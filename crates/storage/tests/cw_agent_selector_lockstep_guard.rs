@@ -63,44 +63,117 @@ fn extract_selector_regex(content: &str, name: &str) -> String {
     tail[..end + 2].to_string()
 }
 
+/// INVERTED 2026-08-25. There is no second copy any more, and that is the fix.
+///
+/// This guard used to require the EMF metric-selector alternation in
+/// `user-data.sh.tftpl` to stay byte-identical to the one in
+/// `deploy/aws/cloudwatch-agent.json`. Keeping two copies in sync is exactly
+/// the kind of obligation a ratchet can enforce and a design should not
+/// create: the duplicate was ~1.6 KB, and it pushed the user-data template to
+/// EXACTLY its 15,872-byte budget with ZERO bytes free — measured, not
+/// estimated — which blocked every subsequent addition to the boot script,
+/// including the EMF names the observability audit wanted.
+///
+/// The template now emits a MINIMAL host-only fallback and copies the repo
+/// file into place after the Step 5 clone. One copy cannot drift from itself.
+///
+/// What this test pins is that the arrangement stays that way: no selector
+/// re-embedded in the template, and the post-clone install still present. If
+/// the install were dropped while the selector stayed absent, every box would
+/// silently run host-metrics-only — a far quieter failure than drift ever was.
 #[test]
-fn cw_agent_selector_copies_are_byte_identical() {
+fn user_data_carries_no_second_copy_of_the_selector() {
     let root = repo_root();
+    let boot = read(&root.join("deploy/aws/terraform/user-data.sh.tftpl"));
+
+    assert!(
+        !boot.contains("\"metric_selectors\""),
+        "the EMF metric-selector list is back inside user-data.sh.tftpl. It is ~1.6 KB \
+         and the template's byte budget has no room for it (it sat at exactly 0 bytes \
+         free before this duplication was removed). The single source of truth is \
+         deploy/aws/cloudwatch-agent.json, copied into place after the Step 5 clone."
+    );
+
+    // The repo copy must still be the real thing.
     let live = extract_selector_regex(
         &read(&root.join("deploy/aws/cloudwatch-agent.json")),
         "deploy/aws/cloudwatch-agent.json",
     );
-    let boot = extract_selector_regex(
-        &read(&root.join("deploy/aws/terraform/user-data.sh.tftpl")),
-        "deploy/aws/terraform/user-data.sh.tftpl",
+    assert!(
+        live.starts_with("^(tv_") && live.ends_with(")$"),
+        "deploy/aws/cloudwatch-agent.json must still carry the anchored exact-name \
+         alternation — a prefix wildcard would publish every metric the app has and \
+         the budget auto-stops the box at 90%"
     );
-    assert_eq!(
-        live, boot,
-        "cw-agent metric_selectors drifted between deploy/aws/cloudwatch-agent.json \
-         (live, per-deploy) and deploy/aws/terraform/user-data.sh.tftpl (first-boot) — \
-         the two copies MUST stay byte-identical or a fresh instance selects a \
-         different metric set than a deployed one"
+
+    // And the boot script must actually install it, or the fallback becomes
+    // the permanent config and no app metric ever reaches CloudWatch.
+    assert!(
+        boot.contains("deploy/aws/cloudwatch-agent.json"),
+        "user-data must copy the repo CloudWatch agent config after the clone; without \
+         it every box runs the host-only fallback and publishes no app metrics at all"
     );
+    assert!(
+        boot.contains("fetch-config"),
+        "the copied config must be applied with amazon-cloudwatch-agent-ctl -a fetch-config, \
+         otherwise the file is written and the running agent never reads it"
+    );
+
+    // The fallback must keep the signal the disk alarm reads — a fallback
+    // that reports nothing is the same as no fallback. Memory and CPU left on
+    // 2026-11-11 (operator Quote 53, "Trim CloudWatch metrics"): no kept alarm
+    // reads them (docs/audits/2026-11-alarm-review.md), and nothing here may
+    // bring them back without an alarm that reads them.
+    assert!(
+        boot.contains("used_percent"),
+        "the host-only fallback must still collect `used_percent` — it is what the \
+         disk alarm reads when the clone has failed"
+    );
+    for gone in ["mem_used_percent", "cpu_usage_active"] {
+        assert!(
+            !boot.contains(&format!("\"{gone}\"")),
+            "the host-only fallback ships `{gone}` again, which no kept alarm reads \
+             (Quote 53: CloudWatch receives only what an alarm reads)"
+        );
+    }
 }
 
 #[test]
 fn cw_agent_selector_ships_heartbeat_and_drops_groww_live_metrics() {
     // 2026-07-15 (Groww live-feed retirement, Trap-A lockstep): the selector
-    // must ship the re-pointed liveness alarm's heartbeat gauge and must NOT
-    // resurrect the 4 retired Groww-live names (a dead name in the EMF list
-    // implies coverage no producer can ever publish again).
+    // must ship the re-pointed liveness alarm's gauge and must NOT resurrect
+    // retired names (a dead name in the EMF list implies coverage no producer
+    // can ever publish again).
+    //
+    // ⚠ RE-POINTED 2026-09-17. This guard REQUIRED
+    // `tv_rest_1m_fire_heartbeat` — correct until the operator's SOCKETS-ONLY
+    // narrowing removed all three of its producers
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10), at which point it was
+    // asserting the exact reverse of both of its own rules at once: it
+    // DEMANDED an EMF name whose producer is gone (the dead-name clause
+    // directly below) while its message warned of a false-SOS the alarm can no
+    // longer raise, because that alarm was re-pointed the same day.
+    //
+    // The RULE is unchanged and is why this was re-pointed rather than
+    // deleted: `tv-<env>-market-hours-liveness-missing` is
+    // `treat_missing_data = breaching` and is the ONLY ~5-minute detector in
+    // the gated set, so whatever gauge it reads MUST be shipped or it pages
+    // every gated window, every trading day. Only the gauge moved.
     let root = repo_root();
     let live = extract_selector_regex(
         &read(&root.join("deploy/aws/cloudwatch-agent.json")),
         "deploy/aws/cloudwatch-agent.json",
     );
     assert!(
-        live.contains("tv_rest_1m_fire_heartbeat"),
-        "cw-agent metric_selectors must ship tv_rest_1m_fire_heartbeat — the \
+        live.contains("tv_dhan_feed_last_tick_age_secs"),
+        "cw-agent metric_selectors must ship tv_dhan_feed_last_tick_age_secs — the \
          market-hours liveness alarm (treat_missing_data=breaching) is blind \
-         without it (false-SOS ~09:25 IST daily)"
+         without it (false-SOS every gated window, every trading day)"
     );
     for retired in [
+        // Lost all three producers with the per-minute REST legs (§12.10);
+        // shipping the name would imply coverage nothing can publish.
+        "tv_rest_1m_fire_heartbeat",
         "tv_groww_ws_active",
         "tv_feed_last_tick_age_seconds",
         "tv_feed_sidecar_stall_restart_total",
@@ -134,7 +207,9 @@ fn resource_block_extractor_is_bounded_at_own_closing_brace() {
     // after the alarm's own lines were deleted.
     let root = repo_root();
     let tf = read(&root.join("deploy/aws/terraform/app-alarms.tf"));
-    for block_name in ["questdb_disconnected", "disk_watcher_respawn"] {
+    // disk_watcher_respawn was the second sample until 2026-11-11, when the
+    // operator Quote 53 alarm review removed it; spill_dir_free_low replaces it.
+    for block_name in ["questdb_disconnected", "spill_dir_free_low"] {
         let block = resource_block(&tf, block_name);
         assert_eq!(
             block
@@ -169,4 +244,114 @@ fn selector_extractor_is_not_vacuous() {
         live.matches("tv_").count() >= 10,
         "selector regex should carry the tv_ metric alternation, got: {live}"
     );
+}
+
+/// The two `collect_list` entries of an agent config, as
+/// `(log_stream_name, timestamp_format, timezone)`. A missing key reads as
+/// the empty string so the assertions below name it instead of panicking in
+/// the extractor.
+fn collect_list_time_config(body: &str) -> Vec<(String, String, String)> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).expect("cloudwatch-agent.json must be valid JSON"); // APPROVED: test
+    let list = json["logs"]["logs_collected"]["files"]["collect_list"]
+        .as_array()
+        .expect("logs.logs_collected.files.collect_list must be an array") // APPROVED: test
+        .clone();
+    list.iter()
+        .map(|entry| {
+            let field = |k: &str| entry[k].as_str().unwrap_or("").to_string();
+            (
+                field("log_stream_name"),
+                field("timestamp_format"),
+                field("timezone"),
+            )
+        })
+        .collect()
+}
+
+/// Every stream that isn't stamped with its OWN event time is a problem.
+/// Returns one human-readable offence per bad entry; empty means correct.
+fn collect_list_time_offences(body: &str) -> Vec<String> {
+    let mut offences = Vec::new();
+    for (stream, format, zone) in collect_list_time_config(body) {
+        if !format.starts_with("%Y-%m-%dT%H:%M:%S.%f") {
+            offences.push(format!(
+                "{stream}: timestamp_format `{format}` — must start with %Y-%m-%dT%H:%M:%S.%f"
+            ));
+        }
+        if format.contains("%z") {
+            offences.push(format!(
+                "{stream}: %z maps to [+-]HHMM and can never match app.log's `+05:30`"
+            ));
+        }
+        let expected_zone = if stream.ends_with("/errors-jsonl") {
+            "UTC"
+        } else if stream.ends_with("/app") {
+            "Local"
+        } else {
+            ""
+        };
+        if expected_zone.is_empty() {
+            offences.push(format!(
+                "{stream}: unknown stream — decide its timezone here"
+            ));
+        } else if zone != expected_zone {
+            offences.push(format!(
+                "{stream}: timezone `{zone}`, expected `{expected_zone}`"
+            ));
+        }
+    }
+    offences
+}
+
+/// ADDED 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
+///
+/// With no `timestamp_format`, the agent stamps each log event with the
+/// moment it READ the line, not the moment the line was written. A backlog
+/// read at boot (the `*.2*` globs match yesterday's rotated files too) then
+/// arrives in CloudWatch as a burst of "new" coded errors, and every metric
+/// filter on the group counts them into the current window — which is how
+/// yesterday's errors paged the operator before the open on 2026-09-23.
+///
+/// `errors.jsonl` writes UTC with a trailing `Z`, so it is parsed as UTC.
+/// `app.log` writes IST with `+05:30` (IstTimer, `%:z`). The agent's `%z`
+/// only matches `+0530`, so the offset cannot be parsed; the stream is
+/// read as `Local` instead, which is correct only while the box stays on
+/// Asia/Kolkata (set by user-data). That dependency is Assumed, not
+/// enforced here.
+#[test]
+fn both_log_streams_are_stamped_with_their_own_event_time() {
+    let root = repo_root();
+    let body = read(&root.join("deploy/aws/cloudwatch-agent.json"));
+    let entries = collect_list_time_config(&body);
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected exactly the errors-jsonl and app streams, got {entries:?}"
+    );
+    let offences = collect_list_time_offences(&body);
+    assert!(
+        offences.is_empty(),
+        "cloudwatch-agent.json log streams are not stamped with event time — a boot \
+         backlog would replay old errors into today's alarm windows: {offences:#?}"
+    );
+}
+
+#[test]
+fn the_event_time_check_bites_on_a_missing_or_wrong_format() {
+    let fixture = r#"{"logs":{"logs_collected":{"files":{"collect_list":[
+        {"log_stream_name":"{instance_id}/errors-jsonl","timezone":"UTC"},
+        {"log_stream_name":"{instance_id}/app","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f%z","timezone":"UTC"}
+    ]}}}}"#;
+    let offences = collect_list_time_offences(fixture);
+    assert_eq!(
+        offences.len(),
+        3,
+        "missing format, %z, and the wrong app timezone must all be reported: {offences:#?}"
+    );
+    let good = r#"{"logs":{"logs_collected":{"files":{"collect_list":[
+        {"log_stream_name":"{instance_id}/errors-jsonl","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f","timezone":"UTC"},
+        {"log_stream_name":"{instance_id}/app","timestamp_format":"%Y-%m-%dT%H:%M:%S.%f","timezone":"Local"}
+    ]}}}}"#;
+    assert!(collect_list_time_offences(good).is_empty());
 }

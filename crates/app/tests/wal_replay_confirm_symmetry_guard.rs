@@ -31,16 +31,47 @@
 
 use std::path::PathBuf;
 
+/// The one STAGE-C confirm site in `main.rs`. Since 2026-11-07 boot settles
+/// `replaying/` through `boot_wal_confirm` (which archives only a pass that
+/// read its segments, never a failed or refused one) instead of calling
+/// `ws_frame_spill::confirm_replayed(` directly; the counting and ordering
+/// below are unchanged and now read this call.
+const CONFIRM_SITE: &str = "boot_wal_confirm::settle_boot_replay_staging(";
+
+/// Strip `//` line comments so PROSE about the confirm can neither satisfy
+/// nor break an assertion about the CODE.
+///
+/// `main.rs` carries three comment mentions of `confirm_replayed` beside
+/// the one real call. The count below is an EQUALITY, so the concrete
+/// bypass an adversarial sweep named on 2026-09-05 is: delete the real
+/// call and write one comment containing the full
+/// `ws_frame_spill::confirm_replayed(` literal. The count stays 1, the
+/// guard stays green, and staged WAL segments re-replay every boot —
+/// the 25-75 GB per restart this guard exists to prevent.
+///
+/// A guard that reads comments is reading documentation, not code.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn main_rs() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()));
+    strip_line_comments(&raw)
 }
 
 #[test]
 fn confirm_replayed_called_from_both_boot_paths() {
     // PR-C2: single boot path → exactly one confirm site.
     let body = main_rs();
-    let calls = body.matches("ws_frame_spill::confirm_replayed(").count();
+    let calls = body.matches(CONFIRM_SITE).count();
     assert_eq!(
         calls, 1,
         "ws_frame_spill::confirm_replayed must be called exactly once (the \
@@ -66,7 +97,7 @@ fn both_paths_gate_confirm_on_a_reinjection_clean_flag() {
     // and the next reader's cheapest fix is to weaken it.
     let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
     let flat_confirm = flat
-        .find("ws_frame_spill::confirm_replayed(")
+        .find(CONFIRM_SITE)
         .expect("confirm_replayed must exist in the normalised body too");
     for ws_type in ["live_feed", "order_update"] {
         let needle =

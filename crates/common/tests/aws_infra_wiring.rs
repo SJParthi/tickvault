@@ -100,6 +100,8 @@ fn test_terraform_instance_type_pinned() {
     let content =
         std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
             .expect("variables.tf must be readable"); // APPROVED: test
+    // 2026-10-21 (Quotes 32/33): the lock is r8g.large, 2 vCPU / 16 GiB, multi-AZ
+    // kept; the text below is the 2026-08-08 record it replaced.
     // Operator-lock 2026-08-08 (daily-universe-scope-expansion-2026-05-27.md §7
     // Quote 13): r8g.xlarge ONLY (Graviton4 memory-optimised, 4 vCPU / 32 GiB).
     // Sized for the 13-timeframe current-day workload WITH raw-tick retention at
@@ -118,11 +120,11 @@ fn test_terraform_instance_type_pinned() {
     // may still appear in SUPERSEDES prose — only the validation condition is
     // forbidden.
     assert!(
-        content.contains("\"r8g.xlarge\""),
-        "variables.tf must pin instance_type to r8g.xlarge (operator lock 2026-08-08, see daily-universe-scope-expansion-2026-05-27.md §7 Quote 13)"
+        content.contains("\"r8g.large\""),
+        "variables.tf must pin instance_type to r8g.large (operator Quotes 32/33, 2026-10-21, see daily-universe-scope-expansion-2026-05-27.md §7)"
     );
     assert!(
-        content.contains("var.instance_type == \"r8g.xlarge\""),
+        content.contains("var.instance_type == \"r8g.large\""),
         "variables.tf must VALIDATE instance_type pinning"
     );
     assert!(
@@ -137,8 +139,8 @@ fn test_terraform_instance_type_pinned() {
     // validated default (r8g.large/m8g.large/t4g.large may still appear in
     // SUPERSEDES comments, so we only forbid them as the validation condition).
     assert!(
-        !content.contains("var.instance_type == \"r8g.large\""),
-        "r8g.large retired as the pinned type (operator downsize lock 2026-07-15)"
+        !content.contains("var.instance_type == \"r8g.xlarge\""),
+        "r8g.xlarge retired as the pinned type (operator Quotes 32/33, 2026-10-21: the half-size server)"
     );
     assert!(
         !content.contains("var.instance_type == \"m8g.large\""),
@@ -186,41 +188,27 @@ fn test_deploy_aws_does_not_auto_seed_prod_secrets() {
 
 #[test]
 fn test_cloudwatch_operator_dashboard_exists() {
-    // The CloudWatch-only runtime has NO Grafana — the operator dashboard is a
-    // native CloudWatch dashboard (deploy/aws/terraform/dashboard.tf). It must
-    // exist + chart only metrics the CW agent actually scrapes (the allowlist
-    // in user-data prometheus.yaml) + reference real alarm resources, so a
-    // terraform apply doesn't fail and no widget is empty.
-    let dash = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/dashboard.tf"))
-        .expect("dashboard.tf must be readable"); // APPROVED: test
+    // Name kept so the test-count ratchet holds; the meaning is reversed.
+    // Operator Quote 53 (2026-11-11, card "Delete the CloudWatch dashboard")
+    // deleted deploy/aws/terraform/dashboard.tf and its dashboard_url output,
+    // reversing Quote 37's "dashboard KEPT". The operator portal and Telegram
+    // stay. Bringing the dashboard back needs a fresh dated owner quote.
+    let dir = workspace_root().join("deploy/aws/terraform");
     assert!(
-        dash.contains("resource \"aws_cloudwatch_dashboard\" \"operator\""),
-        "dashboard.tf must declare the operator CloudWatch dashboard"
+        !dir.join("dashboard.tf").exists(),
+        "dashboard.tf is back; Quote 53 deleted the CloudWatch dashboard"
     );
-    // A few signal metrics that MUST be charted (and are in the scrape allowlist).
-    // (PR-C2, 2026-07-13: tv_realtime_guarantee_score replaced by the Groww
-    // lag gauge — the score widget retired with the PARKed SLO publisher.)
-    // (2026-07-15: the Groww lag gauge replaced by tv_rest_1m_fire_heartbeat
-    // — its sample producer died with the Groww live feed.)
-    // (2026-07-17, stage-3 dead-WS sweep: tv_aggregator_seals_emitted_total
-    // left this list — its widget retired with the tick aggregator; the
-    // series can never publish again.)
-    for metric in &[
-        "tv_rest_1m_fire_heartbeat",
-        "tv_questdb_disconnected_seconds",
-        "tv_token_remaining_seconds",
-    ] {
-        assert!(
-            dash.contains(metric),
-            "operator dashboard must chart {metric} (a scraped Tickvault/Prod metric)"
-        );
-    }
-    // The dashboard_url output lets the operator jump straight to it.
-    let outputs = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/outputs.tf"))
-        .expect("outputs.tf must be readable"); // APPROVED: test
+    let outputs =
+        std::fs::read_to_string(dir.join("outputs.tf")).expect("outputs.tf must be readable"); // APPROVED: test
+    let live_outputs: String = outputs
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        outputs.contains("dashboard_url"),
-        "outputs.tf must expose dashboard_url for one-click console access"
+        !live_outputs.contains("dashboard_url")
+            && !live_outputs.contains("aws_cloudwatch_dashboard"),
+        "outputs.tf still exposes the deleted dashboard"
     );
 }
 
@@ -304,19 +292,19 @@ fn test_terraform_eventbridge_schedules_match_budget() {
         content.contains("cron(0 3 ? * MON-FRI *)"),
         "main.tf missing weekday start schedule (03:00 UTC Mon-Fri = 08:30 IST)"
     );
-    // Weekday stop: 17:30 IST = 12:00 UTC Mon-Fri (operator widened the window
-    // to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till 5.30 pm";
-    // supersedes the 2026-06-05 08:30-16:30 narrowing).
+    // Weekday stop: 16:30 IST = 11:00 UTC Mon-Fri (operator Quote 37,
+    // 2026-10-21, plan item 64: "startign 8.30 am till 4 pm or 4.30 pm woudl be
+    // fine"; supersedes the 2026-08-08 Quote 14 08:30-17:30 widening).
     assert!(
-        content.contains("cron(0 12 ? * MON-FRI *)"),
-        "main.tf missing weekday stop schedule (12:00 UTC Mon-Fri = 17:30 IST)"
+        content.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf missing weekday stop schedule (11:00 UTC Mon-Fri = 16:30 IST)"
     );
-    // Inverted pin: the retired 16:30 IST stop must NOT come back silently. A
-    // shorter window would stop the box an hour before the operator expects,
-    // mid-session for anything running past 16:30.
+    // Inverted pin: the retired 17:30 IST stop must NOT come back silently. A
+    // longer window bills an extra hour every weekday and the hourly hard-stop
+    // guard (closing at 16:30) would force-stop the box at 17:05 and page.
     assert!(
-        !content.contains("cron(0 11 ? * MON-FRI *)"),
-        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, 2026-08-08 Quote 14)"
+        !content.contains("cron(0 12 ? * MON-FRI *)"),
+        "the 17:30 IST stop cron is retired (operator moved the stop back to 16:30 IST, 2026-10-21 Quote 37)"
     );
     // Negative asserts — the prior 7-day daily crons (every day, no MON-FRI
     // restriction) must NOT return. The weekday-only `? * MON-FRI` form is
@@ -448,24 +436,138 @@ fn test_deploy_aws_resolves_account_id_at_runtime() {
     );
 }
 
+/// The text of one top-level `resource "<kind>" "<name>"` block in a
+/// terraform file, from its header to the next top-level `resource`, with
+/// `#` comments removed so a comment can neither satisfy nor trip a check.
+fn terraform_resource_block(content: &str, kind: &str, name: &str) -> String {
+    let header = format!("resource \"{kind}\" \"{name}\"");
+    let start = content
+        .find(&header)
+        .unwrap_or_else(|| panic!("main.tf must declare {header}")); // APPROVED: test
+    let rest = &content[start + header.len()..];
+    let end = rest.find("\nresource ").unwrap_or(rest.len());
+    let block = &content[start..start + header.len() + end];
+    block
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// ITEM 45f, operator Quotes 27 + 28 (2026-09-29): the cold bucket tiers
+/// objects down and never expires them, current or noncurrent.
 #[test]
-fn test_terraform_s3_lifecycle_matches_sebi_retention() {
+fn test_terraform_tv_cold_lifecycle_never_expires_and_tiers_down() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
         .expect("main.tf must be readable"); // APPROVED: test
-    // 5-year SEBI retention = 1825 days
+    let lifecycle =
+        terraform_resource_block(&content, "aws_s3_bucket_lifecycle_configuration", "tv_cold");
     assert!(
-        content.contains("days = 1825"),
-        "main.tf S3 lifecycle must have 1825-day (5-year SEBI) expiration"
+        !lifecycle.contains("expiration"),
+        "the tv_cold lifecycle must carry no `expiration` and no \
+         `noncurrent_version_expiration` (Quotes 27 + 28, 2026-09-29: nothing \
+         captured is ever deleted). Found:\n{lifecycle}"
     );
-    // 30-day transition to Intelligent-Tiering
     assert!(
-        content.contains("INTELLIGENT_TIERING"),
-        "main.tf S3 lifecycle must transition to Intelligent-Tiering"
+        lifecycle.contains("INTELLIGENT_TIERING"),
+        "the tv_cold lifecycle must transition to Intelligent-Tiering"
     );
-    // 1-year transition to Glacier IR
     assert!(
-        content.contains("GLACIER_IR"),
-        "main.tf S3 lifecycle must transition to Glacier IR"
+        lifecycle.contains("GLACIER_IR"),
+        "the tv_cold lifecycle must transition to Glacier IR"
+    );
+    // Operator Quote 53 (2026-11-11): raw-frames/ moves to Glacier Instant
+    // Retrieval after 30 days (was Deep Archive under ITEM 45f), current and
+    // noncurrent versions, and nothing goes to Deep Archive any more.
+    assert!(
+        lifecycle.contains("prefix = \"raw-frames/\"")
+            && lifecycle.contains("id     = \"raw-frames-glacier-ir\"")
+            && lifecycle.contains("noncurrent_version_transition"),
+        "the tv_cold lifecycle must move raw-frames/ to Glacier IR, current and \
+         noncurrent (Quote 53). Found:\n{lifecycle}"
+    );
+    assert!(
+        !lifecycle.contains("DEEP_ARCHIVE") && !lifecycle.contains("\"GLACIER\""),
+        "Quote 53 REJECTs Deep Archive or Glacier Flexible in tv_cold. Found:\n{lifecycle}"
+    );
+    assert!(
+        !lifecycle.contains("questdb-partitions/")
+            && !lifecycle.contains("deploys/")
+            && !lifecycle.contains("instrument-snapshots/")
+            && !lifecycle.contains("prefix = \"logs/\""),
+        "Quote 53 REJECTs a new transition rule for questdb-partitions/, deploys/, \
+         instrument-snapshots/ or logs/. Found:\n{lifecycle}"
+    );
+    assert!(
+        lifecycle.contains("depends_on = [aws_s3_bucket_versioning.tv_cold]"),
+        "the tv_cold lifecycle must be applied after versioning is enabled"
+    );
+}
+
+/// ITEM 45f: versioning stays Enabled on the cold bucket, so an overwrite or
+/// a delete leaves the prior version. Suspending it is a Quote 27/28 REJECT.
+#[test]
+fn test_terraform_tv_cold_versioning_is_enabled() {
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    let versioning = terraform_resource_block(&content, "aws_s3_bucket_versioning", "tv_cold");
+    assert!(
+        versioning.contains("bucket = aws_s3_bucket.tv_cold.id"),
+        "tv_cold versioning must target the tv_cold bucket"
+    );
+    assert!(
+        versioning.contains("status = \"Enabled\"") && !versioning.contains("Suspended"),
+        "tv_cold versioning must be Enabled, never Suspended. Found:\n{versioning}"
+    );
+}
+
+/// The block of `main.tf` that starts at `header` and ends at the next
+/// top-level `}` (a line that is exactly `}`).
+fn terraform_block<'a>(content: &'a str, header: &str) -> &'a str {
+    let start = content
+        .find(header)
+        .unwrap_or_else(|| panic!("main.tf must declare {header}")); // APPROVED: test
+    let rest = &content[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+    &rest[..end]
+}
+
+/// Plan item 45f (operator Quotes 27 + 28, 2026-09-29): the cold bucket keeps
+/// everything. An `expiration` (current or noncurrent) or a suspended
+/// versioning would let S3 delete market data nobody holds another copy of.
+#[test]
+fn test_terraform_cold_bucket_keeps_everything() {
+    let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    let lifecycle = terraform_block(
+        &content,
+        "resource \"aws_s3_bucket_lifecycle_configuration\" \"tv_cold\"",
+    );
+    for banned in [
+        "expiration",
+        "noncurrent_version_expiration",
+        "abort_incomplete_multipart_upload",
+    ] {
+        // abort_incomplete_multipart_upload is harmless in itself but is the
+        // usual neighbour of an expiry; keep the block expiry-free entirely so
+        // a reader never has to reason about which "expire" is safe.
+        assert!(
+            !lifecycle.contains(banned),
+            "the cold bucket lifecycle must not contain `{banned}`: nothing in \
+             tv-<env>-cold is ever expired (plan item 45f)"
+        );
+    }
+    assert!(
+        lifecycle.contains("prefix = \"raw-frames/\"") && lifecycle.contains("\"GLACIER_IR\""),
+        "raw frames must move to Glacier IR (Quote 53), not be deleted"
+    );
+    let versioning = terraform_block(
+        &content,
+        "resource \"aws_s3_bucket_versioning\" \"tv_cold\"",
+    );
+    assert!(
+        versioning.contains("status = \"Enabled\""),
+        "the cold bucket must have versioning Enabled (never Suspended)"
     );
 }
 
@@ -488,11 +590,15 @@ fn test_terraform_oidc_role_restricts_to_repo() {
 fn test_terraform_alarms_publish_to_sns() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/alarms.tf"))
         .expect("alarms.tf must be readable"); // APPROVED: test
-    // All 5 alarms must reference the SNS topic for Telegram fan-out.
+    // Every alarm in the file must reference the SNS topic for Telegram
+    // fan-out. Two alarms since 2026-11-11 (operator Quote 53 alarm review,
+    // docs/audits/2026-11-alarm-review.md): the instance and system status
+    // checks, which also carry the EC2 reboot and recover self-heal actions.
     let alarm_count = content.matches("aws_sns_topic.tv_alerts.arn").count();
     assert!(
-        alarm_count >= 5,
-        "alarms.tf must wire >= 5 alarms to tv_alerts SNS (found {alarm_count})"
+        alarm_count >= 2 && content.contains("arn:aws:automate:${var.aws_region}:ec2:recover"),
+        "alarms.tf must wire the system status alarm to tv_alerts SNS and keep its \
+         EC2 recover action (found {alarm_count} SNS references)"
     );
 }
 
@@ -521,16 +627,19 @@ fn test_deploy_aws_workflow_refreshes_repo_and_systemd_unit() {
     // — a stale unit would load a stale config. Under the single-prod-env model
     // (operator 2026-06-30) the unit sets TV_ENVIRONMENT=prod and production.toml
     // locks dry_run=true (NO real orders), so refreshing the unit keeps the box
-    // on the correct env. The deploy must git-pull the clone AND re-copy the
-    // systemd unit before daemon-reload + restart.
+    // on the correct env. The deploy must refresh to the exact shipped SHA
+    // AND re-copy the systemd unit before daemon-reload + restart. Following
+    // moving origin/main can combine one revision's binary with another's config.
     let content =
         std::fs::read_to_string(workspace_root().join(".github/workflows/deploy-aws.yml"))
             .expect("deploy-aws.yml must be readable"); // APPROVED: test
     assert!(
-        content.contains("git -C repo reset --hard origin/main"),
-        "deploy-aws.yml SSM command must git-refresh the box's repo clone to \
-         origin/main before copying config/systemd — otherwise the box runs \
-         its stale first-boot files forever."
+        content.contains("git -C repo fetch --depth 1 origin $DEPLOY_SHA")
+            && content.contains("git -C repo reset --hard $DEPLOY_SHA")
+            && content.contains("TV_REV=$(sudo -u ec2-user git -C repo rev-parse HEAD)")
+            && !content.contains("git -C repo reset --hard origin/main"),
+        "deploy-aws.yml must pin and verify the exact binary revision before \
+         copying config/systemd; a moving main or stale first-boot clone is unsafe."
     );
     assert!(
         content.contains(
@@ -556,6 +665,82 @@ fn test_deploy_aws_workflow_has_market_hours_guard() {
     assert!(
         content.contains("330") && content.contains("1015"),
         "deploy-aws.yml must encode the 09:00-15:45 IST window in UTC (330-1015)"
+    );
+}
+
+// Regression: 2026-10-26 (audit PR L4) — aws-control refused its sensitive
+// actions only 09:15-15:30 IST and downsize-instance only 09:00-15:35, while
+// capture runs 09:00-15:40 IST (TICK_PERSIST_START/END). A stop at 09:05 or
+// 15:38 cut the live session.
+#[test]
+fn test_regression_workflow_stop_guards_cover_the_capture_window() {
+    let read = |rel: &str| {
+        std::fs::read_to_string(workspace_root().join(rel))
+            .unwrap_or_else(|e| panic!("{rel} must be readable: {e}")) // APPROVED: test
+    };
+    // 09:00 IST = 03:30 UTC = minute 210; 15:40 IST = 10:10 UTC = minute 610.
+    let control = read(".github/workflows/aws-control.yml");
+    assert!(
+        control.contains(r#"[ "$mins" -ge 210 ] && [ "$mins" -le 610 ]"#),
+        "aws-control.yml must refuse stop/reboot/restart-app/stop-app/rotate-ip \
+         for UTC minutes 210-610 (09:00-15:40 IST)"
+    );
+    assert!(
+        !control.contains("-ge 225") && !control.contains("-le 600"),
+        "aws-control.yml still carries the old 09:15-15:30 IST window"
+    );
+    let downsize = read(".github/workflows/downsize-instance.yml");
+    assert!(
+        downsize.contains(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]"#),
+        "downsize-instance.yml must refuse 09:00-15:40 IST"
+    );
+    assert!(
+        !downsize.contains("-le 1535"),
+        "downsize-instance.yml still ends its window at 15:35 IST"
+    );
+    // The deploy failure auto-stop skips the capture window before it stops.
+    let deploy = read(".github/workflows/deploy-aws.yml");
+    let check = deploy
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; }; then echo "::warning::Deploy failed inside"#)
+        .expect("deploy-aws.yml auto-stop must skip 09:00-15:40 IST"); // APPROVED: test
+    let stop = deploy
+        .find("tickvault auto-stop on deploy failure")
+        .expect("deploy-aws.yml auto-stop dispatch"); // APPROVED: test
+    assert!(
+        check < stop,
+        "the IST check must run before the auto-stop dispatch"
+    );
+    // terraform-apply re-checks the band in the apply step itself.
+    let tf = read(".github/workflows/terraform-apply.yml");
+    let recheck = tf
+        .find(r#"[ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; } && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]"#)
+        .expect("terraform-apply.yml must re-check IST at apply time"); // APPROVED: test
+    let apply = tf
+        .find("apply -auto-approve -no-color")
+        .expect("terraform apply line"); // APPROVED: test
+    assert!(
+        recheck < apply,
+        "the IST re-check must sit right before terraform apply"
+    );
+}
+
+// Regression: 2026-10-26 (audit PR L4) — the market-hours gate disarmed the
+// app-death alarms at 15:35 IST while capture (and, since the 2026-08-03 NSE
+// closing auction, the session) runs to 15:40 IST.
+#[test]
+fn test_regression_liveness_gate_closes_at_1540_ist() {
+    let tf = std::fs::read_to_string(
+        workspace_root().join("deploy/aws/terraform/market-hours-liveness-alarm.tf"),
+    )
+    .expect("market-hours-liveness-alarm.tf must be readable"); // APPROVED: test
+    // 15:40 IST = 10:10 UTC.
+    assert!(
+        tf.contains(r#"schedule_expression = "cron(10 10 ? * MON-FRI *)""#),
+        "the liveness close rule must fire at 10:10 UTC (15:40 IST)"
+    );
+    assert!(
+        !tf.contains("cron(5 10 ? * MON-FRI *)"),
+        "the liveness close rule still fires at 15:35 IST"
     );
 }
 
@@ -1098,4 +1283,176 @@ fn test_deploy_watchdog_handler_only_dispatches_when_positively_stale() {
         h.contains("deploy-aws-after-close.yml"),
         "watchdog must dispatch the idempotent + market-hours-guarded auto-deploy workflow"
     );
+}
+
+// QDB-10 (2026-10-11): the QuestDB-disconnected alarm text must not name the
+// retired "100K rescue ring" or promise that nothing is lost.
+#[test]
+fn test_questdb_disconnected_alarm_text_has_no_retired_rescue_ring() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/app-alarms.tf"))
+            .expect("app-alarms.tf must be readable"); // APPROVED: test
+    let start = content
+        .find("resource \"aws_cloudwatch_metric_alarm\" \"questdb_disconnected\"")
+        .expect("questdb_disconnected alarm must exist"); // APPROVED: test
+    let block = &content[start..];
+    let end = block.find("\n}\n").expect("alarm block must close"); // APPROVED: test
+    let block = &block[..end];
+    let description = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("alarm_description"))
+        .expect("alarm must carry a description"); // APPROVED: test
+    assert!(
+        !description.contains(concat!("100K rescue ", "ring")),
+        "the description names a retired rescue ring: {description}"
+    );
+    assert!(
+        !description.to_lowercase().contains("no data"),
+        "the description must not promise no loss: {description}"
+    );
+    assert!(description.contains("finite reserve"));
+}
+
+/// Audit SEC-12 (2026-10-11): the `operator_cidr` validation must refuse a
+/// world-open or broad CIDR. Before, any valid CIDR passed, so setting the
+/// `TF_VAR_OPERATOR_CIDR` secret to 0.0.0.0/0 reopened port 22 to the
+/// internet with no refusal (the state audit PR36c removed).
+#[test]
+fn operator_cidr_validation_refuses_world_open_and_broad_prefixes() {
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/variables.tf"))
+            .expect("variables.tf must be readable"); // APPROVED: test
+    let header = "variable \"operator_cidr\" {";
+    let start = content
+        .find(header)
+        .expect("variables.tf must declare variable \"operator_cidr\""); // APPROVED: test
+    let rest = &content[start..];
+    let end = rest.find("\n}\n").map_or(rest.len(), |i| i + 3);
+    let block: String = rest[..end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let condition = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("condition"))
+        .expect("the operator_cidr variable must carry a validation condition"); // APPROVED: test
+    assert!(
+        condition.contains(") >= 24"),
+        "the operator_cidr validation must enforce an IPv4 prefix floor of /24; \
+         a bare can(cidrhost(...)) accepts 0.0.0.0/0. Found:\n{condition}"
+    );
+    // Review of SEC-12 (2026-10-11): the SSH ingress puts the value in
+    // `cidr_blocks`, which takes IPv4 only, so IPv6 must be refused at plan
+    // time instead of failing at AWS apply.
+    assert!(
+        condition.contains("length(regexall(\":\", var.operator_cidr)) == 0")
+            && !condition.contains("? 64"),
+        "the operator_cidr validation must refuse IPv6 (any \":\"), because the \
+         SSH ingress cidr_blocks is IPv4 only. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("try("),
+        "the prefix check must sit inside try() so a value with no \"/\" reads \
+         false instead of erroring. Found:\n{condition}"
+    );
+    assert!(
+        condition.contains("var.operator_cidr == \"\""),
+        "an empty operator_cidr (no SSH ingress) must stay valid"
+    );
+    let message = block
+        .lines()
+        .find(|line| line.trim_start().starts_with("error_message"))
+        .expect("the operator_cidr validation must carry an error_message"); // APPROVED: test
+    assert!(
+        message.contains("0.0.0.0/0") && message.contains("refused"),
+        "the error_message must say 0.0.0.0/0 is refused. Found:\n{message}"
+    );
+    assert!(
+        message.contains("IPv6 is refused") && !message.contains("/64"),
+        "the error_message must not advertise IPv6 as accepted. Found:\n{message}"
+    );
+    let main_tf = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf"))
+        .expect("main.tf must be readable"); // APPROVED: test
+    assert!(
+        !main_tf.contains("ipv6_cidr_blocks = [ingress.value]"),
+        "if main.tf gains an IPv6 SSH branch, relax the IPv6 refusal in \
+         variables.tf in the same change"
+    );
+}
+
+/// The scheduler's sole automation target passes its own role. Source checks
+/// cannot establish live IAM drift or replace a reviewed Terraform plan.
+fn scheduler_pass_role_is_scoped(content: &str) -> bool {
+    let policy =
+        terraform_resource_block(content, "aws_iam_role_policy", "eventbridge_ec2_scheduler");
+    if policy.matches("\"iam:PassRole\"").count() != 1 {
+        return false;
+    }
+    let rest = &policy[policy.find("\"iam:PassRole\"").unwrap()..];
+    let statement = &rest[..rest.find("Condition").unwrap_or(rest.len())];
+    let resource_lines: Vec<_> = statement
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Resource"))
+        .collect();
+    let target = terraform_resource_block(content, "aws_cloudwatch_event_target", "daily_start");
+    resource_lines == ["Resource = aws_iam_role.eventbridge_ec2_scheduler.arn"]
+        && rest.contains("\"iam:PassedToService\" = \"ssm.amazonaws.com\"")
+        && target
+            .lines()
+            .any(|line| line.trim() == "role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn")
+        && target.lines().any(|line| {
+            line.trim() == "AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]"
+        })
+}
+
+#[test]
+fn eventbridge_scheduler_pass_role_is_scoped_to_its_actual_target() {
+    let source =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf")).unwrap();
+    assert!(scheduler_pass_role_is_scoped(&source));
+}
+
+#[test]
+fn eventbridge_scheduler_pass_role_guard_rejects_permission_and_target_regressions() {
+    let source =
+        std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/main.tf")).unwrap();
+    assert!(scheduler_pass_role_is_scoped(&source));
+    for (before, after) in [
+        (
+            "Resource = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "Resource = \"*\"",
+        ),
+        (
+            "Resource = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "Resource = aws_iam_role.unrelated.arn",
+        ),
+        (
+            "\"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+            "\"iam:PassedToService\" = \"ec2.amazonaws.com\"",
+        ),
+        (
+            "\"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+            "# \"iam:PassedToService\" = \"ssm.amazonaws.com\"",
+        ),
+        (
+            "role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn",
+            "role_arn  = aws_iam_role.unrelated.arn",
+        ),
+        (
+            "AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]",
+            "AutomationAssumeRole = [aws_iam_role.unrelated.arn]",
+        ),
+    ] {
+        assert_eq!(
+            source.matches(before).count(),
+            1,
+            "fixture must change exactly one target"
+        );
+        assert!(
+            !scheduler_pass_role_is_scoped(&source.replace(before, after)),
+            "regression={after}"
+        );
+    }
 }

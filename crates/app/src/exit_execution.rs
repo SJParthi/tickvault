@@ -51,9 +51,9 @@ use tickvault_common::config::ExitOrdersConfig;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
 use tickvault_common::sanitize::capture_rest_error_body;
-use tickvault_common::segment::segment_code_to_str;
+use tickvault_common::types::ExchangeSegment;
 use tickvault_trading::oms::exit_rules::{self, ExitCommand};
-use tickvault_trading::oms::types::OrderLeg;
+use tickvault_trading::oms::types::{OrderLeg, resolve_order_segment_code};
 use tickvault_trading::oms::{
     ExecutionVerdict, OmsError, OrderManagementSystem, PlaceOrderRequest,
 };
@@ -157,8 +157,19 @@ pub async fn dispatch_exit_command(
     let result: Result<(), OmsError> = match cmd {
         ExitCommand::CloseAll {
             security_id,
+            exchange_segment,
             freeze_limit,
-        } => close_all_for_security(oms, risk_engine, security_id, freeze_limit, cfg).await,
+        } => {
+            close_all_for_security(
+                oms,
+                risk_engine,
+                security_id,
+                exchange_segment,
+                freeze_limit,
+                cfg,
+            )
+            .await
+        }
         ExitCommand::PlaceBracket(request) => {
             // M5 (2026-07-14 hostile review): the bracket ENTRY is
             // risk-gated exactly like the pipeline's plain entry arms
@@ -171,7 +182,14 @@ pub async fn dispatch_exit_command(
                 TransactionType::Buy => lots,
                 TransactionType::Sell => lots.saturating_neg(),
             };
-            match risk_engine.check_order(request.security_id, signed_lots) {
+            // I-P1-11 (audit M7): a super order is always booked on NSE_FNO
+            // (`place_super_order` → `wire_order_segment`), so its position
+            // check reads that segment's row, never IDX_I's.
+            match risk_engine.check_order_in_segment(
+                request.security_id,
+                ExchangeSegment::NseFno,
+                signed_lots,
+            ) {
                 RiskCheck::Approved => {
                     let security_id = request.security_id;
                     oms.place_super_order(request, cfg.default_freeze_limit_qty)
@@ -250,9 +268,19 @@ pub async fn execute_exit_for_security(
     order_side: &OrderSideObserver,
     exchange_segment_code: u8,
 ) {
+    // I-P1-11 (audit M7, 2026-10-04): the position to close is the composite
+    // `(security_id, segment)`. An unknown segment code refuses the exit
+    // before anything is cancelled or placed (counted and logged with
+    // `code = I-P1-11` inside `resolve_order_segment_code`). Before this the
+    // close was always sent as NSE_FNO and sized from the IDX_I row.
+    let Some(exchange_segment) = resolve_order_segment_code(exchange_segment_code, security_id)
+    else {
+        return;
+    };
     if cfg.enabled {
         let cmd = ExitCommand::CloseAll {
             security_id,
+            exchange_segment,
             freeze_limit: cfg.default_freeze_limit_qty,
         };
         if let Err(err) = dispatch_exit_command(oms, risk_engine, cmd, cfg).await {
@@ -277,7 +305,7 @@ pub async fn execute_exit_for_security(
     let active: Vec<String> = oms
         .active_orders()
         .iter()
-        .filter(|o| o.security_id == security_id)
+        .filter(|o| o.security_id == security_id && o.exchange_segment == exchange_segment)
         .map(|o| o.order_id.clone())
         .collect();
     for order_id in active {
@@ -305,7 +333,7 @@ pub async fn execute_exit_for_security(
         }
     }
     // Step 2: Close open position (if any filled lots exist)
-    let net_lots = risk_engine.net_lots_for(security_id);
+    let net_lots = risk_engine.net_lots_for_in_segment(security_id, exchange_segment);
     if net_lots != 0 {
         let close_type = if net_lots > 0 {
             TransactionType::Sell
@@ -321,6 +349,7 @@ pub async fn execute_exit_for_security(
         );
         let close_request = PlaceOrderRequest {
             security_id,
+            exchange_segment,
             transaction_type: close_type,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -345,7 +374,7 @@ pub async fn execute_exit_for_security(
                         order_id,
                         correlation_id: String::new(),
                         security_id,
-                        exchange_segment: segment_code_to_str(exchange_segment_code),
+                        exchange_segment: exchange_segment.as_str(),
                         transaction_type: if net_lots > 0 { "SELL" } else { "BUY" },
                         quantity: close_qty,
                         price: 0.0,
@@ -386,6 +415,7 @@ async fn close_all_for_security(
     oms: &mut OrderManagementSystem,
     risk_engine: &RiskEngine,
     security_id: u64,
+    exchange_segment: ExchangeSegment,
     freeze_limit: i64,
     cfg: &ExitOrdersConfig,
 ) -> Result<(), OmsError> {
@@ -393,7 +423,7 @@ async fn close_all_for_security(
     let active: Vec<String> = oms
         .active_orders()
         .iter()
-        .filter(|o| o.security_id == security_id)
+        .filter(|o| o.security_id == security_id && o.exchange_segment == exchange_segment)
         .map(|o| o.order_id.clone())
         .collect();
     for order_id in &active {
@@ -418,7 +448,7 @@ async fn close_all_for_security(
     }
 
     // Step 2: close the net position (sliced when it exceeds the freeze).
-    let net_lots = risk_engine.net_lots_for(security_id);
+    let net_lots = risk_engine.net_lots_for_in_segment(security_id, exchange_segment);
     if net_lots == 0 {
         return Ok(());
     }
@@ -437,6 +467,7 @@ async fn close_all_for_security(
     );
     let close_request = PlaceOrderRequest {
         security_id,
+        exchange_segment,
         transaction_type: close_type,
         order_type: OrderType::Market,
         product_type: ProductType::Intraday,
@@ -712,6 +743,7 @@ mod tests {
         let commands = vec![
             ExitCommand::CloseAll {
                 security_id: 13,
+                exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: 1800,
             },
             ExitCommand::PlaceBracket(bracket_request(49081)),
@@ -749,12 +781,13 @@ mod tests {
     async fn test_dispatch_close_all_cancels_slices_and_verifies() {
         let mut oms = make_dry_run_oms();
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill(13, 5, 100.0, 1); // net +5 lots to flatten
+        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 5, 100.0, 1); // net +5 lots to flatten
         let cfg = enabled_cfg(2);
 
         // Pre-existing active paper order for the same security.
         let pending = PlaceOrderRequest {
             security_id: 13,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -769,6 +802,7 @@ mod tests {
 
         let cmd = ExitCommand::CloseAll {
             security_id: 13,
+            exchange_segment: ExchangeSegment::NseFno,
             freeze_limit: cfg.default_freeze_limit_qty,
         };
         dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg)
@@ -870,6 +904,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 13,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -947,11 +982,12 @@ mod tests {
     async fn test_execute_exit_disabled_runs_legacy_cancel_and_close() {
         let mut oms = make_dry_run_oms();
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill(13, 3, 100.0, 1); // net +3 lots
+        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 3, 100.0, 1); // net +3 lots
         let cfg = ExitOrdersConfig::default(); // disabled
 
         let pending = PlaceOrderRequest {
             security_id: 13,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -964,7 +1000,15 @@ mod tests {
         };
         let pending_id = oms.place_order(pending).await.expect("paper place");
 
-        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, 0).await;
+        execute_exit_for_security(
+            &mut oms,
+            &mut risk,
+            13,
+            &cfg,
+            &None,
+            ExchangeSegment::NseFno.binary_code(),
+        )
+        .await;
 
         // Legacy path: the active order cancelled + exactly ONE close
         // order placed (freeze scalar 0 is IGNORED — no slicing path).
@@ -983,7 +1027,15 @@ mod tests {
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
         let cfg = ExitOrdersConfig::default();
 
-        execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, 0).await;
+        execute_exit_for_security(
+            &mut oms,
+            &mut risk,
+            13,
+            &cfg,
+            &None,
+            ExchangeSegment::NseFno.binary_code(),
+        )
+        .await;
         assert_eq!(oms.total_placed(), 0, "flat + no actives = no orders");
     }
 
@@ -994,14 +1046,101 @@ mod tests {
     async fn test_execute_exit_enabled_routes_through_dispatcher_and_slices() {
         let mut oms = make_dry_run_oms();
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill(21, -2, 50.0, 1); // net -2 lots → BUY 2 to close
+        risk.record_fill_in_segment(21, ExchangeSegment::NseFno, -2, 50.0, 1); // net -2 lots → BUY 2 to close
         let cfg = enabled_cfg(1);
 
-        execute_exit_for_security(&mut oms, &mut risk, 21, &cfg, &None, 0).await;
+        execute_exit_for_security(
+            &mut oms,
+            &mut risk,
+            21,
+            &cfg,
+            &None,
+            ExchangeSegment::NseFno.binary_code(),
+        )
+        .await;
         assert_eq!(
             oms.total_placed(),
             2,
             "2 lots at freeze 1 must slice into 2 paper close orders"
+        );
+    }
+
+    /// Audit M7 (2026-10-04): the exit closes only the position booked in
+    /// its OWN segment. A position on `(13, NSE_FNO)` is a different
+    /// instrument from `(13, IDX_I)`, so an IDX_I exit places nothing; an
+    /// NSE_FNO exit closes it and sends the close in NSE_FNO.
+    ///
+    /// Before this the close was sized from the IDX_I row and always sent as
+    /// NSE_FNO, so an IDX_I exit for a held NSE_FNO position closed nothing
+    /// and an NSE_FNO exit read an empty row.
+    #[tokio::test]
+    async fn test_execute_exit_closes_only_its_own_segment() {
+        for enabled in [false, true] {
+            let mut oms = make_dry_run_oms();
+            let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+            risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 2, 100.0, 1);
+            let cfg = if enabled {
+                enabled_cfg(10)
+            } else {
+                ExitOrdersConfig::default()
+            };
+
+            let idx = ExchangeSegment::IdxI.binary_code();
+            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, idx).await;
+            assert_eq!(
+                oms.total_placed(),
+                0,
+                "an IDX_I exit must not close the NSE_FNO position (enabled={enabled})"
+            );
+
+            let fno = ExchangeSegment::NseFno.binary_code();
+            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, fno).await;
+            assert_eq!(oms.total_placed(), 1, "enabled={enabled}");
+            assert!(
+                oms.all_orders()
+                    .values()
+                    .all(|o| o.exchange_segment == ExchangeSegment::NseFno),
+                "the close is sent in the position's own segment (enabled={enabled})"
+            );
+        }
+    }
+
+    /// Audit M7: a segment code that names no segment (6 is the annexure
+    /// gap) refuses the exit before anything is cancelled or placed — never
+    /// a guess.
+    #[tokio::test]
+    async fn test_execute_exit_refuses_an_unknown_segment_code() {
+        let mut oms = make_dry_run_oms();
+        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
+        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 2, 100.0, 1);
+        let pending = PlaceOrderRequest {
+            security_id: 13,
+            exchange_segment: ExchangeSegment::NseFno,
+            transaction_type: TransactionType::Buy,
+            order_type: OrderType::Market,
+            product_type: ProductType::Intraday,
+            validity: OrderValidity::Day,
+            quantity: 1,
+            price: 0.0,
+            trigger_price: 0.0,
+            lot_size: 1,
+            expiry_date: None,
+        };
+        let pending_id = oms.place_order(pending).await.expect("paper place");
+
+        execute_exit_for_security(
+            &mut oms,
+            &mut risk,
+            13,
+            &ExitOrdersConfig::default(),
+            &None,
+            6,
+        )
+        .await;
+        assert_eq!(oms.total_placed(), 1, "no close order was placed");
+        assert!(
+            oms.active_orders().iter().any(|o| o.order_id == pending_id),
+            "nothing was cancelled"
         );
     }
 
@@ -1041,6 +1180,7 @@ mod tests {
         let order_id = oms
             .place_order(PlaceOrderRequest {
                 security_id: 13,
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -1072,7 +1212,7 @@ mod tests {
     async fn test_close_all_verify_budget_bounds_total_ladder_time() {
         let mut oms = make_dry_run_oms();
         let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill(13, 5, 100.0, 1); // net +5 lots
+        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 5, 100.0, 1); // net +5 lots
         let mut cfg = enabled_cfg(1); // freeze 1 → 5 close slices
         cfg.mpp_verify_deadline_secs = 1; // 1s TOTAL verify budget
 
@@ -1082,6 +1222,7 @@ mod tests {
             &mut risk,
             ExitCommand::CloseAll {
                 security_id: 13,
+                exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: cfg.default_freeze_limit_qty,
             },
             &cfg,
@@ -1142,6 +1283,7 @@ mod tests {
         let labels = [
             command_label(&ExitCommand::CloseAll {
                 security_id: 13,
+                exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: 1,
             }),
             command_label(&ExitCommand::PlaceBracket(bracket_request(13))),

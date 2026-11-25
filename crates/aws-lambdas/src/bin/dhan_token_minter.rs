@@ -2,6 +2,7 @@
 //! `tickvault_aws_lambdas::dhan_token_minter` (thin-bin coverage rule).
 
 // House restriction-lint blanket — match the lib.rs / other bin roots.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]

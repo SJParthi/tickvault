@@ -60,8 +60,17 @@ use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
 
 /// Directory the day's contract artifact lives in.
 ///
-/// The same directory the mapping artifact uses, so one cleanup and one
-/// retention policy covers both.
+/// The same directory the mapping artifact uses, so ONE retention sweep covers
+/// both -- `dhan_universe::sweep_stale_artifacts`, which runs at the end of the
+/// daily build and removes artifacts older than its retention window.
+///
+/// 2026-09-05: this comment previously read "so one cleanup and one retention
+/// policy covers both" while NO such policy existed anywhere -- every
+/// `remove_file` touching this directory was inside a `#[cfg(test)]` block. The
+/// shared directory was a precondition for a single policy, and the comment
+/// asserted the policy itself. A reader auditing disk growth would have
+/// believed these files were managed and looked elsewhere. The sweep named
+/// above is what makes the sentence true.
 const CONTRACT_DIR: &str = "data/instrument-cache";
 
 /// Path of the day's contract artifact.
@@ -102,6 +111,18 @@ pub struct ContractRow {
     pub l: String,
     /// Underlying symbol.
     pub u: String,
+    /// `LOT_SIZE` — the contract multiplier. `0` when the master did not
+    /// carry one.
+    ///
+    /// `serde(default)` is load-bearing, not tidiness: this artifact is
+    /// written to disk once a day and re-read by every later boot, so a
+    /// restart on the SAME day this field ships would meet a file written by
+    /// the previous binary with no `z` key. Without the default that parse
+    /// fails, the artifact reads as unusable, and the lane falls back to the
+    /// 4-index universe — the exact 99.98% collapse this repo already has an
+    /// alarm for.
+    #[serde(default)]
+    pub z: u32,
 }
 
 impl ContractRow {
@@ -125,6 +146,7 @@ impl ContractRow {
             strike_paise: self.s,
             option_leg: OptionLeg::from_master_field(&self.l),
             underlying_symbol: self.u.clone(),
+            lot_size: self.z,
         }
     }
 }
@@ -159,6 +181,7 @@ pub fn contract_rows_from_master(master: &[MasterRow]) -> Vec<ContractRow> {
             }
             .into(),
             u: r.underlying_symbol.clone(),
+            z: r.lot_size,
         })
         .collect()
 }
@@ -187,17 +210,185 @@ pub fn write_contract_artifact(date_ist: &str, rows: &[ContractRow]) -> anyhow::
     Ok(())
 }
 
-/// Reads the day's contract artifact.
+/// Reads the day's contract artifact, SHARED rather than copied.
+///
+/// # Why this returns an `Arc` and no owned form exists (2026-09-19)
+///
+/// This used to return `Vec<ContractRow>`, and every caller paid a deep copy
+/// of the whole artifact — the 2026-08-21 production log records
+/// `contracts_in_artifact: 121674`, roughly 11 MB of JSON and ~46,000 `String`
+/// allocations per call. The 2026-09-01 change moved that copy off the cache
+/// LOCK, which stopped one caller blocking another, and left the copy itself
+/// in place: the per-minute depth steering loop still allocated and freed
+/// 11 MB every sixty seconds for a file that is written ONCE per trading day
+/// and is immutable afterwards.
+///
+/// Every production caller is read-only (`&rows`, `.iter()`, `.len()`), so
+/// none of them ever needed to own it. The owned form is therefore DELETED
+/// rather than kept beside this one: a `Vec`-returning sibling is exactly the
+/// thing a future caller reaches for without noticing what it costs, and the
+/// note the old function carried telling callers to "prefer an `Arc`-returning
+/// accessor" was advice a compiler cannot enforce.
+///
+/// `Arc<Vec<ContractRow>>` derefs transitively, so a caller passing `&rows`
+/// where `&[ContractRow]` or `&Vec<ContractRow>` is expected needs no change.
+/// A caller that genuinely needs ownership writes `(*rows).clone()` and the
+/// cost is then visible at its own call site, which is the point.
 ///
 /// # Errors
 ///
 /// Missing or unparseable file. Both are non-fatal to the caller and are
 /// reported as "contracts are NOT in effect" rather than as an empty set that
 /// looks like a market with no derivatives.
-pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>> {
+pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<std::sync::Arc<Vec<ContractRow>>> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_contract_artifact_on_this_thread(date_ist))
+}
+
+/// The body of [`read_contract_artifact`], run on whichever thread calls it.
+fn read_contract_artifact_on_this_thread(
+    date_ist: &str,
+) -> anyhow::Result<std::sync::Arc<Vec<ContractRow>>> {
     let path = contract_artifact_path(date_ist);
+    let stamp = artifact_stamp(&path);
+
+    // Cache hit: same file, same size, same mtime. The `Arc` bump is O(1) and
+    // is now the WHOLE cost of a hit — there is no copy left anywhere on this
+    // path.
+    if let Some(hit) = cached_artifact(date_ist, stamp) {
+        return Ok(hit);
+    }
+
     let body = std::fs::read_to_string(&path)?;
-    Ok(serde_json::from_str(&body)?)
+    let rows: Vec<ContractRow> = serde_json::from_str(&body)?;
+    // Store FIRST, then hand back the very `Arc` the cache holds, so a miss
+    // costs one allocation of the `Vec` and not two.
+    Ok(store_artifact(date_ist, stamp, rows))
+}
+
+/// `(len, mtime_nanos)` for the artifact, or `None` when it cannot be stat'd.
+///
+/// `None` DISABLES the cache for that call rather than being treated as a
+/// stable identity: a file we cannot stat is one we cannot prove unchanged,
+/// and serving a cached universe against an unknown file is the failure this
+/// guard exists to prevent.
+fn artifact_stamp(path: &std::path::Path) -> Option<(u64, i128)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md.modified().ok()?;
+    let nanos = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i128::try_from(d.as_nanos()).ok()?,
+        // Pre-epoch mtime: representable, and negative keeps it distinct from
+        // any post-epoch value rather than collapsing onto 0.
+        Err(e) => -i128::try_from(e.duration().as_nanos()).ok()?,
+    };
+    Some((md.len(), nanos))
+}
+
+/// The parsed artifact, kept across attempts.
+///
+/// # Why this exists (2026-08-22)
+///
+/// `attach_depth_when_available` retries on a timer, and BOTH halves of each
+/// iteration open this file: the depth loader reads it, then the contract
+/// loader reads it again. The 2026-08-21 production log records
+/// `contracts_in_artifact: 121674` — roughly 11 MB of JSON (Estimated at
+/// ~90 B/row). So every attempt was two full parses of a multi-megabyte file,
+/// and tightening the pre-open cadence multiplied them, on a 4-vCPU box,
+/// during the pre-open minutes when the drain is folding ticks.
+///
+/// The file is written once per trading day by the daily rider, atomically
+/// (tmp then rename), and is immutable afterwards. So it is parsed once and
+/// shared.
+///
+/// # Why a stat guard rather than trusting the date
+///
+/// Keying on the date ALONE would be wrong in the one case that matters: the
+/// rider is supervised, so a respawn can legitimately rewrite TODAY's file
+/// after something has already read it. A date-keyed cache would then serve
+/// the superseded universe for the rest of the session, silently — a stale
+/// contract set is indistinguishable downstream from a correct one. Comparing
+/// `(len, mtime)` costs one `stat` instead of an 11 MB parse and makes a
+/// rewrite land on the next attempt.
+static CONTRACT_ARTIFACT_CACHE: std::sync::Mutex<Option<CachedArtifact>> =
+    std::sync::Mutex::new(None);
+
+/// `(trading date, stat stamp, parsed rows)` — the one cached artifact.
+///
+/// Named rather than inlined because all three parts are load-bearing and a
+/// bare tuple hides that: the date stops yesterday answering for today, the
+/// stamp stops a same-day rewrite being served stale, and the `Arc` is what
+/// keeps the ~11 MB from being held twice while a caller clones it out.
+type CachedArtifact = (
+    String,
+    Option<(u64, i128)>,
+    std::sync::Arc<Vec<ContractRow>>,
+);
+
+/// Returns the cached rows when the date AND the stat stamp both match.
+///
+/// A `None` stamp never matches — see [`artifact_stamp`]. Lock poisoning is
+/// recovered with `into_inner()` (the house pattern): a panic in another
+/// thread must not turn a cache into a hard failure of the boot path.
+fn cached_artifact(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+) -> Option<std::sync::Arc<Vec<ContractRow>>> {
+    let stamp = stamp?;
+    let guard = CONTRACT_ARTIFACT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cached_date, cached_stamp, rows) = guard.as_ref()?;
+    if cached_date == date_ist && *cached_stamp == Some(stamp) {
+        // Return the `Arc`, NOT a deep clone — 2026-09-01.
+        //
+        // This used to be `rows.as_ref().clone()`, which copied the whole
+        // ~11 MB `Vec` (~46,000 `String` allocations) WHILE HOLDING THE LOCK.
+        // The depth rebalance calls this once a minute for the whole session,
+        // on a tokio worker the WebSocket read loops share on a 4-vCPU host —
+        // the same "pins a worker, the read loop stops pumping pongs, the
+        // socket gets dropped" hazard the ILP flush was moved off the drain to
+        // avoid.
+        //
+        // The `Arc` bump is O(1) and the lock is now held for exactly that.
+        // Any caller that genuinely needs an owned `Vec` clones it AFTER the
+        // guard is dropped, so the copy no longer blocks other tasks.
+        return Some(std::sync::Arc::clone(rows));
+    }
+    None
+}
+
+/// Replaces whatever is cached and returns the `Arc` now held. One entry,
+/// never a growing map: only today's artifact is ever asked for, so keeping
+/// yesterday's would hold ~11 MB for nothing.
+///
+/// # Why it TAKES the `Vec` and HANDS BACK the `Arc` (2026-09-19)
+///
+/// It used to take `&[ContractRow]` and call `rows.to_vec()`, so a cache MISS
+/// allocated the artifact twice: once by `serde_json`, once again here. Taking
+/// ownership makes the second copy impossible to write, and returning the
+/// stored `Arc` means the caller does not then have to re-read its own cache
+/// to get one.
+///
+/// An unstampable file (`stamp == None`) is not cached — see
+/// [`artifact_stamp`] — but the caller still needs its rows, so the `Arc` is
+/// built and returned without being stored.
+fn store_artifact(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+    rows: Vec<ContractRow>,
+) -> std::sync::Arc<Vec<ContractRow>> {
+    let shared = std::sync::Arc::new(rows);
+    let Some(stamp) = stamp else { return shared };
+    let mut guard = CONTRACT_ARTIFACT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((
+        date_ist.to_owned(),
+        Some(stamp),
+        std::sync::Arc::clone(&shared),
+    ));
+    shared
 }
 
 /// Index underlyings whose FULL option chain is subscribed.
@@ -222,6 +413,199 @@ pub fn read_contract_artifact(date_ist: &str) -> anyhow::Result<Vec<ContractRow>
 /// tracked; this one is what the lane actually subscribes.
 pub const FULL_CHAIN_INDEX_UNDERLYINGS: [&str; 2] = ["NIFTY", "BANKNIFTY"];
 
+/// Percentage of stock-option underlyings that must be PRICED before a
+/// contract selection is treated as final.
+///
+/// 60 sits deliberately between the two failure modes it separates.
+///
+/// Too low is what shipped: at one priced underlying out of ~208 (0.5%) the
+/// selection closed and every other stock lost its options for the day. Too
+/// high never dials at all on a thin morning — the illiquid tail of the F&O
+/// list can take minutes to print, and a 95% bar would spend the entire
+/// allowance waiting for names nobody trades. 60% means the liquid majority
+/// has printed, which is what "at-the-money is locatable" actually requires.
+///
+/// It is NOT a hard gate. The attach ANDs `stock_options_are_pending` with
+/// `!out_of_time`, so a morning that never reaches quorum still dials whatever
+/// it has at the deadline rather than nothing.
+///
+/// UNMEASURED, and stated as such: the real distribution of how many F&O
+/// underlyings have printed by 09:15:30 is not known. The first session after
+/// this lands should be read against the `underlyings_total` /
+/// `underlyings_without_spot` fields on the `contract universe resolved` line,
+/// and this number re-tuned from that evidence rather than defended.
+///
+/// Lives HERE rather than in `crates/common/src/constants.rs` deliberately: it
+/// has exactly one reader, and `testing-scope.md` escalates any `crates/common`
+/// edit to a full-workspace run — a 10-15 minute cost for a knob no other crate
+/// can see.
+pub const STOCK_OPTION_PRICING_QUORUM_PERCENT: usize = 60;
+
+/// Counter: a TERMINAL defect in the day's contract selection. Label: `reason`.
+///
+/// Until 2026-08-21 this module carried **zero** `metrics::` calls. "No options
+/// resolved today", "the ATM window shrank to three", "the artifact was
+/// unreadable" were `error!` lines and struct fields that nothing consumed — a
+/// session missing ~22,000 authorized contracts left no number anywhere for an
+/// alarm or a triage path to read. The 2026-08-20 incident is the shape:
+/// `atm_window_reason = "no_ladders"` was recorded, printed, and ignored.
+///
+/// EVERY label value is a real defect, deliberately. The CloudWatch EMF
+/// processor folds labels into the single declared dimension set by SUMMING,
+/// so a name that also carried successes would alarm on a healthy day. The
+/// success side stays on the `contract universe resolved` info line.
+pub const CONTRACT_UNIVERSE_FAILED_COUNTER: &str = "tv_dhan_contract_universe_failed_total";
+
+/// Every `reason` value [`CONTRACT_UNIVERSE_FAILED_COUNTER`] can carry.
+///
+/// Enumerated so they can be pre-registered: the CloudWatch delta pipeline
+/// drops each series' FIRST observed sample as its baseline, so a reason that
+/// is not pre-registered loses its first increment — and on a once-per-session
+/// counter, its first increment is its only one.
+pub const CONTRACT_FAILURE_REASONS: [&str; 9] = [
+    "artifact_unreadable",
+    // The price SOURCE returned zero rows. Split out of `no_ladders` on
+    // 2026-09-08: that reason fires for BOTH "no prices arrived" and "prices
+    // arrived and none matched", so it could never say which, and the two have
+    // nothing in common but the symptom.
+    "no_spot_rows",
+    // The price source returned rows and NOT ONE joined onto the symbol map —
+    // an identity defect, not a data-availability one. Reported separately
+    // because it is the shape a key or segment change produces, and it would
+    // otherwise read as a quiet market.
+    "spot_keys_unmatched",
+    // The late-attach loop reached its deadline or the 15:30 hard stop with
+    // contracts never on the wire. Emitted by `record_contract_give_up`, NOT
+    // by the classifier: at a give-up there is no `ContractSelection` to
+    // classify, which is exactly why this path had no signal at all until
+    // 2026-08-21 -- the give-up `return`s bypassed the only emitter, so the
+    // alarm built for a contract-less session could only ever observe its own
+    // pre-registered zero.
+    "gave_up",
+    "symbol_map_unreadable",
+    "no_contracts",
+    "no_ladders",
+    "no_room",
+    "window_shrunk",
+];
+
+/// Publish a 0 baseline for every reason. Call ONCE, before the first attempt.
+pub fn pre_register_contract_failure_counters() {
+    for reason in CONTRACT_FAILURE_REASONS {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(0);
+    }
+}
+
+/// Classify the TERMINAL verdict for a contract selection.
+///
+/// Pure, so the classification is testable without a metrics recorder — the
+/// emit below is a thin loop over what this returns.
+///
+/// Called ONCE, when the selection is dialed or abandoned, never per retry.
+/// That distinction is the whole design: `no_ladders` on a pre-open attempt is
+/// NORMAL — no tick has landed yet, and this module's own docs say so — so a
+/// per-attempt emit would fire ~46 times between 08:30 and 09:16 on a perfectly
+/// healthy morning and page for it.
+#[must_use]
+pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if selection.instruments.is_empty() {
+        reasons.push("no_contracts");
+    }
+    match selection.atm_window_reason {
+        // Guarded on the denominator: a master with genuinely no stock options
+        // reports `no_ladders` legitimately and must not page for it.
+        //
+        // Since 2026-09-08 the guarded arm ALSO says which side failed. Both
+        // sub-reasons ride WITH `no_ladders` rather than replacing it, so the
+        // alarm built on that name keeps firing exactly as before and the new
+        // labels are additional detail, not a silent re-route.
+        "no_ladders" if selection.stock_option_underlyings > 0 => {
+            reasons.push("no_ladders");
+            if selection.spot_rows_available == 0 {
+                reasons.push("no_spot_rows");
+            } else {
+                // Rows arrived and the ladder set is still empty: every one of
+                // them failed to join. Not a market condition — a key or
+                // segment mismatch between the price source and the symbol map.
+                reasons.push("spot_keys_unmatched");
+            }
+        }
+        "no_room" => reasons.push("no_room"),
+        "applied" if selection.atm_window_used < STOCK_OPTION_ATM_STRIKES_EACH_SIDE => {
+            reasons.push("window_shrunk");
+        }
+        _ => {}
+    }
+    // Contracts pushed out by capacity BEFORE the stock-option window is
+    // fitted (2026-08-21).
+    //
+    // The four reasons above all describe the stock-option window. Nothing
+    // described the three push sites that run first — index futures, stock
+    // futures, and the full index-option chains. Those increment
+    // `dropped_for_capacity` on `NoRoom`, and if the window then fits its
+    // authorized size the verdict is `applied` with the full width, so NOT ONE
+    // reason fires. The counter reads its pre-registered zero, the alarm stays
+    // green, and contracts the operator authorized never reached the wire.
+    //
+    // That is the same silent-shortfall shape `record_contract_give_up` was
+    // added for, one layer in: the give-up arms had no emitter, and these
+    // drops had no reason.
+    //
+    // Deliberately independent of the window reasons rather than folded into
+    // them: a drop is a shortfall whatever the window did, and `no_room` and
+    // this can legitimately both fire for one selection. Two labels on one
+    // counter is the honest description of two distinct facts — collapsing
+    // them would hide whichever came second.
+    if selection.dropped_for_capacity > 0 {
+        reasons.push("dropped_for_capacity");
+    }
+    reasons
+}
+
+/// Local gauges for the last successfully read contract master. If the master is
+/// unreadable the attach records its existing failure counter and keeps the
+/// last observation. A successfully read empty master sets both gauges to zero.
+fn record_contract_spot_coverage(selection: &ContractSelection) {
+    // APPROVED: cast — the selected market universe fits exactly in f64.
+    metrics::gauge!("tv_dhan_contract_underlyings_without_spot")
+        .set(selection.underlyings_without_spot as f64);
+    // APPROVED: cast — same bounded count as the denominator in the attach log.
+    metrics::gauge!("tv_dhan_contract_stock_option_underlyings")
+        .set(selection.stock_option_underlyings as f64);
+}
+
+/// Record the terminal verdict. One increment per reason, once per session.
+pub fn record_contract_verdict(selection: &ContractSelection) {
+    for reason in contract_verdict_reasons(selection) {
+        metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => reason).increment(1);
+    }
+}
+
+/// Record that the late-attach loop STOPPED with contracts never on the wire.
+///
+/// Separate from [`record_contract_verdict`] because the two answer different
+/// questions and only one of them had an emitter. The verdict classifies a
+/// selection that was actually produced; this fires when the loop gave up and
+/// there is no selection to classify — the session simply ends carrying spot
+/// instruments and nothing else.
+///
+/// That was the gap: both give-up arms in `attach_depth_when_available`
+/// `return`ed straight past the only call to `record_contract_verdict`, which
+/// lives inside the SUCCESSFUL dial branch. So a session that resolved zero
+/// contracts by the deadline — the precise condition
+/// `tv_dhan_contract_universe_failed_total` exists to page on — left that
+/// counter reading its pre-registered zero, and the only trace was an
+/// unalarmed log line.
+///
+/// Caller must gate on the half actually being incomplete. Firing this when
+/// contracts DID reach the wire and only depth did not would page for a
+/// failure that did not happen, which is the fastest way to teach an operator
+/// to ignore the alarm.
+pub fn record_contract_give_up() {
+    metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "gave_up").increment(1);
+}
+
 /// What a contract selection produced, and everything it refused.
 ///
 /// Every refusal is a counted field rather than a silent drop. A selection
@@ -233,10 +617,12 @@ pub struct ContractSelection {
     /// The contracts to subscribe, deduped on the I-P1-11 composite key and
     /// sorted deterministically.
     pub instruments: Vec<SubscribeInstrument>,
-    /// Index futures selected (all expiries at or after today).
-    pub index_futures: usize,
-    /// Stock futures selected (all expiries at or after today).
-    pub stock_futures: usize,
+    // Futures are NOT selected. The operator removed the entire futures
+    // subscription on 2026-09-18 (equity underlying spots and options only —
+    // `websocket-connection-scope-lock.md`, "2026-09-18 (THIRD)"), so there is
+    // no `index_futures` / `stock_futures` count here. A counter with nothing
+    // feeding it reads as "none selected today" when the truth is "never
+    // selected", which is the dead-monitor class the house rules forbid.
     /// Index options selected (current expiry, full chain, 2 underlyings).
     pub index_options: usize,
     /// Stock options selected (current expiry, ATM window both legs).
@@ -245,11 +631,30 @@ pub struct ContractSelection {
     /// [`STOCK_OPTION_ATM_STRIKES_EACH_SIDE`] means the envelope forced a
     /// shrink — the operator asked for 25 and got this.
     ///
-    /// **0 means no window was applied to anything.** Read it with
-    /// [`Self::atm_window_reason`], which names WHY — a window of 0 from a
-    /// full envelope and a window of 0 from an empty ladder set are different
-    /// failures with different remedies.
+    /// **0 is AMBIGUOUS on its own and must never be read alone.** It carries
+    /// two opposite meanings, separated only by [`Self::atm_window_reason`]:
     ///
+    /// - `0` with `"applied"` — the at-the-money strike itself, BOTH legs, was
+    ///   subscribed for every ladder, and nothing wider fit. This is a
+    ///   SUCCESS: `stock_options` is non-zero.
+    /// - `0` with `"no_room"` or `"no_ladders"` — nothing was subscribed at
+    ///   all. `stock_options` is zero.
+    ///
+    /// CORRECTED 2026-08-26: this said "**0 means no window was applied to
+    /// anything**", which is the second case stated as though it were the
+    /// only one. `fit_atm_window` returns `Some(0)` for the ATM-only fit and
+    /// `None` for the two failures, and the caller's own comment spells the
+    /// distinction out — "window 0 still selects the ATM strike itself, both
+    /// legs, for every stock". So an operator trusting this doc would read a
+    /// successful ATM-only session, with hundreds of pairs subscribed, as a
+    /// total failure. Found by a property test written FROM this doc, which
+    /// is the useful part: the test encoded the doc's claim and the code
+    /// disagreed with it.
+    ///
+    /// The reliable single field to read is `stock_options`. This one
+    /// describes the WIDTH; it never, on its own, says whether anything was
+    ///
+    /// taken.
     /// CORRECTED 2026-08-19: this reported **25 while zero stock options were
     /// selected** whenever the ladder set came back empty. The same run's
     /// boot line then read `stock_options = 0, atm_window = 25` — a number
@@ -273,6 +678,36 @@ pub struct ContractSelection {
     /// Underlyings whose options were REFUSED because no live spot price was
     /// available to locate at-the-money. Never guessed.
     pub underlyings_without_spot: usize,
+    /// Price rows the SOURCE returned, before the join onto the symbol map.
+    ///
+    /// The number that separates the two ways `underlyings_without_spot` can
+    /// reach its maximum, which are opposite problems with an identical
+    /// symptom:
+    ///
+    /// - `spot_rows_available == 0` — the price SOURCE gave us nothing. A
+    ///   persistence, query-window or database-lag problem; the identity
+    ///   plumbing is untested because it never ran.
+    /// - `spot_rows_available > 0` with `underlyings_without_spot` still at the
+    ///   denominator — rows arrived and NONE of them joined. An identity
+    ///   problem: the `(security_id, segment)` composites the source returned
+    ///   are not the ones the symbol map holds.
+    ///
+    /// Recorded 2026-09-08, after a live session where every stock option was
+    /// absent and the log said only `priced_underlyings: 0` — which is the sum
+    /// of both cases and therefore names neither. From outside the box the two
+    /// were indistinguishable, and the fix for one is no help against the
+    /// other.
+    pub spot_rows_available: usize,
+    /// Stock underlyings the master listed an option chain for, priced or not.
+    ///
+    /// The DENOMINATOR of the pricing quorum, and the number
+    /// [`Self::underlyings_without_spot`] alone cannot supply: 207 unpriced out
+    /// of 208 and 207 unpriced out of 20,000 share a numerator and are opposite
+    /// situations. Without it the pending predicate could only ask "is anything
+    /// unpriced?", which a single priced underlying answers — and that is
+    /// exactly how one liquid stock printing at 09:15:30 used to close the
+    /// selection for every other stock in the master.
+    pub stock_option_underlyings: usize,
     /// Rows refused for carrying no usable expiry at all.
     pub refused_no_expiry: usize,
     /// Rows refused for having ALREADY expired.
@@ -299,6 +734,16 @@ pub struct ContractSelection {
     pub deduped: usize,
     /// Contracts the envelope could not fit even at an ATM window of zero.
     pub dropped_for_capacity: usize,
+    /// The selected option legs, NEAREST THE MONEY FIRST, capped at
+    /// [`crate::main_feed_backup::BACKUP_RANK_MAX`]. The head of this list is
+    /// what gets a backup copy on a second main-feed socket (scope lock
+    /// 2026-10-02). A subset of [`Self::instruments`], in rank order.
+    pub backup_rank: Vec<SubscribeInstrument>,
+    /// Contracts the subscribe-time expiry-scope check REFUSED after selection
+    /// (`expiry_scope_check::enforce_subscribe_expiry_scope`, owner 2026-10-28):
+    /// on a live expiry that is not the current one, expired, or unknown to the
+    /// contract file. 0 on a healthy day: the selector cannot pick one.
+    pub refused_off_expiry: usize,
 }
 
 /// Maps a master row's `EXCH_ID` to the derivative segment we subscribe.
@@ -311,7 +756,23 @@ pub struct ContractSelection {
 pub fn derivative_segment(exch_id: &str) -> Option<ExchangeSegment> {
     match exch_id {
         "NSE" => Some(ExchangeSegment::NseFno),
-        "BSE" => Some(ExchangeSegment::BseFno),
+        // BSE is REFUSED, narrowed from the 2026-08-15 authorization by the
+        // operator's 2026-08-20 instruction: *"only for the nse alone"*, with
+        // the full-chain underlyings named as NIFTY and BANKNIFTY — both NSE.
+        //
+        // This is a narrowing, never a widening, so it cannot breach the scope
+        // lock's REJECT list in the direction that list guards. Two things
+        // follow from it that are worth having:
+        //
+        //  - SENSEX derivatives stop consuming main-feed slots, and those
+        //    slots are exactly what the ATM window was short of.
+        //  - Depth is NSE-only at the vendor anyway (`validate_depth_segment`),
+        //    so a BSE contract could only ever have been a main-feed row whose
+        //    depth counterpart was refused later — half a subscription.
+        //
+        // Refused rows are COUNTED as `refused_unknown_segment`, not dropped:
+        // a day where the master suddenly carries only BSE derivatives must
+        // read as a refusal, not as a market with no contracts.
         _ => None,
     }
 }
@@ -371,17 +832,17 @@ pub fn select_contract_universe(
 
     // ---- pass 1: bucket by underlying, O(rows) ----
     //
-    // Four buckets, not one flat list, because every downstream decision is
+    // Two buckets, not one flat list, because every downstream decision is
     // per-underlying: which expiry is nearest, where ATM sits, whether a full
     // chain is authorized. A flat list would need a scan per underlying.
-    let mut index_futures: Vec<Contract<'_>> = Vec::new();
-    let mut stock_futures: Vec<Contract<'_>> = Vec::new();
+    //
+    // No future bucket: futures are refused above, before this point.
     let mut index_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
     let mut stock_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
 
     for row in rows {
         let class = row.class;
-        if !class.is_future() && !class.is_option() {
+        if !class.is_option() {
             continue;
         }
         let Some(segment) = derivative_segment(&row.exch_id) else {
@@ -419,8 +880,6 @@ pub fn select_contract_universe(
             underlying: row.underlying_symbol.as_str(),
         };
         match class {
-            InstrumentClass::IndexFuture => index_futures.push(c),
-            InstrumentClass::StockFuture => stock_futures.push(c),
             InstrumentClass::IndexOption | InstrumentClass::StockOption => {
                 // An option with no strike or no leg cannot be placed on a
                 // ladder either.
@@ -446,28 +905,14 @@ pub fn select_contract_universe(
     //
     // Priority is what makes the capacity bound principled: when the envelope
     // binds, what gives way is the far-from-the-money tail of stock options,
-    // never a future and never an index chain.
+    // never an index chain.
     let mut chosen: HashSet<(SecurityId, ExchangeSegment)> = HashSet::new();
     let mut picked: Vec<SubscribeInstrument> = Vec::new();
+    // Every pushed leg with its distance from the money, for the backup
+    // ranking (scope lock 2026-10-02). See `ContractSelection::backup_rank`.
+    let mut ranked: Vec<BackupRankEntry<'_>> = Vec::new();
 
-    // 1 + 2. Futures, ALL expiries at or after today. Never rolled, never
-    // trimmed: they are ~700 contracts against a 25,000 envelope.
-    for c in &index_futures {
-        match push_contract(c, capacity, &mut chosen, &mut picked) {
-            PushOutcome::Added => out.index_futures += 1,
-            PushOutcome::Duplicate => out.deduped += 1,
-            PushOutcome::NoRoom => out.dropped_for_capacity += 1,
-        }
-    }
-    for c in &stock_futures {
-        match push_contract(c, capacity, &mut chosen, &mut picked) {
-            PushOutcome::Added => out.stock_futures += 1,
-            PushOutcome::Duplicate => out.deduped += 1,
-            PushOutcome::NoRoom => out.dropped_for_capacity += 1,
-        }
-    }
-
-    // 3. Index options — FULL chain, current expiry, exactly the two
+    // 1. Index options — FULL chain, current expiry, exactly the two
     // authorized underlyings. No spot price needed: taking every strike is
     // what "entire options contracts" means.
     for underlying in FULL_CHAIN_INDEX_UNDERLYINGS {
@@ -479,16 +924,65 @@ pub fn select_contract_universe(
         let Some(expiry) = expiry else {
             continue;
         };
-        for c in bucket.options.iter().filter(|c| c.expiry_ymd == expiry) {
+        // NEAREST THE MIDDLE OF THE LADDER FIRST.
+        //
+        // The chain is taken WHOLE — that is what "entire options contracts"
+        // means, and no window is applied here. This ordering therefore
+        // changes nothing on a normal day: every strike is pushed either way.
+        //
+        // It decides what happens on the day the envelope BINDS, and the
+        // comment above this block used to promise that could not happen to an
+        // index chain ("what gives way is the far-from-the-money tail of stock
+        // options, never a future and never an index chain"). That promise
+        // holds only while the chains fit. The scope lock records the
+        // authorized set at ~24,600 against 25,000, with the index chains
+        // explicitly UNCAPPED and their measured depth swinging from 542 legs
+        // to 2,037 — so a breach is a vendor's ordinary decision to list more
+        // strikes, not an exotic scenario.
+        //
+        // Pushed in master order, a breach dropped whichever strikes the file
+        // listed last, which could be the at-the-money ones, and a different
+        // set on a day the vendor re-sorted its export. Ordering by distance
+        // from the ladder's MEDIAN strike makes the survivors the near-the-
+        // money ones and makes the answer a function of the data.
+        //
+        // The median rather than spot, deliberately: index options take no
+        // price input here by design, and inventing a dependency on one to
+        // order a set that is normally taken whole would be the larger change.
+        // Vendors list strikes roughly symmetric about spot, so the middle of
+        // the ladder is the proxy that needs nothing new.
+        //
+        // Found by a property test asserting that reversing the master cannot
+        // change the chosen set.
+        let mut chain: Vec<&Contract<'_>> = bucket
+            .options
+            .iter()
+            .filter(|c| c.expiry_ymd == expiry)
+            .collect();
+        let mut strikes: Vec<i64> = chain.iter().map(|c| c.strike_paise).collect();
+        strikes.sort_unstable();
+        strikes.dedup();
+        let centre = strikes.get(strikes.len() / 2).copied().unwrap_or(0);
+        chain.sort_unstable_by_key(|c| {
+            (
+                c.strike_paise.saturating_sub(centre).saturating_abs(),
+                c.strike_paise,
+                c.security_id,
+            )
+        });
+        for c in chain {
             match push_contract(c, capacity, &mut chosen, &mut picked) {
-                PushOutcome::Added => out.index_options += 1,
+                PushOutcome::Added => {
+                    out.index_options += 1;
+                    ranked.push(BackupRankEntry::new(c, centre, 0));
+                }
                 PushOutcome::Duplicate => out.deduped += 1,
                 PushOutcome::NoRoom => out.dropped_for_capacity += 1,
             }
         }
     }
 
-    // 4. Stock options — current expiry, ATM ± window, both legs. The only
+    // 2. Stock options — current expiry, ATM ± window, both legs. The only
     // class that needs a live price, and the only one that shrinks.
     //
     // The window is chosen BEFORE anything is pushed so the result is the
@@ -502,9 +996,13 @@ pub fn select_contract_universe(
             out.atm_window_used = window;
             out.atm_window_reason = "applied";
             for ladder in &ladders {
+                let reference = ladder.strikes.get(ladder.atm).copied().unwrap_or(0);
                 for c in ladder.within(window) {
                     match push_contract(c, capacity, &mut chosen, &mut picked) {
-                        PushOutcome::Added => out.stock_options += 1,
+                        PushOutcome::Added => {
+                            out.stock_options += 1;
+                            ranked.push(BackupRankEntry::new(c, reference, 1));
+                        }
                         PushOutcome::Duplicate => out.deduped += 1,
                         PushOutcome::NoRoom => out.dropped_for_capacity += 1,
                     }
@@ -542,7 +1040,147 @@ pub fn select_contract_universe(
     // subscribe batches, which is what makes a diff between days meaningful.
     picked.sort_unstable_by_key(|i| (i.segment as u8, i.security_id));
     out.instruments = picked;
+    out.backup_rank = backup_rank_from(ranked);
     out
+}
+
+/// One selected option leg with its distance from the money, for
+/// [`ContractSelection::backup_rank`].
+struct BackupRankEntry<'a> {
+    /// `|strike - reference| / reference`, in parts per million.
+    distance_ppm: u64,
+    /// 0 = index option, 1 = stock option (index first on a tie).
+    class: u8,
+    underlying: &'a str,
+    strike_paise: i64,
+    instrument: SubscribeInstrument,
+}
+
+impl<'a> BackupRankEntry<'a> {
+    fn new(c: &Contract<'a>, reference_paise: i64, class: u8) -> Self {
+        let distance_ppm = if reference_paise > 0 {
+            let gap = u64::try_from(
+                c.strike_paise
+                    .saturating_sub(reference_paise)
+                    .saturating_abs(),
+            )
+            .unwrap_or(u64::MAX);
+            gap.saturating_mul(1_000_000) / reference_paise.unsigned_abs()
+        } else {
+            u64::MAX
+        };
+        Self {
+            distance_ppm,
+            class,
+            underlying: c.underlying,
+            strike_paise: c.strike_paise,
+            instrument: SubscribeInstrument {
+                security_id: c.security_id,
+                segment: c.segment,
+            },
+        }
+    }
+}
+
+/// Orders the selected legs nearest-the-money first and keeps the head.
+///
+/// Distance is a PERCENTAGE of the reference strike, so a NIFTY strike 0.4%
+/// out ranks beside a stock strike 0.4% out rather than the index chain's 50
+/// rupee steps being compared with a stock's 20 rupee ones. Ties go to the
+/// index chain, then by name, strike and id, so the answer is a function of
+/// the data. O(k log k) over the selected legs, once per selection.
+fn backup_rank_from(mut ranked: Vec<BackupRankEntry<'_>>) -> Vec<SubscribeInstrument> {
+    ranked.sort_unstable_by(|a, b| {
+        (
+            a.distance_ppm,
+            a.class,
+            a.underlying,
+            a.strike_paise,
+            a.instrument.security_id,
+            a.instrument.segment as u8,
+        )
+            .cmp(&(
+                b.distance_ppm,
+                b.class,
+                b.underlying,
+                b.strike_paise,
+                b.instrument.security_id,
+                b.instrument.segment as u8,
+            ))
+    });
+    ranked
+        .into_iter()
+        .take(crate::main_feed_backup::BACKUP_RANK_MAX)
+        .map(|e| e.instrument)
+        .collect()
+}
+
+/// Whether a selection is still WAITING on spot prices rather than finished.
+///
+/// # The failure this exists to stop
+///
+/// 2026-08-20, live: an app booted at 15:44 IST and its very first attach
+/// attempt read the price table sixteen seconds later, before QuestDB was
+/// serving. The price map came back empty, so no ladder could be built, so
+/// `stock_options` was **0** — and the attach then DIALED that selection and
+/// returned, because the retry loop's success test was "did we get any
+/// instruments at all?" and 2,536 futures and index options is not zero. One
+/// unlucky read at boot locked in a universe missing **every stock option**
+/// for the rest of the session, with no error anywhere: the report said
+/// `atm_window_reason = "no_ladders"` and was ignored, because nothing
+/// consumed it.
+///
+/// The distinction that makes this decidable is already recorded. A master
+/// that genuinely lists no stock options leaves
+/// [`ContractSelection::underlyings_without_spot`] at zero — there was
+/// nothing to price. A master that lists them while every one of them was
+/// refused for want of a price leaves it non-zero. So a non-zero count beside
+/// a zero selection is not "the market has no stock options today", it is
+/// "ask again once prices exist", and the two must never be answered the same
+/// way.
+///
+/// Deliberately NOT keyed on [`ContractSelection::atm_window_reason`]: the
+/// `"no_room"` case is also a zero-option outcome, and it is genuinely final
+/// — retrying cannot conjure envelope space. Only the price-source case is
+/// worth another attempt.
+/// # The 2026-08-21 widening: a QUORUM, not "anything at all"
+///
+/// This used to read `stock_options == 0 && underlyings_without_spot > 0`.
+/// Every ladder under the fitted window pushes options, so ONE priced
+/// underlying made `stock_options > 0` and the predicate went false. The
+/// attach then dialed and returned; the spot top-up is a one-shot budget and
+/// there is no second pass — so every stock that had not printed at that
+/// instant lost its options for the whole session. At 09:15:30 only the liquid
+/// names have traded, which is how a few thousand of the ~22,440 authorized
+/// strikes could be locked in and the rest silently dropped.
+///
+/// It stays FAIL-OPEN: the caller ANDs this with `!out_of_time`, so a morning
+/// that never reaches quorum still dials the coverage it earned rather than
+/// nothing.
+#[must_use]
+pub fn stock_options_are_pending(selection: &ContractSelection) -> bool {
+    // Nothing to price is FINISHED, not pending. Without this arm a master
+    // carrying no stock options at all would hold the retry loop to the
+    // deadline every single day.
+    if selection.stock_option_underlyings == 0 {
+        return false;
+    }
+    // Everything the master offered was priced. Whatever happened next —
+    // including `no_room`, which retrying cannot fix — is final.
+    if selection.underlyings_without_spot == 0 {
+        return false;
+    }
+    let priced = selection
+        .stock_option_underlyings
+        .saturating_sub(selection.underlyings_without_spot);
+    // Integer cross-multiply, never a float ratio. A percentage computed in
+    // f64 and compared for ordering ties differently at the boundary depending
+    // on rounding, and this decides whether ~22,000 contracts are subscribed
+    // for the day.
+    priced.saturating_mul(100)
+        < selection
+            .stock_option_underlyings
+            .saturating_mul(STOCK_OPTION_PRICING_QUORUM_PERCENT)
 }
 
 /// What happened to one attempted subscription.
@@ -595,7 +1233,7 @@ fn push_contract(
 /// Deliberately small. A genuinely thin weekly on an illiquid stock is real
 /// and must survive; the case this rejects is the single-row artefact, not the
 /// quiet market.
-const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
+pub(crate) const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 
 /// The nearest expiry at or after today that carries a real chain.
 ///
@@ -616,6 +1254,7 @@ const MIN_LEGS_FOR_A_REAL_EXPIRY: usize = 4;
 ///
 /// Returns `None` when no expiry qualifies. `usize` is the number skipped.
 fn nearest_expiry(contracts: &[Contract<'_>]) -> (Option<u32>, usize) {
+    // APPROVED: not an instrument key — the key is an expiry date YYYYMMDD.
     let mut legs: HashMap<u32, usize> = HashMap::new();
     for c in contracts {
         *legs.entry(c.expiry_ymd).or_insert(0) += 1;
@@ -640,16 +1279,37 @@ struct Ladder<'a> {
     atm: usize,
     /// Every current-expiry contract, kept for the final filter.
     contracts: Vec<Contract<'a>>,
+    /// Running count of contracts at strike indices `0..i`, so
+    /// `prefix[hi + 1] - prefix[lo]` is the number inside any strike-index
+    /// range in O(1).
+    ///
+    /// Built once per ladder because `fit_atm_window` probes 26 window sizes
+    /// across every ladder. Counting by filtering `contracts` each time made
+    /// that O(26 x total contracts) — at ~220 underlyings with full chains,
+    /// hundreds of thousands of comparisons to answer a question that is
+    /// arithmetic on a table already sorted. Sizing the window is now
+    /// O(26 x ladders); only the final push is proportional to what it
+    /// actually selects.
+    prefix: Vec<usize>,
 }
 
 impl<'a> Ladder<'a> {
+    /// The strike-index range `window` covers, clamped to the ladder.
+    ///
+    /// `min` rather than a bare index: the ladder can be shorter than the
+    /// window on either side, and an out-of-range index is a panic on a path
+    /// that runs against vendor data.
+    fn range(&self, window: usize) -> (usize, usize) {
+        (
+            self.atm.saturating_sub(window),
+            (self.atm + window).min(self.strikes.len().saturating_sub(1)),
+        )
+    }
+
     /// Contracts within `window` strikes each side of ATM, both legs.
     fn within(&self, window: usize) -> impl Iterator<Item = &Contract<'a>> {
-        let lo = self.strikes[self.atm.saturating_sub(window)];
-        // `min` rather than a bare index: the ladder can be shorter than the
-        // window on either side, and an out-of-range index is a panic on a
-        // path that runs against vendor data.
-        let hi_idx = (self.atm + window).min(self.strikes.len() - 1);
+        let (lo_idx, hi_idx) = self.range(window);
+        let lo = self.strikes[lo_idx];
         let hi = self.strikes[hi_idx];
         self.contracts
             .iter()
@@ -658,8 +1318,16 @@ impl<'a> Ladder<'a> {
 
     /// How many contracts `window` would select. Used to size the window
     /// before anything is pushed.
+    ///
+    /// O(1) — two prefix reads. This is called 26 times per ladder by
+    /// `fit_atm_window`, which is why it must not be a scan.
     fn count_within(&self, window: usize) -> usize {
-        self.within(window).count()
+        let (lo_idx, hi_idx) = self.range(window);
+        self.prefix
+            .get(hi_idx + 1)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.prefix.get(lo_idx).copied().unwrap_or(0))
     }
 }
 
@@ -674,6 +1342,9 @@ fn build_ladders<'a>(
     out: &mut ContractSelection,
 ) -> Vec<Ladder<'a>> {
     let mut ladders = Vec::with_capacity(stock_opt.len());
+    // Recorded BEFORE any refusal, so the pricing quorum's denominator is the
+    // master's full ask rather than whatever happened to survive.
+    out.stock_option_underlyings = stock_opt.len();
     // Sorted so the selection is deterministic regardless of hash order.
     let mut underlyings: Vec<&&str> = stock_opt.keys().collect();
     underlyings.sort_unstable();
@@ -718,10 +1389,34 @@ fn build_ladders<'a>(
             let above = strikes[idx] - spot;
             if below <= above { idx - 1 } else { idx }
         };
+        // One pass over the contracts to count how many sit at each strike
+        // index, then a running total. `partition_point` is a binary search on
+        // the already-sorted distinct strikes, so this is O(n log k) once —
+        // paid to make all 26 later window probes O(1) each.
+        let mut per_strike = vec![0usize; strikes.len()];
+        for c in &contracts {
+            let idx = strikes.partition_point(|&s| s < c.strike_paise);
+            // A contract whose strike is not in `strikes` is impossible —
+            // `strikes` was built FROM these contracts — but indexing on that
+            // assumption would panic on vendor data if it ever stopped being
+            // true. Skipping is the fail-closed choice: it undercounts the
+            // window, which shrinks it, rather than crashing the boot.
+            if let Some(slot) = per_strike.get_mut(idx) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        let mut prefix = Vec::with_capacity(strikes.len() + 1);
+        prefix.push(0usize);
+        let mut running = 0usize;
+        for n in &per_strike {
+            running = running.saturating_add(*n);
+            prefix.push(running);
+        }
         ladders.push(Ladder {
             strikes,
             atm,
             contracts,
+            prefix,
         });
     }
     ladders
@@ -775,6 +1470,173 @@ fn fit_atm_window(ladders: &[Ladder<'_>], remaining: usize) -> Option<usize> {
 /// one attempt rather than the session.
 const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 
+/// Seconds the database backstop may take when the drain ALREADY holds
+/// today's prices in RAM.
+///
+/// The database is the BACKSTOP, not the source: it covers the one case RAM
+/// cannot — a stock that traded before this process booted and not since.
+/// On 2026-09-08 the database's apply lag ran to 27,089 transactions, and a
+/// selector that waited the full [`QUESTDB_EXEC_TIMEOUT_SECS`] on every
+/// attach and every steering minute was blocked behind a stalled backstop
+/// while RAM held every price it needed. Two seconds is the cold-path cost
+/// this repository already accepts for a `/exec` round trip on a healthy
+/// database (the sibling readers measure ~0.2 s); a database that cannot
+/// answer in two seconds is the exact database that RAM exists to outrun.
+pub const SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS: u64 = 2;
+
+/// Counter of backstop reads by `outcome` — `answered` or `timed_out` are
+/// counted once per READ; `stale_row` and `unstamped_row` are counted once
+/// per ROW the read returned and the age gate refused.
+///
+/// A timed-out backstop is NOT a failure of the selection (RAM still centres
+/// every ladder it has a price for); it is the number that says how often the
+/// database was too slow to be consulted, which is the trend the WAL apply-lag
+/// alarm reports from the other side. A refused row is likewise not a failure:
+/// it is a price the database holds that is too old to centre a ladder on, and
+/// the count is what separates "the backstop had nothing" from "the backstop
+/// had only stale prices" — two different reasons for the same empty map.
+pub const SPOT_BACKSTOP_COUNTER: &str = "tv_spot_backstop_total";
+
+/// Every `outcome` label [`SPOT_BACKSTOP_COUNTER`] can carry.
+pub const SPOT_BACKSTOP_OUTCOMES: [&str; 5] = [
+    "answered",
+    "failed",
+    "timed_out",
+    "stale_row",
+    "unstamped_row",
+];
+
+/// Seeds every outcome at zero once per process.
+///
+/// The CloudWatch agent computes a counter delta PER LABEL SET and DROPS the
+/// first sample of a set it has never seen. So a label whose first increment
+/// IS the event publishes nothing on the one occasion that matters — and
+/// `failed` is exactly that shape: it fires only when the database read did
+/// not happen. This file's own history records the same rule swallowing
+/// `tv_depth_rows_spilled_total` on 2026-08-28 and leaving 104,540 rows
+/// permanently unclassifiable.
+///
+/// Costs five zero-increments once. Label values fold into one summed series
+/// per host, so this adds no EMF name and no money.
+pub fn pre_register_spot_backstop_counters() {
+    for outcome in SPOT_BACKSTOP_OUTCOMES {
+        metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => outcome).increment(0);
+    }
+}
+
+/// Oldest a backstop row may be, in seconds, and still centre a ladder.
+///
+/// The query already bounds rows to TODAY, which is what stopped yesterday's
+/// close from pricing at-the-money. It did not stop this morning's price from
+/// doing the same thing at two in the afternoon: `LATEST ON` returns a stock's
+/// last print whenever it happened, so an illiquid stock that traded once at
+/// 09:20 and never since was handed to the selector at 14:00 as if it were
+/// current, and its window was centred four and a half hours stale with no
+/// log saying so. RAM cannot catch it either — RAM only ever holds what THIS
+/// process decoded, and the whole point of the backstop is the stock RAM never
+/// saw.
+///
+/// Fifteen minutes is the widest gap the selector's own consumers tolerate: the
+/// per-minute re-fit measured a median strike spacing of 2.63% of price and an
+/// average intraday drift of 0.8 strikes per DAY (2026-08-27), so a price up to
+/// fifteen minutes old is, in almost every case, still inside the same strike.
+/// Anything older is refused and COUNTED, so the ladder that loses its price
+/// shows up as `underlyings_without_spot` plus a `stale_row` count rather than
+/// as a window quietly centred on the morning.
+///
+/// Strictly longer than the read budget and strictly shorter than a session,
+/// both pinned: a floor under the budget would refuse rows the read itself was
+/// still fetching, and one over a session would never refuse anything.
+pub const SPOT_BACKSTOP_MAX_AGE_SECS: u64 = 900;
+
+/// Rows the backstop read returned, split into the prices the age gate let
+/// through and the counts of what it refused.
+///
+/// Both refusal counts are carried rather than folded into the map's length
+/// because the caller logs them: an empty map with `stale_refused = 300` is a
+/// database that fell behind the session, and an empty map with both counts at
+/// zero is a database that has no rows for today at all. Those need different
+/// operator actions and are indistinguishable from the map alone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SpotPriceRows {
+    /// `(security_id, segment) -> paise` for every row inside the age floor.
+    pub prices: HashMap<(u64, u8), i64>,
+    /// Rows whose `ts` fell before the freshness floor.
+    pub stale_refused: usize,
+    /// Rows with no parseable `ts` — fail-closed, because a price whose age is
+    /// unknown cannot be shown to be fresh.
+    pub unstamped_refused: usize,
+}
+
+/// The budget the backstop gets, from how much RAM already knows.
+///
+/// RAM empty ⇒ the full `/exec` budget: nothing else can price a ladder, so
+/// the read is worth waiting for. RAM populated ⇒ the short budget: the read
+/// can only ADD stragglers, and a stalled database must not delay the sockets.
+#[must_use]
+pub const fn spot_backstop_budget_secs(ram_prices: usize) -> u64 {
+    if ram_prices == 0 {
+        QUESTDB_EXEC_TIMEOUT_SECS
+    } else {
+        SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+    }
+}
+
+/// [`fetch_spot_prices`] bounded by [`spot_backstop_budget_secs`].
+///
+/// Callers take the RAM snapshot FIRST and pass its size, so the budget is
+/// derived from what is already in hand rather than guessed. A timeout
+/// returns an EMPTY map — the same shape every other failure of the read
+/// already returns — and is counted, so a database that is never consulted
+/// shows up as a number rather than as a quietly narrower ladder set.
+pub async fn fetch_spot_prices_backstop(
+    questdb: &tickvault_common::config::QuestDbConfig,
+    today_ist_nanos: i64,
+    ram_prices: usize,
+) -> HashMap<(u64, u8), i64> {
+    // Seeded HERE, not only at the depth-rebalance pre-register site, because
+    // the contract attach calls this long before that loop starts — and a
+    // seed that lands after the first increment is no seed at all.
+    static SEED: std::sync::Once = std::sync::Once::new();
+    SEED.call_once(pre_register_spot_backstop_counters);
+    let budget = std::time::Duration::from_secs(spot_backstop_budget_secs(ram_prices));
+    match tokio::time::timeout(budget, fetch_spot_prices(questdb, today_ist_nanos)).await {
+        Ok(Some(prices)) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "answered").increment(1);
+            prices
+        }
+        // The read FAILED — client build, non-2xx, unreadable body, send
+        // error, or an unparseable response. Every one of those used to
+        // return an empty map, which the arm above then counted as
+        // `answered`: a QuestDB outage during contract attach read as a
+        // backstop that had answered and simply found nothing. The ONLY
+        // outcome distinguished was the timeout, so the one surface an
+        // operator has for "the database is not answering" asserted success
+        // on four of its five failure paths.
+        //
+        // It is `failed` and not a second timeout label because the two call
+        // for different things: a timeout means the database is slow and RAM
+        // carried the session; a failure means the read did not happen at
+        // all, and on a boot before the drain has priced anything that is the
+        // difference between a narrower ladder set and none.
+        Ok(None) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "failed").increment(1);
+            HashMap::new()
+        }
+        Err(_elapsed) => {
+            metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "timed_out").increment(1);
+            tracing::warn!(
+                budget_secs = budget.as_secs(),
+                ram_prices,
+                "spot prices: the database backstop did not answer inside its budget — \
+                 selection continues on the prices the drain holds in RAM; only a stock \
+                 that traded before this process booted and never since could be missing"
+            );
+            HashMap::new()
+        }
+    }
+}
+
 /// The `/exec` query returning today's latest traded price per instrument.
 ///
 /// `LATEST ON ts PARTITION BY security_id, segment` collapses the day's ticks
@@ -789,8 +1651,11 @@ const QUESTDB_EXEC_TIMEOUT_SECS: u64 = 10;
 #[must_use]
 pub fn build_spot_price_query(today_ist_nanos: i64) -> String {
     let today_micros = today_ist_nanos / 1_000;
+    // `ts` rides along so the reader can AGE each row: the day bound keeps
+    // yesterday out, the age gate in `parse_spot_prices_since` keeps this
+    // morning out of this afternoon. See `SPOT_BACKSTOP_MAX_AGE_SECS`.
     format!(
-        "SELECT security_id, segment, ltp FROM ticks \
+        "SELECT security_id, segment, ltp, ts FROM ticks \
          WHERE feed = 'dhan' AND ts >= {today_micros} AND ltp > 0 \
          LATEST ON ts PARTITION BY security_id, segment;"
     )
@@ -809,6 +1674,151 @@ pub fn build_spot_price_query(today_ist_nanos: i64) -> String {
 /// fields is skipped rather than failing the parse — one bad row must not cost
 /// the other seven hundred.
 pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String> {
+    let (map, collisions) = parse_symbol_map_counting_collisions(body)?;
+    if collisions > 0 {
+        // Identity sweep row 24 (2026-09-08): a symbol that resolves to TWO
+        // different (id, segment) pairs is the I-P1-11 class arriving through
+        // the mapping artifact — last-write-wins silently picked one, and
+        // every contract of that underlying was then priced off whichever
+        // row happened to come last. Still last-write-wins (the artifact's
+        // order is deterministic, so the choice is reproducible), but COUNTED
+        // and said once per parse, so a non-zero reading is the signal to
+        // look at the ISIN join rather than at the option ladder.
+        metrics::counter!("tv_dhan_contract_symbol_collisions_total").increment(collisions as u64);
+        tracing::warn!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "symbol_map_collision",
+            collisions,
+            "contract universe: {collisions} symbol(s) in the mapping artifact resolve to more \
+             than one (security_id, segment) — last row wins; check the ISIN join"
+        );
+    }
+    Ok(map)
+}
+
+/// The parsed symbol map, kept across calls, keyed on the same stat guard the
+/// contract artifact uses.
+///
+/// # Why this exists (2026-09-19)
+///
+/// The contract artifact has been cached since 2026-08-22; the mapping
+/// artifact beside it never was. BOTH per-minute readers —
+/// `dhan_depth_universe::load_depth_candidates` and
+/// `select_contract_universe_from_disk` — did a full `read_to_string` plus a
+/// full `serde_json` parse of the mapping file on EVERY call, then built a
+/// fresh `HashMap` with one `to_uppercase()` `String` allocation per row. The
+/// 2026-08-22 measurement puts that at ~4,565 rows per parse, once a minute,
+/// for the whole session, on the steering task.
+///
+/// It is the same file with the same lifecycle as the contract artifact —
+/// written once per trading day by the daily rider, atomically, immutable
+/// afterwards — so it gets the same treatment and the SAME reason for a stat
+/// guard rather than a date key: the rider is supervised, so a respawn can
+/// legitimately rewrite today's file, and a date-keyed cache would then serve
+/// the superseded map silently for the rest of the session.
+static SYMBOL_MAP_CACHE: std::sync::Mutex<Option<CachedSymbolMap>> = std::sync::Mutex::new(None);
+
+/// `(trading date, stat stamp, parsed map)` — the one cached symbol map.
+type CachedSymbolMap = (
+    String,
+    Option<(u64, i128)>,
+    std::sync::Arc<HashMap<String, (u64, u8)>>,
+);
+
+/// Reads and parses the day's mapping artifact into `symbol -> (id, segment)`,
+/// SHARED rather than re-parsed.
+///
+/// # Why the collision warning now fires once per PARSE, not once per READ
+///
+/// [`parse_symbol_map`] emits `tv_dhan_contract_symbol_collisions_total` and a
+/// coded `warn!` when a symbol resolves to two different pairs. Before this
+/// cache that fired on every read — once a minute, all session, for a
+/// condition that is a property of the FILE and cannot change while the file
+/// does not. It now fires once per parse, which is once per artifact version.
+///
+/// That is a deliberate reduction and it is stated rather than left to be
+/// discovered: the counter's per-session TOTAL drops by roughly the number of
+/// reads, so a reading compared against a pre-2026-09-19 session is not
+/// comparable. What it measures is unchanged — a non-zero value still means
+/// the ISIN join produced an ambiguous symbol, which is the signal.
+///
+/// # Errors
+///
+/// An unreadable file (the `io::Error` rendered) or a malformed one (the
+/// [`parse_symbol_map`] message). A failure is NOT cached: the next call
+/// re-reads, so a file that arrives late is picked up on the following minute
+/// rather than being negatively cached for the session.
+pub fn read_symbol_map(
+    date_ist: &str,
+) -> Result<std::sync::Arc<HashMap<String, (u64, u8)>>, String> {
+    // Sweep S5: the stat, read and parse run off the shared tokio worker,
+    // so the attach retry loop cannot hold the worker the socket readers use.
+    tickvault_storage::off_worker::off_worker(|| read_symbol_map_on_this_thread(date_ist))
+}
+
+/// The body of [`read_symbol_map`], run on whichever thread calls it.
+fn read_symbol_map_on_this_thread(
+    date_ist: &str,
+) -> Result<std::sync::Arc<HashMap<String, (u64, u8)>>, String> {
+    let path = crate::dhan_universe::mapping_artifact_path(date_ist);
+    let stamp = artifact_stamp(&path);
+
+    if let Some(hit) = cached_symbol_map(date_ist, stamp) {
+        return Ok(hit);
+    }
+
+    let body = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let map = parse_symbol_map(&body)?;
+    Ok(store_symbol_map(date_ist, stamp, map))
+}
+
+/// Returns the cached map when the date AND the stat stamp both match.
+///
+/// A `None` stamp never matches — see [`artifact_stamp`]. Lock poisoning is
+/// recovered with `into_inner()` (the house pattern), and the lock is held for
+/// exactly one `Arc` bump: no copy happens under it, which is the property the
+/// contract-artifact cache had to be repaired for on 2026-09-01.
+fn cached_symbol_map(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+) -> Option<std::sync::Arc<HashMap<String, (u64, u8)>>> {
+    let stamp = stamp?;
+    let guard = SYMBOL_MAP_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (cached_date, cached_stamp, map) = guard.as_ref()?;
+    if cached_date == date_ist && *cached_stamp == Some(stamp) {
+        return Some(std::sync::Arc::clone(map));
+    }
+    None
+}
+
+/// Replaces whatever is cached and returns the `Arc` now held. One entry, for
+/// the same reason [`store_artifact`] keeps one.
+fn store_symbol_map(
+    date_ist: &str,
+    stamp: Option<(u64, i128)>,
+    map: HashMap<String, (u64, u8)>,
+) -> std::sync::Arc<HashMap<String, (u64, u8)>> {
+    let shared = std::sync::Arc::new(map);
+    let Some(stamp) = stamp else { return shared };
+    let mut guard = SYMBOL_MAP_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((
+        date_ist.to_owned(),
+        Some(stamp),
+        std::sync::Arc::clone(&shared),
+    ));
+    shared
+}
+
+/// [`parse_symbol_map`] with the number of symbols that mapped to a DIFFERENT
+/// `(security_id, segment)` than an earlier row. Pure, so the collision count
+/// is a unit test rather than a log line.
+pub fn parse_symbol_map_counting_collisions(
+    body: &str,
+) -> Result<(HashMap<String, (u64, u8)>, usize), String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Err("mapping artifact is not valid JSON".to_owned());
     };
@@ -816,6 +1826,7 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
         return Err("mapping artifact has no `mappings` array".to_owned());
     };
     let mut out = HashMap::with_capacity(rows.len());
+    let mut collisions: usize = 0;
     for row in rows {
         let (Some(symbol), Some(id), Some(seg)) = (
             row.get("symbol").and_then(serde_json::Value::as_str),
@@ -827,26 +1838,64 @@ pub fn parse_symbol_map(body: &str) -> Result<HashMap<String, (u64, u8)>, String
         };
         let Ok(seg) = u8::try_from(seg) else { continue };
         // A stock appears once per index it belongs to, so the same symbol
-        // arrives many times with the same id. Insert is idempotent.
-        out.insert(symbol.trim().to_uppercase(), (id, seg));
+        // arrives many times with the same id. Insert is idempotent for that
+        // shape; a DIFFERENT pair under the same symbol is a collision.
+        if let Some(previous) = out.insert(symbol.trim().to_uppercase(), (id, seg))
+            && previous != (id, seg)
+        {
+            collisions = collisions.saturating_add(1);
+        }
     }
-    Ok(out)
+    Ok((out, collisions))
 }
 
 /// Converts a QuestDB `/exec` dataset of `[security_id, segment, ltp]` into a
-/// price map keyed on the I-P1-11 composite, in paise.
+/// price map keyed on the I-P1-11 composite, in paise — with NO age gate.
+///
+/// Every row inside the day bound is accepted whatever its `ts`. Production
+/// reads go through [`parse_spot_prices_since`]; this form exists for callers
+/// that have already established the rows are current, and it is what the
+/// wire-format tests pin, since the age gate is a separate concern from the
+/// column shapes.
 ///
 /// # Errors
 ///
 /// Malformed JSON or a missing `dataset` array.
 pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> {
+    parse_spot_rows(body, None).map(|rows| rows.prices)
+}
+
+/// [`parse_spot_prices`] with the age gate: a row whose `ts` (column 3, the
+/// IST-as-epoch designated timestamp the `ticks` table stores) is BEFORE
+/// `freshness_floor_ist_nanos` is refused and counted as stale; a row with no
+/// parseable `ts` is refused and counted as unstamped. Fail-closed on both,
+/// because a price that cannot be shown to be fresh must not centre a ladder.
+///
+/// The floor is a parameter rather than a clock read so the gate is pure and
+/// its two refusal arms are testable at exact boundaries.
+///
+/// # Errors
+///
+/// Malformed JSON or a missing `dataset` array.
+pub fn parse_spot_prices_since(
+    body: &str,
+    freshness_floor_ist_nanos: i64,
+) -> Result<SpotPriceRows, String> {
+    parse_spot_rows(body, Some(freshness_floor_ist_nanos))
+}
+
+/// The one parser behind both public forms. `floor = None` means no gate.
+fn parse_spot_rows(body: &str, floor: Option<i64>) -> Result<SpotPriceRows, String> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return Err("spot price response is not valid JSON".to_owned());
     };
     let Some(rows) = v.get("dataset").and_then(|d| d.as_array()) else {
         return Err("spot price response has no `dataset` array".to_owned());
     };
-    let mut out = HashMap::with_capacity(rows.len());
+    let mut out = SpotPriceRows {
+        prices: HashMap::with_capacity(rows.len()),
+        ..SpotPriceRows::default()
+    };
     for row in rows {
         let Some(cols) = row.as_array() else { continue };
         if cols.len() < 3 {
@@ -885,23 +1934,313 @@ pub fn parse_spot_prices(body: &str) -> Result<HashMap<(u64, u8), i64>, String> 
         let Some(ltp) = cols[2].as_f64() else {
             continue;
         };
-        // Non-finite or non-positive is refused, not stored: a price of zero
-        // would place at-the-money at the bottom of every ladder.
-        if !ltp.is_finite() || ltp <= 0.0 {
+        // ONE conversion, shared with the RAM path. Written twice these would
+        // drift, and the fallback would centre ladders one rounding step from
+        // the primary — an off-by-one strike no log explains. Non-finite,
+        // non-positive and past-exact-integer prices are refused inside it: a
+        // price of zero would put at-the-money at the bottom of every ladder.
+        let Some(paise) = crate::spot_price_store::rupees_to_paise(ltp) else {
             continue;
+        };
+        if let Some(floor) = floor {
+            // QuestDB renders the designated timestamp as an RFC 3339 string
+            // with a `Z` suffix. The column holds IST-as-epoch (the house
+            // convention every `ist_midnight_nanos` caller relies on), so the
+            // `Z` is a rendering artefact and the parsed instant IS the
+            // IST-epoch value — no offset is added, exactly as the day bound
+            // in `build_spot_price_query` adds none.
+            let stamped = cols
+                .get(3)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+                .and_then(|dt| dt.timestamp_nanos_opt());
+            match stamped {
+                None => {
+                    out.unstamped_refused = out.unstamped_refused.saturating_add(1);
+                    continue;
+                }
+                Some(ts) if ts < floor => {
+                    out.stale_refused = out.stale_refused.saturating_add(1);
+                    continue;
+                }
+                Some(_) => {}
+            }
         }
-        let paise = (ltp * 100.0).round();
-        if paise > 9_007_199_254_740_991.0 {
-            continue;
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        // APPROVED: bounded above by the line before and below by the `<= 0.0`
-        // guard — a whole number well inside i64.
-        let paise = paise as i64;
-        out.insert((id, seg), paise);
+        out.prices.insert((id, seg), paise);
     }
     Ok(out)
 }
+
+/// Spot and index names for the same table, from the day's symbol map
+/// (added 2026-09-22 — until then every spot and index `ticks` / candle row
+/// wrote a NULL `contract`, because the table was built from option rows only).
+///
+/// Only the three spot segments are taken: IDX_I (0), NSE_EQ (1), BSE_EQ (4).
+/// A derivative id in the symbol map is not a spot and must not borrow a
+/// spot's name. When two symbols map to the same `(id, segment)` (an alias in
+/// the artifact), the lexically smallest wins so the choice is reproducible
+/// from the file rather than from hash iteration order.
+#[must_use]
+pub fn spot_labels_from(
+    symbols: &HashMap<String, (u64, u8)>,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
+        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
+            symbols.len(),
+            ahash::RandomState::default(),
+        );
+    for (name, (id, code)) in symbols {
+        if !matches!(*code, 0 | 1 | 4) {
+            continue;
+        }
+        let Ok(id) = i64::try_from(*id) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(*code);
+        match out.entry((id, seg)) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                if name.as_str() < &**held.get() {
+                    held.insert(std::sync::Arc::from(name.as_str()));
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(std::sync::Arc::from(name.as_str()));
+            }
+        }
+    }
+    out
+}
+
+/// Option names for EVERY option row of the day's contract file, keyed as the
+/// candle writer probes them (`(security_id as i64, segment string)`).
+///
+/// Uncapped, unlike [`crate::contract_underlying_map::labels_from_artifact`]:
+/// at boot nothing is selected yet, and a capped file-order walk names the
+/// first 25,000 of ~121,000 rows, which need not include the contracts the
+/// WAL replay rewrites. The name is the same [`contract_label`] the attach
+/// uses, so a row written at boot and one written after the attach carry the
+/// same string. Options only, same segment derivation and zero-id refusal as
+/// the attach. O(rows), once per boot; about 11 MB until the attach replaces
+/// the table (estimate: ~121,000 entries of key, pointer and a ~25-byte name).
+///
+/// A composite key the file lists twice (Dhan reuses derivative ids) is named
+/// from the row the selector would admit on `today_ymd` (the file's own day),
+/// never from whichever row came last: the same row the expiry index keeps
+/// (`expiry_scope_check::preferred_option_rows`). Until 2026-10-28 the last
+/// row won, so a current contract whose expired twin sat later in the file
+/// was stored under the expired name. One more O(rows) pass.
+///
+/// [`contract_label`]: crate::contract_underlying_map::contract_label
+#[must_use]
+pub(crate) fn option_labels_from(
+    contracts: &[ContractRow],
+    today_ymd: u32,
+) -> tickvault_storage::candle_contract_labels::CandleContractLabels {
+    let mut out: tickvault_storage::candle_contract_labels::CandleContractLabels =
+        tickvault_storage::candle_contract_labels::CandleContractLabels::with_capacity_and_hasher(
+            contracts.len(),
+            ahash::RandomState::default(),
+        );
+    for row in crate::expiry_scope_check::preferred_option_rows(contracts, today_ymd) {
+        if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") || row.i == 0 {
+            continue;
+        }
+        let Some(segment) = derivative_segment(&row.x) else {
+            continue;
+        };
+        let Ok(id) = i64::try_from(row.i) else {
+            continue;
+        };
+        let seg = tickvault_common::segment::segment_code_to_str(segment.binary_code());
+        out.insert(
+            (id, seg),
+            std::sync::Arc::from(
+                crate::contract_underlying_map::contract_label(&row.u, row.e, row.s, &row.l)
+                    .as_str(),
+            ),
+        );
+    }
+    out
+}
+
+/// How many days before the boot's own date the boot publish looks back for a
+/// symbol map. A boot after midnight (the 2026-10-10 02:01 IST redeploy
+/// replayed 9 Oct frames) or before the day's file is built still names the
+/// rows it rewrites from the newest earlier file; 7 covers a long weekend.
+const BOOT_LABEL_LOOKBACK_DAYS: u32 = 7;
+
+/// Set once the contract attach has published the day's names. After that a
+/// boot publish never replaces the table.
+static ATTACH_LABELS_PUBLISHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `YYYYMMDD` of the files the last boot publish read; 0 before any.
+static BOOT_LABELS_DAY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether a boot publish of `new_len` names read from day `new_day` replaces
+/// the held table (`held_len` names, from boot day `held_day`).
+///
+/// Never after the attach. Otherwise a newer day wins, and on the same day
+/// only a larger table (a contract file that became readable between the two
+/// boot calls). An empty table never replaces anything. Pure, O(1).
+fn boot_publish_wins(
+    attach_published: bool,
+    held_day: u32,
+    held_len: usize,
+    new_day: u32,
+    new_len: usize,
+) -> bool {
+    !attach_published
+        && new_len > 0
+        && (held_len == 0 || new_day > held_day || (new_day == held_day && new_len > held_len))
+}
+
+/// The newest day at or before `date_ist`, at most `lookback_days` back, for
+/// which `read` returns a value: that day as `YYYY-MM-DD` and the value. None
+/// when no day in the window reads or `date_ist` does not parse. O(lookback).
+fn newest_readable_day<T>(
+    date_ist: &str,
+    lookback_days: u32,
+    mut read: impl FnMut(&str) -> Option<T>,
+) -> Option<(String, T)> {
+    let mut day = chrono::NaiveDate::parse_from_str(date_ist, "%Y-%m-%d").ok()?;
+    for _ in 0..=lookback_days {
+        let date = day.format("%Y-%m-%d").to_string();
+        if let Some(value) = read(&date) {
+            return Some((date, value));
+        }
+        day = day.pred_opt()?;
+    }
+    None
+}
+
+/// `YYYY-MM-DD` as `YYYYMMDD`; 0 when it does not parse.
+fn day_key(date_ist: &str) -> u32 {
+    chrono::NaiveDate::parse_from_str(date_ist, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.format("%Y%m%d").to_string().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Publishes contract names at boot, before the seal writer's boot drain and
+/// before the lane's WAL replay: spot and index names from the symbol map,
+/// and (since 2026-10-10) every option name from the contract file, both from
+/// the newest day at or before `date_ist` (at most
+/// [`BOOT_LABEL_LOOKBACK_DAYS`] back) whose symbol map reads. Returns how many
+/// names it published (0 when no symbol map reads, or the held table wins —
+/// both leave the column as it is, never wrong).
+///
+/// Called twice per boot, both times before the lane starts, so the attach
+/// (which runs in the lane) can never interleave with it.
+///
+/// Regression (2026-10-09): this published spot and index names only. The
+/// evening redeploys replayed the day's frame log and drained the spilled
+/// seals before the contract attach published option names (862 names from
+/// 22:30 to 22:46 IST, then 25,862). Every option candle and tick written in
+/// that window carried no `contract`, and the DEDUP UPSERT replaced the
+/// stored row whole, so rows written in the session with their name lost it:
+/// `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped finding them.
+///
+/// Honest limit: a boot that replays an earlier day's frames AFTER today's
+/// files exist names them from today's files; a derivative id the master
+/// reassigned overnight would carry today's name. The attach has the same
+/// limit.
+pub fn publish_contract_labels_at_boot(date_ist: &str) -> usize {
+    let Some((date, symbols)) = newest_readable_day(date_ist, BOOT_LABEL_LOOKBACK_DAYS, |d| {
+        read_symbol_map(d).ok()
+    }) else {
+        return 0;
+    };
+    let mut labels = spot_labels_from(&symbols);
+    // Spot segments and option segments never share a key, so the order
+    // only matters for readability. A missing contract file publishes spot
+    // names only, as before.
+    if let Ok(contracts) = read_contract_artifact(&date) {
+        labels.extend(option_labels_from(&contracts, day_key(&date)));
+    }
+    let n = labels.len();
+    let new_day = day_key(&date);
+    let held_len = tickvault_storage::candle_contract_labels::candle_contract_labels().len();
+    if !boot_publish_wins(
+        ATTACH_LABELS_PUBLISHED.load(std::sync::atomic::Ordering::Acquire),
+        BOOT_LABELS_DAY.load(std::sync::atomic::Ordering::Acquire),
+        held_len,
+        new_day,
+        n,
+    ) {
+        return 0;
+    }
+    tickvault_storage::candle_contract_labels::publish_candle_contract_labels(labels);
+    BOOT_LABELS_DAY.store(new_day, std::sync::atomic::Ordering::Release);
+    tracing::info!(
+        contract_names = n,
+        names_from = %date,
+        "contract names published at boot — rows the boot rewrites keep their name"
+    );
+    n
+}
+
+/// Every contract name the writers would have given `date_ist`'s rows: spot
+/// and index names from that day's symbol map, plus every option name from
+/// that day's contract file, built exactly as the boot publish builds them.
+///
+/// Reads `date_ist`'s own files only, never an earlier day's: a repair must
+/// name a day's rows with that day's ids. `None` when the day's symbol map
+/// does not read (no file for a weekend, or kept past
+/// `ARTIFACT_RETENTION_DAYS`). A missing contract file names spots only.
+/// O(rows of both files), cold; used by the after-close name repair.
+#[must_use]
+pub fn contract_names_for_day(
+    date_ist: &str,
+) -> Option<tickvault_storage::candle_contract_labels::CandleContractLabels> {
+    let symbols = read_symbol_map(date_ist).ok()?;
+    let mut labels = spot_labels_from(&symbols);
+    if let Ok(contracts) = read_contract_artifact(date_ist) {
+        labels.extend(option_labels_from(&contracts, day_key(date_ist)));
+    }
+    Some(labels)
+}
+
+/// [`contract_names_for_day`] for the day repair: both of the day's files
+/// must read (2026-11-21 review: a missing contract file would name spots
+/// only and leave every option row of the rebuilt day unnamed). O(rows).
+///
+/// # Errors
+/// The day's symbol map or contract file does not read.
+pub fn contract_names_for_day_strict(
+    date_ist: &str,
+) -> anyhow::Result<tickvault_storage::candle_contract_labels::CandleContractLabels> {
+    let symbols =
+        read_symbol_map(date_ist).map_err(|e| anyhow::anyhow!("symbol map for {date_ist}: {e}"))?;
+    let contracts = read_contract_artifact(date_ist)
+        .map_err(|e| anyhow::anyhow!("contract file for {date_ist}: {e}"))?;
+    let mut labels = spot_labels_from(&symbols);
+    labels.extend(option_labels_from(&contracts, day_key(date_ist)));
+    Ok(labels)
+}
+
+/// IST "now" as epoch nanoseconds — wall clock plus the fixed IST offset, the
+/// same convention the `ticks` designated timestamp is written in.
+fn ist_now_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// The oldest `ts` the backstop accepts on this read: now minus
+/// [`SPOT_BACKSTOP_MAX_AGE_SECS`], never earlier than the day bound.
+#[must_use]
+pub fn spot_backstop_freshness_floor(now_ist_nanos: i64, today_ist_nanos: i64) -> i64 {
+    let age = i64::try_from(SPOT_BACKSTOP_MAX_AGE_SECS)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(NANOS_PER_SEC);
+    now_ist_nanos.saturating_sub(age).max(today_ist_nanos)
+}
+
+/// Nanoseconds in one second — the unit the `ticks` designated timestamp and
+/// every IST-epoch helper in this module share.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Joins the symbol map and the price map into the `symbol -> paise` form
 /// selection consumes.
@@ -923,6 +2262,17 @@ pub fn spot_paise_by_symbol(
     out
 }
 
+/// Whether a failed read of today's contract artifact is the expected
+/// pre-rider kind (2026-11-15 audit, live-6): the file is MISSING (not found)
+/// at a time the rider has not built it yet (`absence_expected`). A file that
+/// exists but cannot be read or parsed is never expected. Pure, O(1).
+fn contract_artifact_error_is_expected(err: &anyhow::Error, absence_expected: bool) -> bool {
+    absence_expected
+        && err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Loads today's contract universe: artifact from disk, prices from QuestDB.
 ///
 /// Returns an EMPTY selection on any failure, having said which one. An empty
@@ -932,6 +2282,13 @@ pub fn spot_paise_by_symbol(
 // TEST-EXEMPT: async I/O composition (file read + HTTP GET); every pure part it calls — read_contract_artifact, parse_symbol_map, parse_spot_prices, spot_paise_by_symbol, select_contract_universe — is separately tested above.
 pub async fn load_contract_universe(
     questdb: &tickvault_common::config::QuestDbConfig,
+    // Today's spot prices as the DRAIN saw them, with no database in the
+    // path. Primary source since 2026-09-08: on that day ticks arrived at
+    // 103,887 per five minutes from the 09:15 open while the QuestDB join
+    // returned nothing until 09:45, because an ACKed row is not queryable
+    // until it is APPLIED and the apply lag ran 11,503 -> 27,089 across the
+    // session. Thirty minutes, 20,224 stock options, zero subscribed.
+    spot_store: &crate::spot_price_store::SpotPriceStore,
     date_ist: &str,
     today_ymd: u32,
     today_ist_nanos: i64,
@@ -940,22 +2297,46 @@ pub async fn load_contract_universe(
     let contracts = match read_contract_artifact(date_ist) {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                date_ist,
-                path = %contract_artifact_path(date_ist).display(),
-                "contract universe: today's contract artifact is unreadable — the lane will \
-                 carry its spot universe only. No futures, no option contracts."
+            // Live-6 (2026-11-15): before the rider builds today's file (or on
+            // a non-trading day) a MISSING file is expected and logged at
+            // WARN, like the live universe's pre-rider line. Any other
+            // failure, or a boot at or after the rider hour, stays ERROR.
+            let absence_expected = crate::dhan_live_universe::day_artifact_absence_expected_at(
+                crate::dhan_feed_stack::ist_second_of_day_now(),
             );
+            if contract_artifact_error_is_expected(&err, absence_expected) {
+                tracing::warn!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = crate::dhan_live_universe::PRE_RIDER_BOOT_SOURCE,
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact does not exist yet \
+                     (non-trading day, or before the daily rider's build hour) — the lane \
+                     carries its spot universe until it does. Expected for this boot."
+                );
+            } else {
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    date_ist,
+                    path = %contract_artifact_path(date_ist).display(),
+                    "contract universe: today's contract artifact is unreadable — the lane will \
+                     carry its spot universe only. No futures, no option contracts."
+                );
+            }
+            // Bumped HERE rather than through `record_contract_verdict`: this
+            // path returns a default selection, which carries none of the
+            // information needed to classify what went wrong.
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "artifact_unreadable")
+                .increment(1);
             return ContractSelection::default();
         }
     };
+    // Computed for the error arm's log line only; the read itself is cached.
     let mapping_path = crate::dhan_universe::mapping_artifact_path(date_ist);
-    let symbols = match std::fs::read_to_string(&mapping_path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| parse_symbol_map(&b))
-    {
+    // SHARED, not re-parsed — see `read_symbol_map`.
+    let symbols = match read_symbol_map(date_ist) {
         Ok(s) => s,
         Err(err) => {
             tracing::error!(
@@ -965,45 +2346,241 @@ pub async fn load_contract_universe(
                 "contract universe: the symbol map is unreadable, so at-the-money cannot be \
                  located for any stock. Futures and index chains are unaffected."
             );
-            HashMap::new()
+            // Same reasoning as the artifact arm: the selection continues from
+            // here with an empty map and would classify only as `no_ladders`,
+            // which reads as "no stock priced yet" — a normal pre-open state —
+            // rather than "the map itself is broken".
+            metrics::counter!(CONTRACT_UNIVERSE_FAILED_COUNTER, "reason" => "symbol_map_unreadable")
+                .increment(1);
+            std::sync::Arc::default()
         }
     };
 
-    let prices = fetch_spot_prices(questdb, today_ist_nanos).await;
+    // Both sources, RAM last, because neither alone is sufficient.
+    //
+    // RAM holds only what THIS process has decoded since it booted, so a
+    // mid-session restart leaves it blind to an illiquid stock that traded at
+    // 09:20 and not since -- that stock's ladder would be absent for the rest
+    // of the day. QuestDB holds it. Conversely QuestDB cannot see the last N
+    // minutes at all while its apply lag runs, which is the thirty-minute
+    // blackout this pairing exists to end.
+    //
+    // Overlaid in this order so RAM WINS every conflict: it is the fresher of
+    // the two by construction -- the database's copy of a price is the same
+    // tick, later.
+    // RAM is read FIRST so its size sets the database budget: a populated
+    // store means the read below can only add stragglers and gets the short
+    // budget; an empty one means nothing else can price a ladder and the read
+    // gets the full one. See `fetch_spot_prices_backstop`.
+    let ram = spot_store.snapshot_prices();
+    let from_ram = ram.len();
+    let mut prices = fetch_spot_prices_backstop(questdb, today_ist_nanos, from_ram).await;
+    let from_questdb = prices.len();
+    prices.extend(ram);
     let spot = spot_paise_by_symbol(&symbols, &prices);
 
     let rows: Vec<MasterRow> = contracts.iter().map(ContractRow::to_master_row).collect();
-    let selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    let mut selection = select_contract_universe(&rows, &spot, today_ymd, capacity);
+    // The expiry-scope guarantee, layer 1 (owner 2026-10-28): every selected
+    // contract must sit on its underlying's current expiry, recomputed from the
+    // same file by a separate pass. A contract that does not is REFUSED here,
+    // before anything below names, maps or dials it.
+    // O(rows) over ~120,000 rows: moved off the runtime worker (`off_worker`)
+    // so the other tasks on this worker keep running while it builds.
+    let expiry_scope = tickvault_storage::off_worker::off_worker(|| {
+        crate::expiry_scope_check::enforce_subscribe_expiry_scope(
+            &mut selection,
+            &contracts,
+            today_ymd,
+        )
+    });
+    crate::expiry_scope_check::record_subscribe_expiry_scope(&expiry_scope, today_ymd);
+    // Carried on the selection rather than logged here alone, so the pure
+    // classifier below can tell the two failures apart without re-reading I/O.
+    selection.spot_rows_available = prices.len();
+
+    // Publish the contract -> underlying/family mapping the ranking layer reads
+    // per tick. Built HERE because this is the one place that holds BOTH inputs
+    // -- the day's contract rows and the symbol map -- so building it anywhere
+    // else would mean re-reading two artifacts to learn what is already in hand.
+    //
+    // AFTER the selection, with the SELECTED contracts ordered FIRST —
+    // CORRECTED 2026-09-10. This block sat BEFORE the selection on the
+    // reasoning that the map should describe what the artifact CONTAINS. The
+    // artifact contains every expiry: 76,890 option legs on 2026-09-10 against
+    // a 25,000-entry cap, so the build kept the first 25,000 in FILE order and
+    // refused 51,890 — and file order is not subscription order. A subscribed
+    // contract among the refused was unrankable, silently: its ticks arrived,
+    // `owner_of` answered `None`, and the drain skipped them by design. Now
+    // every subscribed option leg is mapped before any unsubscribed one takes
+    // a slot; the room left after them still goes to the artifact's remainder,
+    // so the map still describes more than the wire carries — just not INSTEAD
+    // of it.
+    {
+        crate::contract_underlying_map::pre_register_contract_underlying_counters();
+        // One row per composite key, the row the selector would admit
+        // (2026-10-28 review): the owner map and its labels are last-wins per
+        // id, so a reused id whose expired twin sits later in the file would
+        // otherwise be mapped to the expired contract's underlying and family.
+        // The option rows are cloned once per attach attempt (about 120,000
+        // rows, cold, off the runtime worker), so the two builders below keep
+        // their slice inputs.
+        let named_rows: Vec<ContractRow> = tickvault_storage::off_worker::off_worker(|| {
+            crate::expiry_scope_check::preferred_option_rows(&contracts, today_ymd)
+                .into_iter()
+                .cloned()
+                .collect()
+        });
+        let (legs, artifact_refusals) =
+            crate::contract_underlying_map::legs_from_artifact(&named_rows, &symbols);
+        // Counted by REASON, not just totalled. The count alone is what the
+        // line below carried until 2026-09-09, and on 2026-09-08 and
+        // 2026-09-09 it read `113182` then `113746` -- EVERY option leg in the
+        // artifact -- while saying nothing about why, so the top-volume board
+        // ranked nothing for two sessions and the cause had to be found by
+        // reading source. See `count_artifact_refusals` for the full record.
+        // Only SUBSCRIBED contracts' refusals are counted (PR M / M4): the
+        // rest are other expiries and BSE, refused on every attach attempt.
+        let artifact_refusals = crate::contract_underlying_map::subscribed_refusals(
+            &artifact_refusals,
+            &selection.instruments,
+        );
+        let artifact_refusal_reasons =
+            crate::contract_underlying_map::count_artifact_refusals(&artifact_refusals);
+        let (legs, selected_first) =
+            crate::contract_underlying_map::order_selected_first(legs, &selection.instruments);
+        if selected_first == 0 && !selection.instruments.is_empty() {
+            // A non-empty selection that shares ZERO legs with the artifact means
+            // the two were built from different contract sets (a stale artifact
+            // after an expiry rollover, or an id-space mismatch). Every subscribed
+            // option is then unrankable, and the info line below would read as
+            // success on `mapped_contracts` alone.
+            tracing::warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "contract_map_selection_disjoint",
+                subscribed_instruments = selection.instruments.len(),
+                option_legs_in_artifact = legs.len(),
+                "contract-to-underlying map shares no option leg with the subscribed \
+                 set — the ranking cannot see any subscribed contract"
+            );
+        }
+        // Labels come from the SAME `&[ContractRow]` the legs came from, with
+        // the SAME selected-first priority, so under the shared 25,000 cap a
+        // subscribed contract is labelled whenever the owner map admits it.
+        // (Until 2026-09-22 this walked the artifact in FILE order, and every
+        // subscribed option past row 25,000 wrote candles with a NULL
+        // `contract`; the comment here claimed the two maps could never
+        // differ.) They can still differ on a contract the owner map REFUSES
+        // for a reason this pass cannot see (unresolved underlying, no lot
+        // size) — an extra label, which is harmless. Published BEFORE the
+        // owner map: the projection only reads a label for a contract the
+        // leaderboard already tracks.
+        let labels = crate::contract_underlying_map::labels_from_artifact_selected_first(
+            &named_rows,
+            &selection.instruments,
+        );
+        // The candle writer fills `candles_<tf>.contract` from this table,
+        // keyed in the row's own `(security_id, segment-string)` shape
+        // (storage cannot see this crate's map). The whole table is REPLACED,
+        // so the spot names the boot published are included again here.
+        //
+        // EVERY option row of the day's file is named, uncapped, exactly as
+        // the boot publish names them (`option_labels_from`), never the
+        // 25,000-capped ranking table above. CORRECTED 2026-10-28: this was
+        // built from that capped table, so the attach NARROWED the boot's full
+        // table to the current selection plus whatever fitted in file order.
+        // The attach retries through the morning and the socket keeps every
+        // contract an earlier attempt subscribed; one the latest attempt no
+        // longer selects (the at-the-money window moves as stocks price) lost
+        // its name, and its candles were written with a NULL `contract` (seen
+        // live: HAVELLS-23Nov2026-1260-CE, security_id 114816, on 2026-10-28).
+        // Same names, same renderer (`contract_label`) as the ranking table.
+        // About 120,000 `Arc<str>` entries, the size the boot already
+        // publishes; once per attach attempt, never on the tick path, built
+        // off the runtime worker (`off_worker`).
+        let mut candle_labels = spot_labels_from(&symbols);
+        candle_labels.extend(tickvault_storage::off_worker::off_worker(|| {
+            option_labels_from(&contracts, today_ymd)
+        }));
+        // Set BEFORE the publish: from here on a boot publish never replaces
+        // the attach's table (2026-10-10).
+        ATTACH_LABELS_PUBLISHED.store(true, std::sync::atomic::Ordering::Release);
+        let published = tickvault_storage::candle_contract_labels::publish_candle_contract_labels(
+            candle_labels,
+        );
+        tracing::info!(
+            candle_contract_names = published,
+            "candle contract names published — option candles now carry their contract name"
+        );
+        crate::contract_underlying_map::global_contract_underlying_map().publish_labels(labels);
+        let (build, refused_subscribed_in_build) =
+            crate::contract_underlying_map::global_contract_underlying_map()
+                .publish_from_legs_selected_first(&legs, selected_first);
+        tracing::info!(
+            mapped_contracts = build.accepted,
+            subscribed_option_legs_ordered_first = selected_first,
+            subscribed_instruments = selection.instruments.len(),
+            option_legs_in_artifact = legs.len(),
+            refused_in_build = build.refusals.len(),
+            refused_subscribed_in_build,
+            refused_subscribed_in_artifact_scan = artifact_refusals.len(),
+            artifact_refusal_reasons = %artifact_refusal_reasons,
+            "contract-to-underlying map published — this is what the top-volume ranking \
+             can see; every subscribed option leg was offered a slot before any \
+             unsubscribed one"
+        );
+    }
 
     tracing::info!(
         contracts_in_artifact = contracts.len(),
         priced_underlyings = spot.len(),
+        // The join's INPUT beside its OUTPUT. `priced_underlyings` alone is the
+        // sum of "the source returned nothing" and "nothing the source returned
+        // matched", which are opposite defects.
+        spot_rows_available = prices.len(),
+        // WHICH source answered. Without this a healthy RAM path and a healthy
+        // database path are indistinguishable, so a silently-unfed store reads
+        // exactly like a working one for as long as the database keeps up.
+        spot_from_ram = from_ram,
+        spot_from_questdb = from_questdb,
+        symbol_map_entries = symbols.len(),
         selected = selection.instruments.len(),
-        index_futures = selection.index_futures,
-        stock_futures = selection.stock_futures,
         index_options = selection.index_options,
         stock_options = selection.stock_options,
         atm_window = selection.atm_window_used,
         atm_window_reason = selection.atm_window_reason,
+        underlyings_total = selection.stock_option_underlyings,
         without_spot = selection.underlyings_without_spot,
         dropped_for_capacity = selection.dropped_for_capacity,
+        refused_off_expiry = selection.refused_off_expiry,
         "contract universe resolved"
     );
+    record_contract_spot_coverage(&selection);
     selection
 }
 
-/// Reads today's latest price per instrument. Empty on any failure, said once.
-async fn fetch_spot_prices(
+/// Reads each underlying's LAST price today from `ticks`, keyed on the I-P1-11
+/// composite.
+///
+/// `pub` since 2026-08-21 so the depth selector can share the ONE spot fetch
+/// rather than issue a second identical query on the same 60s retry tick.
+///
+// TEST-EXEMPT: async HTTP I/O; the pure parts it composes — build_spot_price_query and parse_spot_prices — are separately tested, including the pin that the query carries no session filter.
+pub async fn fetch_spot_prices(
     questdb: &tickvault_common::config::QuestDbConfig,
     today_ist_nanos: i64,
-) -> HashMap<(u64, u8), i64> {
+) -> Option<HashMap<(u64, u8), i64>> {
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(QUESTDB_EXEC_TIMEOUT_SECS))
         .build()
     else {
-        tracing::error!("contract universe: HTTP client build failed — no stock options");
-        return HashMap::new();
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "spot_backstop_client_build",
+            "contract universe: HTTP client build failed — no stock options"
+        );
+        return None;
     };
     let sql = build_spot_price_query(today_ist_nanos);
     let body = match client
@@ -1015,33 +2592,467 @@ async fn fetch_spot_prices(
         Ok(resp) if resp.status().is_success() => match resp.text().await {
             Ok(b) => b,
             Err(err) => {
-                tracing::error!(?err, "contract universe: spot price response unreadable");
-                return HashMap::new();
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    source = "spot_backstop_unreadable",
+                    ?err,
+                    "contract universe: spot price response unreadable"
+                );
+                return None;
             }
         },
         Ok(resp) => {
-            tracing::error!(status = %resp.status(), "contract universe: spot price query non-2xx");
-            return HashMap::new();
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_non_2xx",
+                status = %resp.status(),
+                "contract universe: spot price query non-2xx"
+            );
+            return None;
         }
         Err(err) => {
-            tracing::error!(?err, "contract universe: spot price query failed");
-            return HashMap::new();
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_send_failed",
+                ?err,
+                "contract universe: spot price query failed"
+            );
+            return None;
         }
     };
-    match parse_spot_prices(&body) {
-        Ok(p) => p,
+    let floor = spot_backstop_freshness_floor(ist_now_nanos(), today_ist_nanos);
+    match parse_spot_prices_since(&body, floor) {
+        Ok(rows) => {
+            if rows.stale_refused > 0 || rows.unstamped_refused > 0 {
+                metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "stale_row")
+                    .increment(rows.stale_refused as u64);
+                metrics::counter!(SPOT_BACKSTOP_COUNTER, "outcome" => "unstamped_row")
+                    .increment(rows.unstamped_refused as u64);
+                tracing::warn!(
+                    accepted = rows.prices.len(),
+                    stale_refused = rows.stale_refused,
+                    unstamped_refused = rows.unstamped_refused,
+                    max_age_secs = SPOT_BACKSTOP_MAX_AGE_SECS,
+                    "spot prices: the database backstop returned rows older than the \
+                     age floor — refused rather than centred on; a ladder that only \
+                     the backstop could price now reads as without_spot instead of \
+                     being centred on this morning"
+                );
+            }
+            Some(rows.prices)
+        }
         Err(err) => {
-            tracing::error!(err, "contract universe: spot price response unparseable");
-            HashMap::new()
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "spot_backstop_unparseable",
+                err,
+                "contract universe: spot price response unparseable"
+            );
+            None
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// The candle writer probes with `(row.security_id, row.segment)`, where
+    /// the segment is `segment_code_to_str(code)`. The option names the attach
+    /// publishes must spell it identically or every lookup misses and every
+    /// option candle silently reads NULL.
+    #[test]
+    fn test_option_labels_from_keys_exactly_as_a_candle_row_probes() {
+        use tickvault_common::types::ExchangeSegment;
+        let row = super::ContractRow {
+            i: 52_175,
+            x: "NSE".into(),
+            c: "OPTIDX".into(),
+            e: 20_260_925,
+            s: 2_450_000,
+            l: "CE".into(),
+            u: "NIFTY".into(),
+            z: 75,
+        };
+        let out = super::option_labels_from(&[row], 20_260_901);
+        let nse =
+            tickvault_common::segment::segment_code_to_str(ExchangeSegment::NseFno.binary_code());
+        assert_eq!(nse, "NSE_FNO");
+        assert_eq!(
+            out.get(&(52_175, nse)).map(|s| &**s),
+            Some("NIFTY-25Sep2026-24500-CE")
+        );
+    }
+
+    /// 2026-11-15 audit (live-6): an off-hours boot (00:26 IST, Saturday
+    /// 14:23) logged today's not-yet-built contract artifact as a coded ERROR
+    /// on every attach attempt. A missing file at a time the rider has not
+    /// built it is expected; a file that exists but fails to read or parse,
+    /// or any failure after the rider hour on a trading day, is not. Bites:
+    /// dropping the `NotFound` check passes the parse-error case.
+    #[test]
+    fn test_regression_contract_artifact_error_is_expected_only_for_a_missing_file() {
+        let missing =
+            read_contract_artifact_on_this_thread("1999-01-01").expect_err("no artifact for 1999");
+        assert!(super::contract_artifact_error_is_expected(&missing, true));
+        assert!(!super::contract_artifact_error_is_expected(&missing, false));
+        let unparsable =
+            anyhow::Error::from(serde_json::from_str::<Vec<u8>>("{").expect_err("bad json"));
+        assert!(!super::contract_artifact_error_is_expected(
+            &unparsable,
+            true
+        ));
+        let denied =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!super::contract_artifact_error_is_expected(&denied, true));
+    }
+
+    /// Regression (2026-10-28, HAVELLS-23Nov2026-1260-CE written with a NULL
+    /// `contract`): the attach must publish the candle names from EVERY option
+    /// row of the day's file, never from the 25,000-capped ranking table, or a
+    /// contract an earlier attach attempt subscribed (the socket keeps it) but
+    /// the latest attempt no longer selects loses its name.
+    #[test]
+    fn test_regression_attach_publishes_every_option_name_uncapped() {
+        let src = include_str!("dhan_contract_universe.rs");
+        let body = src
+            .split("pub async fn load_contract_universe(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .unwrap_or("");
+        assert!(
+            body.contains("option_labels_from(&contracts, today_ymd)")
+                && body.contains("candle_labels.extend(tickvault_storage::off_worker::off_worker("),
+            "the attach must name every option row of the day's file"
+        );
+        assert!(
+            !body.contains("candle_labels.extend(candle_labels_from("),
+            "the capped ranking table must never feed the candle names again"
+        );
+    }
+    /// The cache is a process-global single slot, so these tests must not run
+    /// concurrently with each other — one storing while another reads would
+    /// make a genuine failure look like a flake and vice versa. Poisoning is
+    /// recovered rather than propagated, the house pattern.
+    static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The seed must name EVERY outcome the counter can carry, or the label it
+    /// misses keeps the defect the seeding exists to remove: the CloudWatch
+    /// agent drops the first sample of a label set it has never seen, so an
+    /// unseeded label publishes nothing on its first episode — and `failed`
+    /// has no second episode to fall back on when the read is what is broken.
+    ///
+    /// Asserting against the SOURCE rather than the metric registry is
+    /// deliberate: the registry is process-global, so a test that read it
+    /// would be order-dependent against every other test that increments a
+    /// counter. The source is the thing that can drift.
+    #[test]
+    fn pre_register_spot_backstop_counters_seeds_every_outcome_label() {
+        let src = include_str!("dhan_contract_universe.rs");
+        for outcome in super::SPOT_BACKSTOP_OUTCOMES {
+            assert!(
+                src.contains(&format!("\"outcome\" => \"{outcome}\"")),
+                "{outcome} is in SPOT_BACKSTOP_OUTCOMES but no site emits it — \
+                 either the label is dead or an emit site was renamed"
+            );
+        }
+        assert_eq!(
+            super::SPOT_BACKSTOP_OUTCOMES.len(),
+            5,
+            "an outcome was added or removed — update the seed list AND this \
+             pin together, so the pair cannot drift"
+        );
+        // Non-vacuous: the function must actually loop the list, not just
+        // declare it.
+        assert!(
+            src.contains("for outcome in SPOT_BACKSTOP_OUTCOMES"),
+            "pre_register_spot_backstop_counters must seed from the list"
+        );
+    }
+
+    /// Scope lock 2026-10-02: the backup ranking is nearest-the-money by
+    /// PERCENTAGE, index chain first on a tie, and a pure function of the data.
+    #[test]
+    fn test_backup_rank_from_orders_nearest_the_money_by_percentage() {
+        use tickvault_common::types::ExchangeSegment;
+        let leg = |id: u64, underlying: &'static str, strike_rupees: i64| super::Contract {
+            security_id: id,
+            segment: ExchangeSegment::NseFno,
+            expiry_ymd: 20_261_029,
+            strike_paise: strike_rupees * 100,
+            leg: super::OptionLeg::Call,
+            underlying,
+        };
+        let nifty_atm = leg(1, "NIFTY", 25_000);
+        let nifty_far = leg(2, "NIFTY", 25_500); // 2.0% out
+        let stock_near = leg(3, "RELIANCE", 1_404); // 0.29% out of 1,400
+        let stock_atm = leg(4, "RELIANCE", 1_400);
+        let entries = vec![
+            super::BackupRankEntry::new(&nifty_far, 2_500_000, 0),
+            super::BackupRankEntry::new(&stock_near, 140_000, 1),
+            super::BackupRankEntry::new(&stock_atm, 140_000, 1),
+            super::BackupRankEntry::new(&nifty_atm, 2_500_000, 0),
+        ];
+        let ids: Vec<u64> = super::backup_rank_from(entries)
+            .iter()
+            .map(|i| i.security_id)
+            .collect();
+        // Both at-the-money legs tie at 0 ppm; the index chain goes first.
+        assert_eq!(ids, vec![1, 4, 3, 2]);
+        // A reference of 0 (no price) ranks last, never first.
+        let unpriced = leg(5, "ABC", 100);
+        let ranked = super::backup_rank_from(vec![
+            super::BackupRankEntry::new(&unpriced, 0, 1),
+            super::BackupRankEntry::new(&nifty_far, 2_500_000, 0),
+        ]);
+        assert_eq!(ranked.last().map(|i| i.security_id), Some(5));
+    }
+
+    fn crow(id: u64) -> super::ContractRow {
+        super::ContractRow {
+            i: id,
+            x: "NSE".into(),
+            c: "OPTSTK".into(),
+            e: 20_260_828,
+            s: 250_000,
+            l: "CE".into(),
+            u: "RELIANCE".into(),
+            z: 0,
+        }
+    }
+
+    /// The hit: same date, same stamp, rows come back without touching disk.
+    /// This is the whole point of the cache — ~120 attempts in the pre-open
+    /// window would otherwise be ~240 parses of an ~11 MB file.
+    #[test]
+    fn contract_artifact_cache_returns_rows_on_an_identical_date_and_stamp() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-22", stamp, vec![crow(7), crow(8)]);
+        let hit = super::cached_artifact("2026-08-22", stamp).expect("identical stamp must hit");
+        assert_eq!(hit.len(), 2);
+        assert_eq!(hit[0].i, 7);
+    }
+
+    /// The miss that MATTERS. The daily rider is supervised, so a respawn can
+    /// legitimately rewrite TODAY's artifact after something has already read
+    /// it. A date-only cache would serve the superseded contract set for the
+    /// rest of the session, and downstream a stale universe is
+    /// indistinguishable from a correct one. Any change to len or mtime must
+    /// miss.
+    #[test]
+    fn contract_artifact_cache_misses_when_the_file_was_rewritten_the_same_day() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-22", first, vec![crow(7)]);
+
+        // Same size, later mtime — a rewrite that happens to land the same
+        // byte count. Length alone would have called this unchanged.
+        let same_len_new_mtime = Some((4_242_u64, 1_700_000_000_000_000_001_i128));
+        assert!(
+            super::cached_artifact("2026-08-22", same_len_new_mtime).is_none(),
+            "a rewrite with an identical byte count must still invalidate"
+        );
+
+        // Same mtime, different size — the filesystem's mtime resolution can
+        // put two writes in the same tick, so size has to be checked too.
+        let new_len_same_mtime = Some((4_243_u64, 1_700_000_000_000_000_000_i128));
+        assert!(
+            super::cached_artifact("2026-08-22", new_len_same_mtime).is_none(),
+            "a rewrite inside one mtime tick must still invalidate"
+        );
+    }
+
+    /// A new trading day must never serve yesterday's contracts — the artifact
+    /// is per-date and derivative ids are documented as unstable across days.
+    #[test]
+    fn contract_artifact_cache_misses_on_a_different_date() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamp = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_artifact("2026-08-21", stamp, vec![crow(7)]);
+        assert!(
+            super::cached_artifact("2026-08-22", stamp).is_none(),
+            "yesterday's artifact must not answer for today"
+        );
+    }
+
+    /// A file we cannot stat is one we cannot prove unchanged, so the cache is
+    /// DISABLED for that call rather than the unknown being treated as a
+    /// stable identity. Both directions: an unstattable read never hits, and
+    /// an unstattable result is never stored.
+    #[test]
+    fn contract_artifact_cache_is_disabled_when_the_file_cannot_be_stat_ed() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            super::artifact_stamp(std::path::Path::new(
+                "/nonexistent/tickvault/contract-artifact.json"
+            ))
+            .is_none(),
+            "a missing file must not produce a stamp"
+        );
+        super::store_artifact("2026-08-22", None, vec![crow(7)]);
+        assert!(
+            super::cached_artifact("2026-08-22", None).is_none(),
+            "an unknown stamp must never hit"
+        );
+    }
+
+    /// Two reads of an unchanged mapping artifact hand back the SAME
+    /// allocation.
+    ///
+    /// `Arc::ptr_eq` is the proof deliberately, rather than comparing the maps:
+    /// a re-parse would produce an EQUAL map at a different address, so
+    /// equality passes whether or not the cache works. Pointer identity is the
+    /// only assertion that fails when the parse is re-run, and not re-running
+    /// it is the entire point — the 2026-08-22 measurement puts this file at
+    /// ~4,565 rows, parsed twice a minute before this cache existed.
+    #[test]
+    fn contract_names_for_day_strict_refuses_a_day_with_no_files() {
+        assert!(contract_names_for_day_strict("1999-01-01").is_err());
+    }
+
+    #[test]
+    fn read_symbol_map_shares_one_parse_across_reads() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A date no production path and no other test uses, so the single
+        // cache slot cannot be contended and the file cannot collide with a
+        // real artifact.
+        let date = "2099-01-02";
+        let path = crate::dhan_universe::mapping_artifact_path(date);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).expect("cache dir");
+        }
+        std::fs::write(
+            &path,
+            r#"{"mappings":[{"symbol":"reliance","security_id":2885,"exchange_segment":1}]}"#,
+        )
+        .expect("writes");
+
+        let first = super::read_symbol_map(date).expect("reads");
+        assert_eq!(
+            first.get("RELIANCE"),
+            Some(&(2885_u64, 1_u8)),
+            "the symbol is upper-cased on the way in, because the spot join is \
+             case-sensitive and the artifact is not"
+        );
+
+        let second = super::read_symbol_map(date).expect("reads again");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "an unchanged artifact must be handed back, never re-parsed"
+        );
+
+        std::fs::remove_file(&path).expect("cleanup");
+        assert!(
+            super::read_symbol_map(date).is_err(),
+            "a missing artifact is an ERROR, never an empty map — an empty map \
+             silently drops every stock from at-the-money selection"
+        );
+    }
+
+    /// The miss that MATTERS, for the same reason the contract artifact's does:
+    /// the daily rider is supervised, so a respawn can rewrite TODAY's mapping
+    /// after something has read it, and a date-keyed cache would then serve the
+    /// superseded map for the rest of the session.
+    #[test]
+    fn symbol_map_cache_misses_when_the_file_was_rewritten_the_same_day() {
+        let _g = CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = Some((4_242_u64, 1_700_000_000_000_000_000_i128));
+        super::store_symbol_map("2026-08-22", first, HashMap::new());
+        assert!(
+            super::cached_symbol_map("2026-08-22", first).is_some(),
+            "an identical stamp must hit"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", Some((4_242, 1_700_000_000_000_000_001)))
+                .is_none(),
+            "a rewrite with an identical byte count must still invalidate"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", Some((4_243, 1_700_000_000_000_000_000)))
+                .is_none(),
+            "a rewrite inside one mtime tick must still invalidate"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-21", first).is_none(),
+            "yesterday's map must not answer for today"
+        );
+        assert!(
+            super::cached_symbol_map("2026-08-22", None).is_none(),
+            "a file we cannot stat is one we cannot prove unchanged"
+        );
+    }
+
     use super::*;
 
     /// Builds a master row. Only the fields selection reads are meaningful.
+    /// When the envelope binds on an index chain, the strikes that survive are
+    /// the ones near the money — not the ones the master happened to list
+    /// first.
+    ///
+    /// The chain is taken whole on any normal day, so this pins the behaviour
+    /// on the day it cannot be. The scope lock records the authorized set at
+    /// ~24,600 against 25,000 with the index chains explicitly UNCAPPED and
+    /// their measured depth swinging 542 to 2,037 legs, so a breach is a
+    /// vendor listing more strikes, not an exotic case.
+    ///
+    /// Found by a property test asserting that reversing the master cannot
+    /// change the chosen set: pushed in file order it could, and the strikes
+    /// it dropped were whichever came last.
+    #[test]
+    fn a_binding_envelope_keeps_the_index_strikes_nearest_the_money() {
+        // A NIFTY chain from 24,000 to 24,800 in 100-point steps, both legs:
+        // nine strikes, eighteen contracts. Listed FAR STRIKES FIRST, so file
+        // order and money-order disagree.
+        let mut rows = Vec::new();
+        let mut id = 1_u64;
+        let mut strikes: Vec<i64> = (0..9).map(|k| 24_000 + k * 100).collect();
+        strikes.sort_by_key(|s| -(s - 24_400).abs()); // furthest first
+        for strike in strikes {
+            for leg in [OptionLeg::Call, OptionLeg::Put] {
+                rows.push(contract(
+                    id,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    20260924,
+                    strike,
+                    leg,
+                ));
+                id += 1;
+            }
+        }
+        // Room for three strikes' worth of legs.
+        let sel = select_contract_universe(&rows, &HashMap::new(), 20260826, 6);
+        assert_eq!(sel.instruments.len(), 6);
+        let kept: Vec<i64> = sel
+            .instruments
+            .iter()
+            .filter_map(|i| {
+                rows.iter()
+                    .find(|r| r.security_id == i.security_id)
+                    .map(|r| r.strike_paise / 100)
+            })
+            .collect();
+        for strike in kept {
+            assert!(
+                (strike - 24_400).abs() <= 100,
+                "kept {strike}, which is not one of the three nearest the middle"
+            );
+        }
+    }
+
     fn contract(
         id: u64,
         class: InstrumentClass,
@@ -1063,10 +3074,13 @@ mod tests {
             strike_paise: strike_rupees * 100,
             option_leg: leg,
             underlying_symbol: underlying.into(),
+            // A REAL multiplier, so every fixture below exercises the value
+            // actually carried rather than the absent sentinel.
+            lot_size: 75,
         }
     }
 
-    const TODAY: u32 = 2026_08_19;
+    const TODAY: u32 = 20260819;
 
     fn no_spot() -> HashMap<String, i64> {
         HashMap::new()
@@ -1082,20 +3096,25 @@ mod tests {
     fn an_empty_master_selects_nothing_and_says_so() {
         let sel = select_contract_universe(&[], &no_spot(), TODAY, 25_000);
         assert!(sel.instruments.is_empty());
-        assert_eq!(sel.index_futures, 0);
+        assert_eq!(sel.index_options, 0);
         assert_eq!(sel.stock_options, 0);
         assert_eq!(sel.dropped_for_capacity, 0);
     }
 
     #[test]
-    fn futures_take_every_expiry_at_or_after_today() {
+    fn a_future_is_never_selected_whatever_its_expiry() {
+        // The operator removed the entire futures subscription on 2026-09-18
+        // (equity underlying spots and options only). This test replaces the
+        // two that used to prove futures WERE selected at every live expiry —
+        // it is the same fixture, asserting the opposite, so a revival of the
+        // selection path fails here rather than shipping silently.
         let rows = vec![
             contract(
                 1,
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                TODAY,
                 0,
                 OptionLeg::None,
             ),
@@ -1104,54 +3123,33 @@ mod tests {
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_09_24,
+                20260924,
                 0,
                 OptionLeg::None,
             ),
             contract(
                 3,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::StockFuture,
                 "NSE",
-                "NIFTY",
-                2026_10_29,
-                0,
-                OptionLeg::None,
-            ),
-            // Yesterday's contract must NOT be subscribed: it is not tradeable
-            // and its absence of ticks would read as a silent instrument.
-            contract(
-                4,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_08_18,
+                "RELIANCE",
+                20261029,
                 0,
                 OptionLeg::None,
             ),
         ];
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(
-            sel.index_futures, 3,
-            "all three live expiries, never rolled"
+        assert!(
+            sel.instruments.is_empty(),
+            "futures are out of scope — got {:?}",
+            sel.instruments
         );
-        assert!(!sel.instruments.iter().any(|i| i.security_id == 4));
-    }
-
-    #[test]
-    fn todays_expiry_is_still_subscribed_on_expiry_day() {
-        // Index futures NEVER roll: the expiring contract streams through its
-        // final session and falls out of tomorrow's build by itself.
-        let rows = vec![contract(
-            1,
-            InstrumentClass::IndexFuture,
-            "NSE",
-            "NIFTY",
-            TODAY,
-            0,
-            OptionLeg::None,
-        )];
-        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.index_futures, 1, ">= today, not > today");
+        // And refused SILENTLY rather than counted as a capacity drop: a
+        // future is not a contract we wanted and could not fit, it is a class
+        // we no longer subscribe. Counting it would make every healthy day
+        // report ~680 drops.
+        assert_eq!(sel.dropped_for_capacity, 0);
+        assert_eq!(sel.refused_no_expiry, 0);
+        assert_eq!(sel.refused_no_strike, 0);
     }
 
     #[test]
@@ -1168,7 +3166,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -1177,7 +3175,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -1188,7 +3186,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "NIFTY",
-            2026_09_24,
+            20260924,
             24_000,
             OptionLeg::Call,
         ));
@@ -1207,7 +3205,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "FINNIFTY",
-            2026_08_28,
+            20260828,
             24_000,
             OptionLeg::Call,
         )];
@@ -1236,7 +3234,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 underlying,
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -1245,7 +3243,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 underlying,
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -1253,6 +3251,142 @@ mod tests {
         rows
     }
 
+    /// The pre-open call auction settles at 09:08–09:12 IST and publishes a
+    /// real exchange equilibrium price for every scrip. That price is exactly
+    /// what the ATM window needs, and it exists THREE MINUTES BEFORE the
+    /// 09:15 open — so nothing about locating at-the-money requires waiting
+    /// for the continuous session to start.
+    ///
+    /// This is pinned because the opposite was ASSUMED. The reasoning ran
+    /// "ATM needs a spot price, our feed's ticks start at 09:15, therefore
+    /// contracts cannot resolve before 09:15" — and every step of that is
+    /// true except the middle one. There is no session filter anywhere in
+    /// this path:
+    ///
+    ///   * a pre-open tick IS persisted — `dhan_feed_stack`'s
+    ///     `test_pre_open_tick_is_written_even_though_it_opens_no_candle`
+    ///     pins that the candle-session rule stopped deciding what gets
+    ///     CAPTURED;
+    ///   * `build_spot_price_query` filters on `ts >= today AND ltp > 0` and
+    ///     nothing else, so a 09:10 price qualifies exactly like a 09:20 one;
+    ///   * and the selection below treats it as any other price.
+    ///
+    /// The chain was already built. What was missing was anybody checking,
+    /// which is why a capability we already had got written down as a
+    /// limitation we had to engineer around.
+    #[test]
+    fn a_pre_open_price_locates_at_the_money_exactly_like_a_session_price() {
+        let rows = stock_ladder("RELIANCE");
+
+        // The identical spot, reached two ways. The selector cannot tell them
+        // apart, and that indistinguishability IS the property under test.
+        let from_pre_open = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+        let from_session = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+
+        assert_eq!(
+            from_pre_open.atm_window_used, 25,
+            "a pre-open equilibrium price must yield the FULL authorized window, \
+             not a narrowed one"
+        );
+        assert_eq!(from_pre_open.stock_options, 102, "51 strikes x 2 legs");
+        assert_eq!(
+            from_pre_open.underlyings_without_spot, 0,
+            "the underlying is priced — there is nothing left to wait for"
+        );
+        assert_eq!(from_pre_open.stock_options, from_session.stock_options);
+        assert_eq!(from_pre_open.atm_window_used, from_session.atm_window_used);
+    }
+
+    /// The query half of the same claim, asserted against the SQL itself.
+    ///
+    /// A session predicate added here later would silently push contract
+    /// resolution back to 09:15 and nothing else in the tree would fail — the
+    /// symptom is three lost minutes every morning, which no test would catch
+    /// and no counter would report.
+    #[test]
+    fn the_spot_price_query_has_no_session_filter_so_pre_open_prices_qualify() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        let lower = sql.to_lowercase();
+        assert!(
+            lower.contains("ltp > 0"),
+            "an unpriced row must still be excluded — this test must not be \
+             read as licence to accept zeros"
+        );
+        for banned in ["session", "09:15", "33300", "market_hours", "continuous"] {
+            assert!(
+                !lower.contains(banned),
+                "`{banned}` appears in the spot price query. A session bound here \
+                 discards the 09:08-09:12 pre-open equilibrium price, which is a \
+                 real exchange print and the earliest at-the-money can be known. \
+                 sql={sql}"
+            );
+        }
+    }
+
+    /// Non-vacuity for the pair above: an underlying with NO price at all must
+    /// still be refused. Otherwise "pre-open prices are accepted" would be
+    /// indistinguishable from "anything is accepted".
+    #[test]
+    fn accepting_pre_open_prices_does_not_accept_the_absence_of_one() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 1);
+    }
+
+    /// `count_within` is now arithmetic on a prefix table while `within` still
+    /// filters the contracts. They must agree at EVERY window size, or the
+    /// selector sizes a window against one number and then pushes a different
+    /// one — silently over- or under-filling the connection budget while every
+    /// log reads correct.
+    ///
+    /// This is the test that makes the optimisation safe: it compares the fast
+    /// path against the slow one it replaced, rather than asserting the fast
+    /// path's own answer.
+    #[test]
+    fn count_within_agrees_with_within_at_every_window_size() {
+        let rows = stock_ladder("RELIANCE");
+        // Route through the REAL selector so the ladder under test is the one
+        // production builds; then rebuild it directly to reach the private
+        // window helpers.
+        let mut bucket = UnderlyingBucket::default();
+        for r in &rows {
+            if r.strike_paise == 0 || r.option_leg == OptionLeg::None {
+                continue;
+            }
+            bucket.options.push(Contract {
+                security_id: r.security_id,
+                segment: ExchangeSegment::NseFno,
+                expiry_ymd: r.expiry_ymd,
+                strike_paise: r.strike_paise,
+                leg: r.option_leg,
+                underlying: r.underlying_symbol.as_str(),
+            });
+        }
+        let mut stock_opt: HashMap<&str, UnderlyingBucket<'_>> = HashMap::new();
+        stock_opt.insert("RELIANCE", bucket);
+
+        let mut sel = ContractSelection::default();
+        let ladders = build_ladders(&stock_opt, &spot("RELIANCE", 1000), &mut sel);
+        assert!(!ladders.is_empty(), "the fixture must produce a ladder");
+
+        for ladder in &ladders {
+            for window in 0..=STOCK_OPTION_ATM_STRIKES_EACH_SIDE {
+                assert_eq!(
+                    ladder.count_within(window),
+                    ladder.within(window).count(),
+                    "prefix count disagrees with the real filter at window {window}"
+                );
+            }
+            // Past the end of the ladder the answer must saturate at the whole
+            // ladder rather than run off the table.
+            assert_eq!(
+                ladder.count_within(10_000),
+                ladder.contracts.len(),
+                "an over-wide window selects the whole ladder"
+            );
+        }
+    }
     #[test]
     fn stock_options_take_the_atm_window_both_legs() {
         let rows = stock_ladder("RELIANCE");
@@ -1324,10 +3458,48 @@ mod tests {
     }
 
     #[test]
+    fn contract_spot_coverage_gauges_track_each_resolved_selection() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rows = [(1, "RELIANCE"), (2, "OTHER")].map(|(id, symbol)| {
+            contract(
+                id,
+                InstrumentClass::StockOption,
+                "NSE",
+                symbol,
+                20260828,
+                1_000,
+                OptionLeg::Call,
+            )
+        });
+        let mut both_priced = spot("RELIANCE", 1_000);
+        both_priced.extend(spot("OTHER", 1_000));
+        metrics::with_local_recorder(&recorder, || {
+            for (master, prices, missing, total) in [
+                (rows.as_slice(), no_spot(), 2, 2),
+                (rows.as_slice(), spot("RELIANCE", 1_000), 1, 2),
+                (rows.as_slice(), both_priced, 0, 2),
+                (&[][..], no_spot(), 0, 0),
+            ] {
+                let selection = select_contract_universe(master, &prices, TODAY, 25_000);
+                super::record_contract_spot_coverage(&selection);
+                let output = handle.render();
+                for (metric, count) in [
+                    ("tv_dhan_contract_underlyings_without_spot", missing),
+                    ("tv_dhan_contract_stock_option_underlyings", total),
+                ] {
+                    let sample = format!("{metric} {count}");
+                    assert!(output.lines().any(|line| line == sample), "{sample}");
+                }
+            }
+        });
+    }
+
+    #[test]
     fn atm_window_reason_is_applied_only_when_a_window_really_was() {
         let rows = stock_ladder("RELIANCE");
         let mut prices = HashMap::new();
-        prices.insert("RELIANCE".to_string(), 1_000_00i64);
+        prices.insert("RELIANCE".to_string(), 100_000i64);
         let sel = select_contract_universe(&rows, &prices, TODAY, 25_000);
         assert!(sel.stock_options > 0, "the fixture must actually select");
         assert_eq!(sel.atm_window_reason, "applied");
@@ -1356,7 +3528,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "TINY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Call,
             ));
@@ -1365,7 +3537,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "TINY",
-                2026_08_28,
+                20260828,
                 strike,
                 OptionLeg::Put,
             ));
@@ -1412,40 +3584,48 @@ mod tests {
             "both underlyings selected symmetrically"
         );
     }
-
     #[test]
-    fn futures_and_index_chains_outrank_stock_options_under_pressure() {
-        let mut rows = vec![
-            contract(
-                1,
-                InstrumentClass::IndexFuture,
+    fn index_chains_outrank_stock_options_under_pressure() {
+        // Futures used to head this priority order and are gone (2026-09-18).
+        // The ordering that remains is index chains before stock options, and
+        // it is what this fixture now proves: with room for two, the NIFTY
+        // chain takes both slots and the RELIANCE ladder gets nothing.
+        //
+        // Four index legs, not two: `MIN_LEGS_FOR_A_REAL_EXPIRY` would skip a
+        // two-leg chain as a stub, and the test would then pass its
+        // `stock_options == 0` assertion for the wrong reason entirely.
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000i64, 24_100].into_iter().enumerate() {
+            let base = 1 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                2,
-                InstrumentClass::StockFuture,
+                20260828,
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
                 "NSE",
-                "RELIANCE",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+                "NIFTY",
+                20260828,
+                strike,
+                OptionLeg::Put,
+            ));
+        }
         rows.extend(stock_ladder("RELIANCE"));
-        // Only 2 slots: the two futures must win, stock options get nothing.
         let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 2);
-        assert_eq!(sel.index_futures, 1);
-        assert_eq!(sel.stock_futures, 1);
+        assert_eq!(sel.index_options, 2, "the chain takes both slots");
         assert_eq!(sel.stock_options, 0);
         assert_eq!(sel.instruments.len(), 2);
-        // The 102 stock options the operator asked for and did not get are
-        // COUNTED. A selection that silently returns futures only is
-        // indistinguishable from one where the master had no options.
-        assert_eq!(sel.dropped_for_capacity, 102);
+        // Everything asked for and not given is COUNTED — the two index legs
+        // past the envelope AND the whole stock ladder. A selection that
+        // silently returns two rows is indistinguishable from one where the
+        // master offered nothing else.
+        assert_eq!(sel.dropped_for_capacity, 2 + 102);
         assert_eq!(sel.atm_window_used, 0, "no window was usable");
         assert_eq!(
             sel.atm_window_reason, "no_room",
@@ -1454,48 +3634,397 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_smaller_than_the_futures_alone_drops_and_reports() {
-        let rows = vec![
-            contract(
-                1,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                2,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_09_24,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                3,
-                InstrumentClass::IndexFuture,
-                "NSE",
-                "NIFTY",
-                2026_10_29,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+    fn an_envelope_smaller_than_the_index_chain_drops_and_reports() {
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000, 24_100, 24_200].into_iter().enumerate() {
+            for (j, leg) in [OptionLeg::Call, OptionLeg::Put].into_iter().enumerate() {
+                rows.push(contract(
+                    (i * 2 + j + 1) as u64,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    20260828,
+                    strike,
+                    leg,
+                ));
+            }
+        }
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 2);
         assert_eq!(sel.instruments.len(), 2);
         assert_eq!(
-            sel.dropped_for_capacity, 1,
+            sel.dropped_for_capacity, 4,
             "a truncation that is not counted is indistinguishable from a complete set"
         );
     }
 
+    /// Both arms of `stock_options_are_pending` on hand-built values, so the
+    /// predicate is pinned independently of what `select_contract_universe`
+    /// happens to produce. The four fixtures below prove the same thing
+    /// end-to-end; this one proves the boolean itself cannot drift.
     #[test]
-    fn derivative_segment_maps_sensex_to_bse_fno_and_nse_to_nse_fno() {
+    fn test_stock_options_are_pending_reads_both_arms() {
+        let mut sel = ContractSelection::default();
+
+        // Nothing to price at all is FINISHED, never pending — otherwise a
+        // master with no stock options holds the loop to the deadline daily.
+        sel.stock_option_underlyings = 0;
+        sel.stock_options = 0;
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "nothing to price");
+
+        // A real master with nothing priced yet.
+        sel.stock_option_underlyings = 208;
+        sel.underlyings_without_spot = 208;
+        assert!(stock_options_are_pending(&sel), "priceable, unpriced");
+
+        // ONE priced underlying out of 208.
+        //
+        // This arm used to assert NOT pending, and in doing so it ENCODED the
+        // 2026-08-21 defect: a single liquid stock printing at 09:15:30 closed
+        // the selection, and every stock that had not yet traded lost its
+        // options for the whole session with no second pass. The assertion is
+        // inverted here deliberately — under the quorum this is still pending.
+        sel.stock_options = 1;
+        sel.underlyings_without_spot = 207;
+        assert!(
+            stock_options_are_pending(&sel),
+            "one priced underlying out of 208 must NOT close the selection — that is precisely \
+             the defect the quorum exists to fix"
+        );
+
+        // 125 of 208 priced = 60.1%, just over the quorum.
+        sel.underlyings_without_spot = 83;
+        assert!(
+            !stock_options_are_pending(&sel),
+            "the quorum is a FLOOR, not 'all' — waiting for the illiquid tail would spend the \
+             whole allowance on names nobody trades"
+        );
+
+        // Everything priced: final, whatever happened next.
+        sel.underlyings_without_spot = 0;
+        assert!(!stock_options_are_pending(&sel), "all priced");
+    }
+
+    /// An ATM window narrowed below the authorized 25 IS a defect, even though
+    /// options were selected and every other field looks healthy.
+    ///
+    /// This is the case that produces NO signal of any kind today: the
+    /// selection succeeds, the log line prints a smaller number than the
+    /// operator authorized, and nothing counts it.
+    #[test]
+    fn contract_verdict_reasons_flags_a_shrunk_window_even_when_options_were_selected() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = 3;
+        assert_eq!(contract_verdict_reasons(&sel), vec!["window_shrunk"]);
+    }
+
+    /// Non-vacuity. Without this the guard above would pass on a function that
+    /// reported a defect unconditionally.
+    #[test]
+    fn contract_verdict_reasons_reports_nothing_for_a_full_window() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(
+            contract_verdict_reasons(&sel).is_empty(),
+            "a healthy selection must report NOTHING — a counter that fires on a good day \
+             trains the operator to ignore it"
+        );
+    }
+
+    /// The gap this closes: contracts dropped by the push sites that run
+    /// BEFORE the stock-option window is fitted — index futures, stock
+    /// futures, index chains — while the window itself then applies at its
+    /// authorized width. Every other reason describes the window, so this
+    /// selection previously reported a clean verdict while contracts the
+    /// operator authorized never reached the wire.
+    #[test]
+    fn contract_verdict_reasons_flags_drops_even_when_the_window_applied_in_full() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 1;
+        assert_eq!(
+            contract_verdict_reasons(&sel),
+            vec!["dropped_for_capacity"],
+            "a full-width window does not make a dropped contract acceptable — the \
+             selection is still smaller than the operator authorized, and this was the \
+             one shortfall shape no reason described"
+        );
+    }
+
+    /// Both facts are reported, not one. A window that could not fit AND
+    /// contracts pushed out are two distinct failures of the same selection;
+    /// reporting only the first would hide however many contracts were lost.
+    #[test]
+    fn contract_verdict_reasons_reports_no_room_and_drops_together() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_room";
+        sel.dropped_for_capacity = 42;
+        let reasons = contract_verdict_reasons(&sel);
+        assert!(reasons.contains(&"no_room"), "got {reasons:?}");
+        assert!(reasons.contains(&"dropped_for_capacity"), "got {reasons:?}");
+    }
+
+    /// Non-vacuity: zero drops must stay silent, or the alarm fires on every
+    /// healthy session and the operator learns to ignore it.
+    #[test]
+    fn contract_verdict_reasons_stay_silent_when_nothing_was_dropped() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.stock_options = 500;
+        sel.atm_window_reason = "applied";
+        sel.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        sel.dropped_for_capacity = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
+    }
+
+    #[test]
+    fn contract_verdict_reasons_report_no_contracts_for_an_empty_selection() {
+        let sel = ContractSelection::default();
+        assert!(contract_verdict_reasons(&sel).contains(&"no_contracts"));
+    }
+
+    /// A master that genuinely lists no stock options reports `no_ladders`
+    /// legitimately. Paging for it would fire on every such day forever.
+    #[test]
+    fn contract_verdict_reasons_holds_no_ladders_harmless_at_zero_underlyings() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 0;
+        assert!(contract_verdict_reasons(&sel).is_empty());
+
+        // ...but with a real master behind it, it IS the 2026-08-20 defect.
+        // `spot_rows_available` defaults to 0, so this is the no-prices half.
+        sel.stock_option_underlyings = 208;
+        assert_eq!(
+            contract_verdict_reasons(&sel),
+            vec!["no_ladders", "no_spot_rows"]
+        );
+    }
+
+    /// THE 2026-09-08 SPLIT. `no_ladders` fires for two opposite defects, and
+    /// before this the counter could not say which — so an operator paged at
+    /// 09:15 could not tell "the price source is empty" from "the price source
+    /// is fine and its keys do not match ours".
+    ///
+    /// Both sub-reasons ride WITH `no_ladders`, never instead of it: the alarm
+    /// built on that name must keep firing exactly as it did.
+    #[test]
+    fn contract_verdict_reasons_separates_no_prices_from_prices_that_did_not_join() {
+        let mut sel = ContractSelection::default();
+        sel.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        sel.atm_window_reason = "no_ladders";
+        sel.stock_option_underlyings = 208;
+
+        // The source gave us nothing — a persistence / query-window problem.
+        sel.spot_rows_available = 0;
+        let empty_source = contract_verdict_reasons(&sel);
+        assert!(empty_source.contains(&"no_ladders"), "{empty_source:?}");
+        assert!(empty_source.contains(&"no_spot_rows"), "{empty_source:?}");
+        assert!(
+            !empty_source.contains(&"spot_keys_unmatched"),
+            "an empty source is not a key mismatch: {empty_source:?}"
+        );
+
+        // Rows arrived and NOT ONE joined — an identity problem. Same symptom,
+        // opposite fix, and the only thing that separates them is this number.
+        sel.spot_rows_available = 4_312;
+        let unmatched = contract_verdict_reasons(&sel);
+        assert!(unmatched.contains(&"no_ladders"), "{unmatched:?}");
+        assert!(unmatched.contains(&"spot_keys_unmatched"), "{unmatched:?}");
+        assert!(
+            !unmatched.contains(&"no_spot_rows"),
+            "rows WERE available: {unmatched:?}"
+        );
+    }
+
+    /// Every reason the classifier can produce must be in the pre-registration
+    /// list, or its first — and on a once-per-session counter, its only —
+    /// increment is eaten as the CloudWatch delta baseline.
+    #[test]
+    fn pre_register_contract_failure_counters_covers_every_classified_reason() {
+        for reason in ["no_contracts", "no_ladders", "no_room", "window_shrunk"] {
+            assert!(
+                CONTRACT_FAILURE_REASONS.contains(&reason),
+                "`{reason}` can be emitted but is not pre-registered at 0"
+            );
+        }
+        // The two the classifier cannot produce, because their call sites have
+        // no ContractSelection to classify.
+        for reason in ["artifact_unreadable", "symbol_map_unreadable"] {
+            assert!(CONTRACT_FAILURE_REASONS.contains(&reason));
+        }
+    }
+
+    // The emit wrappers must be callable with no recorder installed — which
+    // is the state in every unit test and in the seconds before boot Step 3.
+
+    /// `gave_up` must be pre-registered like every other reason, or the ONE
+    /// increment it will ever make in a session is eaten as the CloudWatch
+    /// delta baseline — which would leave the give-up path exactly as silent
+    /// after this fix as it was before it.
+    #[test]
+    fn record_contract_give_up_uses_a_pre_registered_reason() {
+        assert!(
+            CONTRACT_FAILURE_REASONS.contains(&"gave_up"),
+            "the give-up reason must be pre-registered at 0"
+        );
+        // Safe with no recorder installed, like its siblings.
+        record_contract_give_up();
+    }
+
+    /// The classifier must NOT be able to produce `gave_up`. It classifies a
+    /// selection that exists; a give-up is the case where none does. If both
+    /// could emit it, a single failing session would count twice and the
+    /// reason would stop meaning anything specific.
+    #[test]
+    fn the_classifier_never_produces_the_give_up_reason() {
+        let empty = ContractSelection::default();
+        assert!(!contract_verdict_reasons(&empty).contains(&"gave_up"));
+        let mut full = ContractSelection::default();
+        full.instruments.push(SubscribeInstrument {
+            security_id: 1,
+            segment: ExchangeSegment::NseFno,
+        });
+        full.stock_options = 500;
+        full.atm_window_reason = "applied";
+        full.atm_window_used = STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert!(!contract_verdict_reasons(&full).contains(&"gave_up"));
+    }
+    #[test]
+    fn record_contract_verdict_is_safe_without_a_recorder() {
+        pre_register_contract_failure_counters();
+        record_contract_verdict(&ContractSelection::default());
+    }
+
+    /// The quorum boundary, exactly. Integer cross-multiply rather than a
+    /// float ratio, so this cannot tie differently depending on rounding.
+    #[test]
+    fn the_quorum_boundary_is_inclusive_at_the_percentage() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 10;
+        sel.stock_options = 1;
+
+        sel.underlyings_without_spot = 4; // 6 priced = 60% exactly
+        assert!(
+            !stock_options_are_pending(&sel),
+            "exactly at the quorum must be FINISHED, not pending"
+        );
+
+        sel.underlyings_without_spot = 5; // 5 priced = 50%
+        assert!(
+            stock_options_are_pending(&sel),
+            "one under the quorum must still hold"
+        );
+    }
+
+    /// A selection that ran out of envelope room is FINAL. Retrying cannot
+    /// conjure connection slots, so holding for it would burn the allowance
+    /// and then dial the same thing anyway.
+    #[test]
+    fn a_no_room_selection_is_not_held_by_the_quorum() {
+        let mut sel = ContractSelection::default();
+        sel.stock_option_underlyings = 208;
+        sel.underlyings_without_spot = 0;
+        sel.atm_window_reason = "no_room";
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    /// The live 2026-08-20 shape: a master full of stock options, not one
+    /// priced, so nothing was selected. This must read as PENDING, not done.
+    #[test]
+    fn a_priceless_stock_option_master_reads_as_pending_not_finished() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.atm_window_reason, "no_ladders");
+        assert!(
+            stock_options_are_pending(&sel),
+            "options exist and none could be priced — the attach must ask again"
+        );
+    }
+
+    /// The opposite reading, and the one that keeps the fix from hanging: a
+    /// master with no stock options at all is FINISHED, not pending. Without
+    /// this the retry loop would wait forever for options that do not exist.
+    #[test]
+    fn a_master_with_no_stock_options_is_finished_not_pending() {
+        let rows = vec![contract(
+            7,
+            InstrumentClass::IndexFuture,
+            "NSE",
+            "NIFTY",
+            20260828,
+            0,
+            OptionLeg::None,
+        )];
+        let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 0);
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    /// A successful selection is never pending — the obvious direction, pinned
+    /// so a future edit cannot make the predicate fire on the happy path and
+    /// stall every attach.
+    #[test]
+    fn a_priced_selection_is_never_pending() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 25_000);
+        assert!(sel.stock_options > 0, "the fixture must actually select");
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    /// `no_room` is a FINAL zero, not a pending one: retrying cannot create
+    /// envelope space, so the attach must dial what it has rather than spin.
+    /// This is why the predicate reads the WITHOUT-SPOT count and never
+    /// `atm_window_reason` — both reasons yield zero options, and only one of
+    /// them is worth asking again about.
+    #[test]
+    fn a_no_room_selection_is_final_not_pending() {
+        let rows = stock_ladder("RELIANCE");
+        let sel = select_contract_universe(&rows, &spot("RELIANCE", 1000), TODAY, 0);
+        assert_eq!(sel.stock_options, 0);
+        assert_eq!(sel.underlyings_without_spot, 0, "it WAS priced");
+        assert!(!stock_options_are_pending(&sel));
+    }
+
+    #[test]
+    fn derivative_segment_maps_nse_only_and_refuses_every_other_exchange() {
         assert_eq!(derivative_segment("NSE"), Some(ExchangeSegment::NseFno));
-        assert_eq!(derivative_segment("BSE"), Some(ExchangeSegment::BseFno));
+        // BSE refused since 2026-08-20 (operator: "only for the nse alone").
+        assert_eq!(derivative_segment("BSE"), None);
         // Commodity and currency are outside the authorized scope, and a
         // wrong segment is a wrong-instrument subscription that looks healthy.
         assert_eq!(derivative_segment("MCX"), None);
@@ -1506,10 +4035,10 @@ mod tests {
     fn an_unmappable_exchange_is_counted_not_silently_skipped() {
         let rows = vec![contract(
             1,
-            InstrumentClass::IndexFuture,
+            InstrumentClass::IndexOption,
             "MCX",
             "GOLD",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         )];
@@ -1520,58 +4049,127 @@ mod tests {
 
     #[test]
     fn the_same_composite_key_twice_is_deduped_per_i_p1_11() {
+        // Four legs, not two: `MIN_LEGS_FOR_A_REAL_EXPIRY` skips a shorter
+        // chain as a stub, so a two-row fixture would prove the stub rule
+        // rather than the dedup rule. Two strikes x two legs is the smallest
+        // chain the selector will actually take.
+        //
+        // The duplicate is the 24_100 PUT carrying the 24_000 CALL's id. Per
+        // I-P1-11 `push_contract` keys on `(security_id, segment)`, so the
+        // second arrival is a duplicate however its strike or leg differ.
         let rows = vec![
             contract(
                 7,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
-                0,
-                OptionLeg::None,
+                20260828,
+                24_000,
+                OptionLeg::Call,
+            ),
+            contract(
+                8,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                20260828,
+                24_000,
+                OptionLeg::Put,
+            ),
+            contract(
+                9,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                20260828,
+                24_100,
+                OptionLeg::Call,
             ),
             contract(
                 7,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_09_24,
-                0,
-                OptionLeg::None,
+                20260828,
+                24_100,
+                OptionLeg::Put,
             ),
         ];
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.instruments.len(), 1);
+        assert_eq!(sel.instruments.len(), 3, "the repeated id lands once");
         assert_eq!(sel.deduped, 1);
     }
 
+    /// A BSE row sharing an NSE row's id must be REFUSED and COUNTED — never
+    /// swallowed as a duplicate.
+    ///
+    /// Until 2026-08-20 this test read `the_same_id_in_two_segments_is_kept_as_
+    /// two_instruments` and asserted BOTH were selected, which was the correct
+    /// I-P1-11 pin while BSE was in scope. With BSE narrowed out by the
+    /// operator's "only for the nse alone", the two-segment case can no longer
+    /// arise inside this selector — every row it emits is `NseFno`.
+    ///
+    /// So the pin moves to the distinction that still matters and is easier to
+    /// get wrong: an out-of-scope row must land in `refused_unknown_segment`,
+    /// not in `deduped`. Those two counters send triage to opposite places —
+    /// "the master offered something we do not subscribe" versus "the master
+    /// listed the same contract twice" — and a refusal filed as a duplicate
+    /// would read as normal housekeeping.
+    ///
+    /// I-P1-11 itself is unchanged and still enforced: `push_contract` keys
+    /// `chosen` on `(security_id, segment)`, and the sibling test above proves
+    /// the same pair twice is deduped.
     #[test]
-    fn the_same_id_in_two_segments_is_kept_as_two_instruments() {
-        // The I-P1-11 case that matters: security_id alone is NOT unique, and
-        // deduping on it would silently drop one of two real instruments.
-        let rows = vec![
-            contract(
-                7,
-                InstrumentClass::IndexFuture,
+    fn a_bse_row_sharing_an_nse_id_is_refused_and_counted_not_deduped() {
+        // A real four-leg NSE chain, because `MIN_LEGS_FOR_A_REAL_EXPIRY`
+        // skips a shorter one as a stub and the NSE side must actually be
+        // SELECTED for "only the NSE row survives" to mean anything.
+        let mut rows = Vec::new();
+        for (i, strike) in [24_000i64, 24_100].into_iter().enumerate() {
+            let base = 7 + (i as u64) * 2;
+            rows.push(contract(
+                base,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-            contract(
-                7,
-                InstrumentClass::IndexFuture,
-                "BSE",
-                "SENSEX",
-                2026_08_28,
-                0,
-                OptionLeg::None,
-            ),
-        ];
+                20260828,
+                strike,
+                OptionLeg::Call,
+            ));
+            rows.push(contract(
+                base + 1,
+                InstrumentClass::IndexOption,
+                "NSE",
+                "NIFTY",
+                20260828,
+                strike,
+                OptionLeg::Put,
+            ));
+        }
+        // The BSE row carries id 7 — the same id as the first NSE leg.
+        rows.push(contract(
+            7,
+            InstrumentClass::IndexOption,
+            "BSE",
+            "SENSEX",
+            20260828,
+            80_000,
+            OptionLeg::Call,
+        ));
         let sel = select_contract_universe(&rows, &no_spot(), TODAY, 25_000);
-        assert_eq!(sel.instruments.len(), 2);
-        assert_eq!(sel.deduped, 0);
+        assert_eq!(sel.instruments.len(), 4, "only the NSE chain survives");
+        assert!(
+            sel.instruments
+                .iter()
+                .all(|i| i.segment == ExchangeSegment::NseFno),
+            "and every survivor is NSE, never the BSE one"
+        );
+        assert_eq!(
+            sel.refused_unknown_segment, 1,
+            "the BSE row is refused BY SEGMENT — the counter that says \
+             'out of scope', not the one that says 'seen twice'"
+        );
+        assert_eq!(sel.deduped, 0, "it was never a duplicate");
     }
 
     #[test]
@@ -1579,7 +4177,7 @@ mod tests {
         let rows = vec![
             contract(
                 1,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
                 0,
@@ -1591,7 +4189,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::Call,
             ),
@@ -1600,7 +4198,7 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 1000,
                 OptionLeg::None,
             ),
@@ -1658,7 +4256,7 @@ mod tests {
             InstrumentClass::IndexFuture,
             "NSE",
             "NIFTY",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         ));
@@ -1695,7 +4293,7 @@ mod tests {
             InstrumentClass::StockOption,
             "NSE",
             "RELIANCE",
-            2026_08_28,
+            20260828,
             1_234,
             OptionLeg::Put,
         )]);
@@ -1707,6 +4305,65 @@ mod tests {
         assert_eq!(m.option_leg, OptionLeg::Put);
         assert_eq!(m.strike_paise, 123_400);
         assert_eq!(m.underlying_symbol, "RELIANCE");
+        // The lot size must survive the disk round trip: the ranking divides
+        // by it, and the artifact is the only place it reaches the lane.
+        assert_eq!(back[0].z, 75);
+        assert_eq!(m.lot_size, 75);
+    }
+
+    #[test]
+    fn an_artifact_written_before_the_lot_size_field_still_parses() {
+        // The load-bearing case for `#[serde(default)]`, and the reason it is
+        // not tidiness: this artifact is written once a day and re-read by
+        // every later boot, so a restart on the DAY this field ships meets a
+        // file the previous binary wrote with no `z` key. Without the default
+        // that parse fails, `load_contract_universe` reports the artifact
+        // unusable, and the lane collapses to the 4-index fallback.
+        let legacy =
+            r#"[{"i":5,"x":"NSE","c":"OPTSTK","e":20260828,"s":123400,"l":"PE","u":"RELIANCE"}]"#;
+        let back: Vec<ContractRow> = serde_json::from_str(legacy).expect("legacy artifact parses");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].z, 0, "absent reads as the sentinel, not a guess");
+        assert_eq!(back[0].u, "RELIANCE", "every other field still lands");
+        // And the sentinel is what the ranking refuses, so a legacy artifact
+        // costs the board its contracts for one session — never a silently
+        // wrong ordering.
+        assert_eq!(back[0].to_master_row().lot_size, 0);
+    }
+
+    #[test]
+    fn contract_rows_from_master_carries_each_contracts_own_lot_size() {
+        let master = [
+            MasterRow {
+                lot_size: 75,
+                ..contract(
+                    5,
+                    InstrumentClass::IndexOption,
+                    "NSE",
+                    "NIFTY",
+                    20260828,
+                    24_500,
+                    OptionLeg::Call,
+                )
+            },
+            MasterRow {
+                lot_size: 250,
+                ..contract(
+                    6,
+                    InstrumentClass::StockOption,
+                    "NSE",
+                    "RELIANCE",
+                    20260828,
+                    3_000,
+                    OptionLeg::Call,
+                )
+            },
+        ];
+        let rows = contract_rows_from_master(&master);
+        // Per contract, never one figure for the file — two real contracts on
+        // the same day have genuinely different multipliers.
+        assert_eq!(rows[0].z, 75);
+        assert_eq!(rows[1].z, 250);
     }
 
     #[test]
@@ -1777,7 +4434,7 @@ mod tests {
             InstrumentClass::IndexOption,
             "NSE",
             "NIFTY",
-            2026_08_20,
+            20260820,
             24_000,
             OptionLeg::Call,
         )];
@@ -1788,7 +4445,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Call,
             ));
@@ -1797,7 +4454,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Put,
             ));
@@ -1820,7 +4477,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Call,
             ));
@@ -1829,7 +4486,7 @@ mod tests {
                 InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_26,
+                20260826,
                 strike,
                 OptionLeg::Put,
             ));
@@ -1847,19 +4504,19 @@ mod tests {
         let rows = vec![
             contract(
                 1,
-                InstrumentClass::IndexFuture,
+                InstrumentClass::IndexOption,
                 "NSE",
                 "NIFTY",
-                2026_08_18,
+                20260818,
                 0,
                 OptionLeg::None,
             ),
             contract(
                 2,
-                InstrumentClass::StockFuture,
+                InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_01,
+                20260801,
                 0,
                 OptionLeg::None,
             ),
@@ -1874,10 +4531,10 @@ mod tests {
     fn a_missing_underlying_is_filed_under_its_own_counter() {
         let rows = vec![contract(
             1,
-            InstrumentClass::IndexFuture,
+            InstrumentClass::IndexOption,
             "NSE",
             "",
-            2026_08_28,
+            20260828,
             0,
             OptionLeg::None,
         )];
@@ -1894,6 +4551,40 @@ mod tests {
     fn a_malformed_price_response_is_an_error_not_an_empty_market() {
         assert!(parse_spot_prices("not json").is_err());
         assert!(parse_spot_prices(r#"{"columns":[]}"#).is_err());
+    }
+
+    #[test]
+    fn parse_symbol_map_counting_collisions_counts_only_a_symbol_that_changes_its_pair() {
+        // Identity sweep row 24 (2026-09-08): a stock appears once per index
+        // list with the SAME id — that is not a collision. The same symbol
+        // resolving to a DIFFERENT (id, segment) is, and last row wins.
+        let body = r#"{"mappings":[
+            {"symbol":"RELIANCE","security_id":2885,"exchange_segment":1},
+            {"symbol":"reliance ","security_id":2885,"exchange_segment":1},
+            {"symbol":"TCS","security_id":11536,"exchange_segment":1},
+            {"symbol":"TCS","security_id":99999,"exchange_segment":1},
+            {"symbol":"INFY","security_id":1594,"exchange_segment":1},
+            {"symbol":"INFY","security_id":1594,"exchange_segment":4}
+        ]}"#;
+        let (m, collisions) = parse_symbol_map_counting_collisions(body).expect("parses");
+        assert_eq!(
+            collisions, 2,
+            "TCS changed id, INFY changed segment; RELIANCE repeated"
+        );
+        assert_eq!(m.get("RELIANCE"), Some(&(2885, 1)));
+        assert_eq!(
+            m.get("TCS"),
+            Some(&(99999, 1)),
+            "last row wins, deterministically"
+        );
+        assert_eq!(m.get("INFY"), Some(&(1594, 4)));
+        assert_eq!(m.len(), 3);
+        let (_, none) = parse_symbol_map_counting_collisions(
+            r#"{"mappings":[{"symbol":"A","security_id":1,"exchange_segment":1}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(none, 0);
+        assert!(parse_symbol_map_counting_collisions("not json").is_err());
     }
 
     #[test]
@@ -1914,6 +4605,206 @@ mod tests {
     fn a_malformed_symbol_map_is_an_error_not_an_empty_universe() {
         assert!(parse_symbol_map("not json").is_err());
         assert!(parse_symbol_map(r#"{"resolved":7}"#).is_err());
+    }
+
+    #[test]
+    fn spot_labels_from_names_only_spot_segments_under_their_own_segment() {
+        let mut symbols = HashMap::new();
+        symbols.insert("NIFTY 50".to_string(), (13u64, 0u8));
+        symbols.insert("RELIANCE".to_string(), (2885u64, 1u8));
+        symbols.insert("RELIANCE-BSE".to_string(), (500_325u64, 4u8));
+        // A derivative id must never borrow a spot name.
+        symbols.insert("SOMEFUT".to_string(), (13u64, 2u8));
+        symbols.insert("MCXTHING".to_string(), (77u64, 5u8));
+        let labels = spot_labels_from(&symbols);
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY 50"));
+        assert_eq!(
+            labels.get(&(2885, "NSE_EQ")).map(|s| &**s),
+            Some("RELIANCE")
+        );
+        assert_eq!(
+            labels.get(&(500_325, "BSE_EQ")).map(|s| &**s),
+            Some("RELIANCE-BSE")
+        );
+        // Same numeric id on a derivative segment: absent, never borrowed.
+        assert!(!labels.contains_key(&(13, "NSE_FNO")));
+        assert!(!labels.contains_key(&(77, "MCX_COMM")));
+    }
+
+    #[test]
+    fn spot_labels_from_breaks_an_alias_tie_by_the_smallest_name() {
+        // Every insertion order must give the same answer.
+        for order in [["NIFTY", "NIFTY 50"], ["NIFTY 50", "NIFTY"]] {
+            let mut symbols = HashMap::new();
+            for name in order {
+                symbols.insert(name.to_string(), (13u64, 0u8));
+            }
+            let labels = spot_labels_from(&symbols);
+            assert_eq!(labels.len(), 1);
+            assert_eq!(labels.get(&(13, "IDX_I")).map(|s| &**s), Some("NIFTY"));
+        }
+    }
+
+    #[test]
+    fn spot_labels_from_an_empty_map_is_empty() {
+        assert!(spot_labels_from(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn publish_contract_labels_at_boot_publishes_nothing_without_an_artifact() {
+        // No mapping artifact exists for this date or the week before it, so
+        // nothing is read and nothing is published — the column stays as it
+        // is rather than wrong.
+        assert_eq!(publish_contract_labels_at_boot("1999-01-01"), 0);
+    }
+
+    #[test]
+    fn contract_names_for_day_is_none_without_that_days_symbol_map() {
+        // Never steps back to an earlier day: a repair names a day's rows
+        // with that day's ids or not at all.
+        assert!(contract_names_for_day("1999-01-01").is_none());
+        assert!(contract_names_for_day("not-a-date").is_none());
+    }
+
+    /// Regression (2026-10-10): the 02:01 IST boot replayed 9 Oct frames with
+    /// today's date, found no file for it and published no names at all. The
+    /// boot now takes the newest day that reads, within the lookback.
+    #[test]
+    fn test_regression_newest_readable_day_steps_back_to_the_last_built_day() {
+        let built = ["2026-10-09"];
+        let found = newest_readable_day("2026-10-10", BOOT_LABEL_LOOKBACK_DAYS, |d| {
+            built.contains(&d).then_some(d.len())
+        });
+        assert_eq!(found, Some(("2026-10-09".to_string(), 10)));
+    }
+
+    #[test]
+    fn newest_readable_day_prefers_the_day_itself() {
+        let found = newest_readable_day("2026-10-09", 7, |d| Some(d.to_string()));
+        assert_eq!(found.map(|(d, _)| d), Some("2026-10-09".to_string()));
+    }
+
+    #[test]
+    fn newest_readable_day_stops_at_the_lookback() {
+        let mut asked = 0_u32;
+        let found: Option<(String, ())> = newest_readable_day("2026-10-09", 7, |_| {
+            asked += 1;
+            None
+        });
+        assert!(found.is_none());
+        // The day itself plus seven earlier days, never more.
+        assert_eq!(asked, 8);
+        // Exactly at the edge: a file seven days back is still found.
+        let edge = newest_readable_day("2026-10-09", 7, |d| (d == "2026-10-02").then_some(()));
+        assert!(edge.is_some());
+        let past = newest_readable_day("2026-10-09", 7, |d| (d == "2026-10-01").then_some(()));
+        assert!(past.is_none());
+    }
+
+    #[test]
+    fn newest_readable_day_refuses_a_date_that_does_not_parse() {
+        let found = newest_readable_day("09-10-2026", 7, |d| Some(d.to_string()));
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn day_key_packs_the_date_and_refuses_garbage() {
+        assert_eq!(day_key("2026-10-09"), 20_261_009);
+        assert_eq!(day_key("not a date"), 0);
+        assert!(day_key("2026-10-10") > day_key("2026-10-09"));
+    }
+
+    /// The boot publish never replaces the attach's table, never publishes
+    /// an empty one, and otherwise lets the newer day (or, on the same day, the
+    /// larger table) win.
+    #[test]
+    fn test_boot_publish_wins_truth_table() {
+        // attach, held_day, held_len, new_day, new_len
+        assert!(boot_publish_wins(false, 0, 0, 20_261_009, 862));
+        assert!(!boot_publish_wins(false, 0, 0, 20_261_009, 0));
+        // After the attach: never, whatever the boot read.
+        assert!(!boot_publish_wins(true, 0, 0, 20_261_009, 25_862));
+        assert!(!boot_publish_wins(
+            true, 20_261_009, 862, 20_261_010, 30_000
+        ));
+        // Same day: only a larger table replaces (the contract file became
+        // readable between the two boot calls).
+        assert!(boot_publish_wins(
+            false, 20_261_009, 862, 20_261_009, 121_862
+        ));
+        assert!(!boot_publish_wins(
+            false, 20_261_009, 121_862, 20_261_009, 862
+        ));
+        assert!(!boot_publish_wins(false, 20_261_009, 862, 20_261_009, 862));
+        // A newer day replaces even a larger older table.
+        assert!(boot_publish_wins(
+            false, 20_261_009, 121_862, 20_261_010, 862
+        ));
+        // An older day never replaces a newer one.
+        assert!(!boot_publish_wins(
+            false, 20_261_010, 862, 20_261_009, 121_862
+        ));
+        // An empty held table is always filled.
+        assert!(boot_publish_wins(false, 20_261_010, 0, 20_261_009, 1));
+    }
+
+    /// Regression (2026-10-09): the evening boot's frame-log replay wrote
+    /// option candles before any option name was published, and each upsert
+    /// replaced a named row with a blank one. The boot table now names every
+    /// option of the day's contract file, with the attach's own label.
+    #[test]
+    fn test_regression_option_labels_from_names_every_option_like_the_attach() {
+        let itc = ContractRow {
+            i: 85_650,
+            x: "NSE".into(),
+            c: "OPTSTK".into(),
+            e: 20_261_027,
+            s: 25_500,
+            l: "CE".into(),
+            u: "ITC".into(),
+            z: 1_725,
+        };
+        let mut future = itc.clone();
+        future.i = 9;
+        future.c = "FUTSTK".into();
+        let mut bse = itc.clone();
+        bse.i = 10;
+        bse.x = "BSE".into();
+        let mut zero = itc.clone();
+        zero.i = 0;
+        let labels = option_labels_from(&[itc.clone(), future, bse, zero], 20_261_001);
+        assert_eq!(labels.len(), 1, "options on NSE only, never a zero id");
+        let name = labels.get(&(85_650, "NSE_FNO")).map(|s| &**s);
+        assert_eq!(name, Some("ITC-27Oct2026-255-CE"));
+        let attach = crate::contract_underlying_map::labels_from_artifact(&[itc]);
+        assert_eq!(
+            attach.get(&(85_650, ExchangeSegment::NseFno)).map(|s| &**s),
+            name,
+            "the boot name and the attach name must be the same string"
+        );
+    }
+
+    /// The attach's own table is capped at 25,000; the boot table is not,
+    /// because nothing is selected yet and a capped file-order walk could
+    /// leave a replayed contract unnamed.
+    #[test]
+    fn test_option_labels_from_is_not_capped() {
+        let rows: Vec<ContractRow> = (1..=30_000)
+            .map(|i| {
+                let mut row = crow(i);
+                row.s = i64::try_from(i).unwrap_or(0) * 100;
+                row
+            })
+            .collect();
+        let labels = option_labels_from(&rows, 20_260_901);
+        assert_eq!(labels.len(), 30_000);
+        assert!(labels.contains_key(&(30_000, "NSE_FNO")));
+    }
+
+    #[test]
+    fn test_option_labels_from_an_empty_file_is_empty() {
+        assert!(option_labels_from(&[], 20_260_901).is_empty());
     }
 
     #[test]
@@ -1959,7 +4850,7 @@ mod tests {
                 InstrumentClass::IndexFuture,
                 "NSE",
                 "NIFTY",
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::None,
             ),
@@ -1968,14 +4859,14 @@ mod tests {
                 InstrumentClass::StockOption,
                 "NSE",
                 "RELIANCE",
-                2026_08_28,
+                20260828,
                 1_000,
                 OptionLeg::Put,
             ),
         ]);
         write_contract_artifact(date, &rows).expect("writes");
         let back = read_contract_artifact(date).expect("reads");
-        assert_eq!(back, rows);
+        assert_eq!(*back, rows);
 
         // No `.tmp` may survive: a leftover temp file is a partial artifact
         // sitting next to the real one, waiting for a future glob to find it.
@@ -2019,35 +4910,189 @@ mod tests {
                         InstrumentClass::StockOption,
                         "NSE",
                         &underlying,
-                        2026_08_28,
+                        20260828,
                         strike,
                         leg,
                     ));
                     next += 1;
                 }
             }
-            // and one future per stock
+            // and one future per stock, which the master really carries and
+            // the selection must now ignore entirely (2026-09-18).
             rows.push(contract(
                 next,
                 InstrumentClass::StockFuture,
                 "NSE",
                 &underlying,
-                2026_08_28,
+                20260828,
                 0,
                 OptionLeg::None,
             ));
             next += 1;
         }
         let sel = select_contract_universe(&rows, &prices, TODAY, 25_000);
-        assert_eq!(sel.stock_futures, 220);
+        assert_eq!(
+            sel.instruments.len(),
+            220 * 102,
+            "options only — the 220 futures in the fixture reach nothing"
+        );
         assert_eq!(sel.stock_options, 220 * 102);
         assert_eq!(sel.atm_window_used, 25, "no shrink needed at this scale");
         assert_eq!(sel.dropped_for_capacity, 0);
-        assert!(
-            sel.instruments.len() > 22_000,
-            "got {} — the authorized set is ~24,600",
-            sel.instruments.len()
-        );
         assert!(sel.instruments.len() <= 25_000, "never over the envelope");
+    }
+}
+
+/// The database backstop's budget, derived from what RAM already holds.
+#[cfg(test)]
+mod spot_backstop_tests {
+    use super::*;
+
+    /// With nothing in RAM the database is the only source, so it gets the
+    /// full `/exec` budget — the same one every sibling reader uses.
+    #[test]
+    fn spot_backstop_budget_secs_gives_an_empty_store_the_full_budget() {
+        assert_eq!(spot_backstop_budget_secs(0), QUESTDB_EXEC_TIMEOUT_SECS);
+    }
+
+    /// One price in RAM is enough to demote the database to a backstop: the
+    /// read can only add stragglers, and a stalled database must not delay
+    /// the sockets for a read that adds nothing the ladders need.
+    #[test]
+    fn a_populated_store_bounds_the_database_to_the_short_budget() {
+        assert_eq!(
+            spot_backstop_budget_secs(1),
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+        );
+        assert_eq!(
+            spot_backstop_budget_secs(25_000),
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS
+        );
+    }
+
+    /// The short budget is genuinely SHORTER. A future edit that raises it to
+    /// or past the full budget would silently restore the 2026-09-08 shape —
+    /// a selector blocked behind a stalled database — with the same names
+    /// still in place.
+    #[test]
+    fn the_short_budget_is_strictly_shorter_than_the_full_one() {
+        assert!(SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS < QUESTDB_EXEC_TIMEOUT_SECS);
+        assert!(
+            SPOT_BACKSTOP_BUDGET_WITH_RAM_SECS >= 1,
+            "a zero budget never asks at all"
+        );
+    }
+
+    /// The query must carry `ts` as the FOURTH column, or the age gate has
+    /// nothing to age and refuses every row as unstamped — an empty map that
+    /// looks exactly like "no rows today".
+    #[test]
+    fn build_spot_price_query_carries_ts_as_the_fourth_column() {
+        let sql = build_spot_price_query(1_700_000_000_000_000_000);
+        assert!(
+            sql.starts_with("SELECT security_id, segment, ltp, ts FROM ticks"),
+            "column order is the wire contract parse_spot_prices_since reads: {sql}"
+        );
+    }
+
+    /// The age floor is strictly inside the session and strictly longer than
+    /// the read budget. Under the budget it would refuse rows the read was
+    /// still fetching; over a session it would never refuse anything and the
+    /// 09:20-print-at-14:00 shape would be back with the constant in place.
+    #[test]
+    fn spot_backstop_max_age_secs_sits_between_the_read_budget_and_a_session() {
+        assert!(SPOT_BACKSTOP_MAX_AGE_SECS > QUESTDB_EXEC_TIMEOUT_SECS);
+        const SESSION_SECS: u64 = 6 * 3600 + 15 * 60;
+        assert!(SPOT_BACKSTOP_MAX_AGE_SECS < SESSION_SECS);
+    }
+
+    /// The floor is `now - max_age`, never earlier than the day bound: before
+    /// 09:15 the day bound is the tighter of the two and must win, or the
+    /// floor would reach into yesterday and re-admit what the query already
+    /// keeps out.
+    #[test]
+    fn spot_backstop_freshness_floor_is_now_minus_max_age_clamped_to_today() {
+        let today = 1_700_000_000_000_000_000;
+        let age = i64::try_from(SPOT_BACKSTOP_MAX_AGE_SECS).expect("fits") * NANOS_PER_SEC;
+        let midday = today + 5 * 3600 * NANOS_PER_SEC;
+        assert_eq!(spot_backstop_freshness_floor(midday, today), midday - age);
+        let just_after_midnight = today + 60 * NANOS_PER_SEC;
+        assert_eq!(
+            spot_backstop_freshness_floor(just_after_midnight, today),
+            today,
+            "the day bound wins when now - age would fall before it"
+        );
+    }
+
+    /// The gate at exact boundaries: a row AT the floor is fresh, one
+    /// nanosecond before it is stale, and a row with no `ts` is refused as
+    /// unstamped rather than admitted as fresh. The fixture is the real wire
+    /// shape — `ts` rendered RFC 3339 with a `Z`, holding IST-as-epoch.
+    #[test]
+    fn parse_spot_prices_since_refuses_stale_and_unstamped_rows_and_keeps_the_rest() {
+        // 2026-09-08T14:00:00Z as IST-as-epoch nanos.
+        let floor = chrono::DateTime::parse_from_rfc3339("2026-09-08T14:00:00.000000Z")
+            .expect("fixture")
+            .timestamp_nanos_opt()
+            .expect("fits");
+        let body = r#"{"dataset":[
+            [1,"NSE_EQ",100.0,"2026-09-08T14:00:00.000000Z"],
+            [2,"NSE_EQ",200.0,"2026-09-08T13:59:59.999999Z"],
+            [3,"NSE_EQ",300.0,"2026-09-08T14:30:12.345678Z"],
+            [4,"NSE_EQ",400.0],
+            [5,"NSE_EQ",500.0,"not a timestamp"],
+            [6,"NSE_EQ",600.0,null]
+        ]}"#;
+        let rows = parse_spot_prices_since(body, floor).expect("parses");
+        assert_eq!(
+            rows.prices.get(&(1, 1)),
+            Some(&10_000),
+            "at the floor is fresh"
+        );
+        assert!(
+            !rows.prices.contains_key(&(2, 1)),
+            "one microsecond before is stale"
+        );
+        assert_eq!(rows.prices.get(&(3, 1)), Some(&30_000));
+        assert_eq!(rows.prices.len(), 2);
+        assert_eq!(rows.stale_refused, 1);
+        assert_eq!(
+            rows.unstamped_refused, 3,
+            "missing, unparseable and null ts are all refused, never admitted"
+        );
+    }
+
+    /// The ungated form is unchanged by the gate: it neither reads nor
+    /// requires the fourth column, so the wire-format pins above stay honest.
+    #[test]
+    fn parse_spot_prices_ignores_the_ts_column_and_never_refuses_on_age() {
+        let body = r#"{"dataset":[
+            [1,"NSE_EQ",100.0,"1999-01-01T00:00:00.000000Z"],
+            [2,"NSE_EQ",200.0]
+        ]}"#;
+        let p = parse_spot_prices(body).expect("parses");
+        assert_eq!(p.len(), 2);
+    }
+
+    /// A backstop that cannot answer inside its budget yields an EMPTY map
+    /// rather than an error or a hang: the same shape every other failure of
+    /// the read produces, so the callers' `extend(ram)` is unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_spot_prices_backstop_abandons_a_stalled_database_with_an_empty_map() {
+        // A black-hole host: RFC 5737 TEST-NET, guaranteed unroutable, so the
+        // connect attempt outlives the two-second budget and the timeout —
+        // not the network — is what returns. Paused tokio time makes the
+        // wait instantaneous.
+        let questdb = tickvault_common::config::QuestDbConfig {
+            host: "192.0.2.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let prices = fetch_spot_prices_backstop(&questdb, 0, 1).await;
+        assert!(
+            prices.is_empty(),
+            "a timed-out backstop must add nothing, not hang"
+        );
     }
 }

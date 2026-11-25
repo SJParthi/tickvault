@@ -243,49 +243,57 @@ fn candle_tables_are_swept_via_single_source() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let pm =
         fs::read_to_string(src.join("partition_manager.rs")).expect("read partition_manager.rs");
+    // 2026-09-18 — assert the EMITTED accessor by name, not by substring.
+    //
+    // `emitted_candle_table_names()` CONTAINS the literal `candle_table_names()`,
+    // so the original `pm.contains("candle_table_names()")` check passed
+    // unchanged the moment retention was re-pointed at the filtered set — a
+    // guard satisfied by the very edit it exists to notice. Both directions are
+    // pinned now: the emitted accessor must be present, and the unfiltered one
+    // must NOT be, because sweeping all TF_COUNT names asks QuestDB about
+    // fifteen dropped tables once per retention cycle forever.
     assert!(
-        pm.contains("candle_table_names()"),
-        "partition_manager must sweep candle tables via candle_table_names() — the candle \
-         retention loop is missing (the #1022 phantom-`_shadow`-name bug would return)"
+        pm.contains("emitted_candle_table_names()"),
+        "partition_manager must sweep candle tables via emitted_candle_table_names() — \
+         the candle retention loop is missing (the #1022 phantom-`_shadow`-name bug \
+         would return)"
+    );
+    assert!(
+        !pm.split("#[cfg(test)]")
+            .next()
+            .unwrap_or("")
+            .contains("shadow_persistence::candle_table_names()"),
+        "partition_manager must NOT sweep the unfiltered TF_COUNT set — the retired \
+         frames have no table, so every cycle would log a warn for each of them"
     );
 
     let names = tickvault_storage::shadow_persistence::candle_table_names();
 
-    // 21 → 24 on 2026-08-11: the live-feed revival added the three
-    // second-scale frames the operator's 13-timeframe requirement needs.
-    //
     // The count is asserted BY NAME, not as a bare number. A count tells you
     // a number moved; it does not tell you WHICH table lost its retention
     // sweep — and an unswept candle table grows until the disk fills, which
     // is a slow failure nobody attributes to a test that once said "21".
+    //
+    // 24 → 9 on 2026-09-19, when the operator's nine-frame directive DELETED
+    // the other fifteen variants. Those fifteen did not lose their retention
+    // sweep — they got something stronger: `retired_candle_table_names()`
+    // DROPS them at boot, so there is no table left to sweep. The ledger here
+    // is therefore the LIVE set, and the sibling test below is what proves no
+    // live name ever drifts into that drop list.
+    // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` left the fold;
+    // they are archive-only (`ARCHIVE_ONLY_CANDLE_TABLES`), pinned below.
     let expected = [
-        // Second scale — 1s..15s plus 30s. These are the frames the
-        // 13-timeframe requirement added, and the reason the count moved.
+        // Second scale.
         "candles_1s",
-        "candles_2s",
-        "candles_3s",
-        "candles_4s",
-        "candles_5s",
-        "candles_6s",
-        "candles_7s",
-        "candles_8s",
-        "candles_9s",
-        "candles_10s",
-        "candles_11s",
-        "candles_12s",
-        "candles_13s",
-        "candles_14s",
-        "candles_15s",
-        "candles_30s",
-        // Minute scale and the day frame.
+        // Minute scale.
         "candles_1m",
-        "candles_2m",
         "candles_3m",
         "candles_5m",
         "candles_15m",
         "candles_30m",
         "candles_60m",
-        "candles_1d",
+        // Since 2026-09-22 ("no views anywhere") 10m is a folded table.
+        "candles_10m",
     ];
     let actual: std::collections::BTreeSet<&str> = names.iter().copied().collect();
     let want: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
@@ -308,4 +316,99 @@ fn candle_tables_are_swept_via_single_source() {
             "candle table name must be plain candles_<TF> (no _shadow): {n}"
         );
     }
+}
+
+/// The emitted and retired candle-name sets must never intersect, and no LIVE
+/// frame may sit in the drop list.
+///
+/// Added 2026-09-18 with the nine-frame directive, when the model was
+/// "emitted + retired PARTITION `candle_table_names()`" — true while the
+/// retired frames were still enum variants, so the ordinal set spanned all 24
+/// names.
+///
+/// **That model died on 2026-09-19**, when the directive DELETED those fifteen
+/// variants. `candle_table_names()` now derives from `TfIndex::ALL`, so it
+/// returns the nine LIVE names and the retired fifteen are outside it by
+/// construction — `union == all` became arithmetically unsatisfiable, and the
+/// orphan check it guarded became unreachable through this accessor.
+///
+/// What survives is the half that was always the safety property, restated as
+/// two checks a derived ordinal set CAN still make:
+///
+///   * `emitted == all` — every live frame gets its table created; a frame
+///     that folds bars into a table nothing creates is the silent-loss case.
+///   * `retired ∩ all == ∅` — no LIVE frame is in the boot drop list. That is
+///     the catastrophic direction: a table dropped every morning and written
+///     all day, losing a full session on every restart.
+///
+/// The orphan class the old union check covered — a table that once existed,
+/// stopped being emitted, and was never added to the retired ledger — is NOT
+/// derivable from today's enum, and this test no longer claims to catch it.
+/// `RETIRED_CANDLE_TABLES` is a hand-written historical fact for exactly that
+/// reason; its own docblock carries the argument.
+#[test]
+fn emitted_and_retired_candle_names_never_intersect() {
+    use std::collections::BTreeSet;
+
+    let all: BTreeSet<&str> = tickvault_storage::shadow_persistence::candle_table_names()
+        .iter()
+        .copied()
+        .collect();
+    let emitted: BTreeSet<&str> =
+        tickvault_storage::shadow_persistence::emitted_candle_table_names()
+            .into_iter()
+            .collect();
+    let retired: BTreeSet<&str> =
+        tickvault_storage::shadow_persistence::retired_candle_table_names()
+            .into_iter()
+            .collect();
+
+    let overlap: Vec<_> = emitted.intersection(&retired).collect();
+    assert!(
+        overlap.is_empty(),
+        "a candle table is both created and dropped in the same boot: {overlap:?}"
+    );
+
+    let dropped_live: Vec<_> = retired.intersection(&all).collect();
+    assert!(
+        dropped_live.is_empty(),
+        "these LIVE fold frames are in the boot DROP list — their table would be \
+         destroyed every morning and rewritten all day, losing a full session on \
+         every restart: {dropped_live:?}"
+    );
+
+    assert_eq!(
+        emitted, all,
+        "every live fold frame must have its table created — a frame missing \
+         here folds bars into a table nothing creates"
+    );
+
+    // Anti-vacuity in both directions: an empty emitted set would mean no candle
+    // is ever written, and an empty retired set would mean this whole change is
+    // a no-op. Either would leave every assertion above trivially true.
+    assert!(
+        !emitted.is_empty() && !retired.is_empty(),
+        "both sets must be non-empty or the assertions above are vacuous"
+    );
+
+    // The operator's 2026-09-18 directive names the frames that keep a TABLE;
+    // 2026-09-22 ("no views anywhere") turned `candles_10m` from a derived view
+    // over candles_1m into a folded table, so it is in the set now.
+    let want: BTreeSet<&str> = [
+        "candles_1s",
+        "candles_1m",
+        "candles_3m",
+        "candles_5m",
+        "candles_15m",
+        "candles_30m",
+        "candles_60m",
+        "candles_10m",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        emitted, want,
+        "the emitted candle tables must be exactly the operator's eight fold frames \
+         (10m has been a folded table since 2026-09-22; 3s and 5s left on 2026-10-22)"
+    );
 }

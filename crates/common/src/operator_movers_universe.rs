@@ -1,0 +1,1668 @@
+//! The Stocks movers UNIVERSE and the pure per-filter selection over it
+//! (plan PR MV, 2026-11-06 live incident).
+//!
+//! Measured live on 2026-11-06: a portal Stocks movers click took 2.6 to 8.0 s
+//! because every filter, sort or page change went portal → Lambda → SSM →
+//! box helper → `/api/stock-movers` → QuestDB, although the database part
+//! was 0.1 to 0.4 s. A universe is ONE observation of every price row the
+//! view can show (the union of the day's F&O list and the index-membership
+//! list), plus both lists. [`select`] turns it into exactly the reply the
+//! per-filter path returned for that filter from the same rows and times, so
+//! the app answers every filter from one cached universe and the operator
+//! Lambda answers from a published copy without a round trip to the box.
+//!
+//! Shared transport, dependency-light: the operator Lambda includes this
+//! source file directly (`#[path]`), as it does `operator_movers_wire.rs`, so
+//! nothing here may name `crate::constants`. The constants below are pinned
+//! against the common constants by `crates/common/tests/operator_movers_universe_constants.rs`.
+//!
+//! # Complexity
+//!
+//! Cold path, never per tick. [`select`] builds lookup maps from the lists
+//! and scans the price rows. It partitions the matching rows at the page
+//! boundaries in linear time, then sorts at most [`SELECTION_LIMIT`] rows.
+//! [`MoversUniverse::valid`] is O(rows + list rows).
+//!
+//! # Honest limits
+//!
+//! - A universe read from JSON carries the same floats the box held only up
+//!   to `serde_json`'s default float parsing, which can differ from the
+//!   printed value by one unit in the last place for long mantissas. Prices
+//!   in paise round-trip exactly.
+//! - The universe reads the union in ONE query. A database answer with more
+//!   rows than the bound the API sets for it is refused for every filter,
+//!   where the per-filter path refused it only for the filters whose own
+//!   answer was too long. With one row per stock (the query's `LATEST ON`)
+//!   this cannot happen on a real answer.
+
+use crate::operator_movers_wire::{
+    BridgeError, MAX_SOURCE_ROWS, MAX_WIRE_BYTES, SELECTION_LIMIT, SourceStatus, Stock,
+};
+use crate::operator_stock_movers_wire::{
+    Direction, FILTERED_PROTOCOL_VERSION, Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES,
+    MemberStock, MembershipStatus, MoversCategory, MtfCoverage, Outcome, Reply, Snapshot,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// Maximum bytes of a dated index mapping, including its MTF terms history.
+pub const MAX_DAILY_MAPPING_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum superseded MTF intervals retained alongside the latest terms.
+pub const MAX_MTF_HISTORY_INTERVALS: usize = 32_768;
+
+/// Version of the universe format. A reader refuses any other value.
+pub const UNIVERSE_FORMAT_VERSION: u32 = 1;
+/// Largest universe object a reader accepts, in bytes.
+pub const MAX_UNIVERSE_BYTES: usize = 4 * 1024 * 1024;
+/// Largest number of price rows a universe may carry (the union of two lists
+/// of at most [`MAX_SOURCE_ROWS`] stocks each).
+pub const MAX_UNIVERSE_PRICE_ROWS: usize = 2 * MAX_SOURCE_ROWS;
+/// Largest number of rows in one stored list (the mapping artifact's own cap).
+pub const MAX_UNIVERSE_LIST_ROWS: usize = 32_768;
+/// Dhan's `NSE_EQ` segment code. Pinned to `constants::EXCHANGE_SEGMENT_NSE_EQ`.
+pub const UNIVERSE_NSE_EQ_SEGMENT_CODE: u8 = 1;
+/// The text of the `NSE_EQ` segment on the wire.
+pub const UNIVERSE_NSE_EQ_SEGMENT: &str = "NSE_EQ";
+/// IST minus UTC, seconds. Pinned to `constants::IST_UTC_OFFSET_SECONDS_I64`.
+pub const UNIVERSE_IST_OFFSET_SECS: i64 = 19_800;
+/// 09:00 IST, seconds of day. Pinned to `constants::TICK_PERSIST_START_SECS_OF_DAY_IST`.
+pub const UNIVERSE_SESSION_START_SECS_OF_DAY_IST: i64 = 32_400;
+/// 09:15 IST, the regular cash-market open. Pinned to `MARKET_OPEN_IST_NANOS`.
+pub const UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST: i64 = 33_300;
+/// 15:40 IST, seconds of day. Pinned to `constants::TICK_PERSIST_END_SECS_OF_DAY_IST`.
+pub const UNIVERSE_SESSION_END_SECS_OF_DAY_IST: i64 = 56_400;
+/// Newest row at most this old reads `live` (the API's `FNO_STOCKS_LIVE_MAX_AGE_SECS`).
+pub const UNIVERSE_LIVE_MAX_AGE_SECS: i64 = 60;
+/// Window reported by an answer with no rows (the API's `FNO_STOCKS_WINDOW_SECS`).
+pub const UNIVERSE_DEFAULT_WINDOW_SECS: i64 = 900;
+/// A published universe older than this is not used (the reader falls back
+/// to asking the box). One bound, session open or closed: the publisher
+/// re-publishes every 5 s whenever a viewer is active, closed session
+/// included, so a closed-session universe needs no longer bound (the 300 s
+/// bound it had was dead: a reply's own capture bound is 60 s).
+pub const UNIVERSE_MAX_AGE_SECS: i64 = 20;
+/// A universe stamped this far ahead of the reader's clock is refused.
+pub const UNIVERSE_MAX_FUTURE_SKEW_SECS: i64 = 5;
+/// Object key of the published universe inside the live-view bucket.
+pub const MOVERS_UNIVERSE_OBJECT_KEY: &str = "movers/universe.json";
+/// Object key of the viewer heartbeat inside the live-view bucket. The
+/// operator Lambda writes it on a movers call; the app publishes the universe
+/// only while it is unexpired (no viewer, no publishing, no database query).
+pub const MOVERS_VIEWER_OBJECT_KEY: &str = "movers/viewer.json";
+/// A heartbeat keeps the publisher running this long after it was written.
+pub const VIEWER_HEARTBEAT_TTL_SECS: i64 = 120;
+/// The Lambda writes the heartbeat at most once per this many seconds per
+/// container (the portal refreshes every 30 s while the view is open).
+pub const VIEWER_HEARTBEAT_INTERVAL_SECS: i64 = 30;
+/// Largest heartbeat object a reader accepts, in bytes.
+pub const MAX_VIEWER_BYTES: usize = 256;
+// A viewer refreshing every interval keeps the heartbeat alive across two
+// missed writes.
+const _: () = assert!(VIEWER_HEARTBEAT_INTERVAL_SECS * 3 < VIEWER_HEARTBEAT_TTL_SECS);
+/// The Stocks view never shows the turnover estimate as actual value.
+pub const ACTUAL_VALUE_UNAVAILABLE: &str =
+    "Actual traded value is not captured; Value (Cr.) is unavailable.";
+
+const SECONDS_PER_DAY: i64 = 86_400;
+/// Bound on one stored list name; a name the view cannot show (over 128
+/// bytes) is still carried so `select` refuses it exactly as the API did.
+const MAX_LIST_NAME_BYTES: usize = 1_024;
+
+/// The viewer heartbeat (`movers/viewer.json`): "a viewer is looking until
+/// this UTC second".
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ViewerHeartbeat {
+    pub until_epoch_secs: i64,
+}
+
+impl ViewerHeartbeat {
+    /// The heartbeat a call at `now_epoch` writes.
+    #[must_use]
+    pub fn written_at(now_epoch: i64) -> Self {
+        Self {
+            until_epoch_secs: now_epoch.saturating_add(VIEWER_HEARTBEAT_TTL_SECS),
+        }
+    }
+
+    /// Parses a stored heartbeat; `None` when oversize or malformed. O(bytes).
+    #[must_use]
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > MAX_VIEWER_BYTES {
+            return None;
+        }
+        serde_json::from_slice(bytes).ok()
+    }
+
+    /// Whether a viewer is active at `now_epoch`: unexpired, and not stamped
+    /// further ahead than one heartbeat plus the clock skew bound (a far
+    /// future value would otherwise keep the publisher running for good).
+    #[must_use]
+    pub fn active_at(&self, now_epoch: i64) -> bool {
+        now_epoch < self.until_epoch_secs
+            && self.until_epoch_secs.saturating_sub(now_epoch)
+                <= VIEWER_HEARTBEAT_TTL_SECS + UNIVERSE_MAX_FUTURE_SKEW_SECS
+    }
+}
+
+/// S3 bucket name rules this view's bucket must meet: 3 to 63 characters of
+/// `[a-z0-9-]`, starting and ending with a letter or digit, and none of the
+/// reserved prefixes or suffixes (`xn--`, `sthree-`, `-s3alias`, `--ol-s3`,
+/// `--x-s3`). Dots are refused too (they break TLS virtual hosting). O(len).
+#[must_use]
+pub fn valid_live_view_bucket_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (3..=63).contains(&bytes.len())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && !name.starts_with("xn--")
+        && !name.starts_with("sthree-")
+        && !name.ends_with("-s3alias")
+        && !name.ends_with("--ol-s3")
+        && !name.ends_with("--x-s3")
+}
+
+/// An AWS account id: exactly 12 ASCII digits.
+#[must_use]
+pub fn valid_account_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Weekday 09:00–15:40 IST at a UTC second. The reader's own session state
+/// (the Lambda has no holiday calendar, so a weekday holiday reads open and
+/// an open universe on it is refused: the box answers). O(1).
+#[must_use]
+pub fn weekday_session_open_at(epoch_secs: i64) -> bool {
+    let local = epoch_secs.saturating_add(UNIVERSE_IST_OFFSET_SECS);
+    // 1970-01-01 was a Thursday: day 0 → Thu, 2 → Sat, 3 → Sun.
+    let weekday_from_thursday = local.div_euclid(SECONDS_PER_DAY).rem_euclid(7);
+    let of_day = local.rem_euclid(SECONDS_PER_DAY);
+    !matches!(weekday_from_thursday, 2 | 3)
+        && (UNIVERSE_SESSION_START_SECS_OF_DAY_IST..UNIVERSE_SESSION_END_SECS_OF_DAY_IST)
+            .contains(&of_day)
+}
+
+/// The live-view bucket of one environment, `tv-<env>-live-view`.
+#[must_use]
+pub fn live_view_bucket_for(environment: &str) -> String {
+    format!("tv-{environment}-live-view")
+}
+
+/// One stock on a stored list, keyed on the composite `(security_id, segment)`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListedStock {
+    pub security_id: u64,
+    pub segment_code: u8,
+    pub name: String,
+}
+
+/// The index memberships of one stock (positions in [`UniverseMembership::indices`]).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StockIndices {
+    pub security_id: u64,
+    pub segment_code: u8,
+    pub indices: Vec<usize>,
+}
+
+/// Observed daily broker terms keyed by NSE cash security ID. An explicit
+/// zero is distinguishable from an instrument with no usable master entry.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MtfTerms {
+    pub observed_at_epoch_secs: i64,
+    #[serde(deserialize_with = "crate::mtf_receipt_json::deserialize_mtf_leverage_map")]
+    pub leverage_by_security_id: std::collections::BTreeMap<u64, f64>,
+}
+
+/// The day's index-membership mapping, as the API read it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseMembership {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtf: Option<MtfTerms>,
+    pub names: Vec<ListedStock>,
+    /// Index labels, strictly ascending.
+    pub indices: Vec<String>,
+    pub by_stock: Vec<StockIndices>,
+    /// An index was unresolved or a known index is missing.
+    pub partial: bool,
+}
+
+/// One accepted price row: finite positive last price, inside the read window.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PriceRow {
+    pub security_id: u64,
+    pub segment_code: u8,
+    pub ltp: f64,
+    /// Previous session's close, only when finite and positive.
+    pub prev_close: Option<f64>,
+    /// Exchange-reported opening price of this session. Earlier universes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_open: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_low: Option<f64>,
+    /// Day's cumulative volume as stored (zero kept; the view drops it).
+    pub volume: Option<u64>,
+    /// Exchange time of the row, IST seconds since the epoch (naive IST).
+    pub ts_ist_secs: i64,
+}
+
+/// What the price query gave.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UniversePrices {
+    /// The accepted rows, in the order the database returned them.
+    Rows { rows: Vec<PriceRow> },
+    /// Closed and before the day's 09:15: nothing to read, no query ran.
+    BeforeSession,
+    /// The database did not answer.
+    Unreachable,
+    /// The database answered with an error or a malformed body.
+    QueryFailed,
+}
+
+/// One observation of the Stocks movers view.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MoversUniverse {
+    pub format_version: u32,
+    /// IST date of the read instant, `YYYY-MM-DD`; the lists are that day's.
+    pub trading_date_ist: String,
+    /// UTC epoch seconds of the observation (the reply's capture time).
+    pub observed_at_epoch_secs: i64,
+    /// The read instant (now, or a chosen past minute), naive IST seconds.
+    pub read_at_ist_secs: i64,
+    /// Session open AND a live read (not a chosen minute).
+    pub market_open: bool,
+    /// Window the query read, seconds.
+    pub window_secs: i64,
+    pub prices: UniversePrices,
+    /// Today's F&O list; `None` when missing or unreadable.
+    pub fno: Option<Vec<ListedStock>>,
+    /// Today's index memberships; `None` when missing or unreadable.
+    pub membership: Option<UniverseMembership>,
+}
+
+/// Why a published universe is not used by a reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniverseRefusal {
+    /// Wrong format version or a field outside its bounds.
+    Invalid,
+    /// Built for a different IST date than the reader's.
+    OtherDay,
+    /// Older than [`UNIVERSE_MAX_AGE_SECS`].
+    Stale,
+    /// Stamped more than [`UNIVERSE_MAX_FUTURE_SKEW_SECS`] ahead of the reader.
+    Future,
+    /// Its `market_open` differs from the reader's own session state at the
+    /// read (a universe built just before 09:00 or 15:40 read just after).
+    SessionChanged,
+}
+
+impl UniverseRefusal {
+    /// Stable label for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::OtherDay => "other_day",
+            Self::Stale => "stale",
+            Self::Future => "future",
+            Self::SessionChanged => "session_changed",
+        }
+    }
+}
+
+/// IST date of a UTC epoch second, `YYYY-MM-DD`.
+#[must_use]
+pub fn ist_date_of_epoch(epoch_secs: i64) -> Option<String> {
+    let local = epoch_secs.checked_add(UNIVERSE_IST_OFFSET_SECS)?;
+    chrono::DateTime::from_timestamp(local, 0).map(|t| t.format("%Y-%m-%d").to_string())
+}
+
+fn valid_date_shape(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+fn valid_list(list: &[ListedStock]) -> bool {
+    let mut keys = HashSet::with_capacity(list.len());
+    list.len() <= MAX_UNIVERSE_LIST_ROWS
+        && list.iter().all(|s| {
+            s.security_id != 0
+                && s.segment_code == UNIVERSE_NSE_EQ_SEGMENT_CODE
+                && s.name.len() <= MAX_LIST_NAME_BYTES
+                && keys.insert((s.security_id, s.segment_code))
+        })
+}
+
+impl MoversUniverse {
+    /// Shape and bounds check a reader runs before [`select`]. O(rows + list rows).
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        let prices_valid = match &self.prices {
+            UniversePrices::Rows { rows } => {
+                rows.len() <= MAX_UNIVERSE_PRICE_ROWS
+                    && rows.iter().all(|r| {
+                        r.ltp.is_finite()
+                            && r.ltp > 0.0
+                            && r.prev_close.is_none_or(|p| p.is_finite() && p > 0.0)
+                            && [r.session_open, r.session_high, r.session_low]
+                                .into_iter()
+                                .flatten()
+                                .all(|p| p.is_finite() && p > 0.0)
+                    })
+            }
+            _ => true,
+        };
+        let membership_valid = self.membership.as_ref().is_none_or(|m| {
+            let mut keys = HashSet::with_capacity(m.by_stock.len());
+            valid_list(&m.names)
+                && m.indices.len() <= MAX_INDEX_NAMES
+                && m.indices.iter().all(|s| {
+                    !s.is_empty()
+                        && s.len() <= MAX_INDEX_NAME_BYTES
+                        && !s.chars().any(char::is_control)
+                })
+                && m.indices.windows(2).all(|w| w[0] < w[1])
+                && m.by_stock.len() <= MAX_UNIVERSE_LIST_ROWS
+                && m.by_stock.iter().all(|s| {
+                    s.segment_code == UNIVERSE_NSE_EQ_SEGMENT_CODE
+                        && keys.insert((s.security_id, s.segment_code))
+                        && s.indices.len() <= m.indices.len()
+                        && s.indices.iter().all(|i| *i < m.indices.len())
+                        && s.indices.windows(2).all(|w| w[0] < w[1])
+                })
+        });
+        self.format_version == UNIVERSE_FORMAT_VERSION
+            && valid_date_shape(&self.trading_date_ist)
+            && self.window_secs > 0
+            && self.window_secs <= SECONDS_PER_DAY
+            && prices_valid
+            && self.fno.as_deref().is_none_or(valid_list)
+            && membership_valid
+    }
+
+    /// Whether a reader at `now_epoch` (UTC seconds) may answer from this
+    /// universe. O(rows) for the shape check, O(1) otherwise.
+    ///
+    /// # Errors
+    ///
+    /// The [`UniverseRefusal`] naming why it may not.
+    pub fn usable_at(&self, now_epoch: i64) -> Result<(), UniverseRefusal> {
+        if !self.valid() {
+            return Err(UniverseRefusal::Invalid);
+        }
+        if ist_date_of_epoch(now_epoch).as_deref() != Some(self.trading_date_ist.as_str()) {
+            return Err(UniverseRefusal::OtherDay);
+        }
+        let age = now_epoch.saturating_sub(self.observed_at_epoch_secs);
+        if age < -UNIVERSE_MAX_FUTURE_SKEW_SECS {
+            return Err(UniverseRefusal::Future);
+        }
+        if age > UNIVERSE_MAX_AGE_SECS {
+            return Err(UniverseRefusal::Stale);
+        }
+        if weekday_session_open_at(now_epoch) != self.market_open {
+            return Err(UniverseRefusal::SessionChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Reply expiry: one minute after the observation, or the next 09:00, 15:40
+/// or IST midnight, whichever comes first. `None` on overflow.
+#[must_use]
+pub fn snapshot_deadline(observed: i64) -> Option<i64> {
+    let local = observed.checked_add(UNIVERSE_IST_OFFSET_SECS)?;
+    let midnight = local
+        .div_euclid(SECONDS_PER_DAY)
+        .checked_mul(SECONDS_PER_DAY)?
+        .checked_sub(UNIVERSE_IST_OFFSET_SECS)?;
+    let mut deadline = observed.checked_add(60)?;
+    for seconds in [
+        UNIVERSE_SESSION_START_SECS_OF_DAY_IST,
+        UNIVERSE_SESSION_END_SECS_OF_DAY_IST,
+        SECONDS_PER_DAY,
+    ] {
+        let boundary = midnight.checked_add(seconds)?;
+        if boundary > observed {
+            deadline = deadline.min(boundary);
+        }
+    }
+    Some(deadline)
+}
+
+fn hh_mm_ss(ist_secs: i64) -> String {
+    let of_day = ist_secs.rem_euclid(SECONDS_PER_DAY);
+    format!(
+        "{:02}:{:02}:{:02}",
+        of_day / 3_600,
+        (of_day / 60) % 60,
+        of_day % 60
+    )
+}
+
+fn change_against(ltp: f64, prev_close: Option<f64>) -> (Option<f64>, Option<f64>) {
+    match prev_close {
+        Some(prev) if prev.is_finite() && prev > 0.0 && ltp.is_finite() && ltp > 0.0 => {
+            let change = ltp - prev;
+            (Some(change), Some(change / prev * 100.0))
+        }
+        _ => (None, None),
+    }
+}
+
+type Key = (u64, u8);
+
+fn name_map(list: &[ListedStock]) -> HashMap<Key, &str> {
+    list.iter()
+        .map(|s| ((s.security_id, s.segment_code), s.name.as_str()))
+        .collect()
+}
+
+struct MembershipView<'a> {
+    names: HashMap<Key, &'a str>,
+    indices: &'a [String],
+    by_stock: HashMap<Key, &'a [usize]>,
+    partial: bool,
+    mtf: Option<&'a MtfTerms>,
+}
+
+impl<'a> MembershipView<'a> {
+    fn new(m: &'a UniverseMembership) -> Self {
+        Self {
+            names: name_map(&m.names),
+            indices: &m.indices,
+            by_stock: m
+                .by_stock
+                .iter()
+                .map(|s| ((s.security_id, s.segment_code), s.indices.as_slice()))
+                .collect(),
+            partial: m.partial,
+            mtf: m.mtf.as_ref(),
+        }
+    }
+}
+
+struct PricedStock {
+    qualifies: bool,
+    security_id: u64,
+    name: String,
+    ltp: f64,
+    prev_close: Option<f64>,
+    change: Option<f64>,
+    change_pct: Option<f64>,
+    volume: Option<u64>,
+    last_trade_ist: String,
+}
+
+struct PriceView {
+    status: SourceStatus,
+    market_open: bool,
+    observed: i64,
+    as_of_ist: Option<String>,
+    data_age_secs: Option<i64>,
+    total: usize,
+    stocks_priced: usize,
+    window_secs: i64,
+    stocks: Vec<PricedStock>,
+}
+
+impl PriceView {
+    fn empty(status: SourceStatus, market_open: bool, total: usize, observed: i64) -> Self {
+        Self {
+            status,
+            market_open,
+            observed,
+            as_of_ist: None,
+            data_age_secs: None,
+            total,
+            stocks_priced: 0,
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            stocks: Vec::new(),
+        }
+    }
+}
+
+/// The price engine over the selected names (the API's `compute_for_list`).
+fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>, filter: &Filter) -> PriceView {
+    let total = names.len();
+    let open = universe.market_open;
+    let now = universe.observed_at_epoch_secs;
+    let rows = match &universe.prices {
+        UniversePrices::BeforeSession => {
+            return PriceView::empty(SourceStatus::Closed, false, total, now);
+        }
+        UniversePrices::Unreachable => {
+            return PriceView::empty(SourceStatus::Unreachable, open, total, now);
+        }
+        UniversePrices::QueryFailed => {
+            return PriceView::empty(SourceStatus::QueryFailed, open, total, now);
+        }
+        UniversePrices::Rows { rows } => rows,
+    };
+    let at = universe.read_at_ist_secs;
+    let session_start = at
+        .saturating_sub(at.rem_euclid(SECONDS_PER_DAY))
+        .saturating_add(UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST);
+    let session_end = if open {
+        at.saturating_add(UNIVERSE_MAX_FUTURE_SKEW_SECS)
+    } else {
+        at
+    };
+    let mut newest: Option<i64> = None;
+    let mut stocks = Vec::with_capacity(rows.len().min(total));
+    for row in rows {
+        let Some(name) = names.get(&(row.security_id, row.segment_code)) else {
+            continue;
+        };
+        if !row.ltp.is_finite() || row.ltp <= 0.0 {
+            continue;
+        }
+        let prev_close = row.prev_close.filter(|p| p.is_finite() && *p > 0.0);
+        let (change, change_pct, qualifies) =
+            if filter.category == Some(MoversCategory::ExtremeOpenings) {
+                // Compare the high and low reported on this quote at its timestamp.
+                // A pre-open or out-of-session quote can carry another day's OHLC.
+                if !(session_start..=session_end).contains(&row.ts_ist_secs) {
+                    continue;
+                }
+                let (Some(open), Some(high), Some(low)) =
+                    (row.session_open, row.session_high, row.session_low)
+                else {
+                    continue;
+                };
+                let range = low..=high;
+                if !range.contains(&open) || !range.contains(&row.ltp) {
+                    continue;
+                }
+                let (change, pct) = change_against(row.ltp, Some(open));
+                if !pct.is_some_and(f64::is_finite) {
+                    continue;
+                }
+                let qualifies = match filter.direction {
+                    Direction::Gainers => open == low,
+                    Direction::Losers => open == high,
+                    Direction::All => open == low || open == high,
+                };
+                (change, pct, qualifies)
+            } else {
+                let (change, pct) = change_against(row.ltp, prev_close);
+                (change, pct, true)
+            };
+        newest = Some(newest.map_or(row.ts_ist_secs, |n| n.max(row.ts_ist_secs)));
+        stocks.push(PricedStock {
+            qualifies,
+            security_id: row.security_id,
+            name: (*name).to_string(),
+            ltp: row.ltp,
+            prev_close,
+            change,
+            change_pct,
+            volume: row.volume,
+            last_trade_ist: hh_mm_ss(row.ts_ist_secs),
+        });
+    }
+    let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
+        let status = if open {
+            SourceStatus::NoData
+        } else {
+            SourceStatus::Closed
+        };
+        return PriceView::empty(status, open, total, now);
+    };
+    let age = universe.read_at_ist_secs.saturating_sub(newest).max(0);
+    PriceView {
+        status: if !open {
+            SourceStatus::Closed
+        } else if age <= UNIVERSE_LIVE_MAX_AGE_SECS {
+            SourceStatus::Live
+        } else {
+            SourceStatus::Stale
+        },
+        market_open: open,
+        observed: now,
+        as_of_ist: Some(hh_mm_ss(newest)),
+        data_age_secs: Some(age),
+        total,
+        stocks_priced: stocks.len(),
+        window_secs: universe.window_secs,
+        stocks,
+    }
+}
+
+/// Protocol v2 clients omitting sort fields retain the original percentage,
+/// name and identity ordering. The losers view reversed that entire order.
+fn compare_for_page(
+    filter: &Filter,
+    left: &MemberStock,
+    right: &MemberStock,
+) -> std::cmp::Ordering {
+    if filter.sort_by.is_some() {
+        return filter.compare_rows(left, right);
+    }
+    let (a, b) = (&left.price, &right.price);
+    let order = match (a.change_pct, b.change_pct) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| a.name.cmp(&b.name))
+    .then_with(|| a.security_id.cmp(&b.security_id));
+    if filter.direction == Direction::Losers {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+/// Isolate the requested ranks in linear time and sort just the returned page.
+/// The comparator totally orders validated, unique stock identities.
+fn select_page(mut matches: Vec<MemberStock>, filter: &Filter) -> Vec<MemberStock> {
+    let start = filter.offset;
+    if start >= matches.len() {
+        return Vec::new();
+    }
+    let compare = |a: &MemberStock, b: &MemberStock| compare_for_page(filter, a, b);
+    if start > 0 {
+        matches.select_nth_unstable_by(start - 1, compare);
+    }
+    let after_offset = &mut matches[start..];
+    if after_offset.len() > SELECTION_LIMIT {
+        after_offset.select_nth_unstable_by(SELECTION_LIMIT, compare);
+    }
+    let count = after_offset.len().min(SELECTION_LIMIT);
+    after_offset[..count].sort_unstable_by(compare);
+    matches.into_iter().skip(start).take(count).collect()
+}
+
+fn finish(
+    prices: PriceView,
+    filter: &Filter,
+    membership: Option<&MembershipView<'_>>,
+    fno: Option<&HashMap<Key, &str>>,
+    mtf_coverage: Option<MtfCoverage>,
+) -> Reply {
+    let observed = prices.observed;
+    let index_names = membership.map_or_else(Vec::new, |m| m.indices.to_vec());
+    let membership_status = match membership {
+        None => MembershipStatus::Unavailable,
+        Some(m) if m.partial => MembershipStatus::Partial,
+        Some(_) => MembershipStatus::Available,
+    };
+    let mut ids = HashSet::with_capacity(prices.stocks.len());
+    let mut selected = Vec::with_capacity(prices.stocks.len());
+    for row in prices.stocks {
+        let price = Stock {
+            security_id: row.security_id,
+            segment: UNIVERSE_NSE_EQ_SEGMENT.into(),
+            name: row.name,
+            ltp: row.ltp,
+            prev_close: row.prev_close,
+            change: row.change,
+            change_pct: row.change_pct,
+            // A zero cumulative cannot prove a reported zero; unavailable.
+            volume: row.volume.filter(|volume| *volume > 0),
+            // The captured value is an estimate; never shown as actual value.
+            value_cr: None,
+            last_trade_ist: row.last_trade_ist,
+        };
+        if !price.valid() || !ids.insert(price.security_id) {
+            return Reply::error(BridgeError::InvalidResponse, observed);
+        }
+        if !row.qualifies || !filter.matches_price(&price) {
+            continue;
+        }
+        let key = (price.security_id, UNIVERSE_NSE_EQ_SEGMENT_CODE);
+        let indices = membership
+            .and_then(|m| m.by_stock.get(&key))
+            .map(|i| i.to_vec())
+            .unwrap_or_default();
+        let eligible = fno.map(|f| f.contains_key(&key));
+        let volume_text = price.volume.map(|volume| volume.to_string());
+        let mtf_leverage = mtf_coverage.and_then(|_| {
+            membership?
+                .mtf?
+                .leverage_by_security_id
+                .get(&price.security_id)
+                .copied()
+        });
+        selected.push(MemberStock {
+            mtf_leverage,
+            price,
+            company_name: None,
+            volume_text,
+            indices,
+            fno: eligible,
+        });
+    }
+    let matching_total = selected.len();
+    let rows = select_page(selected, filter);
+    let snapshot = Snapshot {
+        mtf_coverage,
+        filter: filter.clone(),
+        status: prices.status,
+        market_open: prices.market_open,
+        as_of_ist: prices.as_of_ist,
+        data_age_secs: prices.data_age_secs,
+        universe_available: (filter.category != Some(MoversCategory::Mtf)
+            || mtf_coverage.is_some())
+            && (if filter.fno_only {
+                fno.is_some()
+            } else {
+                membership.is_some()
+            })
+            && filter.index.as_ref().is_none_or(|name| {
+                membership.is_some_and(|m| m.indices.binary_search(name).is_ok())
+            }),
+        universe_total: prices.total,
+        stocks_priced: prices.stocks_priced,
+        matching_total,
+        selection_limit: SELECTION_LIMIT,
+        window_secs: prices.window_secs,
+        value_basis: ACTUAL_VALUE_UNAVAILABLE.into(),
+        index_names,
+        membership_status,
+        fno_list_available: fno.is_some(),
+        rows,
+    };
+    let Some(valid_until_epoch_secs) = snapshot_deadline(observed) else {
+        return Reply::error(BridgeError::InvalidResponse, observed);
+    };
+    if !snapshot.valid() {
+        return Reply::error(BridgeError::InvalidResponse, observed);
+    }
+    let reply = Reply {
+        valid_until_epoch_secs,
+        version: FILTERED_PROTOCOL_VERSION,
+        captured_at_epoch_secs: observed,
+        outcome: Outcome::Snapshot {
+            snapshot: Box::new(snapshot),
+        },
+    };
+    if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_WIRE_BYTES) {
+        return Reply::error(BridgeError::ResponseTooLarge, observed);
+    }
+    reply
+}
+
+/// The filtered, paged movers reply for `filter` from one universe: exactly
+/// what the per-filter API path returned for the same rows, lists and times
+/// (pinned by the API's property test against that path). Ranking takes O(n)
+/// comparisons plus O(p log p) for the returned page of p ≤ [`SELECTION_LIMIT`].
+/// n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]. Every failure is a typed reply.
+#[must_use]
+pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
+    let now = universe.observed_at_epoch_secs;
+    let open = universe.market_open;
+    let fno = universe.fno.as_deref().map(name_map);
+    let membership = universe.membership.as_ref().map(MembershipView::new);
+    let closed_or = |status| {
+        if open { status } else { SourceStatus::Closed }
+    };
+    let finish_empty = |status, coverage| {
+        finish(
+            PriceView::empty(status, open, 0, now),
+            filter,
+            membership.as_ref(),
+            fno.as_ref(),
+            coverage,
+        )
+    };
+    if filter.fno_only && fno.is_none() {
+        return finish_empty(closed_or(SourceStatus::NoFnoList), None);
+    }
+    if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
+    }
+    let names = if filter.fno_only {
+        fno.as_ref()
+    } else {
+        membership.as_ref().map(|m| &m.names)
+    };
+    let Some(names) = names else {
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
+    };
+    let selected_index = filter
+        .index
+        .as_ref()
+        .and_then(|name| membership.as_ref()?.indices.binary_search(name).ok());
+    if filter.index.is_some() && selected_index.is_none() {
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
+    }
+    let mut names: HashMap<Key, &str> = names
+        .iter()
+        .filter(|(key, _)| {
+            selected_index.is_none_or(|index| {
+                membership
+                    .as_ref()
+                    .and_then(|m| m.by_stock.get(*key))
+                    .is_some_and(|indices| indices.binary_search(&index).is_ok())
+            })
+        })
+        .map(|(key, name)| (*key, *name))
+        .collect();
+    if names.len() > MAX_SOURCE_ROWS {
+        return Reply::error(BridgeError::ResponseTooLarge, now);
+    }
+    let mut mtf_coverage = None;
+    if filter.category == Some(MoversCategory::Mtf) {
+        let cutoff = universe
+            .read_at_ist_secs
+            .saturating_sub(UNIVERSE_IST_OFFSET_SECS);
+        let Some(terms) = membership.as_ref().and_then(|m| m.mtf).filter(|t| {
+            t.observed_at_epoch_secs > 0
+                && t.observed_at_epoch_secs <= cutoff
+                && ist_date_of_epoch(t.observed_at_epoch_secs).as_deref()
+                    == Some(universe.trading_date_ist.as_str())
+                && !t.leverage_by_security_id.is_empty()
+                && t.leverage_by_security_id.len() <= MAX_UNIVERSE_LIST_ROWS
+        }) else {
+            return finish_empty(SourceStatus::NoMtfList, None);
+        };
+        let selected = names.len();
+        let mut assessed = 0;
+        names.retain(|&(id, _), _| match terms.leverage_by_security_id.get(&id) {
+            Some(&n) if n == 0.0 || (n.is_finite() && n >= 1.0) => {
+                assessed += 1;
+                n >= 1.0
+            }
+            _ => false,
+        });
+        mtf_coverage = Some(MtfCoverage {
+            selected,
+            assessed,
+            eligible: names.len(),
+            observed_at_epoch_secs: terms.observed_at_epoch_secs,
+        });
+    }
+    if names.is_empty() {
+        return finish_empty(closed_or(SourceStatus::NoData), mtf_coverage);
+    }
+    finish(
+        price_view(universe, &names, filter),
+        filter,
+        membership.as_ref(),
+        fno.as_ref(),
+        mtf_coverage,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator_stock_movers_wire::{SortColumn, SortOrder};
+
+    const OBSERVED: i64 = 1_793_252_730; // 2026-10-29 11:15:30 IST
+    fn ist(observed: i64) -> i64 {
+        observed + UNIVERSE_IST_OFFSET_SECS
+    }
+    fn listed(id: u64) -> ListedStock {
+        ListedStock {
+            security_id: id,
+            segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+            name: format!("STOCK{id:03}"),
+        }
+    }
+    fn universe(rows: Vec<PriceRow>) -> MoversUniverse {
+        MoversUniverse {
+            format_version: UNIVERSE_FORMAT_VERSION,
+            trading_date_ist: ist_date_of_epoch(OBSERVED).unwrap(),
+            observed_at_epoch_secs: OBSERVED,
+            read_at_ist_secs: ist(OBSERVED),
+            market_open: true,
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            prices: UniversePrices::Rows { rows },
+            fno: Some((1..=4).map(|id| listed(id * 2)).collect()),
+            membership: Some(UniverseMembership {
+                mtf: None,
+                names: (1..=8).map(listed).collect(),
+                indices: vec!["Nifty 50".into(), "Nifty Bank".into()],
+                by_stock: (1..=8)
+                    .map(|id| StockIndices {
+                        security_id: id,
+                        segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                        indices: if id % 2 == 0 { vec![0, 1] } else { vec![0] },
+                    })
+                    .collect(),
+                partial: false,
+            }),
+        }
+    }
+    fn row(id: u64, ltp: f64, age: i64) -> PriceRow {
+        PriceRow {
+            security_id: id,
+            segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+            ltp,
+            session_open: None,
+            session_high: None,
+            session_low: None,
+            prev_close: Some(100.0),
+            volume: Some(1_000 + id),
+            ts_ist_secs: ist(OBSERVED) - age,
+        }
+    }
+    fn snapshot(reply: Reply) -> Snapshot {
+        match reply.outcome {
+            Outcome::Snapshot { snapshot } => *snapshot,
+            Outcome::Error { code } => panic!("expected snapshot, got {code:?}"),
+        }
+    }
+
+    #[test]
+    fn mtf_counts_known_zeros_unknowns_and_unpriced_eligible_stocks() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(6, 110.0, 4), row(8, 125.0, 3)]);
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED - 10,
+            leverage_by_security_id: [(2, 1.0), (4, 3.75), (6, 0.0)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let reply = select(&stocks, &filter);
+        assert!(reply.valid_at(OBSERVED, &filter));
+        let s = snapshot(reply);
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 3, 2));
+        assert_eq!(
+            (s.universe_total, s.stocks_priced, s.matching_total),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (s.rows[0].price.security_id, s.rows[0].mtf_leverage),
+            (2, Some(1.0))
+        );
+        for (leverage, valid) in [(1.0, true), (0.0, false), (0.9, false)] {
+            let mut changed = s.clone();
+            changed.rows[0].mtf_leverage = Some(leverage);
+            assert_eq!(changed.valid(), valid);
+        }
+        let mut changed = s.clone();
+        changed.rows[0].mtf_leverage = None;
+        assert!(!changed.valid());
+        let mut changed = s;
+        changed.mtf_coverage.as_mut().unwrap().eligible = 4;
+        assert!(!changed.valid());
+
+        let daily = select(&stocks, &Filter::default());
+        stocks.membership.as_mut().unwrap().mtf = None;
+        assert_eq!(daily, select(&stocks, &Filter::default()));
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::NoMtfList);
+        assert!(!s.universe_available);
+        assert!(s.mtf_coverage.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_mtf_leverage_map_preserves_other_prices_and_refuses_ambiguous_security() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(4, 99.0, 0)]);
+        let ordinary = select(&stocks, &Filter::default());
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        for raw in [
+            r#"{"2":0,"2":2.5}"#,
+            r#"{"02":0,"2":2.5}"#,
+            r#"{"2":2.5,"\u0032":0}"#,
+            r#"{"2":2.5,"+2":1,"2":3}"#,
+            r#"{" 2 ":0,"2":2.5}"#,
+        ] {
+            let parse = |body: &str| {
+                serde_json::from_str::<MtfTerms>(&format!(
+                    r#"{{"observed_at_epoch_secs":{},"leverage_by_security_id":{body}}}"#,
+                    OBSERVED
+                ))
+                .unwrap()
+            };
+            stocks.membership.as_mut().unwrap().mtf = Some(parse(raw));
+            let unavailable = snapshot(select(&stocks, &filter));
+            assert_eq!(unavailable.status, SourceStatus::NoMtfList, "{raw}");
+            assert!(unavailable.mtf_coverage.is_none());
+            assert_eq!(select(&stocks, &Filter::default()), ordinary);
+            let normal = format!("{},\"4\":1.0}}", &raw[..raw.len() - 1]);
+            let known = parse(&normal);
+            assert_eq!(known.leverage_by_security_id, [(4, 1.0)].into());
+        }
+    }
+
+    #[test]
+    fn mtf_rejects_future_wrong_day_and_cross_cutoff_wire_terms() {
+        let mut stocks = universe(vec![row(2, 101.0, 0)]);
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            as_of: Some(
+                chrono::DateTime::from_timestamp(ist(OBSERVED), 0)
+                    .unwrap()
+                    .format("%Y-%m-%dT%H:%M")
+                    .to_string(),
+            ),
+            ..Filter::default()
+        };
+        stocks.market_open = false;
+        stocks.read_at_ist_secs = ist(OBSERVED) - 30;
+        for stamp in [OBSERVED, OBSERVED - 86_400, 0] {
+            stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+                observed_at_epoch_secs: stamp,
+                leverage_by_security_id: [(2, 1.0)].into(),
+            });
+            let answer = select(&stocks, &filter);
+            assert!(answer.valid_at(OBSERVED, &filter));
+            assert_eq!(snapshot(answer).status, SourceStatus::NoMtfList);
+        }
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .observed_at_epoch_secs = OBSERVED - 30;
+        let answer = select(&stocks, &filter);
+        assert!(answer.valid_at(OBSERVED, &filter));
+        for stamp in [OBSERVED - 29, OBSERVED - 86_400] {
+            let mut changed = answer.clone();
+            let Outcome::Snapshot { snapshot } = &mut changed.outcome else {
+                panic!("snapshot")
+            };
+            snapshot
+                .mtf_coverage
+                .as_mut()
+                .unwrap()
+                .observed_at_epoch_secs = stamp;
+            assert!(!changed.valid_at(OBSERVED, &filter));
+        }
+    }
+
+    #[test]
+    fn mtf_all_known_ineligible_survives_price_failure_and_invalid_values_stay_unknown() {
+        let mut stocks = universe(vec![]);
+        stocks.prices = UniversePrices::Unreachable;
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED,
+            leverage_by_security_id: [(2, 0.0), (4, -1.0), (6, f64::NAN), (8, 0.5)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let s = snapshot(select(&stocks, &filter));
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 1, 0));
+        assert!(s.universe_available);
+        assert_eq!(s.status, SourceStatus::NoData);
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .leverage_by_security_id
+            .insert(4, 2.0);
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::Unreachable);
+        assert_eq!(s.universe_total, 1);
+    }
+
+    #[test]
+    fn extreme_openings_match_the_reported_day_extreme_and_keep_zero_recovery() {
+        let quote = |id, ltp, open, high, low| PriceRow {
+            session_open: Some(open),
+            session_high: Some(high),
+            session_low: Some(low),
+            ..row(id, ltp, 1)
+        };
+        let mut stocks = universe(vec![
+            quote(2, 99.0, 90.0, 110.0, 90.0),
+            quote(4, 110.0, 125.0, 125.0, 100.0),
+            quote(6, 100.0, 100.0, 100.0, 100.0),
+            quote(8, 130.0, 110.0, 140.0, 105.0),
+        ]);
+        for (direction, expected) in [
+            (Direction::Gainers, vec![(2, 10.0), (6, 0.0)]),
+            (Direction::Losers, vec![(4, -12.0), (6, 0.0)]),
+        ] {
+            let filter = Filter {
+                category: Some(MoversCategory::ExtremeOpenings),
+                direction,
+                ..Filter::default()
+            };
+            let reply = select(&stocks, &filter);
+            assert!(reply.valid_at(OBSERVED, &filter));
+            let s = snapshot(reply);
+            assert_eq!((s.stocks_priced, s.matching_total), (4, 2));
+            assert_eq!(
+                s.rows
+                    .iter()
+                    .map(|r| (r.price.security_id, r.price.change_pct.unwrap()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        // A subsequent low below the open removes a stock from Open = Low.
+        let UniversePrices::Rows { rows } = &mut stocks.prices else {
+            unreachable!()
+        };
+        rows[0].session_low = Some(89.0);
+        let low = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            direction: Direction::Gainers,
+            ..Filter::default()
+        };
+        assert_eq!(snapshot(select(&stocks, &low)).matching_total, 1);
+        // Intraday and Price Movers share the daily previous-close measure.
+        let intraday = Filter {
+            category: Some(MoversCategory::Intraday),
+            ..Filter::default()
+        };
+        let daily = snapshot(select(&stocks, &Filter::default()));
+        assert_eq!(snapshot(select(&stocks, &intraday)).rows, daily.rows);
+    }
+
+    #[test]
+    fn old_missing_or_inconsistent_session_ranges_and_out_of_session_ticks_are_unavailable() {
+        let legacy:PriceRow=serde_json::from_value(serde_json::json!({"security_id":2,"segment_code":1,"ltp":100.0,"prev_close":90.0,"volume":10,"ts_ist_secs":ist(OBSERVED)})).unwrap();
+        let full = PriceRow {
+            session_open: Some(100.0),
+            session_high: Some(110.0),
+            session_low: Some(100.0),
+            ..row(4, 100.0, 0)
+        };
+        let midnight = ist(OBSERVED).div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY;
+        let samples = [
+            legacy,
+            PriceRow {
+                session_low: None,
+                ..full.clone()
+            },
+            PriceRow {
+                session_low: Some(101.0),
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: midnight + UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST - 1,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) - SECONDS_PER_DAY,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) + UNIVERSE_MAX_FUTURE_SKEW_SECS + 1,
+                ..full
+            },
+        ];
+        let filter = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            ..Filter::default()
+        };
+        assert_eq!(
+            Filter::from_hex(&filter.to_hex().unwrap()),
+            Some(filter.clone())
+        );
+        for sample in samples {
+            let s = snapshot(select(&universe(vec![sample]), &filter));
+            assert_eq!(
+                (s.status, s.stocks_priced, s.matching_total),
+                (SourceStatus::NoData, 0, 0)
+            );
+        }
+        let mut u = universe(vec![]);
+        u.prices = UniversePrices::QueryFailed;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::QueryFailed
+        );
+        u.prices = UniversePrices::Unreachable;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::Unreachable
+        );
+        u.membership = None;
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            ..filter
+        };
+        assert_eq!(
+            snapshot(select(&u, &index)).status,
+            SourceStatus::NoIndexList
+        );
+    }
+
+    #[test]
+    fn test_select_filters_sorts_and_pages_one_universe_for_every_filter() {
+        let u = universe((1..=8).map(|id| row(id, 100.0 + id as f64, 5)).collect());
+        assert!(u.valid());
+        let fno = snapshot(select(&u, &Filter::default()));
+        assert_eq!(fno.status, SourceStatus::Live);
+        assert_eq!((fno.universe_total, fno.stocks_priced), (4, 4));
+        assert_eq!(fno.rows[0].price.security_id, 8);
+        assert!(fno.rows.iter().all(|r| r.fno == Some(true)));
+        let all = snapshot(select(
+            &u,
+            &Filter {
+                fno_only: false,
+                sort_by: Some(SortColumn::Name),
+                sort_order: Some(SortOrder::Asc),
+                ..Filter::default()
+            },
+        ));
+        assert_eq!(all.matching_total, 8);
+        assert_eq!(all.rows[0].price.name, "STOCK001");
+        assert_eq!(all.rows[0].fno, Some(false));
+        let bank = snapshot(select(
+            &u,
+            &Filter {
+                fno_only: false,
+                index: Some("Nifty Bank".into()),
+                ..Filter::default()
+            },
+        ));
+        assert_eq!(bank.universe_total, 4);
+        let losers = snapshot(select(
+            &u,
+            &Filter {
+                direction: Direction::Losers,
+                ..Filter::default()
+            },
+        ));
+        assert!(losers.rows.is_empty(), "every change is positive");
+        let reply = select(&u, &Filter::default());
+        assert!(reply.valid_at(OBSERVED, &Filter::default()));
+    }
+
+    #[test]
+    fn test_movers_pages_match_full_sort_across_ties_missing_values_and_offsets() {
+        // Interleave IDs and repeat names and prices so equal values straddle page boundaries.
+        let rows: Vec<_> = (0..97_u64)
+            .map(|i| {
+                let id = (i * 53) % 97 + 1;
+                let mut price = row(
+                    id,
+                    match i % 3 {
+                        0 => 90.0,
+                        1 => 100.0,
+                        _ => 110.0,
+                    },
+                    5,
+                );
+                if id % 11 == 0 {
+                    price.prev_close = None;
+                }
+                price.volume = (id % 7 != 0).then_some((1_u64 << 53) + id % 4);
+                price
+            })
+            .collect();
+        let mut all = universe(rows.clone());
+        all.fno = Some(
+            rows.iter()
+                .map(|r| ListedStock {
+                    name: format!("SHARE{}", r.security_id % 4),
+                    ..listed(r.security_id)
+                })
+                .collect(),
+        );
+
+        // Project each input onto its wire row independently of the multi-row ranking.
+        let mut one = all.clone();
+        let mut legacy: Vec<_> = rows
+            .into_iter()
+            .map(|r| {
+                one.prices = UniversePrices::Rows { rows: vec![r] };
+                snapshot(select(&one, &Filter::default())).rows.remove(0)
+            })
+            .collect();
+        // Original price-view order: descending percentage, then ascending name and ID.
+        legacy.sort_by(|left, right| {
+            let (a, b) = (&left.price, &right.price);
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap()
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.security_id.cmp(&b.security_id))
+        });
+        let sorts = [
+            SortColumn::Name,
+            SortColumn::Ltp,
+            SortColumn::Change,
+            SortColumn::ChangePct,
+            SortColumn::ValueCr,
+            SortColumn::Volume,
+        ];
+        for direction in [Direction::All, Direction::Gainers, Direction::Losers] {
+            let modes = sorts
+                .into_iter()
+                .flat_map(|c| {
+                    [
+                        (Some(c), Some(SortOrder::Asc)),
+                        (Some(c), Some(SortOrder::Desc)),
+                    ]
+                })
+                .chain(std::iter::once((None, None)));
+            for (sort_by, sort_order) in modes {
+                let mut filter = Filter {
+                    direction,
+                    sort_by,
+                    sort_order,
+                    ..Filter::default()
+                };
+                let mut ordered: Vec<_> = legacy
+                    .iter()
+                    .filter(|r| filter.matches_price(&r.price))
+                    .cloned()
+                    .collect();
+                if sort_by.is_some() {
+                    ordered.sort_unstable_by(|a, b| filter.compare_rows(a, b));
+                } else if direction == Direction::Losers {
+                    ordered.reverse();
+                }
+                for offset in [0, 20, 40, 60, 80, 100, MAX_SOURCE_ROWS - SELECTION_LIMIT] {
+                    filter.offset = offset;
+                    let result = snapshot(select(&all, &filter));
+                    assert_eq!(result.matching_total, ordered.len());
+                    assert_eq!((result.stocks_priced, result.universe_total), (97, 97));
+                    let start = offset.min(ordered.len());
+                    let end = (start + SELECTION_LIMIT).min(ordered.len());
+                    assert_eq!(result.rows, ordered[start..end], "{filter:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_reports_missing_lists_unknown_index_and_failed_query_distinctly() {
+        let mut u = universe(vec![row(2, 101.0, 5)]);
+        u.fno = None;
+        assert_eq!(
+            snapshot(select(&u, &Filter::default())).status,
+            SourceStatus::NoFnoList
+        );
+        let mut u = universe(vec![row(2, 101.0, 5)]);
+        u.membership = None;
+        let no_index = Filter {
+            fno_only: false,
+            ..Filter::default()
+        };
+        assert_eq!(
+            snapshot(select(&u, &no_index)).status,
+            SourceStatus::NoIndexList
+        );
+        let u = universe(vec![row(2, 101.0, 5)]);
+        let unknown = Filter {
+            index: Some("Not an index".into()),
+            ..Filter::default()
+        };
+        let s = snapshot(select(&u, &unknown));
+        assert_eq!(s.status, SourceStatus::NoIndexList);
+        assert!(!s.universe_available);
+        for (prices, status) in [
+            (UniversePrices::Unreachable, SourceStatus::Unreachable),
+            (UniversePrices::QueryFailed, SourceStatus::QueryFailed),
+        ] {
+            let mut u = universe(vec![]);
+            u.prices = prices;
+            assert_eq!(snapshot(select(&u, &Filter::default())).status, status);
+        }
+        let mut u = universe(vec![]);
+        u.prices = UniversePrices::BeforeSession;
+        u.market_open = false;
+        let s = snapshot(select(&u, &Filter::default()));
+        assert_eq!((s.status, s.market_open), (SourceStatus::Closed, false));
+        assert_eq!(
+            snapshot(select(&universe(vec![]), &Filter::default())).status,
+            SourceStatus::NoData
+        );
+    }
+
+    #[test]
+    fn test_select_ages_stale_rows_and_refuses_duplicate_identity() {
+        let u = universe(vec![row(2, 101.0, 330)]);
+        let s = snapshot(select(&u, &Filter::default()));
+        assert_eq!(
+            (s.status, s.data_age_secs),
+            (SourceStatus::Stale, Some(330))
+        );
+        let u = universe(vec![row(2, 101.0, -3)]);
+        assert_eq!(
+            snapshot(select(&u, &Filter::default())).data_age_secs,
+            Some(0)
+        );
+        let u = universe(vec![row(2, 101.0, 5), row(2, 102.0, 5)]);
+        assert_eq!(
+            select(&u, &Filter::default()).outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+    }
+
+    #[test]
+    fn test_select_drops_zero_volume_and_never_shows_estimated_value() {
+        let mut zero = row(2, 101.0, 5);
+        zero.volume = Some(0);
+        let mut no_close = row(4, 99.0, 5);
+        no_close.prev_close = None;
+        let s = snapshot(select(&universe(vec![zero, no_close]), &Filter::default()));
+        let by_id = |id| s.rows.iter().find(|r| r.price.security_id == id).unwrap();
+        assert!(by_id(2).price.volume.is_none() && by_id(2).volume_text.is_none());
+        assert!(by_id(4).price.change.is_none() && by_id(4).price.change_pct.is_none());
+        assert!(s.rows.iter().all(|r| r.price.value_cr.is_none()));
+        assert_eq!(s.value_basis, ACTUAL_VALUE_UNAVAILABLE);
+        assert_eq!(by_id(2).price.last_trade_ist, "11:15:25");
+    }
+
+    #[test]
+    fn test_universe_round_trips_through_json_and_selects_identically() {
+        let u = universe((1..=8).map(|id| row(id, 100.25 + id as f64, 5)).collect());
+        let text = serde_json::to_string(&u).unwrap();
+        let back: MoversUniverse = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, u);
+        assert_eq!(
+            select(&back, &Filter::default()),
+            select(&u, &Filter::default())
+        );
+        assert!(
+            serde_json::from_str::<MoversUniverse>(&text.replace("\"format_version\"", "\"x\""))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_valid_refuses_out_of_bound_fields() {
+        let good = universe(vec![row(2, 101.0, 5)]);
+        assert!(good.valid());
+        let mutations: [fn(&mut MoversUniverse); 9] = [
+            |u| u.format_version = 2,
+            |u| u.trading_date_ist = "2026-1-29".into(),
+            |u| u.window_secs = 0,
+            |u| {
+                u.prices = UniversePrices::Rows {
+                    rows: vec![row(2, f64::NAN, 5)],
+                }
+            },
+            |u| {
+                u.prices = UniversePrices::Rows {
+                    rows: vec![row(2, 0.0, 5)],
+                }
+            },
+            |u| u.fno.as_mut().unwrap().push(listed(2)),
+            |u| u.fno.as_mut().unwrap()[0].segment_code = 2,
+            |u| u.membership.as_mut().unwrap().indices.reverse(),
+            |u| u.membership.as_mut().unwrap().by_stock[0].indices = vec![5],
+        ];
+        for change in mutations {
+            let mut bad = good.clone();
+            change(&mut bad);
+            assert!(!bad.valid(), "{bad:?}");
+            assert_eq!(bad.usable_at(OBSERVED), Err(UniverseRefusal::Invalid));
+        }
+    }
+
+    #[test]
+    fn test_usable_at_refuses_other_day_stale_future_and_session_changed_universes() {
+        let mut u = universe(vec![]);
+        assert_eq!(u.usable_at(OBSERVED), Ok(()));
+        assert_eq!(u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_SECS), Ok(()));
+        assert_eq!(
+            u.usable_at(OBSERVED + UNIVERSE_MAX_AGE_SECS + 1),
+            Err(UniverseRefusal::Stale)
+        );
+        assert_eq!(
+            u.usable_at(OBSERVED - UNIVERSE_MAX_FUTURE_SKEW_SECS - 1),
+            Err(UniverseRefusal::Future)
+        );
+        assert_eq!(
+            u.usable_at(OBSERVED + SECONDS_PER_DAY),
+            Err(UniverseRefusal::OtherDay)
+        );
+        // Mid-session, a universe that says closed is refused.
+        u.market_open = false;
+        assert_eq!(u.usable_at(OBSERVED), Err(UniverseRefusal::SessionChanged));
+        // 15:40:00 IST the same Thursday: a closed universe is usable for the
+        // same 20 s (the publisher refreshes it every 5 s while viewed).
+        let close = OBSERVED + 15_870;
+        u.observed_at_epoch_secs = close;
+        assert_eq!(u.usable_at(close + UNIVERSE_MAX_AGE_SECS), Ok(()));
+        assert_eq!(
+            u.usable_at(close + UNIVERSE_MAX_AGE_SECS + 1),
+            Err(UniverseRefusal::Stale)
+        );
+        // Built open at 15:39:55, read at 15:40:02: the session changed.
+        u.market_open = true;
+        u.observed_at_epoch_secs = close - 5;
+        assert_eq!(u.usable_at(close + 2), Err(UniverseRefusal::SessionChanged));
+        for refusal in [
+            UniverseRefusal::Invalid,
+            UniverseRefusal::OtherDay,
+            UniverseRefusal::Stale,
+            UniverseRefusal::Future,
+            UniverseRefusal::SessionChanged,
+        ] {
+            assert!(!refusal.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_weekday_session_open_at_follows_the_ist_clock_and_weekday() {
+        let close = OBSERVED + 15_870; // Thu 15:40:00 IST
+        let nine = OBSERVED - 8_130; // Thu 09:00:00 IST
+        assert!(weekday_session_open_at(OBSERVED));
+        assert!(weekday_session_open_at(nine));
+        assert!(!weekday_session_open_at(nine - 1));
+        assert!(weekday_session_open_at(close - 1));
+        assert!(!weekday_session_open_at(close));
+        assert!(weekday_session_open_at(OBSERVED + SECONDS_PER_DAY)); // Fri
+        assert!(!weekday_session_open_at(OBSERVED + 2 * SECONDS_PER_DAY)); // Sat
+        assert!(!weekday_session_open_at(OBSERVED + 3 * SECONDS_PER_DAY)); // Sun
+        assert!(weekday_session_open_at(OBSERVED + 4 * SECONDS_PER_DAY)); // Mon
+        assert!(!weekday_session_open_at(i64::MIN));
+        let _ = weekday_session_open_at(i64::MAX);
+    }
+
+    #[test]
+    fn test_viewer_heartbeat_written_at_parse_and_active_at() {
+        let beat = ViewerHeartbeat::written_at(OBSERVED);
+        assert_eq!(beat.until_epoch_secs, OBSERVED + VIEWER_HEARTBEAT_TTL_SECS);
+        let bytes = serde_json::to_vec(&beat).unwrap();
+        assert_eq!(bytes, br#"{"until_epoch_secs":1793252850}"#);
+        assert_eq!(ViewerHeartbeat::parse(&bytes), Some(beat));
+        assert!(beat.active_at(OBSERVED));
+        assert!(beat.active_at(OBSERVED + VIEWER_HEARTBEAT_TTL_SECS - 1));
+        assert!(!beat.active_at(OBSERVED + VIEWER_HEARTBEAT_TTL_SECS));
+        // A heartbeat stamped far ahead never keeps the publisher running.
+        let far = ViewerHeartbeat {
+            until_epoch_secs: OBSERVED
+                + VIEWER_HEARTBEAT_TTL_SECS
+                + UNIVERSE_MAX_FUTURE_SKEW_SECS
+                + 1,
+        };
+        assert!(!far.active_at(OBSERVED));
+        assert!(far.active_at(OBSERVED + 1));
+        assert!(ViewerHeartbeat::parse(b"{}").is_none());
+        assert!(ViewerHeartbeat::parse(br#"{"until_epoch_secs":1,"x":2}"#).is_none());
+        let mut big = bytes.clone();
+        big.resize(MAX_VIEWER_BYTES + 1, b' ');
+        assert!(ViewerHeartbeat::parse(&big).is_none());
+    }
+
+    #[test]
+    fn test_valid_live_view_bucket_name_and_valid_account_id() {
+        for good in ["tv-prod-live-view", "abc", "a1-b2", &"a".repeat(63)] {
+            assert!(valid_live_view_bucket_name(good), "{good}");
+        }
+        for bad in [
+            "",
+            "ab",
+            &"a".repeat(64),
+            "Tv-prod-live-view",
+            "tv.prod.live",
+            "-tv",
+            "tv-",
+            "tv_prod",
+            "tv prod",
+            "xn--tv",
+            "sthree-tv",
+            "tv-s3alias",
+            "tv--ol-s3",
+            "tv--x-s3",
+            "tv/prod",
+        ] {
+            assert!(!valid_live_view_bucket_name(bad), "{bad}");
+        }
+        assert!(valid_live_view_bucket_name(&live_view_bucket_for("prod")));
+        assert!(valid_account_id("123456789012"));
+        for bad in [
+            "",
+            "12345678901",
+            "1234567890123",
+            "12345678901a",
+            " 23456789012",
+        ] {
+            assert!(!valid_account_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_ist_date_of_epoch_uses_the_ist_calendar_day() {
+        assert_eq!(ist_date_of_epoch(OBSERVED).as_deref(), Some("2026-10-29"));
+        // 23:59:59 IST and the next IST midnight fall on different dates.
+        let midnight = OBSERVED + (86_400 - 40_530);
+        assert_eq!(
+            ist_date_of_epoch(midnight - 1).as_deref(),
+            Some("2026-10-29")
+        );
+        assert_eq!(ist_date_of_epoch(midnight).as_deref(), Some("2026-10-30"));
+        assert_eq!(ist_date_of_epoch(i64::MAX), None);
+        assert_eq!(hh_mm_ss(-1), "23:59:59");
+    }
+
+    #[test]
+    fn test_live_view_bucket_for_names_the_environment_bucket() {
+        assert_eq!(live_view_bucket_for("prod"), "tv-prod-live-view");
+    }
+
+    #[test]
+    fn test_snapshot_deadline_stops_at_session_and_day_boundaries() {
+        assert_eq!(snapshot_deadline(OBSERVED), Some(OBSERVED + 60));
+        let midnight = OBSERVED + (86_400 - 40_530);
+        assert_eq!(snapshot_deadline(midnight - 10), Some(midnight));
+        let session_end = midnight - 86_400 + UNIVERSE_SESSION_END_SECS_OF_DAY_IST;
+        assert_eq!(snapshot_deadline(session_end - 1), Some(session_end));
+        assert!(snapshot_deadline(i64::MAX).is_none());
+    }
+}

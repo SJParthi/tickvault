@@ -163,6 +163,37 @@ and replaced with the hard bans in this rule.
       re-authorized tick path, and NOTHING here relaxes rules 1-6 (no
       synthesized ticks into `ticks`, ever). FOLD-01 runbook:
       `.claude/rules/project/rest-candle-fold-error-codes.md`.
+    - **2026-08-25 dated edit — the LIVE aggregator must NEVER derive `candles_1d`
+      (operator directive 2026-08-25, verbatim, typos included):** *"never evr do
+      th edeirvation of 1day usign these intenrla tiemframes clauclation ddue
+      okay?"* Given alongside the same message's candle-window and 09:15-open
+      clauses. This RESTORES the pre-2026-07-16 posture for the live path and is
+      the "fresh dated quote" that `tf_index.rs::is_operator_requested` names as
+      the precondition for changing its set.
+
+      **What changes:** `TfIndex::D1` leaves `is_operator_requested()`, so the
+      live lane's three seal write boundaries (`dhan_feed_stack.rs` — per-tick
+      fold, `force_seal_all`, `catch_up_seal_all`, all three already gated on
+      that one predicate) stop emitting 1d rows. The operator-requested set moves
+      **13 → 12**; the ratchet moves with it in the same change.
+
+      **What does NOT change:** the fold still computes all 24 slots, so ordinals,
+      the `[_; TF_COUNT]` arrays and the audit-table `timeframe` SYMBOL column are
+      untouched — only EMISSION is gated, exactly as the 12 surviving timeframes
+      already are. The `candles_1d` table is still CREATEd (DDL/self-heal intact)
+      and simply stops being written by the live lane, the same shape the
+      2026-06-02 directive originally used.
+
+      **Honest envelope — what this leaves unresolved.** The authoritative daily
+      candle is supposed to come from a REST pull, and the two historical sources
+      for it are BOTH inert today: `prev_day_ohlcv` belonged to the deleted
+      historical chain, and `[rest_candle_fold]` — the 2026-07-16 grant's subject —
+      is `enabled = false` in `config/base.toml` (stood down 2026-08-11 because it
+      collided with the live lane's `candles_<tf>` tables). So after this change
+      **nothing writes `candles_1d` at all**. That is the correct reading of the
+      directive — a wrong 1d is worse than an absent one — but it is a gap, not a
+      completed substitution, and re-establishing an authoritative daily pull needs
+      its own dated scope.
 
 11. **Post-market 1-minute cross-verification — RE-ALLOWED 2026-06-02 (operator
     directive, narrowed).** Operator quote: *"put back the historical cross

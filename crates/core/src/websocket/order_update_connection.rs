@@ -14,13 +14,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::connection::DIAL_TIMEOUT;
+use super::ws_dial::{DialedWs, dial_ws_tls_with_keepalive};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
 use tokio::sync::broadcast;
 use tokio::time;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, error, info, warn};
 
 use chrono::{NaiveTime, Utc};
@@ -37,6 +39,7 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{
     OrderUpdateParseError, build_order_update_login, parse_order_update,
+    unreadable_order_frame_type,
 };
 
 /// PR-E: poll cadence (secs) while the Dhan feed is disabled at runtime — the
@@ -57,12 +60,53 @@ const ORDER_UPDATE_OUTAGE_PAGE_FAILURE_THRESHOLD: u32 = 3;
 /// far beyond the observed die-after-login window (~10ms, 2026-07-06 incident)
 /// and far below `WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS`.
 const ORDER_UPDATE_RECONNECT_STABILITY_SECS: u64 = 60;
+
+/// Largest message (and frame) the order-update socket accepts (audit J4,
+/// 2026-10-26). A Dhan order update is one JSON object; the documented sample
+/// in `docs/dhan-ref/10-live-order-update-websocket.md` is 1,448 bytes, so
+/// 64 KiB is about 45x headroom. tungstenite's default is a 64 MiB message
+/// and a 16 MiB frame, which let a hostile or MITM'd endpoint make us buffer
+/// 64 MiB before the JSON parser ran. Over-cap input is refused by the
+/// library as a read error, which ends this connection and takes the normal
+/// reconnect path.
+const ORDER_UPDATE_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Read buffer of the order-update socket: one typical message fits many
+/// times over.
+const ORDER_UPDATE_READ_BUFFER_BYTES: usize = 16 * 1024;
+
+/// Write buffer: the login message and pongs are a few hundred bytes.
+const ORDER_UPDATE_WRITE_BUFFER_BYTES: usize = 4 * 1024;
+
+/// Bound on queued outgoing bytes (tungstenite's default is unbounded). Must
+/// exceed [`ORDER_UPDATE_WRITE_BUFFER_BYTES`] by at least one message.
+const ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+// The library requires the write ceiling to sit above the write buffer.
+const _: () = assert!(ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES > ORDER_UPDATE_WRITE_BUFFER_BYTES);
+
+/// The explicit WebSocket configuration of the order-update socket. Every
+/// field this product cares about is set, never inherited; message and frame
+/// caps are equal so fragments cannot add up past the frame cap. Cold path,
+/// once per connect.
+fn order_update_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(ORDER_UPDATE_READ_BUFFER_BYTES)
+        .write_buffer_size(ORDER_UPDATE_WRITE_BUFFER_BYTES)
+        .max_write_buffer_size(ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES)
+        .max_message_size(Some(ORDER_UPDATE_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(ORDER_UPDATE_MAX_MESSAGE_BYTES))
+        .accept_unmasked_frames(false)
+}
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
-    spawn_with_panic_notify,
+    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge, note_activity,
 };
 use crate::websocket::tls::build_websocket_tls_connector;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "order_update_connection/idle_probe.rs"]
+mod idle_probe;
+use idle_probe::{IdleProbe, SessionWatchdog};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -422,6 +466,8 @@ fn emit_order_update_ws_audit(
         down_secs: i64::try_from(down_secs).unwrap_or(i64::MAX),
         attempts: i64::from(attempts),
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        // The order-update socket changes no subscription (audit M8).
+        subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
     };
     // O(1) EXEMPT: end
     // 2026-07-05: upgraded from debug! (silent-loss window — the operator found
@@ -666,10 +712,16 @@ async fn connect_and_listen(
     // standard practice for trading sockets. Receive-only paper mode today,
     // so the present blast radius is small — but this is the socket the live
     // order path re-uses, and the disconnect it prevents is the expensive one.
-    let (ws_stream, _response) =
-        connect_async_tls_with_config(request, None, true, Some(tls_connector))
-            .await
-            .map_err(|err| OrderUpdateConnectionError::Connect(err.to_string()))?;
+    //
+    // 2026-11-13 (audit B2 findings 6 and 7): the dial is bounded by the same
+    // `DIAL_TIMEOUT` (15 s) as the main feed, and its TCP socket has
+    // SO_KEEPALIVE on (`ws_dial`). Before, a peer that accepted the TCP
+    // connection and never answered the TLS hello or the upgrade parked this
+    // task for the rest of the session: the session watchdog is built only
+    // after the dial returns, so nothing counted a failure and the outage page
+    // never fired. A timed-out dial is now an ordinary `Connect` error and
+    // takes the same reconnect and paging path as a refused one.
+    let ws_stream = dial_order_update_socket(request, tls_connector, DIAL_TIMEOUT).await?;
     // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
@@ -707,17 +759,121 @@ async fn connect_and_listen(
         );
     }
 
-    let m_active = metrics::gauge!("tv_order_update_ws_active");
+    let _ = calendar; // market-hours flag no longer needed in the read loop
+    listen_on_connected_order_stream(
+        ws_stream,
+        metrics::gauge!("tv_order_update_ws_active"),
+        OrderUpdateSession {
+            client_id,
+            access_token: &access_token,
+            order_sender,
+            wal_spill,
+            authenticated_signal,
+            authenticated_latch,
+            notifier,
+            failures_before_attempt,
+            stability_reached,
+            #[cfg(test)]
+            test_watchdog_notify: None,
+        },
+    )
+    .await
+}
+
+/// Dials the order-update socket: keepalive TCP, TLS, upgrade, all bounded by
+/// `limit`. A dial that does not finish inside `limit` is a `Connect` error, so
+/// the run loop counts it and reconnects exactly as for a refused dial.
+async fn dial_order_update_socket(
+    request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    tls_connector: tokio_tungstenite::Connector,
+    limit: Duration,
+) -> Result<DialedWs, OrderUpdateConnectionError> {
+    // Third argument is `disable_nagle` (kept `true`, see the comment above).
+    let dial = dial_ws_tls_with_keepalive(
+        request,
+        Some(order_update_websocket_config()),
+        true,
+        Some(tls_connector),
+    );
+    match time::timeout(limit, dial).await {
+        Ok(Ok((ws_stream, _response))) => Ok(ws_stream),
+        // O(1) EXEMPT: begin, cold path, once per failed dial
+        Ok(Err(err)) => Err(OrderUpdateConnectionError::Connect(err.to_string())),
+        Err(_elapsed) => Err(OrderUpdateConnectionError::Connect(format!(
+            "dial timed out after {} s (TCP, TLS or upgrade never finished)",
+            limit.as_secs()
+        ))),
+        // O(1) EXEMPT: end
+    }
+}
+
+/// Owns the connected-socket gauge until login/read finishes or is dropped.
+/// A scope guard also clears it on early errors, task cancellation and unwind.
+struct OrderUpdateActiveGuard(metrics::Gauge);
+
+impl OrderUpdateActiveGuard {
+    fn new(gauge: metrics::Gauge) -> Self {
+        gauge.set(1.0);
+        Self(gauge)
+    }
+}
+
+impl Drop for OrderUpdateActiveGuard {
+    fn drop(&mut self) {
+        self.0.set(0.0);
+    }
+}
+
+/// Borrowed inputs for one connected login/read session.
+struct OrderUpdateSession<'a> {
+    client_id: &'a str,
+    access_token: &'a str,
+    order_sender: &'a broadcast::Sender<OrderUpdate>,
+    wal_spill: Option<&'a Arc<WsFrameSpill>>,
+    authenticated_signal: Option<&'a Arc<tokio::sync::Notify>>,
+    authenticated_latch: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
+    notifier: Option<&'a Arc<crate::notification::NotificationService>>,
+    failures_before_attempt: u32,
+    stability_reached: &'a mut bool,
+    /// Inject only the idle signal in unit tests; production uses its watchdog.
+    #[cfg(test)]
+    test_watchdog_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// Runs the same login/read lifecycle for any connected WebSocket transport.
+/// Keeping the transport boundary here allows in-memory failure tests.
+async fn listen_on_connected_order_stream<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    m_active: metrics::Gauge,
+    session: OrderUpdateSession<'_>,
+) -> Result<(), OrderUpdateConnectionError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let OrderUpdateSession {
+        client_id,
+        access_token,
+        order_sender,
+        wal_spill,
+        authenticated_signal,
+        authenticated_latch,
+        notifier,
+        failures_before_attempt,
+        stability_reached,
+        #[cfg(test)]
+        test_watchdog_notify,
+    } = session;
     let m_messages = metrics::counter!("tv_order_update_messages_total");
-    m_active.set(1.0);
+    let _active = OrderUpdateActiveGuard::new(m_active);
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send login message.
-    let login_msg = build_order_update_login(client_id, &access_token);
-    write
-        .send(Message::Text(login_msg.into()))
+    // The read watchdog starts after login. Bound a stalled login write so the
+    // connection can return to the reconnect loop even with no writable capacity.
+    let login_msg = build_order_update_login(client_id, access_token);
+    time::timeout(DIAL_TIMEOUT, write.send(Message::Text(login_msg.into())))
         .await
+        .map_err(|_elapsed| OrderUpdateConnectionError::LoginSendTimeout)?
         .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?; // O(1) EXEMPT: cold path, once per connect
 
     debug!("order update WebSocket login sent");
@@ -729,35 +885,19 @@ async fn connect_and_listen(
     // that may never come (causes false AuthTimeout reconnect loops).
     info!("order update WebSocket login sent — entering read loop");
 
-    // STAGE-B (P1.1): no client-side read deadline on the order update WS.
-    //
-    // Order update is a JSON stream, not binary. Silence is NORMAL — no
-    // orders means no messages, sometimes for hours. A read deadline here
-    // was the root cause of the 2-minute reconnect storm we saw earlier.
-    // Dhan's server-side ping/pong keeps the connection alive; our reader
-    // only wakes on real data, real errors, or real stream closure.
-    //
-    // Stage C's watchdog provides a liveness backstop at 660s (11 min).
-    let _ = calendar; // market-hours flag no longer needed
-    let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
-
-    // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
-    // allowable silence between orders + 60s safety margin). The counter
-    // is bumped on every Some(Ok(_)) message — Text, Ping, Pong, Close,
-    // Binary. Dhan's server pings every 10s, so even in a no-order window
-    // the counter advances constantly and the watchdog never fires a
-    // false positive. It only fires when the socket is truly dead.
-    let activity_counter = Arc::new(AtomicU64::new(0));
+    // Order updates can be legitimately silent for hours. Keep the existing
+    // four-hour, market-hours-gated idle backstop, then probe the socket before
+    // deciding to reconnect. Dhan's order-stream docs do not promise pings on
+    // a cadence; RFC 6455 requires peers to answer Ping with matching Pong.
+    let _ = select_read_timeout_secs; // retained for existing compatibility tests
+    let activity_counter = Arc::new(crate::sync::AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
-    let watchdog = ActivityWatchdog::new(
-        // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
-        "order-update".to_string(),
-        Arc::clone(&activity_counter),
-        Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
-        Arc::clone(&watchdog_notify),
-    );
-    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
-    let watchdog_handle = spawn_with_panic_notify(watchdog);
+    #[cfg(test)]
+    let watchdog_notify = test_watchdog_notify.unwrap_or(watchdog_notify);
+    let mut watchdog =
+        SessionWatchdog::new(Arc::clone(&activity_counter), Arc::clone(&watchdog_notify));
+    let mut idle_probe: Option<IdleProbe> = None;
+    let mut probe_sequence = 0_u64;
 
     // ZL-P0-1: heartbeat gauge handle for the order update WS.
     // O(1) EXEMPT: one gauge lookup per reconnect cycle
@@ -772,17 +912,60 @@ async fn connect_and_listen(
     let stability_sleep = time::sleep(stability_window());
     tokio::pin!(stability_sleep);
 
-    // The read loop is wrapped in a helper closure so every exit path can
-    // abort the watchdog handle exactly once. This avoids sprinkling
-    // `watchdog_handle.abort()` at every `return` site.
-    let loop_result: Result<(), OrderUpdateConnectionError> = loop {
+    // The watchdog guard aborts its task on return, cancellation and unwind.
+    loop {
+        let probe_deadline = idle_probe.as_ref().map(IdleProbe::deadline);
+        let probe_sending = idle_probe.as_ref().is_some_and(IdleProbe::sending);
         let frame_result = tokio::select! {
+            // An expired deadline wins a simultaneous ready read. This keeps
+            // the probe bounded; it is not an exactly-once delivery guarantee.
             biased;
-            () = watchdog_notify.notified() => {
-                m_active.set(0.0);
-                break Err(OrderUpdateConnectionError::WatchdogFired(
-                    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
-                ));
+            () = idle_probe::wait_deadline(probe_deadline), if idle_probe.is_some() => {
+                if let Some(probe) = idle_probe.as_ref() {
+                    let (phase, timeout_secs) = probe.timeout_phase();
+                    let result = if probe.sending() { "send_timeout" } else { "response_timeout" };
+                    metrics::counter!(
+                        "tv_ws_activity_watchdog_fired_total", "label" => "order-update"
+                    ).increment(1);
+                    metrics::counter!(
+                        "tv_order_update_idle_probe_total", "result" => result
+                    ).increment(1);
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        source = "order_update_liveness_probe",
+                        idle_threshold_secs = WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+                        phase, timeout_secs,
+                        "order stream idle probe timed out; reconnecting after bounded liveness check"
+                    );
+                    break Err(OrderUpdateConnectionError::LivenessProbeTimeout { phase, timeout_secs });
+                }
+                continue;
+            }
+            sent = std::future::poll_fn(|cx| match idle_probe.as_mut() {
+                Some(probe) => probe.poll_send(&mut write, cx),
+                None => std::task::Poll::Pending,
+            }), if probe_sending => {
+                match sent {
+                    Ok(()) => {
+                        if idle_probe.as_mut().is_some_and(IdleProbe::sent) {
+                            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+                            idle_probe = None;
+                            watchdog.restart();
+                        }
+                    }
+                    Err(err) => {
+                        metrics::counter!("tv_order_update_idle_probe_total", "result" => "send_error").increment(1);
+                        // O(1) EXEMPT: cold failed-probe transport error, never per tick.
+                        break Err(OrderUpdateConnectionError::LivenessProbeSend(err.to_string()));
+                    }
+                }
+                continue;
+            }
+            () = watchdog_notify.notified(), if idle_probe.is_none() => {
+                probe_sequence = probe_sequence.wrapping_add(1);
+                idle_probe = Some(IdleProbe::new(probe_sequence));
+                metrics::counter!("tv_order_update_idle_probe_total", "result" => "started").increment(1);
+                continue;
             }
             () = &mut stability_sleep, if !*stability_reached => {
                 // Guard is load-bearing: a completed tokio Sleep must never
@@ -812,23 +995,27 @@ async fn connect_and_listen(
         // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
         // ZL-P0-1: also set heartbeat gauge.
         if matches!(frame_result, Some(Ok(_))) {
-            activity_counter.fetch_add(1, Ordering::Relaxed);
+            note_activity(&activity_counter);
             m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
         }
 
         let msg = match frame_result {
             Some(Ok(msg)) => msg,
             Some(Err(err)) => {
-                m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
                 break Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             None => {
                 // Stream ended (server closed connection).
-                m_active.set(0.0);
                 break Ok(());
             }
         };
+
+        if idle_probe.as_mut().is_some_and(|probe| probe.observe(&msg)) {
+            metrics::counter!("tv_order_update_idle_probe_total", "result" => "live").increment(1);
+            idle_probe = None;
+            watchdog.restart();
+        }
 
         match msg {
             Message::Text(text) => {
@@ -848,7 +1035,13 @@ async fn connect_and_listen(
                         tickvault_storage::ws_frame_spill::next_frame_seq(),
                     );
                     if outcome == AppendOutcome::Dropped {
+                        // The spill counts the drop itself, per frame type
+                        // (`drop_critical` / `ticks_lost_*`); this line names
+                        // the frame type the spill's own log line does not.
                         error!(
+                            code = tickvault_common::error_code::ErrorCode::WsSpill02FrameDropped
+                                .code_str(),
+                            source = "order_update_wal",
                             "CRITICAL: WAL spill dropped OrderUpdate frame — disk writer stalled"
                         );
                     }
@@ -867,6 +1060,70 @@ async fn connect_and_listen(
                             symbol = %update.symbol,
                             "order update received"
                         );
+                        // ORDER-EVT-02 (2026-08-25) — HOLLOW DECODE.
+                        //
+                        // `OrderUpdate` carries `#[serde(default)]` on every
+                        // field, so a frame whose key names do not match
+                        // deserializes into a full struct of defaults and
+                        // returns `Ok`. There is no error to catch: the parse
+                        // genuinely succeeded, it just produced nothing.
+                        //
+                        // Found live on 2026-08-25, when ten captured rows
+                        // held only `ref_ltp`, `tick_size`, `mkt_type`,
+                        // `multiplier`, `good_till_days_date` and
+                        // `algo_ord_no` — every core field empty, and the
+                        // operator's manual super order nowhere in them.
+                        // Diagnosing it was impossible after the fact
+                        // because `text` is dropped here and never logged.
+                        //
+                        // So the excerpt is the point of this block, not the
+                        // counter: it is the only place the raw frame still
+                        // exists. Bounded to keep a malformed-frame storm
+                        // from flooding the sink, and the client id is
+                        // redacted because an order payload carries it.
+                        //
+                        // Cheap by construction: three `is_empty()` calls on
+                        // an already-decoded struct. The excerpt is built
+                        // ONLY on the hollow branch, so a healthy frame pays
+                        // nothing beyond the three compares.
+                        //
+                        // 2026-10-28 (18 live ORDER-EVT-02 lines). The parser
+                        // now reads both casings of every field (it read the
+                        // other casing of only seven before). A frame whose
+                        // order keys came in camelCase (`orderNo`, `status`)
+                        // therefore no longer decodes hollow. That this was
+                        // the cause of the live lines is ASSUMED, not proven:
+                        // the 2026-08-25 rows had `mkt_type` filled, which the
+                        // old parser read only from PascalCase `MktType`, so
+                        // those frames carried at least one PascalCase field
+                        // and do not fit an all-camelCase frame. ORDER-EVT-02
+                        // stays open until a captured excerpt confirms it.
+                        // Every hollow frame, whatever its `Type` tag, stays
+                        // ORDER-EVT-02 at ERROR on the hollow counter and is
+                        // still broadcast: Dhan documents only `order_alert`
+                        // on this socket, so an unknown tag is the format
+                        // change this page exists for. So does a frame with
+                        // no order number whose tag names another type (it
+                        // may now decode a camelCase `status` and not be
+                        // hollow). The tag is logged so the next capture
+                        // says what the frame was. A frame carrying an order
+                        // number pays one `is_empty()` here.
+                        if let Some(msg_type) = unreadable_order_frame_type(&update, &text) {
+                            metrics::counter!(ORDER_UPDATE_HOLLOW_DECODE_COUNTER).increment(1);
+                            error!(
+                                code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
+                                    .code_str(),
+                                msg_type = %msg_type,
+                                excerpt = %redacted_frame_excerpt(&text),
+                                "order update PARSED but decoded HOLLOW — order_no, status and \
+                                 security_id are all empty in either casing, so this frame's key \
+                                 names do not match what OrderUpdate expects. The row is still \
+                                 captured; the excerpt above is the raw frame (client id \
+                                 redacted, length bounded) and is what a schema fix must be \
+                                 written against — do not guess at Dhan's field names from this \
+                                 message alone."
+                            );
+                        }
                         // Broadcast to subscribers (OMS, notification, etc.).
                         // 2026-04-24 audit finding #4: previously discarded the
                         // SendError with "no receivers — that's fine". BUT if
@@ -890,6 +1147,9 @@ async fn connect_and_listen(
                         if let Err(err) = order_sender.send(update) {
                             metrics::counter!("tv_order_update_broadcast_drops_total").increment(1);
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::OrderEvt01PersistFailed
+                                    .code_str(),
+                                stage = "broadcast_no_receiver",
                                 order_no = %err.0.order_no,
                                 "order update broadcast dropped — no active receivers \
                                  (OMS subscriber likely crashed or channel torn down)"
@@ -918,11 +1178,57 @@ async fn connect_and_listen(
                         match classify_auth_response(&text) {
                             AuthResponseKind::Failed(reason) => {
                                 error!(
+                                    code = tickvault_common::error_code::ErrorCode::WsGapDisconnectClassification
+                                        .code_str(),
                                     reason = %reason,
                                     "order update WebSocket auth/API error from server"
                                 );
-                                m_active.set(0.0);
                                 break Err(OrderUpdateConnectionError::AuthFailed(reason));
+                            }
+                            // R4 (2026-10-01, reality check): a frame carrying the
+                            // documented order envelope that failed the typed parse
+                            // is an order event this process cannot read. It used to
+                            // fall into the arm below as a "non-order" frame at
+                            // debug level, so a vendor format change would drop every
+                            // order update without a trace.
+                            AuthResponseKind::Success if looks_like_order_update(&text) => {
+                                // Dhan streams order events only to an
+                                // authenticated session.
+                                fire_authenticated_signal_once(
+                                    authenticated_signal,
+                                    authenticated_latch,
+                                );
+                                let seen = UNPARSEABLE_ORDER_FRAMES
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    .saturating_add(1);
+                                metrics::counter!(
+                                    "tv_order_update_frames_dropped_total",
+                                    "reason" => "unparseable_order"
+                                )
+                                .increment(1);
+                                if seen.is_power_of_two() {
+                                    // Line and column only: a serde type error
+                                    // can quote a field value such as the client id.
+                                    let (err_line, err_column) = match &err {
+                                        OrderUpdateParseError::JsonError(e) => {
+                                            (e.line(), e.column())
+                                        }
+                                        OrderUpdateParseError::FrameTooLarge { .. } => (0, 0),
+                                    };
+                                    error!(
+                                        code = tickvault_common::error_code::ErrorCode::OrderEvt02DecodedHollow
+                                            .code_str(),
+                                        stage = "typed_parse_failed",
+                                        seen,
+                                        err_line,
+                                        err_column,
+                                        excerpt = %redacted_frame_excerpt(&text),
+                                        "order update DROPPED: the frame carries the order-update \
+                                         envelope but failed the typed parse, so this order event \
+                                         never reaches the order book. Excerpt is the raw frame \
+                                         (client id redacted, length bounded); logged at powers of two."
+                                    );
+                                }
                             }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
@@ -953,18 +1259,13 @@ async fn connect_and_listen(
             }
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
-                m_active.set(0.0);
                 break Ok(());
             }
             _ => {
                 // Binary, Pong, Frame — ignore.
             }
         }
-    };
-
-    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
-    watchdog_handle.abort();
-    loop_result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1363,150 @@ enum AuthResponseKind {
     Failed(String),
 }
 
+/// Prometheus counter for ORDER-EVT-02 hollow decodes.
+pub const ORDER_UPDATE_HOLLOW_DECODE_COUNTER: &str = "tv_order_update_hollow_decode_total";
+
+/// R4 (2026-10-01). Order-update frames that failed the typed parse but carry
+/// the order envelope, process-wide. Read only to throttle the ORDER-EVT-02
+/// `typed_parse_failed` log to powers of two.
+static UNPARSEABLE_ORDER_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// R4 (2026-10-01). Pure, allocation-free. True iff a frame that FAILED
+/// `parse_order_update` still carries the documented order envelope: the
+/// `"order_alert"` tag, or a `"Data"` (or drifted `"data"`) key whose value
+/// opens an object or an array. An array `Data` is refused by the typed
+/// parse (`parse_order_update`), and this is what routes that refusal to
+/// the coded ORDER-EVT-02 `typed_parse_failed` arm instead of the debug-only
+/// non-order arm.
+///
+/// # Complexity
+/// O(frame bytes), bounded by `ORDER_UPDATE_MAX_FRAME_BYTES`, the same bound
+/// as the two parses this path already runs. Not O(1); runs only on a frame
+/// the typed parse refused.
+fn looks_like_order_update(text: &str) -> bool {
+    if text.contains("\"order_alert\"") {
+        return true;
+    }
+    ["\"Data\"", "\"data\""].iter().any(|key| {
+        let mut rest = text;
+        while let Some(at) = rest.find(key) {
+            rest = &rest[at + key.len()..];
+            if let Some(value) = rest.trim_start().strip_prefix(':')
+                && value.trim_start().starts_with(['{', '['])
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Longest raw-frame excerpt ORDER-EVT-02 will log.
+///
+/// An order-update frame is small; 1 KiB carries the whole key set, which is
+/// the only thing the excerpt exists to show. The bound is here so a storm of
+/// malformed frames cannot flood the log sink — the same reasoning as
+/// `ORDER_UPDATE_MAX_FRAME_BYTES`, applied to the logging side.
+const ORDER_UPDATE_EXCERPT_MAX_BYTES: usize = 1024;
+
+/// Builds a bounded, client-id-redacted excerpt of a raw order-update frame.
+///
+/// Redacts the client-id VALUE whatever the key's casing: the parser reads
+/// `ClientId` and `clientId`, and the key is matched ASCII
+/// case-insensitively, so `DhanClientId`, `dhanClientId` and a snake_case
+/// `client_id` are redacted too. A string value and a bare JSON number
+/// are both redacted. An order payload carries the account identifier, and
+/// this string goes to a log sink. The KEY is deliberately preserved: a
+/// schema fix needs to see which keys the frame contained, and a
+/// wholly-removed key would misrepresent that. An occurrence that is not a
+/// `key: value` pair (the word inside another value, say) is left verbatim
+/// and the walk continues past it, so a later real key is still redacted.
+///
+/// Truncation is on a CHARACTER boundary, never a byte index, so a multi-byte
+/// symbol name cannot panic the logging path.
+fn redacted_frame_excerpt(raw: &str) -> String {
+    const NEEDLES: [&str; 2] = ["clientid", "client_id"];
+    // ASCII lowercasing keeps every byte offset, so a match in `lower` is the
+    // same span in `raw`.
+    let lower = raw.to_ascii_lowercase();
+    let mut out = String::with_capacity(raw.len().min(ORDER_UPDATE_EXCERPT_MAX_BYTES) + 16);
+    let mut pos = 0;
+    // Walk the frame replacing each client-id VALUE. A frame carries at most
+    // one, but the loop costs nothing and a repeated key cannot slip through.
+    while let Some((found, len)) = NEEDLES
+        .iter()
+        .filter_map(|n| lower[pos..].find(n).map(|i| (pos + i, n.len())))
+        .min_by_key(|(i, _)| *i)
+    {
+        let key_end = found + len;
+        let after_key = &raw[key_end..];
+        out.push_str(&raw[pos..key_end]);
+        // Expect `"` `:` then a quoted string or a bare number. Anything else
+        // is left verbatim rather than guessed at — a redactor that reshapes a
+        // frame it did not understand would corrupt the evidence it exists to
+        // preserve.
+        match split_key_value(after_key) {
+            Some((prefix_end, value_end)) => {
+                out.push_str(&after_key[..prefix_end]);
+                out.push_str("<redacted>");
+                pos = key_end + value_end;
+            }
+            None => pos = key_end,
+        }
+    }
+    out.push_str(&raw[pos..]);
+    if out.len() > ORDER_UPDATE_EXCERPT_MAX_BYTES {
+        let cut = out
+            .char_indices()
+            .take_while(|(i, _)| *i <= ORDER_UPDATE_EXCERPT_MAX_BYTES)
+            .last()
+            .map_or(0, |(i, _)| i);
+        out.truncate(cut);
+        out.push_str("…[truncated]");
+    }
+    out
+}
+
+/// Given the text immediately AFTER a JSON key name, locates that key's
+/// value: a quoted string or a bare JSON number.
+///
+/// Returns `(prefix_end, value_end)` where `[..prefix_end]` is everything up
+/// to the value (including a string's opening quote) and `value_end` indexes
+/// the first byte after the value's content (a string's closing quote, or the
+/// end of the number). `None` when the text is not `"` `:` followed by such a
+/// value — the caller then leaves that occurrence untouched.
+fn split_key_value(after_key: &str) -> Option<(usize, usize)> {
+    // 1. The key's own closing quote.
+    let kq = after_key.find('"')?;
+    let after_kq = &after_key[kq + 1..];
+    // 2. The colon — and it must come BEFORE the next quote, otherwise this
+    //    is not `key: value` and we are looking at something else entirely.
+    let colon = after_kq.find(':')?;
+    if after_kq[..colon].contains('"') {
+        return None;
+    }
+    let after_colon = &after_kq[colon + 1..];
+    let ws = after_colon.len() - after_colon.trim_start().len();
+    let value = &after_colon[ws..];
+    let base = kq + 1 + colon + 1 + ws;
+    if let Some(body) = value.strip_prefix('"') {
+        // 3a. A string: its closing quote, skipping backslash escapes so an
+        //     escaped quote cannot end the redaction early.
+        let mut escaped = false;
+        let vend = body.char_indices().find_map(|(i, c)| {
+            let close = c == '"' && !escaped;
+            escaped = c == '\\' && !escaped;
+            close.then_some(i)
+        })?;
+        return Some((base + 1, base + 1 + vend));
+    }
+    // 3b. A bare number.
+    let len = value
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E')))
+        .unwrap_or(value.len());
+    (len > 0 && matches!(value.as_bytes()[0], b'0'..=b'9' | b'-')).then_some((base, base + len))
+}
+
 /// O2 (2026-04-17): Fires the authenticated-signal notify exactly once per
 /// process lifetime. Uses a CAS latch so repeated calls (many successful
 /// messages in a row) are a no-op after the first. Called from both
@@ -1094,14 +1539,22 @@ fn fire_authenticated_signal_once(
 /// typically contains `"error"` or `"errorCode"` fields. If none are found,
 /// the response is treated as a success (could be an ack or the first order update).
 ///
-/// Pure function — no I/O, no allocation on success path when response is valid.
+/// Pure function, no I/O. **Not allocation-free and not once per connect**
+/// (corrected 2026-10-30, O(1) sweep): the read loop calls it for EVERY text
+/// frame that fails the typed order-update parse (the login ack and any
+/// other non-order JSON, for the life of the connection), and each call
+/// parses the frame into a `serde_json::Value` tree, O(frame bytes) with an
+/// allocation per node; a non-JSON frame also gets a lowercase copy. The
+/// cadence is the order-update socket's non-order traffic, which is sparse
+/// (orders are 1 to 100 a day), and the frame size cap bounds the bytes, so
+/// it is recorded in CLAUDE.md's O(1) table rather than reworked.
 fn classify_auth_response(response_text: &str) -> AuthResponseKind {
     // Try to parse as JSON to inspect for error fields.
     match serde_json::from_str::<serde_json::Value>(response_text) {
         Ok(value) => classify_auth_json(&value),
         Err(_) => {
             // Non-JSON text response — check for error keywords.
-            let lower = response_text.to_lowercase(); // O(1) EXEMPT: cold auth path, runs once per connect
+            let lower = response_text.to_lowercase(); // O(1) EXEMPT: per non-order text frame, sparse; see the doc above
             if lower.contains("error") || lower.contains("unauthorized") || lower.contains("denied")
             {
                 AuthResponseKind::Failed(
@@ -1293,6 +1746,9 @@ enum OrderUpdateConnectionError {
     #[error("failed to send login message: {0}")]
     Send(String),
 
+    #[error("order update login send timed out after {}s", DIAL_TIMEOUT.as_secs())]
+    LoginSendTimeout,
+
     #[error("auth response indicates failure: {0}")]
     AuthFailed(String),
 
@@ -1307,14 +1763,14 @@ enum OrderUpdateConnectionError {
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
 
-    /// STAGE-C.3: per-connection activity watchdog fired. No frames or
-    /// pings received within the 660s (11 min) threshold — the socket is
-    /// dead and the outer loop must reconnect. Distinct from
-    /// `ReadTimeout` because the watchdog enforces a TRUE silence check
-    /// (frames + pings), whereas `ReadTimeout` was a client-side read
-    /// deadline that fired on any silence, including legitimate idle.
-    #[error("order update WebSocket activity watchdog fired after {0}s of silence")]
-    WatchdogFired(u64),
+    #[error("order update liveness probe timed out {phase} after {timeout_secs}s")]
+    LivenessProbeTimeout {
+        phase: &'static str,
+        timeout_secs: u64,
+    },
+
+    #[error("order update liveness probe send failed: {0}")]
+    LivenessProbeSend(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,8 +1778,180 @@ enum OrderUpdateConnectionError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "order_update_connection/tests.rs"]
+mod active_gauge_tests;
+
+#[cfg(test)]
+#[path = "order_update_connection/idle_probe_tests.rs"]
+mod idle_probe_tests;
+
+#[cfg(test)]
+#[path = "order_update_connection/dial_timeout_tests.rs"]
+mod dial_timeout_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn production_source(src: &str) -> String {
+        tickvault_common::source_scan::production_region(src)
+            .expect("order-update source must retain its cfg(test) mod tests boundary")
+    }
+
+    #[test]
+    fn test_regression_order_source_guard_keeps_code_after_test_only_fields() {
+        // Regression: 2026-11-02 — the injected idle signal's cfg(test)
+        // field hid the entire read loop from first-attribute splitters.
+        let src = "struct Session {\n    #[cfg(test)]\n    signal: (),\n}\n\
+                   fn read_loop() { production_read(); }\n\
+                   #[cfg(test)]\nmod tests { fn fixture() { test_only_read(); } }\n\
+                   fn trailing() { production_tail(); }\n";
+        let prod = production_source(src);
+        assert!(prod.contains("production_read();"));
+        assert!(prod.contains("production_tail();"));
+        assert!(!prod.contains("test_only_read();"));
+        assert!(
+            std::panic::catch_unwind(|| production_source("fn no_test_module() {}")).is_err(),
+            "a missing test-module boundary must fail loudly"
+        );
+    }
+
+    #[test]
+    fn test_order_update_websocket_config_sets_every_bound_explicitly() {
+        // Audit J4: the order-update dial used tungstenite's defaults (64 MiB
+        // message, 16 MiB frame, unbounded write buffer).
+        let config = order_update_websocket_config();
+        assert_eq!(
+            config.max_message_size,
+            Some(ORDER_UPDATE_MAX_MESSAGE_BYTES)
+        );
+        assert_eq!(config.max_frame_size, Some(ORDER_UPDATE_MAX_MESSAGE_BYTES));
+        assert_eq!(config.max_message_size, config.max_frame_size);
+        assert_eq!(config.read_buffer_size, ORDER_UPDATE_READ_BUFFER_BYTES);
+        assert_eq!(config.write_buffer_size, ORDER_UPDATE_WRITE_BUFFER_BYTES);
+        assert_eq!(
+            config.max_write_buffer_size,
+            ORDER_UPDATE_MAX_WRITE_BUFFER_BYTES
+        );
+        assert!(config.max_write_buffer_size > config.write_buffer_size);
+        assert!(!config.accept_unmasked_frames);
+        // Tens of KiB, never the library's megabyte-scale defaults.
+        let defaults = WebSocketConfig::default();
+        assert!(ORDER_UPDATE_MAX_MESSAGE_BYTES <= 64 * 1024);
+        assert!(config.max_message_size < defaults.max_message_size);
+        assert!(config.max_frame_size < defaults.max_frame_size);
+        assert!(config.max_write_buffer_size < defaults.max_write_buffer_size);
+    }
+
+    #[test]
+    fn test_order_update_cap_holds_a_documented_order_update_with_headroom() {
+        // The documented sample is 1,448 bytes; a real update must never hit
+        // the cap and force a reconnect.
+        let sample = r#"{"Data":{"Exchange":"NSE","Segment":"E","Source":"P","SecurityId":"14366","ClientId":"1000000001","ExchOrderNo":"1100000000000000","OrderNo":"1124091136546","Product":"C","TxnType":"B","OrderType":"LMT","Validity":"DAY","DiscQuantity":0,"DiscQtyRem":0,"RemainingQuantity":1,"Quantity":1,"TradedQty":0,"Price":13,"TriggerPrice":0,"TradedPrice":0,"AvgTradedPrice":0,"AlgoOrdNo":"","OffMktFlag":"0","OrderDateTime":"2024-09-11 14:39:29","ExchOrderTime":"2024-09-11 14:39:29","LastUpdatedTime":"2024-09-11 14:39:29","Remarks":"NA","MktType":"NL","ReasonDescription":"CONFIRMED","LegNo":1,"Instrument":"EQUITY","Symbol":"IDEA","ProductName":"CNC","Status":"Pending","LotSize":1,"StrikePrice":0,"ExpiryDate":"0001-01-01 00:00:00","OptType":"XX","DisplayName":"Vodafone Idea","Isin":"INE669E01016","Series":"EQ","GoodTillDaysDate":"2024-09-11","RefLtp":13.1,"TickSize":0.01,"AlgoId":"0","Multiplier":1,"CorrelationId":"00000000-0000-0000-0000-000000000000"},"Type":"order_alert"}"#;
+        assert!(sample.len().saturating_mul(30) < ORDER_UPDATE_MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn test_order_update_dial_passes_the_explicit_config() {
+        let src = include_str!("order_update_connection.rs");
+        let production = production_source(src);
+        assert!(production.contains("Some(order_update_websocket_config())"));
+        assert!(!production.contains(concat!("request, ", "None, true")));
+    }
+
+    // R4 (2026-10-01, reality check): an order frame the typed parse cannot
+    // read is flagged, not filed as a harmless non-order message.
+    #[test]
+    fn test_looks_like_order_update_detects_an_unreadable_order_frame() {
+        // A documented order frame whose Quantity changed type: the typed
+        // parse fails while the envelope stays.
+        let drifted = r#"{"Data":{"OrderNo":"999","Quantity":"ten"},"Type":"order_alert"}"#;
+        assert!(
+            parse_order_update(drifted).is_err(),
+            "precondition: the typed parse fails"
+        );
+        assert_eq!(
+            classify_auth_response(drifted),
+            AuthResponseKind::Success,
+            "precondition: the old path filed it as a non-order frame"
+        );
+        assert!(looks_like_order_update(drifted));
+        assert!(
+            looks_like_order_update(r#"{ "Data" :  {"OrderNo":1} }"#),
+            "whitespace around the key"
+        );
+        assert!(
+            looks_like_order_update(r#"{"Data":null,"Type":"order_alert"}"#),
+            "the tag alone"
+        );
+        assert!(
+            looks_like_order_update(r#"{"data":{"orderNo":"1"}}"#),
+            "casing drift"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_order_update_leaves_genuine_non_order_frames_alone() {
+        for frame in [
+            r#"{"status":"success"}"#,
+            "{}",
+            "pong",
+            "",
+            r#"{"Data":null}"#,
+            r#"{"Data":"ok"}"#,
+            r#"{"Message":"Data received"}"#,
+            "\u{20b9}\u{20b9}\"Data\"",
+            "\"Data\"",
+        ] {
+            assert!(!looks_like_order_update(frame), "{frame:?}");
+        }
+    }
+
+    /// Source pin: the envelope arm must precede the plain Success arm (a
+    /// guarded arm after it would be unreachable), count the drop and log the
+    /// coded line.
+    #[test]
+    fn test_unparseable_order_arm_precedes_the_non_order_arm_and_counts_the_drop() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = production_source(src);
+        let arm = prod
+            .find("AuthResponseKind::Success if looks_like_order_update(&text)")
+            .expect("the envelope arm exists");
+        let generic = prod
+            .find("tv_order_update_non_order_messages_total")
+            .expect("the non-order arm exists");
+        assert!(arm < generic, "the envelope arm must be matched first");
+        let between = &prod[arm..generic];
+        assert!(between.contains("\"unparseable_order\""));
+        assert!(between.contains("OrderEvt02DecodedHollow"));
+        assert!(between.contains("stage = \"typed_parse_failed\""));
+    }
+
+    /// An array `Data` is refused by the typed parse (it would decode
+    /// positionally or as an all-default update). The refusal must reach the
+    /// coded ORDER-EVT-02 `typed_parse_failed` arm, not the debug-only
+    /// non-order arm: the parse fails, the auth classifier calls it Success,
+    /// and the envelope check (matched first, pinned by the source test
+    /// above) recognises it.
+    #[test]
+    fn test_array_data_frame_reaches_the_typed_parse_failed_arm() {
+        for frame in [
+            r#"{"Data":[]}"#,
+            r#"{"data":[]}"#,
+            r#"{ "Data" : [ ] }"#,
+            r#"{"Data":["NSE","D","52432","c","1124"]}"#,
+            r#"{"data":[{"OrderNo":"1"}],"Type":"login_ack"}"#,
+            r#"[{"Data":{"OrderNo":"1"}}]"#,
+        ] {
+            assert!(parse_order_update(frame).is_err(), "precondition: {frame}");
+            assert_eq!(
+                classify_auth_response(frame),
+                AuthResponseKind::Success,
+                "precondition: {frame}"
+            );
+            assert!(looks_like_order_update(frame), "{frame}");
+        }
+    }
 
     // ========================================================================
     // O2 (2026-04-17) — Authenticated-signal latch tests
@@ -2416,7 +3044,7 @@ mod tests {
     #[test]
     fn test_frame_too_large_arm_precedes_auth_classification() {
         let src = include_str!("order_update_connection.rs");
-        let prod = &src[..src.find("#[cfg(test)]").expect("test marker present")];
+        let prod = production_source(src);
         let arm_region = &prod[prod
             .find("match parse_order_update(&text)")
             .expect("frame parse match must exist in the read loop")..];
@@ -2436,4 +3064,233 @@ mod tests {
             "the FrameTooLarge arm must count the dropped frame"
         );
     }
+
+    /// ORDER-EVT-02: the excerpt must redact the client id VALUE while
+    /// KEEPING the key. A schema fix needs to see which keys the frame
+    /// carried; a removed key would misrepresent the frame it is meant to
+    /// document.
+    #[test]
+    fn test_hollow_excerpt_redacts_client_id_value_but_keeps_the_key() {
+        let raw = r#"{"Data":{"DhanClientId":"1106656882","MktType":"XX"}}"#;
+        let out = redacted_frame_excerpt(raw);
+        assert!(
+            !out.contains("1106656882"),
+            "the account id must never reach a log sink: {out}"
+        );
+        assert!(
+            out.contains("DhanClientId"),
+            "the KEY must survive — the excerpt exists to show the key set: {out}"
+        );
+        assert!(
+            out.contains("<redacted>"),
+            "redaction must be visible: {out}"
+        );
+        assert!(
+            out.contains("\"MktType\":\"XX\""),
+            "every other field must pass through verbatim: {out}"
+        );
+    }
+
+    /// A frame with no client id at all passes through unchanged — the
+    /// redactor must not mangle the common case.
+    #[test]
+    fn test_hollow_excerpt_passes_through_a_frame_with_no_client_id() {
+        let raw = r#"{"Data":{"RefLtp":11.15,"TickSize":0.05}}"#;
+        assert_eq!(redacted_frame_excerpt(raw), raw);
+    }
+
+    /// Review 2026-10-28: the parser now reads camelCase frames, so the
+    /// excerpt must redact `clientId` / `dhanClientId` too, a bare numeric
+    /// value as well as a string, and must keep walking past an occurrence
+    /// that is not a key/value pair.
+    #[test]
+    fn test_hollow_excerpt_redacts_every_client_id_casing_and_value_shape() {
+        let id = "1106656882";
+        let frames = [
+            format!(r#"{{"Data":{{"clientId":"{id}","mktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"dhanClientId":"{id}","mktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"ClientId": {id},"MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"clientId":-{id},"MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"client_id" : "{id}","MktType":"XX"}}}}"#),
+            format!(r#"{{"Data":{{"CLIENTID":"{id}","MktType":"XX"}}}}"#),
+            // The word inside another value first, then the real key.
+            format!(r#"{{"Data":{{"Remarks":"clientId","ClientId":"{id}"}}}}"#),
+            // A non-value occurrence (`null`) does not stop the walk.
+            format!(r#"{{"Data":{{"ClientId":null,"clientId":"{id}"}}}}"#),
+            // Two keys, both redacted.
+            format!(r#"{{"Data":{{"ClientId":"{id}","clientId":{id}}}}}"#),
+            // An escaped quote inside the value does not end it early.
+            format!(r#"{{"Data":{{"clientId":"{id}\"{id}","X":"Y"}}}}"#),
+        ];
+        for raw in &frames {
+            let out = redacted_frame_excerpt(raw);
+            assert!(
+                !out.contains(id),
+                "the account id reached the excerpt: {out}"
+            );
+            assert!(
+                out.contains("<redacted>"),
+                "redaction must be visible: {out}"
+            );
+            assert!(
+                out.to_ascii_lowercase().contains("clientid")
+                    || out.to_ascii_lowercase().contains("client_id"),
+                "the KEY must survive: {out}"
+            );
+        }
+        assert_eq!(
+            redacted_frame_excerpt(r#"{"Data":{"clientId":1106656882,"mktType":"XX"}}"#),
+            r#"{"Data":{"clientId":<redacted>,"mktType":"XX"}}"#
+        );
+        assert_eq!(
+            redacted_frame_excerpt(r#"{"Data":{"Remarks":"clientId","ClientId":"7"}}"#),
+            r#"{"Data":{"Remarks":"clientId","ClientId":"<redacted>"}}"#
+        );
+        // `null` and booleans are not account ids and pass through verbatim.
+        let raw = r#"{"Data":{"clientId":null,"MktType":"XX"}}"#;
+        assert_eq!(redacted_frame_excerpt(raw), raw);
+    }
+
+    /// The bound exists so a malformed-frame storm cannot flood the sink.
+    #[test]
+    fn test_hollow_excerpt_is_length_bounded() {
+        let raw = format!(r#"{{"Data":{{"Remarks":"{}"}}}}"#, "x".repeat(4096));
+        let out = redacted_frame_excerpt(&raw);
+        assert!(
+            out.len() <= ORDER_UPDATE_EXCERPT_MAX_BYTES + 16,
+            "excerpt must stay bounded, got {} bytes",
+            out.len()
+        );
+        assert!(out.ends_with("…[truncated]"), "truncation must be visible");
+    }
+
+    /// Truncation must land on a CHARACTER boundary. A multi-byte symbol
+    /// name near the cut would panic a byte-index `truncate`, and this
+    /// logging path runs inside the order-update read loop.
+    #[test]
+    fn test_hollow_excerpt_truncates_on_a_char_boundary_not_a_byte_index() {
+        // '₹' is 3 bytes, so a naive byte cut lands mid-character.
+        let raw = format!(r#"{{"Data":{{"Remarks":"{}"}}}}"#, "₹".repeat(2048));
+        let out = redacted_frame_excerpt(&raw);
+        assert!(out.ends_with("…[truncated]"));
+        // Reaching here without a panic IS the assertion; this re-states it.
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    /// The detector's own condition, stated as a test so the three-field
+    /// AND cannot silently become an OR: a frame missing ONLY the status
+    /// is a partial update, not a hollow decode, and must NOT fire.
+    #[test]
+    fn test_hollow_detector_requires_all_three_core_fields_empty() {
+        // Built through the REAL parser, not a struct literal: the whole
+        // defect is that `parse_order_update` returns Ok on a frame whose
+        // keys it does not recognise, so the test must go through it.
+        let hollow = parse_order_update(r#"{"Data":{"MktType":"XX","RefLtp":11.15}}"#)
+            .expect("an unrecognised-key frame still parses Ok — that IS the defect");
+        assert!(
+            hollow.order_no.is_empty() && hollow.status.is_empty() && hollow.security_id.is_empty(),
+            "a frame of unknown keys decodes hollow: {hollow:?}"
+        );
+        // And the shape that must NOT fire: a real update missing only the
+        // status is a partial frame, not a hollow decode.
+        let partial = parse_order_update(r#"{"Data":{"OrderNo":"12345"}}"#)
+            .expect("a partial but recognisable frame parses");
+        assert!(
+            !(partial.order_no.is_empty()
+                && partial.status.is_empty()
+                && partial.security_id.is_empty()),
+            "an update carrying an order number is NOT hollow — firing here would \
+             page on every legitimately partial frame"
+        );
+    }
+    /// 2026-10-28 (hostile review): every frame the parser cannot read as
+    /// an order (hollow, or no order number with a foreign `Type`) stays on
+    /// ORDER-EVT-02 at ERROR and on the hollow counter that feeds the
+    /// order-path loss page, and is STILL broadcast: no `continue`, no
+    /// second counter, no info-level side path between the verdict and the
+    /// send.
+    #[test]
+    fn test_unreadable_order_frame_type_verdict_pages_and_still_broadcasts() {
+        let src = include_str!("order_update_connection.rs");
+        let prod = production_source(src);
+        let gate = prod
+            .find("if let Some(msg_type) = unreadable_order_frame_type(&update, &text)")
+            .expect("the ORDER-EVT-02 gate uses the parser's verdict");
+        let send = prod
+            .find("order_sender.send(update)")
+            .expect("the broadcast exists");
+        assert!(gate < send);
+        let arm = &prod[gate..send];
+        assert!(arm.contains("ORDER_UPDATE_HOLLOW_DECODE_COUNTER"));
+        assert!(arm.contains("OrderEvt02DecodedHollow"));
+        assert!(arm.contains(concat!("error", "!(")));
+        assert!(arm.contains("msg_type = %msg_type"));
+        assert!(
+            !arm.contains("continue;"),
+            "an unreadable order frame must never skip the broadcast"
+        );
+        assert!(!arm.contains("info!("));
+        assert!(
+            !prod.contains("non_order_typed"),
+            "no side counter may take frames off the loss page"
+        );
+    }
+
+    /// The frame shapes behind the live ORDER-EVT-02 lines, end to end
+    /// through the real parser: an all-camelCase order event is readable;
+    /// a hollow one pages whatever its tag; a foreign-typed frame with no
+    /// order number pages even when it decodes a camelCase status.
+    #[test]
+    fn test_live_hollow_shapes_parse_or_page() {
+        let camel = r#"{"Data":{"exchange":"NSE","segment":"D","source":"N","securityId":"52432","orderNo":"1124091136546","txnType":"B","status":"TRADED","quantity":75,"tradedQty":75,"refLtp":11.15,"tickSize":0.05,"mktType":"NL","multiplier":1,"goodTillDaysDate":"2026-10-28","algoOrdNo":"0"},"Type":"order_alert"}"#;
+        let update = parse_order_update(camel).expect("camelCase order event parses");
+        assert_eq!(unreadable_order_frame_type(&update, camel), None);
+        assert_eq!(update.order_no, "1124091136546");
+        assert_eq!(update.status, "TRADED");
+        assert_eq!(update.traded_qty, 75);
+
+        for (frame, tag) in [
+            (
+                r#"{"Data":{"MktType":"XX","RefLtp":11.15},"Type":"order_alert"}"#,
+                "order_alert",
+            ),
+            (
+                r#"{"Data":{"Message":"session ok"},"Type":"heartbeat"}"#,
+                "heartbeat",
+            ),
+            (
+                r#"{"Data":{"status":"success"},"Type":"login_ack"}"#,
+                "login_ack",
+            ),
+        ] {
+            let update = parse_order_update(frame).expect("parses");
+            assert_eq!(
+                unreadable_order_frame_type(&update, frame).as_deref(),
+                Some(tag),
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hollow_decode_detector_is_wired_at_the_parse_site() {
+        let src = include_str!("order_update_connection.rs");
+        assert!(
+            src.contains("OrderEvt02DecodedHollow"),
+            "the ORDER-EVT-02 emit must stay at the parse site"
+        );
+        assert!(
+            src.contains(ORDER_UPDATE_HOLLOW_DECODE_COUNTER),
+            "the hollow-decode counter must stay wired"
+        );
+        assert!(
+            src.contains("excerpt = %redacted_frame_excerpt(&text)"),
+            "the RAW excerpt is the whole point — a counter alone leaves the \
+             next occurrence as undiagnosable as this one was"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "order_update_connection_run_loop_cov_tests.rs"]
+mod order_update_connection_run_loop_cov_tests;

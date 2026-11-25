@@ -41,9 +41,11 @@ on:
   workflow_dispatch:
     inputs:
       confirm_market_hours:
-        description: 'Deploying during market hours? Type "yes" to override the guard.'
+        description: 'Deploying during market hours? Choose "yes" to override the guard.'
         required: false
         default: 'no'
+        type: choice
+        options: ['no', 'yes']
   push:
     branches: [main]
     paths:
@@ -91,9 +93,106 @@ jobs:
   preflight:
     name: Preflight — check bootstrap secrets
     runs-on: ubuntu-24.04
+    # Read-only API access for the two checks below (audit PR36b). This job
+    # assumes no AWS role, so it needs no id-token.
+    permissions:
+      contents: read
+      checks: read
+      pull-requests: read
+      actions: read
     outputs:
       bootstrap_ready: ${{ steps.check.outputs.bootstrap_ready }}
     steps:
+      # Audit PR36b: a manual run (workflow_dispatch) could be started from
+      # any branch and reach the prod environment, shipping a commit that
+      # never passed All Green. Every automatic dispatcher (after-close cron,
+      # post-merge catch-up, deploy watchdog, operator console) dispatches
+      # main, so this refuses nothing they send. A manual run must be on main
+      # AND its commit must have a successful All Green, either on the commit
+      # itself or on the head of the pull request that was squash-merged as
+      # it. Any API failure refuses (fail-closed); the next after-close cron
+      # retries. Honest limit: this check lives in the workflow file, so a
+      # run from a branch that deletes it is not stopped here. That barrier
+      # is the prod environment's deployment-branch rule (next step).
+      #
+      # Audit PR36c (2026-10-03, owner: "security yes"): a pushed v*.*.* tag
+      # also deploys, and it skipped this check, so a tag on any commit
+      # (a branch nobody merged, or one that failed CI) reached prod. A tag
+      # run now passes the same All Green check, and its commit must already
+      # be on main (the tag may name an older main commit, never one outside
+      # it). Undo: revert this step's `if:` to the dispatch-only form.
+      - name: Refuse a manual or tag deploy of a commit that did not pass All Green
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_REF: ${{ github.ref }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          refuse() {
+            echo "::error::deploy refused: $1" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          if [[ "$RUN_REF" == refs/tags/* ]]; then
+            # `behind` = the commit is an ancestor of main; `identical` = it
+            # is main's head. Anything else is not on main.
+            on_main=$(gh api "repos/${REPO}/compare/main...${RUN_SHA}" --jq '.status' 2>/dev/null) \
+              || refuse "could not compare ${RUN_SHA} with main"
+            case "$on_main" in
+              identical|behind) echo "✅ tag ${RUN_REF#refs/tags/} names ${RUN_SHA}, which is on main." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+              *) refuse "tag ${RUN_REF#refs/tags/} names ${RUN_SHA}, which is not on main (compare status: ${on_main:-empty})" ;;
+            esac
+          elif [ "$RUN_REF" != "refs/heads/main" ]; then
+            refuse "it was started from ${RUN_REF}; only main can be deployed by hand"
+          fi
+          # Prints the number of successful All Green runs (posted by GitHub
+          # Actions, latest attempt only) on a commit, or nothing on an API
+          # failure.
+          all_green_count() {
+            gh api "repos/${REPO}/commits/$1/check-runs?check_name=All%20Green&filter=latest&per_page=100" \
+              --jq '[.check_runs[] | select(.app.slug == "github-actions" and .conclusion == "success")] | length' \
+              2>/dev/null
+          }
+          direct=$(all_green_count "$RUN_SHA")
+          [[ "$direct" =~ ^[0-9]+$ ]] || refuse "could not read the checks of ${RUN_SHA}"
+          if [ "$direct" -ge 1 ]; then
+            echo "✅ ${RUN_SHA} passed All Green itself." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pr=$(gh api "repos/${REPO}/commits/${RUN_SHA}/pulls" \
+            --jq "[.[] | select(.merged_at != null and .base.ref == \"main\" and .merge_commit_sha == \"${RUN_SHA}\")][0] | if . == null then \"\" else \"\(.number) \(.head.sha)\" end" \
+            2>/dev/null) || refuse "could not read the pull request behind ${RUN_SHA}"
+          [ -n "$pr" ] || refuse "${RUN_SHA} has no All Green of its own and is not the merge of a pull request into main"
+          pr_number=${pr%% *}
+          pr_head=${pr##* }
+          via_pr=$(all_green_count "$pr_head")
+          [[ "$via_pr" =~ ^[0-9]+$ ]] || refuse "could not read the checks of pull request #${pr_number}"
+          if [ "$via_pr" -ge 1 ]; then
+            echo "✅ ${RUN_SHA} is the merge of pull request #${pr_number}, whose head ${pr_head} passed All Green." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          refuse "pull request #${pr_number} (head ${pr_head}) has no successful All Green"
+
+      # Audit PR36b: the AWS role trusts any job that runs in the prod
+      # environment, whatever its branch (oidc.tf, the environment:prod
+      # subject). What stops a run from another branch is the environment's
+      # own deployment-branch rule, a repository setting this file cannot
+      # set. Report it on every run so a missing rule is visible. Never
+      # fatal: a deploy is not blocked on a setting.
+      - name: Report whether the prod environment is limited to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          policy=$(gh api "repos/${REPO}/environments/prod" \
+            --jq 'if .deployment_branch_policy == null then "none" else "set" end' 2>/dev/null) || policy="unreadable"
+          case "$policy" in
+            set)  echo "✅ prod environment has a deployment-branch rule." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            none) echo "::warning::prod environment accepts runs from ANY branch; set Settings > Environments > prod > Deployment branches and tags to main plus tags v*" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *)    echo "::warning::could not read the prod environment's deployment-branch rule" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
       - name: Check whether AWS bootstrap secrets are configured
         id: check
         env:
@@ -125,7 +224,7 @@ jobs:
       binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain (host = aarch64-unknown-linux-musl, static binary)
         # MUSL static target eliminates GLIBC version dependency entirely.
@@ -133,7 +232,7 @@ jobs:
         # A glibc-dynamic binary built on the runner refuses to load on the box
         # with `version GLIBC_2.38/2.39 not found`. Static musl binary = zero
         # runtime libc dependency = runs on any Linux forever. Z+ L4 PREVENT.
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
           toolchain: 1.95.0
           targets: aarch64-unknown-linux-musl
@@ -196,7 +295,7 @@ jobs:
           exit 1
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -216,7 +315,7 @@ jobs:
           # review HIGH fix — a rerun-if-env-changed on GITHUB_SHA killed the
           # Build & Verify cache on every commit).
           TICKVAULT_BUILD_GIT_SHA: ${{ github.sha }}
-        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault -p tickvault-app
+        run: cargo build --release --target aarch64-unknown-linux-musl --bin tickvault --bin tv-movers -p tickvault-app
 
       - name: Build smoke_test binary (ARM64 musl static)
         # Separate binary at crates/app/src/bin/smoke_test.rs — exits 0/1
@@ -234,6 +333,8 @@ jobs:
           BIN_DIR=target/aarch64-unknown-linux-musl/release
           file "$BIN_DIR/tickvault"
           file "$BIN_DIR/smoke_test"
+          file "$BIN_DIR/tv-movers" | grep -q 'aarch64\|ARM'
+          file "$BIN_DIR/tv-movers" | grep -q 'statically linked'
           # Confirm the file command reports ARM aarch64 (not x86)
           file "$BIN_DIR/tickvault" | grep -q 'aarch64\|ARM' \
             || (echo "FAIL: tickvault is not ARM64 — arch mismatch with Graviton box"; exit 1)
@@ -260,16 +361,15 @@ jobs:
             exit 1
           fi
 
-      - name: Stage both binaries for upload
+      - name: Stage app, smoke test and read-only operator helper
         run: |
           mkdir -p dist
           BIN_DIR=target/aarch64-unknown-linux-musl/release
-          cp "$BIN_DIR/tickvault"   dist/tickvault
-          cp "$BIN_DIR/smoke_test"  dist/smoke_test
+          cp "$BIN_DIR/tickvault" "$BIN_DIR/smoke_test" "$BIN_DIR/tv-movers" dist/
 
-      - name: Upload artifact (both binaries)
+      - name: Upload artifact (all three binaries)
         id: upload
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: tickvault-binary
           path: dist/
@@ -281,7 +381,7 @@ jobs:
         # deploy job's credential step (same action + inputs) so it works both
         # pre- and post-OIDC-migration.
         if: failure()
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -321,28 +421,42 @@ jobs:
     outputs:
       deploy_allowed: ${{ steps.window.outputs.deploy_allowed }}
     steps:
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check current IST time against market window
         id: window
+        # SEC-7 (2026-10-12): a dispatch input reaches the script through env,
+        # never as an inline expression the runner pastes into the script.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03: "only between 9 am till 3.45 pm it should not happen").
           # Monday-Friday only (NSE trading days, ignoring holidays for now).
           UTC_HOUR=$(date -u +%H)
           UTC_MINUTE=$(date -u +%M)
-          UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
+          UTC_DOW=$(date -u +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes  # 1=Mon, 7=Sun; MUHURAT = a calendar Muhurat date (IST), a whole no-deploy day
           UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
           # No-deploy window in UTC: 0330 (09:00 IST) to 1015 (15:45 IST)
-          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
-            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+          if [ "$MUHURAT" = "yes" ] || { [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; }; then
+            if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
               echo "WARNING: deploying during market hours with explicit override"
             elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
               # An explicit human/dispatcher action asked for an in-window
               # deploy WITHOUT the override — keep the loud red signal so the
               # asker learns immediately that nothing was deployed.
-              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
+              echo "BLOCK: deploying during 09:00-15:45 IST on a weekday, or on a calendar Muhurat date (MUHURAT=$MUHURAT), is forbidden without override."
               echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
               exit 1
             elif [ "${{ github.event_name }}" = "push" ] && [ "$GITHUB_REF" = "refs/heads/main" ]; then
@@ -370,7 +484,7 @@ jobs:
               # TAG pushes still block red below (the after-close cron
               # delivers main HEAD only).
               echo "deploy_allowed=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::Deploy of ${{ github.sha }} deferred: inside 09:00-15:45 IST market window; the after-close redeploy cron (15:46 IST, deploy-aws-after-close.yml) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
+              echo "::notice::Deploy of ${{ github.sha }} deferred: inside the 09:00-15:45 IST weekday market window, or on a calendar Muhurat date (MUHURAT=$MUHURAT); the next weekday after-close redeploy cron (deploy-aws-after-close.yml: 15:46 IST, or the next weekday morning after a Muhurat date) will deliver it. Immediate delivery remains available via workflow_dispatch with confirm_market_hours=yes."
               exit 0
             else
               # HOSTILE-REVIEW FIX 2026-07-17: the green defer above is
@@ -379,7 +493,7 @@ jobs:
               # in-window TAG push (v*.*.*, possibly on a non-HEAD commit)
               # would be a SILENT never-deploy. Tags and any other in-window
               # non-override shape keep the original loud red block.
-              echo "BLOCK: deploying during 09:00-15:45 IST is forbidden without override."
+              echo "BLOCK: deploying during 09:00-15:45 IST on a weekday, or on a calendar Muhurat date (MUHURAT=$MUHURAT), is forbidden without override."
               echo "This event (${{ github.event_name }} on $GITHUB_REF) cannot be green-deferred: the after-close cron redeploys main HEAD only."
               exit 1
             fi
@@ -403,10 +517,10 @@ jobs:
     environment: prod
     steps:
       - name: Checkout (for deploy scripts)
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download built binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tickvault-binary
           path: ./dist/
@@ -417,7 +531,7 @@ jobs:
         # operator has only AWS_ACCESS_KEY_ID/SECRET set — so this step MUST
         # accept either. Mirrors seed-staging-ssm.yml so deploy works the
         # moment the box exists, not only after the OIDC migration.
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -464,7 +578,7 @@ jobs:
           #
           # AWS does not define an order for Reservations, and this filter
           # deliberately includes stopped instances (the box is stopped
-          # outside its 08:30-17:30 window, which is most of the day). Taking
+          # outside its 08:30-16:30 window, which is most of the day). Taking
           # element zero therefore meant that during any replacement window a
           # STOPPED OLD instance could outrank the RUNNING NEW one, and the
           # deploy would land on the wrong machine — the same class of failure
@@ -566,8 +680,27 @@ jobs:
         #      monitor, notify, auto-stop) no-ops via its `env.DEPLOY_SKIP_REASON
         #      == ''` guard and stays SILENT (no Telegram spam), then exit ZERO so
         #      this intentional skip is recorded GREEN — a deliberate no-op is not
-        #      a deploy FAILURE. The 08:45 IST pre-market cron (deploy-aws-after-
-        #      close) redeploys the same commit once the box is up. Honest
+        #      a deploy FAILURE. CORRECTED 2026-09-06: this used to name "the
+        #      08:45 IST pre-market cron" as the redeploy. That slot is INERT --
+        #      deploy-aws-after-close suppresses dispatch across [08:15, 09:15)
+        #      IST (the boot-critical prep window) and BOTH its morning crons
+        #      (08:30 + 08:45 IST) fall inside it, so fired on time they
+        #      dispatch nothing. That file already says so; this one did not.
+        #      The REAL cover splits by merge type:
+        #        - BOT merge (auto-merge, GITHUB_TOKEN): the push run is
+        #          suppressed, so NO run exists for the SHA and
+        #          postmerge-catchup dispatches deploy-aws -- since 2026-11-07
+        #          ONLY on an ordinary IST trading day (not Muhurat) between 15:45 and 16:05 IST,
+        #          when the box is up by schedule, so it never starts the box
+        #          (it used to dispatch any time, and the run self-started
+        #          the stopped box at night and at weekends). The same
+        #          watchdog / post-close crons below are the other cover.
+        #        - HUMAN merge: the push run DID fire and skipped green, and
+        #          catchup counts any run as covered -- so catchup will NOT
+        #          re-dispatch. Cover is the deploy-watchdog at 08:50 IST
+        #          Mon-Fri, which dispatches after-close by workflow_dispatch
+        #          (that BYPASSES the prep-window gate), plus the post-close
+        #          crons at 15:46 / 16:16 / 17:01 IST Mon-Fri. Honest
         #      envelope: an off-hours push shows a GREEN Actions run that did
         #      nothing-on-purpose (correct — "nothing to deploy, box is down by
         #      design") and pages nobody. A GENUINE deploy error (box up, smoke
@@ -580,7 +713,10 @@ jobs:
         run: |
           set -uo pipefail
           # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window;
-          # narrowed back from 08:00-17:00 on 2026-06-05 per operator).
+          # back to 16:30 on 2026-10-22 per operator Quote 37 (17:30 from Quote 14), recorded in
+          # daily-universe-scope-expansion-2026-05-27.md. That quote moved FOUR
+          # coupled sites in lockstep; this workflow was a FIFTH nobody listed,
+          # and it kept the old 16:30 until 2026-08-27).
           DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
           UP_WINDOW=no
@@ -602,25 +738,54 @@ jobs:
             sleep 5
           done
 
-          if [ "$ST" = "running" ]; then
-            echo "instance already running — proceeding with deploy"
-            exit 0
-          fi
-
-          if [ "$ST" != "stopped" ]; then
-            echo "::error::instance in unexpected state '$ST' — not safe to deploy"
-            exit 1
-          fi
+          # 2026-10-20: each one-line branch was four lines; merged to pay for
+          # the holiday-stop check below (the run-line budget only shrinks).
+          if [ "$ST" = "running" ]; then echo "instance already running — proceeding with deploy"; exit 0; fi
+          if [ "$ST" != "stopped" ]; then echo "::error::instance in unexpected state '$ST' — not safe to deploy"; exit 1; fi
 
           if [ "$SHOULD_BE_UP" != "yes" ]; then
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. The 08:45 IST pre-market cron will redeploy this commit once the box is up."
+            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one only on an ordinary IST trading day (never a weekend, holiday or Muhurat date) between 15:45 and 16:05 IST, when the box is already up by schedule, so the catch-up never starts the box (2026-11-07). If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
             # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
             # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
             # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
             # (no SSM against a down box, no false success/failure Telegram). The
             # run is GREEN. A real failure (box up + error) never reaches here.
             exit 0
+          fi
+
+          # Audit PR30 (2026-09-27): a budget stop stays stopped for the UTC
+          # billing month. The latch is read before the start, for every
+          # event type (the post-merge catch-up dispatches by workflow_dispatch
+          # too). Fail closed on unreadable or malformed markers. Only the
+          # CLI's exact ParameterNotFound classification proves absence.
+          # GNU date round-trips the expected month/date form; raw values and
+          # provider error bodies never reach logs. Each provider read is bounded.
+          # A suffix preserves trailing bytes through shell capture; only one
+          # normal CLI newline is removed. Local C locale makes lengths bytes.
+          read_stop_fence() { local kind="$1" suffix="$2" format="$3" raw rc LC_ALL=C expected=10; [ "$kind" != budget ] || expected=7; shift 3
+            if raw=$(timeout -k 5 20 "$@" 2>&1 | tr '\000' '?' | head -c 4097; rc=$?; printf '.'; exit "$rc"); then raw=${raw%.}; raw=${raw%$'\n'}; if [ "$kind" = budget ] && [[ "$raw" =~ ^released-([0-9]{4}-[0-9]{2})$ ]] && [ "$(date -u -d "${BASH_REMATCH[1]}-01" +%Y-%m 2>/dev/null)" = "${BASH_REMATCH[1]}" ]; then echo "DEPLOY_FENCE $kind=released" >&2; return 0; fi; [ "${#raw}" = "$expected" ] && [ "$(date -u -d "${raw}${suffix}" +"$format" 2>/dev/null)" = "$raw" ] || { echo "::error::DEPLOY_FENCE $kind invalid; refusing start" >&2; return 1; }; echo "DEPLOY_FENCE $kind=valid" >&2; printf '%s' "$raw"
+            else rc=$?; raw=${raw%.}; if { [ "$rc" = 254 ] || [ "$rc" = 255 ]; } && [ "${#raw}" -le 4096 ] && [[ "$raw" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then echo "DEPLOY_FENCE $kind=absent" >&2; else echo "::error::DEPLOY_FENCE $kind unavailable; refusing start" >&2; return 1; fi; fi
+          }
+          LATCH=$(read_stop_fence budget -01 %Y-%m aws ssm get-parameter --region "$REGION" --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text) || exit 1
+          if [ -n "$LATCH" ] && [ "$LATCH" = "$(date -u +%Y-%m)" ]; then
+            echo "DEPLOY_SKIP_REASON=budget_stop" >> "$GITHUB_ENV"
+            echo "::notice::DEPLOY_FENCE budget=matching — leaving the budget-stopped box stopped; no override attempted."
+            exit 0
+          fi
+
+          # 2026-10-20: the holiday gate (holiday_gate.rs) stamps today's IST
+          # date into this marker before it stops the box on a weekday NSE
+          # holiday. Every dispatcher (deploy-watchdog, deploy-aws-after-close,
+          # postmerge-catchup) runs this workflow by workflow_dispatch, which
+          # sets SHOULD_BE_UP=yes, so without this check a holiday redeploy
+          # would start the box the gate just stopped. The same strict reader
+          # validates this date and refuses an unknown result before starting.
+          # GitHub role already reads this parameter (oidc.tf). A valid matching
+          # marker is a green no-op; unreadable/invalid is a loud refusal.
+          HSTOP=$(read_stop_fence holiday '' %F aws ssm get-parameter --region "$REGION" --name "/tickvault/prod/holiday-stop-date" --query 'Parameter.Value' --output text) || exit 1
+          if [ -n "$HSTOP" ] && [ "$HSTOP" = "$(TZ='Asia/Kolkata' date +%F)" ]; then
+            echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::DEPLOY_FENCE holiday=matching — leaving the holiday-stopped box stopped; no override attempted."; exit 0
           fi
 
           echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
@@ -697,16 +862,13 @@ jobs:
             echo "::warning::$MISSING /tickvault/prod/* keys are missing — app boot may HALT. Populate them MANUALLY via aws ssm put-parameter (operator-owned; the deploy never auto-seeds prod)."
           fi
 
-      - name: Upload both binaries to S3 deploy bucket
+      - name: Upload app, smoke test and read-only helper to S3
         # Skipped on an intentional off-hours skip — no deploy is happening.
         if: env.DEPLOY_SKIP_REASON == ''
         run: |
-          chmod +x ./dist/tickvault ./dist/smoke_test
-          aws s3 cp ./dist/tickvault \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }}
-          aws s3 cp ./dist/smoke_test \
-            s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test \
+          chmod +x ./dist/tickvault ./dist/smoke_test ./dist/tv-movers
+          aws s3 cp ./dist/ \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/ --recursive --exclude '*' --include tickvault --include smoke_test --include tv-movers \
             --region ${{ vars.AWS_REGION || 'ap-south-1' }}
 
       - name: Re-gate market hours at SWAP time (no mid-session restart)
@@ -731,17 +893,19 @@ jobs:
         # intentional defer, not a failure) while keeping the run non-success
         # so the cron re-fires. The manual override path stays open via
         # workflow_dispatch confirm_market_hours=yes (same as the start guard).
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           set -uo pipefail
-          if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+          if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
             echo "operator override (confirm_market_hours=yes) — proceeding with swap during market hours"
             exit 0
           fi
-          DOW=$(TZ='Asia/Kolkata' date +%u)
+          DOW=$(TZ='Asia/Kolkata' date +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; then
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; then
             echo "DEPLOY_SKIP_REASON=market_hours_swap_abort" >> "$GITHUB_ENV"
-            echo "::warning::Market is OPEN ($HHMM IST) at swap time — the build crossed into the 09:00-15:45 IST no-deploy band. ABORTING the binary swap to avoid a mid-session restart. The 15:46 IST post-market cron will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
+            echo "::warning::Market is OPEN ($HHMM IST, MUHURAT=$MUHURAT) at swap time — the build crossed into the 09:00-15:45 IST weekday no-deploy band or a calendar Muhurat date. ABORTING the binary swap to avoid a mid-session restart. The next weekday after-close cron (15:46 IST) will redeploy this commit. (Override: re-run with confirm_market_hours=yes.)"
             exit 1
           fi
           echo "outside market hours ($HHMM IST, dow=$DOW) — safe to swap"
@@ -815,6 +979,25 @@ jobs:
       # but if user-data never ran (rebuilt instance) OR QuestDB was stopped, the
       # app boots and hits BOOT-02 (QuestDB readiness deadline 60s). Idempotent:
       # `docker compose up -d` is a no-op when containers are already running.
+      # 2026-09-09 CLEAR-AND-RETRY-ONCE: `up -d` is NOT always a no-op — when the
+      # resolved config differs from what a container was created with, compose
+      # RECREATES it, and its recreate path renames the old container to
+      # `<id>_<service>` as a backup before creating the replacement. On the
+      # 2026-09-09 deploy of 2e681b94c that path failed twice, deterministically,
+      # with different container ids (`9ed786971d89_tv-questdb`, then
+      # `d437d47db47c_tv-questdb`) — `Error response from daemon: No such
+      # container: <id>` — so it is the recreate implementation, not a race. The
+      # binary swap runs ABOVE this step and had already succeeded, so the box
+      # was serving the new code while the deploy reported FATAL and skipped the
+      # B9 provenance write, leaving `binary-git-sha` stale and the
+      # tv-prod-binary-sha-stale alarm armed against a box that was actually fine.
+      # Attempt 1 is unchanged. Only on failure do we remove THIS project's
+      # containers (`docker compose ps -aq` lists the renamed backup too — a
+      # rename keeps the compose labels) and run `up -d` again, which then has
+      # nothing to recreate and simply creates. Data is untouched: the volumes
+      # are named (`tv-questdb-data`, `tv-loki-data`) and `docker rm` never
+      # removes a named volume. Two failures still exit FATAL, so a genuinely
+      # broken compose file can never be papered over as a recovery.
       # Z+ L3 RECONCILE: prove the running state matches the desired state.
       # B4 QuestDB console fix (2026-07-03): persist TV_QDB_HTTP_BIND=0.0.0.0 in
       # the compose project .env (gitignored — survives the reset --hard above)
@@ -823,7 +1006,7 @@ jobs:
       # connection and every console request 503s box-offline while the box is
       # RUNNING. Exposure unchanged: the box SG admits 9000 from the Lambda SG
       # ONLY (main.tf dynamic ingress) — never public. .env is read by EVERY
-      # compose caller (this step, user-data boot, infra.rs, ensure-questdb.sh),
+      # compose caller (this step, user-data boot, infra.rs, `tickvault ensure-questdb`),
       # so the bind persists across restarts. Idempotent grep-or-append.
       # Verify QuestDB is actually listening on 9000 (HTTP) within 30s
       # Console-shell HARD canary (2026-07-06 shell-hang fix; hard gate 2026-07-08): the console back lambda rewrites GET / -> /index.html, so /index.html must complete box-locally within 5s on every box deploy — this is the lane that ships QuestDB image bumps. curl -f fails on any code >= 400, and --max-time 5 fails an unframed keep-alive response whose body never completes (curl exit 28): completion-within-5s IS the framing assertion. Disclosed limitation: a framed 3xx at /index.html (< 400) passes curl -f here; the end-to-end proxy gate in terraform-apply.yml requires a literal 200 and catches that shape on the next in-window apply. Never probe bare / here: QuestDB answers it with an unframed keep-alive 301 that would hang this shell.
@@ -879,6 +1062,14 @@ jobs:
       # READY behind the daily-universe infinite-retry CSV fetch — a >300s CDN blip
       # would false-fail this poll while the boot is legitimately still retrying;
       # if that mode returns, revisit this bound (or gate READY earlier app-side).
+      # RESET-FAILED BEFORE THE RESTART (2026-10-09, stress audit OPS-2). A unit
+      # that crash-looped into its start limit is refused by a plain restart
+      # ("start request repeated too quickly"), so a deploy carrying the FIX
+      # failed and the rollback then reinstalled the crashing binary. The
+      # rollback already clears it; the normal swap now does too, at the end of
+      # the planned-restart marker element (kept in that element so the restart
+      # element and the SSM shell budget do not grow; the restart's failure
+      # banners were shortened by at least as many bytes).
       # === OBSERVABILITY LAST (non-fatal + time-bounded) ===
       # SELF-HEAL: CloudWatch Agent install + config (mirrors user-data Step 2-3).
       # Without this the dashboards show No data and /tickvault/prod/app log group
@@ -894,27 +1085,51 @@ jobs:
         # NOT a subcommand of `tickvault`. The previous version
         # (`bin/tickvault.new smoke-test --duration 30`) was wrong and would
         # exit non-zero with "unrecognized subcommand".
+        # The holiday-gate and app units are copied only AFTER
+        # `bin/tickvault-host` is refreshed (audit D6c, D6d): they run
+        # `tickvault-host holiday-gate` and `tickvault-host ensure-questdb`, and
+        # a deploy that fails its smoke test must not leave a new unit pointing
+        # at an older copy that does not know that subcommand (it would ignore
+        # the argument and boot the whole app inside the unit).
+        # ENABLE THE HOLIDAY GATE ON EVERY DEPLOY (2026-10-20): the deploy
+        # copied tickvault-holiday-gate.service but enabled only tickvault and
+        # tickvault-host-tuning. Only first-boot user-data enabled the gate, and
+        # terraform ignores user_data changes, so the live box never had it
+        # enabled and ran through the 2026-10-02 and 2026-10-20 NSE holidays.
+        # One `systemctl enable` element now names all three units, after
+        # `systemctl daemon-reload` (shell budget shrinks by one element).
+        # One `systemctl enable` naming three units fails whole if any unit
+        # file is absent, and `|| true` would hide that, so the gate unit's
+        # copy is unconditional: a missing file now fails the deploy under
+        # `set -euo pipefail` instead of silently leaving all three disabled.
+        # The gate itself stops the box only on a weekday NSE holiday booted
+        # inside 08:25 to 09:15 IST (holiday_gate.rs), so a weekend or
+        # after-hours deploy start is never stopped by it.
+        # Pinned by host_tuning_boot_wiring_guard.rs
+        # `deploy_enables_the_holiday_gate_after_daemon_reload`.
         id: ssm
         # EXPRESSION-LENGTH LOCK (2026-08-18): this run block MUST stay free of
         # `${{ }}` interpolation. GitHub compiles any run script containing an
         # expression into a SINGLE template expression capped at 21,000 chars;
-        # this block is ~23,100, so one interpolation makes the whole workflow
-        # file unparseable — `422 Exceeded max expression length 21000` — which
-        # kills the push trigger AND workflow_dispatch, silently blocking every
-        # deploy. Pass values through `env:` below and reference them as shell
-        # variables instead. Inside the single-quoted `--parameters 'commands=[…]'`
-        # payload use quote-splicing ('"$VAR"') — a bare $VAR will not expand.
+        # a historically oversized block failed with `422 Exceeded max expression
+        # length 21000`. The current block is smaller, but keeping expressions out
+        # avoids coupling deploy validity to that limit. Pass values through env.
+        # DEPLOY_SHA is validated as exactly 40 lowercase hex characters before
+        # its single literal splice into the SSM script; subsequent references
+        # expand only on the instance. No unvalidated value enters that payload.
+        # The splice sits on the `'commands=[` opener line: the SSM quoting lint
+        # (scripts/validate-deploy-ssm-quoting.sh) rejects an apostrophe on any
+        # interior line of the block, and the opener is the one line it allows.
         env:
           AWS_REGION_EFF: ${{ vars.AWS_REGION || 'ap-south-1' }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
-          CMD_ID=$(aws ssm send-command \
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid deployment SHA"; exit 1; }; CMD_ID=$(aws ssm send-command \
             --region "$AWS_REGION_EFF" \
             --instance-ids "$IID" \
             --document-name "AWS-RunShellScript" \
             --comment "tickvault deploy sha=$DEPLOY_SHA" \
-            --parameters 'commands=[
-              "set -euo pipefail",
+            --parameters 'commands=["set -euo pipefail; DEPLOY_SHA='$DEPLOY_SHA'",
               "command -v git >/dev/null 2>&1 || sudo timeout 180 dnf install -y git || sudo timeout 180 yum install -y git",
               "command -v docker >/dev/null 2>&1 || sudo timeout 180 dnf install -y docker || sudo timeout 180 yum install -y docker",
               "sudo systemctl enable --now docker",
@@ -925,38 +1140,38 @@ jobs:
               "if docker compose version >/dev/null 2>&1; then echo COMPOSE-PLUGIN-OK: already present - skipping install; else sudo timeout 180 dnf install -y docker-compose-plugin || sudo timeout 180 yum install -y docker-compose-plugin || echo compose plugin not in distro repos - falling back to pinned static binary; fi",
               "if ! docker compose version >/dev/null 2>&1; then COMPOSE_ARCH=$(uname -m); case \"$COMPOSE_ARCH\" in aarch64) COMPOSE_SHA256=\"$COMPOSE_SHA256_AARCH64\";; x86_64) COMPOSE_SHA256=\"$COMPOSE_SHA256_X86_64\";; *) COMPOSE_SHA256=\"\";; esac; if [ -z \"$COMPOSE_SHA256\" ]; then echo WARN: no pinned compose sha256 for arch $COMPOSE_ARCH - skipping static install; else timeout 150 curl -fsSL --max-time 120 https://github.com/docker/compose/releases/download/$COMPOSE_PIN/docker-compose-linux-$COMPOSE_ARCH -o /tmp/docker-compose.dl && echo \"$COMPOSE_SHA256  /tmp/docker-compose.dl\" | sha256sum -c - && sudo mkdir -p /usr/local/lib/docker/cli-plugins && sudo install -m 0755 -o root -g root /tmp/docker-compose.dl /usr/local/lib/docker/cli-plugins/docker-compose || echo WARN: pinned compose plugin download or sha256 verification FAILED - nothing installed - final verify below decides; rm -f /tmp/docker-compose.dl; fi; fi",
               "docker compose version || (echo FATAL: docker compose plugin still unavailable after distro package + pinned sha256-verified static binary attempts - boot path would BOOT-02 on the next nuke; exit 1)",
-              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin",
+              "mkdir -p /opt/tickvault/config /opt/tickvault/data/spill /opt/tickvault/logs /opt/tickvault/bin/.next",
+              "cd /opt/tickvault/bin/.next; TVS3=s3://tv-prod-cold/deploys/$DEPLOY_SHA; timeout 300 aws s3 cp \"$TVS3/tickvault\" tickvault",
+              "timeout 300 aws s3 cp \"$TVS3/smoke_test\" smoke_test",
+              "timeout 300 aws s3 cp \"$TVS3/tv-movers\" tv-movers",
+              "chmod +x tickvault smoke_test tv-movers",
+              "(cd ../..; timeout -k 5 120 bin/.next/smoke_test --preserve-deploy)",
               "chown -R ec2-user:ec2-user /opt/tickvault",
               "if [ ! -d /opt/tickvault/repo/.git ]; then sudo -u ec2-user git clone --depth 1 https://github.com/SJParthi/tickvault.git /opt/tickvault/repo; fi",
               "cd /opt/tickvault",
-              "if [ -d repo/.git ]; then sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin main && sudo -u ec2-user git -C repo reset --hard origin/main; fi",
+              "sudo -u ec2-user timeout 120 git -C repo fetch --depth 1 origin $DEPLOY_SHA && sudo -u ec2-user git -C repo reset --hard $DEPLOY_SHA && TV_REV=$(sudo -u ec2-user git -C repo rev-parse HEAD) && test \"$TV_REV\" = $DEPLOY_SHA || exit 1",
               "if [ ! -d repo/config ]; then echo FATAL: repo/config missing after git clone; exit 1; fi",
               "cp -f repo/config/*.toml config/",
               "chown -R ec2-user:ec2-user config/",
               "echo ===== deployed config/production.toml line count + head =====",
               "wc -l config/production.toml repo/config/production.toml",
-              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config/production.toml differs from repo/config/production.toml after cp; diff config/production.toml repo/config/production.toml; exit 1)",
-              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
-              "if [ -f repo/deploy/systemd/tickvault-holiday-gate.service ]; then cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service; fi",
+              "diff -q config/production.toml repo/config/production.toml || (echo FATAL: deployed config differs from repo after copy; diff config/production.toml repo/config/production.toml; exit 1)",
               "if [ -f repo/deploy/systemd/tickvault-host-tuning.service ]; then cp -f repo/deploy/systemd/tickvault-host-tuning.service /etc/systemd/system/tickvault-host-tuning.service; fi",
               "rm -rf scripts/groww-sidecar && echo GROWW-SIDECAR-RETIRED: on-box sidecar source removed",
               "rm -rf /opt/tickvault/data/groww/venv && echo GROWW-VENV-RETIRED: stale sidecar venv removed",
+              "timeout 40 bin/.next/smoke_test --duration 30",
               "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault  bin/tickvault.new",
-              "timeout 300 aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/smoke_test bin/smoke_test.new",
-              "chmod +x bin/tickvault.new bin/smoke_test.new",
-              "timeout 40 bin/smoke_test.new --duration 30",
-              "mv bin/tickvault.new   bin/tickvault",
-              "mv bin/smoke_test.new  bin/smoke_test",
-              "chown ec2-user:ec2-user bin/tickvault bin/smoke_test",
+              "(cd bin/.next; chown ec2-user:ec2-user tickvault smoke_test tv-movers; mv tickvault smoke_test tv-movers ..)",
+              "install -m 0755 -o root -g root bin/tickvault bin/tickvault-host",
+              "cp -f repo/deploy/systemd/tickvault-holiday-gate.service /etc/systemd/system/tickvault-holiday-gate.service",
+              "if [ -f repo/deploy/systemd/tickvault.service ]; then cp -f repo/deploy/systemd/tickvault.service /etc/systemd/system/tickvault.service; fi",
               "grep -q \"^TV_QDB_HTTP_BIND=\" repo/deploy/docker/.env 2>/dev/null || echo \"TV_QDB_HTTP_BIND=0.0.0.0\" >> repo/deploy/docker/.env",
               "chown ec2-user:ec2-user repo/deploy/docker/.env",
-              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d) || (echo FATAL: docker compose up failed or exceeded 600s; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
+              "if [ -f repo/deploy/docker/docker-compose.yml ]; then export TV_QUESTDB_PG_USER=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-user --with-decryption --output text --query Parameter.Value 2>/dev/null || echo admin); export TV_QUESTDB_PG_PASSWORD=$(aws ssm get-parameter --region ap-south-1 --name /tickvault/prod/questdb/pg-password --with-decryption --output text --query Parameter.Value 2>/dev/null || echo quest); (cd repo/deploy/docker && { TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: first attempt; } || { echo \"WARN: compose retry after stale-container cleanup; named volumes and data retained\"; docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; TV_QUESTDB_PG_USER=\"$TV_QUESTDB_PG_USER\" TV_QUESTDB_PG_PASSWORD=\"$TV_QUESTDB_PG_PASSWORD\" timeout 600 docker compose up -d && echo COMPOSE-UP-OK: recovered on attempt 2 after clearing stale containers; }) || (echo FATAL: docker compose up failed on BOTH attempts or exceeded 600s; docker compose -f repo/deploy/docker/docker-compose.yml ps -a || true; exit 1); else echo FATAL: docker-compose.yml missing from repo/deploy/docker; exit 1; fi",
               "for i in 1 2 3 4 5 6; do if curl -fsS http://127.0.0.1:9000/exec?query=SELECT%201 >/dev/null 2>&1; then echo QUESTDB-UP; break; fi; sleep 5; if [ $i -eq 6 ]; then echo FATAL: QuestDB not responding on :9000 after 30s; docker compose -f repo/deploy/docker/docker-compose.yml ps; exit 1; fi; done",
               "curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:9000/index.html || { echo \"FATAL: console shell page (/index.html) not served as a complete HTTP 200 within 5s on the box\"; exit 1; }",
               "systemctl daemon-reload",
-              "systemctl enable tickvault || true",
-              "systemctl enable tickvault-host-tuning || true",
+              "systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true",
               "systemctl restart tickvault-host-tuning || true",
               "ENVF=/opt/tickvault/repo/deploy/docker/.env",
               "touch $ENVF",
@@ -966,12 +1181,13 @@ jobs:
               "QDB_BEFORE=$(grep -E \"^QDB_MEM_LIMIT=\" $ENVF | tail -1 || true)",
               "grep -qE \"^QDB_MEM_LIMIT=\" $ENVF && sed -i \"s/^QDB_MEM_LIMIT=.*/QDB_MEM_LIMIT=$QDB_WANT/\" $ENVF || echo \"QDB_MEM_LIMIT=$QDB_WANT\" >> $ENVF",
               "QDB_AFTER=$(grep -E \"^QDB_MEM_LIMIT=\" $ENVF | tail -1 || true)",
-              "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && docker compose up -d --force-recreate questdb) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
+              "if [ \"$QDB_BEFORE\" != \"$QDB_AFTER\" ]; then echo \"questdb-mem: CORRECTED [$QDB_BEFORE] -> [$QDB_AFTER] — recreating questdb so the new cap takes effect\"; (cd /opt/tickvault/repo/deploy/docker && { docker compose up -d --force-recreate tv-questdb || { docker compose ps -aq 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true; docker compose up -d; }; }) || echo \"questdb-mem: WARNING recreate failed — cap applies on next container start\"; else echo \"questdb-mem: already $QDB_AFTER\"; fi",
               "systemctl is-active tickvault-host-tuning >/dev/null 2>&1 && echo \"host-tuning: applied\" || echo \"host-tuning: WARNING not active - check journalctl -u tickvault-host-tuning\"",
               "cat /opt/tickvault/net-tuning.status 2>/dev/null || echo \"host-tuning: no net-tuning.status yet\"",
-              "systemctl restart tickvault --no-block || (echo ===== systemctl restart dispatch failed ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
-              "READY_OK=no; for i in $(seq 1 60); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
-              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 300s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
+              "if systemctl is-active --quiet tickvault; then date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN || echo WARN: planned-restart marker not written - this restart will page as an unexpected stop; else echo planned-restart-marker: app not running, no stop to announce; fi; systemctl reset-failed tickvault || true",
+              "systemctl restart tickvault --no-block || (echo == restart failed == && systemctl status tickvault.service --no-pager -l || true; echo == journal -xeu == && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1)",
+              "READY_OK=no; for i in $(seq 1 150); do if systemctl is-active --quiet tickvault; then READY_OK=yes; break; fi; sleep 5; done",
+              "if [ \"$READY_OK\" != yes ]; then echo ===== tickvault not active within 750s - app likely never sent READY=1 - start job continues in background ===== && systemctl status tickvault.service --no-pager -l || true; echo ===== app stdout/stderr ONLY last 200 ===== && journalctl -u tickvault.service -n 200 --no-pager --output=cat || true; echo ===== journalctl -xeu last 100 ===== && journalctl -xeu tickvault.service -n 100 --no-pager || true; exit 1; fi",
               "echo TICKVAULT-UP",
               "command -v amazon-cloudwatch-agent-ctl >/dev/null 2>&1 || sudo timeout 180 dnf install -y amazon-cloudwatch-agent || sudo timeout 180 yum install -y amazon-cloudwatch-agent || (curl -fsSL --max-time 120 https://amazoncloudwatch-agent-ap-south-1.s3.ap-south-1.amazonaws.com/amazon_linux/arm64/latest/amazon-cloudwatch-agent.rpm -o /tmp/cwa.rpm && sudo rpm -i /tmp/cwa.rpm) || true",
               "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
@@ -1020,7 +1236,7 @@ jobs:
           # ~12.6 min), so 240 polls ≈ 25 min REAL. Sizing: every on-box stage
           # is now explicitly bounded (same-date deploy-hang fix — dnf ≤180s,
           # curl ≤120s, git fetch ≤120s, s3 cp ≤300s each, compose up ≤600s,
-          # smoke ≤40s, no-block restart + 300s readiness poll, CW agent ≤~300s), and the
+          # smoke ≤40s, no-block restart + 750s readiness poll, CW agent ≤~300s), and the
           # sizing case is a POST-NUKE FIRST deploy that must also dnf-install
           # docker + pull the QuestDB image inside `compose up` — realistic
           # wall-clock ~8-12 min, so 25 min real gives ~2x headroom while any
@@ -1242,11 +1458,54 @@ jobs:
               echo "EOF_DIAG"
             } >> "$GITHUB_ENV"
             echo "ROLLBACK: tickvault is not active after deploy — rolling back"
-            aws ssm send-command \
+            # `reset-failed` BEFORE the restart, and it is the whole reason a
+            # rollback can leave the box dead. The unit sets StartLimitBurst=5
+            # / RestartSec=3 (was 8/600s until 2026-09-03), so a binary that
+            # exits immediately trips the start limit within ~15s and systemd
+            # then REFUSES every further start with "Start request repeated too
+            # quickly" until the 3600s StartLimitIntervalSec window expires --
+            # an hour, not ten minutes, which makes the `reset-failed` below
+            # MORE load-bearing than it was, not less. A bare `systemctl restart`
+            # in that state is a no-op: the good binary is back on disk and
+            # nothing runs it.
+            #
+            # Verified live on 2026-08-28, by hand, during the outage this was
+            # written for: `systemctl start` alone did nothing, and only
+            # `reset-failed` followed by `start` brought the app up.
+            #
+            # `cp` not `mv` for the backup: `mv` CONSUMES it, so a second
+            # rollback in the same session finds no backup and silently does
+            # nothing (the `if [ -f ... ]` simply falls through). Keeping the
+            # file means the recovery path is repeatable.
+            #
+            # The result is now READ instead of fired and forgotten, so a
+            # rollback that failed to restore service says so in the log
+            # rather than reporting the same "exit 1" as one that worked.
+            RB_CMD=$(aws ssm send-command \
               --region "$REGION" \
               --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
+              --parameters 'commands=["set -euo pipefail","if [ ! -d /opt/tickvault ]; then echo SKIP_ROLLBACK_NO_DIR; exit 0; fi","cd /opt/tickvault","if [ ! -f bin/tickvault.backup ]; then echo ROLLBACK_NO_BACKUP_BINARY; exit 1; fi","cp -f bin/tickvault.backup bin/tickvault","systemctl reset-failed tickvault || true","systemctl start tickvault","for i in $(seq 1 30); do if systemctl is-active --quiet tickvault; then echo ROLLBACK_ACTIVE; exit 0; fi; sleep 2; done","echo ROLLBACK_NOT_ACTIVE; systemctl status tickvault --no-pager -l | head -20; exit 1"]' \
+              --query 'Command.CommandId' --output text 2>/dev/null || echo "")
+            if [ -n "$RB_CMD" ]; then
+              for _ in $(seq 1 24); do
+                sleep 5
+                RB_STATE=$(aws ssm get-command-invocation --region "$REGION" \
+                  --command-id "$RB_CMD" --instance-id "$IID" \
+                  --query 'Status' --output text 2>/dev/null || echo "Pending")
+                case "$RB_STATE" in Success|Failed|Cancelled|TimedOut) break ;; esac
+              done
+              RB_OUT=$(aws ssm get-command-invocation --region "$REGION" \
+                --command-id "$RB_CMD" --instance-id "$IID" \
+                --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
+              if printf '%s' "$RB_OUT" | grep -q ROLLBACK_ACTIVE; then
+                echo "::warning::ROLLBACK SUCCEEDED — the previous binary is running. The deploy still FAILS so the bad build is not recorded as shipped."
+              else
+                echo "::error::ROLLBACK DID NOT RESTORE SERVICE (state=${RB_STATE:-unknown}). The box has NO APP. Output: ${RB_OUT}"
+              fi
+            else
+              echo "::error::ROLLBACK could not be dispatched — the box may have NO APP."
+            fi
             exit 1
           fi
           echo "DEPLOY VERIFIED: tickvault reached readiness (systemd active, or a healthy slow WAL-replay boot with no crash)"
@@ -1392,8 +1651,13 @@ jobs:
         # refused to self-heal it — see aws-autopilot.sh "unit disabled"
         # branch). Leaving the unit ENABLED means: systemd auto-starts it at
         # the next boot, the autopilot restarts an enabled-but-inactive unit,
-        # and a genuinely-bad binary is replaced by the morning redeploy
-        # (~08:45 IST) — all without the operator touching the box. The
+        # and a genuinely-bad binary is replaced by the next redeploy: the
+        # deploy-watchdog at 08:50 IST Mon-Fri (it compares the on-box
+        # binary-git-sha against main HEAD and dispatches after-close,
+        # bypassing the prep-window gate), or the post-close crons at
+        # 15:46 / 16:16 / 17:01 IST. CORRECTED 2026-09-06: this named the
+        # "~08:45 IST morning redeploy", a slot the prep-window gate always
+        # suppresses — all without the operator touching the box. The
         # intentional kill-switch (disable via AWS Control) stays the ONLY
         # source of a disabled unit, so the autopilot's disabled==intentional
         # semantics remain correct. Regression-locked by
@@ -1403,6 +1667,14 @@ jobs:
         # step). For earlier failures it silently no-ops via `|| true`.
         run: |
           set +e
+          # 2026-10-26 (audit PR L4): never stop the app inside the 09:00-15:40
+          # IST capture window. A deploy that passed its gate at 08:57 can fail
+          # at ~09:10; stopping then loses the live session. Same IST check as
+          # the swap re-gate above; the next deploy or the post-close crons fix
+          # a bad binary. Net run-line count unchanged (shell budget): the two
+          # check lines are paid by joining four send-command flags below.
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -le 1540 ]; }; then echo "::warning::Deploy failed inside the 09:00-15:40 IST capture window or on a Muhurat date ($HHMM IST); NOT stopping the app."; exit 0; fi
           # QUOTING FIX (2026-07-02, run #415 rc=127): the on-box echo message
           # previously contained an unquoted `;` — SSM runs each commands[]
           # element as a shell line, so the `;` TERMINATED the echo and the
@@ -1411,17 +1683,17 @@ jobs:
           # auto-stop invocation exited rc=127 even though the systemctl stop
           # itself succeeded. The message is now split into two `;`-free echos.
           aws ssm send-command \
-            --region ${{ vars.AWS_REGION || 'ap-south-1' }} \
-            --instance-ids "$IID" \
-            --document-name "AWS-RunShellScript" \
-            --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
+            --region ${{ vars.AWS_REGION || 'ap-south-1' }} --instance-ids "$IID" \
+            --document-name "AWS-RunShellScript" --comment "tickvault auto-stop on deploy failure sha=${{ github.sha }}" \
             --parameters 'commands=["systemctl stop tickvault || true","echo AUTO-STOPPED-UNIT-STAYS-ENABLED: stopped to break the Restart=always spam loop for this boot","echo unit kept ENABLED so it auto-starts at the next boot and aws-autopilot self-heals it"]' \
             --query Command.CommandId --output text || echo "(could not dispatch auto-stop — AWS creds likely not configured at this stage)"
 
       - name: Notify Telegram on failure
         # ANTI-SPAM 2026-06-02: an intentional off-hours skip (box stopped on
         # purpose, auto push outside the up-window) is NOT a failure worth
-        # paging the operator at 2 AM. The 08:45 IST pre-market cron redeploys.
+        # paging the operator at 2 AM. The redeploy comes from postmerge-catchup (bot
+        # merges, 15:45-16:05 IST on a trading day) or the 08:50 IST deploy-watchdog / post-close crons --
+        # NOT the 08:45 IST slot, which the prep-window gate always suppresses.
         # Genuine deploy failures (box up, smoke test failed, etc.) still page.
         if: failure() && env.DEPLOY_SKIP_REASON == ''
         run: |
@@ -1464,13 +1736,30 @@ jobs:
           IID: ${{ env.IID }}
         run: |
           set -uo pipefail
-          DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
+          DOW=$(TZ='Asia/Kolkata' date +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes  # 1=Mon..7=Sun
           HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then
-            echo "Inside 08:30-16:30 IST Mon-Fri window — leaving the box running."
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; }; then
+            echo "Inside 08:30-16:30 IST Mon-Fri window, or a Muhurat date (the Muhurat start watchdog owns the box today) — leaving the box running."
             exit 0
           fi
           echo "Outside the up-window (dow=$DOW time=$HHMM) and THIS run started the box — stopping it to avoid an out-of-window bill."
+          # Announce the stop to the app first (dhan-rest-only-noise-lock
+          # §2.3x, 2026-09-23): the SIGTERM this stop delivers lands outside
+          # the 16:25-16:45 quiet window, so without the planned-restart
+          # marker the app pages "Unexpected stop" for a stop this workflow
+          # chose. Best effort and bounded: if the marker cannot be written,
+          # the stop still happens and simply pages — the loud direction.
+          MARK_ID=$(aws ssm send-command --region "$REGION" --instance-ids "$IID" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["date +%s > /opt/tickvault/data/planned-restart.marker && chown ec2-user:ec2-user /opt/tickvault/data/planned-restart.marker && echo PLANNED-RESTART-MARKER-WRITTEN"]' \
+            --query 'Command.CommandId' --output text 2>/dev/null || true)
+          if [ -n "$MARK_ID" ] && [ "$MARK_ID" != "None" ]; then
+            timeout 60 aws ssm wait command-executed --region "$REGION" --command-id "$MARK_ID" --instance-id "$IID" \
+              && echo "planned-restart marker written before the stop" \
+              || echo "WARN: planned-restart marker not confirmed — this stop may page as unexpected"
+          else
+            echo "WARN: could not send the planned-restart marker — this stop may page as unexpected"
+          fi
           aws ec2 stop-instances --region "$REGION" --instance-ids "$IID" >/dev/null \
             && echo "stop-instances dispatched for $IID" \
             || echo "(could not dispatch stop — AWS creds likely not configured at this stage)"

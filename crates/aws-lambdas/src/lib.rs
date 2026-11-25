@@ -18,6 +18,7 @@
 //! pushes; none of the hot-path (zero-alloc / O(1)) constraints apply, but
 //! the charter lints below do.
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
@@ -27,19 +28,43 @@
 pub mod alarm_gate;
 pub mod budget_digest;
 pub mod budget_killswitch;
+pub mod budget_spend;
+pub mod budget_stop_latch;
 pub mod clients;
 pub mod deploy_watchdog;
 pub mod dhan_token_minter;
+pub mod drain_hold;
 pub mod events;
 pub mod hard_stop_guard;
 pub mod logging;
 pub mod market_hours_gate;
 pub mod market_open_readiness;
+pub mod muhurat_window;
+pub mod nse_calendar;
 pub mod operator_control;
 pub mod operator_control_action_commands;
 pub mod operator_control_commands;
+// Share the std+serde-only wire schema without linking the application's common crate.
+pub mod operator_movers;
+#[path = "../../common/src/operator_movers_wire.rs"]
+pub mod operator_movers_wire;
 pub mod qdb_console_front;
 pub mod qdb_console_proxy;
 pub mod start_watchdog;
 pub mod telegram_webhook;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod time;
+pub mod waste_check;
+
+#[path = "../../common/src/operator_stock_movers_wire.rs"]
+pub mod operator_stock_movers_wire;
+// Plan PR MV (2026-11-06): the movers universe + pure selection, shared
+// source with tickvault-common (no common dependency in the Lambda).
+#[path = "../../common/src/mtf_receipt_json.rs"]
+pub mod mtf_receipt_json;
+
+#[path = "../../common/src/operator_movers_universe.rs"]
+pub mod operator_movers_universe;
+
+pub mod operator_stock_movers;

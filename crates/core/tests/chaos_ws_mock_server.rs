@@ -20,6 +20,12 @@
 //! patterns we care about in production. If any of these assertions
 //! regress, the zero-tick-loss guarantee is broken.
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit PROOF-2).** `run_read_loop` no longer
+//! exists, and this file never drove the production socket type: it drives
+//! raw `tokio_tungstenite` streams. The production `DhanFeedSocketImpl` and
+//! `run_connection` against a real loopback server are proved by
+//! `ws_fake_dhan_server_end_to_end.rs`.
+//!
 //! Run cost: < 200 ms for the whole file. Safe for normal CI.
 
 #![cfg(test)]
@@ -170,8 +176,11 @@ async fn chaos_ws_mock_server_silence_mid_stream_does_not_time_out_client() {
     })
     .await;
 
-    let mut client_ws = connect_client(port).await;
+    // Start the clock before connecting: the server begins its 500 ms silence
+    // right after accepting, so a clock started after `connect` returns can
+    // read a few ms short of the window on a loaded machine.
     let start = Instant::now();
+    let mut client_ws = connect_client(port).await;
     let mut received = 0usize;
     while let Some(msg) = client_ws.next().await {
         match msg.expect("recv frame") {

@@ -5,7 +5,7 @@
 //! Why (HIGH finding, 2026-07-01 adversarial automation hunt): `is_trading_day`
 //! (`crates/common/src/trading_calendar.rs`) treats ANY weekday not explicitly
 //! listed in `nse_holidays` as a trading day — there is no year bound. The
-//! holiday-gate self-stop (`deploy/aws/holiday-gate.sh`) relies on that calendar.
+//! holiday-gate self-stop (`tickvault holiday-gate`) relies on that calendar.
 //! So if the list only contains (say) 2026 dates and the box runs into 2027,
 //! every 2027 weekday holiday (Republic Day, Holi, Diwali, …) is treated as a
 //! trading day: the box starts, both feeds connect, and it burns a full ~8h of
@@ -51,12 +51,12 @@ fn max_nse_holiday_year(toml: &str) -> Option<i32> {
     for block in toml.split("[[trading.nse_holidays]]").skip(1) {
         // Stop at the next table header so we only read THIS holiday's date.
         let scope = block.split("[[").next().unwrap_or(block);
-        if let Some(date_line) = scope.lines().find(|l| l.trim_start().starts_with("date")) {
-            if let Some(q0) = date_line.find('"') {
-                let after = &date_line[q0 + 1..];
-                if let Some(year) = after.get(0..4).and_then(|y| y.parse::<i32>().ok()) {
-                    max_year = Some(max_year.map_or(year, |m| m.max(year)));
-                }
+        if let Some(date_line) = scope.lines().find(|l| l.trim_start().starts_with("date"))
+            && let Some(q0) = date_line.find('"')
+        {
+            let after = &date_line[q0 + 1..];
+            if let Some(year) = after.get(0..4).and_then(|y| y.parse::<i32>().ok()) {
+                max_year = Some(max_year.map_or(year, |m| m.max(year)));
             }
         }
     }

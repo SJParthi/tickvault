@@ -6,24 +6,43 @@
 //! actually start landing in the DLQ — at which point real loss is already
 //! happening if the DLQ also fills up.
 //!
-//! The watcher polls `df` every 60s and exposes:
+//! The watcher probes the filesystem every 60s and exposes:
 //!   * `tv_spill_dir_free_bytes` — gauge, current free bytes
 //!   * `tv_spill_dir_total_bytes` — gauge, current total bytes
 //!   * `tv_spill_dir_health_check_failed_total` — counter
+//!   * `tv_disk_hours_left_at_fill_rate` — gauge, hours until full at the
+//!     last hour's fill rate, -1 when not filling (DA-12, local `/metrics` only)
+//!
+//! It also publishes that projection for the disk-pressure loop
+//! ([`published_hours_left`], PR AA step 4), which starts archiving early when
+//! the disk is projected to fill before the box stops.
 //!
 //! Prometheus alert rule (added separately): fires CRITICAL Telegram when
 //! `tv_spill_dir_free_bytes < SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD`.
 //! Operator gets ~hours of warning instead of seconds.
 //!
-//! The watcher is intentionally minimal — no external `nix`/`fs2` deps, just
-//! stdlib `std::process::Command` invoking `df` (POSIX). Linux/macOS only;
-//! on Windows the watcher logs a warning at boot and exits cleanly.
+//! # How free space is read (deep audit DA-12, 2026-10-12)
+//!
+//! One `statvfs(2)` system call per probe, through `libc`. Until 2026-10-12
+//! this forked the external `df` tool (GNU form first, then the BSD form) and
+//! parsed its text. That probe is also called by the tick and depth rescue
+//! paths, including the frame drain's own inline fallback, so a process start
+//! sat on the path that runs exactly when the disk is slow; a missing `df`, a
+//! process-table or file-handle shortage turned a recoverable spill into a
+//! refused one; and the two output formats behaved differently on macOS and
+//! Linux. `statvfs` is one syscall with the same struct on both, no parsing
+//! and no child process. It can still block on a wedged volume (as any call
+//! touching that filesystem can), which is why the periodic callers keep
+//! running it on the blocking pool.
+//!
+//! `libc` was already a pinned workspace dependency (used by `tickvault-core`
+//! for the reader-thread affinity); this crate now names it directly. No new
+//! package enters `Cargo.lock`.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Cadence of the disk-health probe. 60s gives ~hours of warning before a
 /// fast-filling spill dir actually runs out of space, while burning
@@ -52,80 +71,427 @@ pub const SPILL_DISK_HEALTH_POLL_INTERVAL_SECS: u64 = 60;
 /// sweep exists to eliminate.
 pub const SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
+/// Fraction of the measured filesystem the warning aims to reserve, expressed
+/// as a divisor: `total / 10` = 10%.
+///
+/// 10% is not a new number — it is the number the constant above was CHOSEN
+/// for, in its own words: *"10 GiB restores a genuinely actionable margin
+/// (~10% of the 100 GB volume)"*. What was missing is that the volume moved
+/// and the byte count did not.
+pub const SPILL_DISK_FREE_TARGET_DIVISOR: u64 = 10;
+
+/// The free-space threshold to warn at, for a filesystem of `total_bytes`.
+///
+/// # Why this is derived and not a constant any more
+///
+/// The fixed 10 GiB above was justified as "~10% of the 100 GB volume". The
+/// live root volume is **300 GB** since 2026-08-25 (Quote 19), so the same
+/// number is 3.3% — and at the fill rate measured during that day's disk-full
+/// outage it buys well under an hour, for a problem whose remediation takes
+/// longer than that. The intent was a proportion; only the arithmetic was
+/// frozen.
+///
+/// The old doc argued AGAINST a percentage on the grounds that "the spill
+/// directory and the data volume can be sized independently". That objection
+/// does not apply to what is actually measured here: `probe_disk_free_bytes`
+/// reports `total_bytes` for the filesystem the spill directory ITSELF lives
+/// on, so a fraction of that total is the same volume, not a proxy for it.
+///
+/// # The floor is what makes this safe in both directions
+///
+/// `max(FLOOR, total/10)` can only ever move the threshold UP relative to
+/// today. A small dev disk keeps the 10 GiB it has now rather than collapsing
+/// to a threshold that would fire after the disk is already unusable; the
+/// 300 GB production volume gets 30 GiB, which is the margin the constant
+/// always claimed to provide.
+///
+/// Pure and O(1). Pinned by `derived_threshold_scales_with_the_volume`.
+#[must_use]
+pub const fn spill_disk_free_critical_threshold(total_bytes: u64) -> u64 {
+    let proportional = total_bytes / SPILL_DISK_FREE_TARGET_DIVISOR;
+    if proportional > SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD {
+        proportional
+    } else {
+        SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+    }
+}
+
 /// Outcome of one health check, exposed for unit testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskHealthOutcome {
-    /// `df` succeeded; we have a free-bytes number.
+    /// `statvfs` succeeded; we have a free-bytes number.
     Ok { free_bytes: u64, total_bytes: u64 },
-    /// `df` failed (non-POSIX OS, command not found, parse error). Gauge
-    /// is left at its previous value; operator has no signal.
+    /// `statvfs` failed (path missing or unreadable, a path with an interior
+    /// NUL byte, or a non-Unix OS). Gauge is left at its previous value;
+    /// operator has no signal.
     ProbeFailed { reason: &'static str },
 }
 
-/// One-shot health check. Spawns `df --output=avail,size --block-size=1`
-/// against `path` and parses the output. Returns the outcome enum so the
-/// caller can decide what to do with it (the production background task
-/// just updates the gauge; tests can assert on the parsed numbers).
-// TEST-EXEMPT: covered by `test_probe_against_real_path_returns_ok_or_probe_failed` (different name pattern; the test exercises this exact entrypoint against `/tmp` on POSIX runners and the ProbeFailed branch on others).
-pub fn probe_disk_free_bytes(path: &std::path::Path) -> DiskHealthOutcome {
-    // GNU coreutils `df --output=avail,size --block-size=1` produces:
-    //     Avail Size
-    //     <bytes> <bytes>
-    // BSD/macOS `df` does NOT support `--output`; use `df -k` and convert
-    // 1024-byte blocks to bytes. We try GNU form first, then fall back.
-    let gnu = Command::new("df")
-        .args(["--output=avail,size", "--block-size=1", "--"])
-        .arg(path)
-        .output();
-    let parsed = match gnu {
-        Ok(out) if out.status.success() => parse_df_gnu(&out.stdout),
-        _ => {
-            let bsd = Command::new("df").args(["-k", "--"]).arg(path).output();
-            match bsd {
-                Ok(out) if out.status.success() => parse_df_bsd_kb(&out.stdout),
-                _ => None,
-            }
+/// The `reason` of a failed probe. One string for every failure so the
+/// callers' blind-write counters read one series.
+pub const DISK_PROBE_FAILED_REASON: &str = "statvfs_failed";
+
+/// One `statvfs(2)` reading of the filesystem holding a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FsStats {
+    /// Bytes an unprivileged writer may still use (`f_bavail * f_frsize`),
+    /// the same "Avail" figure `df` printed.
+    free_bytes: u64,
+    /// Size of the filesystem (`f_blocks * f_frsize`).
+    total_bytes: u64,
+    /// Inodes an unprivileged writer may still use (`f_favail`).
+    free_inodes: u64,
+    /// Inodes of the filesystem (`f_files`).
+    total_inodes: u64,
+}
+
+/// The one `statvfs` call, and nothing else that needs `unsafe`.
+///
+/// The crate root denies `unsafe_code` outside tests (audit CR-5,
+/// 2026-10-11); this module is one of the two production opt-outs, both
+/// listed in `crates/core/tests/unsafe_code_lint_guard.rs`. The block carries
+/// a SAFETY note.
+#[cfg(unix)]
+#[allow(unsafe_code)] // APPROVED: one statvfs(2) call on an owned NUL-terminated path, see SAFETY
+mod statvfs_probe {
+    use std::os::unix::ffi::OsStrExt;
+
+    /// `statvfs` on `path`; `None` when the call fails or the path holds an
+    /// interior NUL byte. O(1): one syscall, plus one `CString` allocation
+    /// for the path (the kernel needs a NUL-terminated copy).
+    pub(super) fn stat(path: &std::path::Path) -> Option<super::FsStats> {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call, and `st` points to writable memory the size of `libc::statvfs`.
+        let rc = unsafe { libc::statvfs(c_path.as_ptr(), st.as_mut_ptr()) }; // SAFETY: see above
+        if rc != 0 {
+            return None;
         }
-    };
-    match parsed {
-        Some((free, total)) => DiskHealthOutcome::Ok {
-            free_bytes: free,
-            total_bytes: total,
+        // SAFETY: `statvfs` returned 0, so the kernel filled every field; the struct was also zeroed first, so no field is uninitialised either way.
+        let st = unsafe { st.assume_init() }; // SAFETY: see above
+        Some(super::fs_stats_from_fields(
+            widen(st.f_bavail),
+            widen(st.f_blocks),
+            widen(st.f_frsize),
+            widen(st.f_favail),
+            widen(st.f_files),
+        ))
+    }
+
+    /// The `statvfs` field types differ by platform (`u64` on 64-bit Linux,
+    /// `u32` on macOS); every one of them widens losslessly to `u64`.
+    fn widen<T: Into<u64>>(v: T) -> u64 {
+        v.into()
+    }
+}
+
+/// Bytes and inodes from the raw `statvfs` fields. Saturating, so a
+/// fabricated or corrupt block size can never wrap into a small number that
+/// reads as "nearly full" or "plenty free". Pure, O(1).
+const fn fs_stats_from_fields(
+    avail_blocks: u64,
+    total_blocks: u64,
+    fragment_size: u64,
+    free_inodes: u64,
+    total_inodes: u64,
+) -> FsStats {
+    FsStats {
+        free_bytes: avail_blocks.saturating_mul(fragment_size),
+        total_bytes: total_blocks.saturating_mul(fragment_size),
+        free_inodes,
+        total_inodes,
+    }
+}
+
+/// `statvfs` on `path`, or `None` on a non-Unix OS.
+fn stat_fs(path: &std::path::Path) -> Option<FsStats> {
+    #[cfg(unix)]
+    {
+        statvfs_probe::stat(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// One-shot health check: one `statvfs(2)` call on the filesystem holding
+/// `path`. Returns the outcome enum so the caller can decide what to do with
+/// it (the production background task just updates the gauge; tests can
+/// assert on the numbers).
+///
+/// # Performance
+/// O(1): one syscall and one small `CString` for the path, no child process
+/// and no parsing. It still touches the filesystem, so on a wedged volume it
+/// can block like any other call there; the periodic callers run it on the
+/// blocking pool.
+// TEST-EXEMPT: covered by `test_probe_against_real_path_returns_ok_or_probe_failed` and `test_probe_disk_free_bytes_statvfs_on_tmp_reports_nonzero_total` (different name pattern).
+pub fn probe_disk_free_bytes(path: &std::path::Path) -> DiskHealthOutcome {
+    match stat_fs(path) {
+        Some(stats) => DiskHealthOutcome::Ok {
+            free_bytes: stats.free_bytes,
+            total_bytes: stats.total_bytes,
         },
         None => DiskHealthOutcome::ProbeFailed {
-            reason: "df_invocation_or_parse_failed",
+            reason: DISK_PROBE_FAILED_REASON,
         },
     }
 }
 
-/// Parse GNU `df --output=avail,size --block-size=1` output. Format is two
-/// header words then one data row of two integers. Returns
-/// `Some((avail_bytes, total_bytes))` on success.
-fn parse_df_gnu(stdout: &[u8]) -> Option<(u64, u64)> {
-    let s = std::str::from_utf8(stdout).ok()?;
-    let mut lines = s.lines().skip(1); // drop header row
-    let row = lines.next()?;
-    let mut nums = row.split_whitespace().filter_map(|t| t.parse::<u64>().ok());
-    let avail = nums.next()?;
-    let total = nums.next()?;
-    Some((avail, total))
+/// Free and total INODES of the filesystem holding `path`, from the same
+/// `statvfs(2)` call as the byte probe. `None` when the call fails — the byte
+/// probe above is the one that decides health; this is the second number the
+/// operator has never had.
+///
+/// Infra sweep row 1 (2026-09-08): the spill and WAL tiers write MANY small
+/// files (one NDJSON per rescue, one segment per rotation), and a volume can
+/// run out of inodes with hundreds of gigabytes free — every create then
+/// fails with ENOSPC while the bytes gauge reads healthy and the free-space
+/// alarm stays green. Published as `tv_spill_dir_free_inodes` (local
+/// `/metrics` only; no EMF name, no alarm — budget rule) so the number exists
+/// before anyone needs it.
+///
+/// A filesystem that does not track inodes reports a total of 0; that is
+/// returned as `None`, never as "0 free".
+#[must_use]
+pub fn probe_disk_free_inodes(path: &std::path::Path) -> Option<(u64, u64)> {
+    let stats = stat_fs(path)?;
+    (stats.total_inodes > 0).then_some((stats.free_inodes, stats.total_inodes))
 }
 
-/// Parse BSD/macOS `df -k <path>` output. The data row is:
-///     Filesystem 1024-blocks Used Available Capacity Mounted-on
-/// We need the 4th column (Available) and 2nd column (1024-blocks). Return
-/// values are converted to bytes (multiply by 1024).
-fn parse_df_bsd_kb(stdout: &[u8]) -> Option<(u64, u64)> {
-    let s = std::str::from_utf8(stdout).ok()?;
-    let mut lines = s.lines().skip(1);
-    let row = lines.next()?;
-    let cols: Vec<&str> = row.split_whitespace().collect();
-    if cols.len() < 4 {
+// ---------------------------------------------------------------------------
+// Hours left at the current fill rate (deep audit DA-12, S3-1, 2026-10-12)
+// ---------------------------------------------------------------------------
+//
+// The free-space threshold above says "low now". It cannot say "full by the
+// end of the day while the cold upload is behind", which is the case that
+// matters when frame logs are kept until a verified S3 copy exists. So the
+// watcher keeps its last hour of free-space readings in a fixed ring and
+// projects how long the disk lasts at the rate it has been filling.
+//
+// Published as `tv_disk_hours_left_at_fill_rate` on local `/metrics` only (no
+// EMF name, no alarm, no page: budget rule), and one edge-triggered coded
+// `warn!` (`RESOURCE-03`, log-sink-only, `source = "disk_hours_left_low"`)
+// when, at that rate, the disk is full before the session ends at
+// `TICK_PERSIST_END_SECS_OF_DAY_IST` (15:40 IST), after which nothing more is
+// captured and the evening archive frees space. A projection longer than the
+// rest of the session is the normal shape of a trading day (the volume is
+// sized for one session), so it never logs. The ring is a fixed array written
+// once a minute: O(1) per probe, no allocation after the watcher starts.
+//
+// Honest limits: the rate is the slope between the oldest and newest reading
+// of the window, so a cleanup or volume growth inside the hour reads "not
+// filling" until it leaves the window; the opening burst can over-project
+// for the first hour; and the projection does not know whether the upload is
+// failing. A second, upload-aware signal is a separate item.
+
+/// Readings kept for the fill-rate projection: one hour at the 60 s cadence.
+const DISK_FILL_RATE_WINDOW_SAMPLES: usize = 60;
+
+/// The window must span at least this long before a rate is projected, so a
+/// few noisy readings right after start never produce a figure.
+const DISK_FILL_RATE_MIN_SPAN_SECS: u64 = 600;
+
+/// The warning re-arms only once the projection is this many hours longer
+/// than the rest of the session, so a projection hovering near the close logs
+/// once. A projection that disappears (the disk stopped filling) keeps the
+/// latch; the latch clears at the IST day change.
+const DISK_HOURS_LEFT_REARM_MARGIN_HOURS: f64 = 2.0;
+
+/// Gauge value when there is no projection (not filling, or too few readings).
+const DISK_HOURS_LEFT_NONE_GAUGE: f64 = -1.0;
+
+/// One free-space reading: seconds since the watcher started (monotonic) and
+/// the free bytes at that instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FreeSample {
+    at_secs: u64,
+    free_bytes: u64,
+}
+
+/// A fixed ring of the most recent readings. O(1) push, oldest and newest.
+#[derive(Debug, Clone)]
+struct DiskFillWindow {
+    samples: [FreeSample; DISK_FILL_RATE_WINDOW_SAMPLES],
+    len: usize,
+    next: usize,
+}
+
+impl DiskFillWindow {
+    const fn new() -> Self {
+        Self {
+            samples: [FreeSample {
+                at_secs: 0,
+                free_bytes: 0,
+            }; DISK_FILL_RATE_WINDOW_SAMPLES],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    /// Records a reading, overwriting the oldest once the ring is full.
+    fn push(&mut self, sample: FreeSample) {
+        self.samples[self.next] = sample;
+        self.next = (self.next + 1) % DISK_FILL_RATE_WINDOW_SAMPLES;
+        if self.len < DISK_FILL_RATE_WINDOW_SAMPLES {
+            self.len += 1;
+        }
+    }
+
+    fn newest(&self) -> Option<FreeSample> {
+        (self.len > 0).then(|| {
+            self.samples
+                [(self.next + DISK_FILL_RATE_WINDOW_SAMPLES - 1) % DISK_FILL_RATE_WINDOW_SAMPLES]
+        })
+    }
+
+    fn oldest(&self) -> Option<FreeSample> {
+        (self.len > 0).then(|| {
+            if self.len < DISK_FILL_RATE_WINDOW_SAMPLES {
+                self.samples[0]
+            } else {
+                self.samples[self.next]
+            }
+        })
+    }
+}
+
+/// Hours until the disk is full at the rate it filled across the window, or
+/// `None` when it is not filling, the window spans under
+/// [`DISK_FILL_RATE_MIN_SPAN_SECS`], or the clock did not move forward.
+/// Pure and O(1).
+fn hours_left(window: &DiskFillWindow) -> Option<f64> {
+    let oldest = window.oldest()?;
+    let newest = window.newest()?;
+    let span_secs = newest.at_secs.checked_sub(oldest.at_secs)?;
+    if span_secs < DISK_FILL_RATE_MIN_SPAN_SECS {
         return None;
     }
-    let total_kb: u64 = cols[1].parse().ok()?;
-    let avail_kb: u64 = cols[3].parse().ok()?;
-    Some((avail_kb.saturating_mul(1024), total_kb.saturating_mul(1024)))
+    let consumed = oldest.free_bytes.checked_sub(newest.free_bytes)?;
+    if consumed == 0 {
+        return None;
+    }
+    let bytes_per_sec = consumed as f64 / span_secs as f64;
+    Some(newest.free_bytes as f64 / bytes_per_sec / 3_600.0)
+}
+
+/// Hours from `unix_secs` until the capture window ends today
+/// (`TICK_PERSIST_END_SECS_OF_DAY_IST`, IST), 0 once it has passed. Pure and
+/// O(1).
+fn hours_until_session_end(unix_secs: u64) -> f64 {
+    let ist_secs_of_day = (unix_secs
+        + u64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS.unsigned_abs()))
+        % u64::from(tickvault_common::constants::SECONDS_PER_DAY);
+    let end = u64::from(tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST);
+    end.saturating_sub(ist_secs_of_day) as f64 / 3_600.0
+}
+
+/// The IST calendar day number of `unix_secs` (days since 1970-01-01 IST).
+/// Pure and O(1).
+fn ist_day_number(unix_secs: u64) -> u64 {
+    (unix_secs + u64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS.unsigned_abs()))
+        / u64::from(tickvault_common::constants::SECONDS_PER_DAY)
+}
+
+// ---------------------------------------------------------------------------
+// The published projection (PR AA step 4, Quote 51, 2026-11-07)
+// ---------------------------------------------------------------------------
+//
+// The disk-pressure loop starts archiving early when the disk is projected
+// to fill before the box stops. It reads the watcher's projection here
+// instead of keeping a second fill window of its own.
+//
+// One `AtomicU64` holds both the figure and when it was taken, so a reader
+// can never pair a new figure with an old time (or the other way round):
+// the high 32 bits are the Unix second of the reading, the low 32 bits are
+// the hours left in hundredths, or `HOURS_LEFT_NOT_FILLING` when the disk
+// was not filling. `0` means nothing was published yet. A reading older
+// than `PROJECTION_MAX_AGE_SECS`, or stamped ahead of the reader's clock
+// (the clock stepped back), reads as unknown, and unknown never starts an
+// episode: archiving early is a choice made only on a fresh reading.
+
+/// A projection older than this reads as unknown: five probe cadences, so
+/// one slow probe never drops it, and a stopped watcher stops it within five
+/// minutes.
+pub const PROJECTION_MAX_AGE_SECS: i64 = 300;
+
+/// Low-word value for "the disk was not filling" (no projection).
+const HOURS_LEFT_NOT_FILLING: u32 = u32::MAX;
+
+/// The packed projection. See the section comment above.
+static PUBLISHED_HOURS_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Packs a projection taken at `at_unix_secs`. Hours are kept in hundredths
+/// and capped just below the "not filling" marker; a negative, NaN or
+/// infinite figure is stored as "not filling". Pure and O(1).
+// APPROVED: cast — a finite, non-negative value clamped to 0..=u32::MAX-1 first.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn pack_hours_left(hours: Option<f64>, at_unix_secs: i64) -> u64 {
+    let at = u64::from(u32::try_from(at_unix_secs.max(0)).unwrap_or(u32::MAX));
+    // APPROVED: u32 marker widened to f64 (exact), not an f32 price.
+    let cap = f64::from(HOURS_LEFT_NOT_FILLING - 1);
+    let low = match hours {
+        Some(h) if h.is_finite() && h >= 0.0 => (h * 100.0).round().min(cap) as u32,
+        _ => HOURS_LEFT_NOT_FILLING,
+    };
+    (at << 32) | u64::from(low)
+}
+
+/// Reads a packed projection at `now_unix_secs`: the hours left when the
+/// reading is fresh and the disk was filling, `None` otherwise (never
+/// published, older than [`PROJECTION_MAX_AGE_SECS`], stamped in the
+/// future, or not filling). Pure and O(1).
+fn fresh_hours_left(packed: u64, now_unix_secs: i64) -> Option<f64> {
+    if packed == 0 {
+        return None;
+    }
+    let at = i64::from(u32::try_from(packed >> 32).unwrap_or(u32::MAX));
+    let age = now_unix_secs.checked_sub(at)?;
+    if !(0..=PROJECTION_MAX_AGE_SECS).contains(&age) {
+        return None;
+    }
+    let low = u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(HOURS_LEFT_NOT_FILLING);
+    // APPROVED: u32 hundredths widened to f64 (exact), not an f32 price.
+    (low != HOURS_LEFT_NOT_FILLING).then(|| f64::from(low) / 100.0)
+}
+
+/// Records the watcher's latest projection. Called once a minute by the
+/// watcher, after each successful probe. O(1), one atomic store.
+fn publish_hours_left(hours: Option<f64>, at_unix_secs: i64) {
+    PUBLISHED_HOURS_LEFT.store(
+        pack_hours_left(hours, at_unix_secs),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The watcher's hours-to-full at the last hour's fill rate, if the reading
+/// is fresh at `now_unix_secs` and the disk was filling. Read once a minute
+/// by the disk-pressure loop (PR AA step 4). O(1), one atomic load.
+#[must_use]
+pub fn published_hours_left(now_unix_secs: i64) -> Option<f64> {
+    fresh_hours_left(
+        PUBLISHED_HOURS_LEFT.load(std::sync::atomic::Ordering::Acquire),
+        now_unix_secs,
+    )
+}
+
+/// The edge-triggered decision for the hours-left warning: `(fire, latched)`.
+/// Fires once when the projection is shorter than `session_hours_left` (the
+/// disk fills before the capture window ends). Re-arms only once the
+/// projection is [`DISK_HOURS_LEFT_REARM_MARGIN_HOURS`] longer than that; no
+/// projection keeps the latch as it is. Pure and O(1).
+fn hours_left_warn_edge(
+    hours: Option<f64>,
+    session_hours_left: f64,
+    latched: bool,
+) -> (bool, bool) {
+    match hours {
+        Some(h) if h < session_hours_left => (!latched, true),
+        Some(h) if h < session_hours_left + DISK_HOURS_LEFT_REARM_MARGIN_HOURS => (false, latched),
+        Some(_) => (false, false),
+        None => (false, latched),
+    }
 }
 
 /// Spawn the background watcher task. Idempotent — call once at boot. The
@@ -134,23 +500,36 @@ fn parse_df_bsd_kb(stdout: &[u8]) -> Option<(u64, u64)> {
 /// On non-POSIX systems the watcher logs a warning and the task exits
 /// immediately (the gauges remain at zero, which is honest about the lack
 /// of a signal).
-// TEST-EXEMPT: tokio task spawn — exercised in production by `crates/app/src/main.rs`. The pure-function `probe_disk_free_bytes` above is fully unit-tested (5 tests covering parser branches + a real /tmp probe); this wrapper is a one-line spawn that needs an integration harness to test usefully.
+// TEST-EXEMPT: tokio task spawn — exercised in production by `crates/app/src/main.rs`. The pure functions above (`probe_disk_free_bytes`, `fs_stats_from_fields`, `hours_left`, `hours_left_warn_edge`) are unit-tested, including real `statvfs` probes of the temp dir; this wrapper is a one-line spawn that needs an integration harness to test usefully.
 pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let m_free = metrics::gauge!("tv_spill_dir_free_bytes");
         let m_total = metrics::gauge!("tv_spill_dir_total_bytes");
+        let m_free_inodes = metrics::gauge!("tv_spill_dir_free_inodes");
+        let m_total_inodes = metrics::gauge!("tv_spill_dir_total_inodes");
         let m_failed = metrics::counter!("tv_spill_dir_health_check_failed_total");
+        // DA-12 (S3-1): local `/metrics` only — no EMF name, no alarm.
+        let m_hours_left = metrics::gauge!("tv_disk_hours_left_at_fill_rate");
+        m_hours_left.set(DISK_HOURS_LEFT_NONE_GAUGE);
+        let started = std::time::Instant::now();
+        let mut fill_window = DiskFillWindow::new();
+        let mut hours_left_latched = false;
+        let mut hours_left_day = 0_u64;
 
         info!(
             path = %spill_dir.display(),
             interval_secs = SPILL_DISK_HEALTH_POLL_INTERVAL_SECS,
-            critical_threshold_bytes = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
-            "spill disk-health watcher started"
+            critical_threshold_floor_bytes = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
+            critical_threshold_divisor = SPILL_DISK_FREE_TARGET_DIVISOR,
+            "spill disk-health watcher started — the effective threshold is \
+             max(floor, total/divisor), resolved against the volume on every probe"
         );
 
-        // Ensure the dir exists so `df` doesn't fail the probe.
+        // Ensure the dir exists so `statvfs` doesn't fail the probe.
         if let Err(err) = std::fs::create_dir_all(&spill_dir) {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                source = "spill_dir_create",
                 ?err,
                 path = %spill_dir.display(),
                 "could not create spill dir for health watcher"
@@ -162,19 +541,86 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            match probe_disk_free_bytes(&spill_dir) {
+            // Plan item 4: one beat per pass; a pass stuck past three cadences
+            // reads as missed on tv_task_heartbeat_missed_total.
+            crate::task_heartbeat::beat(crate::task_heartbeat::WatchedTask::SpillDiskWatcher);
+            // `statvfs` on a stalled or full volume (the moment this probe
+            // matters) can hang. So both probes run on the blocking pool,
+            // never on a shared tokio worker (O(1) sweep, 2026-10-03). One
+            // PathBuf clone a minute.
+            let probe_dir = spill_dir.clone();
+            let (outcome, inodes) = tokio::task::spawn_blocking(move || {
+                (
+                    probe_disk_free_bytes(&probe_dir),
+                    probe_disk_free_inodes(&probe_dir),
+                )
+            })
+            .await
+            .unwrap_or((
+                DiskHealthOutcome::ProbeFailed {
+                    reason: "probe_task_failed",
+                },
+                None,
+            ));
+            match outcome {
                 DiskHealthOutcome::Ok {
                     free_bytes,
                     total_bytes,
                 } => {
                     m_free.set(free_bytes as f64);
                     m_total.set(total_bytes as f64);
-                    if free_bytes < SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD {
+                    if let Some((free_inodes, total_inodes)) = inodes {
+                        m_free_inodes.set(free_inodes as f64);
+                        m_total_inodes.set(total_inodes as f64);
+                    }
+                    fill_window.push(FreeSample {
+                        at_secs: started.elapsed().as_secs(),
+                        free_bytes,
+                    });
+                    let projected = hours_left(&fill_window);
+                    m_hours_left.set(projected.unwrap_or(DISK_HOURS_LEFT_NONE_GAUGE));
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    // PR AA step 4: the disk-pressure loop reads this to start
+                    // archiving early when the disk fills before the stop.
+                    publish_hours_left(projected, i64::try_from(now_unix).unwrap_or(i64::MAX));
+                    let today = ist_day_number(now_unix);
+                    if today != hours_left_day {
+                        hours_left_day = today;
+                        hours_left_latched = false;
+                    }
+                    let session_hours_left = hours_until_session_end(now_unix);
+                    let (fire, latched) =
+                        hours_left_warn_edge(projected, session_hours_left, hours_left_latched);
+                    hours_left_latched = latched;
+                    if fire {
+                        warn!(
+                            code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                            source = "disk_hours_left_low",
+                            path = %spill_dir.display(),
+                            hours_left = projected.unwrap_or(DISK_HOURS_LEFT_NONE_GAUGE),
+                            free_bytes,
+                            total_bytes,
+                            session_hours_left,
+                            "disk fills before the capture window ends at the rate it filled \
+                             over the last hour — check that the cold backup is keeping up"
+                        );
+                    }
+                    // Derived per-probe, never cached: the volume can grow
+                    // online (gp3 `modify-volume` is a one-command operation
+                    // and was used on 2026-08-25), and a threshold resolved
+                    // once at startup would keep warning against the size the
+                    // box booted with.
+                    let threshold_bytes = spill_disk_free_critical_threshold(total_bytes);
+                    if free_bytes < threshold_bytes {
                         error!(
+                            code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                            source = "spill_free_below_threshold",
                             path = %spill_dir.display(),
                             free_bytes,
                             total_bytes,
-                            threshold = SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD,
+                            threshold = threshold_bytes,
                             "CRITICAL: spill dir free space below threshold — \
                              tick spill is at risk if QuestDB stays down"
                         );
@@ -190,6 +636,8 @@ pub fn spawn_spill_disk_health_watcher(spill_dir: PathBuf) -> tokio::task::JoinH
                 DiskHealthOutcome::ProbeFailed { reason } => {
                     m_failed.increment(1);
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::Resource03SpillFreeLow.code_str(),
+                        source = "probe_failed",
                         path = %spill_dir.display(),
                         reason,
                         "spill disk health probe failed — operator has no free-space signal"
@@ -247,8 +695,18 @@ pub fn spawn_supervised_spill_disk_health_watcher(
     tokio::spawn(async move {
         loop {
             let handle = spawn_spill_disk_health_watcher(spill_dir.clone());
-            let join_result = handle.await;
-            let reason = classify_join_exit(&join_result);
+            // Plan item 4: also watches the heartbeat; with
+            // respawn_on_missed_beats on, a stuck task is aborted here.
+            let exit = crate::task_heartbeat::await_watched(
+                crate::task_heartbeat::WatchedTask::SpillDiskWatcher,
+                handle,
+            )
+            .await;
+            let reason = exit.reason();
+            crate::task_heartbeat::note_respawn(
+                crate::task_heartbeat::WatchedTask::SpillDiskWatcher,
+                reason,
+            );
             error!(
                 reason,
                 code = tickvault_common::error_code::ErrorCode::DiskWatcher01Respawned.code_str(),
@@ -274,6 +732,61 @@ mod tests {
         assert!(SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD >= 1024 * 1024 * 1024);
     }
 
+    /// The 2026-08-25 finding: the fixed 10 GiB was sized as "~10% of the
+    /// 100 GB volume" and the volume became 300 GB, so the alert had shrunk
+    /// to 3.3% without anyone changing it.
+    ///
+    /// Bite-proof in BOTH directions — a derived threshold that silently
+    /// went DOWN on a small disk would be worse than the constant it
+    /// replaced, so the floor is asserted as hard as the scaling is.
+    #[test]
+    fn derived_threshold_scales_with_the_volume() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const GB: u64 = 1_000_000_000;
+
+        // The live production volume (300 GB gp3, verified 2026-08-25).
+        // 10% of it is 30 GB, comfortably above the 10 GiB floor, so the
+        // derived value must win.
+        assert_eq!(spill_disk_free_critical_threshold(300 * GB), 30 * GB);
+
+        // The 100 GB volume the constant was originally justified against:
+        // 10 GB proportional vs a 10 GiB floor — the FLOOR wins, because a
+        // GiB is larger than a GB. That is the intended direction (never
+        // weaker than today), and it is the case a naive `total/10` would
+        // have quietly loosened.
+        assert_eq!(
+            spill_disk_free_critical_threshold(100 * GB),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // A small dev disk keeps the floor rather than collapsing to a
+        // threshold that fires after the disk is already unusable.
+        assert_eq!(
+            spill_disk_free_critical_threshold(20 * GIB),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // Degenerate inputs cannot produce a threshold of zero, which would
+        // mean "warn when the disk is completely full" — i.e. never warn in
+        // time. `probe_disk_free_bytes` should never report 0, but a parse
+        // that returned it must not disarm the alarm.
+        assert_eq!(
+            spill_disk_free_critical_threshold(0),
+            SPILL_DISK_FREE_BYTES_CRITICAL_THRESHOLD
+        );
+
+        // Monotonic: a bigger volume never earns a smaller warning margin.
+        let mut prev = 0_u64;
+        for gb in [50_u64, 100, 200, 300, 500, 1000] {
+            let t = spill_disk_free_critical_threshold(gb * GB);
+            assert!(
+                t >= prev,
+                "threshold must never shrink as the volume grows ({gb} GB gave {t}, previous {prev})"
+            );
+            prev = t;
+        }
+    }
+
     #[test]
     fn test_poll_interval_is_reasonable() {
         // Too short = wasted CPU; too long = operator surprised by full disk.
@@ -281,47 +794,336 @@ mod tests {
         assert!(SPILL_DISK_HEALTH_POLL_INTERVAL_SECS <= 300);
     }
 
+    const GIB_TEST: u64 = 1024 * 1024 * 1024;
+
+    fn window_of(points: &[(u64, u64)]) -> DiskFillWindow {
+        let mut w = DiskFillWindow::new();
+        for &(at_secs, free_bytes) in points {
+            w.push(FreeSample {
+                at_secs,
+                free_bytes,
+            });
+        }
+        w
+    }
+
+    /// DA-12 (S3-1): a disk losing 10 GiB an hour with 50 GiB left reads
+    /// five hours; the ring keeps only the last hour, so an old slow stretch
+    /// pushed out of the window no longer dilutes the rate.
     #[test]
-    fn test_parse_df_gnu_happy_path() {
-        let stdout = b"Avail Size\n12345 99999\n";
-        assert_eq!(parse_df_gnu(stdout), Some((12345, 99999)));
+    fn hours_left_projection_from_fill_rate() {
+        // 50 GiB free after losing 10 GiB in 3,600 s → 5.0 hours.
+        let w = window_of(&[(0, 60 * GIB_TEST), (3_600, 50 * GIB_TEST)]);
+        let h = hours_left(&w).expect("a filling disk projects a figure");
+        assert!((h - 5.0).abs() < 1e-9, "expected 5.0 h, got {h}");
+
+        // A full ring: 120 readings a minute apart, 1 GiB lost per minute.
+        // Only the last 60 remain (59 minutes of span, 59 GiB consumed).
+        let mut ring = DiskFillWindow::new();
+        for i in 0..120u64 {
+            ring.push(FreeSample {
+                at_secs: i * 60,
+                free_bytes: (500 - i) * GIB_TEST,
+            });
+        }
+        assert_eq!(ring.len, DISK_FILL_RATE_WINDOW_SAMPLES);
+        assert_eq!(ring.oldest().map(|s| s.at_secs), Some(60 * 60));
+        assert_eq!(ring.newest().map(|s| s.at_secs), Some(119 * 60));
+        let h = hours_left(&ring).expect("filling");
+        // 381 GiB left at 1 GiB/min = 381 min = 6.35 h.
+        assert!((h - 381.0 / 60.0).abs() < 1e-9, "got {h}");
+    }
+
+    /// DA-12 (S3-1): no projection when the disk is flat or gaining space,
+    /// when the window is shorter than the minimum span, when empty, or when
+    /// the clock did not move forward.
+    /// PR AA step 4: a projection reads back only while it is fresh. Older
+    /// than five minutes, stamped ahead of the clock (a backward clock step),
+    /// never published, or "not filling" all read as unknown, and unknown
+    /// never starts an archive episode.
+    #[test]
+    fn test_stale_projection_is_unknown() {
+        let at = 1_762_500_000_i64;
+        let packed = pack_hours_left(Some(3.25), at);
+        assert_eq!(fresh_hours_left(packed, at), Some(3.25));
+        assert_eq!(
+            fresh_hours_left(packed, at + PROJECTION_MAX_AGE_SECS),
+            Some(3.25),
+            "exactly five minutes old is still fresh"
+        );
+        assert_eq!(
+            fresh_hours_left(packed, at + PROJECTION_MAX_AGE_SECS + 1),
+            None,
+            "older than five minutes is unknown"
+        );
+        assert_eq!(
+            fresh_hours_left(packed, at - 1),
+            None,
+            "a reading stamped ahead of the clock is unknown"
+        );
+        assert_eq!(fresh_hours_left(0, at), None, "never published");
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(None, at), at),
+            None,
+            "not filling"
+        );
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert_eq!(
+                fresh_hours_left(pack_hours_left(Some(bad), at), at),
+                None,
+                "{bad} is stored as not filling"
+            );
+        }
+        // A huge figure is capped, never wrapped into "not filling" or zero.
+        let huge = fresh_hours_left(pack_hours_left(Some(1e12), at), at);
+        assert!(
+            huge.is_some_and(|h| h > 1e6),
+            "capped, still a figure: {huge:?}"
+        );
+        // Hundredths survive the round trip.
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(Some(0.004), at), at),
+            Some(0.0)
+        );
+        assert_eq!(
+            fresh_hours_left(pack_hours_left(Some(0.016), at), at),
+            Some(0.02)
+        );
+    }
+
+    /// PR AA step 4: what the watcher publishes is what the pressure loop
+    /// reads, through the one shared atomic.
+    #[test]
+    fn test_published_hours_left_round_trips_through_the_atomic() {
+        let at = 1_762_600_000_i64;
+        publish_hours_left(Some(7.5), at);
+        assert_eq!(published_hours_left(at + 60), Some(7.5));
+        assert_eq!(published_hours_left(at + PROJECTION_MAX_AGE_SECS + 1), None);
+        publish_hours_left(None, at);
+        assert_eq!(published_hours_left(at + 60), None);
     }
 
     #[test]
-    fn test_parse_df_gnu_handles_extra_whitespace() {
-        let stdout = b"Avail Size\n   12345   99999  \n";
-        assert_eq!(parse_df_gnu(stdout), Some((12345, 99999)));
+    fn hours_left_none_when_disk_not_filling() {
+        assert_eq!(hours_left(&DiskFillWindow::new()), None);
+        assert_eq!(hours_left(&window_of(&[(0, GIB_TEST)])), None);
+        // Flat.
+        assert_eq!(
+            hours_left(&window_of(&[(0, 9 * GIB_TEST), (3_600, 9 * GIB_TEST)])),
+            None
+        );
+        // Gaining (cleanup or volume growth).
+        assert_eq!(
+            hours_left(&window_of(&[(0, 9 * GIB_TEST), (3_600, 20 * GIB_TEST)])),
+            None
+        );
+        // Filling, but the span is under the minimum.
+        assert_eq!(
+            hours_left(&window_of(&[
+                (0, 9 * GIB_TEST),
+                (DISK_FILL_RATE_MIN_SPAN_SECS - 1, 8 * GIB_TEST)
+            ])),
+            None
+        );
+        // Exactly the minimum span projects.
+        assert!(
+            hours_left(&window_of(&[
+                (0, 9 * GIB_TEST),
+                (DISK_FILL_RATE_MIN_SPAN_SECS, 8 * GIB_TEST)
+            ]))
+            .is_some()
+        );
+        // Zero free left reads zero hours, never a division by zero.
+        assert_eq!(
+            hours_left(&window_of(&[(0, GIB_TEST), (3_600, 0)])),
+            Some(0.0)
+        );
+    }
+
+    /// DA-12 (S3-1): the warning fires once on the way under a day, stays
+    /// quiet while latched (including the band between 24 h and 30 h), and
+    /// re-arms only above 30 h or when there is no projection.
+    #[test]
+    fn hours_left_warn_is_edge_triggered_with_hysteresis() {
+        // Six session hours left (09:40 IST).
+        assert_eq!(hours_left_warn_edge(None, 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(48.0), 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(5.0), 6.0, false), (true, true));
+        assert_eq!(hours_left_warn_edge(Some(1.0), 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(7.0), 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(7.0), 6.0, false), (false, false));
+        assert_eq!(hours_left_warn_edge(Some(8.5), 6.0, true), (false, false));
+        // No projection (the disk stopped filling) keeps the latch either way.
+        assert_eq!(hours_left_warn_edge(None, 6.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(0.0), 6.0, false), (true, true));
+        // After the close only a disk full within the margin keeps it latched.
+        assert_eq!(hours_left_warn_edge(Some(0.5), 0.0, true), (false, true));
+        assert_eq!(hours_left_warn_edge(Some(3.0), 0.0, true), (false, false));
     }
 
     #[test]
-    fn test_parse_df_gnu_missing_data_row() {
-        let stdout = b"Avail Size\n";
-        assert_eq!(parse_df_gnu(stdout), None);
+    fn hours_left_warn_stays_quiet_on_a_normal_session_fill() {
+        // The volume is sized for one session: a 6.5-hour projection at 09:30
+        // IST (6h10m of capture left) is a normal day and must not log, while
+        // the same rate one hour later with less disk left (5h projected,
+        // 5h10m of capture left) must.
+        assert_eq!(
+            hours_left_warn_edge(Some(6.5), 6.0 + 10.0 / 60.0, false),
+            (false, false)
+        );
+        assert_eq!(
+            hours_left_warn_edge(Some(5.0), 5.0 + 10.0 / 60.0, false),
+            (true, true)
+        );
     }
 
     #[test]
-    fn test_parse_df_bsd_kb_converts_to_bytes() {
-        // Mocked BSD output: Filesystem 1024-blocks Used Available Capacity Mounted-on
-        let stdout =
-            b"Filesystem 1024-blocks Used Avail Cap Mount\n/dev/disk1 1000 200 800 20% /\n";
-        let (avail, total) = parse_df_bsd_kb(stdout).expect("parse");
-        // avail=800 KB → 819_200 bytes; total=1000 KB → 1_024_000 bytes.
-        assert_eq!(avail, 800 * 1024);
-        assert_eq!(total, 1000 * 1024);
+    fn hours_until_session_end_tracks_the_ist_clock() {
+        // 2026-10-12 04:10 UTC = 09:40 IST, six hours before 15:40.
+        let at_0940_ist = 1_791_778_200_u64;
+        assert!((hours_until_session_end(at_0940_ist) - 6.0).abs() < 1e-9);
+        // 15:40 IST and later read 0.
+        assert_eq!(hours_until_session_end(at_0940_ist + 6 * 3_600), 0.0);
+        assert_eq!(hours_until_session_end(at_0940_ist + 8 * 3_600), 0.0);
+        // The IST day changes at 18:30 UTC, not at UTC midnight.
+        assert_eq!(
+            ist_day_number(at_0940_ist),
+            ist_day_number(at_0940_ist + 14 * 3_600 - 1)
+        );
+        assert_eq!(
+            ist_day_number(at_0940_ist) + 1,
+            ist_day_number(at_0940_ist + 14 * 3_600 + 1_200)
+        );
+    }
+
+    /// The byte arithmetic is a multiply of two kernel fields; a fabricated
+    /// block size must saturate, never wrap into a small number.
+    #[test]
+    fn test_fs_stats_from_fields_multiplies_and_saturates() {
+        let s = fs_stats_from_fields(800, 1_000, 4_096, 7, 9);
+        assert_eq!(s.free_bytes, 800 * 4_096);
+        assert_eq!(s.total_bytes, 1_000 * 4_096);
+        assert_eq!((s.free_inodes, s.total_inodes), (7, 9));
+        let huge = fs_stats_from_fields(u64::MAX, u64::MAX, 4_096, 0, 0);
+        assert_eq!(huge.free_bytes, u64::MAX);
+        assert_eq!(huge.total_bytes, u64::MAX);
+        assert_eq!(fs_stats_from_fields(5, 5, 0, 0, 0).total_bytes, 0);
+    }
+
+    /// DA-12 (2026-10-12): on a real Unix filesystem the probe answers from
+    /// `statvfs` with a non-zero total and free never above it.
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_disk_free_bytes_statvfs_on_tmp_reports_nonzero_total() {
+        let tmp = std::env::temp_dir();
+        match probe_disk_free_bytes(&tmp) {
+            DiskHealthOutcome::Ok {
+                free_bytes,
+                total_bytes,
+            } => {
+                assert!(total_bytes > 0, "a mounted filesystem has a size");
+                assert!(
+                    free_bytes <= total_bytes,
+                    "free {free_bytes} > total {total_bytes}"
+                );
+            }
+            DiskHealthOutcome::ProbeFailed { reason } => {
+                panic!("statvfs on the temp dir must succeed on Unix, got {reason}") // APPROVED: test
+            }
+        }
+    }
+
+    /// A path that does not exist is a failed probe with the one reason
+    /// string, never a fabricated zero (which would read as "disk full").
+    #[test]
+    fn test_probe_disk_free_bytes_missing_path_is_probe_failed() {
+        assert_eq!(
+            probe_disk_free_bytes(std::path::Path::new("/definitely/not/a/mount/point")),
+            DiskHealthOutcome::ProbeFailed {
+                reason: DISK_PROBE_FAILED_REASON
+            }
+        );
+    }
+
+    /// A path with an interior NUL byte cannot be handed to the kernel; it is
+    /// a failed probe, never a panic.
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_disk_free_bytes_interior_nul_is_probe_failed() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"));
+        assert!(matches!(
+            probe_disk_free_bytes(p),
+            DiskHealthOutcome::ProbeFailed { .. }
+        ));
+        assert!(probe_disk_free_inodes(p).is_none());
+    }
+
+    /// DA-12: the inode probe answers from the same `statvfs` call.
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_disk_free_inodes_statvfs_on_tmp() {
+        // tmpfs and most real filesystems track inodes; one that does not
+        // reports a total of 0, which the probe turns into None.
+        if let Some((free, total)) = probe_disk_free_inodes(&std::env::temp_dir()) {
+            assert!(total > 0);
+            assert!(free <= total, "free {free} > total {total}");
+        }
+    }
+
+    /// DA-12 ratchet: the probe never starts a child process again. The
+    /// production half of this file (above the test module) must not name
+    /// `Command` at all.
+    #[test]
+    fn test_disk_probe_never_forks_df() {
+        let src = include_str!("disk_health_watcher.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap_or(src); // APPROVED: test
+        assert!(
+            !production.contains("Command::new"),
+            "disk_health_watcher must read free space with statvfs, not by starting a process"
+        );
+        assert!(
+            production.contains("libc::statvfs("),
+            "the statvfs call must stay"
+        );
     }
 
     #[test]
-    fn test_parse_df_bsd_kb_handles_too_few_columns() {
-        let stdout = b"Filesystem Blocks\nbad-row 100\n";
-        assert_eq!(parse_df_bsd_kb(stdout), None);
+    fn probe_disk_free_inodes_never_fabricates_a_reading() {
+        // A path that does not exist yields nothing; a real mount yields a
+        // free count bounded by its total.
+        assert!(
+            probe_disk_free_inodes(std::path::Path::new("/definitely/not/a/mount/point")).is_none()
+        );
+        if let Some((free, total)) = probe_disk_free_inodes(std::path::Path::new("/tmp")) {
+            assert!(total > 0);
+            assert!(free <= total, "free {free} > total {total}");
+        }
     }
 
     #[test]
     fn test_probe_against_real_path_returns_ok_or_probe_failed() {
         // We can't assert specific numbers (CI machines vary), but on a
-        // POSIX runner `df` should succeed against `/tmp` (or `/`). On a
-        // hypothetical non-POSIX runner this returns ProbeFailed; either
-        // outcome is valid — the test just exercises the codepath.
+        // Unix runner `statvfs` succeeds against `/tmp`. On a hypothetical
+        // non-Unix runner this returns ProbeFailed; either outcome is valid —
+        // the test just exercises the codepath. On a real filesystem the free
+        // inode count can never exceed the total.
+        if let Some((free_inodes, total_inodes)) =
+            probe_disk_free_inodes(std::path::Path::new("/tmp"))
+        {
+            assert!(
+                total_inodes > 0,
+                "a mounted filesystem reports its inode total"
+            );
+            assert!(
+                free_inodes <= total_inodes,
+                "free {free_inodes} > total {total_inodes}"
+            );
+        }
+        assert!(
+            probe_disk_free_inodes(std::path::Path::new("/definitely/not/a/mount/point")).is_none(),
+            "a path that does not exist yields no inode reading, never a fabricated one"
+        );
         let outcome = probe_disk_free_bytes(std::path::Path::new("/tmp"));
         match outcome {
             DiskHealthOutcome::Ok {

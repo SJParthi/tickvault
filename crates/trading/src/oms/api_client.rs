@@ -184,6 +184,8 @@ impl OrderApiClient {
         }
         metrics::counter!("tv_alerts_gate_blocks_total", "op" => operation).increment(1);
         error!(
+            code = ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "alerts_gate",
             operation,
             "alerts gate DISARMED: /alerts request refused (dormant surface, no live conditional/multi orders)"
         );
@@ -5456,10 +5458,7 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 // Read until the head AND the Content-Length body arrived —
                 // reqwest may split head/body across writes.
-                loop {
-                    let Ok(read_len) = stream.read(&mut buf).await else {
-                        break;
-                    };
+                while let Ok(read_len) = stream.read(&mut buf).await {
                     if read_len == 0 {
                         break;
                     }

@@ -43,6 +43,15 @@
 //! a calendar day rather than a session is inflated by the 62,400 seconds the
 //! exchange is shut.
 //!
+//! **The figures below are a ~1% UNDERSTATEMENT for depth, deliberately stated
+//! rather than silently carried (2026-09-06).** Depth has no exchange
+//! timestamp, so it is gated on the ARRIVAL clock, which admits a bounded
+//! `ARRIVAL_GRACE_TAIL_SECS` (240 s) tail past the close — a depth row can
+//! therefore be written across **24,240 seconds**, not 24,000. That is roughly
+//! +210 MB/day on the ~21 GB/day estimate. Pinned by
+//! `the_storage_estimate_is_costed_over_a_session_not_a_calendar_day`, which
+//! now asserts BOTH windows so neither can move unnoticed.
+//!
 //! Row width, derived rather than guessed: 4 SYMBOL columns (`feed`, `segment`,
 //! `depth_kind`, `side`) at 4 B of interned key each = 16 B, plus 7 eight-byte
 //! columns (`security_id`, `level`, `price`, `quantity`, `orders`,
@@ -64,6 +73,53 @@
 //! exists anywhere in this crate to copy, and an unverified i64→INT coercion on
 //! the write path that must not fail is a worse trade than 17% of disk. Measure
 //! it against a live QuestDB first.
+//!
+//!
+//! ## ⚠ CORRECTED 2026-08-28 — the table above lists TWO sources; there are THREE
+//!
+//! `DEPTH_KIND_5` is missing from it, and it is the LARGEST of the three.
+//! Added with the 2026-08-19 Full-mode flip, it writes the 5 order-book levels
+//! that ride inside **every Full-mode tick packet** — 10 rows per packet (5
+//! levels x 2 sides) across the whole subscribed universe, not just the 250
+//! instruments the dedicated depth-20 pool covers.
+//!
+//! The measured session settles the split. 1,530,651,649 rows x 72 B =
+//! **110.2 GB**, decomposing as:
+//!
+//! | Kind | Instruments | Rows per update | Rows/session | GB | Basis |
+//! |---|---|---|---:|---:|---|
+//! | **d5** | the WHOLE universe (~23,000) | 10 per tick packet | **~643.5 M** | **46.3** | Derived: 64,349,753 ticks x 10 |
+//! | d20 | 250 | 10,000 | ~739.3 M | 53.2 | Derived at equal cadence |
+//! | d200 | 5 | <= 2,000 | ~147.9 M | 10.6 | Derived; row count is variable, so an upper bound |
+//! | **Total** | | | **1,530.65 M** | **110.2** | MEASURED |
+//!
+//! Why the omission mattered rather than being a tidy-up: the old table's own
+//! bounds are 21 GB/day low and 104 GB/day high, so the measured 110.2 GB sits
+//! ABOVE the stated ceiling — and a reader reconciling that would have gone
+//! looking for a cadence problem in the two pools the table names, when the
+//! missing 46.3 GB is a third source that scales with the TICK count rather
+//! than with either pool's instrument count. Doubling the depth-20 pool does
+//! not move it; widening the subscribed universe does.
+//!
+//! ## The shed gate's rungs, in gigabytes
+//!
+//! Worth stating here because the connection is invisible from either side:
+//! `ingest_shed::ShedLevel::InlineDepth` gates EXACTLY the `DEPTH_KIND_5`
+//! write (`dhan_feed_stack.rs`, the `INGEST_SHED.allows_inline_depth()` arm),
+//! and `AllDepth` gates the dedicated pools as well.
+//!
+//! | Rung | Stops | GB/session |
+//! |---|---|---:|
+//! | `InlineDepth` | d5 | **46.3** (42% of depth) |
+//! | `AllDepth` | d5 + d20 + d200 | **110.2** (80% of the 138 GB session burn) |
+//! | any rung | ticks | **never** |
+//!
+//! So the first rung alone is the single largest lever the box has, it needs
+//! no schema change and no scope decision, and it is fully reversible on the
+//! next poll. What it lacked was a trigger that fires on a day like
+//! 2026-08-28, which closed at 55% free — nowhere near the 15% fractional bar
+//! — while roughly one session of writing from a full disk. That is what
+//! `ingest_shed::SESSION_BURN_BYTES_DEFAULT` and the runway trigger add.
 //!
 //! See the rule-file section for the same-day S3 archival that keeps "nothing
 //! is dropped" true regardless of which end of that range the feed lands on.
@@ -123,15 +179,16 @@
 //! rather than quietly rewritten because an auditor checking the intra-frame
 //! collision would have read that paragraph and concluded it was handled.)*
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use questdb::ingress::{Buffer, ColumnName, ProtocolVersion, Sender, TableName, TimestampNanos};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_MARKET_DEPTH;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
-use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 
 /// The `market_depth` table name.
@@ -189,6 +246,49 @@ pub const DEPTH_SIDE_BID: &str = "bid";
 /// `side` SYMBOL value for the sell side (feed response code 51).
 pub const DEPTH_SIDE_ASK: &str = "ask";
 
+// COMPILE-TIME proof that every closed-set ILP label is already safe, so the
+// write paths can pass them through with ZERO runtime work.
+//
+// Adding a label with a comma, an equals sign, a control byte or a non-ASCII
+// character is a BUILD FAILURE here, not a malformed row discovered in
+// QuestDB. That is what makes it sound for `append_row` to skip the sanitiser
+// for these values — the check did not disappear, it moved to the compiler.
+const _: () = {
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_20
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_200
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_KIND_5
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_BID
+    ));
+    assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        DEPTH_SIDE_ASK
+    ));
+    // EXHAUSTIVE over the whole byte space: whatever segment code the wire
+    // carries, its label is clean. Not a sample — all 256.
+    let mut code = 0u16;
+    while code <= u8::MAX as u16 {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            tickvault_common::segment::segment_code_to_str(code as u8)
+        ));
+        code += 1;
+    }
+    // Every feed label, from the enum's own exhaustive list.
+    let feeds = Feed::ALL;
+    let mut i = 0;
+    while i < feeds.len() {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            feeds[i].as_str()
+        ));
+        i += 1;
+    }
+};
+
 /// Timeout for the idempotent QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -238,6 +338,53 @@ pub struct DepthRow {
 }
 
 // ---------------------------------------------------------------------------
+// Pre-checked ILP names (the per-level row cost, 2026-10-30)
+// ---------------------------------------------------------------------------
+
+// Passing a plain `&str` to a `questdb::ingress::Buffer` method makes it
+// re-check the name character by character on EVERY call: eleven names per
+// `market_depth` row, so on the drain that is one validation pass per name
+// per level. These names are fixed literals, so the answer never changes;
+// `the_depth_ilp_names_pass_questdbs_own_name_checks` (test module) runs
+// QuestDB's own validators over every one of them, and the writers pass the
+// names as `ColumnName` / `TableName` built unchecked, which skips only that
+// re-check. The bytes written are the same (the check can only return an
+// error, never change the output), pinned by
+// `the_prechecked_writer_writes_the_same_bytes_as_the_checked_one`.
+//
+// The name list lives in the test module, not here: a test-only item above
+// the production code would cut the production half that source-scan guards
+// read (they split the file at the first test-config attribute, so that
+// attribute must not appear above the test module, not even in a comment).
+
+/// A depth column name, already proven valid by the test module's name list.
+///
+/// Every build with debug assertions enabled runs QuestDB's own check on each call,
+/// so a name added at a call site without being valid fails every test that
+/// writes a row; a release build skips it.
+///
+/// # Performance
+/// O(1) in release: wraps the `&'static str`, no scan.
+#[inline(always)]
+fn depth_col(name: &'static str) -> ColumnName<'static> {
+    debug_assert!(
+        ColumnName::new(name).is_ok(),
+        "depth ILP column name {name:?} fails QuestDB's own name check"
+    );
+    ColumnName::new_unchecked(name)
+}
+
+/// A depth table name, already proven valid by the test module's name check.
+#[inline(always)]
+fn depth_table(name: &'static str) -> TableName<'static> {
+    debug_assert!(
+        TableName::new(name).is_ok(),
+        "depth ILP table name {name:?} fails QuestDB's own name check"
+    );
+    TableName::new_unchecked(name)
+}
+
+// ---------------------------------------------------------------------------
 // DDL (idempotent self-heal)
 // ---------------------------------------------------------------------------
 
@@ -249,9 +396,11 @@ pub struct DepthRow {
 /// dropping a partition that is still being written.
 #[must_use]
 pub fn market_depth_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in market_depth_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} (\
             feed SYMBOL, \
+            contract SYMBOL, \
             segment SYMBOL, \
             depth_kind SYMBOL, \
             side SYMBOL, \
@@ -270,6 +419,7 @@ pub fn market_depth_create_ddl() -> String {
 /// ALTERs.
 const MARKET_DEPTH_COLUMNS: &[(&str, &str)] = &[
     ("feed", "SYMBOL"),
+    ("contract", "SYMBOL"),
     ("segment", "SYMBOL"),
     ("depth_kind", "SYMBOL"),
     ("side", "SYMBOL"),
@@ -286,16 +436,906 @@ const MARKET_DEPTH_COLUMNS: &[(&str, &str)] = &[
 /// Never a DROP. Pure, so the statement set is unit-testable without QuestDB.
 #[must_use]
 pub fn market_depth_ensure_statements() -> Vec<String> {
-    let mut out = vec![market_depth_create_ddl()];
+    let mut out = vec![market_depth_create_ddl()]; // APPROVED: boot DDL statement list, never per row
     for (col, ty) in MARKET_DEPTH_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
         out.push(format!(
             "ALTER TABLE {MARKET_DEPTH_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
         ));
     }
+    // APPROVED: DEDUP ENABLE statement, boot only
     out.push(format!(
         "ALTER TABLE {MARKET_DEPTH_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_MARKET_DEPTH})"
     ));
     out
+}
+
+// ---------------------------------------------------------------------------
+// Array-row table (plan item 49e step 2) — one row per book side per packet
+// ---------------------------------------------------------------------------
+
+/// The array-row successor of `market_depth`: one row per book SIDE per
+/// packet, the levels held in `DOUBLE[]` columns.
+///
+/// A NEW table, not a column change on `market_depth`: QuestDB cannot change a
+/// column's type in place, and the old table keeps its rows (never deleted;
+/// retention as today). Measured on a scratch QuestDB 9.3.5 on 2026-10-06
+/// (plan item 49d / 45i): 11x to 13.5x fewer bytes written by the database
+/// for depth-200 and depth-20, 2.8x for the inline five levels, every level
+/// read back exact. Not written by anything yet: the drain is switched to it
+/// in step 3, behind a default-off setting.
+pub const MARKET_DEPTH_BOOK_TABLE: &str = "market_depth_book";
+
+/// The `market_depth_book` DEDUP UPSERT key: [`DEDUP_KEY_MARKET_DEPTH`]
+/// without `level`, because a row now carries every level of one side.
+/// `segment` (I-P1-11) and `feed` stay in it.
+pub const DEDUP_KEY_MARKET_DEPTH_BOOK: &str =
+    "ts, security_id, segment, depth_kind, side, capture_seq, feed";
+
+/// Most levels one book row may carry: depth-200 sends 200 per side.
+pub const MAX_DEPTH_BOOK_LEVELS: usize = 200;
+
+/// Flush an array-row buffer once it holds this many bytes.
+///
+/// Counted in BYTES, not rows: a depth-200 side is about 4.8 KB as an array
+/// row, so the row threshold the level writer uses (10,000) would be about
+/// 48 MB, past [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] (attack finding, plan item
+/// 49d). At 8 MiB a full flush queue (`DEPTH_FLUSH_QUEUE_DEPTH` batches) holds
+/// at most 32 MiB, one [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`].
+pub const DEPTH_BOOK_FLUSH_BYTES: usize = 8 * 1024 * 1024;
+
+/// Flush a LEVEL-row buffer that is being filled with LATE rows (the WAL
+/// replay and the after-close deferred pass) once it holds this many bytes,
+/// instead of at the live drain's 10,000 rows (plan item 55).
+///
+/// A late row lands in an hour partition that already holds rows, and QuestDB
+/// rewrites that partition for every commit that adds rows to it, whatever the
+/// commit's size: measured on QuestDB 9.3.5 (2026-10-10, a 6M-row hour, paced
+/// commits) at 464 MB written per 1,000-row commit, 495 MB per 10,000-row
+/// commit and 507 MB per 100,000-row commit, against about 1.7 MB for an
+/// in-order commit. So a late batch's cost is the COUNT of commits, and at
+/// about 179 bytes a row this is about 94,000 rows per commit, about 9 times
+/// fewer commits than 10,000 rows.
+///
+/// Half of [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`], so a batch the full offload
+/// queue hands back still has room for the next span before the byte cut, and
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] batches stay inside the asserted in-flight
+/// bound. The live drain keeps its row threshold: its rows are in time order.
+pub const DEPTH_LATE_FLUSH_BYTES: usize = 16 * 1024 * 1024;
+
+const _: () = assert!(
+    DEPTH_LATE_FLUSH_BYTES * 2 <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+    "a late depth batch must leave the producer room for one more span before its byte cut"
+);
+const _: () = assert!(
+    DEPTH_LATE_FLUSH_BYTES >= DEPTH_BOOK_FLUSH_BYTES,
+    "the late batch exists to be LARGER than the ordinary one"
+);
+
+/// The idempotent `CREATE TABLE` DDL for `market_depth_book`. Pure — no I/O.
+///
+/// Same column set as `market_depth` with `level` replaced by `levels` (the
+/// count of entries in each array), and `price` / `quantity` / `orders` as
+/// `DOUBLE[]`. Quantity and orders fit an `f64` exactly (they are `u32` on
+/// the wire). Same `PARTITION BY HOUR` as `market_depth`, for the same
+/// archive reason.
+#[must_use]
+pub fn market_depth_book_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in market_depth_book_create_ddl
+    format!(
+        "CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_BOOK_TABLE} (\
+            feed SYMBOL, \
+            contract SYMBOL, \
+            segment SYMBOL, \
+            depth_kind SYMBOL, \
+            side SYMBOL, \
+            security_id LONG, \
+            levels LONG, \
+            price DOUBLE[], \
+            quantity DOUBLE[], \
+            orders DOUBLE[], \
+            capture_seq LONG, \
+            ts TIMESTAMP\
+        ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
+    )
+}
+
+/// Every `market_depth_book` column with its type, for the self-heal ALTERs.
+const MARKET_DEPTH_BOOK_COLUMNS: &[(&str, &str)] = &[
+    ("feed", "SYMBOL"),
+    ("contract", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("depth_kind", "SYMBOL"),
+    ("side", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("levels", "LONG"),
+    ("price", "DOUBLE[]"),
+    ("quantity", "DOUBLE[]"),
+    ("orders", "DOUBLE[]"),
+    ("capture_seq", "LONG"),
+];
+
+/// The ordered DDL statements for `market_depth_book`:
+/// CREATE → per-column `ADD COLUMN IF NOT EXISTS` → `DEDUP ENABLE`.
+/// Never a DROP. Pure, so the statement set is unit-testable without QuestDB.
+/// Run at boot from step 3, when the setting that writes the table exists.
+#[must_use]
+pub fn market_depth_book_ensure_statements() -> Vec<String> {
+    let mut out = vec![market_depth_book_create_ddl()]; // APPROVED: boot DDL statement list, never per row
+    for (col, ty) in MARKET_DEPTH_BOOK_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
+        out.push(format!(
+            "ALTER TABLE {MARKET_DEPTH_BOOK_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
+        ));
+    }
+    // APPROVED: DEDUP ENABLE statement, boot only
+    out.push(format!(
+        "ALTER TABLE {MARKET_DEPTH_BOOK_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_MARKET_DEPTH_BOOK})"
+    ));
+    out
+}
+
+/// One row of QuestDB's `table_columns(..)` answer: what the boot needs to
+/// know about a column before it asks for the `market_depth_book` DEDUP key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableColumn {
+    pub(crate) name: String,
+    pub(crate) ty: String,
+    pub(crate) designated: bool,
+}
+
+/// Why an existing `market_depth_book` cannot take its DEDUP key (live audit
+/// LH-01, 2026-10-28): the key leads with `ts`, and QuestDB accepts a DEDUP
+/// key only when it holds the table's DESIGNATED timestamp. A table that an
+/// ILP write auto-created before the boot CREATE ran names that column
+/// `timestamp`, so every boot's `DEDUP ENABLE` failed with "deduplicate key
+/// column not found [column=ts]" and depth fell back to `market_depth`.
+/// `CREATE TABLE IF NOT EXISTS` and `ADD COLUMN` cannot repair it: QuestDB
+/// does not rename or re-designate a table's timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BookTimestampProblem {
+    /// The table has no designated timestamp. `plain_ts_present`: a `ts`
+    /// column exists, but not as the designated timestamp.
+    Missing { plain_ts_present: bool },
+    /// The designated timestamp exists under another name.
+    Misnamed {
+        designated: String,
+        plain_ts_present: bool,
+    },
+}
+
+impl BookTimestampProblem {
+    /// The cause, in words, for the boot's refusal line.
+    fn cause(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Missing {
+                plain_ts_present: true,
+            } => "market_depth_book has a ts column but it is not the designated \
+                  timestamp, and the table has none"
+                .into(),
+            Self::Missing {
+                plain_ts_present: false,
+            } => "market_depth_book has no ts column and no designated timestamp".into(),
+            Self::Misnamed {
+                designated,
+                plain_ts_present,
+            } => {
+                // APPROVED: boot-only refusal text, once per ensure
+                std::borrow::Cow::Owned(format!(
+                    "market_depth_book's designated timestamp is named {designated}, not ts \
+                     (a ts column {}), so the DEDUP key on ts cannot be enabled",
+                    if *plain_ts_present {
+                        "exists but is not designated"
+                    } else {
+                        "does not exist"
+                    }
+                ))
+            }
+        }
+    }
+}
+
+/// The manual repair for a [`BookTimestampProblem`]. The boot never drops or
+/// alters this table, and renames one only when it is EMPTY (PR DP-5: 0 rows,
+/// WAL fully applied and unmoved around the count, inside the depth spill
+/// replay hold); a table with rows is market data (zero
+/// loss, Quotes 27 + 28), and only the operator decides what happens to it.
+///
+/// Why the start time matters (review, 2026-10-29): the depth spill replay is
+/// spawned in `main` BEFORE the Dhan lane runs this ensure, and outside 08:00 to
+/// 15:40 IST its first round POSTs at once. A spilled `market_depth_book` row
+/// reaching QuestDB before the ensure auto-creates the table with its
+/// designated timestamp named `timestamp` again. Inside that window the depth
+/// replay is held (`tick_spill_replay::depth_replay_held_at`), so the boot's
+/// CREATE runs first. That replay is one path that can make this table; that
+/// it made the live LH-01 table is Assumed, not read from the box.
+/// A non-empty table is RENAMED, never dropped, so no row is deleted.
+///
+/// ⚠ CHANGED 2026-11-07 (`ilp_table_gate`): the spill replay no longer
+/// depends on the clock for this. It holds every file with a row for a table
+/// this process has not ensured, and this table is marked ensured only when
+/// [`ensure_market_depth_book_table`] returns `Ensured`, so a spilled book
+/// record can no longer reach a QuestDB without the table, at any hour. The
+/// window advice in the remedy still matters for one thing: the empty-table
+/// self-heal runs only from 08:00 to 15:40 IST.
+const MARKET_DEPTH_BOOK_TS_REMEDY: &str = "outside market hours, with the app stopped \
+     (after the 16:30 IST stop): run SELECT count() FROM market_depth_book. If it \
+     is 0, DROP TABLE market_depth_book. If it has rows, keep them: RENAME TABLE \
+     market_depth_book TO market_depth_book_lh01 (nothing is deleted; that copy \
+     is not archived or swept, so decide separately whether to copy it to S3). \
+     Then leave the app stopped until the scheduled 08:30 IST start: from 08:00 \
+     to 15:40 IST the depth spill replay is held, so the boot creates the new \
+     table with ts before any spilled market_depth_book row reaches QuestDB. A \
+     start outside that window replays data/spill/depth first, and a spilled \
+     market_depth_book row would auto-create the table with the wrong timestamp \
+     again. Until then depth is written to market_depth and nothing is lost. \
+     A boot from 08:00 to 15:40 IST renames this table aside itself \
+     (market_depth_book_lh01_<yyyymmdd>) only when it holds 0 rows with its WAL \
+     fully applied and untouched; it never drops it, and never renames one with rows";
+
+/// Counts boots that found `market_depth_book` with a designated timestamp
+/// other than `ts` and kept depth in `market_depth` (review, 2026-10-29).
+///
+/// Deliberately NOT `tv_depth_persist_errors_total`: that series is summed by
+/// the always-armed market-data persistence-loss alarm, whose text says rows
+/// did not reach QuestDB and are not recoverable. This refusal loses nothing
+/// (every depth row goes to `market_depth`), so it counts here, local
+/// `/metrics` only (not EMF-selected, no alarm), registered at 0 at boot.
+pub const MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER: &str = "tv_depth_book_layout_refused_total";
+
+/// What [`ensure_market_depth_book_table`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "anything but Ensured means market_depth_book cannot take array rows; keep depth in market_depth"]
+pub enum BookEnsureOutcome {
+    /// Every statement was accepted: the table has its DEDUP key.
+    Ensured,
+    /// A statement was refused or QuestDB was unreachable (already counted on
+    /// `tv_depth_persist_errors_total{stage}` and logged by the DDL runner).
+    Failed,
+    /// The table exists with a designated timestamp other than `ts`, so its
+    /// DEDUP key can never be enabled. No statement was sent and nothing is
+    /// lost (depth stays in `market_depth`); logged once at `warn!` with the
+    /// cause and the remedy, counted on [`MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER`].
+    LayoutRefused,
+}
+
+impl BookEnsureOutcome {
+    /// `true` only when the array-row writer may be armed.
+    pub fn is_ensured(self) -> bool {
+        self == Self::Ensured
+    }
+}
+
+/// Counts and logs a [`BookTimestampProblem`] refusal: once per ensure, at
+/// `warn!` (the HOT-PATH-02 page filter matches ERROR only) and on the
+/// non-loss counter, because no row is lost. O(1), boot only.
+fn report_book_layout_refusal(problem: &BookTimestampProblem) {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(1);
+    // APPROVED: not a write failure; no row is lost, every depth row is written to market_depth instead; counted on tv_depth_book_layout_refused_total (review 2026-10-29: the loss counter and an ERROR line paged a loss that does not exist)
+    warn!(
+        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+        stage = "ensure_book_designated_ts",
+        table = MARKET_DEPTH_BOOK_TABLE,
+        cause = %problem.cause(),
+        remedy = MARKET_DEPTH_BOOK_TS_REMEDY,
+        "market_depth_book not ensured: its designated timestamp is not ts, so \
+         the DEDUP key cannot be enabled; this process keeps every depth row in \
+         market_depth, nothing is lost. Repair the table outside market hours \
+         (see remedy)"
+    );
+}
+
+/// Counts the boot self-heal of a `market_depth_book` with the wrong
+/// designated timestamp (PR DP-5, 2026-11-06), by `outcome`
+/// ([`BookSelfHeal::as_str`]). Local `/metrics` only, registered at 0 at the
+/// ensure.
+pub const MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER: &str = "tv_depth_book_self_heal_total";
+
+/// What the self-heal of a wrong-timestamp `market_depth_book` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookSelfHeal {
+    /// The table held 0 rows with its WAL fully applied and unmoved while the
+    /// depth spill replay was held; it was RENAMED aside (nothing deleted),
+    /// and the ensure re-creates `market_depth_book` with `ts`.
+    Healed,
+    /// The table holds rows: kept, refused as before.
+    RefusedRows,
+    /// The row count or the WAL state could not be read: kept, refused.
+    RefusedUnknown,
+    /// The depth spill replay is not held at this hour (outside 08:00 to
+    /// 15:40 IST it can post a `market_depth_book` row at any moment): kept,
+    /// refused.
+    RefusedReplayLive,
+    /// `wal_tables()` showed a new sequencer transaction between the two
+    /// reads around the count (a writer reached the table): kept, refused.
+    RefusedTxnMoved,
+    /// The `RENAME TABLE` itself failed: refused as before.
+    RenameFailed,
+}
+
+impl BookSelfHeal {
+    /// Every outcome, for the zero registration.
+    pub const ALL: [Self; 6] = [
+        Self::Healed,
+        Self::RefusedRows,
+        Self::RefusedUnknown,
+        Self::RefusedReplayLive,
+        Self::RefusedTxnMoved,
+        Self::RenameFailed,
+    ];
+
+    /// The `outcome` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healed => "healed",
+            Self::RefusedRows => "refused_rows",
+            Self::RefusedUnknown => "refused_unknown",
+            Self::RefusedReplayLive => "refused_replay_live",
+            Self::RefusedTxnMoved => "refused_txn_moved",
+            Self::RenameFailed => "rename_failed",
+        }
+    }
+}
+
+/// The readings the self-heal decides on (PR DP-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BookSelfHealReadings {
+    /// `tick_spill_replay::depth_replay_held_at(now)`: the depth spill replay
+    /// cannot post a row right now.
+    pub replay_held: bool,
+    /// `SELECT count()` (`None` = unreadable).
+    pub row_count: Option<i64>,
+    /// From the FIRST `wal_tables()` read, BEFORE the count: writer at the
+    /// sequencer and not suspended. Required too (2026-11-06 combined
+    /// review): a count taken while transactions are still to apply can
+    /// miss rows QuestDB accepted and applies just before the second read.
+    pub wal_applied_before: Option<bool>,
+    /// From the SECOND `wal_tables()` read: writer at the sequencer and not
+    /// suspended (`None` = unreadable or not listed).
+    pub wal_applied: Option<bool>,
+    /// `sequencerTxn` from the `wal_tables()` read BEFORE the count.
+    pub sequencer_before: Option<i64>,
+    /// `sequencerTxn` from the read AFTER the count.
+    pub sequencer_after: Option<i64>,
+}
+
+/// Whether an existing wrong-timestamp `market_depth_book` may be renamed
+/// aside.
+///
+/// Only while the depth spill replay is held (it is spawned before this
+/// ensure and, outside 08:00 to 15:40 IST, can post a row at any moment), with
+/// `Some(0)` rows, the WAL fully applied on BOTH reads, and the same `sequencerTxn` before
+/// and after the count (no writer reached the table in between; a count of 0
+/// with transactions still to apply can be rows QuestDB has accepted and not
+/// yet made visible). `Err` carries the refusal. Pure, O(1).
+///
+/// # Errors
+/// [`BookSelfHeal::RefusedReplayLive`] outside the replay hold,
+/// [`BookSelfHeal::RefusedRows`] when the table holds rows,
+/// [`BookSelfHeal::RefusedTxnMoved`] when the sequencer moved,
+/// [`BookSelfHeal::RefusedUnknown`] when a reading is missing or the WAL is
+/// behind.
+pub const fn book_self_heal_decision(r: BookSelfHealReadings) -> Result<(), BookSelfHeal> {
+    if !r.replay_held {
+        return Err(BookSelfHeal::RefusedReplayLive);
+    }
+    match (
+        r.row_count,
+        r.wal_applied_before,
+        r.wal_applied,
+        r.sequencer_before,
+        r.sequencer_after,
+    ) {
+        (Some(n), _, _, _, _) if n > 0 => Err(BookSelfHeal::RefusedRows),
+        (Some(0), Some(true), Some(true), Some(before), Some(after)) => {
+            if before == after {
+                Ok(())
+            } else {
+                Err(BookSelfHeal::RefusedTxnMoved)
+            }
+        }
+        _ => Err(BookSelfHeal::RefusedUnknown),
+    }
+}
+
+/// `true` when `rows` lists `market_depth_book` fully applied (writer at the
+/// sequencer's transaction) and not suspended; `false` when listed but
+/// behind or suspended; `None` when not listed or a transaction is missing.
+/// Pure, O(rows).
+#[must_use]
+pub fn book_wal_applied(rows: &[crate::wal_suspension_watcher::WalTableRow]) -> Option<bool> {
+    // O(1) EXEMPT: boot-only scan over the few dozen wal_tables() rows.
+    let row = rows.iter().find(|r| r.name == MARKET_DEPTH_BOOK_TABLE)?;
+    let (writer, sequencer) = (row.writer_txn?, row.sequencer_txn?);
+    Some(!row.suspended && writer == sequencer)
+}
+
+/// `market_depth_book`'s `sequencerTxn` in `rows`; `None` when not listed or
+/// missing. Pure, O(rows).
+#[must_use]
+pub fn book_sequencer_txn(rows: &[crate::wal_suspension_watcher::WalTableRow]) -> Option<i64> {
+    // O(1) EXEMPT: boot-only scan over the few dozen wal_tables() rows.
+    rows.iter()
+        .find(|r| r.name == MARKET_DEPTH_BOOK_TABLE)?
+        .sequencer_txn
+}
+
+/// The name a wrong-timestamp `market_depth_book` is renamed to:
+/// `market_depth_book_lh01_<yyyymmdd>` with the IST date of `now_unix_secs`
+/// (the module's own manual remedy, dated). Pure, O(1).
+#[must_use]
+pub fn book_self_heal_rename_target(now_unix_secs: i64) -> String {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    // A clock chrono cannot place falls back to the Unix epoch's date.
+    let date = chrono::DateTime::from_timestamp(ist, 0).unwrap_or_default();
+    // APPROVED: boot-only DDL name, once per self-heal
+    format!("{MARKET_DEPTH_BOOK_TABLE}_lh01_{}", date.format("%Y%m%d"))
+}
+
+/// IST second of day of `now_unix_secs`. Pure, O(1).
+fn ist_secs_of_day(now_unix_secs: i64) -> u32 {
+    let ist = now_unix_secs.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    u32::try_from(ist.rem_euclid(86_400)).unwrap_or(0)
+}
+
+/// One `wal_tables()` read: `(applied, sequencer)` for `market_depth_book`.
+async fn book_wal_reading(client: &reqwest::Client, exec_url: &str) -> (Option<bool>, Option<i64>) {
+    match crate::wal_suspension_watcher::fetch_wal_tables(client, exec_url).await {
+        Ok(rows) => (book_wal_applied(&rows), book_sequencer_txn(&rows)),
+        Err(_) => (None, None),
+    }
+}
+
+/// Renames `market_depth_book` aside when it is empty, fully applied, the
+/// sequencer did not move around the count, and the depth spill replay is
+/// held, so the ensure can re-create it with `ts` (PR DP-5). NOTHING is ever
+/// deleted: the old table keeps whatever it holds under its dated name.
+/// Every step that cannot be read refuses. Boot only, at most four `/exec`
+/// calls.
+async fn self_heal_empty_market_depth_book(
+    questdb_config: &QuestDbConfig,
+    now_unix_secs: i64,
+) -> BookSelfHeal {
+    let replay_held =
+        crate::tick_spill_replay::depth_replay_held_at(ist_secs_of_day(now_unix_secs));
+    if !replay_held {
+        warn!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            outcome = BookSelfHeal::RefusedReplayLive.as_str(),
+            "market_depth_book self-heal REFUSED: outside 08:00 to 15:40 IST the depth \
+             spill replay can post a row at any moment, so the table is kept and depth \
+             stays in market_depth (nothing lost); the next boot inside the window \
+             renames it aside"
+        );
+        return BookSelfHeal::RefusedReplayLive;
+    }
+    // APPROVED: QuestDB base URL, once per boot ensure
+    let exec_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    else {
+        return BookSelfHeal::RefusedUnknown;
+    };
+    let (wal_applied_before, sequencer_before) = book_wal_reading(&client, &exec_url).await;
+    // APPROVED: boot-only probe query
+    let count_sql = format!("SELECT count() FROM {MARKET_DEPTH_BOOK_TABLE}");
+    let row_count = match client
+        .get(&exec_url)
+        .query(&[("query", count_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .text()
+            .await
+            .ok()
+            .and_then(|body| crate::fresh_start_reset::parse_count(&body)),
+        _ => None,
+    };
+    let (wal_applied, sequencer_after) = book_wal_reading(&client, &exec_url).await;
+    let readings = BookSelfHealReadings {
+        replay_held,
+        row_count,
+        wal_applied_before,
+        wal_applied,
+        sequencer_before,
+        sequencer_after,
+    };
+    if let Err(refusal) = book_self_heal_decision(readings) {
+        warn!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            row_count = ?row_count,
+            wal_applied_before = ?wal_applied_before,
+            wal_applied = ?wal_applied,
+            sequencer_before = ?sequencer_before,
+            sequencer_after = ?sequencer_after,
+            outcome = refusal.as_str(),
+            "market_depth_book self-heal REFUSED: the table is not proven empty, applied \
+             and untouched, so it is kept and depth stays in market_depth (nothing lost)"
+        );
+        return refusal;
+    }
+    let target = book_self_heal_rename_target(now_unix_secs);
+    // APPROVED: boot-only DDL, only after the table was proven empty; a rename, never a drop
+    let rename_sql = format!("RENAME TABLE {MARKET_DEPTH_BOOK_TABLE} TO {target}");
+    match client
+        .get(&exec_url)
+        .query(&[("query", rename_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => BookSelfHeal::Healed,
+        _ => {
+            warn!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                stage = "self_heal_book_rename",
+                table = MARKET_DEPTH_BOOK_TABLE,
+                target = %target,
+                "market_depth_book self-heal: RENAME TABLE failed; the table is kept and \
+                 depth stays in market_depth (nothing lost)"
+            );
+            BookSelfHeal::RenameFailed
+        }
+    }
+}
+/// Reads QuestDB's `/exec` answer to `SELECT * FROM table_columns('..')` by
+/// column NAME (`column`, `type`, `designated`), so an added or reordered
+/// result column does not break it. `None` for anything it cannot read (an
+/// error body, a missing column): the check then refuses nothing.
+pub(crate) fn parse_table_columns_answer(body: &str) -> Option<Vec<TableColumn>> {
+    let answer: serde_json::Value = serde_json::from_str(body).ok()?;
+    let header = answer.get("columns")?.as_array()?;
+    let index_of = |wanted: &str| {
+        header
+            .iter()
+            .position(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(wanted))
+    };
+    let (name_at, type_at, designated_at) = (
+        index_of("column")?,
+        index_of("type")?,
+        index_of("designated")?,
+    );
+    let rows = answer.get("dataset")?.as_array()?;
+    let mut out = Vec::with_capacity(rows.len()); // APPROVED: boot-only column list
+    for row in rows {
+        let row = row.as_array()?;
+        out.push(TableColumn {
+            // APPROVED: boot-only column name, once per ensure
+            name: row.get(name_at)?.as_str()?.to_string(),
+            // APPROVED: boot-only column type, once per ensure
+            ty: row.get(type_at)?.as_str()?.to_string(),
+            designated: row.get(designated_at)?.as_bool()?,
+        });
+    }
+    Some(out)
+}
+
+/// `Some` when an existing `market_depth_book` cannot take its DEDUP key
+/// because its designated timestamp is not `ts`. An empty list (no table yet)
+/// is `None`: the boot CREATE makes it with `ts`. O(columns), once per boot.
+fn market_depth_book_designated_ts_problem(
+    columns: &[TableColumn],
+) -> Option<BookTimestampProblem> {
+    if columns.is_empty() {
+        return None;
+    }
+    let plain_ts_present = columns.iter().any(|c| c.name == "ts" && !c.designated);
+    // O(1) EXEMPT: boot-only, once per ensure, over the table's few columns.
+    match columns.iter().find(|c| c.designated) {
+        Some(c) if c.name == "ts" => None,
+        Some(c) => Some(BookTimestampProblem::Misnamed {
+            // APPROVED: boot-only, once per ensure
+            designated: c.name.clone(),
+            plain_ts_present,
+        }),
+        None => Some(BookTimestampProblem::Missing { plain_ts_present }),
+    }
+}
+
+/// Reads `market_depth_book`'s columns once and returns what stops its DEDUP
+/// key, if anything. Any failure to read (unreachable, the table does not
+/// exist yet, an answer it cannot parse) is `None`: the ensure then runs as
+/// before and reports QuestDB's own answer.
+async fn probe_market_depth_book_ts(
+    questdb_config: &QuestDbConfig,
+) -> Option<BookTimestampProblem> {
+    // APPROVED: QuestDB base URL, once per boot ensure
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    // APPROVED: boot-only probe query
+    let query = format!("SELECT * FROM table_columns('{MARKET_DEPTH_BOOK_TABLE}')");
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    market_depth_book_designated_ts_problem(&parse_table_columns_answer(&body)?)
+}
+
+/// Which table a [`DepthWriter`] writes. One writer writes ONE table: a row
+/// written to `market_depth_book` without its three arrays would set them to
+/// NULL over a stored book (seen on the scratch table, plan item 49d), so a
+/// writer refuses rows of the other layout instead of mixing them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthLayout {
+    /// `market_depth`, one row per level, ILP v1. Every writer today.
+    Levels,
+    /// `market_depth_book`, one row per side, ILP v2 (arrays need v2).
+    Book,
+}
+
+impl DepthLayout {
+    /// The ILP protocol this layout's buffer and sender are pinned to.
+    /// Pinned, never negotiated: with no version set the client picks v3,
+    /// and a v2 buffer then fails at flush (attack finding, plan item 49d).
+    #[must_use]
+    pub const fn protocol(self) -> ProtocolVersion {
+        match self {
+            Self::Levels => ProtocolVersion::V1,
+            Self::Book => ProtocolVersion::V2,
+        }
+    }
+
+    /// The `protocol_version=` number written into the sender's conf string.
+    #[must_use]
+    pub const fn protocol_number(self) -> u8 {
+        match self {
+            Self::Levels => 1,
+            Self::Book => 2,
+        }
+    }
+
+    /// Bytes a row buffer of this layout is reserved with up front (plan item
+    /// DT-A2, 2026-10-28): [`DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES`] or
+    /// [`DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES`]. Pure, O(1).
+    #[must_use]
+    pub const fn row_buffer_presize_bytes(self) -> usize {
+        match self {
+            Self::Levels => DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES,
+            Self::Book => DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES,
+        }
+    }
+}
+
+/// Bytes a LEVEL-row depth buffer is reserved with up front (plan item DT-A2,
+/// 2026-10-28; the depth twin of the tick writer's K6
+/// `TICK_ROW_BUFFER_PRESIZE_BYTES`).
+///
+/// A depth row buffer used to start at zero capacity and regrow by doubling
+/// inside the frames whose appends crossed each power of two, so on the frame
+/// drain; the last copies before a flush were megabytes. The live drain cuts a
+/// level batch at 10,000 rows (`DEPTH_FLUSH_ROW_THRESHOLD` in the app crate)
+/// at about 179 bytes a row, about 1.8 MB, so 4 MiB holds a full batch plus
+/// the rows of the frame that crosses the cut. A bigger batch (the late-row
+/// writers, which cut at [`DEPTH_LATE_FLUSH_BYTES`]) still grows past it by
+/// doubling, off the live drain. SPACE: one buffer in the producer, at most
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] queued and as many spares, so at most 9 × 4 MiB
+/// reserved per level writer; pages are committed only as rows are written.
+pub const DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Bytes an ARRAY-row (`market_depth_book`) buffer is reserved with up front
+/// (plan item DT-A2, 2026-10-28).
+///
+/// The book writer cuts on bytes at [`DEPTH_BOOK_FLUSH_BYTES`] (8 MiB), checked
+/// after a frame, so a batch reaches 8 MiB plus the rows of one frame. Reserved
+/// at the threshold plus 1 MiB of headroom for that frame. Before, the buffer
+/// doubled from zero and the frame that crossed 8 MiB copied 8 MiB into a new
+/// 16 MiB buffer on the drain; a recycled spare then kept the 16 MiB capacity.
+/// SPACE: at most 9 × 9 MiB reserved, under the 16 MiB spares the doubling
+/// left behind; pages are committed only as rows are written.
+pub const DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES: usize = DEPTH_BOOK_FLUSH_BYTES + 1024 * 1024;
+
+const _: () = assert!(
+    DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES <= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        && DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+    "a pre-sized depth buffer must be one the spare lane will take back"
+);
+const _: () = assert!(
+    DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES,
+    "the book pre-size must hold a full batch plus the frame that crosses the cut"
+);
+
+/// An empty row buffer for `layout`, reserved to its pre-size. One
+/// allocation, at construction; never per row.
+/// PF-4b (2026-11-06): a book writer stages its rows, so its producer text
+/// buffer (the cold paths' scratch) is NOT reserved; the pre-size now sizes
+/// the writer thread's encode buffer and the staged batch.
+fn presized_depth_row_buffer(layout: DepthLayout) -> Buffer {
+    let mut buffer = Buffer::new(layout.protocol());
+    if layout == DepthLayout::Levels {
+        buffer.reserve(layout.row_buffer_presize_bytes());
+    }
+    buffer
+}
+
+/// Writes one `market_depth_book` array-row line into `buffer` (ILP v2).
+///
+/// The line writer the drain used until PF-4b (2026-11-06), moved out of
+/// `DepthWriter` unchanged so the writer and rescue threads write the same
+/// bytes: only the contract name now arrives as an argument (`name`, the
+/// value the drain's per-run cache used to hold) instead of being read from
+/// that cache. Callers wrap it in a marker so a refused row leaves the
+/// buffer as it was. O(levels).
+pub(crate) fn write_book_line_into(
+    buffer: &mut Buffer,
+    feed: Feed,
+    row: &DepthBookRow<'_>,
+    levels: usize,
+    name: Option<&str>,
+) -> Result<()> {
+    let feed = feed.as_str();
+    // Same closed sets as the level writer, proven ILP-safe at compile
+    // time by the `const _` block; see `append_row_inner`.
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.segment));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+        row.depth_kind
+    ));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(row.side));
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
+    buffer
+        .table(depth_table(MARKET_DEPTH_BOOK_TABLE))
+        .context("table")?
+        .symbol(depth_col("segment"), row.segment)
+        .context("segment")?
+        .symbol(depth_col("depth_kind"), row.depth_kind)
+        .context("depth_kind")?
+        .symbol(depth_col("side"), row.side)
+        .context("side")?
+        .symbol(depth_col("feed"), feed)
+        .context("feed")?;
+    // `contract`, resolved once per instrument run by the drain; omitted
+    // (NULL) when the day's table does not know it.
+    if let Some(name) = name {
+        // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
+        // name is written as it is; no per-row scan.
+        debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
+        buffer
+            .symbol(depth_col("contract"), name)
+            .context("contract")?;
+    }
+    buffer
+        .column_i64(depth_col("security_id"), row.security_id)
+        .context("security_id")?
+        .column_i64(
+            depth_col("levels"),
+            i64::try_from(levels).unwrap_or(i64::MAX),
+        )
+        .context("levels")?
+        .column_arr(depth_col("price"), &row.prices)
+        .context("price")?
+        .column_arr(depth_col("quantity"), &row.quantities)
+        .context("quantity")?
+        .column_arr(depth_col("orders"), &row.orders)
+        .context("orders")?
+        .column_i64(depth_col("capture_seq"), row.capture_seq)
+        .context("capture_seq")?
+        .at(TimestampNanos::new(row.ts_nanos))
+        .context("designated timestamp")?;
+    Ok(())
+}
+
+/// One side of one depth packet, prepared for an array-row append.
+///
+/// Borrows three caller-owned slices (a stack array on the drain), so
+/// building and appending it allocates nothing. The three slices are the
+/// same length, best price first; a level the caller refused is `NaN` in its
+/// slot, never skipped, so positions stay aligned and no level is dropped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthBookRow<'a> {
+    /// Dhan SecurityId.
+    pub security_id: i64,
+    /// Exchange segment wire label.
+    pub segment: &'static str,
+    /// `d5`, `d20` or `d200`.
+    pub depth_kind: &'static str,
+    /// `bid` or `ask`.
+    pub side: &'static str,
+    /// Level prices, best first.
+    pub prices: &'a [f64],
+    /// Level quantities, same order.
+    pub quantities: &'a [f64],
+    /// Orders resting at each level, same order.
+    pub orders: &'a [f64],
+    /// Intra-second tiebreaker; see the module docs.
+    pub capture_seq: i64,
+    /// Designated timestamp — arrival time in IST, as `market_depth`.
+    pub ts_nanos: i64,
+}
+
+/// Both sides of one packet's book, for [`DepthWriter::append_book_pair`]
+/// (speed fix 5, 2026-11-17): the identity columns once, then the bid and
+/// the ask slices. It stands for the two [`DepthBookRow`]s (bid first) that
+/// share every identity column.
+#[derive(Debug, Clone, Copy)]
+pub struct DepthBookPair<'a> {
+    /// Dhan SecurityId.
+    pub security_id: i64,
+    /// Exchange segment wire label.
+    pub segment: &'static str,
+    /// `d5`, `d20` or `d200`.
+    pub depth_kind: &'static str,
+    /// Bid level prices, best first.
+    pub bid_prices: &'a [f64],
+    /// Bid level quantities, same order.
+    pub bid_quantities: &'a [f64],
+    /// Orders resting at each bid level, same order.
+    pub bid_orders: &'a [f64],
+    /// Ask level prices, best first.
+    pub ask_prices: &'a [f64],
+    /// Ask level quantities, same order.
+    pub ask_quantities: &'a [f64],
+    /// Orders resting at each ask level, same order.
+    pub ask_orders: &'a [f64],
+    /// Intra-second tiebreaker; see the module docs.
+    pub capture_seq: i64,
+    /// Designated timestamp — arrival time in IST, as `market_depth`.
+    pub ts_nanos: i64,
+}
+
+impl<'a> DepthBookPair<'a> {
+    /// The single row of one side (`DEPTH_SIDE_BID` or anything else for
+    /// the ask). O(1), borrows only.
+    fn side(&self, side: &'static str) -> DepthBookRow<'a> {
+        let (prices, quantities, orders) = if side == DEPTH_SIDE_BID {
+            (self.bid_prices, self.bid_quantities, self.bid_orders)
+        } else {
+            (self.ask_prices, self.ask_quantities, self.ask_orders)
+        };
+        DepthBookRow {
+            security_id: self.security_id,
+            segment: self.segment,
+            depth_kind: self.depth_kind,
+            side,
+            prices,
+            quantities,
+            orders,
+            capture_seq: self.capture_seq,
+            ts_nanos: self.ts_nanos,
+        }
+    }
+}
+
+// `append_book_pair` reuses the bid line's length for an ask line with the
+// same level count: the side label is the only text that differs.
+const _: () = assert!(DEPTH_SIDE_BID.len() == DEPTH_SIDE_ASK.len());
+
+/// Whether a book row's three slices are equal in length and at most
+/// [`MAX_DEPTH_BOOK_LEVELS`]: the shape `append_book_row` accepts. O(1).
+fn book_row_shape_is_valid(row: &DepthBookRow<'_>) -> bool {
+    let levels = row.prices.len();
+    levels <= MAX_DEPTH_BOOK_LEVELS && row.quantities.len() == levels && row.orders.len() == levels
+}
+
+/// The framed-spill record version for a buffer's protocol.
+///
+/// A v2 buffer is binary and holds `\n` bytes inside its doubles and arrays,
+/// so it must be spilled as ONE record (version 2); cutting it at line
+/// boundaries as v1 text would split rows apart on replay.
+fn spill_version_of(protocol: ProtocolVersion) -> u8 {
+    match protocol {
+        ProtocolVersion::V1 => crate::depth_spill_frame::ILP_VERSION_1,
+        _ => crate::depth_spill_frame::ILP_VERSION_2,
+    }
 }
 
 /// Idempotently self-heals the `market_depth` schema. Best-effort: failures
@@ -306,8 +1346,104 @@ pub fn market_depth_ensure_statements() -> Vec<String> {
 /// missing key is the depth-kind discriminator, so the two pools would begin
 /// overwriting each other's levels — the failure mode this module exists to
 /// prevent. The consequence is named in the log rather than left implicit.
-// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line — the guard reads only the line immediately above).
-pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
+///
+/// Returns `true` only when EVERY statement was accepted, so the boot can
+/// retry a refusal instead of running the whole session on an auto-created
+/// table with no `depth_kind` in its key (`candle_ddl_boot::run_live_table_ddl_at_boot`).
+#[must_use = "a false verdict means the depth_kind DEDUP key may be missing; retry it"]
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_ensure_statements() (kept on ONE line, directly above the fn — the guard reads only that line, so it must sit BELOW the attribute).
+pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) -> bool {
+    let ensured = run_depth_ddl(
+        questdb_config,
+        MARKET_DEPTH_TABLE,
+        &market_depth_ensure_statements(),
+    )
+    .await;
+    // 2026-11-07 (`ilp_table_gate`): the spill replay may post this table's
+    // rows only from here on.
+    if ensured {
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::MarketDepth);
+    }
+    ensured
+}
+
+/// Creates or self-heals `market_depth_book` (plan item 49e step 3). Run by
+/// the Dhan lane at its start, only with `[depth_storage] array_rows` on; the
+/// array-row writer is armed only when this returns
+/// [`BookEnsureOutcome::Ensured`]. With the setting off the table need not
+/// exist: the archive and retention sweeps read a missing table as nothing to
+/// do.
+// TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via market_depth_book_ensure_statements() (test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key).
+pub async fn ensure_market_depth_book_table(questdb_config: &QuestDbConfig) -> BookEnsureOutcome {
+    ensure_market_depth_book_table_at(questdb_config, chrono::Utc::now().timestamp()).await
+}
+
+/// [`ensure_market_depth_book_table`] at wall time `now_unix_secs` (the
+/// self-heal reads the IST hour and date from it; tests pass a fixed one).
+async fn ensure_market_depth_book_table_at(
+    questdb_config: &QuestDbConfig,
+    now_unix_secs: i64,
+) -> BookEnsureOutcome {
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
+    for outcome in BookSelfHeal::ALL {
+        metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => outcome.as_str())
+            .increment(0);
+    }
+    // LH-01: an existing table whose designated timestamp is not `ts` can never
+    // take the DEDUP key, so refuse with the cause and the remedy instead of the
+    // generic DEDUP failure. No row is lost, so it is not counted or logged as
+    // a persistence failure.
+    //
+    // PR DP-5 (2026-11-06): an EMPTY such table is RENAMED aside and re-created
+    // first (`self_heal_empty_market_depth_book`). Measured live: the table
+    // existed with designated timestamp `timestamp` and 0 rows, so every boot
+    // refused array rows and inline depth wrote 10 level rows per Full packet
+    // (~7 GiB an hour). Only while the depth spill replay is held, with the
+    // table proven empty, fully applied and its sequencer unmoved around the
+    // count; nothing is ever deleted. Anything else keeps today's refusal.
+    if let Some(problem) = probe_market_depth_book_ts(questdb_config).await {
+        let healed = self_heal_empty_market_depth_book(questdb_config, now_unix_secs).await;
+        metrics::counter!(MARKET_DEPTH_BOOK_SELF_HEAL_COUNTER, "outcome" => healed.as_str())
+            .increment(1);
+        if healed != BookSelfHeal::Healed {
+            report_book_layout_refusal(&problem);
+            return BookEnsureOutcome::LayoutRefused;
+        }
+        info!(
+            table = MARKET_DEPTH_BOOK_TABLE,
+            renamed_to = %book_self_heal_rename_target(now_unix_secs),
+            cause = %problem.cause(),
+            "market_depth_book self-healed: it had the wrong designated timestamp and \
+             held 0 rows, so it was RENAMED aside (nothing deleted) and is re-created \
+             with ts now (it was empty, its WAL fully applied and untouched, and the \
+             depth spill replay was held)"
+        );
+    }
+    if run_depth_ddl(
+        questdb_config,
+        MARKET_DEPTH_BOOK_TABLE,
+        &market_depth_book_ensure_statements(),
+    )
+    .await
+    {
+        // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post a
+        // framed book record. Before this, the depth replay (spawned in `main`
+        // before this ensure runs, and posting at once outside 08:00 to 15:40
+        // IST) could reach a QuestDB with no such table, and QuestDB created
+        // it itself with its designated timestamp named `timestamp` (LH-01).
+        crate::ilp_table_gate::mark_table_ensured(
+            crate::ilp_table_gate::GatedTable::MarketDepthBook,
+        );
+        BookEnsureOutcome::Ensured
+    } else {
+        BookEnsureOutcome::Failed
+    }
+}
+
+/// Runs one depth table's ensure statements in order. `true` only when every
+/// statement was accepted.
+async fn run_depth_ddl(questdb_config: &QuestDbConfig, table: &str, statements: &[String]) -> bool {
+    // APPROVED: QuestDB base URL, once per depth table ensure at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -323,15 +1459,23 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 stage = "ensure_client_build",
+                table,
                 ?err,
-                "market_depth table not ensured — HTTP client build failed; the first \
+                "depth table not ensured — HTTP client build failed; the first \
                  ILP write may auto-create the table WITHOUT the depth_kind DEDUP key, \
                  which makes depth-20 and depth-200 overwrite each other's levels"
             );
-            return;
+            return false;
         }
     };
-    for ddl in &market_depth_ensure_statements() {
+    let mut every_statement_accepted = true;
+    // B1 review: the gates need only the key-bearing statements (see
+    // `ilp_table_gate::ddl_is_key_bearing`); the table is marked keyed below
+    // when those were all accepted, whatever the column self-heals answered.
+    let mut key_statements_accepted = true;
+    // B1 review 2: a key statement QuestDB answered with a refusal.
+    let mut key_refused_by_server = false;
+    for ddl in statements {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -347,12 +1491,16 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     stage = "ensure_ddl",
+                    table,
                     %status,
                     ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
-                    "market_depth DDL returned non-2xx — the depth_kind DEDUP key may be \
+                    "depth table DDL returned non-2xx — the depth_kind DEDUP key may be \
                      missing, which makes the two depth pools overwrite each other"
                 );
+                every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+                key_refused_by_server |= crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
             Err(err) => {
                 metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl")
@@ -360,30 +1508,537 @@ pub async fn ensure_market_depth_table(questdb_config: &QuestDbConfig) {
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     stage = "ensure_ddl",
+                    table,
                     ?err,
                     ddl = ddl.as_str(),
-                    "market_depth DDL request failed"
+                    "depth table DDL request failed"
                 );
+                every_statement_accepted = false;
+                key_statements_accepted &= !crate::ilp_table_gate::ddl_is_key_bearing(ddl);
             }
         }
     }
+    if key_statements_accepted
+        && let Some(gated) = crate::ilp_table_gate::GatedTable::from_measurement(table.as_bytes())
+    {
+        crate::ilp_table_gate::mark_table_keyed(gated);
+    }
+    // B1 review 2: name a `market_depth` QuestDB created itself (it can never
+    // be keyed). `market_depth_book` has its own shape probe (PR DP-5).
+    if !key_statements_accepted && key_refused_by_server && table == MARKET_DEPTH_TABLE {
+        crate::ilp_table_gate::diagnose_refused_key(
+            questdb_config,
+            crate::ilp_table_gate::GatedTable::MarketDepth,
+        )
+        .await;
+    }
+    every_statement_accepted
 }
 
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
+/// The ILP-over-HTTP `request_timeout` in SECONDS, as a number the rest of the
+/// workspace can reason with.
+///
+/// # Why this exists as a constant
+///
+/// The timeout itself lives inside the `format!` string below, and a source-scan
+/// test pins that literal — fine for the conf, useless to anyone who needs the
+/// VALUE. The shutdown budget needs the value: the lane's tail flush can block
+/// for one full `request_timeout` before the offload join even starts, so
+/// `OFFLOAD_SHUTDOWN_GRACE_SECS` plus this number has to fit inside
+/// `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`.
+///
+/// Before 2026-08-28 that relationship was asserted against a hardcoded margin
+/// of 5, which happened to equal this timeout. Correct — and correct by
+/// coincidence: raising the timeout to 10 s would have left the assert passing
+/// while the real shutdown ran over its budget and abandoned the tick tail,
+/// which is precisely the failure that assert exists to prevent, arriving
+/// through the one door it was not watching.
+///
+/// `ilp_request_timeout_matches_the_conf_literal` fails the build if the two
+/// ever disagree.
+pub const ILP_REQUEST_TIMEOUT_SECS: u64 = 5;
+
 /// ILP-over-HTTP conf: per-flush server ACK with `retry_timeout=0` (the caller
 /// owns retry cadence) and a bounded `request_timeout` so a hung flush cannot
 /// wedge the drain.
-fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
+fn depth_ilp_http_conf(config: &QuestDbConfig, layout: DepthLayout) -> String {
+    // APPROVED: ILP conf string, once per DepthWriter::new
     format!(
-        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
-        config.host, config.http_port
+        "http::addr={}:{};protocol_version={};retry_timeout=0;request_timeout=5000;",
+        config.host,
+        config.http_port,
+        layout.protocol_number()
     )
 }
 
-/// Publish a zero on the drop series before any row can be written.
+// ---------------------------------------------------------------------------
+// Depth ILP spill — the durable floor depth did not have
+// ---------------------------------------------------------------------------
+
+/// Directory failed-flush depth ILP payloads are appended to.
+///
+/// A SIBLING of `tick_persistence::TICK_SPILL_DIR` (`data/spill/ticks`), not a
+/// parallel invention: same `data/spill` root, same `.ilp` payload, same
+/// per-feed-per-hour file naming, so ONE retention sweep and ONE replay task
+/// can see both. Kept in its own subdirectory so the byte cap below bounds
+/// depth independently — depth is ~24× the tick row volume, so sharing a
+/// budget would let depth starve the tick rescue.
+pub const DEPTH_SPILL_DIR: &str = "data/spill/depth";
+
+/// Counter for depth rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss — named so it can never be mistaken for one on a
+/// dashboard. `tv_depth_rows_dropped_total` means "rows left the buffer
+/// without reaching QuestDB and are gone", and it is ALARMED
+/// (`loss-and-retention-alarms.tf`); this means "rows we deliberately declined
+/// to write because they fall outside 09:00–15:39:59 IST".
+pub const DEPTH_OUT_OF_WINDOW_COUNTER: &str = "tv_depth_rows_out_of_window_refused_total";
+
+/// The three reason labels `market_depth` reports.
+///
+/// # Why these words and not the tick ones
+///
+/// Depth carries exactly ONE clock. `DepthRow::ts_nanos` is the ARRIVAL stamp
+/// (`dhan_feed_stack.rs` sets it from `received_at_nanos + IST_UTC_OFFSET`),
+/// and the depth protocol has no exchange timestamp at all — the packet header
+/// is message length, response code, segment, security id and a
+/// sequence/row-count field, and `crates/core/src/parser/depth.rs` contains
+/// zero timestamp tokens. `websocket-enforcement.md` rule 4 says so and is
+/// correct: *"Depth has NO timestamp. Only `received_at_nanos`."*
+///
+/// So saying `ts_out_of_window` here would tell an operator the EXCHANGE
+/// stamped the row outside the session — a claim depth cannot even express.
+/// It says `arrival_out_of_window`, which is the truth.
+///
+/// `arrival_unknown` is the pre-`TVW3` WAL sentinel. Those records carry no
+/// receipt, `ws_frame_spill` maps it to 0, and the row is then stamped
+/// `0 + IST_UTC_OFFSET_NANOS` = 1970-01-01 05:30 IST. Refusing it is right —
+/// it would open a 1970 partition that retention and archival, both keyed on
+/// the trading day, can never reach — but it is a DIFFERENT operational fact
+/// from "we are outside market hours", so it gets its own label rather than
+/// masquerading as one.
+pub const DEPTH_OUT_OF_WINDOW_REASONS: [&str; 3] = [
+    "arrival_out_of_window",
+    "arrival_unknown",
+    "arrival_out_of_plausible_band",
+];
+
+/// Build the session-window counters for a DEPTH writer.
+///
+/// Same reason as `tick_out_of_window_counters`: naming
+/// [`DEPTH_OUT_OF_WINDOW_COUNTER`] once, in a body with no log near it, keeps
+/// `loss_counter_visibility_guard`'s verdict honest instead of letting it pass
+/// on an unrelated `error!` twelve lines down a struct literal.
+fn depth_out_of_window_counters(feed: Feed) -> crate::tick_persistence::OutOfWindowCounters {
+    crate::tick_persistence::OutOfWindowCounters::new(
+        feed,
+        DEPTH_OUT_OF_WINDOW_COUNTER,
+        DEPTH_OUT_OF_WINDOW_REASONS,
+    )
+}
+
+/// Hard ceiling on the depth spill directory, in bytes (512 MiB).
+///
+/// **The bound is explicit because the disk is the thing that fails first.**
+/// The spill lives on the SAME filesystem as QuestDB, which was 86% full on
+/// 2026-08-24. An unbounded rescue would trade a bounded depth loss for an
+/// unbounded outage of everything sharing that volume — a strictly worse
+/// trade. Past the cap the rows ARE dropped and counted, which is the honest
+/// failure this module already had, not a new one.
+///
+/// **Honest horizon:** at the measured 1,530,651,649 rows/session over the
+/// 24,000-second window (~63,800 rows/s) and ~140 B of line protocol per row,
+/// 512 MiB holds roughly **60 seconds** of full-rate depth. That is the right
+/// order of magnitude for the failure this rescues — a QuestDB write stall or
+/// a client-side flush timeout — and deliberately NOT sized for an outage of
+/// minutes, because 24 GB of depth spill on a volume with ~28 GB free is how a
+/// rescue becomes the incident.
+pub const DEPTH_SPILL_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Fraction of the volume the depth spill may occupy: one thirty-second.
+///
+/// Deliberately the SAME fraction as [`crate::tick_persistence::TICK_SPILL_VOLUME_FRACTION`],
+/// so the two rescue tiers scale together instead of drifting apart again.
+pub const DEPTH_SPILL_VOLUME_FRACTION: u64 = 32;
+
+/// Ceiling on the depth spill directory, in bytes — DERIVED from the volume.
+///
+/// # Why this stopped being a constant (2026-08-26)
+///
+/// [`DEPTH_SPILL_MAX_BYTES`] is retained above as the FLOOR and the fallback,
+/// and its reasoning was sound *when written*: it cites a volume "86% full on
+/// 2026-08-24" with "~28 GB free", and argues that 24 GB of depth spill on
+/// such a volume "is how a rescue becomes the incident". That is correct — on
+/// that volume.
+///
+/// The volume is no longer that volume. It was grown to 300 GB and measured at
+/// **255 GB free (16% used)** on 2026-08-26. The constant now encodes a disk
+/// state that has not existed for two days, and it encodes it invisibly: the
+/// number reads as a deliberate safety bound rather than as a snapshot of a
+/// disk that has since changed underneath it.
+///
+/// The asymmetry it produced is the reason this is a defect and not a
+/// preference. Measured on prod the same day:
+///
+/// | tier | ceiling | how sized | rows/s it protects | outage covered |
+/// |---|---|---|---|---|
+/// | tick  | ~9.4 GB | volume ÷ 32 | 2,706 | **~5.2 hours** |
+/// | depth | 512 MiB | a literal | 51,000 | **~75 seconds** |
+///
+/// The stream carrying **19× the volume** was given **250× less coverage**,
+/// and the tick tier was made host-derived on 2026-08-21 for precisely this
+/// reason — the depth tier simply was not moved with it. Deriving it restores
+/// the original intent (a bound that cannot threaten the database it rescues
+/// from) while letting the bound follow the disk: at 1/32 it still leaves
+/// **96.8%** of the volume to QuestDB and the frame WAL, exactly as the tick
+/// tier does.
+///
+/// An unmeasurable volume falls back to the floor with a coded warning, never
+/// silently — same discipline as the tick tier.
+///
+/// # Complexity
+/// O(1) after the first call (`OnceLock`). The first call makes one `statvfs`
+/// call, on the cold flush-failure path only.
+#[must_use]
+pub fn depth_spill_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill dir is created lazily.
+        let mut probe: &std::path::Path = std::path::Path::new(DEPTH_SPILL_DIR);
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break,
+            }
+        }
+        match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+                if total_bytes > 0 =>
+            {
+                let derived = total_bytes / DEPTH_SPILL_VOLUME_FRACTION;
+                // Never BELOW the old fixed cap: this change exists to stop
+                // losing depth rows, so it must not reduce headroom on a
+                // small volume.
+                let ceiling = derived.max(DEPTH_SPILL_MAX_BYTES);
+                tracing::info!(
+                    total_bytes,
+                    ceiling_bytes = ceiling,
+                    fraction = DEPTH_SPILL_VOLUME_FRACTION,
+                    "depth spill ceiling derived from the volume — a failed flush can be \
+                     rescued to disk up to this size before depth rows are dropped"
+                );
+                ceiling
+            }
+            _ => {
+                tracing::warn!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    fallback_bytes = DEPTH_SPILL_MAX_BYTES,
+                    "could not measure the spill volume, so the depth spill ceiling falls \
+                     back to the fixed floor. Rescues past that size will be refused and \
+                     their depth rows dropped — on a large volume this is far more \
+                     conservative than necessary"
+                );
+                DEPTH_SPILL_MAX_BYTES
+            }
+        }
+    })
+}
+
+/// The depth drain's spill-folder byte total (see
+/// [`crate::tick_persistence::SpillHeldBytesCache`]).
+static DEPTH_DRAIN_SPILL_HELD: crate::tick_persistence::SpillHeldBytesCache =
+    crate::tick_persistence::SpillHeldBytesCache::new();
+
+/// Total bytes currently held in the depth spill directory.
+///
+/// Non-recursive and best-effort: an unreadable entry contributes 0 rather
+/// than aborting, because failing to MEASURE the cap must not also fail the
+/// rescue the cap protects. Duplicated from the tick writer's private helper
+/// rather than shared, because that one is module-private there.
+fn depth_spill_dir_bytes(dir: &Path) -> u64 {
+    // Counts the quarantine subtree, matching the tick twin
+    // (`tick_persistence::spill_dir_bytes`).
+    //
+    // FIXED 2026-09-01 (adversarial review). The tick side gained this on
+    // 2026-08-28; depth never did, and the asymmetry was load-bearing: the
+    // replay supervisor quarantines unparseable depth files into
+    // `<dir>/quarantine`, and quarantined bytes occupy the same volume while
+    // counting toward nothing here. A directory holding 9 GB of quarantine
+    // and 2 GB of live files reported 2 GB against a 10 GB cap — so the cap,
+    // and every reserve decision behind it, could never engage. A rail that
+    // cannot fire is not a conservative rail; it is an absent one.
+    // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
+    fn files_in(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    }
+    files_in(dir).saturating_add(files_in(
+        &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
+    ))
+    // O(1) EXEMPT: end
+}
+
+/// Appends a failed flush's ILP payload to the depth spill directory.
+///
+/// # Why the payload is framed (changed 2026-10-09, plan item 49e)
+///
+/// `Buffer::as_bytes()` is the body QuestDB's `/write` endpoint accepts, and
+/// replay still POSTs it back unchanged. Until 2026-10-09 it was appended as
+/// raw text and read back by cutting at newlines, which breaks for ILP v2
+/// (binary values contain newlines). It is now written as length-framed
+/// records (`depth_spill_frame`), each POSTed whole on replay.
+///
+/// # Why replaying it twice is safe
+///
+/// [`DEDUP_KEY_MARKET_DEPTH`] carries `depth_kind` AND `capture_seq`, and both
+/// are emitted on every line. A replayed row therefore reproduces an
+/// IDENTICAL key and UPSERTs onto itself instead of duplicating — including
+/// across the two pools, whose level-5 rows would otherwise collide.
+///
+/// # Why the cap is a parameter
+///
+/// `cap_bytes` is injected rather than read from the const so the enforcement
+/// can be proven end to end without writing half a gigabyte on an already-full
+/// volume — a test that must fill the disk to prove the disk guard is a test
+/// nobody runs. Production always passes [`DEPTH_SPILL_MAX_BYTES`].
+///
+/// # Errors
+///
+/// `Err` when the directory cannot be created, the cap is reached, or the
+/// append fails. The caller treats that as "rescue unavailable" and falls back
+/// to the counted drop: **a spill that cannot be written must never mask the
+/// loss.** The spill filesystem is the one currently closest to full, so this
+/// arm is a live path, not a theoretical one.
+/// `sync`: `SPILL_SYNC_OFF_DRAIN` from the writer and rescue threads (the
+/// payload is `fdatasync`ed before `Ok`; Z8a, 2026-10-02),
+/// `SPILL_UNSYNCED_ON_DRAIN` from the drain's inline fallback, which must not
+/// block on the disk. A failed sync is an `Err` like a failed write, so the
+/// caller marks the range unapplied and counts the loss.
+fn spill_failed_depth_ilp(
+    dir: &Path,
+    payload: &[u8],
+    version: u8,
+    feed: Feed,
+    now_unix_secs: i64,
+    cap_bytes: u64,
+    min_free_headroom_bytes: u64,
+    sync: Option<crate::tick_persistence::SpillSyncFn>,
+) -> std::io::Result<PathBuf> {
+    // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
+    std::fs::create_dir_all(dir)?;
+
+    // SOFT cap, not a refusal — see the twin in `tick_persistence.rs`.
+    //
+    // MEASURED IN PRODUCTION 2026-09-01: this exact arm fired 48 times with
+    // `cap_bytes = 10_063_871_360` while `df` reported 143 GB free, and
+    // 238,615,500 depth rows were permanently discarded. Depth carries ~24x the
+    // tick row volume against an IDENTICALLY sized ceiling, which is why the
+    // depth twin failed 12x more often than the tick one for the same defect.
+    //
+    // The rail's intent — the rescue tier must never starve QuestDB — is kept.
+    // Only the measured quantity changes: from the volume's TOTAL size, which
+    // cannot threaten anything, to FREE space, which is the only thing that can.
+    // LAZY PROBE (2026-09-01, adversarial review). The tick twin was repaired
+    // for this the same day and the depth twin was left behind, so the fork
+    // this guard removed on one path was still being paid on the other.
+    //
+    // `spill_free_bytes(dir)` is an EAGERLY evaluated argument, so passing it
+    // unconditionally probed free space (then a forked `df`) on EVERY rescue — including the common
+    // under-cap case, which needs no free-space answer at all. Combined with
+    // the per-write floor below that was TWO forks per depth rescue, on a path
+    // that can run on the frame-drain task.
+    // The drain's inline fallback (no sync) reuses a fresh listing; the writer
+    // and rescue threads list every time (deep audit DA-12, NT-1).
+    let on_drain = sync.is_none();
+    let held = if on_drain {
+        DEPTH_DRAIN_SPILL_HELD.held(dir, std::time::Instant::now(), depth_spill_dir_bytes)
+    } else {
+        depth_spill_dir_bytes(dir)
+    };
+    if held >= cap_bytes {
+        match crate::tick_persistence::classify_spill_ceiling(
+            held,
+            cap_bytes,
+            crate::tick_persistence::spill_free_bytes(dir),
+            // DEPTH reserve, NOT the tick reserve — depth must refuse first.
+            // See `DEPTH_SPILL_FREE_RESERVE_BYTES` for the derivation and for
+            // why sharing one reserve let record-only depth starve
+            // decision-critical ticks out of their rescue path.
+            crate::tick_persistence::DEPTH_SPILL_FREE_RESERVE_BYTES,
+        ) {
+            crate::tick_persistence::SpillCeilingVerdict::UnderCeiling => {}
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingWithRoom => {
+                metrics::counter!("tv_depth_spill_over_soft_cap_total").increment(1);
+            }
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingNoRoom => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap and free space is \
+                     at or below the database reserve — refusing so QuestDB keeps room \
+                     to operate"
+                    ),
+                ));
+            }
+            crate::tick_persistence::SpillCeilingVerdict::OverCeilingProbeFailed => {
+                // Twin of the tick ceiling arm (2026-09-01): count the blind
+                // refusal, or a failed free-space probe disables depth rescue for the
+                // whole session with no counter naming the cause.
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth")
+                    .increment(1);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "depth spill dir past its {cap_bytes}-byte soft cap and the free-space \
+                     probe failed — refusing rather than growing blind"
+                    ),
+                ));
+            }
+        }
+    }
+
+    // PER-WRITE FREE-SPACE FLOOR (2026-09-01, adversarial review).
+    //
+    // The ceiling above engages only once the spill directory is past its
+    // size rail. Below it, this tier previously wrote with NO free-space
+    // consultation at all -- and that is the regime depth spends most of its
+    // life in. A 4 GB spill directory against a 10 GB rail reads
+    // `UnderCeiling` and wrote freely onto a disk whose free space had
+    // dropped to under a gigabyte, which is exactly the WAL-suspension
+    // outage this tier exists to avoid.
+    //
+    // The floor is the TICK TIER'S CEILING RESERVE, not a multiple of the tick
+    // floor. See `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES` for why a ratio was the
+    // wrong shape and let a live inversion through.
+    //
+    // INJECTED, not read from the constant. Production passes
+    // `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES`; tests pass a small value where
+    // they need the ALLOW arm. Without the parameter the floor's own tests
+    // would assert an outcome that depends on the build machine's free space
+    // -- the exact environment-dependence trap the sibling test below records
+    // falling into once already. `cap_bytes` was injected for that reason from
+    // the start; the floor simply had not caught up.
+    //
+    // Not memoised, deliberately: free space is a moving quantity and a
+    // cached answer describes a disk that no longer exists. One probe per
+    // rescue is free -- a rescue only happens when a flush already failed.
+    // FAIL CLOSED when the probe fails -- deliberately NOT the tick twin's
+    // fail-open (2026-09-01, second adversarial round, hours after the reserve
+    // split this defeats was shipped).
+    //
+    // The tick tier fails OPEN here and its comment gives a good reason: one
+    // failed free-space probe must not disable the whole rescue tier. Copying that
+    // reasoning to depth reintroduced the exact inversion the two-reserve
+    // split exists to prevent. Both tiers refuse on a failed probe INSIDE
+    // their ceiling arm, and that arm engages only once the tier's own spill
+    // directory is past its rail -- and the directories are INDEPENDENT:
+    //
+    //     `df` broken, tick dir over its ceiling, depth dir under its cap
+    //       ticks -> OverCeilingProbeFailed  -> REFUSE
+    //       depth -> ceiling arm skipped     -> fail-open -> WRITE
+    //
+    // Decision-critical ticks discarded while record-only depth is written.
+    // Reachable, not theoretical: a single-table WAL suspension grows one
+    // directory and not the other, which is what happened on 2026-08-25 when
+    // fourteen tables suspended individually.
+    //
+    // The reserves' `const _` assert cannot see this. It compares byte values;
+    // the probe-failure path carries none -- it is the whole `None` domain.
+    //
+    // Depth is record-only and carries ~24x the tick row volume, so a blind
+    // `df` now costs depth rows and never tick rows. That is the ordering the
+    // operator set. The refusal is counted by the same blind counter, so the
+    // event stays visible either way.
+    let free_now = crate::tick_persistence::spill_free_bytes(dir);
+    match crate::tick_persistence::classify_spill_floor(
+        free_now,
+        payload.len() as u64,
+        min_free_headroom_bytes,
+        crate::tick_persistence::BlindWritePolicy::FailClosed,
+    ) {
+        crate::tick_persistence::SpillFloorVerdict::Allow => {}
+        crate::tick_persistence::SpillFloorVerdict::AllowProbeFailed => {
+            // Only reachable with the floor DISABLED (`0`), which is the value
+            // tests inject to exercise the allow arm without depending on the
+            // build machine's free space.
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseProbeFailed => {
+            metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "refusing a depth spill: the free-space probe failed and depth is \
+                 record-only -- it must not write blind while decision-critical ticks \
+                 may need the room",
+            ));
+        }
+        crate::tick_persistence::SpillFloorVerdict::RefuseNoRoom => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte depth spill: only {} bytes free, and the write \
+                     must leave {min_free_headroom_bytes} bytes of headroom -- depth is \
+                     record-only and must not consume the room decision-critical ticks need",
+                    payload.len(),
+                    free_now.unwrap_or(0)
+                ),
+            ));
+        }
+    }
+
+    // One file per feed per hour: bounded file count, and an operator replaying
+    // a known-bad window does not have to read one ever-growing file.
+    //
+    // ⚠ CHANGED 2026-10-09 (plan item 49e): the payload is written as
+    // length-framed records (`depth_spill_frame`), not as raw ILP text, so a
+    // binary ILP v2 batch can be spilled once the array table lands. The
+    // `.dspl` files are drained by `depth_spill_frame::replay_framed_spill_dir`;
+    // `.ilp` files an older binary left behind still drain through the text
+    // replay.
+    let hour = now_unix_secs / 3_600;
+    let path = dir.join(format!(
+        "depth-{}-{hour}.{}",
+        feed.as_str(),
+        crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    // The framing adds bytes, so the drain counts the file growth, not the
+    // payload (two `fstat`s, drain path only).
+    let len_before = if on_drain {
+        file.metadata().map_or(0, |m| m.len())
+    } else {
+        0
+    };
+    crate::depth_spill_frame::append_framed_records(&mut file, payload, version)?;
+    if let Some(sync) = sync {
+        sync(&file)?;
+    }
+    if on_drain {
+        let grown = file
+            .metadata()
+            .map_or(payload.len() as u64, |m| m.len().saturating_sub(len_before));
+        DEPTH_DRAIN_SPILL_HELD.note_written(dir, grown);
+    }
+    Ok(path)
+    // O(1) EXEMPT: end
+}
+
+/// Publish a zero on EVERY depth loss series before any row can be written.
 ///
 /// The CloudWatch agent computes a counter's alarm value as the DELTA between
 /// consecutive samples and DROPS the first sample of a series it has never
@@ -392,24 +2047,321 @@ fn depth_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// it publishes no datapoint and any alarm on it stays silent through the very
 /// episode it exists to catch. Same discipline as `TickWriter`'s
 /// `register_drop_baseline`.
+///
+/// # Why the SIBLINGS are seeded too (2026-08-28, proven by a live session)
+///
+/// Until today only the `dropped` series was seeded, and the session of
+/// 2026-08-28 showed what that costs. Read from CloudWatch afterwards:
+///
+/// | series | session total |
+/// |---|---|
+/// | `tv_ticks_dropped_total` | 308,818 |
+/// | `tv_ticks_spilled_total` | 308,818 |
+/// | `tv_depth_rows_dropped_total` | 104,540 |
+/// | `tv_depth_rows_spilled_total` | **no series at all** |
+/// | `tv_depth_spill_write_errors_total` | **no series at all** |
+///
+/// The tick side seeds both, so `dropped - spilled = 0` proved every dropped
+/// tick had been RESCUED and nothing was permanently lost. The depth side
+/// seeded one, so the same subtraction was impossible: 104,540 rows that were
+/// either all rescued or all permanently gone, and no way to tell which.
+///
+/// An unseeded counter does not read as "zero". It does not appear, and an
+/// absent series is indistinguishable from a healthy one — which is the exact
+/// false-OK the discriminators were added to prevent. The instrument could not
+/// answer the one question it exists to answer.
+///
+/// `tv_depth_spill_write_errors_total` is seeded on BOTH of its `stage` label
+/// values, because a label set is a separate series: seeding `cap` alone would
+/// leave `write` — the more common failure — silent on its first occurrence.
 fn register_depth_drop_baseline(feed: Feed) {
     metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str()).increment(0);
+    metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed.as_str()).increment(0);
+    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap").increment(0);
+    metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write").increment(0);
+    metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_client_build")
+        .increment(0);
+    metrics::counter!("tv_depth_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    metrics::counter!(MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER).increment(0);
+    // Same reasoning as the tick side: this is the series that fires when the
+    // depth rescue proof (`dropped == spilled`) stops holding, so it must be
+    // registered before the bad day rather than during it.
+    metrics::counter!(DEPTH_RESCUE_ABANDONED_COUNTER, "writer" => "depth").increment(0);
 }
 
 /// Batched `market_depth` ILP writer.
 ///
 /// Lazy: an unreachable QuestDB at construction still builds (rows buffer
-/// locally). `flush` returns `Err` and the pending buffer is discarded LOUDLY,
-/// so one poisoned row cannot wedge the rest of the session.
+/// locally). On a failed `flush` the pending buffer leaves memory — but it is
+/// RESCUED to the depth spill tier first, and only genuinely dropped when that
+/// rescue itself fails. Either way it is loud.
 pub struct DepthWriter {
+    /// Which table this writer writes; see [`DepthLayout`]. Fixed for the
+    /// writer's life.
+    layout: DepthLayout,
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Lowest / highest `capture_seq` among the pending rows (`0` = none) —
+    /// the WAL applied-watermark learns the frames a batch covers from these.
+    pending_min_seq: u64,
+    pending_max_seq: u64,
+    /// True once any pending row has NO write-ahead-log backing (a zero or
+    /// freshly minted capture sequence). Such a buffer is never deferred to
+    /// the WAL; it keeps the inline spill (2026-09-26 audit fix PR3).
+    /// Cleared only when `discard_pending` consumes it — a stale `true` is
+    /// conservative (inline spill, the old behaviour), never a loss.
+    pending_unbacked: bool,
+    /// Decides whether a failed flush the rescue thread cannot take may be
+    /// handed to the WAL (`(min_seq, max_seq, unbacked)`). Production is
+    /// always [`crate::wal_frame_fate::rescue_may_defer_to_wal`]; tests swap
+    /// it so they do not depend on the process-global WAL marks (J1).
+    wal_defer_check: fn(u64, u64, bool) -> bool,
     feed: Feed,
-    /// Rows discarded across this writer's lifetime — the honest counterpart
-    /// to "nothing is dropped". If this is non-zero, something WAS dropped and
-    /// the operator is told rather than reassured.
+    /// Pre-resolved session-window refusal counters. See
+    /// [`DEPTH_OUT_OF_WINDOW_REASONS`] for why depth speaks a different
+    /// reason vocabulary than `ticks`.
+    out_of_window: crate::tick_persistence::OutOfWindowCounters,
+    /// Rows that left the buffer without reaching QuestDB, across this
+    /// writer's lifetime.
+    ///
+    /// Deliberately counts the RESCUED rows too, mirroring `TickWriter`: the
+    /// EMF-shipped `tv_depth_rows_dropped_total` is the only depth series an
+    /// alarm can watch, so diverting the common flush failure off it would
+    /// have told the operator LESS than before the rescue existed — a false-OK
+    /// (audit Rule 11). `rescued` is the strictly narrower "and it is
+    /// recoverable"; `dropped - rescued` is the unrecoverable loss.
     dropped: u64,
+    /// Rows durably captured to the spill tier — the recoverable subset of
+    /// `dropped`.
+    rescued: u64,
+    /// Spill directory. Production uses [`DEPTH_SPILL_DIR`]; tests get an
+    /// isolated temp dir so they never write into the repo.
+    spill_dir: PathBuf,
+    /// Per-write free-space floor for the rescue tier. Production carries
+    /// `DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES`; tests carry 0.
+    ///
+    /// A FIELD rather than a `cfg(test)` branch, deliberately: a `cfg` split
+    /// on a data-integrity decision means the tested code is not the shipped
+    /// code, which is the common-runtime violation this repository forbids.
+    /// With a field, production and tests run the identical path and differ
+    /// only in a value -- and the value itself is pinned by the direct-call
+    /// tests that exercise both arms.
+    spill_min_free_headroom: u64,
+    /// Hand-off queue to the depth writer thread when this writer has been
+    /// split by [`DepthWriter::split_for_offload`]. `None` means the
+    /// synchronous arm, which is what every non-lane caller still uses.
+    offload: Option<std::sync::mpsc::SyncSender<DepthFlushBatch>>,
+    /// Set by [`DepthWriter::split_rescue_offload`]. When present,
+    /// [`DepthWriter::discard_pending`] hands the buffer to a dedicated rescue
+    /// thread instead of writing up to 32 MiB on the frame-drain task.
+    ///
+    /// Separate from `offload` on purpose: the rescue exists precisely for the
+    /// two cases that queue cannot serve — it is FULL, or its thread is GONE.
+    rescue: Option<std::sync::mpsc::SyncSender<DepthRescueBatch>>,
+    /// Depth rescue batches parked in RAM when the rescue queue is full (H4,
+    /// 2026-10-03); same shape and bounds as the tick writer's park, see
+    /// [`DEPTH_PARKED_RESCUE_MAX_BATCHES`]. Pre-sized by
+    /// [`DepthWriter::split_rescue_offload`], so parking never allocates.
+    parked_rescue: std::collections::VecDeque<DepthRescueBatch>,
+    /// ILP bytes held in `parked_rescue`.
+    parked_rescue_bytes: usize,
+    /// Consecutive flush spans the producer has RETAINED because the hand-off
+    /// queue was full. Bounded by [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] so
+    /// backpressure cannot silently widen a commit without limit.
+    retained_spans: u32,
+    /// Flush-path counter handles, resolved once at construction
+    /// (2026-09-22, item 44g) — see [`DepthFlushCounters`].
+    flush_counters: DepthFlushCounters,
+    /// Spent buffers coming back from the writer thread for reuse
+    /// (2026-09-22, item 44g). `Some` only once [`DepthWriter::split_for_offload`]
+    /// has run; see [`DepthWriterSink::return_spare_buffer`].
+    spare_buffers: Option<std::sync::mpsc::Receiver<Buffer>>,
+    /// The contract name resolved for the LAST `(security_id, segment)` this
+    /// writer appended (2026-09-22, item 44i).
+    ///
+    /// A depth packet carries 40 (depth-20) or 400 (depth-200) level rows for
+    /// ONE instrument, appended back to back. Resolving the name per level
+    /// would be an `ArcSwap` load plus a hash probe per row on the writer
+    /// that carries ~1.5e9 rows a session; caching on the key makes it one
+    /// resolution per run of rows for an instrument — once per packet — and
+    /// a plain two-field compare on every other level. The name is an
+    /// `Arc<str>` clone of the published entry, so a hit allocates nothing
+    /// and a miss increments one reference count.
+    ///
+    /// Cleared on every flush, so a table republished mid-session is picked
+    /// up at the next batch at the latest.
+    contract_label: Option<(i64, &'static str, Option<std::sync::Arc<str>>)>,
+    /// PF-4b (2026-11-06): the staged `market_depth_book` rows, written as
+    /// ILP text by the thread that needs it (see [`crate::depth_stage`]).
+    /// Always empty on a level writer, whose rows are still text in `buffer`.
+    staged: crate::depth_stage::DepthStagedBatch,
+    /// PF-4b: the book writer's per-run name cache, the twin of
+    /// `contract_label`: `(security_id, segment, pin, name length)`, where
+    /// `pin` names the table in `staged` the run's name came from. Cleared
+    /// at the same points as `contract_label`.
+    book_label: Option<(i64, &'static str, u8, Option<usize>)>,
+    /// PF-4b: spent staged batches coming back from the writer and rescue
+    /// threads (cleared there), so a hand-off does not reserve a fresh one.
+    spare_staged: Option<std::sync::mpsc::Receiver<crate::depth_stage::DepthStagedBatch>>,
+    /// PF-4b: the return lane's sender, kept so the rescue split can hand a
+    /// clone to the rescue thread.
+    spare_staged_tx: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    /// PR AA-G (finding 17 review, 2026-11-11): the archive quiesce lock the
+    /// SYNCHRONOUS arm of [`Self::stage_pin_after_cut`] holds around its
+    /// commit. `None` everywhere but the after-close depth pass, whose
+    /// commits land in old depth hours an archiver may be copying and
+    /// dropping; set by [`Self::hold_archive_quiesce_on_pin_cut`].
+    pin_cut_quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
+    /// B1 (2026-11-13): whether a batch may be posted now, given its table.
+    /// Always [`crate::ilp_table_gate::live_tables_writable`] outside this
+    /// module's tests. One call per flush, never per row.
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+}
+
+/// A unique temp spill directory, so a test writer never touches
+/// `data/spill/depth` in the working tree.
+///
+/// `for_test` is called from the APP crate too, where `cfg(test)` does not
+/// reach — so the isolation has to live in the constructor, not behind a test
+/// gate.
+fn temp_depth_spill_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // APPROVED: temp spill dir path, built once at wiring or in tests
+    std::env::temp_dir().join(format!(
+        "tv-depth-spill-test-{nanos}-{:?}",
+        std::thread::current().id()
+    ))
+}
+
+/// Whether a flush failure is worth ONE retry before the buffer is discarded.
+///
+/// The discard exists for a real reason, stated at [`DepthPersistence::flush`]:
+/// a row the SERVER rejected would be re-sent forever and block every later
+/// row. That reasoning covers a rejection and nothing else — and until
+/// 2026-08-25 the code applied it to every error alike.
+///
+/// It cost rows. On 2026-08-25 at 13:12:07 a flush failed with
+/// `io: Interrupted system call (os error 4)` and 8,810 depth rows left the
+/// buffer. EINTR is a signal arriving mid-syscall. The server never saw a
+/// complete request, nothing was rejected, and the buffer was untouched —
+/// there was nothing to wedge the session and every row was recoverable by
+/// simply trying again.
+///
+/// `SocketError` is the transport class (`from_ureq_error` maps IO and
+/// timeout failures onto it), so it is the one worth retrying.
+/// `ServerFlushError` is the rejection the discard was designed for and is
+/// deliberately NOT retried. Everything else — a bad name, a bad timestamp,
+/// an API misuse — is our own bug and would fail identically forever.
+///
+/// Retrying is safe here for the SAME reason the rescue path already tells
+/// the operator a manual re-ingest is safe: the depth DEDUP key carries
+/// `depth_kind` and `capture_seq`, so a partially-applied write plus a
+/// re-send collapses instead of duplicating.
+/// How fast a retryable flush failure must come back before the ONE retry is
+/// allowed.
+///
+/// The depth flush runs inside `block_in_place` on the drain task — the task
+/// that folds ticks — and the sender's `request_timeout` is 5,000 ms. An
+/// unconditional retry therefore makes the worst case TEN seconds of drain
+/// occupancy on the largest table in the database, which is the same
+/// socket-buffer-fills-and-the-vendor-skips-us mechanism the whole
+/// zero-tick-loss requirement is about.
+///
+/// A timed-out request and an `EINTR` both surface as
+/// `questdb::ErrorCode::SocketError`, so the error class cannot separate the
+/// case the retry exists for from the case that must not be retried. The clock
+/// can: an interrupted syscall returns in microseconds, a timeout consumes the
+/// full 5,000 ms. One second sits three orders of magnitude above the first
+/// and five times below the second.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS: u64 = 1_000;
+
+/// [`DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS`] as a `Duration`.
+pub const DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS);
+
+#[must_use]
+pub(crate) fn flush_failure_is_retryable(err: &questdb::Error) -> bool {
+    matches!(err.code(), questdb::ErrorCode::SocketError)
+}
+
+/// Why a depth row stamped `ts_nanos` is refused before it reaches the buffer,
+/// or `None` when it may be written. Shared by [`DepthWriter::append_row`] and
+/// [`DepthWriter::append_book_row`] so the two layouts refuse the same rows.
+fn depth_arrival_window_refusal(ts_nanos: i64) -> Option<&'static str> {
+    // The WAL sentinel first: a pre-TVW3 record carries no receipt,
+    // which becomes exactly `IST_UTC_OFFSET_NANOS` after stamping.
+    // It IS out of window, but "an old WAL format is being replayed"
+    // and "we are outside market hours" are different operational
+    // facts and must not share a label.
+    //
+    // ## Why depth REFUSES this and ticks ACCEPT the same situation
+    //
+    // `session_window::verdict` treats a `None` receipt on a TICK as
+    // "unknown, not a refusal" and writes the row. This arm refuses.
+    // That looks inconsistent and is not, because the missing value
+    // does not play the same role in the two tables:
+    //
+    //   * a tick carries TWO clocks. A pre-TVW3 tick still has its
+    //     EXCHANGE stamp, which is a real observation of when the
+    //     trade happened, so only the delivery time is unknown and
+    //     the row is worth keeping.
+    //   * depth carries ONE. `ts_nanos` IS the receipt, so a record
+    //     with no receipt has no usable timestamp at all -- the value
+    //     here is the bare IST offset, i.e. 1970-01-01 05:30.
+    //
+    // Writing it would not preserve an observation, it would FABRICATE
+    // one, and it would open a 1970 partition that retention and
+    // archival -- both keyed on the trading day -- can never reach.
+    // The refusal is counted under its own reason so an operator can
+    // tell "an old WAL format is being replayed" from "we are outside
+    // market hours"; the bytes stay on disk in the WAL segment.
+    if ts_nanos == tickvault_common::constants::IST_UTC_OFFSET_NANOS {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[1]);
+    }
+    // Absolute epoch band BEFORE the time-of-day check: the window
+    // question is deliberately date-blind, so a corrupt far-future
+    // stamp whose seconds-of-day happen to land inside 09:00-15:40
+    // would read as perfectly in-window and open a partition that
+    // retention and archival can never reach.
+    let secs = ts_nanos.div_euclid(1_000_000_000);
+    let in_band = u32::try_from(secs).is_ok_and(|s| {
+        (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+            ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+            // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+            .contains(&s)
+    });
+    if !in_band {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[2]);
+    }
+    // ARRIVAL form, not the event form, and the difference is a real
+    // loss path rather than a naming preference.
+    //
+    // `ts_nanos` IS the instant this frame reached us -- the depth
+    // protocol carries no exchange timestamp at all, as the block above
+    // says. Judging it with `row_is_in_an_open_window` therefore asked
+    // "did the EVENT happen in session?" of a number that can only
+    // answer "when did the DELIVERY land?", and refused a snapshot of
+    // the 15:39 book that the vendor handed over at 15:40:05.
+    //
+    // That refusal was silent AND permanent: this arm returns `Ok(())`
+    // by design (so a pre-open frame is not re-offered forever), so it
+    // never marks the frame unapplied and no replay re-offers it. At
+    // the measured p99 Dhan lag of 46.37 s that discarded the tail of
+    // every session for the slowest 1% of depth frames; at the measured
+    // max of 198.69 s, the last ~3.3 minutes -- the closing-auction
+    // book, which is the part of the day this window exists to keep.
+    //
+    // `ARRIVAL_GRACE_TAIL_SECS` (240) clears that measured maximum. It
+    // graces the END only: a frame arriving at 08:58 is genuinely
+    // pre-open and is still refused, because delivery lag makes a row
+    // late, never early. An 18:00 restart is still refused by 2h20m.
+    if !tickvault_common::session_window::arrival_row_is_in_an_open_window(ts_nanos) {
+        return Some(DEPTH_OUT_OF_WINDOW_REASONS[0]);
+    }
+    None
 }
 
 impl DepthWriter {
@@ -418,16 +2370,59 @@ impl DepthWriter {
     // TEST-EXEMPT: production ILP-connect constructor; the lazy-build contract and
     // every append/flush path are covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::with_layout(config, feed, DepthLayout::Levels)
+    }
+
+    /// Production constructor for the array-row table `market_depth_book`
+    /// (plan item 49e step 2): a sender pinned to ILP v2. Used by the drain
+    /// from step 3, behind a default-off setting.
+    #[must_use]
+    // TEST-EXEMPT: production ILP-connect constructor; the v2 pin is tested via depth_ilp_http_conf and every book append path via for_test_book().
+    pub fn new_book(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::with_layout(config, feed, DepthLayout::Book)
+    }
+
+    fn with_layout(config: &QuestDbConfig, feed: Feed, layout: DepthLayout) -> Self {
         register_depth_drop_baseline(feed);
-        match Sender::from_conf(depth_ilp_http_conf(config)) {
+        match Sender::from_conf(depth_ilp_http_conf(config, layout)) {
             Ok(s) => {
-                let b = s.new_buffer();
+                let mut b = s.new_buffer();
+                // DT-A2: reserved up front, so no batch regrows on the drain.
+                // PF-4b: a book writer's drain stages rows instead; its text
+                // buffer is only the cold paths' scratch and stays empty.
+                if layout == DepthLayout::Levels {
+                    b.reserve(layout.row_buffer_presize_bytes());
+                }
                 Self {
+                    layout,
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
+                    pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
+                    out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
+                    rescued: 0,
+                    spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    spill_min_free_headroom:
+                        crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                    offload: None,
+                    rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
+                    retained_spans: 0,
+                    flush_counters: DepthFlushCounters::new(feed),
+                    spare_buffers: None,
+                    contract_label: None,
+                    staged: crate::depth_stage::DepthStagedBatch::for_layout(layout),
+                    book_label: None,
+                    spare_staged: None,
+                    spare_staged_tx: None,
+                    pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
             Err(err) => {
@@ -438,10 +2433,34 @@ impl DepthWriter {
                 );
                 Self {
                     sender: None,
-                    buffer: Buffer::new(ProtocolVersion::V1),
+                    layout,
+                    buffer: presized_depth_row_buffer(layout),
                     pending: 0,
+                    pending_min_seq: 0,
+                    pending_max_seq: 0,
+                    pending_unbacked: false,
+                    wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
                     feed,
+                    out_of_window: depth_out_of_window_counters(feed),
                     dropped: 0,
+                    rescued: 0,
+                    spill_dir: PathBuf::from(DEPTH_SPILL_DIR),
+                    spill_min_free_headroom:
+                        crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                    offload: None,
+                    rescue: None,
+                    parked_rescue: std::collections::VecDeque::new(),
+                    parked_rescue_bytes: 0,
+                    retained_spans: 0,
+                    flush_counters: DepthFlushCounters::new(feed),
+                    spare_buffers: None,
+                    contract_label: None,
+                    staged: crate::depth_stage::DepthStagedBatch::for_layout(layout),
+                    book_label: None,
+                    spare_staged: None,
+                    spare_staged_tx: None,
+                    pin_cut_quiesce: None,
+                    table_gate: crate::ilp_table_gate::live_tables_writable,
                 }
             }
         }
@@ -459,11 +2478,138 @@ impl DepthWriter {
         register_depth_drop_baseline(feed);
         Self {
             sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
+            layout: DepthLayout::Levels,
+            buffer: presized_depth_row_buffer(DepthLayout::Levels),
             pending: 0,
+            pending_min_seq: 0,
+            pending_max_seq: 0,
+            pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
             feed,
+            out_of_window: depth_out_of_window_counters(feed),
             dropped: 0,
+            rescued: 0,
+            spill_dir: temp_depth_spill_dir(),
+            spill_min_free_headroom: 0,
+            offload: None,
+            rescue: None,
+            parked_rescue: std::collections::VecDeque::new(),
+            parked_rescue_bytes: 0,
+            retained_spans: 0,
+            flush_counters: DepthFlushCounters::new(feed),
+            spare_buffers: None,
+            contract_label: None,
+            staged: crate::depth_stage::DepthStagedBatch::new(),
+            book_label: None,
+            spare_staged: None,
+            spare_staged_tx: None,
+            pin_cut_quiesce: None,
+            table_gate: crate::ilp_table_gate::live_tables_writable,
         }
+    }
+
+    /// The gated table this writer's layout posts into (B1). O(1).
+    #[must_use]
+    pub const fn gated_tables(&self) -> &'static [crate::ilp_table_gate::GatedTable] {
+        match self.layout {
+            DepthLayout::Levels => &[crate::ilp_table_gate::GatedTable::MarketDepth],
+            DepthLayout::Book => &[crate::ilp_table_gate::GatedTable::MarketDepthBook],
+        }
+    }
+
+    /// Whether this writer may post now: its table is keyed in this process,
+    /// or the live gate was never armed (B1). One call per flush on the live
+    /// path; the after-close pass also reads it once a round, so a shut gate
+    /// carries its buckets instead of spilling the same rows every round (B1
+    /// review). O(1).
+    #[must_use]
+    pub fn table_keyed(&self) -> bool {
+        (self.table_gate)(self.gated_tables())
+    }
+
+    /// Test-only: replaces the live table gate (B1).
+    #[cfg(test)]
+    #[must_use]
+    fn with_table_gate_for_test(
+        mut self,
+        gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    ) -> Self {
+        self.table_gate = gate;
+        self
+    }
+
+    /// Test constructor for an array-row writer: disconnected, its buffer
+    /// pinned to ILP v2 exactly as [`Self::new_book`] pins it.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used by the book append and spill tests below.
+    pub fn for_test_book(feed: Feed) -> Self {
+        Self {
+            layout: DepthLayout::Book,
+            buffer: presized_depth_row_buffer(DepthLayout::Book),
+            staged: crate::depth_stage::DepthStagedBatch::for_layout(DepthLayout::Book),
+            ..Self::for_test(feed)
+        }
+    }
+
+    /// A short-lived stand-in for `std::mem::replace`, carrying the REAL floor.
+    ///
+    /// `for_test` sets `spill_min_free_headroom: 0`, and production code uses
+    /// it as a placeholder while swapping the live writer out for its offload
+    /// split. Adversarial review flagged the shape (2026-09-01): the window is
+    /// transient today — the real producer is installed two lines later with
+    /// no early return in between — but a floor of ZERO means NO floor on the
+    /// sighted path, so any future edit that returns or `?`s inside that
+    /// window would leave a depth writer spilling with nothing checking free
+    /// space at all.
+    ///
+    /// Rather than pin the window with a test that a refactor can silently
+    /// invalidate, the placeholder simply carries the production floor. Then
+    /// the hazard is not "guarded" — it does not exist.
+    #[must_use]
+    // TEST-EXEMPT: a construction-shape helper; its behaviour is the production floor, pinned by `the_mem_replace_placeholder_carries_the_production_floor`.
+    pub fn placeholder_for_offload_swap(feed: Feed) -> Self {
+        Self {
+            spill_min_free_headroom: crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            ..Self::for_test(feed)
+        }
+    }
+
+    /// Test-only: points the rescue tier at an isolated directory.
+    #[cfg(test)]
+    #[must_use]
+    fn with_spill_dir_for_test(mut self, dir: PathBuf) -> Self {
+        self.spill_dir = dir;
+        self
+    }
+
+    /// Test-only: replaces the WAL-deferral decision (J1) so a test does not
+    /// depend on the process-global WAL flushed / lost marks.
+    #[cfg(test)]
+    #[must_use]
+    fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
+        self.wal_defer_check = check;
+        self
+    }
+
+    /// PR AA-G (finding 17 review, 2026-11-11): makes the synchronous commit
+    /// a pin cut makes inside [`Self::append_book_row`] hold the shared side
+    /// of the PROCESS archive quiesce lock, the same lock the after-close
+    /// depth pass holds around each of its flushes. Only that pass calls this
+    /// (its writer is synchronous and its rows go into old depth hours); a
+    /// live or offloaded writer never does. The lock is taken with
+    /// `blocking_read`, so the writer must run on a plain OS thread. O(1).
+    pub fn hold_archive_quiesce_on_pin_cut(&mut self) {
+        self.pin_cut_quiesce = Some(crate::archive_quiesce::process_archive_quiesce());
+    }
+
+    /// [`Self::hold_archive_quiesce_on_pin_cut`] with a private lock, so a
+    /// test can hold its exclusive side without stalling every other test.
+    #[cfg(test)]
+    fn hold_archive_quiesce_on_pin_cut_with(
+        &mut self,
+        quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
+    ) {
+        self.pin_cut_quiesce = Some(quiesce);
     }
 
     /// Rows appended but not yet flushed.
@@ -473,11 +2619,60 @@ impl DepthWriter {
         self.pending
     }
 
+    /// PF-4b review round 2: the allocation of the batch the drain is
+    /// staging into now, so the hand-off DHAT gate (an integration test) can
+    /// prove a recycled batch came back. O(1).
+    #[doc(hidden)]
+    #[must_use]
+    // TEST-EXEMPT: test seam read by `dhat_depth_book_hand_off`, which asserts on it every cycle.
+    pub fn staged_allocation_for_test(&self) -> usize {
+        self.staged.allocation_addr()
+    }
+
+    /// PF-4b review round 2: the allocations waiting in the staged spare
+    /// lane, oldest first. Takes each batch and sends it back in the same
+    /// order, so the lane is unchanged. Allocates; tests only, never on the
+    /// drain. O(spares).
+    #[doc(hidden)]
+    #[must_use]
+    // TEST-EXEMPT: test seam read by `dhat_depth_book_hand_off`, which asserts on it every cycle.
+    pub fn spare_staged_allocations_for_test(&self) -> Vec<usize> {
+        // O(1) EXEMPT: begin — a test seam; the DHAT gate calls it OUTSIDE its measured window, never the drain.
+        let (Some(spares), Some(back)) =
+            (self.spare_staged.as_ref(), self.spare_staged_tx.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut held = Vec::new();
+        while let Ok(batch) = spares.try_recv() {
+            held.push(batch);
+        }
+        let addrs = held
+            .iter()
+            .map(crate::depth_stage::DepthStagedBatch::allocation_addr)
+            .collect();
+        for batch in held {
+            // The lane was just emptied and holds as many as were taken.
+            let _returned = back.try_send(batch);
+        }
+        // O(1) EXEMPT: end
+        addrs
+    }
+
     /// Rows discarded on failed flushes over this writer's lifetime.
     #[must_use]
     // TEST-EXEMPT: observability accessor, asserted by the discard tests below.
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Rows durably captured to the depth spill tier — the RECOVERABLE subset
+    /// of [`DepthWriter::dropped`]. `dropped - rescued` is the loss nothing
+    /// re-inserts.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the rescue tests below.
+    pub fn rescued(&self) -> u64 {
+        self.rescued
     }
 
     /// Raw ILP buffer text — the ONLY way a caller can assert what was actually
@@ -500,64 +2695,1221 @@ impl DepthWriter {
     // see their own label mapping.
     // TEST-EXEMPT: observability accessor, asserted by the tests it enables.
     pub fn buffer_utf8(&self) -> String {
-        String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
+        String::from_utf8(self.pending_ilp_bytes()).unwrap_or_default()
+    }
+
+    /// The buffered bytes as written, for a binary ILP v2 (array-row) buffer
+    /// that `buffer_utf8` cannot show. Borrowed, no copy.
+    ///
+    /// ⚠ PF-4b (2026-11-06): a book writer STAGES its rows, so this text
+    /// buffer is empty on it outside a cold-path encode; read
+    /// [`Self::pending_ilp_bytes`] for the rows it holds.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> &[u8] {
+        self.buffer.as_bytes()
+    }
+
+    /// The ILP bytes the pending rows will be written as: the text buffer,
+    /// then (book writer) the staged rows encoded exactly as the writer
+    /// thread will encode them. Tests and diagnostics only: allocates,
+    /// O(pending bytes); touches no counter.
+    #[must_use]
+    // TEST-EXEMPT: observability accessor, asserted by the book drain tests and the PF-4b oracle.
+    pub fn pending_ilp_bytes(&self) -> Vec<u8> {
+        let mut out = self.buffer.as_bytes().to_vec();
+        out.extend_from_slice(&self.staged.encode_readonly(self.feed));
+        out
+    }
+
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02) — the depth twin of
+    /// `TickWriter::mark_pending_unbacked`.
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring. Its rows carry a non-zero capture sequence, so unmarked, a busy
+    /// rescue thread would hand them to a WAL replay that can never come.
+    /// Marked, they keep the inline spill. One `bool` store, no allocation.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
     }
 
     /// Appends one prepared [`DepthRow`] to the ILP buffer (no flush).
     ///
     /// ILP requires every SYMBOL before any field column, so the four symbols
-    /// are written first. All four come from closed `&'static str` sets, and
-    /// all four are still routed through `sanitize_ilp_symbol` as defence in
-    /// depth against line-protocol injection — the same discipline `ticks`
-    /// applies to its own closed sets.
+    /// are written first. All four come from closed `&'static str` sets whose
+    /// ILP-safety is proven at COMPILE TIME by the `const _` block near the top
+    /// of this file, so none of them is re-checked per row. See the note at the
+    /// call site for why that mattered.
     ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
     pub fn append_row(&mut self, row: &DepthRow) -> Result<()> {
+        // ---- SESSION-WINDOW GATE ----------------------------------------
+        //
+        // Placed INSIDE `append_row` but BEFORE `append_row_inner`, and it
+        // returns `Ok(())` on a refusal. Both halves are load-bearing.
+        //
+        // `append_row` calls `note_unapplied` on EVERY `Err`, and all three
+        // callers in `dhan_feed_stack.rs` treat a non-`Ok` as `depth_refused`
+        // feeding `tv_depth_rows_dropped_total`, which IS alarmed
+        // (`loss-and-retention-alarms.tf`). So returning `Err` here would do
+        // three wrong things at once: page the operator on every ordinary
+        // pre-open snapshot, count a deliberate refusal as data loss, and
+        // mark the frame unapplied so the next replay re-offers it, is
+        // refused again, and marks it unapplied again -- forever.
+        //
+        // Returning `Ok(())` states the truth: the frame is HANDLED, not
+        // deferred. The tick writer records the identical reasoning.
+        //
+        // Depth carries ONE clock. `ts_nanos` IS the arrival stamp and no
+        // exchange timestamp exists in the depth protocol, so `None` is the
+        // honest second argument -- passing `Some(row.ts_nanos)` would check
+        // one number twice and could never produce a distinct verdict.
+        if let Some(reason) = depth_arrival_window_refusal(row.ts_nanos) {
+            self.out_of_window.note(reason);
+            return Ok(());
+        }
+        let outcome = self.append_row_inner(row);
+        if outcome.is_err() {
+            // Captured to the WAL, never reaching the database from this
+            // session: the next replay must re-offer the frame.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+        }
+        outcome
+    }
+
+    /// Which table this writer writes.
+    #[must_use]
+    pub const fn layout(&self) -> DepthLayout {
+        self.layout
+    }
+
+    /// Bytes waiting in the buffer. An array-row writer flushes on this
+    /// ([`DEPTH_BOOK_FLUSH_BYTES`]), never on a row count.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        // PF-4b: a book writer's rows are staged; their EXACT text size is
+        // kept as they are staged, so this reads what the buffer would hold.
+        self.buffer.len().saturating_add(self.staged.text_bytes())
+    }
+
+    /// True once an array-row buffer has reached [`DEPTH_BOOK_FLUSH_BYTES`].
+    /// Always false for a level writer, which keeps its row threshold.
+    #[must_use]
+    pub fn book_flush_due(&self) -> bool {
+        self.layout == DepthLayout::Book && self.pending_bytes() >= DEPTH_BOOK_FLUSH_BYTES
+    }
+
+    /// Appends one side of one depth packet as ONE array row to
+    /// `market_depth_book` (plan item 49e step 2).
+    ///
+    /// O(levels) to copy the three arrays into the buffer (at most
+    /// [`MAX_DEPTH_BOOK_LEVELS`]), no allocation once the buffer has grown.
+    /// Refuses the same out-of-window rows as [`Self::append_row`], counted
+    /// the same way. Refused with an error, and its frame marked unapplied
+    /// so a replay offers it again: a level writer, three slices of unequal
+    /// length, or more than 200 levels. A level the caller refused travels as
+    /// `NaN` in its slot (it reads back null), so no level, side or packet is
+    /// dropped by the change of layout.
+    pub fn append_book_row(&mut self, row: &DepthBookRow<'_>) -> Result<()> {
+        if let Some(reason) = depth_arrival_window_refusal(row.ts_nanos) {
+            // Counted per LEVEL, as the level layout counts one per row.
+            let levels = u64::try_from(row.prices.len()).unwrap_or(u64::MAX);
+            self.out_of_window.note_n(reason, levels.max(1));
+            return Ok(());
+        }
+        let outcome = self.append_book_row_inner(row);
+        if outcome.is_err() {
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(row.capture_seq).unwrap_or(0));
+        }
+        outcome
+    }
+
+    fn append_book_row_inner(&mut self, row: &DepthBookRow<'_>) -> Result<()> {
+        if self.layout != DepthLayout::Book {
+            anyhow::bail!(
+                "append_book_row on a market_depth level writer: one writer writes one table"
+            );
+        }
+        let levels = row.prices.len();
+        if levels > MAX_DEPTH_BOOK_LEVELS
+            || row.quantities.len() != levels
+            || row.orders.len() != levels
+        {
+            anyhow::bail!(
+                "depth book row refused: {} prices, {} quantities, {} orders (at most {})",
+                levels,
+                row.quantities.len(),
+                row.orders.len(),
+                MAX_DEPTH_BOOK_LEVELS
+            );
+        }
+        // PF-4b (2026-11-06): the row is STAGED here and written as ILP text
+        // by the thread that needs it (see `crate::depth_stage`). The contract
+        // name is resolved once per instrument run exactly as before, but the
+        // cache records the name TABLE (as a pin in the batch) instead of the
+        // name, so the encoder later reads the same name the old line held.
+        let (pin, name_len) = self.resolve_book_label(row.security_id, row.segment);
+        let text_len = crate::depth_stage::book_line_len(self.feed, row, levels, name_len);
+        self.stage_book_side(row, pin, text_len);
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// The run's `(pin, name length)` for `(security_id, segment)`: the
+    /// cached run on a hit (two compares), else the name resolved once.
+    ///
+    /// Speed fix 5 (2026-11-17): on a miss the table load is skipped while
+    /// no name table was published since the batch's last pin was loaded
+    /// (one acquire load and one compare,
+    /// `DepthStagedBatch::current_pin_at_generation`): the name is read from
+    /// that pinned table, which is the table a fresh load would return, so
+    /// the pin, the name and every byte are unchanged. O(1) plus one hash
+    /// probe and one name scan on a miss.
+    #[inline]
+    fn resolve_book_label(
+        &mut self,
+        security_id: i64,
+        segment: &'static str,
+    ) -> (u8, Option<usize>) {
+        if let Some((id, seg, pin, name_len)) = &self.book_label
+            && *id == security_id
+            && *seg == segment
+        {
+            return (*pin, *name_len);
+        }
+        let generation = crate::candle_contract_labels::candle_contract_labels_generation();
+        let (pin, name_len) = match self.staged.current_pin_at_generation(generation) {
+            Some(pin) => {
+                let name_len = self
+                    .staged
+                    .labels(pin)
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                (pin, name_len)
+            }
+            None => {
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
+                let labels = crate::candle_contract_labels::candle_contract_labels();
+                let name_len = labels
+                    .get(&(security_id, segment))
+                    .map(|n| crate::depth_stage::escaped_symbol_len(n));
+                let pin = match self.staged.try_pin_at_generation(labels, generation) {
+                    Ok(pin) => pin,
+                    Err(labels) => self.stage_pin_after_cut(labels),
+                };
+                (pin, name_len)
+            }
+        };
+        self.book_label = Some((security_id, segment, pin, name_len));
+        (pin, name_len)
+    }
+
+    /// Stages one checked side and counts it in `pending`. O(levels).
+    #[inline]
+    fn stage_book_side(&mut self, row: &DepthBookRow<'_>, pin: u8, text_len: usize) {
+        if self.staged.push(row, pin, text_len) {
+            // Past the pre-size: one reallocation on the drain, counted.
+            self.flush_counters.stage_grow.increment(1);
+        }
+        // Counted in LEVELS, the unit the level layout counts, so every
+        // flush, rescue and loss counter reads the same whichever table is
+        // written. A side with no levels still counts one, so a buffered row
+        // is never invisible to `pending`.
+        self.pending = self.pending.saturating_add(row.prices.len().max(1));
+    }
+
+    /// Appends BOTH sides of one packet's book (speed fix 5, 2026-11-17):
+    /// what [`Self::append_book_row`] does for the bid row and then for the
+    /// ask row, with the work the two rows share done once (the window gate,
+    /// the layout check, the run's name lookup, the line length when both
+    /// sides carry the same number of levels, the pending range).
+    ///
+    /// Same rows in the same order, same bytes, same refusals and counts as
+    /// the two single appends; a pair the shared path cannot take whole (a
+    /// level writer, a malformed side) goes through the two single appends.
+    /// Returns the bid result, then the ask result. O(levels), no
+    /// allocation.
+    pub fn append_book_pair(&mut self, pair: &DepthBookPair<'_>) -> (Result<()>, Result<()>) {
+        let bid = pair.side(DEPTH_SIDE_BID);
+        let ask = pair.side(DEPTH_SIDE_ASK);
+        let bid_levels = bid.prices.len();
+        let ask_levels = ask.prices.len();
+        if self.layout != DepthLayout::Book
+            || !book_row_shape_is_valid(&bid)
+            || !book_row_shape_is_valid(&ask)
+        {
+            // Cold: the single appends refuse, count and mark exactly as
+            // they always have.
+            return (self.append_book_row(&bid), self.append_book_row(&ask));
+        }
+        if let Some(reason) = depth_arrival_window_refusal(pair.ts_nanos) {
+            // Counted per LEVEL per side, as two single appends count.
+            for levels in [bid_levels, ask_levels] {
+                let levels = u64::try_from(levels).unwrap_or(u64::MAX);
+                self.out_of_window.note_n(reason, levels.max(1));
+            }
+            return (Ok(()), Ok(()));
+        }
+        let (pin, name_len) = self.resolve_book_label(pair.security_id, pair.segment);
+        let bid_len = crate::depth_stage::book_line_len(self.feed, &bid, bid_levels, name_len);
+        // The side label is the only per-side text and both labels have the
+        // same length (asserted at compile time), so equal level counts give
+        // equal line lengths.
+        let ask_len = if ask_levels == bid_levels {
+            bid_len
+        } else {
+            crate::depth_stage::book_line_len(self.feed, &ask, ask_levels, name_len)
+        };
+        self.stage_book_side(&bid, pin, bid_len);
+        self.stage_book_side(&ask, pin, ask_len);
+        self.note_pending_seq(pair.capture_seq);
+        (Ok(()), Ok(()))
+    }
+
+    /// A ninth contract-name table arrived inside one staged batch (PF-4b,
+    /// the depth twin of `TickWriter::pin_after_cut`): the batch is handed
+    /// off early, then the table is pinned in the fresh batch. A hand-off the
+    /// full queue refuses is rescued through `discard_pending` (durable,
+    /// counted), never dropped. Counted on `tv_depth_stage_pin_cut_total`.
+    /// Cold: names are published a few times a day.
+    #[cold]
+    fn stage_pin_after_cut(
+        &mut self,
+        labels: arc_swap::Guard<
+            std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>,
+        >,
+    ) -> u8 {
+        self.flush_counters.stage_pin_cut.increment(1);
+        // The unbacked mark is set for a frame BEFORE its rows are staged; a
+        // cut on that frame's first row hands the old batch off and clears
+        // the mark, so keep it (a stale `true` costs an inline spill, never a
+        // row; PF-4 review round 1).
+        let unbacked = self.pending_unbacked;
+        // The cut is on a cache miss: the cached run is over either way.
+        self.book_label = None;
+        if self.offload.is_some() {
+            if let DepthOffloadOutcome::QueueFull(_) = self.offload_flush() {
+                self.retained_spans = 0;
+                let _rescued = self.discard_pending();
+            }
+        } else {
+            // The synchronous arm: sends, or rescues the rows on failure.
+            // PR AA-G (finding 17 review, 2026-11-11): this commit is made
+            // INSIDE an append, so the after-close pass's per-flush lock does
+            // not cover it; the pass's writer holds the archive quiesce lock
+            // here itself, so no commit of the pass lands while an archiver
+            // copies and drops an old depth hour. The guard borrows a
+            // `'static` lock, not `self`. Never nested: the pass appends
+            // outside its own flush lock.
+            let _quiesce = self
+                .pin_cut_quiesce
+                .map(crate::archive_quiesce::ArchiveQuiesce::shared_blocking);
+            let _sent_or_rescued = self.flush().is_ok();
+        }
+        self.pending_unbacked |= unbacked;
+        match self.staged.try_pin(labels) {
+            Ok(pin) => pin,
+            Err(labels) => {
+                // A split writer keeps a batch's pins when the drain clears
+                // its rows (a WAL deferral, an inline spill), so the batch can
+                // come back with no rows and every slot full of tables no row
+                // uses. Rescue any rows still held, then drop those stale
+                // pins: the ONE place the drain releases pins, reached only
+                // when a ninth table arrives while the writer queue refused
+                // the hand-off.
+                let unbacked = self.pending_unbacked;
+                let _rescued = self.discard_pending();
+                self.pending_unbacked |= unbacked;
+                self.book_label = None;
+                self.staged.clear();
+                self.staged.try_pin(labels).unwrap_or(0)
+            }
+        }
+    }
+
+    fn append_row_inner(&mut self, row: &DepthRow) -> Result<()> {
+        if self.layout != DepthLayout::Levels {
+            anyhow::bail!("append_row on a market_depth_book writer: one writer writes one table");
+        }
         let feed = self.feed.as_str();
+
+        // The `const _` proof below covers the closed SETS. It cannot cover a
+        // caller — 2026-09-01.
+        //
+        // `DepthRow`'s four symbol fields are `pub &'static str`, so nothing
+        // stops a future construction site assigning a literal that is not a
+        // member of any proven set. That gap is not hypothetical in kind: the
+        // TICK writer's twin optimisation was attempted the same day and its
+        // suite refused it, because `questdb-rs` escapes a newline as a
+        // backslash followed by a REAL newline, which still reaches the wire
+        // and splits one record into two. A forged depth row is the same
+        // class.
+        //
+        // `debug_assert!` is the right instrument and re-adding the sanitiser
+        // is not: this is the highest-volume writer in the process
+        // (~1.53e9 rows/session), the runtime call is exactly what the const
+        // proof was written to delete, and `debug_assert!` compiles to NOTHING
+        // in release. So the optimisation is preserved byte for byte while
+        // every test, every debug run and every CI suite gains a loud failure
+        // the moment a caller introduces a value the proof does not cover.
+        //
+        // `ilp_symbol_is_clean` is a `const fn`, so this is the SAME predicate
+        // the compile-time proof evaluates — not a second, drift-prone copy.
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.segment),
+            "DepthRow.segment {:?} is not ILP-safe. append_row passes symbols \
+             through unsanitised because the const proof covers the closed sets \
+             — a caller has supplied a value outside them, which would forge a \
+             row on the wire.",
+            row.segment
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.depth_kind),
+            "DepthRow.depth_kind {:?} is not ILP-safe — see the segment assert \
+             above; this field is part of the DEDUP key, so a forged value also \
+             corrupts d20/d200 separation.",
+            row.depth_kind
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(row.side),
+            "DepthRow.side {:?} is not ILP-safe — see the segment assert above.",
+            row.side
+        );
+        debug_assert!(
+            tickvault_common::sanitize::ilp_symbol_is_clean(feed),
+            "feed label {feed:?} is not ILP-safe — see the segment assert above."
+        );
+        // Passed through WITHOUT `sanitize_ilp_symbol`, deliberately.
+        //
+        // All four are `&'static str` from CLOSED SETS, and the `const _` block
+        // near the top of this file proves at COMPILE TIME that every member of
+        // every one of those sets is already ILP-safe -- exhaustively, over all
+        // 256 segment codes and every `Feed::ALL` entry. The sanitiser returns
+        // `Cow::Borrowed` for clean input, so it allocated nothing and DHAT
+        // could not see it; what it DID do was walk the characters of the
+        // literal `"bid"` to re-derive an answer fixed when the constant was
+        // written -- four times per row, on a path this module's own header
+        // measures at ~1.53e9 rows per session. The check did not disappear; it
+        // moved to the compiler, which is principle 2 in its literal form.
         self.buffer
-            .table(MARKET_DEPTH_TABLE)
+            .table(depth_table(MARKET_DEPTH_TABLE))
             .context("table")?
-            .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
+            .symbol(depth_col("segment"), row.segment)
             .context("segment")?
-            .symbol("depth_kind", sanitize_ilp_symbol(row.depth_kind).as_ref())
+            .symbol(depth_col("depth_kind"), row.depth_kind)
             .context("depth_kind")?
-            .symbol("side", sanitize_ilp_symbol(row.side).as_ref())
+            .symbol(depth_col("side"), row.side)
             .context("side")?
-            .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-            .context("feed")?
-            .column_i64("security_id", row.security_id)
+            .symbol(depth_col("feed"), feed)
+            .context("feed")?;
+        // `contract` — the instrument's NAME, from the same published table the
+        // tick and candle writers read (operator 2026-09-22, item 44i). Resolved
+        // once per instrument run, not per level; see `contract_label`. It is
+        // NOT part of the DEDUP key — two rows for one level must never become
+        // distinct because a name was published between them. Written only
+        // when the table knows this exact `(security_id, segment)`, otherwise
+        // OMITTED so the cell reads NULL — never a guessed name. Unlike the four
+        // symbols above this value comes from the day's artifact rather than a
+        // closed set, so it goes through `sanitize_ilp_symbol`, which borrows
+        // (no allocation) unless the name actually needs escaping.
+        let hit = matches!(
+            &self.contract_label,
+            Some((id, seg, _)) if *id == row.security_id && *seg == row.segment
+        );
+        if !hit {
+            let labels = crate::candle_contract_labels::candle_contract_labels();
+            let name = labels
+                .get(&(row.security_id, row.segment))
+                .map(std::sync::Arc::clone);
+            self.contract_label = Some((row.security_id, row.segment, name));
+        }
+        if let Some((_, _, Some(name))) = &self.contract_label {
+            // Made ILP-safe once at publish (J1, 2026-10-26), so the stored
+            // name is written as it is; no per-row scan.
+            debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
+            self.buffer
+                .symbol(depth_col("contract"), &**name)
+                .context("contract")?;
+        }
+        self.buffer
+            .column_i64(depth_col("security_id"), row.security_id)
             .context("security_id")?
-            .column_i64("level", row.level)
+            .column_i64(depth_col("level"), row.level)
             .context("level")?
-            .column_f64("price", row.price)
+            .column_f64(depth_col("price"), row.price)
             .context("price")?
-            .column_i64("quantity", row.quantity)
+            .column_i64(depth_col("quantity"), row.quantity)
             .context("quantity")?
-            .column_i64("orders", row.orders)
+            .column_i64(depth_col("orders"), row.orders)
             .context("orders")?
-            .column_i64("capture_seq", row.capture_seq)
+            .column_i64(depth_col("capture_seq"), row.capture_seq)
             .context("capture_seq")?
             .at(TimestampNanos::new(row.ts_nanos))
             .context("designated timestamp")?;
 
         self.pending = self.pending.saturating_add(1);
+        self.note_pending_seq(row.capture_seq);
         Ok(())
     }
 
-    /// Discards the pending buffer, counting and logging the loss.
-    ///
-    /// Returns how many rows were discarded.
-    fn discard_pending(&mut self) -> usize {
-        let dropped = self.pending;
-        if dropped > 0 {
-            self.buffer.clear();
-            self.pending = 0;
-            self.dropped = self.dropped.saturating_add(dropped as u64);
-            metrics::counter!("tv_depth_rows_dropped_total", "feed" => self.feed.as_str())
-                .increment(dropped as u64);
+    /// Widens the pending sequence range to cover one appended row.
+    fn note_pending_seq(&mut self, capture_seq: i64) {
+        let seq = u64::try_from(capture_seq).unwrap_or(0);
+        if seq == 0 {
+            self.pending_unbacked = true;
+            return;
         }
-        dropped
+        if self.pending_min_seq == 0 || seq < self.pending_min_seq {
+            self.pending_min_seq = seq;
+        }
+        if seq > self.pending_max_seq {
+            self.pending_max_seq = seq;
+        }
+    }
+
+    /// Takes the pending range, leaving it empty.
+    fn take_pending_range(&mut self) -> (u64, u64) {
+        let r = (self.pending_min_seq, self.pending_max_seq);
+        self.pending_min_seq = 0;
+        self.pending_max_seq = 0;
+        r
+    }
+
+    /// Restores a range the hand-off gave back (queue full / thread gone).
+    fn restore_pending_range(&mut self, range: (u64, u64)) {
+        self.pending_min_seq = range.0;
+        self.pending_max_seq = range.1;
+    }
+
+    /// Replaces the just-emptied buffer with a recycled spare from the writer
+    /// thread, when one is waiting (2026-09-22, item 44g).
+    ///
+    /// Called only after a hand-off SUCCEEDED, when `self.buffer` is the
+    /// zero-capacity `Buffer::new` the swap left behind (which never
+    /// allocated). Without this every batch regrew its ILP buffer from zero —
+    /// several reallocations per flush on the drain task, at the depth path's
+    /// ~2 MB batch size. A spare of another protocol version is dropped rather
+    /// than used, because the next batch must speak the protocol the sender
+    /// negotiated. `try_recv`, never `recv`. With no spare (or one under the
+    /// layout's pre-size) the buffer is reserved to that size here (DT-A2,
+    /// 2026-10-28), so the next batch does not regrow inside the frames that
+    /// append it. WHERE this runs: on every hand-off, which on the live drain
+    /// is either the 500 ms flush arm or, for the depth size trigger
+    /// (`depth_flush_due`), INSIDE the frame arm right after the frame that
+    /// tripped it. So the reserve is one allocation (a 4 or 9 MiB `mmap`, no
+    /// page committed) per hand-off that finds no spare, sometimes on the
+    /// frame path; never per tick or per row. Before, that path allocated
+    /// nothing there and the next batch's appends did the regrowing instead.
+    fn install_spare_buffer(&mut self, protocol: ProtocolVersion) {
+        if self.layout == DepthLayout::Book {
+            // PF-4b: a book writer's batch is its staged rows; its text
+            // buffer is the cold paths' scratch and is never reserved.
+            self.install_spare_staged();
+            return;
+        }
+        if let Some(spares) = self.spare_buffers.as_ref()
+            && let Ok(mut spare) = spares.try_recv()
+            && spare.protocol_version() == protocol
+        {
+            spare.clear();
+            self.buffer = spare;
+        }
+        // DT-A2: one allocation per spare-less hand-off (see the doc above for
+        // where that runs), none per row. A spare at least the pre-size costs
+        // nothing. A smaller spare is replaced by a fresh buffer rather than
+        // grown: `Buffer` exposes no `reserve_exact`, and `reserve` on a
+        // non-empty capacity doubles it (a spare of pre-size - 1 became
+        // 2 x pre-size - 2), while from capacity 0 it reserves exactly the
+        // amount asked. The buffer is empty here (every caller just swapped
+        // it out), so nothing is lost; a non-empty one keeps `reserve`.
+        let presize = self.layout.row_buffer_presize_bytes();
+        if self.buffer.capacity() < presize {
+            let have = self.buffer.len();
+            if have == 0 {
+                self.buffer = Buffer::new(protocol);
+            }
+            self.buffer.reserve(presize.saturating_sub(have));
+        }
+    }
+
+    /// PF-4b: replaces the just-handed-off staged batch with a spare from
+    /// the writer or rescue thread (already cleared there, pins dropped
+    /// there), or reserves a fresh one. One allocation per spare-less
+    /// hand-off, never per row; `try_recv`, never a wait.
+    fn install_spare_staged(&mut self) {
+        if self.staged.is_empty()
+            && let Some(spares) = self.spare_staged.as_ref()
+            && let Ok(spare) = spares.try_recv()
+        {
+            self.staged = spare;
+        }
+        // 2026-11-16: count the fresh reserve (no spare, or a smaller one).
+        if self.staged.reserve_presize() {
+            self.flush_counters.stage_presize_fresh.increment(1);
+            self.flush_counters.stage_presize_fresh_count = self
+                .flush_counters
+                .stage_presize_fresh_count
+                .saturating_add(1);
+        }
+    }
+
+    /// PF-4b: the name table the running instrument's cached name came
+    /// from, taken (one `Arc` increment) before its batch leaves, so the next
+    /// row of the same run reads the same name from the next batch (the old
+    /// cache held the name itself across a hand-off). `None` with no run.
+    fn carry_cached_table(
+        &self,
+    ) -> Option<std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>> {
+        let (_, _, pin, _) = self.book_label.as_ref()?;
+        self.staged.pinned_table(*pin)
+    }
+
+    /// PF-4b: pins a carried table in the fresh batch and points the run
+    /// cache at it. A fresh batch has free pin slots; if it somehow has none
+    /// the cache is cleared, so the next row resolves its name again.
+    fn repin_carried_table(
+        &mut self,
+        carry: Option<std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>>,
+    ) {
+        let Some(table) = carry else {
+            return;
+        };
+        match self.staged.pin_table(table) {
+            Ok(pin) => {
+                if let Some((_, _, cached_pin, _)) = self.book_label.as_mut() {
+                    *cached_pin = pin;
+                }
+            }
+            Err(_table) => self.book_label = None,
+        }
+    }
+
+    /// PF-4b: writes the staged rows into the text buffer, on the drain's
+    /// COLD paths only (the inline spill, the unsplit synchronous flush),
+    /// inside `off_worker`. A row the encoder refuses is counted there and
+    /// leaves `pending`. Returns the levels refused. Pins are kept (the
+    /// drain never drops them). O(staged bytes).
+    fn materialize_staged(&mut self) -> usize {
+        if self.staged.is_empty() {
+            return 0;
+        }
+        let feed = self.feed;
+        let staged = &mut self.staged;
+        let buffer = &mut self.buffer;
+        crate::off_worker::off_worker(|| {
+            let _written = staged.encode_into(feed, buffer);
+        });
+        let refused = self.staged.refused_levels();
+        self.staged.clear_rows();
+        self.pending = self.pending.saturating_sub(refused);
+        refused
+    }
+
+    /// Rescues every buffered-but-unflushed row to the depth spill tier, then
+    /// clears. Returns how many rows left the buffer.
+    ///
+    /// # What this replaces, and why
+    ///
+    /// This was a bare discard whose own log line said *"These levels are gone
+    /// from the table"*. Ticks have had a three-tier durable floor since
+    /// 2026-08-21 — ring, NDJSON/ILP spill, DLQ — so a tick flush failure is
+    /// recoverable. Depth, at a MEASURED 1,530,651,649 rows/session against
+    /// 64,349,753 ticks (2026-08-24) — **24× the tick volume and the largest
+    /// payload in the process** — had none of it, on a box whose QuestDB write
+    /// path is demonstrably stalling (`market_depth`'s WAL 8,061 transactions
+    /// behind, the volume pinned at its provisioned throughput ceiling). So
+    /// this path is not hypothetical; it is the one most likely to fire.
+    ///
+    /// It also violated the operator's standing 2026-08-15 directive that
+    /// nothing may be missed, hidden or wiped off — the discard did all three
+    /// while reporting a healthy table.
+    ///
+    /// # Why the rescue can still fail, and what happens then
+    ///
+    /// The spill shares the filesystem with QuestDB, which was 86% full. A
+    /// write failure or the [`DEPTH_SPILL_MAX_BYTES`] cap is therefore a live
+    /// outcome, and it falls back to the counted drop with its own coded
+    /// error. Silent loss is the defect; a NAMED unrecoverable loss is not.
+    /// Rescue the buffered levels to the spill tier instead of losing them.
+    ///
+    /// # Why this hands off instead of writing (2026-08-28)
+    ///
+    /// The tick writer's twin of this function was taken off the drain earlier
+    /// today; this is the same fix on the writer that carries **24x the rows**
+    /// — a measured 1,530,651,649 depth rows per session against 64,349,753
+    /// ticks — and on a path with one more way in: the frame arm, the 500 ms
+    /// timer arm, and the shutdown tail all reach it.
+    ///
+    /// Inline it did `create_dir_all`, a `read_dir` + per-entry `metadata()`
+    /// walk of the depth spill directory, a live free-space probe (a forked
+    /// `df` until 2026-10-12, one `statvfs` call since), and then up to
+    /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — 32 MiB — of file write. All on the
+    /// frame-drain task, and all on the volume QuestDB is stalling on.
+    ///
+    /// And it fires at the worst instant BY CONSTRUCTION: the cut that calls it
+    /// only trips after the hand-off queue has been full for
+    /// [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] consecutive flushes, i.e. only when
+    /// the database is already behind. A stalled drain stops emptying the
+    /// socket, the receive buffer fills, and Dhan — which skips a slow consumer
+    /// forward to "the latest available state" with no sequence number —
+    /// discards the intermediate ticks at THEIR side, where nothing we own can
+    /// see them.
+    ///
+    /// The fallback is deliberately the OLD behaviour, never a drop: a full
+    /// rescue queue or a dead rescue thread writes inline exactly as before.
+    pub fn discard_pending(&mut self) -> usize {
+        let rows = self.pending;
+        if rows == 0 {
+            self.buffer.clear();
+            self.staged.clear_rows();
+            return 0;
+        }
+
+        // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
+        // MOVED, and the replacement is the same empty one `offload_flush`
+        // already installs on every successful hand-off. PF-4b: a book
+        // writer's staged batch moves the same way.
+        // H4: older parked batches go to the thread first.
+        self.retry_parked_rescue();
+        let range = self.take_pending_range();
+        let unbacked = std::mem::take(&mut self.pending_unbacked);
+        let mut rescue_unavailable = false;
+        if let Some(tx) = self.rescue.as_ref() {
+            let protocol = self.buffer.protocol_version();
+            // Z7 (2026-10-02): hold the PERSISTED watermark below this batch
+            // until the rescue thread has synced it (or failed and marked it);
+            // see `TickPersistenceWriter::discard_pending`. At most 8 CASes,
+            // no allocation, no lock.
+            let wm = crate::wal_applied_watermark::applied_watermark();
+            let floor = wm.hold_rescue_floor(
+                crate::wal_applied_watermark::AppliedSink::Depth,
+                range.0,
+                range.1,
+            );
+            let carry = self.carry_cached_table();
+            let batch = DepthRescueBatch {
+                buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+                staged: std::mem::take(&mut self.staged),
+                rows,
+                min_seq: range.0,
+                max_seq: range.1,
+                unbacked,
+                floor,
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.flush_counters.rescue_queued.increment(rows as u64);
+                    wm.note_depth_handed_off();
+                    // Counted as rescued HERE, not on the thread, because the
+                    // caller's log-wording branch reads this field one line
+                    // after the call and a queued payload IS on its way to the
+                    // spill file. The rare case where it does not arrive is the
+                    // shutdown abandonment, which has its own counter and its
+                    // own coded error rather than being folded into this one.
+                    self.rescued = self.rescued.saturating_add(rows as u64);
+                    self.pending = 0;
+                    self.dropped = self.dropped.saturating_add(rows as u64);
+                    // The buffer left with the rescue batch; reuse a spare
+                    // from the writer thread instead of regrowing from zero.
+                    self.install_spare_buffer(protocol);
+                    self.repin_carried_table(carry);
+                    return rows;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // H4 (2026-10-03): rows the WAL cannot defer would be
+                    // written on the drain below; park them in RAM instead
+                    // while the bound allows. Counted as rescued now, like a
+                    // queued batch; the floor stays held.
+                    if (range.0 == 0 || unbacked) && self.park_rescue_fits(&returned) {
+                        self.park_rescue(returned);
+                        wm.note_depth_handed_off();
+                        self.rescued = self.rescued.saturating_add(rows as u64);
+                        self.pending = 0;
+                        self.dropped = self.dropped.saturating_add(rows as u64);
+                        self.install_spare_buffer(protocol);
+                        self.repin_carried_table(carry);
+                        return rows;
+                    }
+                    // Never reached the thread: retract its floor; the arms
+                    // below mark or spill the range themselves.
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
+                    self.buffer = returned.buffer;
+                    self.staged = returned.staged;
+                    self.flush_counters.rescue_fallback_queue_full.increment(1);
+                    rescue_unavailable = true;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
+                    self.buffer = returned.buffer;
+                    self.staged = returned.staged;
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    rescue_unavailable = true;
+                }
+            }
+        }
+
+        // 2026-09-26 audit fix PR3 — the drain never writes the spill file.
+        // Same reasoning as `TickPersistenceWriter::discard_pending`: every
+        // row with a capture sequence is already in the capture-at-receipt
+        // WAL, so a busy rescue thread hands the range to the WAL (marked
+        // unapplied, replayed, never archived unread) instead of a `df` fork
+        // and a large file write on the frame-drain task. Rows without a
+        // capture sequence keep the inline spill.
+        // J1 (2026-10-26): and only once the WAL has flushed through the
+        // batch's newest frame and lost nothing at or above its oldest
+        // (`wal_frame_fate::rescue_may_defer_to_wal`); a record queued but
+        // never written was otherwise gone while counted as replayable.
+        if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
+            note_rescue_outcome_depth(false, range, false);
+            self.flush_counters.rows_dropped.increment(rows as u64);
+            self.flush_counters
+                .rescue_deferred_to_wal
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                deferred = rows,
+                min_seq = range.0,
+                max_seq = range.1,
+                source = DEPTH_RESCUE_DEFERRED_TO_WAL_SOURCE,
+                "depth flush failed and the rescue thread is busy — the rows were \
+                 handed to the write-ahead log for replay instead of being written \
+                 to disk on the tick task. They are NOT in QuestDB until the WAL \
+                 replays them."
+            );
+            self.buffer.clear();
+            // PF-4b: the rows only; the name pins stay (never dropped here).
+            self.staged.clear_rows();
+            self.pending = 0;
+            self.dropped = self.dropped.saturating_add(rows as u64);
+            return rows;
+        }
+
+        // Past the park's bound, a gone thread, or no rescue split at all:
+        // the drain's inline spill, NOT synced (see `spill_on_drain`).
+        // PF-4b: a book writer's staged rows are written as text first, on
+        // this already-cold path; a row the encoder refuses is counted there.
+        let refused = self.materialize_staged();
+        let spilled_rows = rows.saturating_sub(refused);
+        let landed = spilled_rows == 0
+            || self.spill_on_drain(
+                self.buffer.as_bytes(),
+                spill_version_of(self.buffer.protocol_version()),
+                spilled_rows,
+                crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked),
+            );
+        note_rescue_outcome_depth(landed, range, false);
+        if landed {
+            self.rescued = self.rescued.saturating_add(spilled_rows as u64);
+        }
+        self.buffer.clear();
+        self.pending = 0;
+        self.dropped = self.dropped.saturating_add(rows as u64);
+        rows
+    }
+
+    /// Splits this writer into a PRODUCER half and a network SINK half.
+    ///
+    /// The producer keeps the ILP buffer and the row accounting and stays on
+    /// the drain task; the sink takes the `Sender` and belongs on a thread of
+    /// its own. They are joined by a bounded queue, so the drain can never be
+    /// blocked by the network and can never grow the queue without bound.
+    ///
+    /// See the module section "Off-drain flush for DEPTH" for why this matters
+    /// more here than on the tick path: depth is 24x the tick row volume and
+    /// its synchronous flush ran on the frame drain, so a QuestDB stall became
+    /// upstream tick loss and a socket disconnect.
+    ///
+    /// Consuming `self` and returning a new one is deliberate: it makes the
+    /// split a one-way door at the type level, so no caller can hold a handle
+    /// that still believes it owns the network.
+    #[must_use]
+    // TEST-EXEMPT: the split itself is exercised by every depth offload test
+    // below, each of which calls it to obtain the producer/sink pair.
+    pub fn split_for_offload(
+        mut self,
+    ) -> (
+        Self,
+        DepthWriterSink,
+        std::sync::mpsc::Receiver<DepthFlushBatch>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
+        // The spare-buffer return lane is bounded by the SAME depth as the
+        // hand-off queue: at most that many buffers are ever in flight, so a
+        // deeper lane could never fill and a shallower one would drop spares
+        // the producer is about to need (2026-09-22, item 44g).
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH);
+        // PF-4b: the staged-batch return lane, shared by the writer and the
+        // rescue thread, so it holds as many batches as both queues.
+        let (staged_tx, staged_rx) =
+            std::sync::mpsc::sync_channel(DEPTH_FLUSH_QUEUE_DEPTH + DEPTH_RESCUE_QUEUE_DEPTH);
+        let sink = DepthWriterSink {
+            sender: self.sender.take(),
+            feed: self.feed,
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
+            spill_min_free_headroom: self.spill_min_free_headroom,
+            spare_return: Some(spare_tx),
+            staged_return: Some(staged_tx.clone()), // APPROVED: channel sender cloned once per process at the offload split
+            scratch: Buffer::new(DepthLayout::Book.protocol()),
+            counters: DepthSinkCounters::new(self.feed),
+            table_gate: self.table_gate,
+            gate_tables: self.gated_tables(),
+        };
+        self.offload = Some(tx);
+        self.spare_buffers = Some(spare_rx);
+        self.spare_staged = Some(staged_rx);
+        self.spare_staged_tx = Some(staged_tx);
+        (self, sink, rx)
+    }
+    /// Hands the depth rescue write to a dedicated thread.
+    ///
+    /// Separate from [`DepthWriter::split_for_offload`] because it solves the
+    /// case that split CANNOT: the rescue fires exactly when the flush queue is
+    /// full or its thread is gone, so it cannot ride the same queue.
+    pub fn split_rescue_offload(
+        &mut self,
+    ) -> (DepthRescueSink, std::sync::mpsc::Receiver<DepthRescueBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(DEPTH_RESCUE_QUEUE_DEPTH);
+        let sink = DepthRescueSink {
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
+            spill_min_free_headroom: self.spill_min_free_headroom,
+            feed: self.feed,
+            spill_sync: crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+            // PF-4b: spent staged batches go back to the drain from here too.
+            staged_return: self.spare_staged_tx.clone(), // APPROVED: channel sender cloned once per process at the rescue split
+        };
+        self.rescue = Some(tx);
+        // Once per process, so a park on the drain never allocates.
+        self.parked_rescue
+            .reserve_exact(DEPTH_PARKED_RESCUE_MAX_BATCHES);
+        (sink, rx)
+    }
+
+    /// Closes the depth rescue queue so its thread can exit.
+    ///
+    /// Leaves the writer in the INLINE state on purpose: a rescue after this
+    /// point writes synchronously rather than being refused, so end-of-session
+    /// levels still reach the spill tier.
+    ///
+    /// H4 (2026-10-03): every parked batch is handed to the rescue thread
+    /// first. Audit K1 (2026-10-26): with a deadline, not a blocking `send`
+    /// (see `TickPersistenceWriter::close_rescue_offload`); past it a batch
+    /// is written inline, and if that fails too its unbacked rows are counted
+    /// on [`DEPTH_RESCUE_ABANDONED_COUNTER`] with a coded `error!`.
+    pub fn close_rescue_offload(&mut self) {
+        use crate::tick_persistence::{
+            RESCUE_SHUTDOWN_HANDOFF_BUDGET, ShutdownHandOff, hand_off_before,
+        };
+        if let Some(tx) = self.rescue.take() {
+            let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
+            while let Some(batch) = self.parked_rescue.pop_front() {
+                self.parked_rescue_bytes =
+                    self.parked_rescue_bytes.saturating_sub(batch.park_bytes());
+                let rows = batch.rows;
+                match hand_off_before(&tx, batch, deadline) {
+                    ShutdownHandOff::Sent => {
+                        self.flush_counters.rescue_queued.increment(rows as u64);
+                    }
+                    ShutdownHandOff::Gone(batch) => {
+                        self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                    ShutdownHandOff::TimedOut(batch) => {
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                }
+            }
+        }
+        // Unreachable with batches still parked (only a split writer parks),
+        // and written inline rather than dropped if it ever is.
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            self.spill_parked_at_shutdown(batch);
+        }
+        self.parked_rescue_bytes = 0;
+        self.flush_counters.rescue_parked_bytes.set(0.0);
+    }
+
+    /// True when `batch` fits in the park without passing either bound.
+    fn park_rescue_fits(&self, batch: &DepthRescueBatch) -> bool {
+        self.parked_rescue.len() < DEPTH_PARKED_RESCUE_MAX_BATCHES
+            && self.parked_rescue_bytes.saturating_add(batch.park_bytes())
+                <= DEPTH_PARKED_RESCUE_MAX_BYTES
+    }
+
+    /// Parks one refused depth rescue batch in RAM (H4). O(1), no allocation,
+    /// floor kept.
+    fn park_rescue(&mut self, batch: DepthRescueBatch) {
+        self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_add(batch.park_bytes());
+        self.flush_counters
+            .rescue_parked
+            .increment(batch.rows as u64);
+        self.parked_rescue.push_back(batch);
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Hands parked depth rescue batches to the rescue thread, oldest first,
+    /// until its queue is full again (H4). One branch when nothing is parked;
+    /// never a wait. A gone thread is the one case written inline.
+    fn retry_parked_rescue(&mut self) {
+        if self.parked_rescue.is_empty() {
+            return;
+        }
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            let bytes = batch.park_bytes();
+            let rows = batch.rows as u64;
+            let Some(tx) = self.rescue.as_ref() else {
+                self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                self.spill_parked_on_drain(batch);
+                continue;
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_queued.increment(rows);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(batch)) => {
+                    self.parked_rescue.push_front(batch);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
+                    self.parked_rescue_bytes = self.parked_rescue_bytes.saturating_sub(bytes);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    self.spill_parked_on_drain(batch);
+                }
+            }
+        }
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_bytes as f64);
+    }
+
+    /// Writes a parked batch inline (thread gone) and completes it exactly as
+    /// the rescue thread would: outcome, floor, completion count. Its rows
+    /// were already counted as rescued and dropped when it was parked.
+    fn spill_parked_on_drain(&self, batch: DepthRescueBatch) {
+        let landed = self.spill_batch_on_drain(
+            &batch,
+            crate::wal_applied_watermark::rescue_failure_fate(
+                batch.min_seq,
+                batch.max_seq,
+                batch.unbacked,
+            ),
+        );
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
+    }
+
+    /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
+    /// inline write also fails and whose rows the WAL does not hold is counted
+    /// on [`DEPTH_RESCUE_ABANDONED_COUNTER`], with a coded line.
+    fn spill_parked_at_shutdown(&self, batch: DepthRescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let rows = batch.rows;
+        let landed = self.spill_batch_on_drain(&batch, fate);
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
+        if !landed && fate == crate::wal_applied_watermark::RESCUE_FATE_LOST {
+            metrics::counter!(DEPTH_RESCUE_ABANDONED_COUNTER, "writer" => "depth")
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                rows,
+                source = crate::tick_persistence::SHUTDOWN_RESCUE_ABANDONED_SOURCE,
+                "shutdown: a parked depth rescue batch could not be handed to the rescue \
+                 thread in time AND could not be written to the spill file, and the WAL does \
+                 not hold its rows. These depth rows are LOST."
+            );
+        }
+    }
+
+    /// A parked rescue batch written on the drain (a gone rescue thread, or
+    /// shutdown), NOT synced. PF-4b: a staged batch is written as text first,
+    /// inside the same `off_worker` call as the file write; a row the encoder
+    /// refuses is counted there and left out of the spilled count. Allocates
+    /// one text buffer for a staged batch (cold path).
+    fn spill_batch_on_drain(&self, batch: &DepthRescueBatch, fate: &'static str) -> bool {
+        // The text is written inside `off_worker`; each file write is the
+        // drain's one unsynced spill, inside its own `off_worker` call.
+        let staged_text = crate::off_worker::off_worker(|| batch.staged_text(self.feed));
+        batch.spill_payloads(staged_text.as_ref(), |payload, rows| {
+            self.spill_on_drain(
+                payload.as_bytes(),
+                spill_version_of(payload.protocol_version()),
+                rows,
+                fate,
+            )
+        })
+    }
+
+    /// The drain's only depth spill write, NOT synced (see
+    /// `SPILL_UNSYNCED_ON_DRAIN`).
+    ///
+    /// A file write, so it runs through `off_worker` (the drain calls `flush`
+    /// bare; see the tick writer's twin).
+    fn spill_on_drain(&self, payload: &[u8], version: u8, rows: usize, fate: &'static str) -> bool {
+        crate::off_worker::off_worker(|| {
+            perform_depth_rescue(
+                &self.spill_dir,
+                payload,
+                version,
+                self.feed,
+                rows,
+                self.spill_min_free_headroom,
+                crate::tick_persistence::SPILL_UNSYNCED_ON_DRAIN,
+                fate,
+            )
+        })
+    }
+
+    /// Closes the hand-off queue, so the writer thread sees the end of the
+    /// stream and can exit.
+    ///
+    /// Shutdown-only. Dropping the sender is what turns the writer's blocking
+    /// `recv` into a clean exit; without it, a caller that joins the thread
+    /// waits forever on a queue nothing will ever close.
+    ///
+    /// Leaves the writer in the UNSPLIT state, so a flush after this point
+    /// takes the synchronous arm and — with the sender long gone to the sink —
+    /// rescues to the depth spill tier rather than silently discarding. That is
+    /// the correct end-of-session behaviour: rows are on disk and named.
+    pub fn close_offload(&mut self) {
+        self.offload = None;
+    }
+
+    /// True once [`Self::split_for_offload`] has run and the queue is open.
+    #[must_use]
+    // TEST-EXEMPT: read by the offload tests below and by the lane's wiring.
+    pub const fn is_offloaded(&self) -> bool {
+        self.offload.is_some()
+    }
+
+    /// Hands the pending buffer to the writer thread without touching the
+    /// network.
+    ///
+    /// Uses `try_send`, never `send`: a blocking send would re-create the exact
+    /// coupling the split exists to remove, one queue further out.
+    fn offload_flush(&mut self) -> DepthOffloadOutcome {
+        let rows = self.pending;
+        // Read the protocol version BEFORE the replace: a fresh buffer must
+        // speak the same protocol the sender negotiated, and borrowing rules
+        // will not let both happen in one expression.
+        let protocol = self.buffer.protocol_version();
+        let (min_seq, max_seq) = self.take_pending_range();
+        let carry = self.carry_cached_table();
+        let batch = DepthFlushBatch {
+            buffer: std::mem::replace(&mut self.buffer, Buffer::new(protocol)),
+            staged: std::mem::take(&mut self.staged),
+            rows,
+            min_seq,
+            max_seq,
+            // Copied, not taken: on a full queue the rows come back and the
+            // flag stays with them; the Sent arm below clears it.
+            unbacked: self.pending_unbacked,
+        };
+        let Some(tx) = self.offload.as_ref() else {
+            // Unreachable — `flush` checks. Treated as the gone arm rather than
+            // silently succeeding, because "we sent it" when nothing was sent
+            // is the one report that must never be wrong.
+            self.buffer = batch.buffer;
+            self.staged = batch.staged;
+            self.restore_pending_range((batch.min_seq, batch.max_seq));
+            return DepthOffloadOutcome::SinkGone(rows);
+        };
+        match tx.try_send(batch) {
+            Ok(()) => {
+                self.pending = 0;
+                self.retained_spans = 0;
+                // The batch carries the mark now; nothing pending is unbacked
+                // (review of G4-audit, 2026-10-11).
+                self.pending_unbacked = false;
+                crate::wal_applied_watermark::applied_watermark().note_depth_handed_off();
+                self.flush_counters.offloaded.increment(1);
+                // Only NOW, after the send succeeded: on the Full arm below the
+                // retained buffer comes back into `self.buffer`, and a spare
+                // installed earlier would be discarded (2026-09-22, item 44g).
+                self.install_spare_buffer(protocol);
+                self.repin_carried_table(carry);
+                DepthOffloadOutcome::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
+                // Backpressure, not loss. Put the rows BACK and keep appending
+                // — the next flush retries. This arm is what makes the bounded
+                // queue safe: without it a full queue would either block the
+                // drain (the original defect) or drop rows (a worse one).
+                self.flush_counters.queue_full.increment(1);
+                // PF-4b: a staged batch's EXACT text size, so the byte cut
+                // lands where it did on the text buffer.
+                let held = returned
+                    .buffer
+                    .as_bytes()
+                    .len()
+                    .saturating_add(returned.staged.text_bytes());
+                self.buffer = returned.buffer;
+                self.staged = returned.staged;
+                self.retained_spans = self.retained_spans.saturating_add(1);
+                // TWO independent cuts. Spans is the primary bound; bytes is
+                // the belt-and-braces one that matters MORE on this path than
+                // on the tick path, because a single depth-200 snapshot is 400
+                // rows and a burst can breach a byte ceiling inside one span.
+                //
+                // `>` and not `>=`: the constant names how many spans may be
+                // RETAINED, so the cut belongs on the span after them.
+                if self.retained_spans > MAX_DEPTH_RETAINED_FLUSH_SPANS
+                    || held >= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+                {
+                    self.flush_counters.width_capped.increment(1);
+                    self.retained_spans = 0;
+                    // Rescue rather than keep widening. Durable, counted, and
+                    // re-ingestable — the same tier a failed flush uses.
+                    let dropped = self.discard_pending();
+                    return DepthOffloadOutcome::WidthCapped(dropped);
+                }
+                DepthOffloadOutcome::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                // The writer thread died. Rescue rather than drop, and say so.
+                // The range rides with the batch and must come back with the
+                // buffer, or the rescue below reports `(0, 0)` and a failed
+                // rescue marks nothing — the tick twin always did this.
+                self.buffer = returned.buffer;
+                self.staged = returned.staged;
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
+                let dropped = self.discard_pending();
+                DepthOffloadOutcome::SinkGone(dropped)
+            }
+        }
     }
 
     /// Flushes buffered rows over ILP-HTTP with a per-flush server ACK.
@@ -571,37 +3923,201 @@ impl DepthWriter {
     /// # Errors
     /// `Err` when disconnected or when the HTTP flush fails.
     pub fn flush(&mut self) -> Result<()> {
+        // A republished name table is picked up at the next batch at the latest.
+        self.contract_label = None;
+        // PF-4b: the book writer's run cache, cleared at the same point.
+        self.book_label = None;
+        // H4: a parked rescue goes to its thread first, even with nothing
+        // pending.
+        self.retry_parked_rescue();
         if self.pending == 0 {
             return Ok(());
         }
-        let Some(sender) = self.sender.as_mut() else {
-            let dropped = self.discard_pending();
-            error!(
-                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
-                feed = self.feed.as_str(),
-                dropped,
-                "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
-                 DISCARDED. These levels are gone from the table; the raw frames remain \
-                 in the write-ahead log"
-            );
-            anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
-        };
-        match sender.flush(&mut self.buffer) {
-            Ok(()) => {
-                self.pending = 0;
-                Ok(())
+        // OFF-DRAIN ARM. Checked before the sender, because once split there
+        // IS no sender on this half — it went to the sink — and falling
+        // through would rescue every batch of a perfectly healthy lane.
+        //
+        // Returns `Ok(())` on QueueFull as well as on Sent, and that is the
+        // load-bearing decision in this function: a full queue means the rows
+        // are still held and still pending, so reporting `Err` would make the
+        // caller decay feed health and log a failure for backpressure that
+        // lost nothing. WidthCapped and SinkGone DID move rows out of the
+        // buffer (rescued, counted, coded), so they report `Err` exactly as a
+        // failed synchronous flush does.
+        if self.offload.is_some() {
+            return match self.offload_flush() {
+                DepthOffloadOutcome::Sent(_) | DepthOffloadOutcome::QueueFull(_) => Ok(()),
+                DepthOffloadOutcome::WidthCapped(rows) => {
+                    anyhow::bail!(
+                        "market_depth producer held {rows} row(s) past its retention bound \
+                         while the writer thread was behind; they were rescued to the depth \
+                         spill tier — see the preceding coded line"
+                    )
+                }
+                DepthOffloadOutcome::SinkGone(rows) => {
+                    anyhow::bail!(
+                        "market_depth writer thread is gone; {rows} row(s) were rescued to \
+                         the depth spill tier — see the preceding coded line"
+                    )
+                }
+            };
+        }
+        // PF-4b: the unsplit (synchronous) arm writes a book writer's staged
+        // rows as text here, on this already-blocking path (`off_worker`). A
+        // row the encoder refuses is counted there; if none is left, nothing
+        // is sent and nothing is acknowledged (the refused frames are marked
+        // unapplied, so a replay offers them again).
+        if !self.staged.is_empty() {
+            let _refused = self.materialize_staged();
+            if self.pending == 0 {
+                let _refused_range = self.take_pending_range();
+                self.pending_unbacked = false;
+                self.buffer.clear();
+                return Ok(());
             }
-            Err(err) => {
-                let dropped = self.discard_pending();
+        }
+        // B1 (2026-11-13): never post into a table this process has not
+        // keyed; the rows take the rescue (WAL deferral or the spill).
+        if self.sender.is_some() && !self.table_keyed() {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            let dropped = self.discard_pending();
+            anyhow::bail!("market_depth: table not keyed yet; {dropped} row(s) rescued");
+        }
+        let Some(sender) = self.sender.as_mut() else {
+            let rescued_before = self.rescued;
+            let dropped = self.discard_pending();
+            // §2.3x (2026-09-23): split by outcome so the pager filter can
+            // exclude the rescued arm by `source` — a rescued batch is on disk.
+            if self.rescued > rescued_before {
                 error!(
                     code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                     feed = self.feed.as_str(),
                     dropped,
-                    ?err,
-                    "market_depth flush FAILED — {dropped} depth row(s) DISCARDED so one \
-                     rejected row cannot wedge the session. These levels are gone from the \
-                     table; the raw frames remain in the write-ahead log"
+                    rescued = true,
+                    source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
+                    "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
+                     left the buffer and were RESCUED to the depth spill tier (see the \
+                     preceding line); they are NOT lost and NOT in QuestDB"
                 );
+            } else {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped,
+                    rescued = false,
+                    "market_depth flush with no QuestDB connection — {dropped} depth row(s) \
+                     left the buffer and the rescue failed; see the preceding line"
+                );
+            }
+            anyhow::bail!("market_depth writer disconnected; {dropped} row(s) discarded");
+        };
+        let started = std::time::Instant::now();
+        // Synchronous ILP round trips (this and the one retry below) run
+        // through `off_worker`: the drain calls `flush` bare.
+        let first = crate::off_worker::off_worker(|| sender.flush(&mut self.buffer));
+        let first_failure_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if flush_failure_is_retryable(&err)
+                    && first_failure_elapsed < DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                // ONE retry, only for the transport class, and only when the
+                // first attempt failed FAST.
+                //
+                // EINTR and a connection reset leave the buffer intact and the
+                // server holding nothing to reject, so discarding here throws
+                // away rows that a second attempt would have written -- which
+                // is exactly what happened on 2026-08-25 at 13:12:07, when
+                // `io: Interrupted system call (os error 4)` cost 8,810 rows.
+                //
+                // Bounded at one deliberately. This runs on the flush path, so
+                // an unbounded ladder would trade row loss for a stall, and a
+                // stall on this path fills the socket buffer and loses ticks
+                // upstream instead -- the same loss wearing a different name.
+                // A second failure falls through to the rescue-then-discard
+                // below, unchanged.
+                //
+                // The TIMING condition (added 2026-08-26) is what keeps that
+                // reasoning true. `request_timeout=5000` and an unconditional
+                // retry make the worst case TEN seconds of a flush that runs
+                // inside `block_in_place` on the drain task -- and the drain
+                // task is the tick fold. A timed-out flush maps to the same
+                // `SocketError` class as an EINTR, so without a clock the two
+                // are indistinguishable and the retry doubles the exact stall
+                // it was reasoned to be safe against. An EINTR returns in
+                // microseconds; a timeout consumes the full budget. The window
+                // separates them with three orders of magnitude to spare.
+                metrics::counter!(
+                    "tv_depth_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                crate::off_worker::off_worker(|| sender.flush(&mut self.buffer))
+            }
+            Err(err) => {
+                if flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_depth_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                self.pending = 0;
+                // Every pending row landed, so the unbacked mark goes with them
+                // (review of G4-audit, 2026-10-11) — see the tick writer's twin.
+                self.pending_unbacked = false;
+                // The synchronous arm acks the watermark itself — see the tick
+                // writer's twin for why.
+                let (_, max_seq) = self.take_pending_range();
+                crate::wal_applied_watermark::applied_watermark().note_depth_acked(max_seq);
+                Ok(())
+            }
+            Err(err) => {
+                let rescued_before = self.rescued;
+                let dropped = self.discard_pending();
+                let rescued = self.rescued > rescued_before;
+                // The message used to say "These levels are gone from the
+                // table" on EVERY failure -- including the common case where
+                // `discard_pending` had just RESCUED the whole buffer to the
+                // depth spill file one line earlier. That is not a wording
+                // nit: reading the 2026-08-25 log it made a rescued 5,770-row
+                // flush look like 5,770 lost rows, and a loss figure that is
+                // wrong in the alarming direction gets acted on.
+                if rescued {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        dropped,
+                        rescued = true,
+                        source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
+                        ?err,
+                        "market_depth flush FAILED — {dropped} depth row(s) left the buffer \
+                         and were RESCUED to the depth spill file named on the preceding \
+                         line. They are NOT lost and NOT in QuestDB; re-ingest is safe to \
+                         repeat"
+                    );
+                } else {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        feed = self.feed.as_str(),
+                        dropped,
+                        rescued = false,
+                        ?err,
+                        "market_depth flush FAILED and the spill rescue failed too — \
+                         {dropped} depth row(s) are permanently gone from the table. The \
+                         raw frames remain in the write-ahead log ONLY if it accepted them (check \
+                         tv_dhan_ws_wal_dropped_total)"
+                    );
+                }
+                // APPROVED: flush-FAILURE error context, never the append path
                 Err(anyhow::anyhow!(err)).context(format!(
                     "market_depth flush failed; {dropped} row(s) discarded"
                 ))
@@ -632,9 +4148,1571 @@ pub fn depth_segment_label(code: u8) -> Option<&'static str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Off-drain flush for DEPTH (2026-08-28)
+// ---------------------------------------------------------------------------
+//
+// # Why this exists, and why it is the single most consequential change here
+//
+// `TickWriter` was taken off the frame-drain task on 2026-08-25. `DepthWriter`
+// was NOT, and it is the writer that needed it more:
+//
+// | | ticks | depth |
+// |---|---|---|
+// | rows per session (MEASURED 2026-08-24) | 64,349,753 | **1,530,651,649** |
+// | flush off the drain | yes | **no, until this change** |
+//
+// Depth is 24x the tick volume and the largest payload in the process, and its
+// flush ran SYNCHRONOUSLY inside `block_in_place` on the drain task, with a
+// 5,000 ms `request_timeout`, up to ~5 times a second at the modelled rate.
+// `block_in_place` bounds the damage to the RUNTIME -- a replacement worker is
+// spun up so other tasks keep running -- but it does not take the drain out of
+// the flush's critical path, and the drain is the only thing emptying the
+// socket. So a QuestDB hiccup stalled the fold, filled the receive buffer, and
+// Dhan (which skips a slow consumer forward to "the latest available state",
+// with no sequence number for us to detect it) discarded the intermediate
+// ticks at THEIR side. A storage stall became upstream tick loss and a
+// WebSocket disconnect, invisibly, and no amount of provisioned disk
+// throughput removes it because the coupling is structural rather than a
+// matter of speed.
+//
+// This is the same split, applied to the bigger writer. Everything below
+// mirrors `tick_persistence.rs` deliberately, including the bound names, so
+// the two paths cannot drift into different failure semantics.
+
+/// Depth of the hand-off queue between the drain and the depth writer thread.
+///
+/// FOUR, matching the tick path, and for the same reason: the queue is a shock
+/// absorber for a QuestDB hiccup SHORTER than the flush cadence, not a place to
+/// store data. Every batch sitting in it is rows that exist only in this
+/// process's memory, so a deeper queue converts a database stall into a bigger
+/// crash-loss window while making the operator's counters look calmer.
+///
+/// Depth flushes on the ROW threshold far more often than on the 500 ms timer
+/// -- at the modelled ~63,800 rows/s and a 10,000-row threshold that is a flush
+/// roughly every 156 ms -- so four batches absorb ~600 ms of stall here rather
+/// than the ~2 s it absorbs on the tick path. That is the honest figure and it
+/// is deliberately NOT compensated for by a deeper queue: a stall longer than
+/// that SHOULD surface as backpressure, because it is one.
+pub const DEPTH_FLUSH_QUEUE_DEPTH: usize = 4;
+
+// ---------------------------------------------------------------------------
+// Off-drain RESCUE for DEPTH (2026-08-28)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the depth rescue thread.
+///
+/// TWO, matching the tick side and small for the same reason: a rescue only
+/// happens when the flush queue has already been full for
+/// [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] consecutive flushes, so this is not a
+/// buffer for a busy day — it is somewhere to put ONE oversized payload while
+/// the previous one is being written. Deeper would hold more rows that exist
+/// nowhere else, which is the trade the rescue tier exists to avoid.
+pub const DEPTH_RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Depth rescue batches the drain may PARK in RAM when the rescue queue is
+/// full (H4, 2026-10-03). Same bound and same trade as
+/// [`crate::tick_persistence::PARKED_RESCUE_MAX_BATCHES`]: only rows the WAL
+/// cannot defer are parked, a crash loses a parked batch where the old inline
+/// write would have kept it, and past the bound the drain writes inline as
+/// before, counted on `tv_depth_rescue_inline_fallback_total`.
+pub const DEPTH_PARKED_RESCUE_MAX_BATCHES: usize = 8;
+// Deep audit DA-12 (2026-10-12): the depth twin of the tick assert — every
+// WAL-backed batch queued, parked or being written holds a rescue floor.
+const _: () = assert!(
+    // `<` rather than `+ 1 <=`: the one extra slot is the batch in flight.
+    DEPTH_RESCUE_QUEUE_DEPTH + DEPTH_PARKED_RESCUE_MAX_BATCHES
+        < crate::wal_applied_watermark::RESCUE_FLOOR_SLOTS,
+    "depth rescue queue + park + in-flight must fit the rescue floor table"
+);
+
+/// Byte bound on the depth park: four producer buffers at their cut-over size.
+pub const DEPTH_PARKED_RESCUE_MAX_BYTES: usize = 4 * MAX_DEPTH_PRODUCER_BUFFER_BYTES;
+
+/// Depth rows parked in RAM by the drain (H4). Not a loss counter.
+pub const DEPTH_RESCUE_PARKED_COUNTER: &str = "tv_depth_rescue_parked_total";
+
+/// Depth ILP bytes parked in RAM right now (H4).
+pub const DEPTH_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_depth_rescue_parked_bytes";
+
+/// Depth rows handed to the rescue thread rather than written on the drain.
+pub const DEPTH_RESCUE_QUEUED_COUNTER: &str = "tv_depth_rescue_queued_total";
+
+/// Depth rescues that had to be written INLINE on the drain after all.
+///
+/// Non-zero means the drain took the stall this hand-off exists to remove.
+/// Not a loss: nothing is dropped on either arm.
+pub const DEPTH_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_depth_rescue_inline_fallback_total";
+
+/// Depth rows a full rescue queue handed to the capture-at-receipt WAL rather
+/// than spilling inline on the drain (2026-09-26 audit fix PR3).
+pub const DEPTH_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_depth_rescue_deferred_to_wal_total";
+
+/// `source` on the depth deferred-to-WAL ERROR line.
+pub const DEPTH_RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "depth_rescue_deferred_to_wal";
+
+/// Depth rescue payloads abandoned because the rescue thread did not finish.
+pub const DEPTH_RESCUE_ABANDONED_COUNTER: &str = "tv_depth_rescue_abandoned_total";
+
+/// One oversized depth ILP payload on its way to the spill tier.
+pub struct DepthRescueBatch {
+    buffer: Buffer,
+    /// PF-4b: a book writer's staged rows; the rescue thread (or a cold
+    /// drain path) writes them as text before the spill. Empty for a level
+    /// writer.
+    staged: crate::depth_stage::DepthStagedBatch,
+    rows: usize,
+    /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
+    /// This batch's hold on the persisted watermark (Z7); released by the
+    /// rescue thread once the write is synced or has failed and been marked.
+    /// An abandoned batch (shutdown) never releases it, so the final persist
+    /// keeps the range replayable.
+    floor: Option<crate::wal_applied_watermark::RescueFloor>,
+}
+
+impl DepthRescueBatch {
+    /// Rows this payload carries — the number an abandoned batch loses.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// `true` when some row has no WAL record behind it (the rescue twin of
+    /// [`DepthFlushBatch::has_unbacked_rows`]; 2026-11-07). O(1).
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by test_depth_rescue_batch_carries_unbacked and the app's abandoned-depth-rescue regression test.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+
+    /// RAM a parked batch holds against `DEPTH_PARKED_RESCUE_MAX_BYTES`:
+    /// its text bytes plus (PF-4b) its staged batch by CAPACITY, since a
+    /// parked staged batch pins its whole reservation. O(1).
+    #[must_use]
+    pub(crate) fn park_bytes(&self) -> usize {
+        self.buffer
+            .as_bytes()
+            .len()
+            .saturating_add(self.staged.ram_bytes())
+    }
+
+    /// Spills this batch through `spill(payload, rows)`, which returns
+    /// whether the payload landed: first its text buffer (a level batch, or
+    /// a book batch a cold path already wrote as text), then (PF-4b) its
+    /// staged rows as [`Self::staged_text`] wrote them, less the levels the
+    /// encoder refused (counted there). `true` only when every payload with
+    /// rows landed. The rescue thread or a cold drain path only. O(batches).
+    fn spill_payloads(
+        &self,
+        staged_text: Option<&(Buffer, usize)>,
+        mut spill: impl FnMut(&Buffer, usize) -> bool,
+    ) -> bool {
+        let staged_rows = self.staged.pending_levels();
+        let text_rows = self.rows.saturating_sub(staged_rows);
+        let mut landed = true;
+        if text_rows > 0 && !self.buffer.as_bytes().is_empty() {
+            landed &= spill(&self.buffer, text_rows);
+        }
+        if let Some((out, refused)) = staged_text {
+            let rows = staged_rows.saturating_sub(*refused);
+            if rows > 0 {
+                landed &= spill(out, rows);
+            }
+        }
+        landed
+    }
+
+    /// PF-4b: the staged rows written as text into one fresh buffer, with
+    /// the levels the encoder refused (counted there, never twice: the batch
+    /// is spilled once and then cleared). `None` when nothing is staged.
+    /// Allocates one buffer; the rescue thread, or a cold drain path inside
+    /// `off_worker`. O(staged bytes).
+    fn staged_text(&self, feed: Feed) -> Option<(Buffer, usize)> {
+        if self.staged.is_empty() {
+            return None;
+        }
+        let mut out = Buffer::new(DepthLayout::Book.protocol());
+        out.reserve(self.staged.text_bytes());
+        let refused = self.staged.encode_counted(feed, &mut out);
+        Some((out, refused))
+    }
+}
+
+/// The depth rescue thread's half: everything the write needs, and nothing else.
+pub struct DepthRescueSink {
+    spill_dir: PathBuf,
+    spill_min_free_headroom: u64,
+    feed: Feed,
+    /// `SPILL_SYNC_OFF_DRAIN` in production; a test injects a failing sync.
+    spill_sync: Option<crate::tick_persistence::SpillSyncFn>,
+    /// PF-4b: the drain's spare lane for spent staged batches (`None` when
+    /// the writer was never split for offload).
+    staged_return: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+}
+
+impl DepthRescueSink {
+    /// Writes one queued payload to the depth spill tier.
+    ///
+    /// Identical code to the inline fallback — both call
+    /// [`perform_depth_rescue`] — so an operator cannot tell which path ran,
+    /// and should not have to. PF-4b: a book batch's staged rows are written
+    /// as text here first; a row the encoder refuses is counted before the
+    /// batch's floor is released.
+    pub fn rescue(&self, batch: &DepthRescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let staged_text = batch.staged_text(self.feed);
+        let landed = batch.spill_payloads(staged_text.as_ref(), |payload, rows| {
+            perform_depth_rescue(
+                &self.spill_dir,
+                payload.as_bytes(),
+                spill_version_of(payload.protocol_version()),
+                self.feed,
+                rows,
+                self.spill_min_free_headroom,
+                self.spill_sync,
+                fate,
+            )
+        });
+        note_rescue_outcome_depth(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Released only now: the spill is synced (Z8a) or the range is marked
+        // unapplied, so the persisted watermark may pass the batch (Z7).
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_depth_completed();
+    }
+
+    /// PF-4b: after [`Self::rescue`], hands the batch's staged allocation
+    /// back to the drain's spare lane, cleared HERE (its name pins dropped
+    /// on this thread, never the drain), so a stall does not make the drain
+    /// reserve a fresh batch for every rescue. Dropped instead when there is
+    /// no lane, the lane is full, the drain is gone, or the batch grew past
+    /// [`MAX_DEPTH_STAGED_SPARE_RAM_BYTES`]. Never waits.
+    pub fn recycle(&self, mut batch: DepthRescueBatch) {
+        recycle_staged(self.staged_return.as_ref(), &mut batch.staged);
+    }
+}
+
+/// A spent staged batch bigger than this is dropped by the thread that spent
+/// it rather than returned to the drain.
+///
+/// ⚠ CHANGED 2026-11-06 (PF-4b review round 1): this was twice the
+/// pre-size, which a batch of depth-20 or depth-200 rows passes BELOW the
+/// 8 MiB flush trigger (the value arena is sized for inline five-level
+/// rows), so every such batch was dropped and every later hand-off reserved
+/// and pre-touched a fresh one on the drain. It is now the most a batch can
+/// grow to while holding at most `DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES` of
+/// text (the flush trigger plus one crossing frame, the bound the text
+/// buffer was sized to): every row costs at least
+/// [`crate::depth_stage::MIN_BOOK_LINE_BYTES`] of text and every value 8, and
+/// a `Vec` grown by doubling holds under twice what it needs. So a batch
+/// grown only up to the flush trigger is always recycled, and on a depth-on
+/// day each batch grows once and is then reused. About 29 MiB of address
+/// space per batch at the worst (rows at the shortest line), committed only
+/// as written; pinned by
+/// `test_a_batch_grown_to_the_flush_trigger_is_still_recycled`.
+pub const MAX_DEPTH_STAGED_SPARE_RAM_BYTES: usize = 2
+    * (DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES / crate::depth_stage::MIN_BOOK_LINE_BYTES
+        * crate::depth_stage::STAGED_BOOK_ROW_BYTES
+        + DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
+
+const _: () = assert!(
+    MAX_DEPTH_STAGED_SPARE_RAM_BYTES
+        >= 2 * (crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE
+            * crate::depth_stage::STAGED_BOOK_ROW_BYTES
+            + crate::depth_stage::DEPTH_STAGED_VALUES_PRESIZE * 8),
+    "a pre-sized staged batch must always be recycled"
+);
+const _: () = assert!(
+    DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES,
+    "the recycle bound covers the flush trigger plus a crossing frame"
+);
+
+/// Clears a spent staged batch ON THE CALLING THREAD (the writer or rescue
+/// thread: its pins are dropped here) and offers it to the drain's spare
+/// lane. `try_send`, never a wait; a refused or oversized batch is dropped
+/// here. O(pins).
+fn recycle_staged(
+    lane: Option<&std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    staged: &mut crate::depth_stage::DepthStagedBatch,
+) {
+    let mut spent = std::mem::take(staged);
+    spent.clear();
+    let Some(lane) = lane else {
+        return;
+    };
+    let ram = spent.ram_bytes();
+    if ram == 0 || ram > MAX_DEPTH_STAGED_SPARE_RAM_BYTES {
+        return;
+    }
+    // Full or disconnected: dropped here, never waited on.
+    let _dropped_if_refused = lane.try_send(spent);
+}
+
+/// A rescued depth payload is APPLIED from the WAL's point of view — the spill
+/// tier is durable and re-ingestable — and a failed rescue is the one arm where
+/// captured frames genuinely need the next replay.
+/// See `note_rescue_outcome_ticks`: only the writer thread's own rescue is in
+/// order with the queue; a producer-side or rescue-thread landing acks nothing.
+///
+/// PR RD (RD-3, 2026-11-08): a batch that landed nowhere is also marked in
+/// the deferred-depth table (every bucket of its range, both kinds) BEFORE
+/// it is counted, so the after-close pass writes its rows back from the WAL
+/// and the prunes keep its segment until then. That is what lets a replay
+/// confirm archive a segment whose TICKS landed while its depth did not
+/// (measured 7 Nov and at the 8 Nov Muhurat boot: the same 5 segments
+/// re-offered on every boot because depth rows met a full spill). A range the
+/// table cannot hold counts as an undeferred loss and holds the segment as
+/// before. The unapplied mark is unchanged. O(buckets in the range), at most
+/// `DEFERRED_BUCKETS`, on a rescue failure only.
+pub(crate) fn note_rescue_outcome_depth(landed: bool, range: (u64, u64), in_order: bool) {
+    let wm = crate::wal_applied_watermark::applied_watermark();
+    if landed {
+        if in_order {
+            wm.note_depth_acked(range.1);
+        }
+    } else {
+        wm.note_unapplied_range(range.0, range.1);
+        let deferred =
+            crate::wal_deferred_depth::lost_depth_marks().defer_lost_range(range.0, range.1);
+        wm.note_unlanded_depth(deferred);
+    }
+}
+
+/// The depth rescue write itself — the part that touches the disk.
+///
+/// Returns `true` when the payload LANDED, so the inline caller can keep its
+/// `rescued` accounting exactly as it was before the split. Extracted so the
+/// SAME code serves the thread and the fallback; two copies would have drifted,
+/// and the one that drifted would have been the fallback — the path that only
+/// runs on the worst day.
+fn perform_depth_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    version: u8,
+    feed: Feed,
+    rows: usize,
+    min_free_headroom_bytes: u64,
+    sync: Option<crate::tick_persistence::SpillSyncFn>,
+    fate: &'static str,
+) -> bool {
+    let payload_len = payload.len();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    match spill_failed_depth_ilp(
+        spill_dir,
+        payload,
+        version,
+        feed,
+        now,
+        depth_spill_max_bytes(),
+        min_free_headroom_bytes,
+        sync,
+    ) {
+        Ok(path) => {
+            // BOTH counters, and the EMF-shipped one is not optional: it is the
+            // only depth series an alarm watches, so incrementing only the new
+            // name would divert the common flush failure off the pager that
+            // exists for it.
+            metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                rescued = rows,
+                source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
+                bytes = payload_len,
+                path = %path.display(),
+                "market_depth flush failed — the buffered levels were RESCUED to the \
+                 depth spill file named here, not lost. They are NOT in QuestDB yet. \
+                 Re-ingest is one command and is safe to repeat, because the depth \
+                 dedup key carries depth_kind and capture_seq: \
+                 curl --data-binary @<path> http://<questdb>:9000/write"
+            );
+            true
+        }
+        Err(err) => {
+            // The rescue itself failed — cap reached, disk full, or no
+            // permission. Count it as the genuine unrecoverable loss it is.
+            if err.kind() == std::io::ErrorKind::StorageFull {
+                metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "cap")
+                    .increment(1);
+            } else {
+                metrics::counter!("tv_depth_spill_write_errors_total", "stage" => "write")
+                    .increment(1);
+            }
+            metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed.as_str())
+                .increment(rows as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                dropped = rows,
+                fate,
+                cap_bytes = depth_spill_max_bytes(),
+                spill_dir = %spill_dir.display(),
+                spill_error = %err,
+                "market_depth flush failed AND the depth spill rescue also failed — \
+                 these levels are in neither QuestDB nor the spill. \
+                 fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                 their frames to the kernel, so the next boot's replay re-inserts them \
+                 unless the host crashes before the device sync; \
+                 fate=deferred_if_wal_flushes means they are re-inserted only if the WAL \
+                 writer flushes those frames (a rise in \
+                 tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                 fate=lost means no write-ahead-log record backs them and they are gone."
+            );
+            false
+        }
+    }
+}
+/// How much un-handed-off ILP text the depth PRODUCER may hold before it
+/// rescues to the spill tier.
+///
+/// When the queue is full the drain keeps its buffer and keeps appending --
+/// that is the whole point, the rows are neither lost nor reported as lost.
+/// But "keep appending forever" is an unbounded memory path, and this
+/// repository's own complexity table records five uncapped maps found the hard
+/// way. Past this ceiling the producer stops accumulating and rescues, which is
+/// durable, counted, and re-ingestable -- the same tier a failed flush uses.
+///
+/// This is the SECONDARY bound; [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] is the
+/// primary one and cuts far earlier. It exists so that a pathological append
+/// rate cannot reach the questdb-rs wedge inside two spans -- which on THIS
+/// path is a real possibility rather than a theoretical one, because a single
+/// depth-200 snapshot is 400 rows and a burst can add them faster than any
+/// span-based bound can react.
+pub const MAX_DEPTH_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// The queue is bounded in COUNT; this bounds it in BYTES.
+///
+/// `DEPTH_FLUSH_QUEUE_DEPTH` slots each holding up to
+/// `MAX_DEPTH_PRODUCER_BUFFER_BYTES` is 128 MiB that can be in flight to the
+/// writer at once, and until now that product was asserted NOWHERE — the two
+/// constants could be raised independently and nothing would notice until the
+/// host did. This is the exact pair that reached 4,004,164,571 bytes in a
+/// single slot on 2026-09-02 and OOM-killed the process ten times in a loop;
+/// the per-batch size trigger fixed the cause, and this fixes the arithmetic
+/// that let the cause exist.
+///
+/// The ceiling is deliberately the SAME `QUESTDB_MAX_BUF_SIZE_BYTES` the
+/// per-buffer assert uses, because a queue that can hold more bytes than the
+/// database will ever accept in one request is holding rows it cannot deliver.
+const _: () = assert!(
+    DEPTH_FLUSH_QUEUE_DEPTH * MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES * 2,
+    "the depth offload queue can hold more bytes in flight than twice QuestDB's \
+     maximum request buffer — raise one of these deliberately, with a memory \
+     figure, or lower the other"
+);
+
+// Same headroom rule as the tick path: the producer ceiling must sit at or
+// below half the questdb-rs `max_buf_size` wedge, or the rescue arm only fires
+// after every flush is already failing permanently -- making the rescue path
+// unreachable exactly when it is needed.
+const _: () = assert!(
+    MAX_DEPTH_PRODUCER_BUFFER_BYTES * 2 <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES,
+    "the depth producer ceiling must sit at or below half the questdb-rs max_buf_size wedge"
+);
+
+/// How many consecutive flush spans the depth producer may RETAIN before it
+/// stops accumulating and spills.
+///
+/// TWO, matching the tick path. The queue already absorbs
+/// [`DEPTH_FLUSH_QUEUE_DEPTH`] batches before the producer ever sees a full
+/// queue, so the honest absorption is that depth plus this; a cap of one would
+/// spill on the first hiccup.
+///
+/// Commit WIDTH matters less here than it does for ticks -- a depth snapshot is
+/// stamped at capture, so it does not reopen closed partitions the way the 10%
+/// of ticks whose exchange timestamp is over an hour behind arrival do -- but
+/// the bound is kept identical anyway. A writer that batches more aggressively
+/// under pressure is exactly the own-goal the tick change was measured against,
+/// and adopting a looser number here on an unmeasured hunch is how that lesson
+/// gets relearned.
+pub const MAX_DEPTH_RETAINED_FLUSH_SPANS: u32 = 2;
+
+/// One handed-off depth ILP payload, in flight between the drain and the
+/// writer thread.
+///
+/// Deliberately opaque, like its tick counterpart: the drain must not be able
+/// to inspect, re-order, or partially consume a batch, because the only correct
+/// thing to do with one is hand it to the network or rescue the whole thing.
+pub struct DepthFlushBatch {
+    buffer: Buffer,
+    /// PF-4b: a book writer's staged rows; the writer thread writes them as
+    /// text before the POST. Empty for a level writer.
+    staged: crate::depth_stage::DepthStagedBatch,
+    rows: usize,
+    /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
+}
+
+impl DepthFlushBatch {
+    /// Rows this batch covers.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload tests below.
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// `true` when some row has no WAL record behind it, so it cannot be
+    /// replayed if this batch is lost. The shutdown join counts such rows as
+    /// lost when it abandons the depth writer thread (2026-11-07, the depth
+    /// twin of the tick `FlushBatch::has_unbacked_rows`). O(1).
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by a_sent_depth_batch_takes_the_unbacked_mark_with_it and the app's abandoned-depth-writer regression test.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+}
+
+/// What happened to a depth batch the producer tried to hand off.
+///
+/// Four arms and not a `Result`, because [`DepthOffloadOutcome::QueueFull`] is
+/// NOT a failure and must never be logged or counted as one: the rows are still
+/// held, still pending, and go out on the next flush. Collapsing it into `Err`
+/// is precisely how a backpressure signal becomes a false loss report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DepthOffloadOutcome {
+    /// Handed to the writer thread. The rows are no longer the drain's.
+    Sent(usize),
+    /// The writer is behind. Rows RETAINED by the producer, nothing lost.
+    QueueFull(usize),
+    /// The writer stayed behind long enough that retaining further would widen
+    /// the commit past [`MAX_DEPTH_RETAINED_FLUSH_SPANS`] or breach
+    /// [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`]. Rows rescued to the spill tier
+    /// rather than accumulated.
+    ///
+    /// Its own arm and not `SinkGone`, because the writer is alive and well --
+    /// reporting "the writer thread is gone" here would send an operator to
+    /// diagnose a thread that is running fine.
+    WidthCapped(usize),
+    /// The writer thread is gone. Rows rescued to the spill tier.
+    SinkGone(usize),
+}
+
+/// The network half of a split [`DepthWriter`] -- owns the ILP `Sender`.
+///
+/// Lives on its own OS thread. It never touches the aggregator, the ring, or
+/// anything the drain owns, which is the entire reason the split exists: a
+/// five-second ILP timeout now blocks a thread whose only job is waiting, not
+/// the thread that must keep emptying the socket.
+pub struct DepthWriterSink {
+    sender: Option<Sender>,
+    feed: Feed,
+    spill_dir: PathBuf,
+    spill_min_free_headroom: u64,
+    /// Return lane for spent buffers — see [`DepthWriterSink::return_spare_buffer`].
+    spare_return: Option<std::sync::mpsc::SyncSender<Buffer>>,
+    /// PF-4b: return lane for spent staged batches (cleared on this thread).
+    staged_return: Option<std::sync::mpsc::SyncSender<crate::depth_stage::DepthStagedBatch>>,
+    /// PF-4b: the text buffer a book batch is written into before the POST,
+    /// reused across batches (reserved to the book pre-size on first use).
+    scratch: Buffer,
+    /// Rescue-arm counter handles, resolved once at the split (item 44g).
+    counters: DepthSinkCounters,
+    /// The producer's live table gate and its layout's table, copied at the
+    /// split (B1).
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    gate_tables: &'static [crate::ilp_table_gate::GatedTable],
+}
+
+/// Flush-path counter handles for the depth PRODUCER half, resolved once per
+/// writer (2026-09-22, item 44g).
+///
+/// Same mechanism as `OutOfWindowCounters`: a `feed` label taken from a
+/// variable drops the `metrics!` macro to its allocating arm (a fresh label
+/// vector plus a registry probe per call). The hand-off counter fired on EVERY
+/// depth flush, on the drain task. Names and labels are exactly the ones the
+/// call sites used before; the seeding in [`register_depth_drop_baseline`] is
+/// untouched.
+#[derive(Debug, Clone)]
+struct DepthFlushCounters {
+    offloaded: metrics::Counter,
+    queue_full: metrics::Counter,
+    width_capped: metrics::Counter,
+    rescue_queued: metrics::Counter,
+    rescue_fallback_queue_full: metrics::Counter,
+    rescue_fallback_thread_gone: metrics::Counter,
+    /// Depth rows parked in RAM by the drain (H4).
+    rescue_parked: metrics::Counter,
+    /// Depth ILP bytes parked in RAM right now (H4).
+    rescue_parked_bytes: metrics::Gauge,
+    /// Rows handed to the capture-at-receipt WAL instead of an inline spill
+    /// write on the drain (2026-09-26 audit fix PR3).
+    rescue_deferred_to_wal: metrics::Counter,
+    /// `tv_depth_rows_dropped_total`, pre-resolved for the deferral arm.
+    rows_dropped: metrics::Counter,
+    /// PF-4b: a staged book batch grew past its pre-size (one reallocation
+    /// on the drain; local `/metrics` only, no alarm).
+    stage_grow: metrics::Counter,
+    /// PF-4b: a ninth name table cut a staged batch early (local only).
+    stage_pin_cut: metrics::Counter,
+    /// Hand-offs that found no staged spare waiting (or a smaller one) and
+    /// reserved and touched a fresh pre-sized batch on the drain
+    /// (2026-11-16, `tv_depth_stage_presize_fresh_total`, local `/metrics`
+    /// only). One relaxed add on that branch only.
+    stage_presize_fresh: metrics::Counter,
+    /// The same count kept on the writer, so a test can read it without a
+    /// recorder.
+    stage_presize_fresh_count: u64,
+}
+
+impl DepthFlushCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            offloaded: metrics::counter!("tv_depth_flush_offloaded_total", "feed" => feed),
+            queue_full: metrics::counter!("tv_depth_flush_queue_full_total", "feed" => feed),
+            width_capped: metrics::counter!("tv_depth_flush_width_capped_total", "feed" => feed),
+            rescue_queued: metrics::counter!(DEPTH_RESCUE_QUEUED_COUNTER, "feed" => feed),
+            rescue_fallback_queue_full: metrics::counter!(
+                DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "queue_full"
+            ),
+            rescue_fallback_thread_gone: metrics::counter!(
+                DEPTH_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "thread_gone"
+            ),
+            rescue_parked: metrics::counter!(DEPTH_RESCUE_PARKED_COUNTER, "feed" => feed),
+            rescue_parked_bytes: metrics::gauge!(DEPTH_RESCUE_PARKED_BYTES_GAUGE, "feed" => feed),
+            // Literal, not the const, so the shipped-metrics guard can see it.
+            rescue_deferred_to_wal: metrics::counter!(
+                "tv_depth_rescue_deferred_to_wal_total",
+                "feed" => feed
+            ),
+            rows_dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
+            stage_grow: metrics::counter!("tv_depth_stage_grow_total", "feed" => feed),
+            stage_pin_cut: metrics::counter!("tv_depth_stage_pin_cut_total", "feed" => feed),
+            // 2026-11-16: registered at 0 when the writer is built (boot).
+            stage_presize_fresh: {
+                let c = metrics::counter!("tv_depth_stage_presize_fresh_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_presize_fresh_count: 0,
+        }
+    }
+}
+
+/// Rescue-arm counter handles for the depth writer-thread half (item 44g).
+/// `dropped` and `spilled` move together on a landed rescue and `dropped`
+/// alone on a failed one — the `dropped == spilled` proof is unchanged.
+#[derive(Debug, Clone)]
+struct DepthSinkCounters {
+    dropped: metrics::Counter,
+    spilled: metrics::Counter,
+    spill_error_cap: metrics::Counter,
+    spill_error_write: metrics::Counter,
+}
+
+impl DepthSinkCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            dropped: metrics::counter!("tv_depth_rows_dropped_total", "feed" => feed),
+            spilled: metrics::counter!("tv_depth_rows_spilled_total", "feed" => feed),
+            spill_error_cap: metrics::counter!(
+                "tv_depth_spill_write_errors_total",
+                "stage" => "cap"
+            ),
+            spill_error_write: metrics::counter!(
+                "tv_depth_spill_write_errors_total",
+                "stage" => "write"
+            ),
+        }
+    }
+}
+
+impl DepthWriterSink {
+    /// Writes one batch. Returns the rows that actually LANDED in QuestDB.
+    ///
+    /// Zero on any failure -- the same contract `DepthWriter::flush` has, and
+    /// for the same reason: the caller reports feed health from this number, so
+    /// a failed write must decay health rather than forge it.
+    ///
+    /// A failure rescues the payload to the depth spill tier through the same
+    /// counters and the same coded error `discard_pending` uses, so an operator
+    /// sees no difference between a synchronous and an offloaded rescue.
+    ///
+    /// The single retry of the synchronous path is deliberately NOT reproduced
+    /// here. That retry exists because the synchronous flush ran on the drain
+    /// and a discarded buffer was the cheaper of two bad options; off the drain
+    /// the rescue tier is strictly better than a retry -- it is durable,
+    /// counted, and re-ingestable, and it cannot stall anything. Keeping the
+    /// retry would have carried a drain-shaped mitigation onto a thread that no
+    /// longer has a drain to protect.
+    pub fn write(&mut self, batch: &mut DepthFlushBatch) -> usize {
+        // PF-4b: a book batch's staged rows become text HERE, before the
+        // POST and before any ack or rescue; a refused row is counted here
+        // and leaves the batch's row count.
+        let swapped = self.encode_staged(batch);
+        let landed = self.write_inner(batch);
+        if swapped {
+            // The scratch comes back to this sink, emptied; the batch keeps
+            // the empty buffer it arrived with.
+            std::mem::swap(&mut batch.buffer, &mut self.scratch);
+            self.scratch.clear();
+            // PF-4b review round 2: a batch past the pre-size (a burst of
+            // depth-200 rows) grew the scratch; keep it at most the pre-size
+            // so the burst's memory is freed here, on the writer thread, and
+            // the next book batch reserves the pre-size again.
+            if self.scratch.capacity() > DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+                self.scratch = Buffer::new(DepthLayout::Book.protocol());
+            }
+        }
+        // The batch is DONE — landed or rescued — whatever the outcome. This
+        // is what the replay confirm waits on, and the watermark file is
+        // refreshed from here at most once a second, off the drain.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        wm.note_depth_completed();
+        wm.persist_if_due_now();
+        // Item 45a: shed-depth marks ride the same once-a-second cadence.
+        crate::wal_deferred_depth::deferred_depth().persist_if_due_now();
+        self.return_spare_buffer(batch);
+        landed
+    }
+
+    /// Hands the batch's spent buffer back to the producer for reuse
+    /// (2026-09-22, item 44g). Called by [`DepthWriterSink::write`] once the
+    /// batch is done; `pub` only so the zero-allocation gate can drive the
+    /// recycle loop without a live QuestDB.
+    ///
+    /// Never blocks and never returns an unbounded buffer. The spent buffer is
+    /// dropped instead of returned when:
+    /// - this sink was not built by a split (no return lane);
+    /// - capacity above [`MAX_DEPTH_PRODUCER_BUFFER_BYTES`] — a burst-sized
+    ///   buffer kept as a spare would pin that memory for the session;
+    /// - the return lane is full — the producer already has spares;
+    /// - the producer is gone — nobody to return to.
+    ///
+    /// The buffer is cleared before it leaves, so a spare can never carry a
+    /// row into the next batch.
+    pub fn return_spare_buffer(&self, batch: &mut DepthFlushBatch) {
+        // PF-4b: the staged allocation goes back on its own lane, cleared
+        // here (pins dropped on this thread, never on the drain).
+        recycle_staged(self.staged_return.as_ref(), &mut batch.staged);
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        if batch.buffer.protocol_version() != DepthLayout::Levels.protocol()
+            || batch.buffer.capacity() == 0
+        {
+            // PF-4b review round 1: a BOOK writer never reads this lane (its
+            // batches are staged), so a text buffer a cold path grew
+            // (`materialize_staged`, the unsplit synchronous flush) and that
+            // rode a later batch here is dropped on THIS thread instead of
+            // sitting in the lane for the life of the process.
+            return;
+        }
+        let protocol = batch.buffer.protocol_version();
+        // `Buffer::new` does not allocate (its `Vec` starts empty).
+        let mut spent = std::mem::replace(&mut batch.buffer, Buffer::new(protocol));
+        if spent.capacity() > MAX_DEPTH_PRODUCER_BUFFER_BYTES {
+            return;
+        }
+        spent.clear();
+        // Full or disconnected: the buffer is dropped here, never waited on.
+        let _dropped_if_refused = spare_return.try_send(spent);
+    }
+
+    /// PF-4b: writes a book batch's staged rows as text, through the
+    /// unchanged line writer, into this sink's reusable scratch, swapped into
+    /// the batch so every later step (the POST, the retry, the rescue) reads
+    /// `batch.buffer` exactly as before. Returns whether the swap happened
+    /// (the caller swaps back). A row the encoder refuses is counted here,
+    /// before the ack or the rescue, and its levels leave `batch.rows`.
+    /// O(batch bytes), on the writer thread.
+    fn encode_staged(&mut self, batch: &mut DepthFlushBatch) -> bool {
+        if batch.staged.is_empty() {
+            return false;
+        }
+        // A book batch arrives with an empty text buffer; if it ever does
+        // not, the rows are appended after its text, never in place of it.
+        let swapped = batch.buffer.as_bytes().is_empty();
+        if swapped {
+            if self.scratch.capacity() < DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES {
+                // Once per sink: reserved from empty, so exactly the size.
+                self.scratch = Buffer::new(DepthLayout::Book.protocol());
+                self.scratch.reserve(DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES);
+            }
+            std::mem::swap(&mut batch.buffer, &mut self.scratch);
+        }
+        let _written = batch.staged.encode_into(self.feed, &mut batch.buffer);
+        batch.rows = batch.rows.saturating_sub(batch.staged.refused_levels());
+        swapped
+    }
+
+    fn write_inner(&mut self, batch: &mut DepthFlushBatch) -> usize {
+        if batch.rows == 0 {
+            return 0;
+        }
+        // B1 (2026-11-13): never post into a table this process has not keyed
+        // (QuestDB would create it in a shape that can never take the key).
+        if self.sender.is_some() && !(self.table_gate)(self.gate_tables) {
+            crate::ilp_table_gate::note_live_batch_held("market_depth");
+            self.rescue(batch, "table not keyed yet (boot DDL refused)");
+            return 0;
+        }
+        let Some(sender) = self.sender.as_mut() else {
+            self.rescue(batch, "no ILP sender (QuestDB unreachable)");
+            return 0;
+        };
+        // 2026-09-03: the SAME bounded retry the synchronous path above has
+        // carried since 2026-08-25 — ported here because the synchronous path
+        // is no longer the one that runs.
+        //
+        // That retry was written for `io: Interrupted system call (os error 4)`
+        // costing 8,810 rows on 2026-08-25. Three days later `split_for_offload`
+        // moved every production depth flush onto this thread, and this arm
+        // shipped without it. So the fix has been sitting on the path that was
+        // superseded, and MEASURED on 2026-09-03 the live cost of its absence
+        // was 41,204 coded flush failures in one session, every one reading
+        // `Connection reset by peer (os error 104)` — the identical transport
+        // class, and one the buffer survives intact.
+        //
+        // Retrying is idempotent BY CONSTRUCTION here, which is what makes one
+        // attempt safe rather than merely cheap: `DEDUP_KEY_MARKET_DEPTH`
+        // carries `capture_seq`, unique per received frame, so a first POST
+        // that actually landed before the reset is collapsed by the same
+        // mechanism that makes the operator's manual re-ingest safe to repeat.
+        //
+        // Bounded at ONE, and gated on the first failure being FAST, for the
+        // reason the sync path records — with the thread changed but the
+        // arithmetic intact. `request_timeout` is 5,000 ms; an unconditional
+        // retry makes the worst case ten seconds. This thread is not the
+        // drain, so that no longer stalls the socket — but at
+        // `DEPTH_FLUSH_QUEUE_DEPTH` = 4 and batches arriving several times a
+        // second it overflows the hand-off queue, and the producer then
+        // rescues rows the retry was supposed to save. A reset returns in
+        // microseconds; a timeout consumes the whole budget. The window
+        // separates them with three orders of magnitude to spare.
+        let started = std::time::Instant::now();
+        let first = sender.flush(&mut batch.buffer);
+        let first_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if flush_failure_is_retryable(&err)
+                    && first_elapsed < DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                metrics::counter!(
+                    "tv_depth_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                sender.flush(&mut batch.buffer)
+            }
+            Err(err) => {
+                if flush_failure_is_retryable(&err) {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_depth_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                let landed = batch.rows;
+                batch.rows = 0;
+                // ACKED by QuestDB: every captured frame up to this sequence
+                // has its depth rows in the database.
+                crate::wal_applied_watermark::applied_watermark().note_depth_acked(batch.max_seq);
+                landed
+            }
+            Err(err) => {
+                let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
+                self.rescue(batch, &why);
+                0
+            }
+        }
+    }
+
+    /// Rescues a batch the network refused, exactly as `discard_pending` does.
+    fn rescue(&mut self, batch: &mut DepthFlushBatch, why: &str) {
+        let rows = batch.rows;
+        if rows == 0 {
+            return;
+        }
+        let payload_len = batch.buffer.as_bytes().len();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        match spill_failed_depth_ilp(
+            &self.spill_dir,
+            batch.buffer.as_bytes(),
+            spill_version_of(batch.buffer.protocol_version()),
+            self.feed,
+            now,
+            depth_spill_max_bytes(),
+            self.spill_min_free_headroom,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+        ) {
+            Ok(path) => {
+                note_rescue_outcome_depth(true, (batch.min_seq, batch.max_seq), true);
+                self.counters.dropped.increment(rows as u64);
+                self.counters.spilled.increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    rescued = rows,
+                    source = crate::tick_persistence::RESCUED_TO_SPILL_SOURCE,
+                    bytes = payload_len,
+                    reason = why,
+                    path = %path.display(),
+                    "offloaded market_depth flush failed — the levels were RESCUED to the \
+                     depth spill file named here, not lost. They are NOT in QuestDB yet. \
+                     Re-ingest is one command and is safe to repeat, because the depth \
+                     dedup key carries depth_kind and capture_seq: \
+                     curl --data-binary @<path> http://<questdb>:9000/write"
+                );
+            }
+            Err(err) => {
+                note_rescue_outcome_depth(false, (batch.min_seq, batch.max_seq), true);
+                if err.kind() == std::io::ErrorKind::StorageFull {
+                    self.counters.spill_error_cap.increment(1);
+                } else {
+                    self.counters.spill_error_write.increment(1);
+                }
+                self.counters.dropped.increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = rows,
+                    reason = why,
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.max_seq,
+                        batch.unbacked,
+                    ),
+                    min_seq = batch.min_seq,
+                    max_seq = batch.max_seq,
+                    cap_bytes = depth_spill_max_bytes(),
+                    spill_dir = %self.spill_dir.display(),
+                    spill_error = %err,
+                    "offloaded market_depth flush failed AND the depth spill rescue also \
+                     failed — these levels are in neither QuestDB nor the spill. \
+                     fate=deferred_to_wal_replay means the WAL writer had already flushed \
+                     their frames to the kernel, so the next boot's replay re-inserts \
+                     them unless the host crashes before the device sync; \
+                     fate=deferred_if_wal_flushes means they are re-inserted only if the \
+                     WAL writer flushes those frames (a rise in \
+                     tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                     fate=lost means no write-ahead-log record backs them and they are gone."
+                );
+            }
+        }
+        batch.buffer.clear();
+        batch.rows = 0;
+    }
+}
 #[cfg(test)]
 mod tests {
+    // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
+
+    /// The WAL flushed everything and lost nothing: deferral as before.
+    fn wal_has_it(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, u64::MAX, 0)
+    }
+
+    /// The WAL writer has flushed nothing yet.
+    fn wal_not_flushed(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, 0, 0)
+    }
+
+    /// The WAL writer lost a record at the batch's oldest frame.
+    fn wal_lost_one(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(
+            min_seq,
+            max_seq,
+            unbacked,
+            u64::MAX,
+            min_seq,
+        )
+    }
+
+    fn j1_assert_inline_spill(check: fn(u64, u64, bool) -> bool, tag: &str) {
+        let dir = spill_tmp(tag);
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(check);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // thread gone -> the fallback arms
+        // A real frame base (row() carries base 0).
+        let r = DepthRow {
+            capture_seq: 1 << 30,
+            ..row()
+        };
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "{tag}: rows the WAL may not hold must be spilled inline, never deferred"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j1_depth_rescue_spills_inline_when_the_wal_has_not_flushed_the_rows() {
+        j1_assert_inline_spill(wal_not_flushed, "j1-depth-not-flushed");
+    }
+
+    #[test]
+    fn j1_depth_rescue_spills_inline_when_the_wal_lost_a_record_in_the_batch() {
+        j1_assert_inline_spill(wal_lost_one, "j1-depth-lost");
+    }
+
+    /// Production wiring: every constructor uses the real WAL check.
+    #[test]
+    fn j1_every_depth_constructor_wires_the_real_wal_defer_check() {
+        let source = include_str!("depth_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert_eq!(
+            prod.matches("wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,")
+                .count(),
+            prod.matches("pending_unbacked: false,").count(),
+            "each constructor sets the real check"
+        );
+        assert!(
+            prod.contains(
+                "rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked)"
+            )
+        );
+    }
+
+    // ---- Audit DB-8 (2026-10-11): a failed depth rescue names its fate ----
+
+    #[test]
+    fn test_depth_rescue_failure_log_carries_fate_and_no_blanket_lost_claim() {
+        let source = include_str!("depth_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert!(!prod.contains(concat!("nothing re-", "inserts")));
+        assert!(!prod.contains(concat!("permanently ", "lost and nothing")));
+        assert!(
+            prod.contains(
+                "                    fate = crate::wal_applied_watermark::rescue_failure_fate(\n"
+            ),
+            "the writer-thread arm reports the fate"
+        );
+        assert!(
+            prod.contains(
+                "                fate,\n                cap_bytes = depth_spill_max_bytes(),"
+            ),
+            "the shared depth rescue arm reports the fate"
+        );
+    }
+
+    #[test]
+    fn test_depth_rescue_batch_carries_unbacked() {
+        let dir = spill_tmp("db8-depth-unbacked");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(!batch.unbacked, "a WAL-sequenced depth row is backed");
+        assert!(!batch.has_unbacked_rows(), "the accessor reads the mark");
+        assert_ne!(batch.min_seq, 0);
+        sink.rescue(&batch);
+
+        w.mark_pending_unbacked();
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(batch.unbacked, "a frame the WAL refused is unbacked");
+        assert!(batch.has_unbacked_rows(), "the accessor reads the mark");
+        assert_eq!(batch.rows(), 1);
+        sink.rescue(&batch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retry window must be far above an interrupted syscall and far below
+    /// The named timeout and the conf literal must never drift apart.
+    ///
+    /// [`ILP_REQUEST_TIMEOUT_SECS`] exists so the shutdown budget can reason
+    /// about how long a tail flush may block before the offload join starts. If
+    /// someone raises the conf literal and leaves the constant behind, that
+    /// reasoning silently becomes wrong and the lane's join gets abandoned
+    /// mid-flight again — the exact failure the budget assert was added to
+    /// prevent, arriving through the one door the assert cannot watch.
+    ///
+    /// Source-scanned for the same reason the retry-window test below is: the
+    /// number that matters is the LITERAL, so a change to it must invalidate
+    /// this test rather than be papered over by a fixture.
+    #[test]
+    fn ilp_request_timeout_matches_the_conf_literal() {
+        let src = include_str!("depth_persistence.rs");
+        let expected = format!("request_timeout={}", ILP_REQUEST_TIMEOUT_SECS * 1000);
+        assert!(
+            src.contains(&expected),
+            "ILP_REQUEST_TIMEOUT_SECS ({ILP_REQUEST_TIMEOUT_SECS}s) implies the conf \
+             literal `{expected}`, which is not present. The shutdown budget in main.rs \
+             derives its margin from this constant, so a drift here makes that budget \
+             wrong without failing anything else."
+        );
+    }
+
+    /// the sender's own request timeout — that gap is the whole reason a clock
+    /// can separate two failures the error class cannot.
+    /// The classifier decides whether a failed flush is worth one more
+    /// attempt. It must say YES to the transport class and NO to everything
+    /// else — a payload QuestDB refused on its merits is refused twice as
+    /// readily as once, and retrying it turns one rejection into two.
+    #[test]
+    fn flush_failure_is_retryable_matches_the_transport_class_only() {
+        use questdb::{Error, ErrorCode};
+
+        // The class that cost 8,810 rows to an EINTR on 2026-08-25 and
+        // 58,746 rescued tick batches to a peer reset on 2026-09-03. The
+        // buffer survives both, so a second attempt sends the same bytes.
+        assert!(
+            flush_failure_is_retryable(&Error::new(
+                ErrorCode::SocketError,
+                "io: Connection reset by peer (os error 104)",
+            )),
+            "a connection reset must be retried — it is the measured live class"
+        );
+        assert!(
+            flush_failure_is_retryable(&Error::new(
+                ErrorCode::SocketError,
+                "io: Interrupted system call (os error 4)",
+            )),
+            "an EINTR must be retried — the 2026-08-25 class"
+        );
+
+        // Everything else is the server's considered answer, or our own bug.
+        for (code, why) in [
+            (
+                ErrorCode::ServerFlushError,
+                "the server read the payload and rejected it; resending is not a fix",
+            ),
+            (
+                ErrorCode::InvalidApiCall,
+                "our own misuse — a retry repeats the mistake",
+            ),
+            (
+                ErrorCode::InvalidTimestamp,
+                "a bad row is bad on the second attempt too",
+            ),
+            (
+                ErrorCode::AuthError,
+                "credentials do not improve by being used again",
+            ),
+            (
+                ErrorCode::ConfigError,
+                "configuration is not a transient condition",
+            ),
+        ] {
+            assert!(
+                !flush_failure_is_retryable(&Error::new(code, "x")),
+                "{code:?} must NOT be retried: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_retry_window_sits_between_an_eintr_and_the_request_timeout() {
+        // Source-scanned rather than built from a config fixture: the number
+        // the window is reasoned against is the LITERAL in `depth_ilp_http_conf`,
+        // and a change to it must invalidate this test.
+        let src = include_str!("depth_persistence.rs");
+        assert!(
+            src.contains("request_timeout=5000"),
+            "the retry window is reasoned against a 5,000 ms request timeout; if that \
+             literal moved, re-derive the window instead of re-blessing this test"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS < 5_000,
+            "a window at or above the request timeout would allow the retry after a \
+             timeout, doubling a 5s stall on the drain task to 10s"
+        );
+        assert!(
+            DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW_MS >= 100,
+            "a window this tight would refuse the EINTR retry the 2026-08-25 8,810-row \
+             loss is the evidence for"
+        );
+    }
     use super::*;
+    // -----------------------------------------------------------------------
+    // Pre-checked ILP names (2026-10-30): same bytes as the checked API
+    // -----------------------------------------------------------------------
+
+    /// Every table column name the two depth writers put on a line.
+    const DEPTH_ILP_COLUMN_NAMES: [&str; 12] = [
+        "segment",
+        "depth_kind",
+        "side",
+        "feed",
+        "contract",
+        "security_id",
+        "level",
+        // `market_depth_book` writes `price`, `quantity` and `orders` as array
+        // columns under the same names.
+        "price",
+        "quantity",
+        "orders",
+        "capture_seq",
+        "levels",
+    ];
+
+    /// A session-window arrival stamp (10:00 IST on 2026-10-29), so the
+    /// writer's window gate never refuses the rows these tests compare.
+    const PRECHECKED_TS_NANOS: i64 = 1_793_268_000_000_000_000;
+
+    /// The `market_depth` line exactly as the writer built it before
+    /// 2026-10-30: every name passed as a `&str`, so QuestDB checks it.
+    fn checked_level_line(buf: &mut Buffer, row: &DepthRow, feed: &str, contract: Option<&str>) {
+        buf.table(MARKET_DEPTH_TABLE)
+            .and_then(|b| b.symbol("segment", row.segment))
+            .and_then(|b| b.symbol("depth_kind", row.depth_kind))
+            .and_then(|b| b.symbol("side", row.side))
+            .and_then(|b| b.symbol("feed", feed))
+            .expect("symbols");
+        if let Some(name) = contract {
+            buf.symbol("contract", name).expect("contract");
+        }
+        buf.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_i64("level", row.level))
+            .and_then(|b| b.column_f64("price", row.price))
+            .and_then(|b| b.column_i64("quantity", row.quantity))
+            .and_then(|b| b.column_i64("orders", row.orders))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_nanos)))
+            .expect("fields");
+    }
+
+    /// The `market_depth_book` line exactly as the writer built it before
+    /// 2026-10-30.
+    fn checked_book_line(
+        buf: &mut Buffer,
+        row: &DepthBookRow<'_>,
+        feed: &str,
+        contract: Option<&str>,
+    ) {
+        buf.table(MARKET_DEPTH_BOOK_TABLE)
+            .and_then(|b| b.symbol("segment", row.segment))
+            .and_then(|b| b.symbol("depth_kind", row.depth_kind))
+            .and_then(|b| b.symbol("side", row.side))
+            .and_then(|b| b.symbol("feed", feed))
+            .expect("symbols");
+        if let Some(name) = contract {
+            buf.symbol("contract", name).expect("contract");
+        }
+        let levels = i64::try_from(row.prices.len()).unwrap_or(i64::MAX);
+        buf.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_i64("levels", levels))
+            .and_then(|b| b.column_arr("price", &row.prices))
+            .and_then(|b| b.column_arr("quantity", &row.quantities))
+            .and_then(|b| b.column_arr("orders", &row.orders))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_nanos)))
+            .expect("fields");
+    }
+
+    /// A fresh buffer shaped exactly like the writer's own.
+    fn buffer_like(w: &DepthWriter) -> Buffer {
+        Buffer::new(w.buffer.protocol_version())
+    }
+
+    /// The contract name the writer resolved for its last row, if any.
+    fn resolved_contract(w: &DepthWriter) -> Option<String> {
+        if w.layout == DepthLayout::Book {
+            // PF-4b: the book run cache names a pinned TABLE; read the name
+            // the encoder will read from it.
+            let (id, seg, pin, _) = w.book_label?;
+            let table = w.staged.pinned_table(pin)?;
+            return table.get(&(id, seg)).map(|n| n.to_string());
+        }
+        w.contract_label
+            .as_ref()
+            .and_then(|(_, _, name)| name.as_deref().map(str::to_owned))
+    }
+
+    /// PF-4b: the book twin of injecting `contract_label`: pins a one-entry
+    /// name table for `(id, seg)` and points the book run cache at it.
+    fn set_book_contract_for_test(w: &mut DepthWriter, id: i64, seg: &'static str, name: &str) {
+        let mut labels = crate::candle_contract_labels::CandleContractLabels::default();
+        labels.insert((id, seg), std::sync::Arc::from(name));
+        let pin = w
+            .staged
+            .pin_table(std::sync::Arc::new(labels))
+            .expect("a free pin slot");
+        w.book_label = Some((
+            id,
+            seg,
+            pin,
+            Some(crate::depth_stage::escaped_symbol_len(name)),
+        ));
+    }
+
+    /// Every level of one packet, appended by the writer and by the checked
+    /// reference, must produce the same bytes.
+    fn assert_level_packet_bytes_match(
+        rows: &[DepthRow],
+        contract: Option<&str>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        if let (Some(name), Some(first)) = (contract, rows.first()) {
+            w.contract_label = Some((
+                first.security_id,
+                first.segment,
+                Some(std::sync::Arc::from(name)),
+            ));
+        }
+        let mut reference = buffer_like(&w);
+        for row in rows {
+            w.append_row(row).map_err(|e| {
+                proptest::test_runner::TestCaseError::fail(format!("append_row: {e:#}"))
+            })?;
+            let label = resolved_contract(&w);
+            checked_level_line(&mut reference, row, Feed::Dhan.as_str(), label.as_deref());
+        }
+        proptest::prop_assert_eq!(w.buffer_bytes(), reference.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn the_depth_ilp_names_pass_questdbs_own_name_checks() {
+        for name in DEPTH_ILP_COLUMN_NAMES {
+            assert!(ColumnName::new(name).is_ok(), "column name {name:?}");
+        }
+        for table in [MARKET_DEPTH_TABLE, MARKET_DEPTH_BOOK_TABLE] {
+            assert!(TableName::new(table).is_ok(), "table name {table:?}");
+        }
+    }
+
+    /// The release build's unchecked names would let an invalid literal
+    /// through; the debug check in `depth_col` is what stops it in tests.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "fails QuestDB's own name check")
+    )]
+    fn a_bad_depth_column_name_fails_every_debug_build() {
+        // Release intentionally skips validation; the valid-name and byte
+        // identity tests above still pin every production literal there.
+        assert_eq!(depth_col("bad,name").as_ref(), "bad,name");
+    }
+
+    #[test]
+    fn the_prechecked_writer_writes_the_same_bytes_as_the_checked_one() {
+        // One hand-picked row per edge: NaN, both infinities, negative zero,
+        // a negative price, the largest finite value, zero and level 200.
+        let prices = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.0,
+            -1.5,
+            f64::MAX,
+            0.0,
+            24_513.05,
+        ];
+        let rows: Vec<DepthRow> = prices
+            .iter()
+            .enumerate()
+            .map(|(i, &price)| DepthRow {
+                security_id: 52_175,
+                segment: "NSE_FNO",
+                depth_kind: DEPTH_KIND_200,
+                side: if i % 2 == 0 {
+                    DEPTH_SIDE_BID
+                } else {
+                    DEPTH_SIDE_ASK
+                },
+                level: if i == 7 {
+                    200
+                } else {
+                    i64::try_from(i).unwrap_or(0) + 1
+                },
+                price,
+                quantity: i64::from(u32::MAX),
+                orders: 0,
+                capture_seq: i64::MAX,
+                ts_nanos: PRECHECKED_TS_NANOS,
+            })
+            .collect();
+        assert_level_packet_bytes_match(&rows, None).expect("no contract");
+        assert_level_packet_bytes_match(&rows, Some("NIFTY-Nov2026-24500-CE")).expect("contract");
+
+        let price = [f64::NAN, 0.0, -1.0, f64::MAX];
+        let quantity = [0.0, f64::from(u32::MAX), 1.0, f64::NAN];
+        let orders = [0.0, 1.0, f64::NAN, f64::from(u32::MAX)];
+        let book = DepthBookRow {
+            security_id: 52_175,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_20,
+            side: DEPTH_SIDE_ASK,
+            prices: &price,
+            quantities: &quantity,
+            orders: &orders,
+            capture_seq: 1,
+            ts_nanos: PRECHECKED_TS_NANOS,
+        };
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.append_book_row(&book).expect("book row");
+        let mut reference = buffer_like(&w);
+        let label = resolved_contract(&w);
+        checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
+        assert_eq!(w.pending_ilp_bytes(), reference.as_bytes());
+    }
+
+    /// Any f64 bit pattern, including every NaN payload and both infinities.
+    fn any_f64_bits() -> impl proptest::strategy::Strategy<Value = f64> {
+        use proptest::strategy::Strategy as _;
+        proptest::prelude::any::<u64>().prop_map(f64::from_bits)
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        /// Random packets of 20 or 200 levels (any price bits, quantities and
+        /// orders across the full u32 range, either side, any capture seq):
+        /// the pre-checked writer and the checked reference write the same
+        /// bytes, for `market_depth` and for `market_depth_book`.
+        #[test]
+        fn proptest_prechecked_depth_lines_match_the_checked_lines(
+            levels in proptest::sample::select(vec![20_usize, 200]),
+            prices in proptest::collection::vec(any_f64_bits(), 200),
+            quantities in proptest::collection::vec(proptest::prelude::any::<u32>(), 200),
+            orders in proptest::collection::vec(proptest::prelude::any::<u32>(), 200),
+            security_id in 0_i64..=i64::from(u32::MAX),
+            capture_seq in 0_i64..=i64::MAX,
+            bid in proptest::prelude::any::<bool>(),
+            with_contract in proptest::prelude::any::<bool>(),
+        ) {
+            let side = if bid { DEPTH_SIDE_BID } else { DEPTH_SIDE_ASK };
+            let kind = if levels == 20 { DEPTH_KIND_20 } else { DEPTH_KIND_200 };
+            let rows: Vec<DepthRow> = (0..levels)
+                .map(|i| DepthRow {
+                    security_id,
+                    segment: "NSE_FNO",
+                    depth_kind: kind,
+                    side,
+                    level: i64::try_from(i).unwrap_or(0) + 1,
+                    price: prices[i],
+                    quantity: i64::from(quantities[i]),
+                    orders: i64::from(orders[i]),
+                    capture_seq,
+                    ts_nanos: PRECHECKED_TS_NANOS,
+                })
+                .collect();
+            let contract = with_contract.then_some("RELIANCE-Nov2026-1400-PE");
+            assert_level_packet_bytes_match(&rows, contract)?;
+
+            let q: Vec<f64> = quantities[..levels].iter().map(|&v| f64::from(v)).collect();
+            let o: Vec<f64> = orders[..levels].iter().map(|&v| f64::from(v)).collect();
+            let book = DepthBookRow {
+                security_id,
+                segment: "NSE_FNO",
+                depth_kind: kind,
+                side,
+                prices: &prices[..levels],
+                quantities: &q,
+                orders: &o,
+                capture_seq,
+                ts_nanos: PRECHECKED_TS_NANOS,
+            };
+            let mut w = DepthWriter::for_test_book(Feed::Dhan);
+            if let Some(name) = contract {
+                set_book_contract_for_test(&mut w, security_id, "NSE_FNO", name);
+            }
+            w.append_book_row(&book).map_err(|e| {
+                proptest::test_runner::TestCaseError::fail(format!("append_book_row: {e:#}"))
+            })?;
+            let mut reference = buffer_like(&w);
+            let label = resolved_contract(&w);
+            checked_book_line(&mut reference, &book, Feed::Dhan.as_str(), label.as_deref());
+            proptest::prop_assert_eq!(w.pending_ilp_bytes(), reference.as_bytes());
+        }
+    }
+
+    // ---- flush-failure classification (2026-08-25) ----------------------
+    //
+    // On 2026-08-25 at 13:12:07 a depth flush failed with
+    // `io: Interrupted system call (os error 4)` and 8,810 rows left the
+    // buffer. Nothing had been rejected; a signal had interrupted a syscall.
+    // These pin which failures earn a retry and, more importantly, which
+    // must NOT -- retrying a server rejection is the wedge the discard was
+    // built to prevent, so widening this predicate re-opens that.
+
+    #[test]
+    fn a_transport_failure_is_retried() {
+        // The observed 2026-08-25 error, verbatim. `from_ureq_error` maps IO
+        // and timeout failures onto SocketError.
+        let eintr = questdb::Error::new(
+            questdb::ErrorCode::SocketError,
+            "Could not flush buffer: io: Interrupted system call (os error 4)",
+        );
+        assert!(
+            flush_failure_is_retryable(&eintr),
+            "EINTR left the buffer intact and the server holding nothing — retry it"
+        );
+    }
+
+    #[test]
+    fn a_server_rejection_is_never_retried() {
+        // THE reason the discard exists. A row the server refused would be
+        // re-sent forever and block every later row, so this must stay false
+        // however the retry predicate is edited.
+        let rejected = questdb::Error::new(
+            questdb::ErrorCode::ServerFlushError,
+            "failed to parse line protocol: invalid field format",
+        );
+        assert!(
+            !flush_failure_is_retryable(&rejected),
+            "a rejected row must be discarded, not re-sent — this is the wedge case"
+        );
+    }
+
+    #[test]
+    fn our_own_bugs_are_never_retried() {
+        // A bad name or timestamp fails identically forever; retrying buys a
+        // second stall and no rows.
+        for code in [
+            questdb::ErrorCode::InvalidName,
+            questdb::ErrorCode::InvalidTimestamp,
+            questdb::ErrorCode::InvalidApiCall,
+            questdb::ErrorCode::ConfigError,
+            questdb::ErrorCode::AuthError,
+        ] {
+            let err = questdb::Error::new(code, "deterministic failure");
+            assert!(
+                !flush_failure_is_retryable(&err),
+                "{code:?} is deterministic — retrying stalls the flush path for nothing"
+            );
+        }
+    }
 
     fn row() -> DepthRow {
         DepthRow {
@@ -647,7 +5725,18 @@ mod tests {
             quantity: 750,
             orders: 12,
             capture_seq: 1,
-            ts_nanos: 1_700_000_000_000_000_000,
+            // 12:30:00 IST, mid-session, and that is now load-bearing.
+            //
+            // This was 1_700_000_000 (22:13:20 IST) until 2026-09-05, which
+            // was fine while nothing read the clock and became a silent
+            // 20-test failure the moment the session-window gate landed: the
+            // gate refused every row, so each test asserted against an empty
+            // buffer. The tick fixture hit the identical wall the same day.
+            //
+            // Derived, not guessed: 1_700_000_000 - (1_700_000_000 % 86_400)
+            // is that day's IST midnight, + 45_000 s puts it at 12:30:00.
+            // Moving it outside 09:00:00-15:39:59.999 empties the buffer again.
+            ts_nanos: 1_699_965_000_000_000_000,
         }
     }
 
@@ -762,6 +5851,89 @@ mod tests {
         }
     }
 
+    fn publish_labels(pairs: &[((i64, &'static str), &str)]) {
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
+        for (k, v) in pairs {
+            m.insert(*k, std::sync::Arc::<str>::from(*v));
+        }
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+    }
+
+    /// Item 44i: a known instrument carries its name as a SYMBOL (before any
+    /// field), an unknown one leaves the cell NULL, and the name is never in
+    /// the DEDUP key.
+    #[test]
+    fn market_depth_rows_carry_the_contract_name_only_when_the_table_knows_it() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_labels(&[((13, "IDX_I"), "NIFTY")]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        let first_field = line.find(' ').expect("fields");
+        let at = line
+            .find(",contract=NIFTY")
+            .expect("known contract must be named");
+        assert!(at < first_field, "contract must be a SYMBOL: {line}");
+
+        publish_labels(&[]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("contract="),
+            "an unknown instrument must be NULL, never a guess: {line}"
+        );
+
+        assert!(
+            !DEDUP_KEY_MARKET_DEPTH.contains("contract"),
+            "a name must never make two rows for one level distinct"
+        );
+        assert!(market_depth_create_ddl().contains("contract SYMBOL"));
+    }
+
+    /// Item 44i: the name is resolved once per instrument run. A second row
+    /// for the SAME instrument reuses the cached name even if the table was
+    /// republished in between; a DIFFERENT instrument resolves afresh; a flush
+    /// clears the cache so the next batch sees the new table.
+    #[test]
+    fn market_depth_contract_name_is_resolved_once_per_instrument_run() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_labels(&[((13, "IDX_I"), "OLD"), ((25, "IDX_I"), "BANKNIFTY")]);
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        w.append_row(&row()).expect("level 1");
+        publish_labels(&[((13, "IDX_I"), "NEW"), ((25, "IDX_I"), "BANKNIFTY")]);
+        let mut level2 = row();
+        level2.level = 2;
+        w.append_row(&level2).expect("level 2");
+        let text = w.buffer_utf8();
+        assert_eq!(
+            text.matches(",contract=OLD").count(),
+            2,
+            "the same packet must not be named twice: {text}"
+        );
+
+        let mut other = row();
+        other.security_id = 25;
+        w.append_row(&other).expect("other instrument");
+        assert!(w.buffer_utf8().contains(",contract=BANKNIFTY"));
+
+        // Same numeric id on a different segment is a different instrument.
+        let mut other_seg = row();
+        other_seg.segment = "NSE_EQ";
+        w.append_row(&other_seg).expect("other segment");
+        let text = w.buffer_utf8();
+        let last = text.lines().last().expect("line");
+        assert!(!last.contains("contract="), "I-P1-11: {last}");
+
+        let _ = w.flush();
+        assert!(w.contract_label.is_none(), "flush must clear the cache");
+        publish_labels(&[]);
+    }
+
     #[test]
     fn append_row_stamps_the_kind_and_side_it_was_given() {
         let mut w = DepthWriter::for_test(Feed::Dhan);
@@ -784,6 +5956,690 @@ mod tests {
             w.append_row(&r).expect("append");
         }
         assert_eq!(w.pending(), 200, "a depth-200 side is 200 rows, not one");
+    }
+
+    // -- the durable floor (2026-08-25) -------------------------------------
+    //
+    // Before this, `discard_pending` threw the pending buffer away and its own
+    // comment said the levels were "gone from the table". Depth is 24× the
+    // tick volume and QuestDB write stalls are measured on the live box, so
+    // this is the largest data-loss surface in the process. Each test below
+    // was written against the OLD behaviour first and failed there.
+
+    fn spill_tmp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tv-depth-spill-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The ILP text held in one framed spill file: every whole record's
+    /// payload, in order. Empty when the file is missing. Panics on a torn
+    /// or corrupt record, because a spill this writer just made must be whole.
+    fn read_spill_payload(path: &Path) -> String {
+        use crate::depth_spill_frame::{RecordAt, read_record_at};
+        let Ok(file) = std::fs::File::open(path) else {
+            return String::new();
+        };
+        let len = file.metadata().expect("spill metadata").len();
+        let mut offset = 0_u64;
+        let mut scratch = Vec::new();
+        let mut text = String::new();
+        while offset < len {
+            match read_record_at(&file, offset, len, &mut scratch).expect("spill read") {
+                RecordAt::Whole { version, next } => {
+                    assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_1);
+                    text.push_str(std::str::from_utf8(&scratch).expect("ILP v1 is text"));
+                    offset = next;
+                }
+                other => panic!("record at {offset} of {path:?} is not whole: {other:?}"),
+            }
+        }
+        text
+    }
+
+    fn spill_files(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Extracts the eight [`DEDUP_KEY_MARKET_DEPTH`] columns from one ILP line.
+    ///
+    /// Returns `None` when any key column is missing — which is the point: a
+    /// line that omits `capture_seq` or `depth_kind` cannot be replayed
+    /// idempotently, and the test that uses this would rather fail than
+    /// silently compare short keys.
+    fn dedup_key_of_ilp_line(line: &str) -> Option<String> {
+        let (head, ts) = line.rsplit_once(' ')?;
+        let (symbols, fields) = head.split_once(' ')?;
+        let mut parts: Vec<String> = vec![format!("ts={}", ts.trim())];
+        for col in DEDUP_KEY_MARKET_DEPTH.split(',').map(str::trim) {
+            if col == "ts" {
+                continue;
+            }
+            let needle = format!("{col}=");
+            let hay = symbols
+                .split(',')
+                .chain(fields.split(','))
+                .find(|kv| kv.starts_with(&needle))?;
+            parts.push(hay.to_string());
+        }
+        Some(parts.join("|"))
+    }
+
+    /// The drain must not write the depth rescue file itself.
+    ///
+    /// The tick twin of this was fixed earlier the same day; this is the same
+    /// defect on the writer that carries 24x the rows, reachable from the frame
+    /// arm, the 500 ms timer arm AND the shutdown tail.
+    #[test]
+    fn a_split_depth_writer_hands_the_rescue_off_instead_of_writing_it() {
+        let dir = spill_tmp("depth-rescue-handoff");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+
+        w.append_row(&row()).expect("append");
+        let rescued = w.discard_pending();
+
+        assert_eq!(rescued, 1, "the rows are accounted for either way");
+        assert_eq!(w.pending(), 0, "the producer must let go of them");
+        assert_eq!(
+            w.rescued(),
+            1,
+            "a queued payload IS on its way to the spill file — the caller's \
+             log-wording branch reads this one line later"
+        );
+        let batch = rx
+            .try_recv()
+            .expect("the payload must be on the rescue queue, not on disk");
+        assert_eq!(batch.rows(), 1);
+        assert_eq!(
+            spill_files(&dir).len(),
+            0,
+            "the drain must not have touched the depth spill directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settles every queued and parked depth rescue batch, releasing the
+    /// watermark floors they hold for the other tests in this process.
+    fn settle_depth_rescues(
+        w: &mut DepthWriter,
+        sink: &DepthRescueSink,
+        rx: &std::sync::mpsc::Receiver<DepthRescueBatch>,
+    ) {
+        loop {
+            while let Ok(batch) = rx.try_recv() {
+                sink.rescue(&batch);
+            }
+            if w.parked_rescue.is_empty() {
+                break;
+            }
+            let _ = w.flush();
+        }
+    }
+
+    /// A full depth rescue queue falls back to the OLD behaviour, never a drop,
+    /// for rows with NO write-ahead-log backing (capture sequence 0). Rows
+    /// that ARE in the WAL are deferred to it instead — see the next test.
+    #[test]
+    fn a_full_depth_rescue_queue_writes_inline_rather_than_dropping() {
+        let dir = spill_tmp("depth-rescue-full");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let unbacked = DepthRow {
+            capture_seq: 0,
+            ..row()
+        };
+
+        // H4 (2026-10-03): the queue, then the park, absorb the burst.
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + DEPTH_PARKED_RESCUE_MAX_BATCHES {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert!(
+            spill_files(&dir).is_empty(),
+            "queue and park absorb the burst without a file write on the drain"
+        );
+        w.append_row(&unbacked).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "with the queue and the park full the rescue must have been written inline"
+        );
+        settle_depth_rescues(&mut w, &sink, &rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-26 audit fix PR3: WAL-backed depth rows with a full rescue
+    /// queue are handed to the WAL — the drain writes NO spill file.
+    #[test]
+    fn a_full_depth_rescue_queue_defers_wal_backed_rows_without_file_io() {
+        let dir = spill_tmp("depth-rescue-defer");
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
+        let (_sink, _rx) = w.split_rescue_offload();
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert_eq!(w.pending(), 0);
+        assert!(
+            spill_files(&dir).is_empty(),
+            "the drain must not write the depth spill file"
+        );
+        assert_eq!(
+            DEPTH_RESCUE_DEFERRED_TO_WAL_COUNTER,
+            "tv_depth_rescue_deferred_to_wal_total"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: depth rows from a frame the WAL REFUSED carry a real capture
+    /// sequence yet exist in no WAL segment. Marked unbacked, a full rescue
+    /// queue must spill them, never defer them to the WAL. Since H4
+    /// (2026-10-03) they are parked first, and reach the rescue thread once
+    /// it has room.
+    #[test]
+    fn mark_pending_unbacked_keeps_depth_rows_in_the_inline_spill() {
+        let dir = spill_tmp("depth-rescue-unbacked");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        w.append_row(&row()).expect("append");
+        assert!(!w.pending_unbacked(), "a non-zero sequence reads as backed");
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
+        assert_eq!(w.discard_pending(), 1, "the rows are accounted for");
+        assert_eq!(
+            w.parked_rescue.len(),
+            1,
+            "parked, never dropped as WAL-backed"
+        );
+        assert!(spill_files(&dir).is_empty(), "and not written on the drain");
+        assert!(!w.pending_unbacked(), "discard_pending consumes the mark");
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            sink.rescue(&rx.try_recv().expect("queued"));
+        }
+        w.flush().expect("nothing pending");
+        assert!(w.parked_rescue.is_empty());
+        let handed: Vec<_> = rx.try_iter().collect();
+        assert_eq!(handed.len(), 1, "the parked rows reached the thread");
+        for batch in &handed {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: shutdown hands the depth park to the rescue thread; a dead thread
+    /// gets the parked rows written inline, never dropped.
+    #[test]
+    fn test_regression_h4_the_depth_park_is_handed_on_or_written_never_dropped() {
+        let dir = spill_tmp("depth-h4-park");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        let unbacked = DepthRow {
+            capture_seq: 0,
+            ..row()
+        };
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + 2 {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2);
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH {
+            rx.try_recv().expect("queued");
+        }
+        // One slot's worth goes on at close; the queue holds two, so both fit.
+        w.close_rescue_offload();
+        assert!(w.parked_rescue.is_empty());
+        assert_eq!(rx.try_iter().count(), 2);
+        assert!(spill_files(&dir).is_empty());
+
+        // A dead thread: the parked batch is written inline on the retry.
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        for _ in 0..DEPTH_RESCUE_QUEUE_DEPTH + 1 {
+            w.append_row(&unbacked).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        drop(rx);
+        w.flush().expect("nothing pending");
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "the parked rows must be on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh depth writer reads as backed until marked.
+    #[test]
+    fn pending_unbacked_is_false_until_marked_on_a_depth_writer() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        assert!(!w.pending_unbacked());
+        w.mark_pending_unbacked();
+        assert!(w.pending_unbacked());
+    }
+
+    /// A depth writer that was never split behaves exactly as before.
+    #[test]
+    fn an_unsplit_depth_writer_still_rescues_inline() {
+        let dir = spill_tmp("depth-rescue-unsplit");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "no rescue channel means the old synchronous path, unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the depth rescue queue restores the inline path, not a refusal.
+    #[test]
+    fn closing_the_depth_rescue_queue_restores_the_inline_path() {
+        let dir = spill_tmp("depth-rescue-closed");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+        w.close_rescue_offload();
+
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !spill_files(&dir).is_empty(),
+            "after close the rescue must still land on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both rescue queues are shallow, and identically so: every payload in one
+    /// is rows that exist nowhere else in the process.
+    #[test]
+    fn the_depth_rescue_queue_matches_the_tick_one() {
+        assert_eq!(
+            DEPTH_RESCUE_QUEUE_DEPTH,
+            crate::tick_persistence::RESCUE_QUEUE_DEPTH,
+            "two writers with the same failure mode must not drift into \
+             different crash-loss windows"
+        );
+    }
+
+    #[test]
+    fn a_failed_flush_leaves_the_rows_recoverable_on_disk_not_merely_counted() {
+        // The defect: a dropped-counter increment is NOT a durable floor. This
+        // asserts the ROWS survive, which the old discard could never satisfy.
+        let dir = spill_tmp("recoverable");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        for level in 1..=20 {
+            let mut r = row();
+            r.level = level;
+            w.append_row(&r).expect("append");
+        }
+        let _ = w.flush();
+
+        let files = spill_files(&dir);
+        assert_eq!(files.len(), 1, "exactly one depth spill file: {files:?}");
+        let body = read_spill_payload(&files[0]);
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            20,
+            "every buffered level must be on disk, not merely counted: {body}"
+        );
+        assert!(body.contains("depth_kind=d20") && body.contains(MARKET_DEPTH_TABLE));
+        assert_eq!(w.rescued(), 20, "the rescue is counted as recoverable");
+        assert_eq!(
+            w.dropped(),
+            20,
+            "the EMF-shipped series still sees rows leaving the buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_spill_file_is_framed_and_drained_by_the_framed_replay() {
+        // Changed 2026-10-09 (plan item 49e): the depth spill is written as
+        // length-framed records. The framed replay must SEE the file, and the
+        // text replay must NOT, because the text replay would POST the binary
+        // headers to /write and quarantine the whole file. If either lister
+        // changes, this fails rather than orphaning or corrupting the spill.
+        let dir = spill_tmp("extension");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+        let _ = w.flush();
+        let files = spill_files(&dir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].extension().and_then(|e| e.to_str()),
+            Some(crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION),
+            "the depth spill must be a framed file: {files:?}"
+        );
+        assert_eq!(
+            crate::depth_spill_frame::list_framed_spill_files(&dir),
+            files,
+            "the framed replay lister must SEE the depth spill file"
+        );
+        assert!(
+            crate::tick_spill_replay::list_spill_files(&dir).is_empty(),
+            "the text replay must never read a framed file"
+        );
+        assert!(
+            read_spill_payload(&files[0]).contains(MARKET_DEPTH_TABLE),
+            "the framed record holds the ILP row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaying_a_spilled_batch_twice_cannot_duplicate_rows() {
+        // Idempotency is a property of the KEY, so this asserts the key: every
+        // one of the eight DEDUP columns is present on every emitted line, and
+        // the same batch spilled twice yields the same key SET. Drop
+        // `capture_seq` or `depth_kind` from the line and this fails — which
+        // is exactly the collapse the single shared table risks.
+        let dir = spill_tmp("idempotent");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        for level in 1..=5 {
+            for (kind, side) in [
+                (DEPTH_KIND_20, DEPTH_SIDE_BID),
+                (DEPTH_KIND_200, DEPTH_SIDE_BID),
+                (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            ] {
+                let mut r = row();
+                r.level = level;
+                r.depth_kind = kind;
+                r.side = side;
+                w.append_row(&r).expect("append");
+            }
+        }
+        let _ = w.flush();
+        // Second failed flush of the SAME rows — a real replay: the drain
+        // re-folds the same WAL frame, so capture_seq is identical.
+        for level in 1..=5 {
+            for (kind, side) in [
+                (DEPTH_KIND_20, DEPTH_SIDE_BID),
+                (DEPTH_KIND_200, DEPTH_SIDE_BID),
+                (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            ] {
+                let mut r = row();
+                r.level = level;
+                r.depth_kind = kind;
+                r.side = side;
+                w.append_row(&r).expect("append");
+            }
+        }
+        let _ = w.flush();
+
+        let files = spill_files(&dir);
+        let body: String = files.iter().map(|p| read_spill_payload(p)).collect();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 30, "both batches are on disk");
+        let mut keys = std::collections::BTreeSet::new();
+        for line in &lines {
+            let key = dedup_key_of_ilp_line(line)
+                .unwrap_or_else(|| panic!("every DEDUP key column must be on the line: {line}"));
+            keys.insert(key);
+        }
+        assert_eq!(
+            keys.len(),
+            15,
+            "re-applying the same batch must UPSERT onto itself, not duplicate: {keys:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spill_write_failure_is_counted_and_coded_never_silent() {
+        // The spill shares the filesystem with QuestDB, which was 86% full on
+        // 2026-08-24 — so this arm is a live path. A regular FILE where the
+        // directory should be makes `create_dir_all` fail deterministically on
+        // every OS (the chaos suite's own "spill disk dead" injection).
+        let dir = spill_tmp("write-fail");
+        std::fs::create_dir_all(dir.parent().expect("temp dir has a parent")).ok();
+        std::fs::write(&dir, b"not a directory").expect("plant a file at the dir path");
+
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_row(&row()).expect("append");
+        let err = w.flush().expect_err("disconnected writer cannot flush");
+        assert!(format!("{err}").contains("1 row(s) discarded"));
+        assert_eq!(w.dropped(), 1, "the loss is COUNTED");
+        assert_eq!(
+            w.rescued(),
+            0,
+            "a failed rescue must NEVER be reported as recoverable — that is \
+             the false-OK this tier exists to avoid"
+        );
+        assert!(
+            spill_failed_depth_ilp(
+                &dir,
+                b"x\n",
+                crate::depth_spill_frame::ILP_VERSION_1,
+                Feed::Dhan,
+                0,
+                DEPTH_SPILL_MAX_BYTES,
+                0,
+                crate::tick_persistence::SPILL_SYNC_OFF_DRAIN
+            )
+            .is_err(),
+            "the spill helper reports the failure rather than claiming success"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+    #[test]
+    fn the_cap_is_a_soft_rail_measured_against_free_space_not_total_size() {
+        // RE-BLESSED 2026-09-01, and the reason matters more than the edit.
+        //
+        // This test used to assert that reaching the cap REFUSES, full stop.
+        // That is the behaviour that discarded 238,615,500 depth rows in
+        // production on 2026-09-01 with 136 GB free, because the cap was
+        // derived from the volume's TOTAL size -- a number that never moves,
+        // so it fired identically on an empty disk and a full one.
+        //
+        // The rail's INTENT is unchanged and still pinned below: the rescue
+        // tier must never starve the database it rescues from. What changed is
+        // the quantity the refusal is measured against.
+        //
+        // Note what the OLD shape made untestable. A unit test cannot
+        // manufacture a nearly-full filesystem, so the arm that actually
+        // protects the database was the one arm no test could reach -- while
+        // the arm that lost the data was the one it pinned. Splitting the
+        // decision out as `classify_spill_ceiling` fixes that: every arm is
+        // now reachable from a table of numbers, and both are asserted here.
+        let dir = spill_tmp("at-cap");
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let seeded = b"already-here\n";
+        std::fs::write(dir.join("depth-dhan-0.ilp"), seeded).expect("seed");
+        let held = depth_spill_dir_bytes(&dir);
+        assert_eq!(
+            held,
+            seeded.len() as u64,
+            "the cap is measured from real bytes on disk"
+        );
+
+        // Under the cap: accepted. (Unchanged.)
+        spill_failed_depth_ilp(
+            &dir,
+            b"under\n",
+            crate::depth_spill_frame::ILP_VERSION_1,
+            Feed::Dhan,
+            1_700_000_000,
+            held + 1,
+            0,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("below the cap the rescue must succeed -- otherwise the test is vacuous");
+
+        // AT the cap: the outcome must AGREE with the classifier for whatever
+        // free space this machine actually has.
+        //
+        // Written this way after the first draft asserted a fixed ALLOW and
+        // failed on a build container with 8.6 GiB free -- under the 16 GiB
+        // reserve, so the code was right and the test was wrong. CI runners
+        // sit in the same range, so a fixed-outcome assertion here is
+        // environment-dependent by construction: it would have passed on the
+        // prod box (138 GB free) and failed every CI run, which is the worst
+        // possible place to learn it.
+        //
+        // Agreement is the stronger property anyway. A fixed ALLOW only proves
+        // one arm on one machine; this proves the writer genuinely CONSULTS
+        // `classify_spill_ceiling` rather than deciding on its own -- on any
+        // machine, at whatever free space it happens to have. The arms
+        // themselves are pinned exhaustively below, where no filesystem is
+        // involved at all.
+        use crate::tick_persistence::{
+            DEPTH_SPILL_FREE_RESERVE_BYTES, SpillCeilingVerdict, classify_spill_ceiling,
+            spill_free_bytes,
+        };
+        let expected = classify_spill_ceiling(
+            depth_spill_dir_bytes(&dir),
+            held,
+            spill_free_bytes(&dir),
+            DEPTH_SPILL_FREE_RESERVE_BYTES,
+        );
+        let outcome = spill_failed_depth_ilp(
+            &dir,
+            b"over\n",
+            crate::depth_spill_frame::ILP_VERSION_1,
+            Feed::Dhan,
+            1_700_000_000,
+            held,
+            0,
+            crate::tick_persistence::SPILL_SYNC_OFF_DRAIN,
+        );
+        match expected {
+            SpillCeilingVerdict::OverCeilingWithRoom => {
+                outcome.expect(
+                    "this machine has room, so the rescue must be ALLOWED -- refusing \
+                     with room is what discarded 238,615,500 rows onto a 55%-empty disk",
+                );
+                let body = read_spill_payload(&dir.join(format!(
+                    "depth-dhan-472222.{}",
+                    crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
+                )));
+                assert!(
+                    body.contains("over"),
+                    "an allowed rescue must actually have written the row: {body}"
+                );
+            }
+            SpillCeilingVerdict::OverCeilingNoRoom
+            | SpillCeilingVerdict::OverCeilingProbeFailed => {
+                let err = outcome.expect_err(
+                    "this machine is at or below the database reserve, so the rescue \
+                     must REFUSE -- that is the case the rail exists for",
+                );
+                assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+                // The refusal is a REFUSAL, not a partial write.
+                let body = read_spill_payload(&dir.join(format!(
+                    "depth-dhan-472222.{}",
+                    crate::depth_spill_frame::DEPTH_FRAMED_SPILL_EXTENSION
+                )));
+                assert!(
+                    !body.contains("over"),
+                    "a refused rescue must write NOTHING, not a truncated row: {body}"
+                );
+            }
+            SpillCeilingVerdict::UnderCeiling => panic!(
+                "the fixture seeds the directory TO the cap, so this arm is \
+                 unreachable -- if it fires, the seeding no longer works and \
+                 every assertion above it is vacuous"
+            ),
+        }
+
+        // AT the cap on a disk WITHOUT room: still REFUSED. This is the arm
+        // the rail exists for, and the arm the old shape could never test.
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "exactly ON the reserve must refuse -- at a boundary the safe \
+             direction is the database's"
+        );
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES - 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingNoRoom,
+            "below the reserve must refuse -- this is the whole point of the rail"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+            "an UNREADABLE free-space number must refuse. Optimism here trades \
+             a bounded tick loss for an unbounded disk, which is the outage \
+             this tier exists to avoid"
+        );
+        assert_eq!(
+            classify_spill_ceiling(
+                held,
+                held,
+                Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::OverCeilingWithRoom,
+            "one byte over the reserve is room, and must be allowed"
+        );
+        assert_eq!(
+            classify_spill_ceiling(held - 1, held, None, DEPTH_SPILL_FREE_RESERVE_BYTES),
+            SpillCeilingVerdict::UnderCeiling,
+            "below the rail the probe must not even be consulted"
+        );
+
+        // And production really does pass the const, so the bound above is the
+        // one that fires on the box.
+        assert!(
+            DEPTH_SPILL_MAX_BYTES > 0 && DEPTH_SPILL_MAX_BYTES <= 1024 * 1024 * 1024,
+            "the depth spill bound must be explicit and sane: {DEPTH_SPILL_MAX_BYTES}"
+        );
+        assert_eq!(DEPTH_SPILL_DIR, "data/spill/depth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_flush_writes_no_spill_file_at_all() {
+        let dir = spill_tmp("empty");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.flush().expect("nothing pending is not a failure");
+        assert!(
+            spill_files(&dir).is_empty(),
+            "an empty buffer must not create a rescue file"
+        );
+        assert_eq!(w.rescued(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn for_test_never_writes_into_the_production_spill_directory() {
+        // `for_test` is called from the app crate too, where cfg(test) does not
+        // reach — so the isolation has to be in the constructor.
+        let w = DepthWriter::for_test(Feed::Dhan);
+        assert_ne!(w.spill_dir, PathBuf::from(DEPTH_SPILL_DIR));
     }
 
     #[test]
@@ -858,6 +6714,40 @@ mod tests {
              every second the exchange is shut — the exact 3.4× error this \
              test exists to stop recurring"
         );
+
+        // ...but DEPTH is not judged on the session window alone.
+        //
+        // Added 2026-09-06. `market_depth` has no exchange timestamp -- its
+        // designated `ts` IS the arrival stamp -- so `DepthWriter::append_row`
+        // gates on `arrival_row_is_in_an_open_window`, which admits a bounded
+        // `ARRIVAL_GRACE_TAIL_SECS` tail past the close (the vendor's measured
+        // delivery lag is p99 46.4 s, max 198.7 s, so refusing that tail was
+        // destroying real books).
+        //
+        // The assertion above was written before the grace existed and was
+        // therefore BLIND to it: depth can be written for 24,240 seconds, not
+        // 24,000, so every GB/day figure in this module's docs is a ~1%
+        // understatement (~210 MB/day at the 21 GB/day estimate). Small, and
+        // recorded rather than left to be rediscovered -- an unstated
+        // understatement in a capacity figure is the same class of defect as an
+        // unstated overstatement, just quieter.
+        let depth_window_secs =
+            window_secs + u64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
+        assert_eq!(
+            depth_window_secs, 24_240,
+            "the window in which a DEPTH row can still be accepted is \
+             {depth_window_secs}s, not the 24,240s this module's storage \
+             estimate is derived from. Either the session window or the arrival \
+             grace moved -- recompute the GB/day figures before trusting any \
+             capacity or cost decision built on them."
+        );
+        // Deliberately NOT asserted here: that the grace is non-zero. A
+        // compile-time `const _: () = assert!(ARRIVAL_GRACE_TAIL_SECS > 199)`
+        // in `constants.rs` already makes a zero grace unbuildable, so a
+        // runtime check for it could never fire. Verified by mutation on
+        // 2026-09-06 -- setting the grace to 0 fails the BUILD, not this test.
+        // A test that cannot fail is decoration, and this file has spent the
+        // day removing that class rather than adding to it.
     }
 
     #[test]
@@ -876,11 +6766,16 @@ mod tests {
         // +1 for `ts`, which is the designated timestamp and therefore not in
         // the ALTER column list.
         let derived = symbols * 4 + (wide + 1) * 8;
+        // 2026-09-22 (item 44i): `contract SYMBOL` joined the row, so the
+        // premise moved 72 -> 76 B/row. At the measured ~1.53e9 rows/session
+        // that is ~6.1 GB/session more on disk, recorded in the scope lock
+        // "2026-09-22 (FIFTH)" before the column landed. Every GB/day figure
+        // in this module's docs that says 72 B is now ~5.6% low.
         assert_eq!(
             (symbols, wide, derived),
-            (4, 6, 72),
-            "row-width premise drifted: the docs' GB/day table assumes 4 SYMBOL \
-             + 7 eight-byte columns = 72 B/row"
+            (5, 6, 76),
+            "row-width premise drifted: the storage estimate assumes 5 SYMBOL \
+             + 7 eight-byte columns = 76 B/row"
         );
     }
 
@@ -897,4 +6792,2409 @@ mod tests {
         assert_eq!(DEPTH_SIDE_BID, "bid");
         assert_eq!(DEPTH_SIDE_ASK, "ask");
     }
+
+    // ---- off-drain flush (2026-08-28) -----------------------------------
+    //
+    // These pin the SEMANTICS, not the plumbing. The plumbing is a bounded
+    // channel; the semantics are which arms report loss and which do not, and
+    // getting that wrong is how a backpressure signal becomes a false loss
+    // report (or, worse, how a real loss reports as healthy).
+
+    // ---- buffer recycling (2026-09-22, item 44g) -------------------------
+
+    /// A spent batch with a real, non-zero capacity, for the recycle tests.
+    fn spent_batch(capacity: usize) -> DepthFlushBatch {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        buffer.reserve(capacity);
+        DepthFlushBatch {
+            buffer,
+            staged: crate::depth_stage::DepthStagedBatch::new(),
+            rows: 0,
+            min_seq: 0,
+            max_seq: 0,
+            unbacked: false,
+        }
+    }
+
+    /// B1 review: `table_keyed` reads the gate for this writer's OWN table
+    /// (level rows: `market_depth`; book rows: `market_depth_book`).
+    #[test]
+    fn test_table_keyed_reads_the_gate_for_the_writers_own_table() {
+        let only_book: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| t == [crate::ilp_table_gate::GatedTable::MarketDepthBook];
+        let levels = DepthWriter::for_test(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(!levels.table_keyed());
+        let book = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(only_book);
+        assert!(book.table_keyed());
+        let shut = DepthWriter::for_test_book(Feed::Dhan).with_table_gate_for_test(|_| false);
+        assert!(!shut.table_keyed());
+    }
+
+    /// Regression, B1 (2026-11-13): with `market_depth` not keyed, the live
+    /// depth writer thread must NOT post (QuestDB would create the table in a
+    /// shape that can never take the DEDUP key); the batch is rescued to the
+    /// spill. The open-gate half proves the server would have been reached.
+    #[test]
+    fn test_regression_depth_sink_never_posts_into_an_unkeyed_table() {
+        use std::io::{Read, Write};
+        for (gate_open, expect_hits) in [(false, 0_usize), (true, 1)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = std::sync::Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = [0u8; 65_536];
+                    let _ = stream.read(&mut buf);
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                }
+            });
+            let cfg = QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            };
+            let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+                if gate_open { |_| true } else { |_| false };
+            let w = DepthWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+            let (mut w, mut sink, rx) = w.split_for_offload();
+            let dir = temp_depth_spill_dir();
+            sink.spill_dir = dir.clone();
+            sink.spill_min_free_headroom = 0;
+            w.append_row(&row()).expect("append");
+            w.flush().expect("hand off");
+            let mut batch = rx.try_recv().expect("batch queued");
+            let landed = sink.write(&mut batch);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expect_hits);
+            if gate_open {
+                assert_eq!(landed, 1, "an open gate posts");
+            } else {
+                assert_eq!(landed, 0, "a shut gate lands nothing");
+                let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+                assert!(
+                    spilled >= 1,
+                    "the rows are rescued to the spill, not dropped"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_written_depth_buffer_round_trips_back_to_the_producer_empty() {
+        let (mut w, mut sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand off");
+
+        let mut batch = rx.try_recv().expect("batch queued");
+        let spent_capacity = batch.buffer.capacity();
+        assert!(spent_capacity > 0, "a batch that held a row has capacity");
+        // `write` rescues (no sender in for_test, temp spill dir) and then
+        // returns the buffer.
+        let _landed = sink.write(&mut batch);
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("second hand-off");
+        assert_eq!(
+            w.buffer.capacity(),
+            spent_capacity,
+            "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert!(
+            w.buffer.as_bytes().is_empty(),
+            "a recycled buffer must arrive EMPTY — a leftover level would be \
+             written twice"
+        );
+    }
+
+    #[test]
+    fn depth_return_spare_buffer_drops_every_buffer_it_must_not_return() {
+        // (case, capacity, pre-fill the lane, drop the producer, expect spares)
+        let cases: [(&str, usize, bool, bool, usize); 4] = [
+            ("normal buffer is returned", 1024, false, false, 1),
+            (
+                "oversized buffer is never returned",
+                MAX_DEPTH_PRODUCER_BUFFER_BYTES + 1,
+                false,
+                false,
+                0,
+            ),
+            (
+                "full lane drops the spare",
+                1024,
+                true,
+                false,
+                DEPTH_FLUSH_QUEUE_DEPTH,
+            ),
+            ("gone producer drops the spare", 1024, false, true, 0),
+        ];
+        for (case, capacity, prefill, drop_producer, expect) in cases {
+            let (producer, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+            if prefill {
+                for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+                    sink.return_spare_buffer(&mut spent_batch(16));
+                }
+            }
+            let spares = if drop_producer {
+                drop(producer);
+                None
+            } else {
+                Some(producer)
+            };
+
+            let mut batch = spent_batch(capacity);
+            // Must return — never block — in every case.
+            sink.return_spare_buffer(&mut batch);
+
+            assert_eq!(
+                batch.buffer.capacity(),
+                0,
+                "{case}: the spent buffer always leaves the batch"
+            );
+            if let Some(p) = spares {
+                let lane = p.spare_buffers.as_ref().expect("split opens the lane");
+                let mut got = 0;
+                while let Ok(spare) = lane.try_recv() {
+                    assert!(spare.as_bytes().is_empty(), "{case}: spares are empty");
+                    assert!(
+                        spare.capacity() <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+                        "{case}: no spare may exceed the producer bound"
+                    );
+                    got += 1;
+                }
+                assert_eq!(got, expect, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_depth_spare_of_another_protocol_is_never_installed() {
+        let (mut w, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        // DT-A2 (2026-10-28): the foreign spare is reserved PAST the pre-size,
+        // so a wrongly installed spare would show a larger capacity than the
+        // fresh pre-sized buffer the assert below expects.
+        let mut foreign = Buffer::new(ProtocolVersion::V2);
+        foreign.reserve(DepthLayout::Levels.row_buffer_presize_bytes() + 64 * 1024);
+        assert!(foreign.capacity() > DepthLayout::Levels.row_buffer_presize_bytes());
+        sink.spare_return
+            .as_ref()
+            .expect("split opens the lane")
+            .try_send(foreign)
+            .expect("lane has room");
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand off");
+
+        assert_eq!(
+            w.buffer.protocol_version(),
+            ProtocolVersion::V1,
+            "the next batch must speak the protocol the sender negotiated"
+        );
+        // The foreign spare (larger than the pre-size) was dropped; the buffer
+        // in its place is a fresh DT-A2 pre-size, reserved by the hand-off.
+        assert_eq!(
+            w.buffer.capacity(),
+            DepthLayout::Levels.row_buffer_presize_bytes(),
+            "the foreign spare was dropped"
+        );
+    }
+
+    // Regression: 2026-10-28 (DT-A2) — the depth row buffer started at zero
+    // capacity and regrew by doubling inside the frames that appended to it
+    // (up to an 8 MiB copy into a 16 MiB buffer on the book layout), on the
+    // frame drain. The tick writer had been fixed two days earlier (K6).
+    #[test]
+    fn test_regression_depth_row_buffer_is_presized_and_never_regrows_on_append() {
+        for (layout, w) in [
+            (DepthLayout::Levels, DepthWriter::for_test(Feed::Dhan)),
+            (DepthLayout::Book, DepthWriter::for_test_book(Feed::Dhan)),
+        ] {
+            // PF-4b (2026-11-06): a book writer stages its rows; its STAGED
+            // batch is the one reserved up front, its text buffer is not.
+            match layout {
+                DepthLayout::Levels => assert!(
+                    w.buffer.capacity() >= layout.row_buffer_presize_bytes(),
+                    "{layout:?}: a new writer's row buffer is reserved up front"
+                ),
+                DepthLayout::Book => assert!(
+                    w.staged.ram_bytes()
+                        >= crate::depth_stage::DEPTH_STAGED_ROWS_PRESIZE
+                            * crate::depth_stage::STAGED_BOOK_ROW_BYTES,
+                    "{layout:?}: a new writer's staged batch is reserved up front"
+                ),
+            }
+            assert_eq!(w.buffer.protocol_version(), layout.protocol());
+        }
+
+        // Levels: a full live batch (the drain cuts at 10,000 rows,
+        // `DEPTH_FLUSH_ROW_THRESHOLD` in the app crate) never reallocates.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let ptr = w.buffer.as_bytes().as_ptr();
+        let cap = w.buffer.capacity();
+        for _ in 0..10_000 {
+            w.append_row(&row()).expect("append");
+        }
+        assert!(!w.buffer.as_bytes().is_empty());
+        assert_eq!(w.buffer.capacity(), cap, "no regrowth below the pre-size");
+        assert_eq!(w.buffer.as_bytes().as_ptr(), ptr, "no reallocation");
+
+        // Book (PF-4b, 2026-11-06): the drain STAGES rows, so the pre-size
+        // that matters is the staged batch's. Inline five-level rows up to
+        // the byte cut (`book_flush_due`) never reallocate it.
+        let mut book = DepthWriter::for_test_book(Feed::Dhan);
+        let rows_ptr = book.staged.as_ptr_for_test();
+        let values_ptr = book.staged.values_ptr_for_test();
+        let caps = book.staged.capacities_for_test();
+        let (p, q, o) = book_levels(5);
+        let mut seq = 1_i64;
+        while !book.book_flush_due() {
+            book.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], seq))
+                .expect("append");
+            seq += 1;
+            assert!(
+                seq < 100_000,
+                "8 MiB must arrive within tens of thousands of rows"
+            );
+        }
+        assert_eq!(
+            book.staged.capacities_for_test(),
+            caps,
+            "book: five-level rows never regrow the staged batch to the cut"
+        );
+        assert_eq!(book.staged.as_ptr_for_test(), rows_ptr, "book: rows kept");
+        assert_eq!(
+            book.staged.values_ptr_for_test(),
+            values_ptr,
+            "book: values kept"
+        );
+        assert!(
+            book.buffer.as_bytes().is_empty(),
+            "book: the drain wrote no text"
+        );
+        // 200-level rows (depth-200 sockets, switched off today) DO grow the
+        // value arena before the cut (counted on `tv_depth_stage_grow_total`),
+        // and the grown batch is still small enough to be recycled.
+        let mut wide = DepthWriter::for_test_book(Feed::Dhan);
+        let caps = wide.staged.capacities_for_test();
+        let (p, q, o) = book_levels(200);
+        while !wide.book_flush_due() {
+            wide.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+            seq += 1;
+        }
+        assert!(
+            wide.staged.capacities_for_test().1 > caps.1,
+            "200-level rows grow the value arena"
+        );
+        assert!(
+            wide.staged.ram_bytes() <= MAX_DEPTH_STAGED_SPARE_RAM_BYTES,
+            "a batch grown only up to the flush trigger is still recycled: {} > {}",
+            wide.staged.ram_bytes(),
+            MAX_DEPTH_STAGED_SPARE_RAM_BYTES
+        );
+
+        // A hand-off that finds no spare waiting reserves the pre-size for the
+        // next batch at the hand-off, never leaving a zero buffer.
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+        producer.flush().expect("hand off");
+        assert!(producer.buffer.as_bytes().is_empty());
+        assert!(
+            producer.buffer.capacity() >= DepthLayout::Levels.row_buffer_presize_bytes(),
+            "the batch after a spare-less hand-off starts pre-sized"
+        );
+    }
+
+    #[test]
+    fn test_row_buffer_presize_bytes_per_layout() {
+        assert_eq!(
+            DepthLayout::Levels.row_buffer_presize_bytes(),
+            DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES
+        );
+        assert_eq!(
+            DepthLayout::Book.row_buffer_presize_bytes(),
+            DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES
+        );
+        // A full book batch plus a frame fits without a doubling.
+        assert!(DEPTH_BOOK_ROW_BUFFER_PRESIZE_BYTES > DEPTH_BOOK_FLUSH_BYTES);
+        // 10,000 level rows at ~179 B (the live cut) fit with room to spare.
+        assert!(DEPTH_LEVEL_ROW_BUFFER_PRESIZE_BYTES >= 10_000 * 179 * 2);
+    }
+
+    #[test]
+    fn a_full_depth_queue_does_not_swallow_a_waiting_spare() {
+        let (mut w, sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        sink.return_spare_buffer(&mut spent_batch(512));
+        w.append_row(&row()).expect("append");
+        w.flush().expect("backpressure is not a failure");
+        assert_eq!(w.pending(), 1, "the row is retained");
+        let lane = w.spare_buffers.as_ref().expect("lane");
+        assert!(
+            lane.try_recv().is_ok(),
+            "the spare must still be waiting — the Full arm must not take it"
+        );
+    }
+
+    #[test]
+    fn a_split_writer_hands_the_batch_to_the_queue_instead_of_the_network() {
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        assert!(w.is_offloaded(), "the split must open the hand-off queue");
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        w.flush().expect("a healthy hand-off is not a failure");
+
+        assert_eq!(w.pending(), 0, "the rows left the producer");
+        let batch = rx.try_recv().expect("the batch must be on the queue");
+        assert_eq!(batch.rows(), 1, "and it must carry the row count");
+    }
+
+    #[test]
+    fn a_sent_depth_batch_takes_the_unbacked_mark_with_it() {
+        // Review of G4-audit (2026-10-11): the mark was copied into the batch
+        // and never cleared, so after ONE unbacked frame every later batch
+        // read as unbacked and its rescue failure was reported as lost.
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        w.append_row(&row()).expect("append");
+        w.mark_pending_unbacked();
+        w.flush().expect("hand-off");
+        let first = rx.try_recv().expect("first batch");
+        assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(first.has_unbacked_rows(), "the accessor reads the mark");
+        assert!(!w.pending_unbacked(), "the Sent arm clears the mark");
+
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand-off");
+        let second = rx.try_recv().expect("second batch");
+        assert!(
+            !second.unbacked,
+            "a later, fully sequenced batch must read as backed"
+        );
+        assert!(!second.has_unbacked_rows(), "the accessor reads the mark");
+    }
+
+    #[test]
+    fn a_full_queue_retains_the_rows_and_is_never_reported_as_a_failure() {
+        // THE test. A full queue means the writer is behind, not that anything
+        // was lost — the producer keeps its buffer and the next flush retries.
+        // Reporting this as `Err` would decay feed health and log a loss for a
+        // batch that is still entirely in hand, which is the exact false-loss
+        // shape this arm exists to prevent.
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        // The queue is now full and `_rx` is deliberately not drained.
+        w.append_row(&row()).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        w.flush()
+            .expect("backpressure is not a failure — the rows are still held");
+
+        assert_eq!(
+            w.pending(),
+            1,
+            "the row must still be pending, not silently consumed"
+        );
+    }
+
+    #[test]
+    fn retaining_past_the_span_bound_rescues_rather_than_widening_forever() {
+        // "Keep appending while the writer is behind" is correct exactly twice.
+        // Past that it is an unbounded memory path wearing a backpressure
+        // costume, so the producer cuts to the durable tier and says so.
+        let dir = temp_depth_spill_dir();
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        for _ in 0..DEPTH_FLUSH_QUEUE_DEPTH {
+            w.append_row(&row()).expect("append");
+            w.flush().expect("fills the queue");
+        }
+        // Every flush from here finds the queue full.
+        let mut last = Ok(());
+        for _ in 0..=MAX_DEPTH_RETAINED_FLUSH_SPANS {
+            w.append_row(&row()).expect("append");
+            last = w.flush();
+        }
+        assert!(
+            last.is_err(),
+            "the span past the retention bound must report that rows left the buffer"
+        );
+        assert_eq!(w.pending(), 0, "and the buffer must be empty afterwards");
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "the rescue must be DURABLE — a width cap that drops rows is worse \
+             than the accumulation it prevents"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dead_writer_thread_rescues_the_rows_and_reports_it() {
+        let dir = temp_depth_spill_dir();
+        let (mut w, _sink, rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        drop(rx); // the writer thread died
+        w.append_row(&row()).expect("append");
+
+        let outcome = w.flush();
+
+        assert!(
+            outcome.is_err(),
+            "a gone writer moved rows out of the buffer — that is a failure, \
+             and reporting Ok here would forge feed health"
+        );
+        assert_eq!(w.pending(), 0);
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "a dead writer must rescue, not drop — the rows are re-ingestable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_offload_returns_the_writer_to_the_synchronous_arm() {
+        // Shutdown ordering: the queue closes so the writer thread's blocking
+        // recv ends, and any last rows then take the synchronous arm — which,
+        // with the sender long gone to the sink, rescues to disk. Rows on disk
+        // and named is the correct end-of-session outcome; a wedged join is not.
+        let (mut w, _sink, _rx) = DepthWriter::for_test(Feed::Dhan).split_for_offload();
+        assert!(w.is_offloaded());
+        w.close_offload();
+        assert!(
+            !w.is_offloaded(),
+            "after close the writer must take the synchronous arm"
+        );
+    }
+
+    #[test]
+    fn the_sink_rescues_a_batch_the_network_refused() {
+        // `for_test` has no ILP sender, so the sink's write is the
+        // QuestDB-unreachable arm — the same one a real network failure takes.
+        let dir = temp_depth_spill_dir();
+        let (mut w, mut sink, rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        sink.spill_dir.clone_from(&dir);
+        w.append_row(&row()).expect("append");
+        w.flush().expect("hand-off");
+        let mut batch = rx.try_recv().expect("batch");
+
+        let landed = sink.write(&mut batch);
+
+        assert_eq!(
+            landed, 0,
+            "a failed write must report ZERO rows landed — the caller derives \
+             feed health from this number, so it may decay it but never forge it"
+        );
+        assert_eq!(batch.rows(), 0, "and the batch must not be re-writable");
+        let spilled: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert!(
+            !spilled.is_empty(),
+            "the sink rescues exactly as the producer does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sink_reports_the_rows_that_actually_landed() {
+        // Zero rows is not a failure and must not touch the spill tier — an
+        // empty flush that wrote a rescue file every 500 ms would fill the
+        // 512 MiB cap with nothing.
+        let dir = temp_depth_spill_dir();
+        let (_w, mut sink, _rx) = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        sink.spill_dir.clone_from(&dir);
+        let mut empty = DepthFlushBatch {
+            buffer: Buffer::new(questdb::ingress::ProtocolVersion::V1),
+            staged: crate::depth_stage::DepthStagedBatch::new(),
+            rows: 0,
+            min_seq: 0,
+            max_seq: 0,
+            unbacked: false,
+        };
+        assert_eq!(sink.write(&mut empty), 0);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) == 0,
+            "an empty batch must never write a rescue file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_split_takes_the_sender_so_the_producer_cannot_touch_the_network() {
+        // The one-way door. If the producer kept a sender, a stray synchronous
+        // flush would put a 5 s blocking round trip back on the drain — the
+        // exact coupling this change removes — and nothing would catch it.
+        let w = DepthWriter::for_test(Feed::Dhan);
+        let had_sender = w.sender.is_some();
+        let (producer, sink, _rx) = w.split_for_offload();
+        assert!(
+            producer.sender.is_none(),
+            "the producer must not retain the ILP sender after the split"
+        );
+        assert_eq!(
+            sink.sender.is_some(),
+            had_sender,
+            "and the sink must hold whatever sender there was"
+        );
+    }
+
+    #[test]
+    fn the_depth_producer_ceiling_leaves_headroom_under_the_questdb_wedge() {
+        // Const-asserted at the definition too; restated as a test so the
+        // reasoning is discoverable from the test list rather than only from a
+        // compile error nobody sees until it fires.
+        assert!(
+            MAX_DEPTH_PRODUCER_BUFFER_BYTES * 2
+                <= crate::tick_persistence::QUESTDB_MAX_BUF_SIZE_BYTES,
+            "past the questdb-rs max_buf_size EVERY flush fails permanently — a wedge, \
+             not a degrade — so the rescue arm must fire well before it"
+        );
+        assert!(
+            MAX_DEPTH_RETAINED_FLUSH_SPANS >= 1,
+            "a retention bound of zero spills on the first hiccup, which converts \
+             ordinary backpressure into disk writes"
+        );
+        assert!(
+            DEPTH_FLUSH_QUEUE_DEPTH >= 1,
+            "a zero-depth queue makes every flush a QueueFull and the split pointless"
+        );
+    }
+
+    /// The offloaded buffer swap is safe only while every identifier we emit
+    /// fits the DEFAULT name limit.
+    ///
+    /// # The residual this pins
+    ///
+    /// A healthy writer builds its buffer with `sender.new_buffer()`, which
+    /// carries the sender's negotiated `max_name_len`. `offload_flush` replaces
+    /// a handed-off buffer with `Buffer::new(protocol)`, which uses the
+    /// questdb-rs default of 127 — and `Buffer` exposes no getter, so the
+    /// negotiated value cannot be carried across without pooling buffers or
+    /// pinning the conf.
+    ///
+    /// That is a real divergence and it is deliberately NOT engineered around,
+    /// because it cannot bite: every table and column name this writer emits is
+    /// far under 127 bytes, so both limits validate identically. The failure
+    /// would need a server reporting a limit BELOW our longest identifier,
+    /// which this test makes impossible to reach silently — add a long column
+    /// name and it fires here rather than as whole rejected flushes in prod.
+    #[test]
+    fn every_depth_identifier_fits_the_default_name_limit() {
+        // questdb-rs `MAX_NAME_LEN_DEFAULT`, restated rather than imported: it
+        // is not re-exported, and a number that only exists in a dependency's
+        // private module is a number nothing here can check.
+        const QUESTDB_DEFAULT_MAX_NAME_LEN: usize = 127;
+        // A generous floor under it. If an identifier ever approaches the real
+        // limit, the design decision above needs revisiting rather than the
+        // test re-blessing.
+        const HEADROOM_FLOOR: usize = 64;
+
+        let mut names: Vec<&str> = vec![MARKET_DEPTH_TABLE];
+        names.extend(DEDUP_KEY_MARKET_DEPTH.split(',').map(str::trim));
+        for name in names {
+            assert!(
+                name.len() <= HEADROOM_FLOOR,
+                "`{name}` is {} bytes. The offloaded flush replaces the buffer with one \
+                 built at the questdb-rs default limit of {QUESTDB_DEFAULT_MAX_NAME_LEN}, \
+                 which is safe only while every identifier sits comfortably under it. \
+                 Past this floor, carry the sender's negotiated max_name_len across the \
+                 split instead of re-blessing this number.",
+                name.len()
+            );
+        }
+    }
+
+    /// The `mem::replace` placeholder must carry the REAL floor.
+    ///
+    /// `for_test` sets the floor to 0, and 0 means NO floor on the sighted
+    /// path — a writer that always has room. Production briefly holds a
+    /// placeholder while swapping the live writer for its offload split; the
+    /// window is transient today, but a floor-0 depth writer escaping it would
+    /// spill with nothing checking free space, which is the exact inversion
+    /// the typed blind-write policy was introduced to make impossible.
+    #[test]
+    fn the_mem_replace_placeholder_carries_the_production_floor() {
+        let placeholder = DepthWriter::placeholder_for_offload_swap(Feed::Dhan);
+        assert_eq!(
+            placeholder.spill_min_free_headroom,
+            crate::tick_persistence::DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+            "the placeholder must carry the production depth floor, not the \
+             test writer's zero"
+        );
+        assert!(
+            placeholder.spill_min_free_headroom > 0,
+            "a floor of zero is not a floor — it allows any write the probe \
+             can see space for, however little"
+        );
+        // Non-vacuous: the thing it is derived FROM really does carry zero, so
+        // this test would fail if someone "simplified" the placeholder back to
+        // `for_test`.
+        assert_eq!(
+            DepthWriter::for_test(Feed::Dhan).spill_min_free_headroom,
+            0,
+            "for_test is expected to carry 0 — if that changed, this test is \
+             no longer proving anything and should be re-derived"
+        );
+    }
+
+    /// The unsanitised symbol path is guarded in debug — 2026-09-01.
+    ///
+    /// `append_row` deliberately skips `sanitize_ilp_symbol` because the
+    /// `const _` block proves every member of the closed sets is ILP-safe.
+    /// The proof cannot cover a CALLER, and the four fields are `pub`.
+    ///
+    /// This pins that a value outside the proven sets is caught rather than
+    /// written. It is a `should_panic` on a `debug_assert!`, so it exercises
+    /// exactly the build configuration tests and CI run in — and costs
+    /// nothing in release, which is the point: the highest-volume writer in
+    /// the process keeps the optimisation.
+    #[test]
+    #[should_panic(expected = "is not ILP-safe")]
+    fn a_hostile_segment_is_refused_in_debug_rather_than_forging_a_row() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        // A raw newline is the specific value that defeats the encoder: it is
+        // escaped as a backslash plus a REAL newline, so it still reaches the
+        // wire and splits one record into two.
+        r.segment = "NSE\nFNO";
+        let _ = w.append_row(&r);
+    }
+
+    /// Same guard, on the field that is part of the DEDUP key.
+    #[test]
+    #[should_panic(expected = "is not ILP-safe")]
+    fn a_hostile_depth_kind_is_refused_in_debug() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.depth_kind = "d20,evil=1";
+        let _ = w.append_row(&r);
+    }
+
+    /// And the happy path must still be untouched — a guard that fires on
+    /// legitimate input would be worse than none.
+    #[test]
+    fn every_proven_label_still_appends_cleanly() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        for (kind, side) in [
+            (DEPTH_KIND_5, DEPTH_SIDE_BID),
+            (DEPTH_KIND_20, DEPTH_SIDE_ASK),
+            (DEPTH_KIND_200, DEPTH_SIDE_BID),
+        ] {
+            let mut r = row();
+            r.depth_kind = kind;
+            r.side = side;
+            w.append_row(&r).expect("proven labels must append"); // APPROVED: test-only
+        }
+    }
+
+    /// Depth's own out-of-window refusal, and it must NOT read as a loss.
+    ///
+    /// The three counters the callers watch (`tv_depth_rows_dropped_total`
+    /// and its rescued twin) must be untouched, and `append_row` must return
+    /// `Ok(())` -- an `Err` here would mark the frame unapplied and the next
+    /// replay would refuse it again, forever, paging on every cycle.
+    #[test]
+    fn an_out_of_window_depth_row_is_refused_as_ok_never_as_a_loss() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        // 22:13:20 IST -- the old fixture value, now a refusal.
+        r.ts_nanos = 1_700_000_000_000_000_000;
+        assert!(
+            w.append_row(&r).is_ok(),
+            "a refusal is Ok(()): an Err marks the frame unapplied and the \
+             callers count it as tv_depth_rows_dropped_total, which is alarmed"
+        );
+        assert_eq!(w.pending, 0, "the refused row must not reach the buffer");
+        assert_eq!(w.dropped, 0, "a refusal is NOT a drop");
+        assert_eq!(w.rescued, 0, "and it is not a rescue either");
+    }
+
+    /// The closing-auction book, delivered late, is now KEPT.
+    ///
+    /// This is the regression this whole arrival-grace change exists for, and
+    /// it fails on the tree as it stood before: the gate asked
+    /// `row_is_in_an_open_window` of a number that is the ARRIVAL instant, so a
+    /// snapshot of the 15:39 book handed over at 15:40:05 was refused -- with
+    /// `Ok(())` returned and no `note_unapplied`, so no replay ever re-offered
+    /// it. At the measured p99 Dhan lag of 46.37 s that discarded the tail of
+    /// every session for the slowest 1% of depth frames.
+    #[test]
+    fn a_late_delivered_closing_book_is_written_not_silently_refused() {
+        let day = row().ts_nanos - (row().ts_nanos % 86_400_000_000_000);
+        let at = |secs: i64| day + secs * 1_000_000_000;
+        let end = i64::from(tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let grace = i64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
+
+        // 15:40:05 -- five seconds past the ungraced close, well inside the
+        // measured delivery lag, describing book state from before it.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = at(end + 5);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 1,
+            "a depth frame delivered 5s past the close must be WRITTEN: its \
+             one clock is the arrival instant, so refusing it discards real \
+             15:39 book state because the vendor was slow"
+        );
+
+        // The measured worst case, 198.69 s, rounded up.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(end + 199);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 1,
+            "the measured 198.69 s worst-case lag must be inside the grace"
+        );
+
+        // And the grace still CLOSES -- an open-ended tail is not a grace.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(end + grace);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(
+            w.pending, 0,
+            "past the grace the row must still be refused, or the window has \
+             simply been removed for depth"
+        );
+
+        // The junk class the window exists for is untouched: an evening
+        // restart is hours out and must never be admitted.
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        r.ts_nanos = at(18 * 3600);
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0, "an 18:00 restart must still be refused");
+        assert_eq!(w.dropped, 0, "and a refusal is still never a drop");
+    }
+
+    /// The pre-TVW3 WAL sentinel: no receipt at all.
+    ///
+    /// `ws_frame_spill` maps an absent receipt to 0, and the depth row is then
+    /// stamped `0 + IST_UTC_OFFSET_NANOS` = 1970-01-01 05:30 IST. It must be
+    /// refused -- a 1970 partition is unreachable by retention and archival,
+    /// both of which key on the trading day -- but under its OWN reason, not
+    /// as an ordinary out-of-hours row.
+    #[test]
+    fn the_pre_tvw3_wal_sentinel_is_refused_under_its_own_reason() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0);
+        assert_eq!(w.dropped, 0);
+        assert_ne!(
+            DEPTH_OUT_OF_WINDOW_REASONS[1], DEPTH_OUT_OF_WINDOW_REASONS[0],
+            "the sentinel must be distinguishable from an out-of-hours row"
+        );
+    }
+
+    /// A corrupt far-future stamp whose TIME OF DAY looks perfectly normal.
+    ///
+    /// 2_600_000_000 s is in the year 2052; its seconds-of-day is 51_200 =
+    /// 14:13:20, squarely inside the session. Only the absolute band check
+    /// catches it, which is why that check runs BEFORE the window check.
+    #[test]
+    fn a_far_future_depth_stamp_that_looks_in_window_is_refused() {
+        let mut w = DepthWriter::for_test(Feed::Dhan);
+        let mut r = row();
+        r.ts_nanos = 2_600_000_000_i64 * 1_000_000_000;
+        assert_eq!(
+            (2_600_000_000_i64 % 86_400) as u32,
+            51_200,
+            "fixture precondition: this stamp's time-of-day IS in window"
+        );
+        assert!(w.append_row(&r).is_ok());
+        assert_eq!(w.pending, 0, "the band check must refuse it anyway");
+    }
+
+    /// Depth speaks `arrival_*`, never `ts_*`.
+    ///
+    /// Depth has ONE clock and it is the arrival stamp; there is no exchange
+    /// timestamp in the depth protocol at all. A reason label saying `ts_`
+    /// would tell an operator the EXCHANGE stamped the row out of window --
+    /// a claim depth cannot express.
+    #[test]
+    fn every_depth_reason_says_arrival_because_depth_has_no_exchange_clock() {
+        for reason in DEPTH_OUT_OF_WINDOW_REASONS {
+            assert!(
+                reason.starts_with("arrival_"),
+                "{reason} must say arrival: DepthRow::ts_nanos IS the receipt"
+            );
+        }
+        let mut seen = DEPTH_OUT_OF_WINDOW_REASONS;
+        seen.sort_unstable();
+        seen.windows(2).for_each(|w| {
+            assert_ne!(w[0], w[1], "two reasons must never share a metric label");
+        });
+    }
+
+    /// The boundary the operator asked for, on the depth path specifically.
+    ///
+    /// ⚠ AMENDED 2026-09-06 — the 15:40:00 row moved from REFUSED to ACCEPTED,
+    /// and that is a deliberate behaviour change, not a relaxed assertion.
+    ///
+    /// The operator's 2026-09-05 rule binds the EVENT clock: a trade the
+    /// exchange stamped outside [09:00, 15:40) is out of session, and this test
+    /// pinned exactly that. But `market_depth` has no event clock — the depth
+    /// protocol carries no exchange timestamp, so `ts_nanos` IS the instant the
+    /// frame reached us. Judging it on 15:40:00 therefore refused a snapshot of
+    /// the 15:39 book because the VENDOR was slow, silently and permanently
+    /// (`Ok(())`, no `note_unapplied`, so no replay re-offers it). At this
+    /// repository's measured p99 Dhan lag of 46.37 s that discarded the tail of
+    /// every session for the slowest 1% of depth frames; at the measured max of
+    /// 198.69 s, the last ~3.3 minutes — the closing-auction book.
+    ///
+    /// So the boundary below is now the GRACED one, and the two rows that
+    /// matter are both still pinned: the grace CLOSES at
+    /// `ARRIVAL_GRACE_TAIL_SECS`, and the window START is not graced at all
+    /// (08:59:59 is still refused — delivery lag makes a row late, never
+    /// early). The ungraced event-clock boundary is unchanged and is pinned by
+    /// `session_window::tests::arrival_grace_does_not_widen_the_event_clock_path`.
+    #[test]
+    fn depth_accepts_the_last_in_window_instant_and_refuses_the_next() {
+        let midnight = 1_699_920_000_i64;
+        let grace = i64::from(tickvault_common::constants::ARRIVAL_GRACE_TAIL_SECS);
+        for (sod, want_pending, label) in [
+            (32_400_i64, 1_usize, "09:00:00 accepted"),
+            (56_399, 1, "15:39:59 accepted"),
+            (
+                56_400,
+                1,
+                "15:40:00 accepted — arrival-clocked, inside the grace",
+            ),
+            (56_400 + grace - 1, 1, "the last graced instant accepted"),
+            (56_400 + grace, 0, "one second past the grace refused"),
+            (32_399, 0, "08:59:59 refused — the START is never graced"),
+        ] {
+            let mut w = DepthWriter::for_test(Feed::Dhan);
+            let mut r = row();
+            r.ts_nanos = (midnight + sod) * 1_000_000_000;
+            assert!(w.append_row(&r).is_ok(), "{label}: always Ok");
+            assert_eq!(w.pending, want_pending, "{label}");
+        }
+    }
+
+    // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------
+
+    /// A depth row at a sequence far above anything another test acks.
+    fn z7_row(k: u64) -> (DepthRow, u64) {
+        let seq = (1u64 << 61) + (k << 40);
+        let mut r = row();
+        r.capture_seq = i64::try_from(seq).expect("fits");
+        (r, seq)
+    }
+
+    #[test]
+    fn test_regression_depth_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it() {
+        let dir = spill_tmp("z7-depth-floor");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let (r, seq) = z7_row(1);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Depth;
+        assert!(batch.floor.is_some());
+        assert!(wm.rescue_floor_is_held(kind, seq));
+        sink.rescue(&batch);
+        assert!(!wm.rescue_floor_is_held(kind, seq));
+        assert!(!wm.snapshot().range_has_unapplied(seq, seq));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_depth_refused_rescue_hand_off_retracts_its_floor() {
+        let dir = spill_tmp("z7-depth-refused");
+        let mut w = DepthWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
+        let (sink, rx) = w.split_rescue_offload();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Depth;
+        let mut queued = Vec::new();
+        for k in 0..DEPTH_RESCUE_QUEUE_DEPTH as u64 {
+            let (r, seq) = z7_row(10 + k);
+            w.append_row(&r).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+            queued.push(seq);
+        }
+        let (r, refused) = z7_row(20);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            !wm.rescue_floor_is_held(kind, refused),
+            "queue full: floor retracted"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(refused, refused),
+            "deferred to the WAL"
+        );
+        for seq in &queued {
+            assert!(wm.rescue_floor_is_held(kind, *seq));
+        }
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        for seq in &queued {
+            assert!(!wm.rescue_floor_is_held(kind, *seq));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_depth_rescue_sink_reports_a_failed_sync_as_a_failed_rescue() {
+        let dir = spill_tmp("z8a-depth-sync-fail");
+        let mut w = DepthWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (mut sink, rx) = w.split_rescue_offload();
+        sink.spill_sync = Some(|_| Err(std::io::Error::other("injected fdatasync failure")));
+        let (r, seq) = z7_row(30);
+        w.append_row(&r).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let unlanded = wm.unlanded_total();
+        sink.rescue(&batch);
+        assert!(wm.unlanded_total() > unlanded);
+        assert!(wm.snapshot().range_has_unapplied(seq, seq));
+        assert!(!wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Depth, seq));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_depth_ilp_returns_err_when_the_sync_fails() {
+        let dir = spill_tmp("z8a-depth-direct");
+        let failing: Option<crate::tick_persistence::SpillSyncFn> =
+            Some(|_| Err(std::io::Error::other("injected")));
+        assert!(
+            spill_failed_depth_ilp(
+                &dir,
+                b"x\n",
+                crate::depth_spill_frame::ILP_VERSION_1,
+                Feed::Dhan,
+                1_700_000_000,
+                u64::MAX,
+                0,
+                failing
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Array-row table, plan item 49e step 2
+    // -----------------------------------------------------------------------
+
+    /// 12:30:00 IST, the same in-window instant `row()` uses.
+    const BOOK_TS_NANOS: i64 = 1_699_965_000_000_000_000;
+
+    fn book_levels(
+        n: usize,
+    ) -> (
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+        [f64; MAX_DEPTH_BOOK_LEVELS],
+    ) {
+        let mut p = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        let mut q = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        let mut o = [0.0_f64; MAX_DEPTH_BOOK_LEVELS];
+        for i in 0..n {
+            p[i] = 24_500.25 - i as f64 * 0.05;
+            q[i] = (750 + i) as f64;
+            o[i] = (12 + i) as f64;
+        }
+        (p, q, o)
+    }
+
+    fn book_row<'a>(p: &'a [f64], q: &'a [f64], o: &'a [f64], seq: i64) -> DepthBookRow<'a> {
+        DepthBookRow {
+            security_id: 52_175,
+            segment: "NSE_FNO",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_BID,
+            prices: p,
+            quantities: q,
+            orders: o,
+            capture_seq: seq,
+            ts_nanos: BOOK_TS_NANOS,
+        }
+    }
+
+    #[test]
+    fn test_market_depth_book_create_ddl_holds_three_double_arrays() {
+        let ddl = market_depth_book_create_ddl();
+        for col in [
+            "price DOUBLE[]",
+            "quantity DOUBLE[]",
+            "orders DOUBLE[]",
+            "levels LONG",
+        ] {
+            assert!(ddl.contains(col), "{col} missing from {ddl}");
+        }
+        assert!(
+            !ddl.contains("level LONG"),
+            "a book row carries no per-level column"
+        );
+        assert!(ddl.contains("PARTITION BY HOUR WAL"));
+        assert!(ddl.contains(MARKET_DEPTH_BOOK_TABLE));
+    }
+
+    #[test]
+    fn test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key() {
+        let stmts = market_depth_book_ensure_statements();
+        assert_eq!(stmts.first(), Some(&market_depth_book_create_ddl()));
+        assert_eq!(stmts.len(), 1 + MARKET_DEPTH_BOOK_COLUMNS.len() + 1);
+        assert!(
+            stmts
+                .iter()
+                .all(|s| !s.to_ascii_uppercase().contains("DROP"))
+        );
+        assert_eq!(
+            stmts.last().map(String::as_str),
+            Some(
+                "ALTER TABLE market_depth_book DEDUP ENABLE UPSERT KEYS(ts, security_id, segment, depth_kind, side, capture_seq, feed)"
+            )
+        );
+    }
+
+    /// The book key is the level key with `level` removed and nothing else
+    /// changed: `segment` (I-P1-11), `depth_kind`, `capture_seq` and `feed`
+    /// all stay.
+    #[test]
+    fn test_book_dedup_key_is_the_level_key_without_level() {
+        let level_cols: Vec<&str> = DEDUP_KEY_MARKET_DEPTH
+            .split(", ")
+            .filter(|c| *c != "level")
+            .collect();
+        let book_cols: Vec<&str> = DEDUP_KEY_MARKET_DEPTH_BOOK.split(", ").collect();
+        assert_eq!(level_cols, book_cols);
+        for must in ["segment", "feed", "depth_kind", "capture_seq", "side"] {
+            assert!(
+                book_cols.contains(&must),
+                "{must} missing from the book key"
+            );
+        }
+    }
+
+    /// Pinned, never negotiated: arrays exist only in ILP v2, and an unpinned
+    /// client negotiates v3, which fails a v2 buffer at flush.
+    #[test]
+    fn test_depth_layout_protocol_number_pins_v1_and_v2_in_the_conf() {
+        let cfg = QuestDbConfig {
+            host: "tv-questdb".to_string(),
+            http_port: 9000,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let levels = depth_ilp_http_conf(&cfg, DepthLayout::Levels);
+        let book = depth_ilp_http_conf(&cfg, DepthLayout::Book);
+        assert!(levels.contains("protocol_version=1;"), "{levels}");
+        assert!(book.contains("protocol_version=2;"), "{book}");
+        for conf in [&levels, &book] {
+            assert!(conf.contains("retry_timeout=0;"));
+            assert!(conf.contains("request_timeout=5000;"));
+        }
+        assert_eq!(DepthLayout::Book.protocol(), ProtocolVersion::V2);
+        assert_eq!(DepthLayout::Levels.protocol(), ProtocolVersion::V1);
+    }
+
+    #[test]
+    fn test_append_book_row_writes_a_200_level_side_as_one_row() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        assert_eq!(w.layout(), DepthLayout::Book);
+        let (p, q, o) = book_levels(200);
+        w.append_book_row(&book_row(&p, &q, &o, 7)).expect("append");
+        // ONE line in the buffer, counted as its 200 levels so every flush
+        // and loss counter reads the unit the level layout counts.
+        assert_eq!(
+            w.pending(),
+            200,
+            "pending counts the levels the row carries"
+        );
+        let bytes = w.pending_ilp_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.starts_with("market_depth_book,"), "{}", &text[..40]);
+        assert!(text.contains("levels=200i"));
+        assert!(text.contains("depth_kind=d200"));
+        assert!(text.contains("segment=NSE_FNO"));
+        assert!(text.contains("feed=dhan"));
+        // A level row for the same side would be ~200 lines; the book is one.
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert!(
+            w.pending_bytes() > 200 * 8 * 3,
+            "three arrays of 200 doubles"
+        );
+    }
+
+    #[test]
+    fn test_a_refused_level_travels_as_nan_in_its_slot() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (mut p, q, o) = book_levels(20);
+        p[3] = f64::NAN;
+        w.append_book_row(&book_row(&p[..20], &q[..20], &o[..20], 9))
+            .expect("a NaN slot is kept, never skipped");
+        assert_eq!(w.pending(), 20, "the NaN slot still counts as a level");
+        assert!(String::from_utf8_lossy(&w.pending_ilp_bytes()).contains("levels=20i"));
+    }
+
+    #[test]
+    fn test_an_empty_book_is_one_row_with_empty_arrays() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        w.append_book_row(&book_row(&[], &[], &[], 11))
+            .expect("empty book");
+        assert_eq!(w.pending(), 1, "a side with no levels still counts one");
+        assert!(String::from_utf8_lossy(&w.pending_ilp_bytes()).contains("levels=0i"));
+    }
+
+    #[test]
+    fn test_unequal_or_oversized_arrays_are_refused_with_nothing_written() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(20);
+        assert!(
+            w.append_book_row(&book_row(&p[..20], &q[..19], &o[..20], 3))
+                .is_err()
+        );
+        assert!(
+            w.append_book_row(&book_row(&p[..20], &q[..20], &o[..21], 3))
+                .is_err()
+        );
+        let big = [1.0_f64; MAX_DEPTH_BOOK_LEVELS + 1];
+        assert!(w.append_book_row(&book_row(&big, &big, &big, 3)).is_err());
+        assert_eq!(w.pending(), 0);
+        assert!(
+            w.buffer.as_bytes().is_empty(),
+            "a refusal writes no partial line"
+        );
+    }
+
+    /// One writer writes one table: a level row on a book writer would leave
+    /// the arrays NULL over a stored book.
+    #[test]
+    fn test_each_writer_refuses_the_other_layout() {
+        let mut book = DepthWriter::for_test_book(Feed::Dhan);
+        assert!(book.append_row(&row()).is_err());
+        assert_eq!(book.pending(), 0);
+        let mut levels = DepthWriter::for_test(Feed::Dhan);
+        let (p, q, o) = book_levels(5);
+        assert!(
+            levels
+                .append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 4))
+                .is_err()
+        );
+        assert_eq!(levels.pending(), 0);
+        assert!(levels.append_row(&row()).is_ok());
+    }
+
+    #[test]
+    fn test_an_out_of_window_book_row_is_refused_like_a_level_row() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(5);
+        let mut r = book_row(&p[..5], &q[..5], &o[..5], 5);
+        r.ts_nanos = tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        w.append_book_row(&r).expect("refused rows are Ok, counted");
+        // 22:13:20 IST, outside every session window.
+        r.ts_nanos = 1_700_000_000_000_000_000;
+        w.append_book_row(&r).expect("refused rows are Ok, counted");
+        assert_eq!(w.pending(), 0);
+        assert_eq!(
+            depth_arrival_window_refusal(BOOK_TS_NANOS),
+            None,
+            "the in-window fixture is still in window"
+        );
+    }
+
+    /// Plan item 49e step 3: with QuestDB unreachable the book-table ensure
+    /// reports false (every statement refused), so the boot DDL report shows
+    /// the depth tables as not ensured rather than a false OK.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_table_reports_false_when_questdb_is_unreachable() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert_eq!(
+            ensure_market_depth_book_table(&cfg).await,
+            BookEnsureOutcome::Failed
+        );
+    }
+
+    /// Review 2026-10-29: the LH-01 refusal loses nothing (depth stays in
+    /// `market_depth`), so it must not move `tv_depth_persist_errors_total`,
+    /// the series the always-armed market-data persistence-loss alarm sums.
+    /// Before the fix it bumped `{stage="ensure_ddl"}` on every boot.
+    #[test]
+    fn test_lh01_refusal_does_not_move_the_persistence_loss_counter() {
+        let rt = crate::tick_spill_replay::tests::counter_test_runtime();
+        let port = rt.block_on(lh01_spawn_stub(
+            lh01_http_200(LH01_AUTO_CREATED_COLUMNS),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let loss = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            "tv_depth_persist_errors_total",
+        );
+        let (outcome, loss_moved) =
+            loss.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(outcome, BookEnsureOutcome::LayoutRefused);
+        assert!(!outcome.is_ensured());
+        assert_eq!(loss_moved, 0, "a no-loss refusal is not a persistence loss");
+        // It is still counted, on the non-loss series.
+        let refused = crate::tick_spill_replay::tests::OneCounterRecorder::new(
+            MARKET_DEPTH_BOOK_LAYOUT_REFUSED_COUNTER,
+        );
+        let (_, refused_moved) =
+            refused.count_during(&rt, ensure_market_depth_book_table(&lh01_cfg(port)));
+        assert_eq!(refused_moved, 1);
+    }
+
+    /// Only `Ensured` arms the array-row writer.
+    #[test]
+    fn test_book_ensure_outcome_is_ensured_only_when_ensured() {
+        assert!(BookEnsureOutcome::Ensured.is_ensured());
+        assert!(!BookEnsureOutcome::Failed.is_ensured());
+        assert!(!BookEnsureOutcome::LayoutRefused.is_ensured());
+    }
+
+    /// Review 2026-10-29: the remedy never drops a table with rows (it is
+    /// renamed), and says to start inside the depth replay hold, so a spilled
+    /// book row cannot auto-create the table again before the boot CREATE.
+    #[test]
+    fn test_lh01_remedy_keeps_rows_and_starts_inside_the_depth_replay_hold() {
+        let r = MARKET_DEPTH_BOOK_TS_REMEDY;
+        assert!(r.contains("RENAME TABLE market_depth_book TO"), "{r}");
+        assert!(
+            r.contains("If it is 0, DROP TABLE market_depth_book"),
+            "{r}"
+        );
+        assert!(r.contains("08:30 IST start"), "{r}");
+        assert!(r.contains("data/spill/depth"), "{r}");
+        // The window the remedy names is the replay hold the code enforces.
+        assert!(crate::tick_spill_replay::depth_replay_held_at(
+            8 * 3600 + 30 * 60
+        ));
+        assert!(!crate::tick_spill_replay::depth_replay_held_at(
+            crate::tick_spill_replay::DEPTH_REPLAY_HOLD_END_SECS_OF_DAY_IST
+        ));
+        assert!(r.contains("08:00") && r.contains("15:40"), "{r}");
+    }
+
+    /// The column list of a `market_depth_book` the boot CREATE would have
+    /// made: every data column plus a designated `ts`.
+    fn book_columns_as_created() -> Vec<TableColumn> {
+        let mut out: Vec<TableColumn> = MARKET_DEPTH_BOOK_COLUMNS
+            .iter()
+            .map(|(name, ty)| TableColumn {
+                name: (*name).to_string(),
+                ty: (*ty).to_string(),
+                designated: false,
+            })
+            .collect();
+        out.push(TableColumn {
+            name: "ts".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        out
+    }
+
+    /// LH-01: a table created by the boot CREATE has its designated `ts`, so
+    /// the ensure goes ahead.
+    #[test]
+    fn test_book_ts_check_accepts_the_table_the_create_makes() {
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&book_columns_as_created()),
+            None
+        );
+    }
+
+    /// LH-01: an absent table (no columns) is left to the CREATE.
+    #[test]
+    fn test_book_ts_check_leaves_an_absent_table_to_the_create() {
+        assert_eq!(market_depth_book_designated_ts_problem(&[]), None);
+    }
+
+    /// LH-01 (live, 2026-10-28): the table an ILP write auto-creates names its
+    /// designated timestamp `timestamp`, so every boot's DEDUP ALTER failed with
+    /// "deduplicate key column not found [column=ts]". The check names it.
+    #[test]
+    fn test_book_ts_check_names_a_designated_timestamp_under_another_name() {
+        let mut cols = book_columns_as_created();
+        cols.retain(|c| c.name != "ts");
+        cols.push(TableColumn {
+            name: "timestamp".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: a `ts` column that is not the designated timestamp is still a
+    /// refusal: the DEDUP key needs `ts` to BE the designated timestamp.
+    #[test]
+    fn test_book_ts_check_refuses_a_plain_ts_column() {
+        let mut cols = book_columns_as_created();
+        for c in &mut cols {
+            c.designated = false;
+        }
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Missing {
+                plain_ts_present: true,
+            })
+        );
+        cols.push(TableColumn {
+            name: "timestamp".to_string(),
+            ty: "TIMESTAMP".to_string(),
+            designated: true,
+        });
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: true,
+            })
+        );
+    }
+
+    /// LH-01: a table with no `ts` and no designated timestamp at all.
+    #[test]
+    fn test_book_ts_check_refuses_a_table_with_no_designated_timestamp() {
+        let mut cols = book_columns_as_created();
+        cols.retain(|c| c.name != "ts");
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Missing {
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: the `/exec` answer to `SELECT * FROM table_columns(..)` is read
+    /// by column NAME, so a QuestDB that adds or reorders columns still parses.
+    #[test]
+    fn test_parse_table_columns_answer_reads_by_column_name() {
+        let body = r#"{"query":"x","columns":[{"name":"designated","type":"BOOLEAN"},{"name":"indexed","type":"BOOLEAN"},{"name":"column","type":"STRING"},{"name":"type","type":"STRING"}],"timestamp":-1,"dataset":[[false,false,"feed","SYMBOL"],[true,false,"timestamp","TIMESTAMP"]],"count":2}"#;
+        let cols = parse_table_columns_answer(body).expect("parses");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[1].name, "timestamp");
+        assert_eq!(cols[1].ty, "TIMESTAMP");
+        assert!(cols[1].designated);
+        assert!(!cols[0].designated);
+        assert_eq!(
+            market_depth_book_designated_ts_problem(&cols),
+            Some(BookTimestampProblem::Misnamed {
+                designated: "timestamp".to_string(),
+                plain_ts_present: false,
+            })
+        );
+    }
+
+    /// LH-01: an answer the check cannot read is `None`, never a refusal:
+    /// the ensure then runs as before and reports what QuestDB says.
+    #[test]
+    fn test_parse_table_columns_answer_refuses_nothing_it_cannot_read() {
+        assert_eq!(parse_table_columns_answer("not json"), None);
+        assert_eq!(
+            parse_table_columns_answer(r#"{"error":"table does not exist"}"#),
+            None
+        );
+        let no_designated =
+            r#"{"columns":[{"name":"column","type":"STRING"}],"dataset":[["feed"]]}"#;
+        assert_eq!(parse_table_columns_answer(no_designated), None);
+    }
+
+    /// The answer an ILP-auto-created `market_depth_book` gives to
+    /// `table_columns(..)`: designated timestamp named `timestamp`, no `ts`.
+    const LH01_AUTO_CREATED_COLUMNS: &str = r#"{"query":"x","columns":[{"name":"column","type":"STRING"},{"name":"type","type":"STRING"},{"name":"designated","type":"BOOLEAN"}],"timestamp":-1,"dataset":[["feed","SYMBOL",false],["price","DOUBLE[]",false],["timestamp","TIMESTAMP",true]],"count":3}"#;
+
+    fn lh01_http_200(body: &str) -> &'static str {
+        let resp = String::from("HTTP/1.1 200 OK\r\nContent-Length: ")
+            + &body.len().to_string()
+            + "\r\n\r\n"
+            + body;
+        Box::leak(resp.into_boxed_str())
+    }
+
+    /// A stub QuestDB: `columns_answer` for the `table_columns` probe, `{}`
+    /// (200) for every other statement; `dedup_seen` turns true when any
+    /// request carries a DEDUP statement.
+    async fn lh01_spawn_stub(
+        columns_answer: &'static str,
+        dedup_seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> u16 {
+        let other = lh01_http_200("[]");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let dedup_seen = std::sync::Arc::clone(&dedup_seen);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or("");
+                    if first.contains("DEDUP") {
+                        dedup_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let resp = if first.contains("table_columns") {
+                        columns_answer
+                    } else {
+                        other
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// PR DP-5 stub QuestDB: the auto-created (wrong-timestamp) columns for
+    /// the `table_columns` probe, `count_answer` for `SELECT count()`, the
+    /// i-th of `wal_answers` for the i-th `wal_tables()` read (the last one
+    /// repeats), `rename_answer` for `RENAME TABLE`, `[]` (200) for everything
+    /// else. Returns the port, whether a RENAME, a DROP and a DEDUP statement
+    /// were seen.
+    async fn dp5_spawn_stub(
+        count_answer: &'static str,
+        wal_answers: Vec<&'static str>,
+        rename_answer: &'static str,
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let other = lh01_http_200("[]");
+        let columns = lh01_http_200(LH01_AUTO_CREATED_COLUMNS);
+        let (rename_seen, drop_seen, dedup_seen) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let wal_reads = Arc::new(AtomicUsize::new(0));
+        let wal_answers = Arc::new(wal_answers);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let flags = (
+            Arc::clone(&rename_seen),
+            Arc::clone(&drop_seen),
+            Arc::clone(&dedup_seen),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let (rename_flag, drop_flag, dedup_flag) = (
+                    Arc::clone(&flags.0),
+                    Arc::clone(&flags.1),
+                    Arc::clone(&flags.2),
+                );
+                let (wal_reads, wal_answers) = (Arc::clone(&wal_reads), Arc::clone(&wal_answers));
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let first = request.lines().next().unwrap_or("");
+                    if first.contains("DEDUP") {
+                        dedup_flag.store(true, Ordering::SeqCst);
+                    }
+                    let resp = if first.contains("wal_tables") {
+                        let i = wal_reads.fetch_add(1, Ordering::SeqCst);
+                        wal_answers[i.min(wal_answers.len() - 1)]
+                    } else if first.contains("count%28%29") {
+                        count_answer
+                    } else if first.contains("RENAME") {
+                        rename_flag.store(true, Ordering::SeqCst);
+                        rename_answer
+                    } else if first.contains("DROP") {
+                        drop_flag.store(true, Ordering::SeqCst);
+                        other
+                    } else if first.contains("table_columns") {
+                        columns
+                    } else {
+                        other
+                    };
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (port, rename_seen, drop_seen, dedup_seen)
+    }
+
+    fn dp5_count(n: i64) -> &'static str {
+        lh01_http_200(&format!(
+            r#"{{"query":"x","columns":[{{"name":"count","type":"LONG"}}],"dataset":[[{n}]],"count":1}}"#
+        ))
+    }
+
+    fn dp5_wal(writer: i64, sequencer: i64, suspended: bool) -> &'static str {
+        lh01_http_200(&format!(
+            r#"{{"query":"x","columns":[{{"name":"name","type":"STRING"}},{{"name":"suspended","type":"BOOLEAN"}},{{"name":"writerTxn","type":"LONG"}},{{"name":"sequencerTxn","type":"LONG"}}],"dataset":[["market_depth_book",{suspended},{writer},{sequencer}]],"count":1}}"#
+        ))
+    }
+
+    /// 2026-11-06 10:00 IST (inside the depth spill replay hold).
+    const DP5_IN_HOLD_UNIX: i64 = 1_793_939_400;
+    /// 2026-11-06 17:00 IST (outside it: the replay can post a row).
+    const DP5_OUT_OF_HOLD_UNIX: i64 = DP5_IN_HOLD_UNIX + 7 * 3_600;
+
+    // Regression: 2026-11-06 (PR DP-5) — market_depth_book existed with
+    // designated timestamp `timestamp` and 0 rows, so every boot refused
+    // array rows and inline depth wrote ~7 GiB an hour of level rows.
+    #[tokio::test]
+    async fn test_regression_dp5_an_empty_applied_wrong_ts_book_is_renamed_never_dropped() {
+        let (port, rename_seen, drop_seen, dedup_seen) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::Ensured
+        );
+        assert!(rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !drop_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "nothing is ever dropped"
+        );
+        assert!(
+            dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "re-created with its DEDUP key"
+        );
+    }
+
+    // Review (PR DP): outside 08:00-15:40 IST the depth spill replay is live
+    // and can ack a row between the count and the rename.
+    #[tokio::test]
+    async fn test_dp5_outside_the_depth_replay_hold_the_book_is_kept() {
+        let (port, rename_seen, drop_seen, _) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_OUT_OF_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    // Review (PR DP): a sequencer transaction landing between the two reads
+    // around the count means a writer reached the table: kept.
+    #[tokio::test]
+    async fn test_dp5_a_sequencer_moving_around_the_count_keeps_the_book() {
+        let (port, rename_seen, _, _) = dp5_spawn_stub(
+            dp5_count(0),
+            vec![dp5_wal(7, 7, false), dp5_wal(8, 8, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_dp5_a_book_with_rows_is_never_renamed() {
+        let (port, rename_seen, drop_seen, _) = dp5_spawn_stub(
+            dp5_count(5),
+            vec![dp5_wal(7, 7, false)],
+            lh01_http_200("{}"),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(!rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!drop_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_dp5_unreadable_count_or_unapplied_wal_refuses_and_keeps_the_table() {
+        for (count, wal) in [
+            (lh01_http_200("[]"), dp5_wal(7, 7, false)),
+            (
+                lh01_http_200("HTTP/1.1 500 Internal Server Error\r\n\r\n"),
+                dp5_wal(7, 7, false),
+            ),
+            (dp5_count(0), dp5_wal(6, 7, false)),
+            (dp5_count(0), dp5_wal(7, 7, true)),
+            (dp5_count(0), lh01_http_200("[]")),
+        ] {
+            let (port, rename_seen, _, _) =
+                dp5_spawn_stub(count, vec![wal], lh01_http_200("{}")).await;
+            assert_eq!(
+                ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+                BookEnsureOutcome::LayoutRefused
+            );
+            assert!(
+                !rename_seen.load(std::sync::atomic::Ordering::SeqCst),
+                "never renamed on a guess"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dp5_a_failed_rename_keeps_the_refusal() {
+        let failed = "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}";
+        let (port, rename_seen, _, dedup_seen) =
+            dp5_spawn_stub(dp5_count(0), vec![dp5_wal(7, 7, false)], failed).await;
+        assert_eq!(
+            ensure_market_depth_book_table_at(&lh01_cfg(port), DP5_IN_HOLD_UNIX).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(rename_seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_dp5_book_self_heal_decision_book_wal_applied_book_sequencer_txn_book_self_heal_rename_target()
+     {
+        let ok = BookSelfHealReadings {
+            replay_held: true,
+            row_count: Some(0),
+            wal_applied_before: Some(true),
+            wal_applied: Some(true),
+            sequencer_before: Some(7),
+            sequencer_after: Some(7),
+        };
+        assert_eq!(book_self_heal_decision(ok), Ok(()));
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                replay_held: false,
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedReplayLive)
+        );
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                sequencer_after: Some(8),
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedTxnMoved)
+        );
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                row_count: Some(1),
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedRows)
+        );
+        assert_eq!(
+            book_self_heal_decision(BookSelfHealReadings {
+                row_count: Some(9),
+                wal_applied: None,
+                ..ok
+            }),
+            Err(BookSelfHeal::RefusedRows)
+        );
+        for r in [
+            BookSelfHealReadings {
+                row_count: None,
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied: Some(false),
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied: None,
+                ..ok
+            },
+            // Regression: 2026-11-06 combined review — rows committed but not
+            // yet applied at the count, applied by the second read.
+            BookSelfHealReadings {
+                wal_applied_before: Some(false),
+                ..ok
+            },
+            BookSelfHealReadings {
+                wal_applied_before: None,
+                ..ok
+            },
+            BookSelfHealReadings {
+                row_count: Some(-1),
+                ..ok
+            },
+            BookSelfHealReadings {
+                sequencer_before: None,
+                ..ok
+            },
+        ] {
+            assert_eq!(
+                book_self_heal_decision(r),
+                Err(BookSelfHeal::RefusedUnknown)
+            );
+        }
+        let row = |name: &str, suspended, w, s| crate::wal_suspension_watcher::WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: w,
+            sequencer_txn: s,
+            error_tag: None,
+            error_message: None,
+        };
+        assert_eq!(book_wal_applied(&[]), None);
+        assert_eq!(
+            book_wal_applied(&[row("ticks", false, Some(1), Some(1))]),
+            None
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, Some(3), Some(3))]),
+            Some(true)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, Some(2), Some(3))]),
+            Some(false)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, true, Some(3), Some(3))]),
+            Some(false)
+        );
+        assert_eq!(
+            book_wal_applied(&[row(MARKET_DEPTH_BOOK_TABLE, false, None, Some(3))]),
+            None
+        );
+        assert_eq!(
+            book_sequencer_txn(&[row(MARKET_DEPTH_BOOK_TABLE, false, None, Some(3))]),
+            Some(3)
+        );
+        assert_eq!(
+            book_sequencer_txn(&[row("ticks", false, None, Some(3))]),
+            None
+        );
+        assert_eq!(
+            book_self_heal_rename_target(DP5_IN_HOLD_UNIX),
+            "market_depth_book_lh01_20261106"
+        );
+        assert!(crate::tick_spill_replay::depth_replay_held_at(
+            ist_secs_of_day(DP5_IN_HOLD_UNIX)
+        ));
+        assert!(!crate::tick_spill_replay::depth_replay_held_at(
+            ist_secs_of_day(DP5_OUT_OF_HOLD_UNIX)
+        ));
+        for o in BookSelfHeal::ALL {
+            assert!(!o.as_str().is_empty());
+        }
+    }
+    fn lh01_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// LH-01 end to end: against a QuestDB whose `market_depth_book` names its
+    /// designated timestamp `timestamp`, the ensure refuses BEFORE it sends any
+    /// statement (so no generic DEDUP failure) and reports false. Before the
+    /// fix it sent every statement and, with a QuestDB that accepts them,
+    /// reported true over a table whose DEDUP key can never exist.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_refuses_a_misnamed_designated_timestamp() {
+        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let port = lh01_spawn_stub(
+            lh01_http_200(LH01_AUTO_CREATED_COLUMNS),
+            std::sync::Arc::clone(&dedup_seen),
+        )
+        .await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::LayoutRefused
+        );
+        assert!(
+            !dedup_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "the refusal comes before the DEDUP statement"
+        );
+    }
+
+    /// LH-01: a probe answer it cannot read refuses nothing; the ensure runs
+    /// every statement as before (the DEDUP one included) and reports true.
+    #[tokio::test]
+    async fn test_ensure_market_depth_book_runs_as_before_when_the_probe_is_unreadable() {
+        let dedup_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let port = lh01_spawn_stub(lh01_http_200("[]"), std::sync::Arc::clone(&dedup_seen)).await;
+        assert_eq!(
+            ensure_market_depth_book_table(&lh01_cfg(port)).await,
+            BookEnsureOutcome::Ensured
+        );
+        assert!(dedup_seen.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// LH-01: the refusal names the cause and the manual remedy, and never
+    /// drops anything itself.
+    #[test]
+    fn test_book_ts_problem_text_names_cause_and_remedy() {
+        let text = BookTimestampProblem::Misnamed {
+            designated: "timestamp".to_string(),
+            plain_ts_present: false,
+        }
+        .cause();
+        assert!(text.contains("timestamp"), "{text}");
+        let missing = BookTimestampProblem::Missing {
+            plain_ts_present: true,
+        }
+        .cause();
+        assert!(missing.contains("not the designated"), "{missing}");
+        assert!(MARKET_DEPTH_BOOK_TS_REMEDY.contains("outside market hours"));
+        assert!(MARKET_DEPTH_BOOK_TS_REMEDY.contains("DROP TABLE market_depth_book"));
+    }
+
+    #[test]
+    fn test_buffer_bytes_returns_the_binary_book_line_buffer_utf8_cannot_show() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        assert!(w.buffer_bytes().is_empty());
+        let (p, q, o) = book_levels(3);
+        w.append_book_row(&book_row(&p[..3], &q[..3], &o[..3], 7))
+            .expect("append");
+        // PF-4b (2026-11-06): the drain stages the row, so the text buffer
+        // stays empty and `pending_ilp_bytes` writes it as the writer would;
+        // `pending_bytes` is that text's exact size.
+        assert!(w.buffer_bytes().is_empty(), "the drain wrote no text");
+        let bytes = w.pending_ilp_bytes();
+        assert!(bytes.starts_with(MARKET_DEPTH_BOOK_TABLE.as_bytes()));
+        assert_eq!(bytes.len(), w.pending_bytes());
+    }
+
+    #[test]
+    fn test_book_flush_due_by_pending_bytes_never_for_a_level_writer() {
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(200);
+        let mut seq = 1_i64;
+        while !w.book_flush_due() {
+            w.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+            seq += 1;
+            assert!(seq < 10_000, "8 MiB must arrive within a few thousand rows");
+        }
+        assert!(w.pending_bytes() >= DEPTH_BOOK_FLUSH_BYTES);
+        assert!(
+            w.pending_bytes() < DEPTH_BOOK_FLUSH_BYTES + 16 * 1024,
+            "due on the row that crosses the bound, not later"
+        );
+        let mut levels = DepthWriter::for_test(Feed::Dhan);
+        for _ in 0..10 {
+            levels.append_row(&row()).expect("append");
+        }
+        assert!(!levels.book_flush_due());
+        // A full flush queue of book batches holds at most one producer
+        // buffer's worth of bytes.
+        assert!(
+            DEPTH_BOOK_FLUSH_BYTES * DEPTH_FLUSH_QUEUE_DEPTH <= MAX_DEPTH_PRODUCER_BUFFER_BYTES
+        );
+    }
+
+    /// A binary v2 batch must spill as ONE framed record: cut at line
+    /// boundaries as v1 text, a newline byte inside a double would split a
+    /// row apart on replay.
+    #[test]
+    fn test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte() {
+        use std::io::Read as _;
+        let mut w = DepthWriter::for_test_book(Feed::Dhan);
+        let (p, q, o) = book_levels(200);
+        for seq in 1..=3 {
+            w.append_book_row(&book_row(&p, &q, &o, seq))
+                .expect("append");
+        }
+        // PF-4b (2026-11-06): the drain stages book rows, so the payload is
+        // the staged rows written as text, exactly as a spill writes them.
+        let payload = w.pending_ilp_bytes();
+        assert!(
+            payload.len() > 3 * 200 * 8 * 3,
+            "the payload must hold the three 200-level rows ({} bytes)",
+            payload.len()
+        );
+        assert!(
+            payload.contains(&b'\n'),
+            "a v2 payload carries newline bytes"
+        );
+        let version = spill_version_of(w.buffer.protocol_version());
+        assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_2);
+        assert_eq!(
+            spill_version_of(ProtocolVersion::V1),
+            crate::depth_spill_frame::ILP_VERSION_1
+        );
+        let dir = temp_depth_spill_dir();
+        let path = spill_failed_depth_ilp(
+            &dir,
+            &payload,
+            version,
+            Feed::Dhan,
+            1_699_965_000,
+            u64::MAX,
+            0,
+            None,
+        )
+        .expect("spill");
+        let file = std::fs::File::open(&path).expect("open");
+        let len = file.metadata().expect("meta").len();
+        let mut scratch = Vec::new();
+        match crate::depth_spill_frame::read_record_at(&file, 0, len, &mut scratch).expect("read") {
+            crate::depth_spill_frame::RecordAt::Whole { version, next } => {
+                assert_eq!(version, crate::depth_spill_frame::ILP_VERSION_2);
+                assert_eq!(next, len, "the whole batch is one record");
+            }
+            other => panic!("expected one whole record, got {other:?}"),
+        }
+        assert_eq!(scratch, payload, "replayed byte for byte");
+        let mut all = Vec::new();
+        std::fs::File::open(&path)
+            .expect("open")
+            .read_to_end(&mut all)
+            .expect("read");
+        assert_eq!(
+            all.len(),
+            crate::depth_spill_frame::FRAME_HEADER_BYTES + payload.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `new_book` builds a v2 writer whether or not QuestDB answers: the pinned
+    /// version means the client never calls `/settings` at construction.
+    #[test]
+    fn test_new_book_builds_a_v2_book_writer_with_no_questdb() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let mut w = DepthWriter::new_book(&cfg, Feed::Dhan);
+        assert_eq!(w.layout(), DepthLayout::Book);
+        assert_eq!(w.buffer.protocol_version(), ProtocolVersion::V2);
+        assert!(
+            w.sender.is_some(),
+            "a pinned v2 conf builds without a server"
+        );
+        let (p, q, o) = book_levels(5);
+        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 21))
+            .expect("append");
+        assert_eq!(w.pending(), 5);
+        assert_eq!(
+            DepthWriter::new(&cfg, Feed::Dhan).layout(),
+            DepthLayout::Levels
+        );
+    }
+
+    // ---- DT-A2 worst-case width and crossing-frame bounds (2026-10-28) ----
+
+    /// Rows the app drain cuts a level batch at (`DEPTH_FLUSH_ROW_THRESHOLD`
+    /// in the app crate; the storage crate cannot import it).
+    const LEVEL_CUT_ROWS: usize = 10_000;
+
+    /// The largest number of Full packets (10 level rows each) in the frame
+    /// that crosses the 10,000-row cut for which the level pre-size still
+    /// holds the whole batch at the WIDEST legal row. Derived in
+    /// `test_level_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows`
+    /// as `(PRESIZE / W - 10,000) / 10`; a frame with more packets than this
+    /// regrows the buffer on the drain (MAX_PACKETS_PER_FRAME is 70,000).
+    const LEVEL_CROSSING_PACKETS_MAX: usize = 815;
+
+    /// The same bound for the book layout: Full packets (2 inline 5-level
+    /// rows each) in the frame that crosses the 8 MiB cut, from
+    /// `(PRESIZE - DEPTH_BOOK_FLUSH_BYTES) / (2 * W)`.
+    const BOOK_CROSSING_PACKETS_MAX: usize = 1_565;
+
+    /// Prices tried for the widest text rendering of a level price.
+    const WIDE_PRICES: [f64; 7] = [
+        24_500.25,
+        123_456.789_012_345_67,
+        99_999_999.999_999_99,
+        0.000_123_456_789_012_345_67,
+        1.234_567_890_123_456_7e-7,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+    ];
+
+    fn widest_level_row(price: f64) -> DepthRow {
+        DepthRow {
+            security_id: i64::from(u32::MAX),
+            segment: "NSE_CURRENCY",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_BID,
+            level: 200,
+            price,
+            quantity: i64::from(u32::MAX),
+            orders: i64::from(u32::MAX),
+            capture_seq: i64::MAX,
+            ts_nanos: row().ts_nanos,
+        }
+    }
+
+    /// Bytes one level row takes in the buffer.
+    fn level_row_width(r: &DepthRow) -> usize {
+        let mut w = DepthWriter::for_test(Feed::Truedata);
+        w.append_row(r).expect("append");
+        w.pending_bytes()
+    }
+
+    /// The widest legal level row and its width W.
+    fn widest_level_row_and_width() -> (DepthRow, usize) {
+        WIDE_PRICES
+            .iter()
+            .map(|&p| {
+                let r = widest_level_row(p);
+                let w = level_row_width(&r);
+                (r, w)
+            })
+            .max_by_key(|(_, w)| *w)
+            .expect("prices")
+    }
+
+    #[test]
+    fn test_level_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows() {
+        let (wide, w) = widest_level_row_and_width();
+        assert!(w > level_row_width(&row()), "the wide row is wider");
+        let presize = DepthLayout::Levels.row_buffer_presize_bytes();
+        let derived = (presize / w - LEVEL_CUT_ROWS) / 10;
+        assert_eq!(derived, LEVEL_CROSSING_PACKETS_MAX, "W = {w} B");
+        assert!((LEVEL_CUT_ROWS + 10 * LEVEL_CROSSING_PACKETS_MAX) * w <= presize);
+        assert!((LEVEL_CUT_ROWS + 10 * (LEVEL_CROSSING_PACKETS_MAX + 1)) * w > presize);
+
+        for p in [1usize, 4, LEVEL_CROSSING_PACKETS_MAX] {
+            let mut wr = DepthWriter::for_test(Feed::Truedata);
+            let ptr = wr.buffer.as_bytes().as_ptr();
+            let cap = wr.buffer.capacity();
+            for _ in 0..LEVEL_CUT_ROWS + 10 * p {
+                wr.append_row(&wide).expect("append");
+            }
+            assert_eq!(wr.pending_bytes(), (LEVEL_CUT_ROWS + 10 * p) * w);
+            assert_eq!(wr.buffer.capacity(), cap, "P={p}: no regrowth");
+            assert_eq!(wr.buffer.as_bytes().as_ptr(), ptr, "P={p}: no reallocation");
+        }
+        // One packet past the bound regrows: the documented limit.
+        let mut wr = DepthWriter::for_test(Feed::Truedata);
+        let cap = wr.buffer.capacity();
+        for _ in 0..LEVEL_CUT_ROWS + 10 * (LEVEL_CROSSING_PACKETS_MAX + 1) {
+            wr.append_row(&wide).expect("append");
+        }
+        assert!(
+            wr.buffer.capacity() > cap,
+            "past the bound the buffer regrows"
+        );
+    }
+
+    /// One inline book row (5 levels) at the widest legal values.
+    fn widest_book_row<'a>(p: &'a [f64], q: &'a [f64], o: &'a [f64]) -> DepthBookRow<'a> {
+        DepthBookRow {
+            security_id: i64::from(u32::MAX),
+            segment: "NSE_CURRENCY",
+            depth_kind: DEPTH_KIND_200,
+            side: DEPTH_SIDE_ASK,
+            prices: p,
+            quantities: q,
+            orders: o,
+            capture_seq: i64::MAX,
+            ts_nanos: BOOK_TS_NANOS,
+        }
+    }
+
+    #[test]
+    fn test_book_presize_holds_the_cut_plus_a_crossing_frame_of_widest_rows() {
+        let p = [f64::MAX; 5];
+        let q = [f64::from(u32::MAX); 5];
+        let o = [f64::from(u32::MAX); 5];
+        let wide = widest_book_row(&p, &q, &o);
+        let mut probe = DepthWriter::for_test_book(Feed::Truedata);
+        probe.append_book_row(&wide).expect("append");
+        let w = probe.pending_bytes();
+        let presize = DepthLayout::Book.row_buffer_presize_bytes();
+        let derived = (presize - DEPTH_BOOK_FLUSH_BYTES) / (2 * w);
+        assert_eq!(derived, BOOK_CROSSING_PACKETS_MAX, "W = {w} B");
+        assert!(DEPTH_BOOK_FLUSH_BYTES + 2 * BOOK_CROSSING_PACKETS_MAX * w <= presize);
+        assert!(DEPTH_BOOK_FLUSH_BYTES + 2 * (BOOK_CROSSING_PACKETS_MAX + 1) * w > presize);
+
+        for packets in [1usize, 4, BOOK_CROSSING_PACKETS_MAX] {
+            let mut wr = DepthWriter::for_test_book(Feed::Truedata);
+            // PF-4b (2026-11-06): the drain stages book rows, so the pre-size
+            // that must hold the crossing frame is the STAGED batch's.
+            let rows_ptr = wr.staged.as_ptr_for_test();
+            let values_ptr = wr.staged.values_ptr_for_test();
+            let caps = wr.staged.capacities_for_test();
+            // Fill to within one row of the cut, not yet due.
+            while wr.pending_bytes() + w < DEPTH_BOOK_FLUSH_BYTES {
+                wr.append_book_row(&wide).expect("fill");
+            }
+            assert!(!wr.book_flush_due(), "packets={packets}: not yet due");
+            for _ in 0..2 * packets {
+                wr.append_book_row(&wide).expect("crossing frame");
+            }
+            assert!(
+                wr.book_flush_due(),
+                "packets={packets}: the frame crossed the cut"
+            );
+            assert_eq!(
+                wr.staged.capacities_for_test(),
+                caps,
+                "packets={packets}: no regrowth"
+            );
+            assert_eq!(
+                wr.staged.as_ptr_for_test(),
+                rows_ptr,
+                "packets={packets}: rows not reallocated"
+            );
+            assert_eq!(
+                wr.staged.values_ptr_for_test(),
+                values_ptr,
+                "packets={packets}: values not reallocated"
+            );
+            assert!(wr.buffer.as_bytes().is_empty(), "the drain wrote no text");
+        }
+    }
+
+    /// `install_spare_buffer` at the pre-size boundary, both layouts: a spare
+    /// of capacity >= the pre-size is installed as is (same pointer, never
+    /// shrunk); below it the buffer is reserved up to the pre-size.
+    #[test]
+    fn test_install_spare_buffer_keeps_or_reserves_at_the_presize_boundary() {
+        // PF-4b (2026-11-06): a BOOK writer stages its rows, so its text buffer
+        // is no longer recycled; its staged batch is (see the depth_stage
+        // oracle tests). The level layout keeps this contract.
+        for layout in [DepthLayout::Levels] {
+            let pre = layout.row_buffer_presize_bytes();
+            for spare_cap in [0, pre - 1, pre, pre + 1, MAX_DEPTH_PRODUCER_BUFFER_BYTES] {
+                let writer = match layout {
+                    DepthLayout::Levels => DepthWriter::for_test(Feed::Dhan),
+                    DepthLayout::Book => DepthWriter::for_test_book(Feed::Dhan),
+                };
+                let (mut w, sink, _rx) = writer.split_for_offload();
+                let mut spare = Buffer::new(layout.protocol());
+                if spare_cap > 0 {
+                    spare.reserve(spare_cap);
+                }
+                let got_cap = spare.capacity();
+                assert!(got_cap >= spare_cap);
+                let spare_ptr = spare.as_bytes().as_ptr();
+                sink.spare_return
+                    .as_ref()
+                    .expect("split opens the lane")
+                    .try_send(spare)
+                    .expect("lane has room");
+                match layout {
+                    DepthLayout::Levels => w.append_row(&row()).expect("append"),
+                    DepthLayout::Book => {
+                        let (p, q, o) = book_levels(5);
+                        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                            .expect("append");
+                    }
+                }
+                w.flush().expect("hand off");
+                let case = format!("{layout:?} spare {spare_cap}");
+                assert!(w.buffer.as_bytes().is_empty(), "{case}");
+                assert_eq!(w.buffer.protocol_version(), layout.protocol(), "{case}");
+                assert!(w.buffer.capacity() >= pre, "{case}: at least the pre-size");
+                if got_cap >= pre {
+                    assert_eq!(w.buffer.as_bytes().as_ptr(), spare_ptr, "{case}: kept");
+                    assert_eq!(w.buffer.capacity(), got_cap, "{case}: never shrunk");
+                }
+                assert!(
+                    w.buffer.capacity() <= MAX_DEPTH_PRODUCER_BUFFER_BYTES,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// BUG (DT-A2): a returned spare just under the pre-size is grown with
+    /// `reserve(presize - len)`, whose amortized growth doubles it (a
+    /// Levels spare of 4 MiB - 1 becomes 8 MiB - 2), so the installed buffer
+    /// is about twice the pre-size the doc states. Address space only (no
+    /// page is committed) and still under the producer bound.
+    #[test]
+    fn test_install_spare_buffer_reserves_exactly_the_presize_below_it() {
+        // PF-4b: the level layout only (see the test above).
+        for layout in [DepthLayout::Levels] {
+            let pre = layout.row_buffer_presize_bytes();
+            for spare_cap in [0, pre / 2 + 1, pre - 1] {
+                let writer = match layout {
+                    DepthLayout::Levels => DepthWriter::for_test(Feed::Dhan),
+                    DepthLayout::Book => DepthWriter::for_test_book(Feed::Dhan),
+                };
+                let (mut w, sink, _rx) = writer.split_for_offload();
+                let mut spare = Buffer::new(layout.protocol());
+                if spare_cap > 0 {
+                    spare.reserve(spare_cap);
+                }
+                sink.spare_return
+                    .as_ref()
+                    .expect("split opens the lane")
+                    .try_send(spare)
+                    .expect("lane has room");
+                match layout {
+                    DepthLayout::Levels => w.append_row(&row()).expect("append"),
+                    DepthLayout::Book => {
+                        let (p, q, o) = book_levels(5);
+                        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                            .expect("append");
+                    }
+                }
+                w.flush().expect("hand off");
+                assert_eq!(
+                    w.buffer.capacity(),
+                    pre,
+                    "{layout:?} spare {spare_cap}: reserved to exactly the pre-size"
+                );
+            }
+        }
+    }
+
+    /// PF-4b review round 1: the BOOK twin of the two tests above. A book
+    /// writer's hand-off installs a STAGED spare from `spare_staged`: one at
+    /// or above the staged pre-size is installed as is (same allocation,
+    /// never shrunk), one below it is grown to the pre-size, and an empty
+    /// lane reserves a fresh pre-sized batch. Its text buffer is never
+    /// reserved.
+    #[test]
+    fn test_book_hand_off_installs_a_staged_spare_at_the_presize_boundary() {
+        use crate::depth_stage::{
+            DEPTH_STAGED_ROWS_PRESIZE as ROWS, DEPTH_STAGED_VALUES_PRESIZE as VALUES,
+            DepthStagedBatch,
+        };
+        let (p, q, o) = book_levels(5);
+        // (spare rows, spare values, expect the same allocation back)
+        let cases: [(Option<(usize, usize)>, bool); 4] = [
+            (None, false),
+            (Some((ROWS / 2, VALUES / 2)), false),
+            (Some((ROWS, VALUES)), true),
+            (Some((ROWS * 2, VALUES * 2)), true),
+        ];
+        for (spare, kept) in cases {
+            let (mut w, _sink, _rx) = DepthWriter::for_test_book(Feed::Dhan).split_for_offload();
+            let mut spare_ptrs = None;
+            if let Some((rows, values)) = spare {
+                let batch = DepthStagedBatch::with_capacity_for_test(rows, values);
+                spare_ptrs = Some((batch.as_ptr_for_test(), batch.capacities_for_test()));
+                w.spare_staged_tx
+                    .as_ref()
+                    .expect("split opens the staged lane")
+                    .try_send(batch)
+                    .expect("lane has room");
+            }
+            let handed = w.staged.as_ptr_for_test();
+            let fresh_before = w.flush_counters.stage_presize_fresh_count;
+            w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+                .expect("append");
+            w.flush().expect("hand off");
+            let case = format!("spare {spare:?}");
+            // 2026-11-16: the fresh-reserve count moves only when no spare of
+            // the pre-size was waiting.
+            assert_eq!(
+                w.flush_counters.stage_presize_fresh_count - fresh_before,
+                u64::from(!kept),
+                "{case}: fresh reserve counted only without a pre-sized spare"
+            );
+            assert!(w.staged.is_empty(), "{case}");
+            assert_ne!(w.staged.as_ptr_for_test(), handed, "{case}: a new batch");
+            let (rows, values) = w.staged.capacities_for_test();
+            assert!(
+                rows >= ROWS && values >= VALUES,
+                "{case}: at least the pre-size"
+            );
+            if let (Some((ptr, caps)), true) = (spare_ptrs, kept) {
+                assert_eq!(w.staged.as_ptr_for_test(), ptr, "{case}: kept");
+                assert_eq!(w.staged.capacities_for_test(), caps, "{case}: never shrunk");
+            }
+            assert_eq!(w.buffer.capacity(), 0, "{case}: no text buffer reserved");
+        }
+    }
+
+    /// PF-4b review round 1: a book writer's text buffer that a cold path
+    /// grew and that then rode an offloaded batch is dropped on the writer
+    /// thread, never parked in the buffer lane a book writer does not read;
+    /// the staged batch still comes back on its own lane.
+    #[test]
+    fn test_book_writer_thread_drops_a_grown_text_buffer_instead_of_parking_it() {
+        let dir = spill_tmp("pf4b-book-buffer-lane");
+        let (mut w, mut sink, rx) = DepthWriter::for_test_book(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .split_for_offload();
+        // What `materialize_staged` or the unsplit flush leaves behind: an
+        // empty text buffer with a large capacity.
+        w.buffer.reserve(1 << 20);
+        assert!(w.buffer.capacity() >= 1 << 20);
+        let (p, q, o) = book_levels(5);
+        w.append_book_row(&book_row(&p[..5], &q[..5], &o[..5], 1))
+            .expect("append");
+        w.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("handed off");
+        assert!(
+            batch.buffer.capacity() >= 1 << 20,
+            "the grown buffer rode the batch"
+        );
+        let _ = sink.write(&mut batch);
+        assert!(
+            w.spare_buffers
+                .as_ref()
+                .expect("split opens the lane")
+                .try_recv()
+                .is_err(),
+            "a book writer's text buffer must never wait in a lane nobody reads"
+        );
+        assert!(
+            w.spare_staged
+                .as_ref()
+                .expect("split opens the staged lane")
+                .try_recv()
+                .is_ok(),
+            "the staged batch is still recycled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+#[cfg(test)]
+#[path = "depth_stage_golden_tests.rs"]
+mod depth_stage_golden_tests;
+
+#[cfg(test)]
+#[path = "depth_stage_oracle_tests.rs"]
+mod depth_stage_oracle_tests;

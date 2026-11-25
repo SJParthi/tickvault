@@ -71,6 +71,11 @@ terraform outputs: portal_git_sha + binary_git_sha_ssm_param
   watchdog's ~2-3 samples/weekday cadence — it **approximates** ">24h
   stale", it is not an exact wall-clock measurement. Missing data (box off,
   weekends, unknown-sha skip) never pages (`notBreaching`).
+  *(2026-11-07, owner: "I dont need any hallucination or illusion I just
+  need the working guaranteed assurance solution": the alarm is now
+  `treat_missing_data = "ignore"`, and the watchdog publishes nothing on a
+  weekend, NSE holiday or Muhurat date. Missing data still never pages, and
+  it no longer turns a Friday ALARM into a false Saturday "recovered".)*
 - The watchdog **skips** publishing when either SHA is unknown — no false
   signal on uncertainty (mirrors the `is_stale` no-false-OK contract).
 - The portal GET can never fail or hang on provenance: all three lookups

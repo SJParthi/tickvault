@@ -17,6 +17,7 @@
 //! CREATE TABLE IF NOT EXISTS ws_event_audit (
 //!     ts                TIMESTAMP,  -- when the event happened (IST nanos)
 //!     trading_date_ist  TIMESTAMP,  -- the trading day (IST midnight)
+//!     feed              SYMBOL,     -- which broker feed the socket belongs to
 //!     ws_type           SYMBOL,     -- main_feed / depth_20 / depth_200 / order_update
 //!     connection_index  LONG,       -- 0..pool_size-1
 //!     pool_size         LONG,       -- configured conns of this ws_type (1 today, up to 5 later)
@@ -26,9 +27,16 @@
 //!     dhan_code         LONG,       -- 805/807/... ; -1 sentinel = none
 //!     down_secs         LONG,       -- reconnect downtime (0 otherwise)
 //!     attempts          LONG,       -- reconnect attempts (0 otherwise)
-//!     market_hours      BOOLEAN     -- inside [09:00,15:30) IST
+//!     market_hours      BOOLEAN,    -- inside [09:00,15:30) IST
+//!     security_id       LONG,       -- instrument that LEFT (swap old / ghost), NULL if none
+//!     segment           SYMBOL,     -- its segment (I-P1-11 pair with security_id)
+//!     new_security_id   LONG,       -- instrument that ARRIVED (swap new), NULL if none
+//!     new_segment       SYMBOL,     -- its segment
+//!     instruments_added LONG,       -- subscribed by the change (what landed), NULL if n/a
+//!     instruments_removed LONG,     -- unsubscribed by the change (what landed), NULL if n/a
+//!     instruments_held  LONG        -- socket's instrument count after the event, NULL if n/a
 //! ) timestamp(ts) PARTITION BY DAY
-//!   DEDUP UPSERT KEYS(ts, trading_date_ist, ws_type, connection_index, event_kind);
+//!   DEDUP UPSERT KEYS(ts, trading_date_ist, feed, ws_type, connection_index, event_kind);
 //! ```
 //!
 //! DEDUP key carries the designated timestamp `ts` (2026-04-28 regression rule)
@@ -44,6 +52,7 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
 pub use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsEventAuditRow};
 #[cfg(test)]
@@ -54,7 +63,16 @@ pub const WS_EVENT_AUDIT_TABLE: &str = "ws_event_audit";
 
 /// DEDUP UPSERT key. Designated timestamp first (2026-04-28 regression rule);
 /// `(ws_type, connection_index)` is the composite-unique connection key per
-/// I-P1-11 (extended to WS streams); `event_kind` distinguishes the 6 kinds.
+/// I-P1-11 (extended to WS streams); `event_kind` distinguishes the kinds.
+///
+/// Audit M8 (2026-10-04): the subscription-change kinds (`subscription_swapped`,
+/// `subscription_resubscribed`, `ghost_unsubscribe_resent`, `overflow_parked`)
+/// use this SAME key; the instrument columns are deliberately NOT in it. Two
+/// such events on one connection could only collide if they carried the same
+/// `ts` AND the same `event_kind`; the live-feed forwarder that stamps every
+/// market-data row makes `ts` strictly increasing across ALL its rows
+/// (`max(now, previous + 1 ns)`), so no two rows it writes share a `ts`, and
+/// a later row can never UPSERT over an earlier one.
 pub const DEDUP_KEY_WS_EVENT_AUDIT: &str =
     "ts, trading_date_ist, feed, ws_type, connection_index, event_kind";
 
@@ -77,17 +95,58 @@ pub fn ws_event_audit_create_ddl() -> String {
             dhan_code         LONG, \
             down_secs         LONG, \
             attempts          LONG, \
-            market_hours      BOOLEAN\
+            market_hours      BOOLEAN, \
+            security_id       LONG, \
+            segment           SYMBOL, \
+            new_security_id   LONG, \
+            new_segment       SYMBOL, \
+            instruments_added LONG, \
+            instruments_removed LONG, \
+            instruments_held  LONG\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_WS_EVENT_AUDIT});"
     )
 }
 
+/// The subscription-change columns (audit M8, 2026-10-04), name and type,
+/// in the order the CREATE DDL lists them.
+///
+/// `security_id` + `segment` name the instrument that LEFT (swap `old`, the
+/// ghost, the single unsubscribed instrument of a resubscribe);
+/// `new_security_id` + `new_segment` the one that ARRIVED. Always written as a
+/// pair (I-P1-11: the id alone is not an instrument). Absent facts are NULL.
+pub const WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS: [(&str, &str); 7] = [
+    ("security_id", "LONG"),
+    ("segment", "SYMBOL"),
+    ("new_security_id", "LONG"),
+    ("new_segment", "SYMBOL"),
+    ("instruments_added", "LONG"),
+    ("instruments_removed", "LONG"),
+    ("instruments_held", "LONG"),
+];
+
+/// One `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per subscription-change
+/// column, so a table created before 2026-10-04 heals at boot. Pure.
+#[must_use]
+pub fn ws_event_audit_subscription_alter_ddls() -> Vec<String> {
+    WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS
+        .iter()
+        .map(|(name, kind)| {
+            format!("ALTER TABLE {WS_EVENT_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS {name} {kind}")
+        })
+        .collect()
+}
+
 /// Create the audit table if absent (idempotent, schema-self-heal pattern).
 /// Failures log at `error!` (Telegram-routable) but do NOT block boot — the WS
 /// events still reach CloudWatch logs + Telegram.
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested via ws_event_audit_create_ddl tests)
-pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -99,10 +158,11 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(c) => c,
         Err(err) => {
             error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
                 ?err,
                 "ws_event_audit: HTTP client build failed — table not ensured"
             );
-            return;
+            return false;
         }
     };
     let ddl = ws_event_audit_create_ddl();
@@ -116,10 +176,15 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: CREATE TABLE returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: CREATE TABLE request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: CREATE TABLE request failed"
+        ),
     }
 
     // Per-feed identity (operator 2026-06-23): `feed` is now a DEDUP-key column —
@@ -139,10 +204,43 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: ALTER ADD COLUMN feed returned non-2xx");
         }
-        Err(err) => error!(?err, "ws_event_audit: ALTER ADD COLUMN feed request failed"),
+        Err(err) => error!(
+            code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+            ?err,
+            "ws_event_audit: ALTER ADD COLUMN feed request failed"
+        ),
+    }
+
+    // Audit M8 (2026-10-04): the subscription-change columns land on tables
+    // created before them. Idempotent; never drops the table (SEBI). None of
+    // them is in the DEDUP key, so no DEDUP re-apply depends on them.
+    for ddl in ws_event_audit_subscription_alter_ddls() {
+        match client
+            .get(&base_url)
+            .query(&[("query", ddl.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    %status, body = %body.chars().take(200).collect::<String>(),
+                    ddl = %ddl,
+                    "ws_event_audit: ALTER ADD COLUMN (subscription change) returned non-2xx");
+            }
+            Err(err) => error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ?err,
+                ddl = %ddl,
+                "ws_event_audit: ALTER ADD COLUMN (subscription change) request failed"
+            ),
+        }
     }
 
     // Re-apply the DEDUP key (now including `feed`) on tables created before the
@@ -158,17 +256,23 @@ pub async fn ensure_ws_event_audit_table(questdb_config: &QuestDbConfig) {
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) if resp.status().is_success() => true,
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            error!(%status, body = %body.chars().take(200).collect::<String>(),
+            error!(code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                %status, body = %body.chars().take(200).collect::<String>(),
                 "ws_event_audit: DEDUP ENABLE UPSERT KEYS returned non-2xx");
+            false
         }
-        Err(err) => error!(
-            ?err,
-            "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
-        ),
+        Err(err) => {
+            error!(
+                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                ?err,
+                "ws_event_audit: DEDUP ENABLE UPSERT KEYS request failed"
+            );
+            false
+        }
     }
 }
 
@@ -195,8 +299,26 @@ pub struct WsEventAuditWriter {
 /// Targets the QuestDB HTTP port (9000-class), NOT the ILP TCP port (9009) —
 /// HTTP gives a per-flush server ACK (see the 2026-07-05 note on
 /// [`WsEventAuditWriter`]). Pure + unit-tested (the transport ratchet).
+///
+/// 2026-11-23: `retry_timeout=0;request_timeout=5000;`, the order-audit
+/// writer's shape. The consumer flushes once per lifecycle event, so with the
+/// client's default retry window a QuestDB outage held each event for the
+/// whole retry loop and a reconnect storm backed the 1,024-slot forwarder up
+/// until it dropped rows. Now a failed flush gives up after one 5 s request;
+/// the rows stay in the buffer (capped at `MAX_PENDING_ROWS`) and go out with
+/// the next flush, so no row is lost to the shorter wait.
 fn ilp_http_conf(config: &QuestDbConfig) -> String {
-    format!("http::addr={}:{};", config.host, config.http_port)
+    format!(
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
+        config.host, config.http_port
+    )
+}
+
+/// A `SecurityId` (u64) as the LONG the table stores. Dhan ids are far below
+/// 2^63; an id that is not is stored as -1 rather than wrapped into a
+/// different, plausible-looking id.
+fn audit_security_id(security_id: u64) -> i64 {
+    i64::try_from(security_id).unwrap_or(-1)
 }
 
 impl WsEventAuditWriter {
@@ -206,6 +328,9 @@ impl WsEventAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (needs live QuestDB); disconnected/append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seeded here so an absent discard series can never read as a healthy
+        // zero — see `ilp_overflow::register_overflow_baseline`.
+        crate::ilp_overflow::register_overflow_baseline("ws_event_audit");
         let conf = ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -275,7 +400,42 @@ impl WsEventAuditWriter {
             .symbol("event_kind", r.event_kind.as_str())
             .context("event_kind")?
             .symbol("source", r.source.as_str())
-            .context("source")?
+            .context("source")?;
+        // Audit M8 (2026-10-04): the subscription-change facts. ILP needs
+        // every symbol before the first non-symbol column, so the two segment
+        // symbols go here. An absent fact is LEFT OUT of the row, which
+        // QuestDB stores as NULL — a lifecycle row reads exactly as before.
+        let sub = &r.subscription;
+        if let Some(i) = sub.instrument {
+            self.buffer
+                .symbol("segment", i.segment.as_str())
+                .context("segment")?;
+        }
+        if let Some(i) = sub.new_instrument {
+            self.buffer
+                .symbol("new_segment", i.segment.as_str())
+                .context("new_segment")?;
+        }
+        if let Some(i) = sub.instrument {
+            self.buffer
+                .column_i64("security_id", audit_security_id(i.security_id))
+                .context("security_id")?;
+        }
+        if let Some(i) = sub.new_instrument {
+            self.buffer
+                .column_i64("new_security_id", audit_security_id(i.security_id))
+                .context("new_security_id")?;
+        }
+        for (name, value) in [
+            ("instruments_added", sub.added),
+            ("instruments_removed", sub.removed),
+            ("instruments_held", sub.held),
+        ] {
+            if let Some(v) = value {
+                self.buffer.column_i64(name, i64::from(v)).context(name)?;
+            }
+        }
+        self.buffer
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -314,9 +474,20 @@ impl WsEventAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("ws_event_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
-            .context("ws_event_audit ILP flush")?;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            // RETAIN on failure (the questdb-rs contract), but BOUNDED: a
+            // sustained outage or a server-side reject would otherwise grow
+            // this buffer without limit and, for a reject, keep it poisoned
+            // for the process lifetime. See ilp_overflow.
+            let dropped = crate::ilp_overflow::discard_if_overflowing(
+                &mut self.buffer,
+                &mut self.pending,
+                "ws_event_audit",
+            );
+            return Err(anyhow::Error::new(err).context(
+                crate::ilp_overflow::flush_failure_context("ws_event_audit ILP flush", dropped),
+            ));
+        }
         self.pending = 0;
         Ok(())
     }
@@ -345,6 +516,7 @@ mod tests {
             down_secs: 0,
             attempts: 0,
             market_hours: true,
+            subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
         }
     }
 
@@ -406,7 +578,10 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = ilp_http_conf(&cfg);
-        assert_eq!(conf, "http::addr=tv-questdb:9000;");
+        assert_eq!(
+            conf,
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+        );
         assert!(
             conf.starts_with("http::addr="),
             "must be ILP-over-HTTP, never tcp:: — got {conf}"
@@ -474,6 +649,77 @@ mod tests {
         let err = w.flush().expect_err("disconnected flush must error");
         assert!(err.to_string().contains("no ILP sender"));
         assert_eq!(w.pending(), 1);
+    }
+
+    /// Audit M8 (2026-10-04): the subscription-change columns are in the
+    /// CREATE DDL and each has its own idempotent self-heal ALTER.
+    #[test]
+    fn test_ws_event_audit_subscription_alter_ddls_heal_every_column_in_the_ddl() {
+        let ddl = ws_event_audit_create_ddl();
+        let alters = ws_event_audit_subscription_alter_ddls();
+        assert_eq!(alters.len(), WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS.len());
+        for ((name, kind), alter) in WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS.iter().zip(&alters) {
+            assert!(ddl.contains(name), "DDL missing {name}: {ddl}");
+            assert_eq!(
+                alter,
+                &format!("ALTER TABLE ws_event_audit ADD COLUMN IF NOT EXISTS {name} {kind}")
+            );
+        }
+        // The id is always paired with its segment (I-P1-11).
+        assert!(ddl.contains("security_id       LONG") && ddl.contains("segment           SYMBOL"));
+        assert!(ddl.contains("new_security_id   LONG") && ddl.contains("new_segment       SYMBOL"));
+        // None of the new columns joined the DEDUP key: uniqueness rests on
+        // the forwarder's strictly increasing `ts` (see DEDUP_KEY doc).
+        for (name, _) in WS_EVENT_AUDIT_SUBSCRIPTION_COLUMNS {
+            assert!(
+                !DEDUP_KEY_WS_EVENT_AUDIT.split(", ").any(|k| k == name),
+                "{name} must not be in the DEDUP key"
+            );
+        }
+    }
+
+    /// Every subscription-change kind appends with its instrument facts, and
+    /// a row carrying them still appends alongside a plain lifecycle row.
+    #[test]
+    fn test_append_row_with_subscription_detail_for_each_new_kind() {
+        use tickvault_common::types::ExchangeSegment;
+        use tickvault_common::ws_event_types::{WsAuditInstrument, WsSubscriptionDetail};
+        let old = WsAuditInstrument {
+            security_id: 52_175,
+            segment: ExchangeSegment::NseFno,
+        };
+        let new = WsAuditInstrument {
+            security_id: 52_176,
+            segment: ExchangeSegment::NseFno,
+        };
+        let mut w = WsEventAuditWriter::for_test();
+        for kind in [
+            WsEventKind::SubscriptionSwapped,
+            WsEventKind::SubscriptionResubscribed,
+            WsEventKind::GhostUnsubscribeResent,
+            WsEventKind::OverflowParked,
+        ] {
+            let mut row = sample_row();
+            row.ws_type = WsType::Depth200;
+            row.event_kind = kind;
+            row.subscription = WsSubscriptionDetail {
+                instrument: Some(old),
+                new_instrument: (kind == WsEventKind::SubscriptionSwapped).then_some(new),
+                added: Some(1),
+                removed: Some(1),
+                held: Some(1),
+            };
+            w.append_row(&row)
+                .unwrap_or_else(|e| panic!("append {kind:?}: {e}"));
+        }
+        w.append_row(&sample_row()).expect("plain lifecycle row");
+        assert_eq!(w.pending(), 5);
+    }
+
+    #[test]
+    fn test_audit_security_id_never_wraps() {
+        assert_eq!(audit_security_id(13), 13);
+        assert_eq!(audit_security_id(u64::MAX), -1);
     }
 
     #[test]

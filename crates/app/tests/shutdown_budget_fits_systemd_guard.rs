@@ -1,0 +1,388 @@
+//! Source-scan ratchet — the app's shutdown budgets MUST fit inside
+//! systemd's `TimeoutStopSec`.
+//!
+//! **The defect this pins closed (found 2026-08-21).** The shutdown path in
+//! `crates/app/src/main.rs` runs two bounded waits SEQUENTIALLY:
+//!
+//! | constant | value | order |
+//! |---|---|---|
+//! | `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS` | 20s | first (main.rs:3552) |
+//! | `SEAL_WRITER_SHUTDOWN_BUDGET_SECS` | 75s | second (main.rs:3585) |
+//! | `SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS` | 5s | third (added 2026-08-28) |
+//! | `WAL_SPILL_SHUTDOWN_BUDGET_SECS` | 10s | fourth (added 2026-08-28) |
+//! | `DHAN_SOCKET_STOP_BUDGET_SECS` | 5s | now FIRST, before all four (added 2026-10-02, Z11d) |
+//! | `SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS` | 2s | after the escalation queue (counted 2026-10-11, CONC-1) |
+//! | `INSTANCE_LOCK_RELEASE_BUDGET_SECS` | 3s | after the WAL drain (added 2026-10-11, CONC-4) |
+//! | `SHUTDOWN_FLUSH_TIMEOUT_SECS` (core) | 10s | last, the Telegram flush (counted 2026-10-11, CONC-1) |
+//!
+//! **⚠ CORRECTED 2026-10-11 (audit CONC-1).** Until this date the guard summed
+//! only the first five rows. The crash-marker finish and the Telegram flush
+//! were already bounded waits on the same sequential path, so the real worst
+//! case was 137 s against `TimeoutStopSec=145`: an 8 s margin where the
+//! second test claimed at least 20. Both are now in the sum.
+//!
+//! …for a worst case of **95 seconds**, while `deploy/systemd/tickvault.service`
+//! carried `TimeoutStopSec=30`. systemd therefore SIGKILLed the process 65s
+//! before the app was willing to stop.
+//!
+//! The cost was not theoretical. If the lane flush used its full 20s, the
+//! seal writer received **10s of its 75s budget**; at the measured
+//! ~10,200 seals/sec that drains ~102,000 of a possible 600,000 seals at the
+//! 25,000-instrument ceiling (that ceiling is `AGGREGATOR_MAX_SLOTS ×
+//! TF_COUNT` and was written at TF_COUNT=24; the 2026-09-19 nine-frame
+//! collapse put it at 225,000 and `TF_COUNT` 10 since 2026-09-22 puts it at
+//! **250,000**, so the same 10s drains ~102,000 of 250,000 — the seals LOST
+//! are unchanged, only the fraction moved).
+//! The remainder — **including every instrument's final bar of the session
+//! on every frame** (this read "final daily bar" until 2026-09-19; the D1
+//! frame it named is retired, and the widest surviving frame is M60) — was
+//! destroyed by the SIGKILL, with no counter moving,
+//! because a killed process cannot log its own death.
+//!
+//! The sharpest part: the 75s constant's OWN comment reasons about this exact
+//! hazard ("overrunning systemd's stop timeout earns a SIGKILL, which loses
+//! the very tail this exists to save") and was then set to 2.5x the timeout it
+//! names. A correct comment is not a gate. Nothing compared the two files, so
+//! they drifted — the identical shape as the `WATCHDOG_INTERVAL_SECS x 2 <=
+//! WatchdogSec` pin in `systemd_boot_notify_guard.rs`, which is why this guard
+//! is written as its sibling.
+//!
+//! This pins the RELATIONSHIP, never the literals: raise either app budget, or
+//! lower the timeout, and the build fails with the arithmetic spelled out.
+
+use std::path::{Path, PathBuf};
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/app -> repo root")
+        .to_path_buf()
+}
+
+fn read(rel: &str) -> String {
+    let p = repo_root().join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+}
+
+/// Strip `//`-comments so a doc-comment mention can never vacuously satisfy a
+/// pin (the house convention — see `systemd_boot_notify_guard.rs`).
+fn strip_comments(src: &str) -> String {
+    src.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read `const <NAME>: u64 = <N>;` from real (non-comment) source.
+fn const_secs(src: &str, name: &str) -> u64 {
+    let code = strip_comments(src);
+    let needle = format!("const {name}: u64 =");
+    let at = code
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} not found in production source — was it renamed?"));
+    code[at + needle.len()..]
+        .split(';')
+        .next()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("{name} is not a plain integer literal"))
+}
+
+/// The notifier source, where the Telegram flush bound lives (audit CONC-1).
+fn notifier_rs() -> String {
+    read("crates/core/src/notification/service.rs")
+}
+
+/// Read `TimeoutStopSec=<N>` from the unit file, ignoring `#` comments.
+fn timeout_stop_secs(unit: &str) -> u64 {
+    unit.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+        .unwrap_or_else(|| panic!("TimeoutStopSec not found in tickvault.service"))
+        .trim()
+        .parse()
+        .expect("TimeoutStopSec must be a plain integer (seconds)")
+}
+
+#[test]
+fn app_shutdown_budgets_fit_inside_systemd_stop_timeout() {
+    let main_rs = read("crates/app/src/main.rs");
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
+    let unit = read("deploy/systemd/tickvault.service");
+
+    // Z11d (2026-10-02): the socket close now runs BEFORE everything else.
+    let sockets = const_secs(&main_rs, "DHAN_SOCKET_STOP_BUDGET_SECS");
+    let lane = const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS");
+    let seal = const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS");
+    // Third wait, and it lives in ANOTHER CRATE. `main` reaches it through
+    // `WsFrameSpill::shutdown`, so a guard that only ever read main.rs would
+    // have been structurally blind to it — the same shape as the unit file
+    // being invisible to a compile-time assert.
+    let escalation = const_secs(&main_rs, "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS");
+    let wal = const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS");
+    // Audit CONC-1 (2026-10-11): three more sequential waits. The crash-marker
+    // finish (after the escalation queue), the dual-instance lock release
+    // (after the WAL drain, CONC-4) and the Telegram flush, whose bound lives
+    // in core and is reached through `NotificationService::shutdown_flush`.
+    let mark = const_secs(&main_rs, "SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS");
+    let lock = const_secs(&main_rs, "INSTANCE_LOCK_RELEASE_BUDGET_SECS");
+    let telegram = const_secs(&notifier_rs(), "SHUTDOWN_FLUSH_TIMEOUT_SECS");
+    let timeout = timeout_stop_secs(&unit);
+
+    // The waits are SEQUENTIAL on the same path, so the worst case is the
+    // SUM. Summing (rather than taking the max) is the whole point: the bug
+    // was that the seal writer inherited only the remainder after the lane
+    // flush had already spent its budget.
+    let worst_case = sockets + lane + seal + escalation + mark + wal + lock + telegram;
+
+    assert!(
+        worst_case < timeout,
+        "SHUTDOWN BUDGET OVERRUN — systemd will SIGKILL the app mid-drain.\n\
+         \n\
+           DHAN_SOCKET_STOP_BUDGET_SECS         = {sockets}s (runs first)\n\
+           DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = {lane}s (then this)\n\
+           SEAL_WRITER_SHUTDOWN_BUDGET_SECS     = {seal}s (runs second)\n\
+           SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS = {escalation}s (runs third)\n\
+           SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS = {mark}s (crash marker)\n\
+           WAL_SPILL_SHUTDOWN_BUDGET_SECS       = {wal}s (runs fourth)\n\
+           INSTANCE_LOCK_RELEASE_BUDGET_SECS    = {lock}s (lock release)\n\
+           SHUTDOWN_FLUSH_TIMEOUT_SECS          = {telegram}s (Telegram flush, last)\n\
+           worst-case app shutdown              = {worst_case}s\n\
+           systemd TimeoutStopSec               = {timeout}s\n\
+         \n\
+         A SIGKILL here destroys the day's final bar for every instrument and\n\
+         every timeframe still buffered, and the process cannot log its own\n\
+         death — the loss is silent.\n\
+         \n\
+         Fix by raising TimeoutStopSec in deploy/systemd/tickvault.service to\n\
+         at least {}s, NOT by shrinking a drain budget that was sized from a\n\
+         live measurement.",
+        worst_case + 25
+    );
+}
+
+#[test]
+fn stop_timeout_keeps_a_real_margin_not_a_hairline() {
+    let main_rs = read("crates/app/src/main.rs");
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
+    let unit = read("deploy/systemd/tickvault.service");
+
+    let worst_case = const_secs(&main_rs, "DHAN_SOCKET_STOP_BUDGET_SECS")
+        + const_secs(&main_rs, "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS")
+        + const_secs(&main_rs, "SEAL_WRITER_SHUTDOWN_BUDGET_SECS")
+        + const_secs(&main_rs, "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS")
+        + const_secs(&main_rs, "SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS")
+        + const_secs(&spill_rs, "WAL_SPILL_SHUTDOWN_BUDGET_SECS")
+        + const_secs(&main_rs, "INSTANCE_LOCK_RELEASE_BUDGET_SECS")
+        + const_secs(&notifier_rs(), "SHUTDOWN_FLUSH_TIMEOUT_SECS");
+    let timeout = timeout_stop_secs(&unit);
+    let margin = timeout.saturating_sub(worst_case);
+
+    // A one-second margin technically passes the test above while leaving no
+    // room for the process teardown that follows the drain (API + otel
+    // shutdown, partition detach). 20s is the floor.
+    assert!(
+        margin >= 20,
+        "TimeoutStopSec={timeout}s leaves only {margin}s over the {worst_case}s worst-case \
+         drain. The final teardown (API + otel shutdown, partition detach) runs AFTER the \
+         drain and needs headroom; a hairline margin is a SIGKILL on a slow day. Require >= 20s."
+    );
+}
+
+#[test]
+fn the_stop_timeout_is_documented_as_derived_not_guessed() {
+    let unit = read("deploy/systemd/tickvault.service");
+    // The value is load-bearing arithmetic, so the unit file must NAME every
+    // constant it is derived from. Renaming a constant without updating the
+    // rationale leaves the next reader unable to re-derive the number.
+    for needle in [
+        "DHAN_SOCKET_STOP_BUDGET_SECS",
+        "DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS",
+        "SEAL_WRITER_SHUTDOWN_BUDGET_SECS",
+        "SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS",
+        "WAL_SPILL_SHUTDOWN_BUDGET_SECS",
+        "SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS",
+        "INSTANCE_LOCK_RELEASE_BUDGET_SECS",
+        "SHUTDOWN_FLUSH_TIMEOUT_SECS",
+    ] {
+        assert!(
+            unit.contains(needle),
+            "tickvault.service must name {needle} in the TimeoutStopSec rationale so the \
+             value can be re-derived rather than guessed at."
+        );
+    }
+}
+
+/// Z11b (2026-10-02): under `panic = "abort"` the panic hook is the last code
+/// that runs, so it must give the WAL writer its bounded drain BEFORE handing
+/// over to the default hook (after which the process aborts), and after the
+/// synchronous panic line (which must never wait behind anything). The
+/// writer-thread skip lives inside `drain_registered_for_abort`; this pins
+/// that the hook reaches it and in which order.
+#[test]
+fn the_panic_hook_drains_the_wal_before_it_aborts() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let hook_at = main_rs
+        .find("std::panic::set_hook(")
+        .expect("main.rs installs a panic hook");
+    let hook = &main_rs[hook_at..];
+    let end = hook
+        .find("default_panic_hook(panic_info)")
+        .expect("the hook chains to the default hook");
+    let hook = &hook[..end];
+    let sync_line = hook
+        .find("append_panic_line_sync(")
+        .expect("the hook writes the synchronous panic line");
+    let drain = hook
+        .find("drain_registered_for_abort(")
+        .expect("the hook must drain the WAL spill before the default hook aborts the process");
+    assert!(
+        sync_line < drain,
+        "the synchronous panic line must be written before the WAL drain waits"
+    );
+    // Audit OBS-1 (2026-10-11): errors.log is not shipped to CloudWatch, the
+    // hourly errors.jsonl file is. The hook writes the crash there too, and
+    // before the WAL drain, which waits up to its budget.
+    let jsonl_line = hook
+        .find("append_panic_jsonl_line_sync(")
+        .expect("the hook writes the panic line into the shipped errors.jsonl stream");
+    assert!(
+        jsonl_line < drain,
+        "the shipped errors.jsonl panic line must be written before the WAL drain waits"
+    );
+    // Review of OBS-1 (2026-10-11): the call must target ERRORS_JSONL_DIR, the
+    // directory the CloudWatch agent tails. Any other directory keeps the
+    // order above green while the crash line never reaches the shipped stream.
+    let jsonl_call = &hook[jsonl_line..];
+    let jsonl_call = &jsonl_call[..jsonl_call
+        .find(");")
+        .expect("the errors.jsonl panic call ends with );")];
+    assert!(
+        jsonl_call.contains("ERRORS_JSONL_DIR"),
+        "the errors.jsonl panic line must be written into observability::ERRORS_JSONL_DIR, \
+         the directory the CloudWatch agent ships: {jsonl_call}"
+    );
+    let agent = read("deploy/aws/cloudwatch-agent.json");
+    assert!(
+        agent.contains("\"/opt/tickvault/data/logs/machine/errors.jsonl.2*\""),
+        "the CloudWatch agent must tail data/logs/machine/errors.jsonl.2*, the directory \
+         ERRORS_JSONL_DIR names (pinned to data/logs/machine in observability.rs)"
+    );
+    // Review of OBS-1 (2026-10-11): in the abort build the tracing line that
+    // carries `wal_drain` dies with the process, so the drain outcome gets its
+    // own synchronous line, after the drain and before the default hook.
+    let drain_line = hook
+        .find("append_panic_wal_drain_jsonl_line_sync(")
+        .expect("the hook writes the WAL drain outcome synchronously");
+    assert!(
+        drain < drain_line,
+        "the WAL drain outcome line must be written after the drain returns"
+    );
+    let drain_call = &hook[drain_line..];
+    let drain_call = &drain_call[..drain_call
+        .find(");")
+        .expect("the drain outcome call ends with );")];
+    assert!(
+        drain_call.contains("ERRORS_JSONL_DIR"),
+        "the WAL drain outcome line must go to the shipped errors.jsonl directory: {drain_call}"
+    );
+    assert!(
+        hook.contains("WAL_ABORT_DRAIN_BUDGET"),
+        "the hook's WAL drain must be bounded by WAL_ABORT_DRAIN_BUDGET"
+    );
+
+    let spill_rs = read("crates/storage/src/ws_frame_spill.rs");
+    let body_at = spill_rs
+        .find("pub fn drain_registered_for_abort(")
+        .expect("drain_registered_for_abort exists");
+    let body = &spill_rs[body_at..];
+    let skip = body
+        .find("WAL_WRITER_THREAD_NAME")
+        .expect("the drain must skip the writer thread, which cannot wait for itself");
+    let wait = body
+        .find(".wait(")
+        .expect("the drain waits on the handshake");
+    assert!(
+        skip < wait,
+        "the writer-thread skip must come before any wait"
+    );
+}
+
+/// Audit CR-3 (2026-10-11): the panic hook is installed before any boot work
+/// that can panic or that a panic must cover — the config load, the first
+/// spawned task, the first OS thread and the WAL writer — and after the
+/// one-shot CLI short-circuits, which never run the app. Until this date it
+/// sat after ~40 spawns and the WAL thread, so an early panic left only the
+/// default stderr message. (2026-10-11, review of G5-crash: the config load
+/// is now `boot_helpers::layered_config_figment`, since G6-input INP-14; the
+/// anchor below follows it.)
+#[test]
+fn the_panic_hook_is_installed_before_any_boot_work() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let start = main_rs
+        .find("async fn async_main(")
+        .expect("main.rs has async_main");
+    let body = &main_rs[start..];
+    let hook = body
+        .find("std::panic::set_hook(")
+        .expect("async_main installs the panic hook");
+    let cli = body
+        .find("ensure_questdb::is_invocation(")
+        .expect("async_main short-circuits the ensure-questdb CLI");
+    assert!(
+        cli < hook,
+        "the hook must come after the one-shot CLI short-circuits"
+    );
+    for later in [
+        "tokio::spawn(",
+        "WsFrameSpill::new_with_guard(",
+        "std::thread::Builder::new(",
+        "layered_config_figment(",
+    ] {
+        let at = body
+            .find(later)
+            .unwrap_or_else(|| panic!("async_main no longer contains {later}"));
+        assert!(
+            hook < at,
+            "the panic hook must be installed before the first {later} in async_main"
+        );
+    }
+}
+
+/// Z11d (2026-10-02): the sockets must be CLOSED before the lane drain is
+/// stopped, and the drain before the WAL writer. Until then nothing closed
+/// the sockets, so they kept appending to a WAL whose writer was being shut
+/// down, and records landing after its last empty poll were lost silently.
+#[test]
+fn shutdown_closes_the_sockets_before_the_lane_and_the_wal() {
+    let main_rs = strip_comments(&read("crates/app/src/main.rs"));
+    let stop = main_rs
+        .find("stop_feed_sockets(DHAN_SOCKET_STOP_BUDGET)")
+        .expect("shutdown must close the Dhan feed sockets");
+    let lane = main_rs
+        .find("dhan_feed_shutdown.notify_one()")
+        .expect("shutdown signals the lane drain");
+    let wal = main_rs
+        .find("spill.shutdown(")
+        .expect("shutdown drains the WAL writer");
+    assert!(
+        stop < lane,
+        "the sockets must close before the lane drain is signalled"
+    );
+    assert!(lane < wal, "the lane must stop before the WAL writer does");
+
+    let stack = strip_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+    let body_at = stack
+        .find("async fn request_stop_and_wait(")
+        .expect("the socket-stop wait exists");
+    let body = &stack[body_at..];
+    let request = body.find("stop.request()").expect("it requests the stop");
+    let wait = body
+        .find("alive.load(")
+        .expect("it waits on the live socket count");
+    assert!(
+        request < wait,
+        "the stop is requested before the wait begins"
+    );
+}

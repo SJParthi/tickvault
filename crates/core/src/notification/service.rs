@@ -120,6 +120,13 @@ pub struct NotificationService {
     boot_dispatch_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Whether the `TICKVAULT_ALLOW_NOOP_NOTIFIER` value turns the strict-mode
+/// override on. Only exactly `1` does (audit INP-16, 2026-10-11): `0`,
+/// `false` or an empty value no longer count as "set".
+fn noop_override_value_allows(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 impl NotificationService {
     /// Internal helper — every constructor funnels through here so the
     /// field defaults live in one place. Adding a new field to the struct
@@ -301,6 +308,10 @@ impl NotificationService {
     /// Escape hatch: set `TICKVAULT_ALLOW_NOOP_NOTIFIER=1` to allow no-op
     /// mode (used by tests and dev runs without SSM access).
     ///
+    /// ⚠ CORRECTED 2026-10-11 (audit INP-16): the value must be exactly `1`.
+    /// Until this date any value was accepted, so `=0` or `=false` turned the
+    /// override ON. Any other value is ignored with a `warn!`.
+    ///
     /// # Errors
     ///
     /// Returns `Err(String)` with a human-readable reason if any of the
@@ -327,12 +338,19 @@ impl NotificationService {
         if service.is_active() {
             return Ok(service);
         }
-        if std::env::var("TICKVAULT_ALLOW_NOOP_NOTIFIER").is_ok() {
+        let override_value = std::env::var("TICKVAULT_ALLOW_NOOP_NOTIFIER").ok();
+        if noop_override_value_allows(override_value.as_deref()) {
             warn!(
                 "notification: strict mode overridden by TICKVAULT_ALLOW_NOOP_NOTIFIER — \
                  running in no-op mode (dev/test only)"
             );
             return Ok(service);
+        }
+        if override_value.is_some() {
+            warn!(
+                "notification: TICKVAULT_ALLOW_NOOP_NOTIFIER is set but not to 1 — \
+                 ignored, strict mode refuses the no-op notifier"
+            );
         }
         Err("NotificationService fell back to no-op mode. \
              SSM is unreachable or Telegram credentials are missing. \
@@ -385,7 +403,14 @@ impl NotificationService {
                         .is_some_and(|key| key.family != EpisodeFamily::Boot || self.boot_bubble)
                 {
                     let svc = Arc::clone(self);
+                    let Some(inflight) = InflightAlertTask::try_start(admits_past_inflight_cap(
+                        severity,
+                        Some(event.episode_role()),
+                    )) else {
+                        return;
+                    };
                     tokio::spawn(async move {
+                        let _inflight = inflight;
                         svc.dispatch_episode_event(event).await;
                     });
                     return;
@@ -459,42 +484,14 @@ impl NotificationService {
                     let base_url = telegram_api_base_url.clone();
                     let chunks = split_message_for_telegram(&message);
 
-                    tokio::spawn(async move {
-                        let total = chunks.len();
-                        let mut failed_parts: Vec<usize> = Vec::new();
-                        for (idx, chunk) in chunks.iter().enumerate() {
-                            let part_num = idx.saturating_add(1);
-                            let body = if total > 1 {
-                                format!("(Part {part_num}/{total})\n{chunk}")
-                            } else {
-                                chunk.clone()
-                            };
-                            let ok = send_telegram_chunk_with_retry(
-                                &client, &base_url, &token, &chat_id, &body,
-                            )
-                            .await;
-                            if !ok {
-                                failed_parts.push(part_num);
-                            }
-                        }
-                        // Q3 (2026-04-23): if ANY chunk failed after all
-                        // retries, emit a single ERROR log so the operator
-                        // knows the report is incomplete. Loki routes
-                        // ERROR-level tracing events to Telegram via
-                        // alertmanager, so this serves as the
-                        // "delivery-failed, investigate" signal even
-                        // though the Telegram transport itself is the
-                        // thing that failed (the alertmanager path is
-                        // independent — different chat channel / retry).
-                        if !failed_parts.is_empty() {
-                            error!(
-                                total_chunks = total,
-                                failed_chunks = failed_parts.len(),
-                                failed_part_numbers = ?failed_parts,
-                                "notification: Telegram chunked-send had mid-batch failures after retries — user-visible report is incomplete"
-                            );
-                        }
-                    });
+                    if let Some(inflight) =
+                        InflightAlertTask::try_start(admits_past_inflight_cap(severity, None))
+                    {
+                        tokio::spawn(async move {
+                            let _inflight = inflight;
+                            send_chunked_page(&client, &base_url, &token, &chat_id, &chunks).await;
+                        });
+                    }
                 }
 
                 // Critical/High only: SNS SMS
@@ -505,7 +502,9 @@ impl NotificationService {
                     let client = sns.clone();
                     let phone = phone.clone();
 
+                    let inflight = InflightAlertTask::start();
                     tokio::spawn(async move {
+                        let _inflight = inflight;
                         send_sns_sms(&client, &phone, &sms_text).await;
                     });
                 }
@@ -1126,10 +1125,10 @@ impl NotificationService {
     /// Declares which feed lines the boot checklist shows as ⏳-pending
     /// from the first page. Called by both boot lanes right after the
     /// notifier is constructed. No-op when the bubble lane is off.
-    pub fn set_boot_expectations(&self, dhan_enabled: bool, groww_enabled: bool) {
+    pub fn set_boot_expectations(&self, dhan_enabled: bool) {
         if self.episode_mode && self.boot_bubble {
             self.episodes
-                .set_boot_expectations(dhan_enabled, groww_enabled, epoch_ms_now());
+                .set_boot_expectations(dhan_enabled, epoch_ms_now());
         }
     }
 
@@ -1967,6 +1966,38 @@ pub(crate) const TELEGRAM_SEND_BACKOFF_INITIAL_MS: u64 = 100;
 /// indefinitely.
 pub(crate) const TELEGRAM_SEND_BACKOFF_CAP_SECS: u64 = 2;
 
+/// Upper bound on a wait Telegram asks for in a 429 reply
+/// (`parameters.retry_after`). PR47 (2026-10-11): the ladder above used to
+/// ignore that field, so a burst that hit the flood limit retried after
+/// 100 ms and 200 ms, inside the window Telegram had just named, and the
+/// page was dropped. The ladder now waits what Telegram asks, up to this
+/// cap. Every send runs on its own spawned task, so the wait holds back
+/// only that page, never the caller. Worst case per chunk:
+/// `(TELEGRAM_SEND_MAX_ATTEMPTS − 1) × 30 s` = 60 s.
+pub(crate) const TELEGRAM_RETRY_AFTER_CAP_SECS: u64 = 30;
+
+/// Reads `parameters.retry_after` (whole seconds) from a Telegram error
+/// body. Any other shape, including an unparseable body, is `None`.
+#[must_use]
+pub(crate) fn parse_retry_after_secs(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("parameters")?
+        .get("retry_after")?
+        .as_u64()
+}
+
+/// The wait before the next attempt: the ladder's backoff, or Telegram's
+/// requested `retry_after` (capped at [`TELEGRAM_RETRY_AFTER_CAP_SECS`])
+/// when that is longer. Never shorter than the ladder's backoff.
+#[must_use]
+pub(crate) fn telegram_retry_wait(backoff: Duration, retry_after_secs: Option<u64>) -> Duration {
+    match retry_after_secs {
+        Some(secs) => Duration::from_secs(secs.min(TELEGRAM_RETRY_AFTER_CAP_SECS)).max(backoff),
+        None => backoff,
+    }
+}
+
 /// Outcome of a single Telegram `sendMessage` request. Drives whether
 /// the caller retries the same chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1974,7 +2005,9 @@ pub(crate) enum TelegramSendOutcome {
     /// HTTP 2xx — Telegram accepted the message.
     Success,
     /// Network error, 5xx, or 429 rate-limit — worth retrying.
-    Transient,
+    /// `retry_after_secs` is the wait Telegram asked for in a 429 body
+    /// (`parameters.retry_after`); `None` for every other transient case.
+    Transient { retry_after_secs: Option<u64> },
     /// 4xx other than 429 — retrying won't help (bad bot token, wrong
     /// chat_id, malformed HTML). Log ERROR once and move on.
     Permanent,
@@ -1987,7 +2020,9 @@ fn classify_telegram_status(status: reqwest::StatusCode) -> TelegramSendOutcome 
     if status.is_success() {
         TelegramSendOutcome::Success
     } else if status.as_u16() == 429 || status.is_server_error() {
-        TelegramSendOutcome::Transient
+        TelegramSendOutcome::Transient {
+            retry_after_secs: None,
+        }
     } else {
         TelegramSendOutcome::Permanent
     }
@@ -2059,14 +2094,15 @@ async fn send_telegram_message(
     match client.post(&url).json(&body).send().await {
         Ok(response) => {
             let status = response.status();
-            let outcome = classify_telegram_status(status);
+            let outcome = with_retry_after(classify_telegram_status(status), response).await;
             match outcome {
                 TelegramSendOutcome::Success => {
                     tracing::debug!("notification: Telegram message sent");
                 }
-                TelegramSendOutcome::Transient => {
+                TelegramSendOutcome::Transient { retry_after_secs } => {
                     warn!(
                         status = %status,
+                        retry_after_secs = ?retry_after_secs,
                         "notification: Telegram sendMessage transient failure — will retry"
                     );
                 }
@@ -2092,9 +2128,28 @@ async fn send_telegram_message(
             warn_transient_send_throttled(&safe_msg);
             // Network errors are always transient — DNS, TLS handshake,
             // TCP reset all self-heal on retry.
-            TelegramSendOutcome::Transient
+            TelegramSendOutcome::Transient {
+                retry_after_secs: None,
+            }
         }
     }
+}
+
+/// For a 429, reads the response body and fills in Telegram's requested
+/// `retry_after`. Every other outcome is returned unchanged and the body is
+/// left unread. Cold path: one body read per rate-limited attempt.
+async fn with_retry_after(
+    outcome: TelegramSendOutcome,
+    response: reqwest::Response,
+) -> TelegramSendOutcome {
+    if response.status().as_u16() != 429 {
+        return outcome;
+    }
+    let retry_after_secs = match response.text().await {
+        Ok(body) => parse_retry_after_secs(&body),
+        Err(_) => None,
+    };
+    TelegramSendOutcome::Transient { retry_after_secs }
 }
 
 /// Sends a single Telegram chunk with per-chunk retry. Retries transient
@@ -2119,9 +2174,9 @@ pub(crate) async fn send_telegram_chunk_with_retry(
         match send_telegram_message(client, base_url, bot_token, chat_id, text).await {
             TelegramSendOutcome::Success => return true,
             TelegramSendOutcome::Permanent => return false,
-            TelegramSendOutcome::Transient => {
+            TelegramSendOutcome::Transient { retry_after_secs } => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2166,13 +2221,12 @@ async fn send_telegram_message_capture(
         Ok(response) => {
             let status = response.status();
             let outcome = classify_telegram_status(status);
-            let message_id = if matches!(outcome, TelegramSendOutcome::Success) {
-                match response.text().await {
-                    Ok(text) => parse_send_message_id(&text),
-                    Err(_) => None,
-                }
-            } else {
-                None
+            if !matches!(outcome, TelegramSendOutcome::Success) {
+                return (with_retry_after(outcome, response).await, None);
+            }
+            let message_id = match response.text().await {
+                Ok(text) => parse_send_message_id(&text),
+                Err(_) => None,
             };
             (outcome, message_id)
         }
@@ -2182,7 +2236,12 @@ async fn send_telegram_message_capture(
                 .to_string()
                 .replace(bot_token.expose_secret(), "[REDACTED]");
             warn_transient_send_throttled(&safe_msg);
-            (TelegramSendOutcome::Transient, None)
+            (
+                TelegramSendOutcome::Transient {
+                    retry_after_secs: None,
+                },
+                None,
+            )
         }
     }
 }
@@ -2203,9 +2262,9 @@ pub(crate) async fn send_telegram_chunk_with_retry_returning_id(
         match send_telegram_message_capture(client, base_url, bot_token, chat_id, text).await {
             (TelegramSendOutcome::Success, message_id) => return (true, message_id),
             (TelegramSendOutcome::Permanent, _) => return (false, None),
-            (TelegramSendOutcome::Transient, _) => {
+            (TelegramSendOutcome::Transient { retry_after_secs }, _) => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2274,10 +2333,14 @@ pub(crate) async fn edit_telegram_message_with_retry(
     let cap = Duration::from_secs(TELEGRAM_SEND_BACKOFF_CAP_SECS);
     let mut last = EditOutcome::Transient;
     for attempt in 1..=TELEGRAM_SEND_MAX_ATTEMPTS {
+        let mut retry_after_secs = None;
         last = match client.post(&url).json(&body).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let response_body = response.text().await.unwrap_or_default();
+                if status == 429 {
+                    retry_after_secs = parse_retry_after_secs(&response_body);
+                }
                 classify_edit_body(status, &response_body)
             }
             Err(err) => {
@@ -2291,7 +2354,7 @@ pub(crate) async fn edit_telegram_message_with_retry(
         match last {
             EditOutcome::Transient => {
                 if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(telegram_retry_wait(delay, retry_after_secs)).await;
                     delay = delay.saturating_mul(2).min(cap);
                 }
             }
@@ -2301,6 +2364,168 @@ pub(crate) async fn edit_telegram_message_with_retry(
     last
 }
 
+/// Sends one page as ordered chunks, each on the retry ladder, and returns
+/// how many chunks were lost. Any lost chunk counts ONE
+/// `tv_telegram_dropped_total{reason="send_failed"}` (the page is what was
+/// lost) and logs one coded TELEGRAM-01 `error!`.
+///
+/// Q3 (2026-04-23): if ANY chunk failed after all retries, the operator is
+/// told the report is incomplete. PR47 (2026-10-11): this was the one
+/// terminal send failure that logged TELEGRAM-01 but never counted, so a
+/// lost Critical page was invisible to the tv-telegram-drops alarm.
+///
+/// # Performance
+///
+/// Cold path only. Called from a spawned task.
+async fn send_chunked_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    chunks: &[String],
+) -> usize {
+    let total = chunks.len();
+    let mut failed_parts: Vec<usize> = Vec::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let part_num = idx.saturating_add(1);
+        let body = if total > 1 {
+            format!("(Part {part_num}/{total})\n{chunk}")
+        } else {
+            chunk.clone()
+        };
+        if !send_telegram_chunk_with_retry(client, base_url, bot_token, chat_id, &body).await {
+            failed_parts.push(part_num);
+        }
+    }
+    if !failed_parts.is_empty() {
+        metrics::counter!(
+            "tv_telegram_dropped_total",
+            "reason" => "send_failed",
+        )
+        .increment(1);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+            source = "chunked_send_partial",
+            total_chunks = total,
+            failed_chunks = failed_parts.len(),
+            failed_part_numbers = ?failed_parts,
+            "notification: Telegram chunked-send had mid-batch failures after retries — user-visible report is incomplete"
+        );
+    }
+    failed_parts.len()
+}
+
+// ---------------------------------------------------------------------------
+// Alert-send task count (PR47, row 166)
+// ---------------------------------------------------------------------------
+
+/// Alert-send tasks currently running (Telegram bypass sends, SMS copies,
+/// episode dispatches). Published on `tv_telegram_send_tasks_inflight`.
+static ALERT_SEND_TASKS_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one spawned alert-send task while it lives.
+///
+/// The bound is recorded, not capped (PR47, row 166): `notify` spawns one
+/// task per High/Critical page and per episode event, because a cap would
+/// have to drop or delay a Critical page, which is the loss this item
+/// closes. What bounds the count is the producers: every High/Critical
+/// event is edge-triggered or once per episode, Medium/Low fold into the
+/// coalescer, and a task lives at most `TELEGRAM_SEND_MAX_ATTEMPTS` sends
+/// plus `(TELEGRAM_SEND_MAX_ATTEMPTS − 1) × TELEGRAM_RETRY_AFTER_CAP_SECS`
+/// of waiting per chunk. This gauge is the measurement of that bound.
+///
+/// 2026-11-23: a soft cap is now added on top ([`InflightAlertTask::try_start`],
+/// [`ALERT_SEND_TASKS_SOFT_CAP`]). It refuses only alerts below High that are
+/// not an episode recovery edge, so the reason above for not capping (a
+/// Critical page must never be dropped or delayed) still holds: Critical and
+/// High pages, their SMS copies and every recovery edge start without the
+/// cap. A refusal is counted on `tv_telegram_dropped_total{reason="inflight_cap"}`.
+pub(crate) struct InflightAlertTask;
+
+impl InflightAlertTask {
+    /// Counts a task in. Call before `tokio::spawn` and move the value in.
+    pub(crate) fn start() -> Self {
+        let now = ALERT_SEND_TASKS_INFLIGHT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        publish_inflight_alert_tasks(now);
+        Self
+    }
+
+    /// Counts a task in unless it is below High, not a recovery edge, and
+    /// [`ALERT_SEND_TASKS_SOFT_CAP`] tasks are already running. A refusal is
+    /// counted on `tv_telegram_dropped_total{reason="inflight_cap"}` and
+    /// logged once per crossing of the cap. O(1): one `fetch_add`, at most
+    /// one `fetch_sub`, no allocation.
+    pub(crate) fn try_start(admit_past_cap: bool) -> Option<Self> {
+        let now = ALERT_SEND_TASKS_INFLIGHT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if !inflight_cap_admits(now, admit_past_cap) {
+            ALERT_SEND_TASKS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+            note_inflight_cap_refusal();
+            return None;
+        }
+        if now <= ALERT_SEND_TASKS_SOFT_CAP / 2 {
+            INFLIGHT_CAP_LATCHED.store(false, Ordering::Relaxed);
+        }
+        publish_inflight_alert_tasks(now);
+        Some(Self)
+    }
+}
+
+/// Above this many running alert-send tasks, an alert below High that is
+/// not a recovery edge is counted and not sent. Critical and High pages
+/// and episode recovery edges are never refused (PR47 follow-up,
+/// 2026-11-23). Each task lives at most `TELEGRAM_SEND_MAX_ATTEMPTS` sends
+/// plus 60 s of `retry_after` waits per chunk, so 256 tasks is far above
+/// any measured storm; the cap bounds memory if Telegram stalls for long.
+pub(crate) const ALERT_SEND_TASKS_SOFT_CAP: u64 = 256;
+
+/// One `warn!` per crossing of the cap; cleared once the count falls to
+/// half of it.
+static INFLIGHT_CAP_LATCHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether an alert may start a send task past [`ALERT_SEND_TASKS_SOFT_CAP`]:
+/// High and Critical always, and an episode recovery edge always, so a
+/// bubble that opened is never left without its close. Pure, O(1).
+pub(crate) fn admits_past_inflight_cap(
+    severity: Severity,
+    episode_role: Option<super::episode::EpisodeRole>,
+) -> bool {
+    severity >= Severity::High || episode_role == Some(super::episode::EpisodeRole::Resolve)
+}
+
+/// Whether a task that would make `now` running tasks is admitted. Pure, O(1).
+fn inflight_cap_admits(now: u64, admit_past_cap: bool) -> bool {
+    admit_past_cap || now <= ALERT_SEND_TASKS_SOFT_CAP
+}
+
+fn note_inflight_cap_refusal() {
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "inflight_cap").increment(1);
+    if !INFLIGHT_CAP_LATCHED.swap(true, Ordering::Relaxed) {
+        warn!(
+            target: "notification",
+            code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+            source = "inflight_cap",
+            cap = ALERT_SEND_TASKS_SOFT_CAP,
+            "notification: too many alert sends running; alerts below High are counted, not sent, until the backlog clears (High and Critical pages still go)"
+        );
+    }
+}
+
+impl Drop for InflightAlertTask {
+    fn drop(&mut self) {
+        let before = ALERT_SEND_TASKS_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        publish_inflight_alert_tasks(before.saturating_sub(1));
+    }
+}
+
+fn publish_inflight_alert_tasks(count: u64) {
+    metrics::gauge!("tv_telegram_send_tasks_inflight").set(count as f64);
+}
+
 // ---------------------------------------------------------------------------
 // Internal SNS Send
 // ---------------------------------------------------------------------------
@@ -2308,7 +2533,12 @@ pub(crate) async fn edit_telegram_message_with_retry(
 /// Sends an SMS via AWS SNS direct publish to a phone number.
 ///
 /// Uses `Transactional` SMS type for highest delivery priority (not promotional).
-/// Logs `warn` on failure — never panics, never blocks caller.
+/// Never panics, never blocks the caller. A failure is counted on
+/// `tv_sns_sms_failed_total{reason}` and logged as a coded TELEGRAM-01
+/// `error!` (PR47, 2026-10-11): before, it was a bare `warn!` with no
+/// counter, so a lost SMS copy of a Critical page left no trace an
+/// operator could query. Prometheus only, no CloudWatch alarm (a page for
+/// it would need a dated row in the noise lock).
 ///
 /// # Performance
 ///
@@ -2321,7 +2551,7 @@ async fn send_sns_sms(client: &aws_sdk_sns::Client, phone_number: &str, message:
     {
         Ok(v) => v,
         Err(err) => {
-            warn!(error = %err, "notification: SNS MessageAttributeValue build failed");
+            record_sns_sms_failure(SNS_SMS_FAILED_ATTRIBUTE_BUILD, &err.to_string());
             return;
         }
     };
@@ -2341,9 +2571,28 @@ async fn send_sns_sms(client: &aws_sdk_sns::Client, phone_number: &str, message:
             );
         }
         Err(err) => {
-            warn!(error = %err, "notification: SNS SMS send failed");
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, &err.to_string());
         }
     }
+}
+
+/// `reason` label: the SMS attribute could not be built (no request sent).
+pub(crate) const SNS_SMS_FAILED_ATTRIBUTE_BUILD: &str = "attribute_build";
+/// `reason` label: SNS refused or failed the publish call.
+pub(crate) const SNS_SMS_FAILED_PUBLISH: &str = "publish_failed";
+
+/// Counts and logs one lost SMS copy of a High/Critical page. The phone
+/// number is never logged.
+fn record_sns_sms_failure(reason: &'static str, error_text: &str) {
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => reason).increment(1);
+    error!(
+        target: "notification",
+        code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+        source = "sns_sms_failed",
+        reason,
+        error = %error_text,
+        "TELEGRAM-01: SNS SMS copy of a High/Critical page was not sent"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2396,6 +2645,150 @@ fn mask_phone(phone: &str) -> String {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
+
+    /// Current number of running alert-send tasks. Kept inside the test
+    /// module: a top-level `#[cfg(test)]` item ends the loss-counter
+    /// guard's scan of this file early, hiding every counter below it.
+    fn inflight_alert_tasks() -> u64 {
+        ALERT_SEND_TASKS_INFLIGHT.load(Ordering::Relaxed)
+    }
+
+    /// A `metrics::Recorder` that records counter increments in memory, so a
+    /// test can assert on a counter the production code emits.
+    ///
+    /// WHY THIS EXISTS, and why it adds no dependency. Three
+    /// `test_disabled_service_*` tests below used to end after a `notify()`
+    /// call with no assertion at all — they proved only that a disabled
+    /// notifier does not panic. The property that actually matters is
+    /// stronger and was untested: a disabled notifier must COUNT every alert
+    /// it drops. A notifier that silently swallows alerts is the exact
+    /// false-OK class this repository keeps retiring, and the counter is the
+    /// only evidence that a dropped page ever existed.
+    ///
+    /// Asserting on it needs a recorder. `metrics-util`'s debugging recorder
+    /// is not a workspace dependency and adding one needs operator approval,
+    /// so this implements the six-method `Recorder` trait directly against
+    /// `metrics`, which `tickvault-core` already depends on. Roughly sixty
+    /// lines, no new dependency root, no version decision.
+    ///
+    /// Scoped with `metrics::with_local_recorder`, NOT a global install:
+    /// `metrics` permits one global recorder per process, so a global install
+    /// would let whichever test ran first win and silently neuter the rest
+    /// under `cargo test`'s parallel harness.
+    #[derive(Clone, Default)]
+    struct CapturingRecorder {
+        counters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl CapturingRecorder {
+        /// Total recorded for `name`, summed across every label set.
+        ///
+        /// Summed deliberately: a caller asserting "the drop was counted"
+        /// cares that it was counted, not which label carried it, and the
+        /// label-specific form is available via `count_labelled` when the
+        /// reason IS the assertion.
+        fn count(&self, name: &str) -> u64 {
+            self.counters
+                .lock()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.as_str() == name || k.starts_with(&format!("{name}{{")))
+                        .map(|(_, v)| *v)
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+
+        /// Total recorded for `name` carrying `label=value`.
+        fn count_labelled(&self, name: &str, label: &str, value: &str) -> u64 {
+            let needle = format!("{label}={value}");
+            self.counters
+                .lock()
+                .map(|m| {
+                    m.iter()
+                        .filter(|(k, _)| k.starts_with(name) && k.contains(&needle))
+                        .map(|(_, v)| *v)
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+    }
+
+    /// One counter handle. Keyed by the rendered `name{label=value,...}` so
+    /// two label sets of the same metric stay distinguishable.
+    struct CapturedCounter {
+        key: String,
+        counters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for CapturedCounter {
+        fn increment(&self, value: u64) {
+            if let Ok(mut m) = self.counters.lock() {
+                *m.entry(self.key.clone()).or_insert(0) += value;
+            }
+        }
+        fn absolute(&self, value: u64) {
+            if let Ok(mut m) = self.counters.lock() {
+                m.insert(self.key.clone(), value);
+            }
+        }
+    }
+
+    fn render_key(key: &metrics::Key) -> String {
+        let labels: Vec<String> = key
+            .labels()
+            .map(|l| format!("{}={}", l.key(), l.value()))
+            .collect();
+        if labels.is_empty() {
+            key.name().to_string()
+        } else {
+            format!("{}{{{}}}", key.name(), labels.join(","))
+        }
+    }
+
+    impl metrics::Recorder for CapturingRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(std::sync::Arc::new(CapturedCounter {
+                key: render_key(key),
+                counters: std::sync::Arc::clone(&self.counters),
+            }))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
 
     #[test]
     fn test_disabled_service_is_not_active() {
@@ -2594,6 +2987,35 @@ mod tests {
             refuse_again.is_err(),
             "Phase 3: cleanup must restore the refuse path"
         );
+
+        // Phase 4 (audit INP-16, 2026-10-11): `=0` must NOT turn the
+        // override on. Until that date any value did.
+        // SAFETY: setting an env var is safe.
+        unsafe {
+            std::env::set_var("TICKVAULT_ALLOW_NOOP_NOTIFIER", "0");
+        }
+        let zero_result = NotificationService::enforce_strict(NotificationService::disabled());
+        // SAFETY: clean up so other tests don't inherit the value.
+        unsafe {
+            std::env::remove_var("TICKVAULT_ALLOW_NOOP_NOTIFIER");
+        }
+        assert!(
+            zero_result.is_err(),
+            "Phase 4: TICKVAULT_ALLOW_NOOP_NOTIFIER=0 must not override strict mode"
+        );
+    }
+
+    /// Audit INP-16 (2026-10-11): only exactly `1` turns the override on.
+    #[test]
+    fn test_noop_override_requires_exactly_one() {
+        assert!(noop_override_value_allows(Some("1")));
+        for value in ["0", "false", "", " 1", "1 ", "true", "yes", "01", "11"] {
+            assert!(
+                !noop_override_value_allows(Some(value)),
+                "value {value:?} must not turn the override on"
+            );
+        }
+        assert!(!noop_override_value_allows(None));
     }
 
     #[test]
@@ -2616,20 +3038,49 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_service_notify_does_not_panic() {
+    fn test_disabled_service_counts_every_dropped_alert() {
+        // RENAMED + rewritten 2026-09-05. This was
+        // `test_disabled_service_notify_does_not_panic` and ended after the
+        // three `notify()` calls with NO assertion at all — it proved only
+        // that a disabled notifier does not panic, which `notify()`'s NoOp
+        // arm cannot do (it is a counter increment and a return).
+        //
+        // The property that actually matters: a disabled notifier must
+        // COUNT every alert it drops. A notifier that silently swallows
+        // alerts leaves a dropped page with no evidence it ever existed —
+        // the false-OK class this repository keeps retiring.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        // Fire-and-forget on a no-op service must not panic.
-        service.notify(NotificationEvent::StartupComplete {
-            mode: "LIVE",
-            spot_1m_enabled: true,
-            spot_1m_indices: 4,
-            chain_1m_enabled: true,
-            chain_1m_underlyings: 3,
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::StartupComplete {
+                mode: "LIVE",
+                spot_1m_enabled: true,
+                spot_1m_indices: 4,
+                chain_1m_enabled: true,
+                chain_1m_underlyings: 3,
+            });
+            service.notify(NotificationEvent::ShutdownComplete);
+            service.notify(NotificationEvent::Custom {
+                message: "test".to_string(),
+            });
         });
-        service.notify(NotificationEvent::ShutdownComplete);
-        service.notify(NotificationEvent::Custom {
-            message: "test".to_string(),
-        });
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            3,
+            "a disabled notifier must count EVERY dropped alert — one per notify()"
+        );
+        // The reason label is load-bearing: an operator triaging a silent
+        // Telegram needs `noop_mode` (SSM was unavailable at boot) told
+        // apart from a coalescer drop or a send failure. Asserting the
+        // total equals the labelled count pins that the NoOp arm returns
+        // without touching any other drop reason.
+        assert_eq!(
+            recorder.count("tv_telegram_dropped_total"),
+            3,
+            "the NoOp arm must return immediately — no other drop reason may fire"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2746,15 +3197,31 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_service_handles_critical_events() {
+    fn test_disabled_service_counts_dropped_critical_alerts() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_handles_critical_events`, assertion-free).
+        // Severity must not change the accounting: a CRITICAL page dropped
+        // because SSM was unavailable at boot is exactly the one an
+        // operator most needs a counter for, so it is counted on the same
+        // footing as an Info event.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        service.notify(NotificationEvent::AuthenticationFailed {
-            reason: "timeout".to_string(),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::AuthenticationFailed {
+                reason: "timeout".to_string(),
+            });
+            service.notify(NotificationEvent::TokenRenewalFailed {
+                attempts: 3,
+                reason: "timeout".to_string(),
+            });
         });
-        service.notify(NotificationEvent::TokenRenewalFailed {
-            attempts: 3,
-            reason: "timeout".to_string(),
-        });
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            2,
+            "Critical events dropped by a disabled notifier must still be counted"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2857,7 +3324,9 @@ mod tests {
         // Rate-limited — must retry, not give up.
         assert_eq!(
             classify_telegram_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            TelegramSendOutcome::Transient
+            TelegramSendOutcome::Transient {
+                retry_after_secs: None
+            }
         );
     }
 
@@ -2868,7 +3337,9 @@ mod tests {
             let status = reqwest::StatusCode::from_u16(code).unwrap();
             assert_eq!(
                 classify_telegram_status(status),
-                TelegramSendOutcome::Transient,
+                TelegramSendOutcome::Transient {
+                    retry_after_secs: None
+                },
                 "HTTP {code} must classify as transient"
             );
         }
@@ -2979,25 +3450,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_returns_noop_without_ssm() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: false,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — Telegram creds fetched from SSM.
-            assert!(
-                service.is_active(),
-                "with real AWS credentials, notification service should be active"
-            );
-        } else {
-            assert!(
-                !service.is_active(),
-                "without real SSM, service should be in no-op mode"
-            );
-        }
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------
@@ -3102,22 +3571,36 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_disabled_service_all_critical_events_safe() {
+    fn test_disabled_service_counts_mixed_severity_drops() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_all_critical_events_safe`, assertion-free).
+        // A mixed batch — two auth-family Criticals and a WS disconnect —
+        // must produce one counted drop each. The count is what tells an
+        // operator how much they did NOT hear about.
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        // Every event variant must be safe to fire on a disabled service
-        service.notify(NotificationEvent::AuthenticationFailed {
-            reason: "test".to_string(),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::AuthenticationFailed {
+                reason: "test".to_string(),
+            });
+            service.notify(NotificationEvent::TokenRenewalFailed {
+                attempts: 99,
+                reason: "catastrophic".to_string(),
+            });
+            service.notify(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "reset".to_string(),
+            });
+            // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
+            // notify calls removed alongside the deleted variants.
         });
-        service.notify(NotificationEvent::TokenRenewalFailed {
-            attempts: 99,
-            reason: "catastrophic".to_string(),
-        });
-        service.notify(NotificationEvent::WebSocketDisconnected {
-            connection_index: 0,
-            reason: "reset".to_string(),
-        });
-        // PR-D (2026-05-26): HistoricalFetchFailed + CandleVerificationFailed
-        // notify calls removed alongside the deleted variants.
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            3,
+            "every dropped alert is counted regardless of event family"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3377,17 +3860,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_with_sns_disabled() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: false,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        // Without real SSM, should fall back to no-op
-        // With real SSM, should be active but without SNS
-        // Either way, should not panic
-        let _ = service.is_active();
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------
@@ -3396,16 +3885,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_initialize_with_sns_enabled_falls_back_gracefully() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
         let config = NotificationConfig {
             send_timeout_ms: 100,
-            telegram_api_base_url: "https://api.telegram.org".to_string(),
+            telegram_api_base_url: "http://127.0.0.1:9".to_string(),
             sns_enabled: true,
             ..NotificationConfig::default()
         };
-        let service = NotificationService::initialize(&config).await;
-        // Whether SSM is available or not, initialize should not panic
-        // SNS phone number fetch may fail, but service still initializes
-        let _ = service.is_active();
+        let service = fixture
+            .scope(NotificationService::initialize(&config))
+            .await;
+        assert!(
+            !service.is_active(),
+            "synthetic SSM failure must return no-op"
+        );
+        // initialize uses join!, so both Telegram parameter reads complete;
+        // an SNS phone lookup must never begin after either required read fails.
+        fixture.assert_requests(2, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     // -----------------------------------------------------------------------
@@ -3505,28 +4001,48 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_disabled_service_websocket_events_safe() {
+    fn test_disabled_service_counts_dropped_ws_episode_events() {
+        // RENAMED + rewritten 2026-09-05 (was
+        // `test_disabled_service_websocket_events_safe`, assertion-free).
+        //
+        // WS lifecycle events are the ones that carry an `episode_key()`
+        // and would fold into a live-edited episode bubble on an ACTIVE
+        // service. This pins that the NoOp arm is consulted FIRST: all five
+        // are counted as plain drops, none reaches the episode dispatcher
+        // (which would `tokio::spawn` and panic outside a runtime — this is
+        // a plain `#[test]`, so a regression that routed them to the
+        // coalescer would fail here loudly rather than silently).
+        let recorder = CapturingRecorder::default();
         let service = NotificationService::disabled();
-        service.notify(NotificationEvent::WebSocketConnected {
-            connection_index: 0,
-            subscribed_count: 5_000,
-            capacity: 5_000,
-            last_activity_secs_ago: Some(1),
+
+        metrics::with_local_recorder(&recorder, || {
+            service.notify(NotificationEvent::WebSocketConnected {
+                connection_index: 0,
+                subscribed_count: 5_000,
+                capacity: 5_000,
+                last_activity_secs_ago: Some(1),
+            });
+            service.notify(NotificationEvent::WebSocketDisconnected {
+                connection_index: 0,
+                reason: "test".to_string(),
+            });
+            service.notify(NotificationEvent::WebSocketReconnected {
+                connection_index: 0,
+                reason: None,
+                down_secs: 0,
+                attempts: 0,
+            });
+            service.notify(NotificationEvent::ShutdownInitiated {
+                class: crate::notification::events::ShutdownClass::ExternalStop,
+            });
+            service.notify(NotificationEvent::ShutdownComplete);
         });
-        service.notify(NotificationEvent::WebSocketDisconnected {
-            connection_index: 0,
-            reason: "test".to_string(),
-        });
-        service.notify(NotificationEvent::WebSocketReconnected {
-            connection_index: 0,
-            reason: None,
-            down_secs: 0,
-            attempts: 0,
-        });
-        service.notify(NotificationEvent::ShutdownInitiated {
-            class: crate::notification::events::ShutdownClass::ExternalStop,
-        });
-        service.notify(NotificationEvent::ShutdownComplete);
+
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "noop_mode"),
+            5,
+            "WS episode-family events must be counted as drops, not silently coalesced"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4394,6 +4910,385 @@ mod tests {
         assert_eq!(outcome, EditOutcome::Fallback);
     }
 
+    // -----------------------------------------------------------------------
+    // PR47 (2026-10-11): an urgent page is never lost uncounted.
+    // -----------------------------------------------------------------------
+
+    /// Answers the first `limited` requests (send or edit) with a 429 that
+    /// carries `parameters.retry_after = retry_after_secs`, then 200 with
+    /// `message_id` 777. Returns the base URL and a request counter.
+    async fn start_rate_limited_then_ok_server(
+        limited: usize,
+        retry_after_secs: u64,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://127.0.0.1:{}", addr.port());
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_task = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = hits_task.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let (status_line, body) = if seen < limited {
+                        (
+                            "HTTP/1.1 429 Too Many Requests",
+                            format!(
+                                r#"{{"ok":false,"error_code":429,"description":"Too Many Requests: retry after {retry_after_secs}","parameters":{{"retry_after":{retry_after_secs}}}}}"#
+                            ),
+                        )
+                    } else {
+                        (
+                            "HTTP/1.1 200 OK",
+                            r#"{"ok":true,"result":{"message_id":777}}"#.to_string(),
+                        )
+                    };
+                    let response = format!(
+                        "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, hits)
+    }
+
+    fn short_timeout_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_parse_retry_after_secs_reads_the_parameters_field() {
+        assert_eq!(
+            parse_retry_after_secs(
+                r#"{"ok":false,"error_code":429,"parameters":{"retry_after":17}}"#
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            parse_retry_after_secs(r#"{"ok":false,"description":"Too Many Requests"}"#),
+            None,
+            "a 429 with no parameters falls back to the ladder"
+        );
+        assert_eq!(parse_retry_after_secs("not json"), None);
+        assert_eq!(parse_retry_after_secs(""), None);
+        assert_eq!(
+            parse_retry_after_secs(r#"{"parameters":{"retry_after":-3}}"#),
+            None,
+            "a negative wait is not a wait"
+        );
+        assert_eq!(
+            parse_retry_after_secs(r#"{"parameters":{"retry_after":"5"}}"#),
+            None,
+            "a string is not the documented integer"
+        );
+    }
+
+    #[test]
+    fn test_telegram_retry_wait_honours_and_caps_retry_after() {
+        let backoff = Duration::from_millis(TELEGRAM_SEND_BACKOFF_INITIAL_MS);
+        assert_eq!(telegram_retry_wait(backoff, None), backoff);
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(5)),
+            Duration::from_secs(5),
+            "Telegram's longer wait wins"
+        );
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(0)),
+            backoff,
+            "never shorter than the ladder"
+        );
+        assert_eq!(
+            telegram_retry_wait(backoff, Some(u64::MAX)),
+            Duration::from_secs(TELEGRAM_RETRY_AFTER_CAP_SECS),
+            "a huge wait is capped"
+        );
+        assert_eq!(
+            telegram_retry_wait(Duration::from_secs(90), Some(1)),
+            Duration::from_secs(90),
+            "a longer ladder step is kept"
+        );
+    }
+
+    const _: () = assert!(
+        TELEGRAM_RETRY_AFTER_CAP_SECS >= 1 && TELEGRAM_RETRY_AFTER_CAP_SECS <= 60,
+        "the retry-after cap must honour Telegram's usual flood window and stay bounded"
+    );
+
+    // Regression: 2026-10-11 — a 429 retried after 100 ms, inside the
+    // window Telegram named, and the page was lost.
+    #[tokio::test]
+    async fn test_regression_send_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let ok =
+            send_telegram_chunk_with_retry(&short_timeout_client(), &base_url, &token, "1", "x")
+                .await;
+        assert!(ok, "the retry after the requested wait is delivered");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the retry waited Telegram's retry_after, not the 100 ms ladder step: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_regression_episode_send_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let (ok, id) = send_telegram_chunk_with_retry_returning_id(
+            &short_timeout_client(),
+            &base_url,
+            &token,
+            "1",
+            "x",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(id, Some(777));
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_regression_edit_retry_waits_for_telegram_retry_after() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(1, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let started = std::time::Instant::now();
+        let outcome = edit_telegram_message_with_retry(
+            &short_timeout_client(),
+            &base_url,
+            &token,
+            "1",
+            42,
+            "x",
+        )
+        .await;
+        assert_eq!(outcome, EditOutcome::Applied);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_on_every_attempt_gives_up_after_the_budget() {
+        let (base_url, hits) = start_rate_limited_then_ok_server(usize::MAX, 1).await;
+        let token = SecretString::from("test-bot-token".to_string());
+        let ok =
+            send_telegram_chunk_with_retry(&short_timeout_client(), &base_url, &token, "1", "x")
+                .await;
+        assert!(!ok);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            TELEGRAM_SEND_MAX_ATTEMPTS as usize,
+            "no attempt beyond the budget"
+        );
+    }
+
+    // Regression: 2026-10-11 — the chunked bypass path (every Critical and
+    // High page outside the episode lane) logged TELEGRAM-01 on a lost page
+    // but never counted it, so the tv-telegram-drops alarm could not see it.
+    #[test]
+    fn test_regression_chunked_page_loss_counts_one_drop_per_page() {
+        let recorder = CapturingRecorder::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let token = SecretString::from("fake".to_string());
+        let chunks = vec!["one".to_string(), "two".to_string()];
+        let lost = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(send_chunked_page(
+                &client,
+                "http://127.0.0.1:1",
+                &token,
+                "1",
+                &chunks,
+            ))
+        });
+        assert_eq!(lost, 2, "both chunks were unreachable");
+        assert_eq!(
+            recorder.count_labelled("tv_telegram_dropped_total", "reason", "send_failed"),
+            1,
+            "one lost page counts once, whatever its chunk count"
+        );
+    }
+
+    #[test]
+    fn test_chunked_page_delivered_counts_no_drop() {
+        let recorder = CapturingRecorder::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let token = SecretString::from("test-bot-token".to_string());
+        let chunks = vec!["one".to_string()];
+        let lost = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (base_url, _hits) = start_rate_limited_then_ok_server(0, 0).await;
+                send_chunked_page(&short_timeout_client(), &base_url, &token, "1", &chunks).await
+            })
+        });
+        assert_eq!(lost, 0);
+        assert_eq!(recorder.count("tv_telegram_dropped_total"), 0);
+    }
+
+    // Regression: 2026-10-11 — a failed SMS copy of a Critical page was a
+    // bare warn! with no counter.
+    #[test]
+    fn test_regression_sns_sms_failure_is_counted_per_reason() {
+        let recorder = CapturingRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, "throttled");
+            record_sns_sms_failure(SNS_SMS_FAILED_PUBLISH, "throttled");
+            record_sns_sms_failure(SNS_SMS_FAILED_ATTRIBUTE_BUILD, "bad attribute");
+        });
+        assert_eq!(
+            recorder.count_labelled("tv_sns_sms_failed_total", "reason", "publish_failed"),
+            2
+        );
+        assert_eq!(
+            recorder.count_labelled("tv_sns_sms_failed_total", "reason", "attribute_build"),
+            1
+        );
+        assert_eq!(
+            recorder.count("tv_telegram_dropped_total"),
+            0,
+            "an SMS loss must not trip the Telegram drop alarm"
+        );
+    }
+
+    #[test]
+    fn test_sns_sms_failure_source_is_coded_and_never_logs_the_phone() {
+        let src = include_str!("service.rs");
+        let start = src.find("fn record_sns_sms_failure").unwrap();
+        let body = &src[start..start + 900];
+        assert!(body.contains("ErrorCode::Telegram01Dropped"));
+        assert!(body.contains("error!("));
+        assert!(!body.contains("phone"), "the phone number is never logged");
+        let sms = src.find("async fn send_sns_sms").unwrap();
+        let sms_body = &src[sms..src[sms..].find("\n}\n").unwrap() + sms];
+        assert!(
+            !sms_body.contains(concat!("warn", "!(")),
+            "SMS loss is an error, not a warning"
+        );
+        assert_eq!(sms_body.matches("record_sns_sms_failure(").count(), 2);
+    }
+
+    #[test]
+    fn test_inflight_alert_tasks_counts_while_alive() {
+        let first = InflightAlertTask::start();
+        let second = InflightAlertTask::start();
+        assert!(inflight_alert_tasks() >= 2, "both tasks are counted");
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn test_inflight_cap_admits_only_up_to_the_cap_unless_exempt() {
+        assert!(inflight_cap_admits(1, false));
+        assert!(inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP, false));
+        assert!(!inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP + 1, false));
+        assert!(inflight_cap_admits(ALERT_SEND_TASKS_SOFT_CAP + 1, true));
+        assert!(inflight_cap_admits(u64::MAX, true));
+    }
+
+    #[test]
+    fn test_admits_past_inflight_cap_never_caps_high_critical_or_recovery() {
+        use super::super::episode::EpisodeRole;
+        assert!(admits_past_inflight_cap(Severity::Critical, None));
+        assert!(admits_past_inflight_cap(Severity::High, None));
+        assert!(admits_past_inflight_cap(
+            Severity::High,
+            Some(EpisodeRole::Open)
+        ));
+        assert!(admits_past_inflight_cap(
+            Severity::Low,
+            Some(EpisodeRole::Resolve)
+        ));
+        assert!(admits_past_inflight_cap(
+            Severity::Info,
+            Some(EpisodeRole::Resolve)
+        ));
+        assert!(!admits_past_inflight_cap(Severity::Medium, None));
+        assert!(!admits_past_inflight_cap(
+            Severity::Low,
+            Some(EpisodeRole::Open)
+        ));
+        assert!(!admits_past_inflight_cap(
+            Severity::Info,
+            Some(EpisodeRole::Progress)
+        ));
+    }
+
+    #[test]
+    fn test_try_start_refuses_low_severity_past_the_cap_and_never_high() {
+        // Fill past the cap with plain counted tasks (other tests only add
+        // to the count, so the cap is exceeded whatever else runs).
+        let held: Vec<InflightAlertTask> = (0..=ALERT_SEND_TASKS_SOFT_CAP)
+            .map(|_| InflightAlertTask::start())
+            .collect();
+        let before = inflight_alert_tasks();
+        assert!(before > ALERT_SEND_TASKS_SOFT_CAP);
+        let refused = InflightAlertTask::try_start(false);
+        assert!(
+            refused.is_none(),
+            "a low-severity send past the cap is refused"
+        );
+        assert!(
+            inflight_alert_tasks() <= before,
+            "a refusal gives its slot back"
+        );
+        let admitted = InflightAlertTask::try_start(true);
+        assert!(admitted.is_some(), "a High/Critical send is never refused");
+        drop(admitted);
+        drop(held);
+    }
+
+    #[test]
+    fn test_every_notify_spawn_is_counted_in_flight() {
+        let src = include_str!("service.rs");
+        let start = src.find("pub fn notify(self: &Arc<Self>").unwrap();
+        let end = start + src[start..].find("pub fn is_active(&self)").unwrap();
+        let notify = &src[start..end];
+        assert_eq!(
+            notify.matches("tokio::spawn(").count(),
+            notify.matches("InflightAlertTask::start()").count()
+                + notify.matches("InflightAlertTask::try_start(").count(),
+            "every task notify spawns is counted on tv_telegram_send_tasks_inflight"
+        );
+        assert_eq!(
+            notify
+                .matches("InflightAlertTask::try_start(admits_past_inflight_cap(")
+                .count(),
+            2,
+            "the Telegram and episode sends go through the cap; the SMS copy (High+ only) does not"
+        );
+        assert_eq!(notify.matches("tokio::spawn(").count(), 3);
+    }
+
     #[tokio::test]
     async fn test_shutdown_flush_drains_digest_and_persists_store() {
         // NoOp service: completes instantly (nothing to drain, no store).
@@ -4674,12 +5569,12 @@ mod tests {
         let base_url = start_scripted_telegram_server().await;
         let service = make_scripted_service(base_url);
         assert!(service.boot_bubble_enabled(), "boot bubble defaults ON");
-        service.set_boot_expectations(true, true);
+        service.set_boot_expectations(true);
         let cl = service
             .episodes
             .boot_checklist()
             .expect("expectations create the checklist");
-        assert_eq!(cl.expectations, Some((true, true)));
+        assert_eq!(cl.expectations, Some(true));
     }
 
     #[test]

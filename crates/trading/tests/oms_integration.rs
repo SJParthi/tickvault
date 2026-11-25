@@ -54,6 +54,7 @@ fn make_oms() -> OrderManagementSystem {
 fn make_limit_order_request() -> PlaceOrderRequest {
     PlaceOrderRequest {
         security_id: 52432,
+        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::Limit,
         product_type: ProductType::Intraday,
@@ -69,6 +70,7 @@ fn make_limit_order_request() -> PlaceOrderRequest {
 fn make_market_order_request() -> PlaceOrderRequest {
     PlaceOrderRequest {
         security_id: 52432,
+        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::Market,
         product_type: ProductType::Intraday,
@@ -543,6 +545,7 @@ async fn test_market_order_with_price_rejected() {
 
     let request = PlaceOrderRequest {
         security_id: 52432,
+        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::Market,
         product_type: ProductType::Intraday,
@@ -565,6 +568,7 @@ async fn test_stop_loss_order_without_trigger_rejected() {
 
     let request = PlaceOrderRequest {
         security_id: 52432,
+        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::StopLoss,
         product_type: ProductType::Intraday,

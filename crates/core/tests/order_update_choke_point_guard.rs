@@ -11,12 +11,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Bounds a source string to its production region (everything before the
-/// first `#[cfg(test)]` marker), so test code can never satisfy or trip a pin.
-fn production_region(src: &str) -> &str {
-    match src.find("#[cfg(test)]") {
-        Some(pos) => &src[..pos],
-        None => src,
+/// Blank the actual inline test module, preserving test-only fields and any
+/// production code after the module. Files without that module are scanned
+/// in full; the known caller and parser must retain their explicit boundary.
+fn production_region(src: &str, require_test_module: bool) -> String {
+    let region = tickvault_common::source_scan::production_region(src);
+    if require_test_module {
+        region.expect("the order-update caller and parser must retain their test-module boundary")
+    } else {
+        region.unwrap_or_else(|| src.to_owned())
     }
 }
 
@@ -95,15 +98,16 @@ fn ratchet_parse_order_update_has_exactly_one_production_caller() {
     for path in &files {
         let src =
             fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let prod = production_region(&src);
         let path_str = path.to_string_lossy().replace('\\', "/");
         let is_parser_module = path_str.ends_with("parser/order_update.rs");
+        let is_known_caller = path_str.ends_with("websocket/order_update_connection.rs");
+        let prod = production_region(&src, is_parser_module || is_known_caller);
 
         if !is_parser_module && prod.contains("parse_order_update(") {
             callers.push(path_str.clone());
         }
         if !is_parser_module {
-            let violations = find_bypass_violations(prod);
+            let violations = find_bypass_violations(&prod);
             assert!(
                 violations.is_empty(),
                 "{path_str} decodes OrderUpdateMessage directly ({violations:?}) — \
@@ -135,7 +139,7 @@ fn ratchet_decode_quirk_counter_exists_in_parser() {
     let parser = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/parser/order_update.rs");
     let src =
         fs::read_to_string(&parser).unwrap_or_else(|e| panic!("read {}: {e}", parser.display()));
-    let prod = production_region(&src);
+    let prod = production_region(&src, true);
     assert!(
         prod.contains("tv_order_update_decode_quirks_total"),
         "the parser must keep the tv_order_update_decode_quirks_total \
@@ -187,6 +191,37 @@ fn bypass_scanner_detects_planted_violation() {
     let legit = "let (tx, rx) = broadcast::channel::<OrderUpdate>(16);";
     assert!(find_bypass_violations(legit).is_empty());
     // The test-region cut keeps test code out of scope.
-    let with_tests = "prod();\n#[cfg(test)]\nmod t { from_str::<OrderUpdateMessage> }";
-    assert!(find_bypass_violations(production_region(with_tests)).is_empty());
+    let with_tests = "prod();\n#[cfg(test)]\nmod tests { from_str::<OrderUpdateMessage> }";
+    assert!(find_bypass_violations(&production_region(with_tests, true)).is_empty());
+}
+
+#[test]
+fn test_regression_choke_point_guard_sees_bypass_after_test_only_field() {
+    // Regression: 2026-11-02 — a field attribute must not hide a production
+    // decoder, including one placed after the inline test module.
+    let src = "struct Session {\n    #[cfg(test)]\n    signal: (),\n}\n\
+               fn read_loop() { serde_json::from_str::<OrderUpdateMessage>(payload); }\n\
+               #[cfg(test)]\nmod tests { fn fixture() { from_slice::<OrderUpdateMessage>(); } }\n\
+               fn trailing() { serde_json::from_value::<OrderUpdate>(value); }\n";
+    assert_eq!(
+        find_bypass_violations(&production_region(src, true)),
+        vec!["from_str::<OrderUpdate", "from_value::<OrderUpdate"]
+    );
+    let without_module =
+        "#[cfg(test)]\nfn helper() {}\nfn live() { from_slice::<OrderUpdate>(bytes); }";
+    assert_eq!(
+        find_bypass_violations(&production_region(without_module, false)),
+        vec!["from_slice::<OrderUpdate"]
+    );
+    assert!(
+        std::panic::catch_unwind(|| production_region(without_module, true)).is_err(),
+        "known caller/parser files must fail loudly if their boundary disappears"
+    );
+    let ungated = "#[cfg(test)]\nfn helper() {}\n\
+                   mod tests { fn live() { from_str::<OrderUpdateMessage>(payload); } }";
+    assert_eq!(
+        find_bypass_violations(&production_region(ungated, false)),
+        vec!["from_str::<OrderUpdate"],
+        "a nearby helper's cfg(test) cannot hide an ungated module's decoder"
+    );
 }

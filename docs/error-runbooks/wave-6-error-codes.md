@@ -4,7 +4,7 @@ paths:
   - "crates/storage/src/shadow_persistence.rs"
   - "crates/storage/src/seal_writer_loop.rs"
   - "crates/app/tests/seal_drop_paging_wiring_guard.rs"
-  - "crates/storage/tests/wave_6_aggregator_alert_guard.rs"
+  - "crates/storage/tests/wave_6_aggregator_alert_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-05-20 with Grafana; NOT ENFORCED
   - "crates/trading/src/aggregator/multi_tf.rs"
   - "crates/app/src/groww_bridge.rs"
   - "crates/app/src/main.rs"
@@ -13,7 +13,7 @@ paths:
   - "crates/trading/src/aggregator/boundary_timer.rs"
   - "crates/trading/src/candles/multi_tf_aggregator.rs"
   - "crates/trading/src/candles/aggregator_cell.rs"
-  - "crates/app/tests/aggregation_task_wiring_guard.rs"
+  - "crates/app/tests/aggregation_task_wiring_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-18 with the 21-timeframe tick aggregator; NOT ENFORCED
   - "crates/storage/src/ws_frame_spill.rs"
 ---
 
@@ -33,8 +33,8 @@ paths:
 
 **Trigger:** the multi-TF aggregator sealed a candle, attempted to flush
 it via the ring buffer (`SEAL_BUFFER_CAPACITY`), the disk spill
-(`data/spill/seals-YYYYMMDD.bin`) and the NDJSON DLQ
-(`data/dlq/seals-*.ndjson`); ALL three absorbing tiers refused the row.
+(`data/spill/seals_v4-YYYY-MM-DD.bin`) and the NDJSON DLQ
+(`data/dlq/seals_v4-*.ndjson`); ALL three absorbing tiers refused the row.
 This is the only code path that constitutes silent data loss for a
 sealed candle. Severity::Critical.
 
@@ -52,6 +52,17 @@ unwritable — by definition catastrophic.
    bounded ring resets and resumes from healthy state.
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter::handle_drop`.
+
+**2026-10-20 — `source = "slot_exhausted"`.** The candle aggregator's
+one-shot "slot table at capacity" line (`MultiTfAggregator`, fields
+`feed`, `security_id`, `segment_code`, `capacity`) now carries this code.
+It had none: the tag guard read `segment_code =` as a `code` field. It
+names the FIRST instrument refused when the slot table is full; the
+live drain's 30-second read-out already pages the same refusal under this
+code (`refused_slot_exhausted`), so no new page. This is NOT a disk
+failure: the instrument's ticks are still written, only its candles are
+missing. Do: raise `AGGREGATOR_MAX_SLOTS` or shrink the universe; do not
+run the disk triage above for this source.
 
 ### 2026-07-09 Update — AGGREGATOR-DROP-01 now PAGES (dual route)
 
@@ -101,6 +112,61 @@ inside the boot prefix) but route 1 still sees its ERROR line; the delta
 counter shape is not live-verified from the sandbox — if it ever proved
 cumulative, Sum over-pages (fail-loud, never a silent miss).
 
+### 2026-09-27 Update (audit PR40a) — a crash's unwritten seals, reported at the next boot
+
+A crash (abort, out of memory, hard kill) loses every sealed candle still in
+memory: the writer channel, the ring and the escalation queue, each sized to
+`SEAL_BUFFER_CAPACITY` (250,000 at `TF_COUNT` 10). The writer now publishes
+that count every cycle as the gauge `tv_seal_unwritten`, and writes it to
+`seal-unwritten.mark` in the spill directory at most once a second when it
+changes. A clean shutdown rewrites the marker with `clean=1` after its final
+drain. The next boot reads it first: a marker that is not clean and holds
+seals fires this code with `source = "crash_unwritten"` and fields
+`seals_unwritten`, `sampled_at_unix_secs` and `sample_age_secs`, and adds the
+number to `tv_seal_crash_unwritten_total`. It pages through the existing
+errcode alarm; no new alarm.
+
+**Triage for `source = "crash_unwritten"`:** the loss already happened in the
+previous process. Find why it died (`journalctl -u tickvault`, the OOM
+monitor, the previous `errors.jsonl`). The reported number is the count at
+the last sample, up to one second before the process died. The candles of the
+windows involved are missing from `candles_*`; their ticks are in `ticks` and
+in the capture log, so a rebuild is possible by hand until PR31b's warm-up
+does it at boot.
+
+**Source:** `crates/storage/src/seal_writer_loop.rs::report_previous_unwritten`.
+
+### 2026-09-27 Update (audit PR40b) — seals a recovery path gave up on, and aged spill files
+
+Two more sources now page through the same errcode alarm (no new alarm):
+
+- `source = "seal_unrecovered"`, field `stage` = `boot_drain` or `replay`,
+  field `seals_unrecovered`. The boot drain could not decode a record (most
+  often a file from an older build) or the writer refused a seal, or the
+  mid-session replay skipped a seal the database refused in every attempt.
+  Nothing retries them. One line per boot drain or replay step, never per
+  seal. Counters: `tv_seal_writer_drain_total{kind="boot_undecodable" |
+  "boot_append_failed"}` and `tv_seal_replay_total{kind="skipped"}`.
+- `source = "spill_retention"`, fields `files` and `records_lost`. The retention
+  sweep deleted spill files older than `SPILL_FILE_MAX_AGE_SECS` (7 days) that
+  still held seals, at the top level of `data/spill/` or in `replaying/`. Until
+  PR40b this line carried the unregistered code `SPILL-RETENTION-01` and paged
+  nobody.
+
+The sweep now also covers `data/spill/replaying/` (unreplayed: an aged file is
+counted as lost) and `data/spill/archive/` (finished with: counted apart as
+`archive_deleted`, logged at `info!`). Both count toward `tv_seal_spill_bytes`.
+
+**Triage for `seal_unrecovered`:** the files are in `data/spill/archive/`
+until they are 7 days old. A format mismatch after an upgrade is the usual
+cause; the seals' ticks are still in `ticks` and in the capture log.
+**Triage for `spill_retention`:** the replay has not drained these files for a
+week. Check why the writer cannot reach QuestDB, and the earlier
+`seal_unrecovered` or AGGREGATOR-SEAL-01 lines.
+
+**Source:** `crates/storage/src/seal_writer_loop.rs::report_unrecovered_seals`,
+`crates/storage/src/seal_spill.rs::prune_spill_files`.
+
 ### 2026-05-11 Update — 4-alert drop-class family is now live
 
 Per Wave 6 Sub-PR #1 items 1.4j/l/n/o (merged #584/#587/#589/#590) the
@@ -120,9 +186,45 @@ All 4 alerts:
 - Wrapped in `increase()` per Rule 12
 
 Family completeness is meta-ratcheted by 3 tests in
-`crates/storage/tests/wave_6_aggregator_alert_guard.rs` (item 1.4p,
+`crates/storage/tests/wave_6_aggregator_alert_guard.rs` (⚠ CORRECTED 2026-11-15: this guard file was deleted 2026-05-20 with Grafana; NOT ENFORCED) (item 1.4p,
 merged #591). Future deletion of any single alert OR severity
 downgrade OR market-hours-gate removal fails the build.
+
+## AGGREGATOR-STALL-01 — the live feed waited on a stalled disk to write a refused candle
+
+**Severity:** Critical. **Pages:** `tv-<env>-errcode-aggregator-stall-01` (noise-lock §2.7, 2026-09-27). **No OK page.**
+
+**What happened.** A sealed candle the database writer could not take normally goes
+to the escalation queue, and the `tv-seal-escalate` thread writes it to the spill.
+That queue holds one full market-close burst. It was full (or its thread had died),
+so the frame-drain task — the one thread that reads the Dhan socket — wrote the
+candle to disk ITSELF and waited at least `SEAL_INLINE_WAIT_PAGE_MS` (1,000 ms) for
+the disk to answer.
+
+**Nothing was lost on the candle side:** the line's `outcome` says where the candle
+went (`Spilled` or `DlqWritten`; a `Lost` outcome ALSO fires `AGGREGATOR-DROP-01`).
+What stalled is the socket read. Dhan skips a slow reader forward with no sequence
+number, so ticks during the wait may never have arrived.
+
+**Fields:** `waited_ms` (this wait), `max_waited_ms` and `stalls` (the longest wait
+and the count of waits of at least 1 s since the previous line), `outcome`. At most
+one line a minute. The local counters `tv_seal_escalation_inline_wait_ms_total` and
+`tv_seal_escalation_inline_stall_total` carry the running totals.
+
+**Triage:**
+1. `df -h /data` and the disk's own health (EBS volume status, IO wait). A full or
+   failing disk is the usual cause.
+2. `ls -la data/spill/` — a growing spill means the database is also refusing
+   writes; check QuestDB health (`make doctor`).
+3. `tv_seal_escalation_inline_fallback_total` rising while this line is quiet
+   means waits shorter than 1 s: degraded, not paged.
+4. If the disk is healthy again, nothing needs replaying: the candles are on disk
+   and the normal replay puts them back. Check the tick-flow gauge for the window
+   of the wait to see how much the socket read missed.
+
+**Honest limits:** the line is written when the wait ENDS. A disk that never
+answers keeps the drain waiting and stops every file-based log with it; the lane
+liveness alarms that treat missing data as breaching own that case.
 
 ## AGGREGATOR-LATE-01 — tick arrived after its bucket sealed (discarded)
 
@@ -151,8 +253,9 @@ so it routes through Telegram per `error_level_meta_guard.rs` Rule 5.
 **Triage:**
 1. Counter `tv_shadow_writer_buffered_total{table}` rate — if it
    sustains, QuestDB ILP is degraded; check `BOOT-01`/`BOOT-02`.
-2. Inspect `data/spill/seals-*.bin` size — growing means the ring is
-   filling and disk-spill is engaging.
+2. Inspect `data/spill/seals_v4-*.bin` size — growing means the ring is
+   filling and disk-spill is engaging. (Files named plain `seals-*` are
+   pre-v4 leftovers; the boot drain stages them but refuses their records.)
 
 **Source:** `crates/storage/src/shadow_persistence.rs::ShadowCandleWriter`
 + existing fix at `candle_persistence.rs::flush_buffer` (legacy path).

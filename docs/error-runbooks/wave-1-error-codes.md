@@ -2,7 +2,7 @@
 paths:
   - "crates/common/src/error_code.rs"
   - "crates/core/src/pipeline/prev_close_writer.rs"
-  - "crates/core/src/instrument/phase2_emit_guard.rs"
+  - "crates/core/src/instrument/phase2_emit_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-05-08 with the phase2 dispatcher; NOT ENFORCED
   - "crates/core/src/pipeline/prev_close_persist.rs"
   - "crates/core/src/pipeline/first_seen_set.rs"
   - "crates/app/src/main.rs"
@@ -58,6 +58,102 @@ becomes fresh again.
 
 **Source:** `crates/core/src/pipeline/prev_close_writer.rs::try_enqueue_global`
 
+### 2026-11-07 — depth writer and rescue threads abandoned at shutdown
+
+HOT-PATH-02 is also the code on the shutdown joins of the Dhan lane's
+writer threads (`crates/app/src/dhan_feed_stack.rs`). Since 2026-11-07 the
+depth pair carries the tick pair's J2 row accounting: when the depth writer
+or depth rescue thread misses the shared shutdown deadline, the coded line
+names `source = "depth_writer_abandoned"` or `"depth_rescue_abandoned"` and
+the batches, rows and unbacked rows it still held. Unbacked rows (from a
+frame the WAL refused, so no replay) are counted lost on
+`tv_ticks_lost_total{source="depth_writer_abandoned"|"depth_rescue_abandoned"}`,
+which pages through the existing `ticks-lost-spill` alarm; the rest replay
+from the WAL on the next boot. Rows are in the depth writer's `pending` unit
+(one per level; a `market_depth_book` side counts its levels). `-1` means
+the queue could not be read at that instant. Triage as for the tick twin:
+check QuestDB and the depth spill volume around the 16:30 stop.
+
+## HOT-PATH-03 — socket reader threads run unpinned (core pin refused)
+
+**Added 2026-10-02** with reader-thread core pinning (owner-approved `libc`
+dependency). **Severity:** Low. **Pages:** nothing (log-sink-only; boot never
+fails over it). Logged ONCE at boot as a coded `warn!`.
+
+**Trigger:** the reader threads (`tv-ws-reader`) were asked to pin to a core
+and did not: `TICKVAULT_WS_READER_CORE` named core 0 (never used — it services
+network interrupts), named a core outside the process's allowed set (the
+systemd unit's `AllowedCPUs`), was not `off` or a core id, or the kernel's
+`sched_setaffinity` refused (`os_errno`, usually `EINVAL` = 22). With no
+variable set and core 1 absent from the allowed set, the threads run
+unpinned with an `info!` line, not this code.
+
+**Check:** `tv_ws_reader_pinned_core` reads the pinned core, or -1.
+
+**Triage:**
+1. Read the line's `plan`, `reason`, `failed_threads`, `os_errno`.
+2. Fix the variable in the systemd unit (a core in `AllowedCPUs`, not 0), or
+   set it to `off`; restart in the next safe window. Unpinned readers still
+   run on their own runtime, so this is a lost optimisation, not an outage.
+
+**Source:** `crates/core/src/websocket/reader_runtime.rs`
+(`resolve_ws_reader_core`, `build_reader_runtime`) and
+`crates/app/src/main.rs::report_reader_core_pin`.
+
+**2026-10-30 (plan ITEM DT) — the same code covers the other hot-thread
+placements.** Each switch is off by default (see the "Hot-thread placement"
+block in `deploy/systemd/tickvault.service`); a requested placement that was
+not applied logs this code once, with a `source` field, and boot continues:
+
+| `source` | Meaning | Fix |
+|---|---|---|
+| `hot_rt_refused` | `TICKVAULT_HOT_RT_PRIORITY` asked for real-time priority and the kernel's RT throttle is off (`sched_rt_runtime_us` = -1 or ≥ the period), below half the period (real-time threads would be held off the CPU most of each period), or unreadable, or the value is not 1 to 49. Readers and drain stay at normal priority, on purpose: without the throttle a stuck thread could hold its core forever. | Restore `kernel.sched_rt_runtime_us=950000`, or set the variable to `off`. |
+| `hot_rt_reader_failed` | The kernel refused `SCHED_FIFO` for a reader (`os_errno` 1 = EPERM, or 38 = ENOSYS). The call is the raw `sched_setscheduler` syscall, because musl stubs the libc wrapper to ENOSYS. | EPERM: add `LimitRTPRIO=2` to the unit's drop-in. |
+| `drain_thread_invalid` | `TICKVAULT_DRAIN_THREAD` is not `off`, `on` or a core id other than 0. The drain runs on the shared runtime. | Fix the value. |
+| `drain_thread_runtime_refused` / `drain_thread_spawn_refused` | The drain's own runtime or thread could not be created. The drain runs on the shared runtime, as before the switch. | Check memory and thread limits (`LimitNPROC`). |
+| `drain_thread_placement_refused` | The drain runs on its own thread but its core pin or `SCHED_FIFO` was refused (`pin_ok`, `fifo_ok`, `os_errno`). | As for the reader rows above. |
+| `background_core_refused` / `background_core_pin_failed` | `TICKVAULT_BACKGROUND_CORE` named the readers' core, a core the process may not use, or not a core id; or the readers are not pinned to a core of their own (`plan = ReadersNotPinned`: pinning main would move them, or an unpinned drain thread, onto the background core); or the kernel refused it. Background threads run unpinned. | Name core 0 on the 2-core box; keep the reader runtime on and pinned (`TICKVAULT_WS_READER_THREADS` ≥ 1, `TICKVAULT_WS_READER_CORE` unset or 1). |
+
+Source for these: `crates/core/src/websocket/hot_thread_placement.rs`,
+`crates/app/src/drain_thread.rs`, `crates/app/src/main.rs::report_hot_thread_placement`.
+
+## HOT-PATH-04 — the hot-path telemetry thread did not start
+
+**Added 2026-10-30** (plan ITEM 52f). **Severity:** Medium. **Pages:** nothing
+(log-sink-only; boot never fails over it). Logged ONCE at boot as a coded
+`error!` (`ErrorCode::HotPath04TelemetryNotStarted`).
+
+**Before this code:** the same failure was tagged BOOT-02, which pages and
+means "the QuestDB boot probe ran out of time". That was wrong in two ways.
+It named the wrong thing, and the line was written before the log was set up,
+so nobody ever saw it. The spawn now runs right after the log is set up.
+
+**Trigger:** `hot_path_telemetry::spawn_publisher` could not start the
+`tv-telemetry` OS thread. The host refused a new thread: a thread or memory
+limit (`TasksMax` in the systemd unit, `ulimit -u`, or low memory).
+
+**What is unavailable:** periodic stage-latency and task-heartbeat
+publication, closed-minute proof production, and this publisher's
+HOT-PATH-STALL-01 detection. This startup failure does not itself establish
+a capture loss. Runtime lateness probes still run, but their observations
+are not published by the missing thread.
+
+**Check:** inspect the boot error and publication freshness/sample counts.
+Some metric handles are registered before the thread spawn, so an existing
+zero or stale series is not proof that the publisher started. Per-minute
+proof rows can also stop advancing.
+
+**Triage:**
+1. Read the line's `error` field (the OS reason).
+2. Check the unit's `TasksMax` and the box's memory. Raise the limit or free
+   memory, then restart in the next safe window (after 15:45 IST).
+3. Until then, treat a quiet HOT-PATH-STALL-01 as "not watched", not as
+   "healthy".
+
+**Source:** `crates/storage/src/hot_path_telemetry.rs::spawn_publisher`,
+called from `crates/app/src/main.rs` right after the tracing subscriber
+`init()`. Ratchet: `crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs`.
+
 ## PHASE2-01 — Phase 2 dispatch failed (LTPs absent or empty plan)
 
 **Trigger:** `run_phase2_scheduler` emitted `Phase2Failed` after one
@@ -90,7 +186,7 @@ acknowledged window, not the underlying value. The alert returns to
 OK on its own once the sample ages out, or immediately after a
 Prometheus restart.
 
-**Source:** `crates/core/src/instrument/phase2_emit_guard.rs::Drop`
+**Source:** `crates/core/src/instrument/phase2_emit_guard.rs::Drop` (⚠ CORRECTED 2026-11-15: this file was deleted 2026-05-08 with the phase2 dispatcher; NOT ENFORCED)
 
 ## PREVCLOSE-01 — previous_close ILP write or flush failed
 

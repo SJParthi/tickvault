@@ -1,6 +1,10 @@
 //! tickvault-logs MCP server (Rust port of
-//! scripts/mcp-servers/tickvault-logs/server.py) — THIN binary; all
+//! the retired reference implementation, formerly under scripts/mcp-servers/tickvault-logs/) — THIN binary; all
 //! logic lives in the library (`tickvault_logs_mcp`).
+#![cfg_attr(not(test), deny(unsafe_code))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
+#![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 
 fn main() {
     let ctx = tickvault_logs_mcp::config::Ctx::from_process_env();

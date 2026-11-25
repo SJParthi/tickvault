@@ -41,8 +41,93 @@
 //! the operator can SEE what normal looks like before judging anything.
 //!
 //! Cold path, best-effort, once a day. Never on the tick hot path. Writes
-//! ONLY the two tables below — NEVER `ticks`, `candles_*` or
+//! ONLY the three tables below — NEVER `ticks`, `candles_*` or
 //! `historical_candles` (the live-feed purity rule).
+//!
+//! # Schema
+//!
+//! ```text
+//! CREATE TABLE IF NOT EXISTS dhan_live_crossverify_cell_audit (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL,
+//!     security_id LONG, segment SYMBOL, minute_ts_ist TIMESTAMP,
+//!     kind SYMBOL, field SYMBOL,
+//!     live_value DOUBLE, rest_value DOUBLE,
+//!     live_volume LONG, rest_volume LONG, diff_paise LONG,
+//!     attempt_at TIMESTAMP
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, security_id, segment,
+//!                   minute_ts_ist, kind, field)
+//!
+//! CREATE TABLE IF NOT EXISTS dhan_live_crossverify_daily (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL,
+//!     instruments LONG, minutes_compared LONG, cells_diverged LONG,
+//!     missing_live LONG, missing_live_traded LONG,
+//!     missing_live_zero_volume LONG, missing_rest LONG,
+//!     tail_unsealed LONG, out_of_session LONG,
+//!     noise_p50_paise LONG, noise_p95_paise LONG, noise_max_paise LONG,
+//!     tolerance_paise LONG, outcome SYMBOL,
+//!     late_excused LONG, missing_live_unjudged LONG, missing_judgeable SYMBOL,
+//!     attempt_at TIMESTAMP, run_complete BOOLEAN,
+//!     missing_minutes_would_page BOOLEAN,
+//!     planned_instrument_minutes LONG, covered_instrument_minutes LONG,
+//!     coverage_known BOOLEAN,
+//!     cells_boundary_consistent LONG, cells_close_within_bar LONG,
+//!     cells_unexplained LONG, cells_unexplained_open LONG,
+//!     cells_unexplained_high LONG, cells_unexplained_low LONG,
+//!     cells_unexplained_close LONG, index_missing_rest_closing LONG
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, trading_date_ist, feed, outcome)
+//!
+//! CREATE TABLE IF NOT EXISTS dhan_rest_1m_tape (
+//!     ts TIMESTAMP, trading_date_ist TIMESTAMP, feed SYMBOL, source SYMBOL,
+//!     security_id LONG, segment SYMBOL, instrument SYMBOL,
+//!     open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+//!     volume LONG, fetched_at TIMESTAMP
+//! ) timestamp(ts) PARTITION BY DAY
+//! DEDUP UPSERT KEYS(ts, security_id, segment, feed, source)
+//! ```
+//!
+//! ## 2026-10-06 (plan ITEM 51c, `no-rest-except-live-feed-2026-06-27.md` §12.15.9)
+//!
+//! The daily table gains `late_excused`, `missing_live_unjudged` and
+//! `missing_judgeable`, and the cell audit gains the kinds `late_excused` and
+//! `missing_live_unjudged`, all through the existing `ALTER ADD COLUMN IF NOT
+//! EXISTS` self-heal; DEDUP keys are unchanged. The `tail_unsealed` column and
+//! cell kind are KEPT for the rows written before this change and are written
+//! 0 from it: the literal two-minute tail they recorded is replaced by the
+//! derived late window, whose excused minutes are `late_excused`. The daily
+//! table also gains `attempt_at` and `run_complete`, and the cell audit
+//! `attempt_at` (one reading per attempt), through the same self-heal and
+//! outside every DEDUP key; they let a reader tell a day's attempts apart.
+//!
+//! ## 2026-10-11 (plan ITEM 51h, `no-rest-except-live-feed-2026-06-27.md` §12.15.11)
+//!
+//! The daily table gains `missing_minutes_would_page` (BOOLEAN), through the
+//! same `ALTER ADD COLUMN IF NOT EXISTS` self-heal and outside the DEDUP key.
+//! It is a SHADOW: what a missing-minutes page would have said for that
+//! attempt. Nothing reads it to page; it is the measured baseline the page
+//! (51j) needs first.
+//!
+//! ## 2026-10-30 (plan ITEM 51e, `no-rest-except-live-feed-2026-06-27.md` §12.15.13)
+//!
+//! The daily table gains `planned_instrument_minutes`, `covered_instrument_minutes`
+//! (LONG) and `coverage_known` (BOOLEAN), through the same self-heal and outside
+//! the DEDUP key: how much of the session the run's targets were subscribed for,
+//! from the day's own subscribe record. Plan item 51f reads them to hold the S3
+//! archive and to keep a `clean` day at `partial`; they never touch `diverged`.
+//! The two minute counts mean something only when `coverage_known` is true: a
+//! row with it false may still carry the record's counts (review round 2).
+//!
+//! ## 2026-11-16 (`no-rest-except-live-feed-2026-06-27.md` §12.15.17)
+//!
+//! The daily table gains eight LONG columns, through the same self-heal and
+//! outside the DEDUP key: `cells_boundary_consistent` and `cells_unexplained`
+//! (a SHADOW split of `cells_diverged`; the two always add up to it),
+//! `cells_close_within_bar` (the close part of the consistent count, a bound,
+//! not proof), `cells_unexplained_{open,high,low,close}`, and
+//! `index_missing_rest_closing` (the `missing_rest` index minutes from 15:30
+//! IST, for which Dhan publishes no bars). Nothing reads them to decide the
+//! verdict, the marker or a page; `cells_diverged` is unchanged.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
@@ -55,6 +140,36 @@ use tickvault_common::error_code::ErrorCode;
 pub const DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE: &str = "dhan_live_crossverify_cell_audit";
 /// QuestDB table — one row per run (the divergence TREND + the keep-better target).
 pub const DHAN_LIVE_XVERIFY_DAILY_TABLE: &str = "dhan_live_crossverify_daily";
+
+/// QuestDB table — **the vendor's own minute candles, exactly as fetched.**
+///
+/// Added 2026-08-26 on operator instruction. Until today this comparison
+/// fetched Dhan's tape, compared it in memory, and **threw it away**: only the
+/// cells that DISAGREED survived, on the audit table above. Three consequences,
+/// all of which the operator named:
+///
+/// 1. **No manual verification.** "What did Dhan say for this instrument at
+///    09:16?" was unanswerable unless that minute happened to diverge.
+/// 2. **No re-verification without re-fetching.** Re-running the comparison
+///    meant ~868 more requests against a rate-limited vendor budget — so in
+///    practice it was never re-run.
+/// 3. **No other analysis.** The vendor's own record simply did not exist on
+///    disk in any form.
+///
+/// Storing the pull turns the comparison into a pure function over two stored
+/// tables: fetch once, compare as often as you like, offline.
+pub const DHAN_REST_1M_TAPE_TABLE: &str = "dhan_rest_1m_tape";
+
+/// The `source` in-key wire value for rows written by the daily sweep.
+///
+/// **This column exists because of a defect found the same day it was added.**
+/// The sibling table `rest_spot_1m` carries a `source` column that is NOT in
+/// its DEDUP key — so two legs writing the same instrument-minute from
+/// different sources silently overwrite each other. Writing this sweep into
+/// that table would have destroyed the per-minute leg's index rows with no
+/// error anywhere. Here `source` is in the key from the first line, so the
+/// same collision cannot be introduced later by a second writer.
+pub const DHAN_REST_1M_TAPE_SOURCE_SWEEP: &str = "xverify_daily_sweep";
 
 /// The `feed` in-key wire value (operator override 2026-06-28 — `feed` in the
 /// DEDUP key of EVERY persisted table). Both sides of this comparison are
@@ -85,6 +200,21 @@ pub const DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT: &str =
 /// downgrade at all).
 pub const DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY: &str = "ts, trading_date_ist, feed, outcome";
 
+/// Vendor-tape DEDUP key.
+///
+/// * Designated `ts` FIRST, and here `ts` IS the minute the candle belongs to
+///   — so the table partitions and queries by market time, which is what a
+///   human asking "what was the 09:16 price" actually wants.
+/// * `security_id` PAIRED with `segment` (I-P1-11): Dhan reuses numeric ids
+///   across segments, and an unpaired id would collapse two instruments.
+/// * `feed` in-key (the 2026-06-28 feed-in-key lock).
+/// * `source` in-key — see [`DHAN_REST_1M_TAPE_SOURCE_SWEEP`] for the defect
+///   in the sibling table that this prevents.
+///
+/// Re-fetching the same minute overwrites it with the same values, so a rerun
+/// is idempotent rather than duplicating the tape.
+pub const DEDUP_KEY_DHAN_REST_1M_TAPE: &str = "ts, security_id, segment, feed, source";
+
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Stable wire-format cell kind (the `kind` SYMBOL column + the
@@ -104,8 +234,25 @@ pub enum DhanLiveXverifyCellKind {
     /// A live-side gap in the LAST TWO session minutes at run time — the seal
     /// may legitimately not have landed by 15:31. Recorded, NEVER counted as
     /// `missing_live` and never a divergence.
+    ///
+    /// **2026-10-06 (§12.15.9): no longer written.** Kept so the rows written
+    /// before that day still read; the derived late window writes
+    /// [`Self::LateExcused`] instead.
     TailUnsealed,
-    /// A row outside `[09:15, 15:30)` IST — recorded, not classified.
+    /// A traded or index minute missing from our side inside the derived
+    /// end-of-session window (`LATE_SEAL_WINDOW_MINUTES`, or every bucket
+    /// ending after the published seal progress), judged under the `Excuse`
+    /// policy, and only when it comes AFTER that instrument's own last live
+    /// minute (a later live bar means its tick closed the bucket): it may
+    /// simply not have sealed by the read. Recorded, never real, and it holds
+    /// the day at `partial` at best (§12.15.9).
+    LateExcused,
+    /// A traded or index minute missing from our side on a run whose live
+    /// read was cut short, so a missing minute cannot be told from an unread
+    /// one. Recorded, never real, and it holds the day at `partial` at best
+    /// (§12.15.9).
+    MissingLiveUnjudged,
+    /// A row outside `[09:15, 15:40)` IST — recorded, not classified.
     OutOfSession,
 }
 
@@ -118,18 +265,27 @@ impl DhanLiveXverifyCellKind {
             Self::MissingLive => "missing_live",
             Self::MissingRest => "missing_rest",
             Self::TailUnsealed => "tail_unsealed",
+            Self::LateExcused => "late_excused",
+            Self::MissingLiveUnjudged => "missing_live_unjudged",
             Self::OutOfSession => "out_of_session",
         }
     }
 
-    /// `true` for the kinds that constitute REAL divergence.
+    /// `true` for the kinds that CAN be real divergence.
     ///
-    /// `TailUnsealed` and `OutOfSession` are explicitly EXCLUDED — they are
-    /// reported categories, never evidence of a feed problem (the doctrine:
-    /// separate expected fluctuation from real divergence).
+    /// `Diverged` is always real. `MissingLive` is real only when the Dhan
+    /// minute traded (`rest_volume > 0`) or the instrument is an index
+    /// (`segment = 'IDX_I'`); a zero-volume non-index minute keeps the kind
+    /// and is never real, so a reader must check those two columns too
+    /// (§12.15.9). `MissingRest`, `TailUnsealed`, `LateExcused`,
+    /// `MissingLiveUnjudged` and `OutOfSession` are EXCLUDED — reported
+    /// categories, never evidence of a feed problem (the doctrine: separate
+    /// expected fluctuation from real divergence). *(Corrected 2026-10-10:
+    /// this returned `true` for `MissingRest`, which the verdict has never
+    /// counted: the vendor tape is sparse by construction.)*
     #[must_use]
     pub const fn is_real_divergence(self) -> bool {
-        matches!(self, Self::Diverged | Self::MissingLive | Self::MissingRest)
+        matches!(self, Self::Diverged | Self::MissingLive)
     }
 }
 
@@ -198,6 +354,74 @@ impl DhanLiveXverifyOutcome {
     }
 }
 
+/// Whether this run could judge minutes missing from our side (the
+/// `missing_judgeable` SYMBOL column). Stable wire labels, never reworded.
+///
+/// Added 2026-10-06 (plan ITEM 51c, §12.15.9). A failed vendor fetch cannot
+/// fake a missing LIVE minute (a target with no vendor bars adds only
+/// `missing_rest`), so it never turns judging off. A live read cut at its row
+/// cap can: it reads `ORDER BY ts ASC LIMIT`, so the cap drops the END of the
+/// day and every minute after the cut would read as lost. That is the one
+/// input this run detects at the read. Since plan item 51d (§12.15.10) the
+/// read waits until the live side is final; when the day's LAST attempt
+/// still finds it not final, judging is off with the reason
+/// (`not_ready_*`). A live row skipped as malformed still reads as a judged
+/// missing minute (§12.15.9 Honest limits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DhanLiveXverifyMissingJudgeable {
+    /// Every missing traded or index minute outside the excused window is
+    /// judged as real loss.
+    Judged,
+    /// The live read hit its row cap; no missing minute is judged.
+    LiveTruncated,
+    /// The day's last attempt read the live side before it was known final
+    /// (plan item 51d, §12.15.10): no missing minute is judged; prices still
+    /// are.
+    NotReady(DhanLiveXverifyNotReady),
+}
+
+/// Why the live side was not known final at the read (plan item 51d,
+/// §12.15.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DhanLiveXverifyNotReady {
+    /// The seal writer had not drained after the last catch-up sweep, or a
+    /// seal spill file for today was still staged.
+    SealsPending,
+    /// A seal spill file the mid-session replay parked is still on disk.
+    SealSpillParked,
+    /// QuestDB had not applied `candles_1m` through the snapshot taken after
+    /// the drain, or `wal_tables()` could not be read.
+    NotApplied,
+    /// The catch-up progress could not say whether the last session buckets
+    /// were sealed.
+    CompletenessUnknown,
+}
+
+impl DhanLiveXverifyMissingJudgeable {
+    /// Stable wire label. Never reworded.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Judged => "judged",
+            Self::LiveTruncated => "live_truncated",
+            Self::NotReady(DhanLiveXverifyNotReady::SealsPending) => "not_ready_seals_pending",
+            Self::NotReady(DhanLiveXverifyNotReady::SealSpillParked) => {
+                "not_ready_seal_spill_parked"
+            }
+            Self::NotReady(DhanLiveXverifyNotReady::NotApplied) => "not_ready_not_applied",
+            Self::NotReady(DhanLiveXverifyNotReady::CompletenessUnknown) => {
+                "not_ready_completeness_unknown"
+            }
+        }
+    }
+
+    /// `true` only for [`Self::Judged`].
+    #[must_use]
+    pub const fn is_judged(self) -> bool {
+        matches!(self, Self::Judged)
+    }
+}
+
 /// One live-vs-REST cell finding, ready for ILP write.
 ///
 /// Both sides' raw rupee values are retained verbatim (never rounded on the
@@ -244,6 +468,19 @@ pub struct DhanLiveXverifyDailyRow {
     /// OHLC cells that differed beyond tolerance.
     pub cells_diverged: i64,
     pub missing_live: i64,
+    /// Of `missing_live`, the minutes whose Dhan bar carried NON-ZERO volume
+    /// — the exchange recorded trades and we hold no candle. A genuine gap.
+    ///
+    /// Split out 2026-08-26 because `missing_live` alone was unanswerable: at
+    /// 31.2% of fetched minutes it could mean a catastrophe or a non-event,
+    /// and one number could not tell them apart. **Uninformative for `IDX_I`**
+    /// — an index has no volume, so every index bar lands in the zero bucket
+    /// regardless.
+    pub missing_live_traded: i64,
+    /// Of `missing_live`, the minutes whose Dhan bar carried ZERO volume —
+    /// nothing traded, and our fold correctly emits nothing for a bucket no
+    /// tick opened. See [`Self::missing_live_traded`] for the IDX_I caveat.
+    pub missing_live_zero_volume: i64,
     pub missing_rest: i64,
     pub tail_unsealed: i64,
     pub out_of_session: i64,
@@ -258,6 +495,102 @@ pub struct DhanLiveXverifyDailyRow {
     /// re-baselining history.
     pub tolerance_paise: i64,
     pub outcome: DhanLiveXverifyOutcome,
+    /// Traded or index minutes missing from our side inside the excused
+    /// end-of-session window (cell kind `late_excused`, §12.15.9). Never real;
+    /// any one holds the day at `partial` at best.
+    pub late_excused: i64,
+    /// Traded or index minutes missing from our side on a run that could not
+    /// judge them (cell kind `missing_live_unjudged`, §12.15.9). Never real;
+    /// any one holds the day at `partial` at best.
+    pub missing_live_unjudged: i64,
+    /// Whether missing minutes were judged on this run, and if not, why.
+    pub missing_judgeable: DhanLiveXverifyMissingJudgeable,
+    /// When the attempt that wrote this row persisted it (IST nanoseconds,
+    /// one reading per attempt). Every attempt of a day writes its daily row at
+    /// the same deterministic `ts`, and `outcome` is in the DEDUP key, so two
+    /// attempts that read differently leave two rows. The day's verdict is the
+    /// newest `diverged` row if any row reads `diverged` or any real spot cell
+    /// exists, otherwise the row with the newest `attempt_at` (§12.15.9,
+    /// 2026-10-10 review): a later attempt never hides an earlier `diverged`
+    /// one whose rows reached the database. Two attempts with the same
+    /// `outcome` share one row, which keeps the later stamp and counts. Not in
+    /// the DEDUP key.
+    pub attempt_at_ist_nanos: i64,
+    /// `true` when at most the marker's allowance of vendor fetches failed
+    /// (5%) and neither the run budget nor the live read cap cut the attempt
+    /// short (`run_is_complete`). An attempt that
+    /// is not complete is retried, so its row is never the last word unless no
+    /// later attempt ran.
+    pub run_complete: bool,
+    /// SHADOW (§12.15.11): `true` when a missing-minutes page would have
+    /// fired for this attempt. Always `false` on a run that could not judge
+    /// missing minutes. Read by no page; outside the DEDUP key.
+    pub missing_minutes_would_page: bool,
+    /// Plan item 51e (§12.15.13): the run's targets times the session's
+    /// minutes. Outside the DEDUP key.
+    pub planned_instrument_minutes: i64,
+    /// Plan item 51e: of `planned_instrument_minutes`, the minutes that start
+    /// at or after each target's first subscribed second of the day (from the
+    /// day's own record). May retain counts when `coverage_known` is false;
+    /// those counts cannot establish coverage. Outside the DEDUP key.
+    pub covered_instrument_minutes: i64,
+    /// Plan item 51e: the target record has known completeness metadata.
+    /// `false` for an absent/unreadable/legacy/incomplete record, or a current
+    /// unfinished widen/unsaved set. This is not continuous delivery evidence.
+    /// Outside the DEDUP key.
+    pub coverage_known: bool,
+    /// SHADOW (§12.15.17, 2026-11-16): diverged cells whose vendor value fits
+    /// a known vendor shape (a minute started at our previous existing bar's
+    /// close, or a close inside our own bar). Includes
+    /// `cells_close_within_bar`. Read by no verdict or page; outside the DEDUP
+    /// key. `cells_boundary_consistent + cells_unexplained == cells_diverged`.
+    pub cells_boundary_consistent: i64,
+    /// SHADOW: of `cells_boundary_consistent`, the close cells inside our own
+    /// `[low, high]`. A bound, not proof. Outside the DEDUP key.
+    pub cells_close_within_bar: i64,
+    /// SHADOW: diverged cells no known vendor shape explains. Outside the
+    /// DEDUP key.
+    pub cells_unexplained: i64,
+    /// SHADOW: unexplained open cells. Outside the DEDUP key.
+    pub cells_unexplained_open: i64,
+    /// SHADOW: unexplained high cells. Outside the DEDUP key.
+    pub cells_unexplained_high: i64,
+    /// SHADOW: unexplained low cells. Outside the DEDUP key.
+    pub cells_unexplained_low: i64,
+    /// SHADOW: unexplained close cells. Outside the DEDUP key.
+    pub cells_unexplained_close: i64,
+    /// Of `missing_rest`, the index minutes from 15:30 IST to the session end
+    /// (Dhan publishes no closing-session index bars). Counted beside
+    /// `missing_rest`, never instead of it. Outside the DEDUP key.
+    pub index_missing_rest_closing: i64,
+}
+
+/// One minute of the vendor's own tape, exactly as fetched.
+///
+/// Deliberately NOT a comparison result — this is the raw pull, stored before
+/// any judgement is applied to it. That separation is the whole point: the
+/// comparison becomes a pure function over stored data instead of a
+/// side-effect of a network call that cannot be repeated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DhanRestTapeRow {
+    /// The minute this candle belongs to — the DESIGNATED timestamp, so the
+    /// table partitions by market time rather than by when we happened to ask.
+    pub minute_ts_ist_nanos: i64,
+    pub trading_date_ist_nanos: i64,
+    pub security_id: i64,
+    pub segment: String,
+    /// The label we asked the vendor with, verbatim. See
+    /// [`REST_1M_TAPE_COLUMNS`] for why this is worth a column.
+    pub instrument: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: i64,
+    /// When we pulled it. Distinct from `minute_ts_ist_nanos`: the gap between
+    /// them is how stale the vendor's own record was when we read it, and it
+    /// is not derivable from anything else on the row.
+    pub fetched_at_nanos: i64,
 }
 
 /// Idempotent `CREATE TABLE` DDL for the cell-audit table. Pure.
@@ -277,7 +610,8 @@ pub fn dhan_live_xverify_cell_audit_create_ddl() -> String {
             rest_value       DOUBLE, \
             live_volume      LONG, \
             rest_volume      LONG, \
-            diff_paise       LONG\
+            diff_paise       LONG, \
+            attempt_at       TIMESTAMP\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT});"
     )
@@ -295,6 +629,8 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             minutes_compared LONG, \
             cells_diverged   LONG, \
             missing_live     LONG, \
+            missing_live_traded LONG, \
+            missing_live_zero_volume LONG, \
             missing_rest     LONG, \
             tail_unsealed    LONG, \
             out_of_session   LONG, \
@@ -302,13 +638,75 @@ pub fn dhan_live_xverify_daily_create_ddl() -> String {
             noise_p95_paise  LONG, \
             noise_max_paise  LONG, \
             tolerance_paise  LONG, \
-            outcome          SYMBOL\
+            outcome          SYMBOL, \
+            late_excused     LONG, \
+            missing_live_unjudged LONG, \
+            missing_judgeable SYMBOL, \
+            attempt_at       TIMESTAMP, \
+            run_complete     BOOLEAN, \
+            missing_minutes_would_page BOOLEAN, \
+            planned_instrument_minutes LONG, \
+            covered_instrument_minutes LONG, \
+            coverage_known BOOLEAN, \
+            cells_boundary_consistent LONG, \
+            cells_close_within_bar LONG, \
+            cells_unexplained LONG, \
+            cells_unexplained_open LONG, \
+            cells_unexplained_high LONG, \
+            cells_unexplained_low LONG, \
+            cells_unexplained_close LONG, \
+            index_missing_rest_closing LONG\
         ) timestamp(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY});"
     )
 }
 
 /// Every cell-audit column, for the idempotent `ALTER ADD COLUMN` self-heal.
+/// Idempotent `CREATE TABLE` DDL for the vendor tape. Pure.
+#[must_use]
+pub fn dhan_rest_1m_tape_create_ddl() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {DHAN_REST_1M_TAPE_TABLE} (\
+            ts               TIMESTAMP, \
+            trading_date_ist TIMESTAMP, \
+            feed             SYMBOL, \
+            source           SYMBOL, \
+            security_id      LONG, \
+            segment          SYMBOL, \
+            instrument       SYMBOL, \
+            open             DOUBLE, \
+            high             DOUBLE, \
+            low              DOUBLE, \
+            close            DOUBLE, \
+            volume           LONG, \
+            fetched_at       TIMESTAMP\
+        ) timestamp(ts) PARTITION BY DAY \
+        DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE});"
+    )
+}
+
+/// Columns added by `ALTER ... ADD COLUMN IF NOT EXISTS` for the vendor tape.
+///
+/// `instrument` is the label we ASKED with, kept verbatim. It is the one
+/// column that makes a wrong-label failure diagnosable after the fact: a
+/// vendor "no candles" answer is identical for a mislabelled instrument and a
+/// genuinely untraded one, and without the label there is nothing to compare
+/// against the master afterwards.
+const REST_1M_TAPE_COLUMNS: &[(&str, &str)] = &[
+    ("trading_date_ist", "TIMESTAMP"),
+    ("feed", "SYMBOL"),
+    ("source", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("segment", "SYMBOL"),
+    ("instrument", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("fetched_at", "TIMESTAMP"),
+];
+
 const CELL_AUDIT_COLUMNS: &[(&str, &str)] = &[
     ("trading_date_ist", "TIMESTAMP"),
     ("feed", "SYMBOL"),
@@ -322,6 +720,7 @@ const CELL_AUDIT_COLUMNS: &[(&str, &str)] = &[
     ("live_volume", "LONG"),
     ("rest_volume", "LONG"),
     ("diff_paise", "LONG"),
+    ("attempt_at", "TIMESTAMP"),
 ];
 
 /// Every daily-row column, for the idempotent `ALTER ADD COLUMN` self-heal.
@@ -332,6 +731,8 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("minutes_compared", "LONG"),
     ("cells_diverged", "LONG"),
     ("missing_live", "LONG"),
+    ("missing_live_traded", "LONG"),
+    ("missing_live_zero_volume", "LONG"),
     ("missing_rest", "LONG"),
     ("tail_unsealed", "LONG"),
     ("out_of_session", "LONG"),
@@ -340,6 +741,24 @@ const DAILY_COLUMNS: &[(&str, &str)] = &[
     ("noise_max_paise", "LONG"),
     ("tolerance_paise", "LONG"),
     ("outcome", "SYMBOL"),
+    ("late_excused", "LONG"),
+    ("missing_live_unjudged", "LONG"),
+    ("missing_judgeable", "SYMBOL"),
+    ("attempt_at", "TIMESTAMP"),
+    ("run_complete", "BOOLEAN"),
+    ("missing_minutes_would_page", "BOOLEAN"),
+    ("planned_instrument_minutes", "LONG"),
+    ("covered_instrument_minutes", "LONG"),
+    ("coverage_known", "BOOLEAN"),
+    // §12.15.17 (2026-11-16): the shadow split of the diverged cells.
+    ("cells_boundary_consistent", "LONG"),
+    ("cells_close_within_bar", "LONG"),
+    ("cells_unexplained", "LONG"),
+    ("cells_unexplained_open", "LONG"),
+    ("cells_unexplained_high", "LONG"),
+    ("cells_unexplained_low", "LONG"),
+    ("cells_unexplained_close", "LONG"),
+    ("index_missing_rest_closing", "LONG"),
 ];
 
 /// The full ordered DDL statement list (CREATE → per-column `ALTER ADD COLUMN
@@ -350,6 +769,7 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
     let mut statements = vec![
         dhan_live_xverify_cell_audit_create_ddl(),
         dhan_live_xverify_daily_create_ddl(),
+        dhan_rest_1m_tape_create_ddl(),
     ];
     for (col, ty) in CELL_AUDIT_COLUMNS {
         statements.push(format!(
@@ -361,9 +781,18 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
             "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
         ));
     }
+    for (col, ty) in REST_1M_TAPE_COLUMNS {
+        statements.push(format!(
+            "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+        ));
+    }
     statements.push(format!(
         "ALTER TABLE {DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE} DEDUP ENABLE \
          UPSERT KEYS({DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT});"
+    ));
+    statements.push(format!(
+        "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} DEDUP ENABLE \
+         UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE});"
     ));
     statements.push(format!(
         "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} DEDUP ENABLE \
@@ -372,11 +801,40 @@ pub fn dhan_live_xverify_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Create both audit tables if absent. Failures log at `error!` but NEVER
-/// block: a failed ensure leaves the first ILP write to auto-create the table
-/// WITHOUT dedup — a duplicate-row window until a later ensure succeeds.
-// TEST-EXEMPT: live-QuestDB DDL runner (the statement list is unit-tested via dhan_live_xverify_ddl_statements).
-pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig) {
+/// Set once [`ensure_dhan_live_crossverify_tables`] had every key-bearing
+/// statement (each CREATE and each `DEDUP ENABLE`) accepted in this process.
+/// Never cleared. Read by [`DhanLiveXverifyAuditWriter::flush`], which
+/// refuses to post until it is set (B1, 2026-11-13): a row reaching a table
+/// that does not exist makes QuestDB create it with the designated timestamp
+/// `timestamp` and no DEDUP key, a shape no later ensure can repair (every key
+/// here starts with `ts`). One Acquire load per flush.
+static XVERIFY_TABLES_KEYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the cross-verify tables are keyed in this process. One Acquire load.
+#[must_use]
+pub fn xverify_tables_keyed() -> bool {
+    XVERIFY_TABLES_KEYED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether `ddl` is one the keyed verdict depends on: a CREATE or a
+/// `DEDUP ENABLE`. The `ADD COLUMN IF NOT EXISTS` self-heals are best-effort
+/// (a missing back-filled column is a gap in old rows, not a table that dedups
+/// wrongly forever), as for the candle tables. Pure.
+#[must_use]
+pub fn xverify_ddl_is_key_bearing(ddl: &str) -> bool {
+    ddl.starts_with("CREATE") || ddl.contains("DEDUP ENABLE")
+}
+
+/// Create the three tables if absent, with their DEDUP keys. Failures log at
+/// `error!` and never block. Returns `true` when every key-bearing statement
+/// was accepted (and then sets [`xverify_tables_keyed`]); `false` otherwise,
+/// and the writer then refuses to post until a later call succeeds: the
+/// cross-verification run re-runs this before each persist while it is
+/// `false` (B1, 2026-11-13: before, the verdict was discarded, nothing re-ran
+/// it, and the first ILP row auto-created an un-keyable table).
+// TEST-EXEMPT: live-QuestDB DDL runner (the statement list is unit-tested via dhan_live_xverify_ddl_statements; the verdict via test_regression_xverify_ensure_returns_a_verdict_and_keys_the_writer).
+pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -393,17 +851,19 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
             )
             .increment(1);
             error!(
-                code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                 comparator = "dhan_live_vs_dhan_rest",
                 stage = "ensure_client_build",
                 ?err,
                 "dhan_live_crossverify: HTTP client build failed — audit tables \
-                 not ensured (first ILP write may auto-create them WITHOUT dedup)"
+                 not ensured (the writer refuses to post until they are)"
             );
-            return;
+            return false;
         }
     };
+    let mut keyed = true;
     for ddl in &dhan_live_xverify_ddl_statements() {
+        let key_bearing = xverify_ddl_is_key_bearing(ddl);
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -412,6 +872,7 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
+                keyed &= !key_bearing;
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
                 metrics::counter!(
@@ -420,24 +881,25 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
                 )
                 .increment(1);
                 error!(
-                    code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                    code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                     comparator = "dhan_live_vs_dhan_rest",
                     stage = "ensure_ddl",
                     %status,
                     ddl = ddl.as_str(),
                     body = %body.chars().take(200).collect::<String>(),
                     "dhan_live_crossverify: DDL returned non-2xx (dedup may be \
-                     missing — duplicate-row window until a later ensure)"
+                     missing; the writer refuses to post until a later ensure succeeds)"
                 );
             }
             Err(err) => {
+                keyed &= !key_bearing;
                 metrics::counter!(
                     "tv_dhan_live_xverify_query_failures_total",
                     "stage" => "ensure_ddl"
                 )
                 .increment(1);
                 error!(
-                    code = ErrorCode::SpotXverify02RunDegraded.code_str(),
+                    code = ErrorCode::DhanLiveXverify01RunDegraded.code_str(),
                     comparator = "dhan_live_vs_dhan_rest",
                     stage = "ensure_ddl",
                     ?err,
@@ -447,14 +909,32 @@ pub async fn ensure_dhan_live_crossverify_tables(questdb_config: &QuestDbConfig)
             }
         }
     }
+    if keyed {
+        XVERIFY_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    keyed
 }
+
+/// The writer's ILP-over-HTTP request timeout, in milliseconds.
+pub const DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// The writer's ILP-over-HTTP minimum throughput, bytes per second. The
+/// client lets one flush run `request_timeout + bytes / this` before it gives
+/// up (questdb-rs 6.1.0, `sender/mod.rs`). 102,400 is the library default,
+/// written out so [`DhanLiveXverifyAuditWriter::flush_worst_case`] cannot
+/// drift from what the client does (2026-10-06, §12.15.8).
+pub const DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 102_400;
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
 /// fire-and-forget lesson) + the shadow-writer knobs.
 fn dhan_live_xverify_ilp_http_conf(config: &QuestDbConfig) -> String {
     format!(
-        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
-        config.host, config.http_port
+        "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout={};\
+         request_min_throughput={};",
+        config.host,
+        config.http_port,
+        DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS,
+        DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC
     )
 }
 
@@ -468,6 +948,9 @@ pub struct DhanLiveXverifyAuditWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Whether the tables are keyed (B1). Always [`xverify_tables_keyed`]
+    /// outside this module's tests.
+    keyed: fn() -> bool,
 }
 
 impl DhanLiveXverifyAuditWriter {
@@ -475,6 +958,20 @@ impl DhanLiveXverifyAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via for_test()).
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed the discard series at zero BEFORE the first row can be dropped.
+        //
+        // A counter never incremented is ABSENT from the exporter, not zero,
+        // and an absent series reads as health -- when it may mean the single
+        // discard episode is the only sample there will ever be. If this name
+        // is ever EMF-selected the CloudWatch agent's dropped-first-sample rule
+        // turns that into total silence on the one episode that matters; that
+        // rule cost 104,540 depth rows their classification on 2026-08-28.
+        //
+        // Only the DHAN name is seeded. The Groww sibling sits on a branch with
+        // no production caller since the 2026-08-21 feed removal, and a
+        // permanently-zero series for a path that cannot write implies a live
+        // path that was deleted -- the false-OK this seeding exists to prevent.
+        metrics::counter!("tv_dhan_live_xverify_audit_rows_discarded_total").increment(0);
         let conf = dhan_live_xverify_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -483,6 +980,7 @@ impl DhanLiveXverifyAuditWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    keyed: xverify_tables_keyed,
                 }
             }
             Err(err) => {
@@ -494,12 +992,16 @@ impl DhanLiveXverifyAuditWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    keyed: xverify_tables_keyed,
                 }
             }
         }
     }
 
-    /// Test constructor — disconnected writer, empty buffer.
+    /// Test constructor: disconnected writer, empty buffer, tables treated as
+    /// keyed (B1 review 4: a test process never runs the ensure, so reading
+    /// the process flag here would send every caller's test down the
+    /// not-keyed path). [`Self::for_test_unkeyed`] gives the other case.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
     pub fn for_test() -> Self {
@@ -507,7 +1009,30 @@ impl DhanLiveXverifyAuditWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            keyed: || true,
         }
+    }
+
+    /// Test constructor: disconnected writer whose tables are NOT keyed
+    /// (B1 review 4), for callers that must prove they stop before a flush.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper, exercised by test_tables_keyed_and_for_test_unkeyed_follow_the_writer_flag and the app persist tests.
+    pub fn for_test_unkeyed() -> Self {
+        Self {
+            sender: None,
+            buffer: Buffer::new(ProtocolVersion::V1),
+            pending: 0,
+            keyed: || false,
+        }
+    }
+
+    /// Whether this writer's tables are keyed (B1 review 4). A caller checks
+    /// it before it appends: while it is `false` every [`Self::flush`] posts
+    /// nothing, so the caller skips the attempt as a deferral instead of
+    /// counting a refused flush as a persist failure. One Acquire load.
+    #[must_use]
+    pub fn tables_keyed(&self) -> bool {
+        (self.keyed)()
     }
 
     /// Rows appended but not yet flushed.
@@ -523,12 +1048,34 @@ impl DhanLiveXverifyAuditWriter {
         String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
     }
 
+    /// Test-only byte length of the ILP buffer — the quantity the 2026-08-26
+    /// loss was measured in (207,965,278 against a 104,857,600 cap).
+    #[cfg(test)]
+    fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Appends one cell finding row. Symbols BEFORE columns (the ILP
     /// tags-before-fields rule).
     ///
+    /// `attempt_at_ist_nanos` is one reading per attempt (§12.15.9 review): a
+    /// finding an earlier attempt wrote and a later one did not keeps the
+    /// earlier stamp, and a later attempt that finds the same cell overwrites
+    /// it (the cell key has no attempt), so a cell's `attempt_at` is the LAST
+    /// attempt that wrote it. The stamps order the writes; they do not split
+    /// the findings by attempt, and the day's real findings are every
+    /// `diverged` cell of the day and every `missing_live` cell whose Dhan
+    /// minute traded (`rest_volume > 0`) or is an index (§12.15.9 reader
+    /// rule; a zero-volume non-index minute is never real).
+    /// The §12.15.6 option pass stamps its own cells and writes no daily row.
+    ///
     /// # Errors
     /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_cell(&mut self, f: &DhanLiveXverifyCellFinding) -> Result<()> {
+    pub fn append_cell(
+        &mut self,
+        f: &DhanLiveXverifyCellFinding,
+        attempt_at_ist_nanos: i64,
+    ) -> Result<()> {
         self.buffer
             .table(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE)
             .context("table")?
@@ -559,7 +1106,56 @@ impl DhanLiveXverifyAuditWriter {
             .context("rest_volume")?
             .column_i64("diff_paise", f.diff_paise)
             .context("diff_paise")?
+            .column_ts("attempt_at", TimestampNanos::new(attempt_at_ist_nanos))
+            .context("attempt_at")?
             .at(TimestampNanos::new(f.run_ts_ist_nanos))
+            .context("designated timestamp")?;
+        self.pending = self.pending.saturating_add(1);
+        Ok(())
+    }
+
+    /// Appends one row of the vendor's own tape.
+    ///
+    /// Symbols BEFORE columns (the ILP tags-before-fields rule).
+    ///
+    /// # Errors
+    /// Propagates ILP buffer errors (table/column append failure).
+    pub fn append_rest_tape(&mut self, r: &DhanRestTapeRow) -> Result<()> {
+        self.buffer
+            .table(DHAN_REST_1M_TAPE_TABLE)
+            .context("table")?
+            .symbol("feed", DHAN_LIVE_XVERIFY_FEED)
+            .context("feed")?
+            .symbol("source", DHAN_REST_1M_TAPE_SOURCE_SWEEP)
+            .context("source")?
+            .symbol("segment", r.segment.as_str())
+            .context("segment")?
+            .symbol("instrument", r.instrument.as_str())
+            .context("instrument")?
+            .column_ts(
+                "trading_date_ist",
+                TimestampNanos::new(r.trading_date_ist_nanos),
+            )
+            .context("trading_date_ist")?
+            .column_i64("security_id", r.security_id)
+            .context("security_id")?
+            .column_f64("open", r.open)
+            .context("open")?
+            .column_f64("high", r.high)
+            .context("high")?
+            .column_f64("low", r.low)
+            .context("low")?
+            .column_f64("close", r.close)
+            .context("close")?
+            .column_i64("volume", r.volume)
+            .context("volume")?
+            .column_ts("fetched_at", TimestampNanos::new(r.fetched_at_nanos))
+            .context("fetched_at")?
+            // The MINUTE is the designated timestamp, not the run time. A
+            // human asking "what was the 09:16 price" is asking about market
+            // time; stamping the run time would file every candle of the day
+            // under one instant and make that question unanswerable.
+            .at(TimestampNanos::new(r.minute_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
@@ -577,6 +1173,8 @@ impl DhanLiveXverifyAuditWriter {
             .context("feed")?
             .symbol("outcome", r.outcome.as_str())
             .context("outcome")?
+            .symbol("missing_judgeable", r.missing_judgeable.as_str())
+            .context("missing_judgeable")?
             .column_ts(
                 "trading_date_ist",
                 TimestampNanos::new(r.trading_date_ist_nanos),
@@ -590,6 +1188,10 @@ impl DhanLiveXverifyAuditWriter {
             .context("cells_diverged")?
             .column_i64("missing_live", r.missing_live)
             .context("missing_live")?
+            .column_i64("missing_live_traded", r.missing_live_traded)
+            .context("missing_live_traded")?
+            .column_i64("missing_live_zero_volume", r.missing_live_zero_volume)
+            .context("missing_live_zero_volume")?
             .column_i64("missing_rest", r.missing_rest)
             .context("missing_rest")?
             .column_i64("tail_unsealed", r.tail_unsealed)
@@ -604,10 +1206,99 @@ impl DhanLiveXverifyAuditWriter {
             .context("noise_max_paise")?
             .column_i64("tolerance_paise", r.tolerance_paise)
             .context("tolerance_paise")?
+            .column_i64("late_excused", r.late_excused)
+            .context("late_excused")?
+            .column_i64("missing_live_unjudged", r.missing_live_unjudged)
+            .context("missing_live_unjudged")?
+            .column_ts("attempt_at", TimestampNanos::new(r.attempt_at_ist_nanos))
+            .context("attempt_at")?
+            .column_bool("run_complete", r.run_complete)
+            .context("run_complete")?
+            .column_bool("missing_minutes_would_page", r.missing_minutes_would_page)
+            .context("missing_minutes_would_page")?
+            .column_i64("planned_instrument_minutes", r.planned_instrument_minutes)
+            .context("planned_instrument_minutes")?
+            .column_i64("covered_instrument_minutes", r.covered_instrument_minutes)
+            .context("covered_instrument_minutes")?
+            .column_bool("coverage_known", r.coverage_known)
+            .context("coverage_known")?
+            .column_i64("cells_boundary_consistent", r.cells_boundary_consistent)
+            .context("cells_boundary_consistent")?
+            .column_i64("cells_close_within_bar", r.cells_close_within_bar)
+            .context("cells_close_within_bar")?
+            .column_i64("cells_unexplained", r.cells_unexplained)
+            .context("cells_unexplained")?
+            .column_i64("cells_unexplained_open", r.cells_unexplained_open)
+            .context("cells_unexplained_open")?
+            .column_i64("cells_unexplained_high", r.cells_unexplained_high)
+            .context("cells_unexplained_high")?
+            .column_i64("cells_unexplained_low", r.cells_unexplained_low)
+            .context("cells_unexplained_low")?
+            .column_i64("cells_unexplained_close", r.cells_unexplained_close)
+            .context("cells_unexplained_close")?
+            .column_i64("index_missing_rest_closing", r.index_missing_rest_closing)
+            .context("index_missing_rest_closing")?
             .at(TimestampNanos::new(r.run_ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
+    }
+
+    /// Flush threshold for the streaming append path.
+    ///
+    /// # The live loss this exists to stop (MEASURED 2026-08-26, not modelled)
+    ///
+    /// `persist_xverify_report` appended EVERY finding and then flushed once.
+    /// On 2026-08-26 that was 764,003 rows, and the single flush was refused:
+    ///
+    /// ```text
+    /// Could not flush buffer: Buffer size of 207965278 exceeds maximum
+    /// configured allowed size of 104857600 bytes.
+    /// ```
+    ///
+    /// The poisoned-buffer defence then discarded all 764,003 — so the revived
+    /// feed's ONE ground-truth record has no row for that day, and
+    /// `WS-GAP-03 source=xverify_failed` fired saying exactly that.
+    ///
+    /// It is not a one-off. The comparison ran fine on 2026-08-25 at 201,353
+    /// findings; the universe grew and the count went 3.8x in a single day, so
+    /// every session from here produces a buffer over the cap.
+    ///
+    /// **The cruellest part was the daily SUMMARY row.** It is appended after
+    /// the cells and flushed with them, so an oversized cell buffer destroys
+    /// the one row that records a comparison happened at all — losing the
+    /// detail AND the evidence of the loss in the same refusal. Chunking fixes
+    /// that as a side effect: the cells drain in pieces, and the summary meets
+    /// a nearly-empty buffer.
+    ///
+    /// 32 MiB against the 100 MiB server cap is ~3x headroom, so a row growing
+    /// wider does not silently re-approach the limit; at the measured ~272
+    /// bytes/row that is ~123,000 rows per flush, about 6 flushes for a
+    /// 2026-08-26-sized session.
+    pub const FLUSH_THRESHOLD_BYTES: usize = 32 * 1024 * 1024;
+
+    /// Flush ONLY if the buffer has grown past [`Self::FLUSH_THRESHOLD_BYTES`].
+    ///
+    /// Called per-append by streaming producers so the buffer is bounded by
+    /// the threshold rather than by the total row count. Cheap when it does
+    /// nothing: one `len()` compare.
+    ///
+    /// On failure the poisoned-buffer defence still applies — that chunk is
+    /// discarded and the error returned — but the buffer is then EMPTY, so a
+    /// caller that keeps going loses one chunk instead of the whole run. That
+    /// is a deliberate change in failure shape: all-or-nothing gave "no rows
+    /// today", which is at least honest; chunked gives "most rows today",
+    /// which is better ONLY IF the shortfall is reported. The caller must
+    /// count these and mark the run degraded — never round a partial write up
+    /// to success.
+    ///
+    /// # Errors
+    /// Propagates [`Self::flush`], including its discard.
+    pub fn flush_if_large(&mut self) -> Result<()> {
+        if self.buffer.len() < Self::FLUSH_THRESHOLD_BYTES {
+            return Ok(());
+        }
+        self.flush()
     }
 
     /// Flushes buffered rows over ILP-HTTP (per-flush server ACK). On ANY
@@ -625,6 +1316,20 @@ impl DhanLiveXverifyAuditWriter {
             anyhow::bail!(
                 "dhan_live_crossverify: no ILP sender (QuestDB unreachable) — \
                  {dropped} pending row(s) discarded (recomputable, DEDUP-idempotent rerun)"
+            );
+        }
+        // B1 (2026-11-13): never post into a table this process has not keyed:
+        // QuestDB would create it in a shape that can never take the key. The
+        // run is degraded (no marker) and retried; the rows are recomputable.
+        // B1 review: the rows were never sent, so this is a deliberate stop,
+        // counted on the local abandoned counter and NOT on the paging
+        // discard counter (§12.15.8); the coded warn in the boot's ensure is
+        // the operator signal.
+        if !(self.keyed)() {
+            let dropped = self.abandon_pending();
+            anyhow::bail!(
+                "dhan_live_crossverify: tables not keyed yet (DDL refused); {dropped} \
+                 pending row(s) not posted; the attempt is retried"
             );
         }
         let flushed = self
@@ -652,6 +1357,23 @@ impl DhanLiveXverifyAuditWriter {
         }
     }
 
+    /// The longest one [`Self::flush`] of the current buffer can block: the
+    /// request timeout plus the buffer's bytes at the minimum throughput, as
+    /// the ILP client computes it, rounded up to a whole millisecond. With
+    /// `retry_timeout=0` there is no retry on top. A caller with a deadline
+    /// starts a flush only when `now + this` is still before it (2026-10-06,
+    /// §12.15.8). O(1): one `len()` and integer arithmetic.
+    #[must_use]
+    pub fn flush_worst_case(&self) -> std::time::Duration {
+        let bytes = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
+        let extra_ms = bytes
+            .saturating_mul(1_000)
+            .div_ceil(DHAN_LIVE_XVERIFY_ILP_MIN_THROUGHPUT_BYTES_PER_SEC);
+        std::time::Duration::from_millis(
+            DHAN_LIVE_XVERIFY_ILP_REQUEST_TIMEOUT_MS.saturating_add(extra_ms),
+        )
+    }
+
     /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
     /// Returns the discarded count; counted by
     /// `tv_dhan_live_xverify_audit_rows_discarded_total` so a discard is
@@ -666,7 +1388,31 @@ impl DhanLiveXverifyAuditWriter {
         self.pending = 0;
         dropped
     }
+
+    /// Drop every buffered-but-unflushed row because the caller chose to stop
+    /// writing, not because a write failed (2026-10-06, §12.15.8: the
+    /// cross-verification persist stops itself at its attempt's deadline).
+    /// Returns the dropped count; counted on the local-only
+    /// [`DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER`], never on
+    /// `tv_dhan_live_xverify_audit_rows_discarded_total`, which is a §2.10
+    /// `audit_rows` member and pages: a deliberate stop of a recomputable
+    /// write is not a lost audit row. The caller must log the stop. O(1).
+    pub fn abandon_pending(&mut self) -> usize {
+        let dropped = self.pending;
+        if dropped > 0 {
+            metrics::counter!(DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER)
+                .increment(dropped as u64);
+        }
+        self.buffer.clear();
+        self.pending = 0;
+        dropped
+    }
 }
+
+/// Rows [`DhanLiveXverifyAuditWriter::abandon_pending`] dropped on purpose.
+/// Local `/metrics` only: no EMF name, filter or alarm reads it (§12.15.8).
+pub const DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER: &str =
+    "tv_dhan_live_xverify_audit_rows_abandoned_total";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -674,6 +1420,193 @@ impl DhanLiveXverifyAuditWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A local QuestDB stand-in: answers `/exec` with `exec_status` and every
+    /// other request (the ILP `/write`) with 204, counting the `/write`s.
+    fn b1_server(exec_status: u16) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&writes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 65_536];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let reply = if head.starts_with("GET /exec") {
+                    format!(
+                        "HTTP/1.1 {exec_status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                } else {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (port, writes)
+    }
+
+    fn b1_cfg(port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// Regression, B1 (2026-11-13): the ensure returns a verdict (it returned
+    /// nothing, so nobody could retry it), a refused DDL reads `false`, and
+    /// the writer refuses to post while the tables are not keyed, so no row
+    /// can make QuestDB auto-create an un-keyable table.
+    #[tokio::test]
+    async fn test_ensure_dhan_live_crossverify_tables_regression_verdict_keys_the_writer() {
+        let (refusing, _) = b1_server(500);
+        assert!(!ensure_dhan_live_crossverify_tables(&b1_cfg(refusing)).await);
+        let (port, writes) = b1_server(200);
+        let cfg = b1_cfg(port);
+        // Not keyed: the flush posts nothing and reports a failure.
+        let mut shut = DhanLiveXverifyAuditWriter::new(&cfg);
+        shut.keyed = || false;
+        shut.append_daily(&sample_daily()).expect("append");
+        let refused = tokio::task::spawn_blocking(move || shut.flush())
+            .await
+            .expect("join");
+        assert!(
+            refused.is_err(),
+            "an un-keyed writer must not report success"
+        );
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing posted"
+        );
+        // Accepted DDL keys the process; the production writer then posts.
+        assert!(ensure_dhan_live_crossverify_tables(&cfg).await);
+        assert!(xverify_tables_keyed());
+        let mut open = DhanLiveXverifyAuditWriter::new(&cfg);
+        open.append_daily(&sample_daily()).expect("append");
+        let sent = tokio::task::spawn_blocking(move || open.flush())
+            .await
+            .expect("join");
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(
+            writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one post"
+        );
+    }
+
+    /// The keyed flag follows an accepted ensure and is never cleared.
+    #[tokio::test]
+    async fn test_xverify_tables_keyed_after_an_accepted_ensure() {
+        let (port, _) = b1_server(200);
+        assert!(ensure_dhan_live_crossverify_tables(&b1_cfg(port)).await);
+        assert!(xverify_tables_keyed());
+        let (refusing, _) = b1_server(500);
+        assert!(!ensure_dhan_live_crossverify_tables(&b1_cfg(refusing)).await);
+        assert!(xverify_tables_keyed(), "a later refusal never clears it");
+    }
+
+    /// Counter names a scoped recorder saw registered (B1 review).
+    #[derive(Default)]
+    struct B1Names(std::sync::Mutex<Vec<String>>);
+
+    impl metrics::Recorder for B1Names {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if let Ok(mut names) = self.0.lock() {
+                names.push(key.name().to_string());
+            }
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// Regression, B1 review (2026-11-13): a flush held back because the
+    /// tables are not keyed sends nothing and is retried, so it is a
+    /// deliberate stop: it moves the local abandoned counter and NEVER the
+    /// paging `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10
+    /// audit_rows group).
+    #[test]
+    fn test_regression_unkeyed_flush_abandons_and_never_counts_as_discarded() {
+        let mut w = DhanLiveXverifyAuditWriter::new(&b1_cfg(1));
+        w.keyed = || false;
+        w.append_daily(&sample_daily()).expect("append");
+        let names = B1Names::default();
+        let out = metrics::with_local_recorder(&names, || w.flush());
+        assert!(out.is_err(), "the attempt must stay unpersisted");
+        assert_eq!(w.pending(), 0);
+        let seen = names.0.lock().map(|n| n.clone()).unwrap_or_default();
+        assert!(
+            !seen
+                .iter()
+                .any(|n| n == "tv_dhan_live_xverify_audit_rows_discarded_total"),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|n| n == DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER),
+            "{seen:?}"
+        );
+    }
+
+    /// B1 review 4: `tables_keyed` reports the writer's own flag, so a caller
+    /// can skip an attempt before any flush.
+    #[test]
+    fn test_tables_keyed_and_for_test_unkeyed_follow_the_writer_flag() {
+        assert!(DhanLiveXverifyAuditWriter::for_test().tables_keyed());
+        assert!(!DhanLiveXverifyAuditWriter::for_test_unkeyed().tables_keyed());
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.keyed = || false;
+        assert!(!w.tables_keyed());
+    }
+
+    #[test]
+    fn test_xverify_ddl_is_key_bearing_split() {
+        let all = dhan_live_xverify_ddl_statements();
+        let keyed = all.iter().filter(|d| xverify_ddl_is_key_bearing(d)).count();
+        assert_eq!(keyed, 6, "three CREATEs and three DEDUP ENABLEs");
+        assert!(!xverify_ddl_is_key_bearing(
+            "ALTER TABLE x ADD COLUMN IF NOT EXISTS y LONG;"
+        ));
+    }
 
     fn sample_cell() -> DhanLiveXverifyCellFinding {
         DhanLiveXverifyCellFinding {
@@ -700,6 +1633,8 @@ mod tests {
             minutes_compared: 375,
             cells_diverged: 2,
             missing_live: 1,
+            missing_live_traded: 1,
+            missing_live_zero_volume: 0,
             missing_rest: 0,
             tail_unsealed: 2,
             out_of_session: 0,
@@ -708,6 +1643,23 @@ mod tests {
             noise_max_paise: 60,
             tolerance_paise: 0,
             outcome: DhanLiveXverifyOutcome::Diverged,
+            late_excused: 4,
+            missing_live_unjudged: 0,
+            missing_judgeable: DhanLiveXverifyMissingJudgeable::Judged,
+            attempt_at_ist_nanos: 3,
+            run_complete: false,
+            missing_minutes_would_page: false,
+            planned_instrument_minutes: 1_540,
+            covered_instrument_minutes: 1_155,
+            coverage_known: true,
+            cells_boundary_consistent: 1,
+            cells_close_within_bar: 0,
+            cells_unexplained: 1,
+            cells_unexplained_open: 0,
+            cells_unexplained_high: 1,
+            cells_unexplained_low: 0,
+            cells_unexplained_close: 0,
+            index_missing_rest_closing: 0,
         }
     }
 
@@ -787,7 +1739,7 @@ mod tests {
 
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(DhanLiveXverifyCellKind::MissingLive.is_real_divergence());
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // The doctrine: expected fluctuation is NOT divergence.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -877,6 +1829,9 @@ mod tests {
             "noise_max_paise",
             "tolerance_paise",
             "outcome",
+            "late_excused",
+            "missing_live_unjudged",
+            "missing_judgeable",
         ] {
             assert!(ddl.contains(tok), "daily DDL missing `{tok}`: {ddl}");
         }
@@ -888,10 +1843,45 @@ mod tests {
     #[test]
     fn dhan_live_xverify_ddl_statements_are_idempotent_and_never_drop() {
         let statements = dhan_live_xverify_ddl_statements();
+
+        // Expressed PER TABLE rather than as one total, so adding a table
+        // needs no literal bumped here — and, more usefully, a table that
+        // arrives with a CREATE but no DEDUP ENABLE fails loudly instead of
+        // sliding under a total that still adds up. An auto-created table has
+        // no dedup at all, which is a silent duplicate-row window.
+        let tables: &[(&str, usize)] = &[
+            (DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE, CELL_AUDIT_COLUMNS.len()),
+            (DHAN_LIVE_XVERIFY_DAILY_TABLE, DAILY_COLUMNS.len()),
+            (DHAN_REST_1M_TAPE_TABLE, REST_1M_TAPE_COLUMNS.len()),
+        ];
+        let mut expected = 0usize;
+        for (table, columns) in tables {
+            let creates = statements
+                .iter()
+                .filter(|s| s.contains("CREATE TABLE IF NOT EXISTS") && s.contains(table))
+                .count();
+            assert_eq!(creates, 1, "{table}: exactly one CREATE");
+            let dedups = statements
+                .iter()
+                .filter(|s| s.contains("DEDUP ENABLE") && s.contains(table))
+                .count();
+            assert_eq!(
+                dedups, 1,
+                "{table}: exactly one DEDUP ENABLE — without it the table \
+                 auto-creates on first write with no dedup at all"
+            );
+            let alters = statements
+                .iter()
+                .filter(|s| s.contains("ADD COLUMN IF NOT EXISTS") && s.contains(table))
+                .count();
+            assert_eq!(alters, *columns, "{table}: one ALTER per declared column");
+            expected += 2 + columns;
+        }
         assert_eq!(
             statements.len(),
-            2 + CELL_AUDIT_COLUMNS.len() + DAILY_COLUMNS.len() + 2,
-            "2 CREATEs + every column ALTER + 2 DEDUP ENABLEs"
+            expected,
+            "every statement must belong to a declared table — a stray one \
+             means a table was half-registered"
         );
         for s in &statements {
             assert!(
@@ -962,7 +1952,7 @@ mod tests {
     #[test]
     fn append_cell_emits_symbols_before_columns_and_counts_pending() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         assert!(line.contains(DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE));
@@ -977,6 +1967,333 @@ mod tests {
         let tags = &line[..first_field];
         assert!(tags.contains("feed=dhan"), "symbols must precede columns");
         assert!(!tags.contains("live_value"), "columns must follow symbols");
+    }
+
+    /// 2026-10-06 (plan ITEM 51c, §12.15.9). The three new daily columns
+    /// reach an already-created table through the ALTER self-heal with the
+    /// type the CREATE declares, the ILP line carries them with the matching
+    /// wire type (a symbol for `missing_judgeable`, integers for the counts),
+    /// the two new cell kinds have stable labels, and no DEDUP key moved.
+    #[test]
+    fn late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged() {
+        let statements = dhan_live_xverify_ddl_statements();
+        let create = dhan_live_xverify_daily_create_ddl();
+        for (col, ty) in [
+            ("late_excused", "LONG"),
+            ("missing_live_unjudged", "LONG"),
+            ("missing_judgeable", "SYMBOL"),
+        ] {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            );
+            assert!(statements.contains(&alter), "missing self-heal: {alter}");
+            assert!(
+                DAILY_COLUMNS.contains(&(col, ty)),
+                "{col} must be in the daily manifest as {ty}"
+            );
+            assert!(create.contains(col), "CREATE must declare {col}");
+        }
+        // DEDUP keys are unchanged by this change (and by any new column).
+        assert_eq!(
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY,
+            "ts, trading_date_ist, feed, outcome"
+        );
+        assert_eq!(
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT,
+            "ts, trading_date_ist, feed, security_id, segment, minute_ts_ist, kind, field"
+        );
+        // The wire.
+        let mut row = sample_daily();
+        row.late_excused = 4;
+        row.missing_live_unjudged = 7;
+        row.missing_judgeable = DhanLiveXverifyMissingJudgeable::LiveTruncated;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let first_field = line.find(' ').expect("space between tags and fields");
+        let (tags, fields) = line.split_at(first_field);
+        assert!(
+            tags.contains("missing_judgeable=live_truncated"),
+            "missing_judgeable is a SYMBOL, so it must ride with the tags: {line}"
+        );
+        assert!(fields.contains("late_excused=4i"), "{line}");
+        assert!(fields.contains("missing_live_unjudged=7i"), "{line}");
+        // tail_unsealed is still written (0 from this change on).
+        row.tail_unsealed = 0;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        assert!(w.buffer_utf8().contains("tail_unsealed=0i"));
+        // Stable labels.
+        assert_eq!(
+            DhanLiveXverifyCellKind::LateExcused.as_str(),
+            "late_excused"
+        );
+        assert_eq!(
+            DhanLiveXverifyCellKind::MissingLiveUnjudged.as_str(),
+            "missing_live_unjudged"
+        );
+        assert_eq!(DhanLiveXverifyMissingJudgeable::Judged.as_str(), "judged");
+        assert_eq!(
+            DhanLiveXverifyMissingJudgeable::LiveTruncated.as_str(),
+            "live_truncated"
+        );
+        assert!(DhanLiveXverifyMissingJudgeable::Judged.is_judged());
+        assert!(!DhanLiveXverifyMissingJudgeable::LiveTruncated.is_judged());
+        // 51d (§12.15.10): the readiness reasons, all unjudged.
+        for (reason, label) in [
+            (
+                DhanLiveXverifyNotReady::SealsPending,
+                "not_ready_seals_pending",
+            ),
+            (
+                DhanLiveXverifyNotReady::SealSpillParked,
+                "not_ready_seal_spill_parked",
+            ),
+            (DhanLiveXverifyNotReady::NotApplied, "not_ready_not_applied"),
+            (
+                DhanLiveXverifyNotReady::CompletenessUnknown,
+                "not_ready_completeness_unknown",
+            ),
+        ] {
+            let j = DhanLiveXverifyMissingJudgeable::NotReady(reason);
+            assert_eq!(j.as_str(), label);
+            assert!(!j.is_judged(), "{label} is never judged");
+        }
+    }
+
+    /// 2026-10-06 (§12.15.9 review). Every attempt of a day writes its daily
+    /// row at the same deterministic `ts` and `outcome` is in the DEDUP key,
+    /// so a retry that reads differently leaves a second row. `attempt_at`
+    /// (one reading per attempt, on the daily row AND every cell) and
+    /// `run_complete` (daily) let a reader order the writes; they do not split
+    /// the findings by attempt (a cell keeps the stamp of the last attempt
+    /// that wrote it; the day's reader rule is in §12.15.9). Both reach an old table through the ALTER self-heal with
+    /// the CREATE's type, ride the ILP line as fields with the matching wire
+    /// type, and stay OUT of every DEDUP key: in the key they would turn each
+    /// retry's rows into new rows instead of upserting the same finding.
+    #[test]
+    fn attempt_at_and_run_complete_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        let statements = dhan_live_xverify_ddl_statements();
+        let daily = dhan_live_xverify_daily_create_ddl();
+        let cell = dhan_live_xverify_cell_audit_create_ddl();
+        for (table, ddl, columns, col, ty) in [
+            (
+                DHAN_LIVE_XVERIFY_DAILY_TABLE,
+                &daily,
+                DAILY_COLUMNS,
+                "attempt_at",
+                "TIMESTAMP",
+            ),
+            (
+                DHAN_LIVE_XVERIFY_DAILY_TABLE,
+                &daily,
+                DAILY_COLUMNS,
+                "run_complete",
+                "BOOLEAN",
+            ),
+            (
+                DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE,
+                &cell,
+                CELL_AUDIT_COLUMNS,
+                "attempt_at",
+                "TIMESTAMP",
+            ),
+        ] {
+            let alter = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty};");
+            assert!(statements.contains(&alter), "missing self-heal: {alter}");
+            assert!(columns.contains(&(col, ty)), "{table}.{col} must be {ty}");
+            assert!(
+                ddl.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')']) == ty),
+                "{table} CREATE must declare {col} {ty}: {ddl}"
+            );
+        }
+        for key in [
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY,
+            DEDUP_KEY_DHAN_LIVE_XVERIFY_CELL_AUDIT,
+        ] {
+            assert!(!key.contains("attempt_at"), "{key}");
+            assert!(!key.contains("run_complete"), "{key}");
+        }
+
+        // The wire: a TIMESTAMP field is `<micros>t`, a BOOLEAN is `t`/`f`,
+        // and both are fields, never tags.
+        let mut row = sample_daily();
+        row.attempt_at_ist_nanos = 1_759_751_460_123_456_000;
+        row.run_complete = true;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        assert!(!tags.contains("attempt_at") && !tags.contains("run_complete"));
+        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
+        assert!(fields.contains("run_complete=t"), "{line}");
+        row.run_complete = false;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        assert!(w.buffer_utf8().contains("run_complete=f"));
+
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_cell(&sample_cell(), 1_759_751_460_123_456_000)
+            .expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        assert!(!tags.contains("attempt_at"));
+        assert!(fields.contains("attempt_at=1759751460123456t"), "{line}");
+    }
+
+    /// 2026-10-11 (§12.15.11, plan 51h). The would-page shadow reaches an old
+    /// daily table through the ALTER self-heal as a BOOLEAN, rides the ILP
+    /// line as a field (`t`/`f`), and stays out of the DEDUP key: in the key
+    /// it would split one attempt's verdict into two rows.
+    #[test]
+    fn missing_minutes_would_page_self_heals_reaches_the_wire_and_stays_out_of_dedup() {
+        let col = "missing_minutes_would_page";
+        let alter = format!(
+            "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} BOOLEAN;"
+        );
+        assert!(
+            dhan_live_xverify_ddl_statements().contains(&alter),
+            "missing self-heal: {alter}"
+        );
+        assert!(DAILY_COLUMNS.contains(&(col, "BOOLEAN")));
+        assert!(
+            dhan_live_xverify_daily_create_ddl()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == "BOOLEAN"),
+            "the CREATE must declare {col} BOOLEAN"
+        );
+        assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+        assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+
+        for (value, wire) in [(true, "t"), (false, "f")] {
+            let mut row = sample_daily();
+            row.missing_minutes_would_page = value;
+            let mut w = DhanLiveXverifyAuditWriter::for_test();
+            w.append_daily(&row).expect("append");
+            let line = w.buffer_utf8();
+            let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+            assert!(!tags.contains(col), "{line}");
+            assert!(fields.contains(&format!("{col}={wire}")), "{line}");
+        }
+    }
+
+    /// Plan item 51e (§12.15.13): the coverage columns self-heal, reach the
+    /// wire as fields, and stay out of every DEDUP key.
+    #[test]
+    fn coverage_columns_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        for (col, ty) in [
+            ("planned_instrument_minutes", "LONG"),
+            ("covered_instrument_minutes", "LONG"),
+            ("coverage_known", "BOOLEAN"),
+        ] {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty};"
+            );
+            assert!(
+                dhan_live_xverify_ddl_statements().contains(&alter),
+                "missing self-heal: {alter}"
+            );
+            assert!(DAILY_COLUMNS.contains(&(col, ty)));
+            assert!(
+                dhan_live_xverify_daily_create_ddl()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == ty),
+                "the CREATE must declare {col} {ty}"
+            );
+            assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+            assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+        }
+        let mut row = sample_daily();
+        row.planned_instrument_minutes = 770;
+        row.covered_instrument_minutes = 396;
+        row.coverage_known = false;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        for col in [
+            "planned_instrument_minutes",
+            "covered_instrument_minutes",
+            "coverage_known",
+        ] {
+            assert!(!tags.contains(col), "{line}");
+        }
+        assert!(fields.contains("planned_instrument_minutes=770i"), "{line}");
+        assert!(fields.contains("covered_instrument_minutes=396i"), "{line}");
+        assert!(fields.contains("coverage_known=f"), "{line}");
+    }
+
+    /// §12.15.17 (2026-11-16): the shadow split columns self-heal onto an old
+    /// daily table as LONG, reach the wire as integer fields (never tags), and
+    /// stay out of every DEDUP key. In the key they would split one attempt's
+    /// verdict row into one row per distinct count.
+    #[test]
+    fn shadow_split_columns_self_heal_reach_the_wire_and_stay_out_of_dedup() {
+        let cols = [
+            "cells_boundary_consistent",
+            "cells_close_within_bar",
+            "cells_unexplained",
+            "cells_unexplained_open",
+            "cells_unexplained_high",
+            "cells_unexplained_low",
+            "cells_unexplained_close",
+            "index_missing_rest_closing",
+        ];
+        let ddl = dhan_live_xverify_daily_create_ddl();
+        let words: Vec<&str> = ddl.split_whitespace().collect();
+        for col in cols {
+            let alter = format!(
+                "ALTER TABLE {DHAN_LIVE_XVERIFY_DAILY_TABLE} ADD COLUMN IF NOT EXISTS {col} LONG;"
+            );
+            assert!(
+                dhan_live_xverify_ddl_statements().contains(&alter),
+                "missing self-heal: {alter}"
+            );
+            assert!(DAILY_COLUMNS.contains(&(col, "LONG")));
+            assert!(
+                words
+                    .windows(2)
+                    .any(|w| w[0] == col && w[1].trim_end_matches([',', ')', '\\']) == "LONG"),
+                "the CREATE must declare {col} LONG"
+            );
+            assert!(!DEDUP_KEY_DHAN_LIVE_XVERIFY_DAILY.contains(col));
+            assert!(!dhan_live_xverify_cell_audit_create_ddl().contains(col));
+        }
+        let mut row = sample_daily();
+        row.cells_boundary_consistent = 115_756;
+        row.cells_close_within_bar = 11_978;
+        row.cells_unexplained = 71_244;
+        row.cells_unexplained_open = 7_359;
+        row.cells_unexplained_high = 30_001;
+        row.cells_unexplained_low = 33_862;
+        row.cells_unexplained_close = 22;
+        row.index_missing_rest_closing = 40;
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_daily(&row).expect("append");
+        let line = w.buffer_utf8();
+        let (tags, fields) = line.split_at(line.find(' ').expect("tags then fields"));
+        for col in cols {
+            assert!(!tags.contains(col), "{line}");
+        }
+        for want in [
+            "cells_boundary_consistent=115756i",
+            "cells_close_within_bar=11978i",
+            "cells_unexplained=71244i",
+            "cells_unexplained_open=7359i",
+            "cells_unexplained_high=30001i",
+            "cells_unexplained_low=33862i",
+            "cells_unexplained_close=22i",
+            "index_missing_rest_closing=40i",
+        ] {
+            assert!(fields.contains(want), "{want} not on the wire: {line}");
+        }
     }
 
     #[test]
@@ -995,6 +2312,83 @@ mod tests {
         assert!(line.contains("tail_unsealed=2"));
     }
 
+    /// The 2026-08-26 loss, as a test.
+    ///
+    /// That session produced 764,003 findings, the single flush built a
+    /// 207,965,278-byte buffer against the server's 104,857,600 cap, and the
+    /// poisoned-buffer defence discarded every row — the revived feed's only
+    /// ground truth had no record for the day.
+    ///
+    /// `for_test()` has no sender, so a flush that is genuinely REACHED must
+    /// fail — and that failure is what makes this test meaningful rather than
+    /// decorative. It appends until the buffer is over the threshold, then
+    /// asserts `flush_if_large` actually TRIED to send (Err, buffer emptied by
+    /// the poisoned-buffer defence). Under the old shape the buffer just kept
+    /// growing, so no call at any size could have produced that.
+    ///
+    /// The small-run half matters too: below the threshold the call must be a
+    /// no-op, because on the live path reaching a flush per row would turn one
+    /// round trip into hundreds of thousands.
+    #[test]
+    fn flush_if_large_bounds_the_buffer_by_bytes_not_row_count() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        // Well under the threshold: nothing should be offered for flush.
+        for _ in 0..50 {
+            w.append_cell(&sample_cell(), 7).expect("append");
+        }
+        assert!(
+            w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES,
+            "a small run must not trigger a flush"
+        );
+        assert!(
+            w.flush_if_large().is_ok(),
+            "below the threshold this is a no-op even with no sender — it must \
+             not be reached, because reaching it would try to send"
+        );
+        assert_eq!(w.pending(), 50, "a no-op flush must not clear pending");
+
+        // Now cross it for real. The append loop is bounded by BYTES, exactly
+        // as the production caller is, so this cannot silently spin if the row
+        // width changes.
+        while w.buffer_len() < DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES {
+            w.append_cell(&sample_cell(), 7).expect("append");
+        }
+        let rows_at_threshold = w.pending();
+        assert!(
+            w.flush_if_large().is_err(),
+            "past the threshold the flush must be REACHED — with no sender that \
+             surfaces as Err. An Ok here would mean the threshold is never \
+             acted on and the buffer grows without bound, which is the \
+             2026-08-26 defect"
+        );
+        assert_eq!(
+            w.pending(),
+            0,
+            "a reached flush that fails must discard its chunk (poisoned-buffer \
+             defence), leaving the buffer empty for the next chunk — not \
+             carrying {rows_at_threshold} poisoned rows forward into it"
+        );
+    }
+
+    /// The threshold has to leave real headroom under the server cap, or the
+    /// fix re-creates the bug the first time a row gets wider.
+    #[test]
+    fn the_flush_threshold_leaves_headroom_under_the_server_cap() {
+        // The cap named verbatim in the 2026-08-26 failure.
+        const OBSERVED_SERVER_CAP_BYTES: usize = 104_857_600;
+        assert!(
+            DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES * 3 <= OBSERVED_SERVER_CAP_BYTES,
+            "the flush threshold must sit at least 3x under the server's \
+             configured max buffer, so a wider row cannot silently re-approach \
+             the limit that discarded 764,003 rows on 2026-08-26"
+        );
+        assert!(
+            DhanLiveXverifyAuditWriter::FLUSH_THRESHOLD_BYTES > 1024 * 1024,
+            "too small a threshold turns one flush into thousands of round \
+             trips on the daily comparator"
+        );
+    }
+
     #[test]
     fn flush_with_no_pending_rows_is_ok() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
@@ -1004,7 +2398,7 @@ mod tests {
     #[test]
     fn flush_without_sender_errors_and_discards_the_poisoned_buffer() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         w.append_daily(&sample_daily()).expect("append");
         assert_eq!(w.pending(), 2);
         let err = w.flush().expect_err("disconnected writer must fail loudly");
@@ -1019,11 +2413,36 @@ mod tests {
     #[test]
     fn discard_pending_returns_the_dropped_count_and_clears() {
         let mut w = DhanLiveXverifyAuditWriter::for_test();
-        w.append_cell(&sample_cell()).expect("append");
-        w.append_cell(&sample_cell()).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
+        w.append_cell(&sample_cell(), 7).expect("append");
         assert_eq!(w.discard_pending(), 2);
         assert_eq!(w.pending(), 0);
         assert_eq!(w.discard_pending(), 0, "discarding twice is a no-op");
+    }
+
+    /// A deliberate stop drops the buffer like a discard, but counts on its
+    /// own local counter, never on the paging discard counter (§12.15.8).
+    #[test]
+    fn abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_cell(&sample_cell(), 7).expect("append");
+        w.append_daily(&sample_daily()).expect("append");
+        assert_eq!(w.abandon_pending(), 2);
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer_utf8().is_empty());
+        assert_eq!(w.abandon_pending(), 0, "abandoning twice is a no-op");
+        let src = include_str!("dhan_live_crossverify_persistence.rs");
+        let body = src
+            .split("pub fn abandon_pending(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n").next())
+            .expect("abandon_pending exists");
+        assert!(body.contains("DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER"));
+        assert!(!body.contains("rows_discarded_total"));
+        assert_eq!(
+            DHAN_LIVE_XVERIFY_AUDIT_ROWS_ABANDONED_COUNTER,
+            "tv_dhan_live_xverify_audit_rows_abandoned_total"
+        );
     }
 
     #[test]
@@ -1037,7 +2456,29 @@ mod tests {
         let conf = dhan_live_xverify_ilp_http_conf(&cfg);
         assert!(conf.contains("http::addr=questdb.internal:9009"));
         assert!(conf.contains("retry_timeout=0"));
-        assert!(conf.contains("request_timeout=5000"));
+        assert!(conf.contains("request_timeout=5000;"));
+        assert!(conf.contains("request_min_throughput=102400;"));
+        // The conf must parse: a typo here is a writer with no sender, which
+        // discards every row.
+        assert!(Sender::from_conf(&conf).is_ok());
+    }
+
+    /// The worst case follows the ILP client's own formula: 5 s, plus the
+    /// buffer's bytes at 102,400 B/s, rounded up to a millisecond.
+    #[test]
+    fn test_flush_worst_case_is_timeout_plus_bytes_at_min_throughput() {
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        assert_eq!(w.flush_worst_case(), std::time::Duration::from_secs(5));
+        w.append_daily(&sample_daily()).expect("append");
+        let bytes = u64::try_from(w.buffer_len()).expect("len");
+        assert!(bytes > 0);
+        let want_ms = 5_000 + (bytes * 1_000).div_ceil(102_400);
+        assert_eq!(
+            w.flush_worst_case(),
+            std::time::Duration::from_millis(want_ms)
+        );
+        // 20,000 rows at the measured ~272 B/row is ~53 s on top of the 5 s.
+        assert!(w.flush_worst_case() > std::time::Duration::from_secs(5));
     }
 
     /// `is_measured` gates the keep-better rerun guard: get it wrong and a
@@ -1102,14 +2543,16 @@ mod tests {
     /// narrowing it would hide real loss.
     #[test]
     fn test_is_real_divergence_separates_expected_fluctuation_from_real_faults() {
-        // Real: a price disagreement, or a minute one side never had.
+        // Real: a price disagreement, or a minute we never captured.
         assert!(DhanLiveXverifyCellKind::Diverged.is_real_divergence());
         assert!(
             DhanLiveXverifyCellKind::MissingLive.is_real_divergence(),
             "a minute Dhan's own tape has but we never captured is the closest \
              proxy we have for packet loss — it MUST count"
         );
-        assert!(DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
+        // A minute only our side has is never a fault: the vendor tape is
+        // sparse by construction (the verdict reads it as `partial` at most).
+        assert!(!DhanLiveXverifyCellKind::MissingRest.is_real_divergence());
         // Expected: recorded for the operator, never counted as a fault.
         assert!(
             !DhanLiveXverifyCellKind::TailUnsealed.is_real_divergence(),
@@ -1117,16 +2560,155 @@ mod tests {
         );
         assert!(
             !DhanLiveXverifyCellKind::OutOfSession.is_real_divergence(),
-            "a row outside [09:15, 15:30) is recorded, never classified"
+            "a row outside [09:15, 15:40) is recorded, never classified"
         );
-        // Exactly three of the five kinds are real.
+        // Exactly two of the seven kinds can be real.
+        // 2026-10-06 (§12.15.9): an excused late minute and an unjudged
+        // minute are recorded, never real.
+        assert!(!DhanLiveXverifyCellKind::LateExcused.is_real_divergence());
+        assert!(!DhanLiveXverifyCellKind::MissingLiveUnjudged.is_real_divergence());
         let kinds = [
             DhanLiveXverifyCellKind::Diverged,
             DhanLiveXverifyCellKind::MissingLive,
             DhanLiveXverifyCellKind::MissingRest,
             DhanLiveXverifyCellKind::TailUnsealed,
+            DhanLiveXverifyCellKind::LateExcused,
+            DhanLiveXverifyCellKind::MissingLiveUnjudged,
             DhanLiveXverifyCellKind::OutOfSession,
         ];
-        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 3);
+        assert_eq!(kinds.iter().filter(|k| k.is_real_divergence()).count(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // THE VENDOR TAPE — added 2026-08-26 on operator instruction
+    //
+    // Until today the fetched tape was compared in memory and thrown away:
+    // only DISAGREEMENTS survived. So "what did Dhan say at 09:16?" had no
+    // answer, and re-verifying meant ~868 more rate-limited requests.
+    // -----------------------------------------------------------------
+
+    fn tape_row() -> DhanRestTapeRow {
+        DhanRestTapeRow {
+            minute_ts_ist_nanos: 1_786_233_600 * 1_000_000_000 + 33_360 * 1_000_000_000,
+            trading_date_ist_nanos: 1_786_233_600 * 1_000_000_000,
+            security_id: 25,
+            segment: "NSE_EQ".to_string(),
+            instrument: "RELIANCE".to_string(),
+            open: 1414.2,
+            high: 1420.0,
+            low: 1410.5,
+            close: 1418.75,
+            volume: 91_240,
+            fetched_at_nanos: 1_786_233_600 * 1_000_000_000 + 56_460 * 1_000_000_000,
+        }
+    }
+
+    #[test]
+    fn the_tape_dedup_key_carries_source() {
+        // THE DEFECT THIS TABLE EXISTS TO AVOID.
+        //
+        // The sibling `rest_spot_1m` has a `source` column that is NOT in its
+        // dedup key. Two legs writing the same instrument-minute from
+        // different sources therefore overwrite each other with no error
+        // anywhere — which is why this sweep could not simply be written
+        // there. Dropping `source` from this key re-creates that trap.
+        assert!(
+            DEDUP_KEY_DHAN_REST_1M_TAPE.contains("source"),
+            "source must be in the key, or a second writer silently overwrites \
+             this one — exactly the collision that forced a new table"
+        );
+    }
+
+    #[test]
+    fn the_tape_dedup_key_pairs_security_id_with_segment() {
+        // I-P1-11: Dhan reuses numeric ids across segments. An unpaired id
+        // collapses two different instruments into one row.
+        let k = DEDUP_KEY_DHAN_REST_1M_TAPE;
+        assert!(k.contains("security_id") && k.contains("segment"));
+        assert!(k.contains("feed"), "the 2026-06-28 feed-in-key lock");
+    }
+
+    #[test]
+    fn dhan_rest_1m_tape_create_ddl_is_idempotent_day_partitioned_and_deduped() {
+        let ddl = dhan_rest_1m_tape_create_ddl();
+        assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS "));
+        assert!(ddl.contains(DHAN_REST_1M_TAPE_TABLE));
+        assert!(ddl.contains("timestamp(ts) PARTITION BY DAY"));
+        assert!(ddl.contains(&format!("DEDUP UPSERT KEYS({DEDUP_KEY_DHAN_REST_1M_TAPE})")));
+        assert!(!ddl.to_ascii_uppercase().contains("DROP"));
+    }
+
+    #[test]
+    fn append_rest_tape_stamps_the_minute_not_the_run() {
+        // If `ts` were the run time, every candle of the day would file under
+        // one instant and "what was the 09:16 price" becomes unanswerable —
+        // which is the question this table was added to answer.
+        assert!(
+            DEDUP_KEY_DHAN_REST_1M_TAPE.starts_with("ts,"),
+            "designated ts first (the 2026-04-28 regression rule)"
+        );
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        let r = tape_row();
+        w.append_rest_tape(&r).expect("append");
+        let wire = w.buffer_utf8();
+        assert!(
+            wire.contains(&r.minute_ts_ist_nanos.to_string()),
+            "the minute must be the row's designated timestamp"
+        );
+    }
+
+    #[test]
+    fn the_tape_row_carries_the_label_we_asked_with() {
+        // A vendor "no candles" answer looks identical for a MISLABELLED
+        // instrument and a genuinely untraded one. Without the label stored,
+        // that ambiguity can never be resolved after the fact.
+        let mut w = DhanLiveXverifyAuditWriter::for_test();
+        w.append_rest_tape(&tape_row()).expect("append");
+        assert!(w.buffer_utf8().contains("RELIANCE"));
+    }
+
+    #[test]
+    fn the_tape_ddl_is_registered_so_the_table_actually_gets_created() {
+        // A writer whose table is never created auto-creates it on first
+        // write WITHOUT dedup — a duplicate-row window the whole key design
+        // above would silently miss.
+        let ddl = dhan_live_xverify_ddl_statements();
+        let joined = ddl.join("\n");
+        assert!(
+            joined.contains(DHAN_REST_1M_TAPE_TABLE),
+            "the tape table must be in the DDL list, or nothing creates it"
+        );
+        assert!(
+            joined.contains(&format!(
+                "ALTER TABLE {DHAN_REST_1M_TAPE_TABLE} DEDUP ENABLE"
+            )),
+            "dedup must be enabled explicitly — an auto-created table has none"
+        );
+    }
+
+    #[test]
+    fn the_tape_write_is_idempotent_by_construction() {
+        // A rerun re-fetches the same minutes. With the key above those
+        // overwrite in place rather than duplicating the tape, so re-running
+        // the comparison is free of side effects.
+        let mut a = DhanLiveXverifyAuditWriter::for_test();
+        let mut b = DhanLiveXverifyAuditWriter::for_test();
+        a.append_rest_tape(&tape_row()).expect("a");
+        b.append_rest_tape(&tape_row()).expect("b");
+        assert_eq!(
+            a.buffer_utf8(),
+            b.buffer_utf8(),
+            "the same input must produce byte-identical rows, or the dedup key \
+             cannot collapse them"
+        );
+    }
+
+    #[test]
+    fn the_tape_table_is_not_the_sibling_table() {
+        // Guard against a future "simplification" that points this writer at
+        // rest_spot_1m. That table's key omits `source`, so the sweep would
+        // silently destroy the per-minute leg's index rows.
+        assert_ne!(DHAN_REST_1M_TAPE_TABLE, "rest_spot_1m");
+        assert_ne!(DHAN_REST_1M_TAPE_TABLE, DHAN_LIVE_XVERIFY_CELL_AUDIT_TABLE);
     }
 }

@@ -16,8 +16,9 @@
 //! * Destructive box actions (stop/reboot/restart-app/stop-app) are blocked
 //!   during market hours (09:15-15:40 IST Mon-Fri) unless `{"force": true}`.
 //! * DATA-DESTRUCTIVE actions (wipe-questdb/docker-reset/docker-nuke-bare)
-//!   are HARD-LOCKED during market hours — refused with 409 even with
-//!   `{"force": true}` (operator incident 2026-07-02 15:05 IST).
+//!   are HARD-LOCKED 09:00-15:45 IST every day — refused with 409 even with
+//!   `{"force": true}` (operator incident 2026-07-02 15:05 IST; window widened
+//!   to daily-universe Quote 25's by audit PR20, 2026-09-27).
 //! * The SQL box is READ-ONLY: only SELECT/SHOW/EXPLAIN/WITH are accepted;
 //!   any mutating keyword is rejected before it ever reaches QuestDB.
 //!
@@ -55,10 +56,53 @@ pub const DESTRUCTIVE: [&str; 7] = [
 // possible.
 pub const DATA_DESTRUCTIVE: [&str; 3] = ["wipe-questdb", "docker-reset", "docker-nuke-bare"];
 
-/// legacy: handler.py:125-129 (`_DATA_DESTRUCTIVE_LOCK_MSG`) — verbatim.
-pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked during market hours \
-(09:15-15:40 IST) — a mid-market wipe destroys data that can never \
-be re-fetched. Run after 15:40.";
+/// Refusal text for [`DATA_DESTRUCTIVE`] inside the lock window.
+///
+/// 2026-09-27 (audit PR20): was "(09:15-15:40 IST) ... Run after 15:40" and
+/// followed [`is_market_hours`]. The rule the lock enforces is wider —
+/// daily-universe Quote 25 REJECTs a nuke "inside 09:00–15:45 IST" — so the
+/// lock now has its own window, [`is_data_destructive_locked`].
+pub const DATA_DESTRUCTIVE_LOCK_MSG: &str = "Data-destructive actions are locked 09:00-15:45 IST \
+every day (market hours plus a margin either side) — a wipe then destroys data \
+that can never be re-fetched. Run after 15:45.";
+
+/// Whether the console may run a [`DATA_DESTRUCTIVE`] action at all.
+///
+/// `false` since 2026-10-02 (plan item 45g D10). Daily-universe Quotes 27 +
+/// 28 (2026-09-29, "nothign shdou lneevr ever be missed or removed or
+/// deleted") record Quotes 21-26 as SPENT and require a fresh dated quote
+/// naming the data, and a verified copy, before any market-data delete. All
+/// three actions delete market data outright (TRUNCATE, or the Docker volume
+/// with the raw-frame WAL), so every request is refused with 409 at any hour.
+/// Re-enabling one is a code change that must cite that fresh quote.
+pub const CONSOLE_DATA_WIPES_AUTHORIZED: bool = false;
+
+/// Refusal text while [`CONSOLE_DATA_WIPES_AUTHORIZED`] is `false`.
+pub const CONSOLE_DATA_WIPES_REFUSED_MSG: &str = "Data-deleting actions are switched off: \
+nothing may delete market data without a verified copy and a fresh dated operator \
+approval naming the data. Nothing was stopped or deleted.";
+
+/// Start of the data-destructive lock, 09:00 IST (seconds-of-day).
+///
+/// Wider than [`MKT_OPEN_SECS`] on purpose: the pre-open session and the
+/// boot's capture start at 09:00, and daily-universe Quote 25's REJECT list
+/// names "Runs the nuke inside 09:00–15:45 IST". Pinned against that rule
+/// text by `test_data_destructive_lock_window_matches_the_rule_file`.
+pub const DATA_DESTRUCTIVE_LOCK_OPEN_SECS: u32 = 9 * 3600;
+/// End of the data-destructive lock, 15:45 IST (seconds-of-day, exclusive).
+/// Five minutes past [`MKT_CLOSE_SECS`], for the same rule.
+pub const DATA_DESTRUCTIVE_LOCK_CLOSE_SECS: u32 = 15 * 3600 + 45 * 60;
+
+/// How long SSM may hold a command for a box that has not picked it up
+/// before it gives up on it (SSM `TimeoutSeconds`, minimum 30).
+///
+/// Without it the SSM default is 3,600 s: a wipe or reset sent at 08:55 to a
+/// box whose agent was reconnecting could start at 09:40. The box-side
+/// `ON_BOX_LOCK_GUARD` refuses that run anyway; this bounds how late any
+/// console command can start, so a refused run is the rare case rather than
+/// the only defence. Two minutes covers an agent reconnect; a box that is
+/// down for longer gets a failed command instead of a surprise later.
+pub const SSM_DELIVERY_TIMEOUT_SECS: i32 = 120;
 
 /// legacy: `_MKT_OPEN_SECS = 9 * 3600 + 15 * 60` (09:15 IST, seconds-of-day).
 pub const MKT_OPEN_SECS: u32 = 9 * 3600 + 15 * 60;
@@ -87,11 +131,29 @@ pub const SECRET_TTL_SECS: f64 = 60.0;
 pub const VIEW_TIMEOUT_SECS: f64 = 6.0;
 /// legacy: `_VIEW_POLL_SECS = 0.4` — SSM get_command_invocation poll cadence.
 pub const VIEW_POLL_SECS: f64 = 0.4;
-/// legacy: `_LATENCY_TIMEOUT_SECS = 15.0` — the REST-era latency snapshot is
-/// one metrics scrape (3s) + one QuestDB round-trip probe (3s) + chronyc +
-/// one bounded rest_fetch_audit aggregate (4s); worst case ≈ 10-11s incl.
-/// SSM registration — per-curl `--max-time` bounds every leg.
-pub const LATENCY_TIMEOUT_SECS: f64 = 15.0;
+/// SSM RunCommand poll budget for the latency tab.
+///
+/// RE-DERIVED 2026-09-17, and the old figure is worth recording because it
+/// was stale in the DANGEROUS direction. It read "one metrics scrape (3s) +
+/// one QuestDB probe (3s) + chronyc + one bounded rest_fetch_audit aggregate
+/// (4s); worst case ≈ 10-11s" against a 15.0 budget — but the per-socket
+/// `WSLAT_RAW=` metrics curl (another 3s) was added later and never counted,
+/// so the real curl sum was 13s and the true margin was 2s, not the 4-5s the
+/// docstring implied.
+///
+/// Measured from the array itself — `LATENCY_COMMANDS` now carries THREE
+/// `--max-time 3` curls (order-placement metrics, QuestDB round-trip,
+/// per-socket WS lag) after the `rest_fetch_audit` aggregate was removed with
+/// the per-minute REST legs (`no-rest-except-live-feed-2026-06-27.md` §12.12,
+/// dated correction). `chronyc` is local and unbounded-but-instant.
+///
+///   3 + 3 + 3 = 9s of curl + SSM registration ≈ 10-11s worst case.
+///
+/// 12.0 leaves 3s over the curl sum — MORE margin than the 2s the 15.0
+/// actually had, while coming down with the work it budgets for. A timeout
+/// that outlives its commands is not free: it is how long an operator stares
+/// at a spinner when the box is wedged.
+pub const LATENCY_TIMEOUT_SECS: f64 = 12.0;
 
 /// legacy: `_SQL_ALLOWED_PREFIXES` — read-only SQL gate: the first keyword
 /// must be one of these.
@@ -133,6 +195,11 @@ pub const SQL_BANNED: [&str; 25] = [
 /// SQL console (both the Data-tab query box and the DB tab share `sql`).
 pub const SQL_MAX_ROWS: i64 = 1000;
 
+// Below SSM's inline stdout ceiling; over-limit replies are errors, not CSV.
+const SQL_MAX_BYTES: usize = 20_000;
+const SQL_COMPLETE: &str = "\nTV_SQL_OK\n";
+const SQL_HTTP_OK: &str = "\nTV_SQL_HTTP_200\n";
+
 /// legacy: `_QDB_LINK_TTL_SECS = 90` — TTL of the one-click console link
 /// token minted by the `qdb_console_url` action. The console front Lambda
 /// verifies it (same control secret, HMAC over `"qdblink|<exp>"`) and swaps
@@ -153,6 +220,20 @@ pub fn is_market_hours(now_utc: DateTime<Utc>) -> bool {
     }
     let sod = ist.hour() * 3600 + ist.minute() * 60 + ist.second();
     (MKT_OPEN_SECS..MKT_CLOSE_SECS).contains(&sod)
+}
+
+/// True inside the data-destructive lock, 09:00 ≤ t < 15:45 IST, on EVERY
+/// day of the week.
+///
+/// Every day and not Mon–Fri, unlike [`is_market_hours`]: the rule's window
+/// carries no weekday qualifier, and a weekend special session (Muhurat
+/// trading, a budget-day Saturday) is still a session whose data cannot be
+/// re-fetched. A weekend wipe waits until 15:45, which costs an operator a
+/// few hours; a wrong guess about which weekends trade costs a day's data.
+pub fn is_data_destructive_locked(now_utc: DateTime<Utc>) -> bool {
+    let ist = now_utc + TimeDelta::seconds(IST_OFFSET_SECS);
+    let sod = ist.hour() * 3600 + ist.minute() * 60 + ist.second();
+    (DATA_DESTRUCTIVE_LOCK_OPEN_SECS..DATA_DESTRUCTIVE_LOCK_CLOSE_SECS).contains(&sod)
 }
 
 /// legacy: `_http_method` (handler.py:202-206). Fail closed: a malformed
@@ -194,6 +275,190 @@ pub fn authorized(headers: &Value, secret: &str) -> bool {
     // legacy `hmac.compare_digest` — constant-time for equal lengths, early
     // length check otherwise; aws-lc-rs mirrors that contract.
     verify_slices_are_equal(presented.as_bytes(), secret.as_bytes()).is_ok()
+}
+
+// ------------------------------------------------- failed-key-attempt guard
+//
+// Audit M4 (2026-10-04). The portal is a public URL behind one shared
+// secret, and that secret can stop the trading box and run a root shell on
+// it. The compare above is constant-time and fails closed; what it did not
+// do was slow down a caller guessing keys. This guard refuses a source
+// after `AUTH_FAILURE_LIMIT` failed attempts inside one
+// `AUTH_FAILURE_WINDOW_SECS` window.
+//
+// HONEST LIMIT: the table lives in ONE warm Lambda container. A cold start
+// begins with an empty table, and with reserved concurrency N there are at
+// most N tables, so the real ceiling is `N × AUTH_FAILURE_LIMIT` attempts
+// per window per source, not a global one. A caller rotating source
+// addresses is not limited by it at all; the API Gateway stage throttle
+// (terraform) is the only global rate bound. The defence that actually
+// holds is the secret's length — rotating it is an operator action.
+
+/// Failed attempts a single source may make inside one window before it is
+/// refused (429) without the secret even being read.
+pub const AUTH_FAILURE_LIMIT: u32 = 10;
+/// Length of the counting window, measured from the source's first failure.
+pub const AUTH_FAILURE_WINDOW_SECS: i64 = 300;
+/// Sources tracked per container. A new source past this, after expired
+/// windows are pruned, is not counted (and that is logged), so the table is
+/// bounded in memory.
+pub const AUTH_FAILURE_MAX_SOURCES: usize = 4_096;
+// A first failure is never a lockout, so `record_failure` may return
+// `Counted(1)` for a new source without checking the limit.
+const _: () = assert!(AUTH_FAILURE_LIMIT > 1);
+/// A source address longer than this is truncated before it becomes a key.
+const AUTH_SOURCE_MAX_CHARS: usize = 64;
+
+/// The caller's address as API Gateway v2 / the Function URL report it
+/// (`requestContext.http.sourceIp` — set by AWS, not by a client header).
+/// Missing or empty → `"unknown"`, which is one shared bucket.
+pub fn source_ip(event: &Value) -> String {
+    match event
+        .pointer("/requestContext/http/sourceIp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(s) if !s.is_empty() => s.chars().take(AUTH_SOURCE_MAX_CHARS).collect(),
+        _ => "unknown".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AuthFailures {
+    window_start: i64,
+    failures: u32,
+}
+
+/// Verdict of [`AuthFailureGuard::check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthGate {
+    /// The source may present a key.
+    Allowed,
+    /// The source used its attempts; refused until the window ends.
+    Refused {
+        /// Seconds until the source's window ends.
+        retry_after_secs: i64,
+    },
+}
+
+/// Outcome of [`AuthFailureGuard::record_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailureRecord {
+    /// Counted; the source has this many failures in its window.
+    Counted(u32),
+    /// This failure reached the limit: the source is now refused.
+    LockedOut,
+    /// The table is full of live windows; this failure was not counted.
+    /// `untracked_total` is the container's running count of such misses.
+    Untracked {
+        /// Running count of uncounted failures in this container.
+        untracked_total: u64,
+    },
+}
+
+/// Per-container table of failed key attempts per source. Every operation
+/// takes one lock and one hash probe — O(1) — except a failure arriving
+/// while the table is full, which prunes expired windows first:
+/// O(`AUTH_FAILURE_MAX_SOURCES`), bounded, and only on that path.
+#[derive(Debug)]
+pub struct AuthFailureGuard {
+    table: std::sync::Mutex<std::collections::HashMap<String, AuthFailures>>,
+    untracked_total: std::sync::atomic::AtomicU64,
+}
+
+impl Default for AuthFailureGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AuthFailureGuard {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self {
+            table: std::sync::Mutex::new(std::collections::HashMap::new()),
+            untracked_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn table(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AuthFailures>> {
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// May `source` present a key at `now`? An expired window is dropped.
+    pub fn check(&self, source: &str, now: i64) -> AuthGate {
+        let mut table = self.table();
+        let Some(entry) = table.get(source).copied() else {
+            return AuthGate::Allowed;
+        };
+        let ends = entry.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS);
+        if now >= ends || now < entry.window_start {
+            // Window over (or the clock stepped back past its start): forget.
+            table.remove(source);
+            return AuthGate::Allowed;
+        }
+        if entry.failures >= AUTH_FAILURE_LIMIT {
+            AuthGate::Refused {
+                retry_after_secs: ends - now,
+            }
+        } else {
+            AuthGate::Allowed
+        }
+    }
+
+    /// Count one failed attempt by `source` at `now`.
+    pub fn record_failure(&self, source: &str, now: i64) -> AuthFailureRecord {
+        let mut table = self.table();
+        if let Some(entry) = table.get_mut(source) {
+            let ends = entry.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS);
+            if now >= ends || now < entry.window_start {
+                *entry = AuthFailures {
+                    window_start: now,
+                    failures: 1,
+                };
+                return AuthFailureRecord::Counted(1);
+            }
+            entry.failures = entry.failures.saturating_add(1);
+            return if entry.failures == AUTH_FAILURE_LIMIT {
+                AuthFailureRecord::LockedOut
+            } else {
+                AuthFailureRecord::Counted(entry.failures)
+            };
+        }
+        if table.len() >= AUTH_FAILURE_MAX_SOURCES {
+            table.retain(|_, e| {
+                now >= e.window_start
+                    && now < e.window_start.saturating_add(AUTH_FAILURE_WINDOW_SECS)
+            });
+        }
+        if table.len() >= AUTH_FAILURE_MAX_SOURCES {
+            let untracked_total = self
+                .untracked_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            return AuthFailureRecord::Untracked { untracked_total };
+        }
+        table.insert(
+            source.to_string(),
+            AuthFailures {
+                window_start: now,
+                failures: 1,
+            },
+        );
+        AuthFailureRecord::Counted(1)
+    }
+
+    /// A correct key from `source`: forget its failures.
+    pub fn record_success(&self, source: &str) {
+        self.table().remove(source);
+    }
+
+    /// Sources currently tracked (tests and diagnostics).
+    pub fn tracked_sources(&self) -> usize {
+        self.table().len()
+    }
 }
 
 // The static gate regexes cannot fail to compile; the `Option` + fail-closed
@@ -325,8 +590,20 @@ pub fn mint_qdb_link_token_default_ttl(secret: &str, now_epoch: i64) -> String {
 
 // -------------------------------------------------------------- more constants
 
-/// legacy: `_REST_LAT_QUERY_MAX_SECS = 4` (handler.py:441).
-pub const REST_LAT_QUERY_MAX_SECS: u64 = 4;
+// ---- `REST_LAT_QUERY_MAX_SECS` is RETIRED 2026-09-17 ----
+//
+// The 4-second `--max-time` budget on the ONE `rest_fetch_audit` percentile
+// curl in `LATENCY_COMMANDS`. That curl is gone (the ninth retired-table read
+// in `operator_control_commands.rs`; full record in
+// `no-rest-except-live-feed-2026-06-27.md` §12.12's dated correction), so a
+// budget sized for it is a number that no longer bounds anything.
+//
+// The rule it encoded is KEPT and is why this tombstone exists rather than a
+// silent deletion: every on-box curl in a command array carries its own
+// `--max-time`, and the tab's `LATENCY_TIMEOUT_SECS` must stay above their sum
+// plus SSM registration. Adding a query back means adding a budget back and
+// re-deriving that total — never reusing this figure, which was fitted to a
+// query nobody will write again.
 
 /// legacy: `_FEED_API_UNREACHABLE` (handler.py:636-638) — verbatim.
 pub const FEED_API_UNREACHABLE: &str =
@@ -335,13 +612,40 @@ pub const FEED_API_UNREACHABLE: &str =
 /// legacy: `_BOX_UNREACHABLE` (handler.py:639) — verbatim.
 pub const BOX_UNREACHABLE: &str = "box unreachable (SSM offline or instance stopped)";
 
-/// legacy: `_FEEDS_TIMEOUT_SECS = 28.0` (handler.py:685). Budget arithmetic
-/// (review fix M1, 2026-07-16): the snapshot's curls are `--max-time` bounded
-/// at 8s + 8s (app /api/feeds + /api/feeds/health) + 4s + 4s (the two
-/// rest_fetch_audit reads) = 24s worst case, PLUS SSM registration/poll
-/// overhead → 28s. The budget MUST exceed the sum of every `--max-time` in
-/// `FEEDS_VIEW_COMMANDS` (drift-proof test parses them).
-pub const FEEDS_TIMEOUT_SECS: f64 = 28.0;
+// ---- `REST_AUDIT_UNPARSEABLE` / `REST_AUDIT_ABSENT` are RETIRED 2026-09-17 ----
+//
+// The two sentences that kept the console's pull line honest, by separating
+// THREE outcomes the console had once folded into one: the query ran and
+// returned nothing (a real zero), the query answered with something
+// unreadable (a shape failure), and the snapshot carried no line at all (a
+// malformed answer). Only the first was ever "zero pulls today".
+//
+// They retire with the pull line itself — `rest_fetch_audit` has no writer
+// after the operator's SOCKETS-ONLY narrowing (§12.10; §12.11 names the reads
+// REMOVE; the console decision is §12.12).
+//
+// The THREE-OUTCOME RULE they encoded is NOT retired and is the durable part:
+// an absent field, an unparseable field and a genuinely empty one are three
+// different facts, and collapsing them into a confident zero is the exact
+// false-OK that produced the 2026-09-08 false alarm recorded in
+// `parse_feeds_view` below. Any future surface that reports a count read off
+// the box owes the same three-way split.
+
+/// SSM RunCommand poll budget for the feeds tab.
+///
+/// RE-DERIVED 2026-09-17. The superseded 28.0 was correct arithmetic for a
+/// four-curl array: 8s + 8s (app `/api/feeds` + `/api/feeds/health`) + 4s + 4s
+/// (the two `rest_fetch_audit` reads) = 24s, plus SSM registration → 28s.
+/// Both audit reads were removed with the per-minute REST legs
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.12), leaving:
+///
+///   8 + 8 = 16s of curl + SSM registration ≈ 18-20s worst case.
+///
+/// 20.0 keeps the SAME 4s margin over the curl sum that the 28.0 had over 24.
+/// The budget MUST exceed the sum of every `--max-time` in
+/// `FEEDS_VIEW_COMMANDS`, and the test parses them rather than copying a
+/// number — adding a curl without raising the budget fails the build.
+pub const FEEDS_TIMEOUT_SECS: f64 = 20.0;
 
 /// legacy: `_MAIN_SHA_TTL_SECS = 60.0` (handler.py:875).
 pub const MAIN_SHA_TTL_SECS: f64 = 60.0;
@@ -435,31 +739,33 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-// The token/hex gate regexes cannot fail to compile; the `Option` +
+// The hex/feed-name gate regexes cannot fail to compile; the `Option` +
 // fail-closed arms exist only to satisfy the no-unwrap/no-expect lints.
-static TOKEN_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^[a-z0-9_-]{1,32}$").ok());
 static FEED_NAME_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"^[a-z][a-z0-9_-]{0,31}$").ok());
 static HEX_SHA_RE: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{7,40}$").ok());
 
-/// legacy `re.fullmatch(r"[a-z0-9_-]{1,32}", s)` — the feed/leg/outcome
-/// charset gate (defense in depth on our own symbols).
-fn is_token(s: &str) -> bool {
-    TOKEN_RE.as_ref().is_some_and(|re| re.is_match(s))
-}
-
-/// legacy `_num` (handler.py:514-520 / 732-738): ""/null/nan → None, else
-/// float-or-None.
-fn parse_num(s: &str) -> Option<f64> {
-    if s.is_empty() {
-        return None;
-    }
-    let low = s.to_lowercase();
-    if low == "null" || low == "nan" {
-        return None;
-    }
-    s.parse::<f64>().ok()
-}
+// ---- `TOKEN_RE` / `is_token` / `parse_num` are RETIRED 2026-09-17 ----
+//
+// All three existed for `parse_rest_lat_row` and the `rest_fetch_audit`
+// parsers above it, which went with the per-minute REST legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.12 and its dated correction).
+// `is_token` gated `<feed>`/`<leg>` symbols and `parse_num` turned
+// `""`/`null`/`NaN` into `None` so a percentile that the database could not
+// compute never became a plausible number.
+//
+// BOTH rules are still enforced, by the parsers that survive — which is why
+// this is a tombstone and not a lost guarantee:
+//   * `FEED_NAME_RE` (immediately above) is the SAME charset gate, anchored
+//     tighter (must start with a letter), and `is_feed_name` applies it to
+//     every feed symbol the console renders.
+//   * `parse_ws_lag_rows` drops a malformed Prometheus line rather than
+//     defaulting it, and `prom_label` returns `None` instead of falling back
+//     to connection 0.
+//
+// A future parser needing either must re-derive it against its own input.
+// Reviving these verbatim would import a charset fitted to a wire format
+// (the on-box CSV) that no longer exists.
 
 // ------------------------------------------------------------------ view snap
 
@@ -467,6 +773,12 @@ fn parse_num(s: &str) -> Option<f64> {
 /// value (';'-joined QuestDB CSV rows like `"dhan",123;"groww",45;`) into
 /// {feed: count_str}. Malformed fragments are skipped; an empty/absent value
 /// yields {} (the UI then shows nothing rather than fabricated zeros).
+///
+/// The `"groww"` in that example and in this module's parser fixtures is NOT
+/// stale after the 2026-08-21 feed removal: the `feed` column is part of every
+/// persisted DEDUP key, and the historical `feed='groww'` rows are retained
+/// (SEBI never-delete), so a GROUP BY feed genuinely still returns them. The
+/// parser must keep handling any feed label it is handed, known or retired.
 pub fn parse_feed_counts(raw: &str) -> Value {
     let mut out = serde_json::Map::new();
     for part in raw.split(';') {
@@ -530,18 +842,42 @@ pub fn parse_view(stdout: &str) -> Value {
         }
     }
     let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
-    let (spot, chain, contracts) = (get("SPOT_TODAY"), get("CHAIN_TODAY"), get("CONTRACT_TODAY"));
+    let (ticks, depth) = (get("TICKS_TODAY"), get("DEPTH_TODAY"));
     json!({
         "app": get("APP"),
-        // Official minute candles captured today by the REST pulls — the
-        // three LIVE tables, per table + per feed. See VIEW_COMMANDS.
-        "rows_today": {"spot": spot, "chain": chain, "contracts": contracts},
-        "rows_today_total": sum_counts(&[&spot, &chain, &contracts]),
+        // Rows captured today by the LIVE socket lane — the two live tables,
+        // per table + per feed. See VIEW_COMMANDS.
+        //
+        // 2026-09-03: `contracts` is GONE from all three fields, not zeroed.
+        // `rest_option_contract_1m` has had no DDL caller and no writer since
+        // the 2026-08-21 Groww removal, so a "contracts: 0" bar would have
+        // said *the leg captured nothing today* about a leg that no longer
+        // exists — and a zero an operator cannot distinguish from a real
+        // outage is worse than an absent field. Rationale + the measurement
+        // live on VIEW_COMMANDS in operator_control_commands.rs.
+        //
+        // ⚠ 2026-09-17: these fields are RE-POINTED, not merely renamed. They
+        // read `rest_spot_1m` / `rest_option_chain_1m` until the operator's
+        // SOCKETS-ONLY narrowing removed both writers
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10; the decision and
+        // its alternatives are §12.12). Both tables are RETAINED and hold real
+        // history, so these queries did not ERROR — they returned a permanent
+        // zero for `today()`, which is the 2026-09-03 paragraph above arriving
+        // a second time and in its worse form. The names move WITH the
+        // queries: a re-pointed read under its old name is the stale-name trap
+        // §12.8(a)/§12.9(a) record, and an operator reading "spot" would
+        // believe they were looking at the retired REST leg.
+        "rows_today": {"ticks": ticks, "depth": depth},
+        "rows_today_total": sum_counts(&[&ticks, &depth]),
         "rows_by_feed": {
-            "spot": parse_feed_counts(&get("SPOT_BY_FEED")),
-            "chain": parse_feed_counts(&get("CHAIN_BY_FEED")),
-            "contracts": parse_feed_counts(&get("CONTRACT_BY_FEED")),
+            "ticks": parse_feed_counts(&get("TICKS_BY_FEED")),
         },
+        // Upsert-key count for `ticks` — FIVE columns
+        // (ts, security_id, segment, capture_seq, feed), per
+        // `tick_persistence::DEDUP_KEY_TICKS` and pinned by
+        // `questdb_init_script_guard.rs`. The expectation moves 4 → 5 with the
+        // re-point; keeping the 4 would have shown a red "DEDUP disabled /
+        // schema drift" shield on a perfectly healthy box, every day.
         "dedup_key_columns": get("DEDUP_KEYS"),
         "recent_errors": errors,
     })
@@ -557,41 +893,29 @@ pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
     if c > 0.0 { Some(s / c) } else { None }
 }
 
-/// legacy: `_parse_rest_lat_row` (handler.py:496-532) — parse one
-/// `<feed>,<leg>,<ok_rows>,<p50>,<p99>` CSV line (latency in MILLISECONDS —
-/// close_to_data_ms is stored in ms), or None for anything malformed — a
-/// failed on-box query yields nothing, never a fabricated row.
-pub fn parse_rest_lat_row(raw: &str) -> Option<Value> {
-    let parts: Vec<&str> = raw.split(',').map(|p| p.trim().trim_matches('"')).collect();
-    if parts.len() != 5 {
-        return None;
-    }
-    let (feed, leg) = (parts[0], parts[1]);
-    if !is_token(feed) || !is_token(leg) {
-        return None;
-    }
-    let rows = parse_num(parts[2])?;
-    if rows < 0.0 {
-        return None;
-    }
-    let (p50, p99) = (parse_num(parts[3]), parse_num(parts[4]));
-    Some(json!({
-        "feed": feed,
-        "leg": leg,
-        // legacy `int(rows)` truncation; `as i64` saturates on the untested
-        // inf edge instead of raising.
-        "ok_rows": rows as i64,
-        "p50_ms": p50.map(round1),
-        "p99_ms": p99.map(round1),
-    }))
-}
+// ---- `parse_rest_lat_row` is RETIRED 2026-09-17 ----
+//
+// It parsed one `<feed>,<leg>,<ok_rows>,<p50>,<p99>` line out of the
+// `RESTLAT_ROW=` stream. Its producer — the `rest_fetch_audit` percentile
+// curl — was removed with the per-minute REST legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction), so
+// nothing emits that prefix any more.
+//
+// The DISCIPLINE it carried is preserved by its siblings and is restated here
+// because it is the durable half: a malformed on-box line yielded `None` and
+// the row was DROPPED — never defaulted, never half-parsed into a plausible
+// wrong number. `parse_ws_lag_rows` and `parse_feed_counts` still hold that
+// line, and any future latency parser must.
 
 /// legacy: `sec_to_ms` inside `_parse_latency` (handler.py:567-571) —
 /// `f"{float(s) * 1000:.1f}"`, "" on unparseable.
 fn sec_to_ms(s: &str) -> String {
     s.trim()
         .parse::<f64>()
-        .map(|f| format!("{:.1}", f * 1000.0))
+        .ok()
+        .map(|seconds| seconds * 1000.0)
+        .filter(|milliseconds| milliseconds.is_finite())
+        .map(|milliseconds| format!("{milliseconds:.1}"))
         .unwrap_or_default()
 }
 
@@ -637,40 +961,88 @@ fn prom_value(line: &str) -> Option<f64> {
 /// lie in the safe direction.
 fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
     use std::collections::BTreeMap;
-    // connection -> (buckets: le -> cumulative count, total count)
-    let mut per_conn: BTreeMap<String, (BTreeMap<String, f64>, f64)> = BTreeMap::new();
+    /// One socket's raw series, gathered before any arithmetic.
+    #[derive(Default)]
+    struct Conn {
+        buckets: BTreeMap<String, f64>,
+        count: f64,
+        endpoint: Option<String>,
+        instruments: Option<f64>,
+        frames: Option<f64>,
+        tick_age_secs: Option<f64>,
+        never_received: bool,
+        receive_buffer_bytes: Option<u32>,
+    }
+    let mut per_conn: BTreeMap<u32, Conn> = BTreeMap::new();
 
     for line in raw {
         let Some(conn) = prom_label(line, "connection") else {
             continue;
         };
+        // A numeric slot, never a string key: "10" must sort AFTER "9", and
+        // the `unknown` bucket the drain degrades into is not a socket.
+        let Ok(slot) = conn.parse::<u32>() else {
+            continue;
+        };
         let Some(value) = prom_value(line) else {
             continue;
         };
-        let entry = per_conn
-            .entry(conn.to_string())
-            .or_insert_with(|| (BTreeMap::new(), 0.0));
+        let entry = per_conn.entry(slot).or_default();
+        if let Some(endpoint) = prom_label(line, "endpoint") {
+            entry.endpoint = Some(endpoint.to_string());
+        }
         if line.starts_with("tv_dhan_ws_lag_ms_bucket") {
             if let Some(le) = prom_label(line, "le") {
-                entry.0.insert(le.to_string(), value);
+                entry.buckets.insert(le.to_string(), value);
             }
         } else if line.starts_with("tv_dhan_ws_lag_ms_count") {
-            entry.1 = value;
+            entry.count = value;
+        } else if line.starts_with("tv_dhan_ws_conn_instruments") {
+            entry.instruments = Some(value);
+        } else if line.starts_with("tv_dhan_ws_conn_frames") {
+            entry.frames = Some(value);
+        } else if line.starts_with("tv_dhan_ws_receive_buffer_bytes{") {
+            // Linux SO_RCVBUF returns a positive signed integer, or the
+            // emitter reports -1 when the socket cannot be sampled.
+            entry.receive_buffer_bytes =
+                (value >= 1.0 && value <= f64::from(i32::MAX) && value.fract() == 0.0)
+                    .then_some(value as u32);
+        } else if line.starts_with("tv_dhan_ws_conn_tick_age_secs") {
+            // The drain publishes -1 for "never delivered"; that is an
+            // absence, not a negative age, and must not render as a number.
+            entry.never_received = value == -1.0;
+            entry.tick_age_secs = (value.is_finite() && value >= 0.0).then_some(value);
         }
     }
 
     per_conn
         .into_iter()
-        .filter(|(_, (_, count))| *count > 0.0)
-        .map(|(conn, (buckets, count))| {
+        // A socket with measured ticks OR published stats gets a row. A bare
+        // zero-count histogram with nothing else is a series the exporter
+        // pre-registered, not a socket that exists.
+        .filter(|(_, c)| {
+            c.count > 0.0
+                || c.instruments.is_some()
+                || c.frames.is_some()
+                || c.endpoint.is_some()
+                || c.receive_buffer_bytes.is_some()
+        })
+        .map(|(slot, c)| {
             // Sort by numeric bound; `+Inf` sorts last by construction.
-            let mut bounds: Vec<(f64, &String, f64)> = buckets
+            let mut bounds: Vec<(f64, &String, f64)> = c
+                .buckets
                 .iter()
                 .map(|(le, cum)| (le.parse::<f64>().unwrap_or(f64::INFINITY), le, *cum))
                 .collect();
             bounds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
+            let count = c.count;
             let quantile = |q: f64| -> Value {
+                if count <= 0.0 {
+                    // No ticks measured: there is no percentile, and a zero
+                    // here would read as "instant delivery".
+                    return Value::Null;
+                }
                 let target = q * count;
                 // The bucket's `le` STRING is deliberately unused here — the
                 // decision below is made on the PARSED value's finiteness, for
@@ -701,7 +1073,13 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
             };
 
             json!({
-                "connection": conn,
+                "connection": slot.to_string(),
+                "endpoint": c.endpoint,
+                "instruments": c.instruments,
+                "frames": c.frames,
+                "tick_age_secs": c.tick_age_secs,
+                "never_received": c.never_received,
+                "receive_buffer_bytes": c.receive_buffer_bytes,
                 "samples": count,
                 "p50_ms": quantile(0.50),
                 "p99_ms": quantile(0.99),
@@ -711,23 +1089,24 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
 }
 
 /// legacy: `_parse_latency` (handler.py:535-585) — parse the labeled latency
-/// snapshot. RESTLAT_ROW lines carry the per-(feed, leg) rest_fetch_audit
-/// aggregate; the METRICS block carries the dormant order-placement
+/// snapshot. WSLAT_RAW lines carry the per-socket live delivery-lag histogram
+/// and gauges; the METRICS block carries the dormant order-placement
 /// histogram. Empty stdout (box stopped) degrades to an empty table + blank
 /// shields — the page says so honestly instead of fabricating numbers.
+///
+/// 2026-09-17: the `RESTLAT_ROW=` aggregate is no longer parsed — its
+/// `rest_fetch_audit` producer went with the per-minute REST legs.
 pub fn parse_latency(stdout: &str) -> Value {
     let mut metrics: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut rest_rows: Vec<Value> = Vec::new();
     let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut ws_raw: Vec<String> = Vec::new();
     let mut in_metrics = false;
     for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("RESTLAT_ROW=") {
-            if let Some(row) = parse_rest_lat_row(rest) {
-                rest_rows.push(row);
-            }
-            continue;
-        }
+        // 2026-09-17: the `RESTLAT_ROW=` arm is GONE with its producer. An
+        // older Lambda build still emitting the prefix now falls through to
+        // the generic `k=v` arm below and lands in `fields`, where nothing
+        // reads it — ignored, never rendered, and never surfaced as a
+        // latency row sourced from a table with no writer.
         if let Some(raw) = line.strip_prefix("WSLAT_RAW=") {
             ws_raw.push(raw.to_string());
             continue;
@@ -751,6 +1130,14 @@ pub fn parse_latency(stdout: &str) -> Value {
             fields.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
+    let questdb_ms = fields
+        .get("QDB_PROBE")
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|reply| reply.get("error").is_none() && reply["dataset"] == json!([[1]]))
+        .and_then(|_| fields.get("QDB"))
+        .filter(|seconds| seconds.parse::<f64>().is_ok_and(|value| value >= 0.0))
+        .map(|seconds| sec_to_ms(seconds))
+        .unwrap_or_default();
     let order_avg = avg_ns(
         metrics
             .get("tv_order_placement_duration_ns_sum")
@@ -760,15 +1147,17 @@ pub fn parse_latency(stdout: &str) -> Value {
             .map_or("", String::as_str),
     );
     json!({
-        // Per-(feed, leg) "how fast after each minute closed" rows. Empty
-        // list = the box returned no rows (stopped box, empty fetch log, or
-        // query failed) — the page says so honestly.
-        "rest_latency": rest_rows,
+        // 2026-09-17: the `rest_latency` field is GONE, not emptied. It
+        // carried per-(feed, leg) "how fast after each minute closed"
+        // percentiles from `rest_fetch_audit`; with no per-minute fetch left
+        // to time, an always-`[]` field would read as "the pulls ran and were
+        // never late" — the zero-an-operator-cannot-distinguish class this
+        // file records twice above.
         // Per-SOCKET live-feed delivery lag. Empty list = the lane produced no
         // ticks (feed off, box stopped, or /metrics unreachable) — the page
         // says that rather than showing a comforting zero.
         "ws_latency": parse_ws_lag_rows(&ws_raw),
-        "questdb_ms": sec_to_ms(fields.get("QDB").map_or("", String::as_str)),
+        "questdb_ms": questdb_ms,
         "clock_skew_ms": sec_to_ms(fields.get("SKEW").map_or("", String::as_str)),
         "order_place_avg_ns": order_avg.map(round1),
     })
@@ -822,73 +1211,19 @@ pub fn extract_marked_json(stdout: &str, begin: &str, end: &str) -> (Value, Stri
     }
 }
 
-/// legacy: `_parse_rest_audit` (handler.py:702-723) — parse the REST_AUDIT
-/// value (';'-joined `feed,outcome,count` CSV rows) into
-/// {feed: {outcome: count_int}}. Charset-validated; malformed fragments are
-/// skipped so an empty/absent value yields {} — the card then says "no pulls
-/// recorded today" instead of fabricated zeros (audit Rule 11).
-pub fn parse_rest_audit(raw: &str) -> Value {
-    let mut out = serde_json::Map::new();
-    for part in raw.split(';') {
-        let parts: Vec<&str> = part
-            .trim()
-            .split(',')
-            .map(|p| p.trim().trim_matches('"'))
-            .collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let (feed, outcome, cnt) = (parts[0], parts[1], parts[2]);
-        if !is_token(feed) || !is_token(outcome) {
-            continue;
-        }
-        if cnt.is_empty() || !cnt.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(n) = cnt.parse::<i64>() else {
-            continue;
-        };
-        if let Some(m) = out
-            .entry(feed.to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()))
-            .as_object_mut()
-        {
-            m.insert(outcome.to_string(), Value::Number(n.into()));
-        }
-    }
-    Value::Object(out)
-}
-
-/// legacy: `_parse_rest_lat_hour` (handler.py:726-755) — parse the
-/// REST_LAT_HOUR value (';'-joined `feed,p50,p99` CSV rows, milliseconds)
-/// into {feed: {p50_ms, p99_ms}}. Malformed fragments skipped, never
-/// fabricated.
-pub fn parse_rest_lat_hour(raw: &str) -> Value {
-    let mut out = serde_json::Map::new();
-    for part in raw.split(';') {
-        let parts: Vec<&str> = part
-            .trim()
-            .split(',')
-            .map(|p| p.trim().trim_matches('"'))
-            .collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let feed = parts[0];
-        if !is_token(feed) {
-            continue;
-        }
-        let (p50, p99) = (parse_num(parts[1]), parse_num(parts[2]));
-        if p50.is_none() && p99.is_none() {
-            continue;
-        }
-        out.insert(
-            feed.to_string(),
-            json!({"p50_ms": p50.map(round1), "p99_ms": p99.map(round1)}),
-        );
-    }
-    Value::Object(out)
-}
+// ---- `parse_rest_audit` and `parse_rest_lat_hour` are RETIRED 2026-09-17 ----
+//
+// They turned the two `rest_fetch_audit` snapshot lines into
+// `{feed: {outcome: count}}` and `{feed: {p50_ms, p99_ms}}`. Both sources are
+// gone with the per-minute REST legs (§12.10 / §12.11 / §12.12).
+//
+// Their shared DISCIPLINE is not retired and binds every future snapshot
+// parser here: charset-validate each fragment, SKIP anything malformed, and
+// let an empty input yield an empty map — never a fabricated zero row. The
+// caller, not the parser, decides what an empty map MEANS.
+//
+// `parse_feed_counts` below is the surviving example of that shape and is
+// still in use by the Data tab.
 
 /// legacy: `_parse_feeds_view` (handler.py:758-798) — parse the marked
 /// feeds-view snapshot. On any failure the matching *_error field carries a
@@ -902,40 +1237,45 @@ pub fn parse_feeds_view(stdout: &str) -> Value {
             "feeds_error": BOX_UNREACHABLE,
             "health": null,
             "health_error": BOX_UNREACHABLE,
-            "rest_audit": {},
-            "rest_lat_hour": {},
+            // Both fields are `null` + a STRUCTURED error, never an empty map.
+            //
+            // That shape is the 2026-09-08 lesson, kept after the third field
+            // that taught it was retired with the REST legs: an empty map
+            // renders as a SENTENCE ("no ... recorded today"), so a blind read
+            // and a genuinely idle lane produce identical words. The operator
+            // read that sentence for a whole morning while the lane was
+            // healthy and flushing every minute.
+            //
+            // A false ALARM manufactured by an unreadable data path costs the
+            // same thing a false OK does: trust in the surface. Any field
+            // added here owes the same three-way split — see the retired
+            // feeds-card tests in this file's test module for the full record.
         });
     }
     let (feeds, feeds_error) = extract_marked_json(stdout, "FEEDS_BEGIN", "FEEDS_END");
     let (health, health_error) =
         extract_marked_json(stdout, "FEEDS_HEALTH_BEGIN", "FEEDS_HEALTH_END");
-    let mut fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut in_block = false;
-    for line in stdout.lines() {
-        // Skip the marker-delimited JSON blocks — a JSON body containing '='
-        // must never be mistaken for a labeled line.
-        if line == "FEEDS_BEGIN" || line == "FEEDS_HEALTH_BEGIN" {
-            in_block = true;
-            continue;
-        }
-        if line == "FEEDS_END" || line == "FEEDS_HEALTH_END" {
-            in_block = false;
-            continue;
-        }
-        if in_block {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            fields.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
+    // ⚠ 2026-09-17: the labeled-line scan that stood here is REMOVED with the
+    // only two lines it ever read — `REST_AUDIT=` and `REST_LAT_HOUR=`, both
+    // sourced from `rest_fetch_audit`, whose writer went with the per-minute
+    // REST legs (`no-rest-except-live-feed-2026-06-27.md` §12.12). Every
+    // command in `FEEDS_VIEW_COMMANDS` now emits marker-delimited JSON and
+    // nothing else, so the scan had no input and its output had no reader:
+    // a `HashMap` built on every call and dropped unread.
+    //
+    // TWO RULES it encoded, restated because re-adding a labeled line means
+    // re-adding the scan and both are easy to miss the second time:
+    //
+    //   1. The scan MUST skip between the BEGIN/END markers. A '=' inside a
+    //      JSON body is not a labeled line, and a body carrying one would
+    //      otherwise register a phantom field.
+    //   2. A field read that way owes the three-way ABSENT / UNPARSEABLE /
+    //      GENUINELY-EMPTY split — see the unreachable arm above.
     json!({
         "feeds": feeds,
         "feeds_error": feeds_error,
         "health": health,
         "health_error": health_error,
-        "rest_audit": parse_rest_audit(fields.get("REST_AUDIT").map_or("", String::as_str)),
-        "rest_lat_hour": parse_rest_lat_hour(fields.get("REST_LAT_HOUR").map_or("", String::as_str)),
     })
 }
 
@@ -951,7 +1291,7 @@ pub fn validate_feed_toggle(feed: &Value, enabled: &Value) -> String {
         .as_str()
         .is_some_and(|s| FEED_NAME_RE.as_ref().is_some_and(|re| re.is_match(s)));
     if !feed_ok {
-        return "feed must be a lowercase feed name like 'dhan' or 'groww'".to_string();
+        return "feed must be a lowercase feed name like 'dhan' or 'truedata'".to_string();
     }
     if !enabled.is_boolean() {
         return "enabled must be a JSON boolean (true or false)".to_string();
@@ -1124,10 +1464,67 @@ pub fn html_resp(footer_html: &str) -> Value {
 // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 #[allow(async_fn_in_trait)]
 pub trait OpsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        None
+    }
+    async fn stock_movers_payload(
+        &self,
+        filter: &crate::operator_stock_movers_wire::Filter,
+    ) -> Result<String, crate::operator_movers_wire::BridgeError> {
+        let encoded = filter
+            .to_hex()
+            .ok_or(crate::operator_movers_wire::BridgeError::InvalidResponse)?;
+        crate::operator_stock_movers::strict_read_payload(
+            self,
+            format!(
+                "{} --filter {}",
+                crate::operator_control_action_commands::MOVERS_COMMAND,
+                encoded
+            ),
+        )
+        .await
+    }
+    /// Plan PR MV (2026-11-06): the published movers universe object
+    /// (`s3://<LIVE_VIEW_BUCKET>/movers/universe.json`), at most
+    /// `MAX_UNIVERSE_BYTES`. `Err` on any failure; the caller then falls back
+    /// to the box. Test shells default to "absent".
+    async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+        Err("absent".to_string())
+    }
+    /// Plan PR MV review: writes the viewer heartbeat
+    /// (`s3://<LIVE_VIEW_BUCKET>/movers/viewer.json`) that keeps the box
+    /// publishing. `Err` on any failure. Test shells default to "absent".
+    async fn put_viewer_heartbeat(&self, _body: Vec<u8>) -> Result<(), String> {
+        Err("absent".to_string())
+    }
+    /// Per-container bounded read cache; test shells may opt out.
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        None
+    }
+    /// Fixed read-only Rust helper, dispatched through the existing shell sender.
+    async fn movers_payload(&self) -> String {
+        match crate::operator_stock_movers::strict_read_payload(
+            self,
+            crate::operator_control_action_commands::MOVERS_COMMAND.to_owned(),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(code) => serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                code,
+                self.now_epoch(),
+            ))
+            .unwrap_or_default(),
+        }
+    }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
     fn market_hours_now(&self) -> bool;
+    /// [`is_data_destructive_locked`] at the current instant.
+    fn data_destructive_locked_now(&self) -> bool;
+    /// [`CONSOLE_DATA_WIPES_AUTHORIZED`] in production.
+    fn data_wipes_authorized(&self) -> bool;
     /// legacy `int(time.time())`.
     fn now_epoch(&self) -> i64;
     /// legacy `os.environ.get(key, "")`.
@@ -1164,6 +1561,155 @@ pub trait OpsShell {
     /// legacy `_main_sha()` — GitHub main HEAD, 60s cache / 600s max-age,
     /// fail-soft to "unknown".
     async fn main_sha(&self) -> String;
+    /// Audit M4: this container's failed-key table.
+    fn auth_failures(&self) -> &AuthFailureGuard;
+}
+
+// Deliberate parity correction: a failed query must never look like zero rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqlQueryError {
+    Unavailable,
+    Failed,
+    TimedOut,
+    Incomplete,
+    TooLarge,
+    InvalidCsv,
+}
+
+fn sql_query_command(query: &str) -> String {
+    let enc = url_quote(query);
+    // Keep the existing read-only SQL/row gates. pipefail preserves curl's
+    // nonzero status; the byte probe and trailer reject truncation, including
+    // SSM truncation. Include the fixed HTTP-status frame plus one extra byte
+    // in the probe: even a truncated body ending in a forged status frame is
+    // one byte over the body cap. Physical-line caps cut multiline CSV cells.
+    format!(
+        "bash -o pipefail -c \"curl -fsS --max-time 5 -w '\\nTV_SQL_HTTP_%{{http_code}}\\n' 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}'|head -c {}&&printf '\\nTV_SQL_OK\\n'\"",
+        SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1
+    )
+}
+
+fn completed_sql_csv(stdout: String, stderr: &str) -> Result<String, SqlQueryError> {
+    if !stderr.is_empty() {
+        return Err(SqlQueryError::Failed);
+    }
+    let framed = stdout
+        .strip_suffix(SQL_COMPLETE)
+        .ok_or(SqlQueryError::Incomplete)?;
+    // curl -f alone accepts redirects. Only an exact HTTP 200 is data.
+    let csv = framed
+        .strip_suffix(SQL_HTTP_OK)
+        .ok_or(SqlQueryError::Failed)?;
+    if csv.is_empty() {
+        return Err(SqlQueryError::Incomplete);
+    }
+    if csv.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    Ok(csv.to_string())
+}
+
+// The existing, workspace-pinned csv crate owns field interpretation. Its
+// parser intentionally accepts some malformed quoting, so reject those forms
+// before parsing rather than silently repairing forensic data.
+fn sql_csv_syntax_valid(text: &str) -> bool {
+    let mut state = 0; // 0 field start, 1 plain, 2 quoted, 3 after quote
+    let mut record_started = false;
+    let mut bytes = text.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if state != 2 && matches!(byte, b'\r' | b'\n') {
+            // csv::Reader skips blank records. Their meaning could be one
+            // null/empty field, so reject rather than invent a zero-row result.
+            if !record_started {
+                return false;
+            }
+            if byte == b'\r' && bytes.peek() == Some(&b'\n') {
+                bytes.next();
+            }
+            state = 0;
+            record_started = false;
+            continue;
+        }
+        record_started = true;
+        state = match (state, byte) {
+            (2, b'"') => 3,
+            (2, _) => 2,
+            (3, b'"') => 2,
+            (3, b',') => 0,
+            (3, _) => return false,
+            (0, b'"') => 2,
+            (_, b'"') => return false,
+            (_, b',') => 0,
+            _ => 1,
+        };
+    }
+    state != 2
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SqlQueryData {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+fn parse_sql_csv(text: &str) -> Result<SqlQueryData, SqlQueryError> {
+    if text.len() > SQL_MAX_BYTES {
+        return Err(SqlQueryError::TooLarge);
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if !sql_csv_syntax_valid(text) {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(text.as_bytes());
+    let header = reader.headers().map_err(|_| SqlQueryError::InvalidCsv)?;
+    if header.is_empty() {
+        return Err(SqlQueryError::InvalidCsv);
+    }
+    let columns = header.iter().map(str::to_owned).collect();
+    let row_limit = usize::try_from(SQL_MAX_ROWS).map_err(|_| SqlQueryError::TooLarge)?;
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        if rows.len() == row_limit {
+            return Err(SqlQueryError::TooLarge);
+        }
+        let record = record.map_err(|_| SqlQueryError::InvalidCsv)?;
+        rows.push(record.iter().map(str::to_owned).collect());
+    }
+    Ok(SqlQueryData { columns, rows })
+}
+
+async fn read_sql_csv<S: OpsShell>(
+    shell: &S,
+    commands: &[String],
+    budget: std::time::Duration,
+) -> Result<String, SqlQueryError> {
+    // Bound the complete operation, including sending and polling AWS calls.
+    tokio::time::timeout(budget, async {
+        let cid = shell
+            .ssm_shell(commands)
+            .await
+            .map_err(|_| SqlQueryError::Unavailable)?;
+        loop {
+            match shell.command_invocation(&cid).await {
+                Ok((status, stdout, stderr)) if status == "Success" => {
+                    return completed_sql_csv(stdout, &stderr);
+                }
+                Ok((status, _, _))
+                    if !matches!(status.as_str(), "Pending" | "InProgress" | "Delayed") =>
+                {
+                    return Err(SqlQueryError::Failed);
+                }
+                // SSM may not have registered the invocation immediately.
+                Ok(_) | Err(_) => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(VIEW_POLL_SECS)).await;
+        }
+    })
+    .await
+    .unwrap_or(Err(SqlQueryError::TimedOut))
 }
 
 /// legacy 500 arm: `except Exception: _resp(500, {"error": "action failed",
@@ -1197,11 +1743,65 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         return html_resp(&footer);
     }
 
+    // Audit M4: a source that used up its failed attempts is refused before
+    // the secret is read or compared.
+    let source = source_ip(event);
+    let guard = shell.auth_failures();
+    if let AuthGate::Refused { retry_after_secs } = guard.check(&source, shell.now_epoch()) {
+        return resp(
+            429,
+            &json!({
+                "error": "too many wrong keys from this address — try again later",
+                "retry_after_secs": retry_after_secs,
+            }),
+        );
+    }
+
     let headers = event.get("headers").cloned().unwrap_or(Value::Null);
     let secret = shell.control_secret().await;
+    // 2026-11-17 (owner card "Remember 30 days"): the page now remembers the
+    // key in the browser and forgets it on a 401. An unreadable secret is our
+    // failure, not a wrong key, so it answers 503: a 401 here would make the
+    // browser forget a correct key.
+    if secret.is_empty() {
+        return resp(
+            503,
+            &json!({"error": "control secret unreadable on the server — try again shortly"}),
+        );
+    }
     if !authorized(&headers, &secret) {
+        // An unreadable secret was answered 503 above, so every refusal here
+        // is a wrong key and counts against the source.
+        {
+            match guard.record_failure(&source, shell.now_epoch()) {
+                AuthFailureRecord::LockedOut => {
+                    tracing::error!(
+                        code = "LAMBDA-PORTAL-01",
+                        action = "auth",
+                        %source,
+                        failures = AUTH_FAILURE_LIMIT,
+                        window_secs = AUTH_FAILURE_WINDOW_SECS,
+                        "operator-portal: source refused after repeated wrong keys (per-container count)"
+                    );
+                }
+                AuthFailureRecord::Untracked { untracked_total }
+                    if untracked_total.is_power_of_two() =>
+                {
+                    tracing::error!(
+                        code = "LAMBDA-PORTAL-01",
+                        action = "auth",
+                        %source,
+                        untracked_total,
+                        max_sources = AUTH_FAILURE_MAX_SOURCES,
+                        "operator-portal: failed-key table full, wrong key not counted"
+                    );
+                }
+                AuthFailureRecord::Counted(_) | AuthFailureRecord::Untracked { .. } => {}
+            }
+        }
         return resp(401, &json!({"error": "unauthorized"}));
     }
+    guard.record_success(&source);
 
     // legacy: `raw = event.get("body") or "{}"`; dict passthrough, else
     // json.loads (fail → 400). Ledger deviation: a parsed NON-OBJECT payload
@@ -1220,16 +1820,33 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     let action = payload_str(&payload, "action").to_string();
     let force = truthy(payload.get("force").unwrap_or(&Value::Bool(false)));
 
-    // HARD gate first: data-destructive actions have NO force escape during
-    // market hours (audit fix #2 — see DATA_DESTRUCTIVE above). Must run
-    // BEFORE the soft gate below because DATA_DESTRUCTIVE ⊂ DESTRUCTIVE.
-    if DATA_DESTRUCTIVE.contains(&action.as_str()) && shell.market_hours_now() {
+    // HARD gate first: data-destructive actions have NO force escape inside
+    // the lock window (audit fix #2 — see DATA_DESTRUCTIVE above; the window
+    // is 09:00-15:45 every day since audit PR20). Must run BEFORE the soft
+    // gate below because DATA_DESTRUCTIVE ⊂ DESTRUCTIVE.
+    if DATA_DESTRUCTIVE.contains(&action.as_str()) && shell.data_destructive_locked_now() {
         return resp(
             409,
             &json!({
                 "error": DATA_DESTRUCTIVE_LOCK_MSG,
                 "action": action,
                 "market_hours_locked": true,
+            }),
+        );
+    }
+    // Zero-loss gate (plan item 45g D10): no data-deleting action runs at any
+    // hour while CONSOLE_DATA_WIPES_AUTHORIZED is false.
+    if DATA_DESTRUCTIVE.contains(&action.as_str()) && !shell.data_wipes_authorized() {
+        tracing::warn!(
+            %action,
+            "operator-portal: data-deleting action refused (zero-loss lock)"
+        );
+        return resp(
+            409,
+            &json!({
+                "error": CONSOLE_DATA_WIPES_REFUSED_MSG,
+                "action": action,
+                "data_wipes_disabled": true,
             }),
         );
     }
@@ -1248,21 +1865,21 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         "start" => match shell.ec2_start().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "stop" => match shell.ec2_stop().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
         "reboot" => match shell.ec2_reboot().await {
             Ok(()) => resp(200, &json!({"ok": true, "action": action})),
             Err(exc) => {
-                tracing::error!(%action, %exc, "operator-portal action failed");
+                tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                 action_failed(&action)
             }
         },
@@ -1276,7 +1893,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1292,23 +1909,25 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
         }
         "restart-questdb" => {
-            // ensure-questdb.sh (create-or-restart) — robust to
+            // The on-box self-heal (create-or-restart), robust to
             // docker-compose v1/v2 absence + the CORRECT service name +
-            // SSM creds for the recreate case (incident 2026-06-08).
-            let cmds = ["bash /opt/tickvault/repo/scripts/ensure-questdb.sh".to_string()];
+            // SSM creds for the recreate case (incident 2026-06-08). Now the
+            // `ensure-questdb` subcommand of the installed binary (audit D6d).
+            let cmds =
+                [crate::operator_control_action_commands::ENSURE_QUESTDB_COMMAND.to_string()];
             match shell.ssm_shell(&cmds).await {
                 Ok(cid) => resp(
                     200,
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1380,7 +1999,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1423,7 +2042,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     )
                 }
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1461,7 +2080,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                     &json!({"ok": true, "action": action, "command_id": cid}),
                 ),
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     action_failed(&action)
                 }
             }
@@ -1471,7 +2090,7 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             let state = match shell.instance_state().await {
                 Ok(s) => s,
                 Err(exc) => {
-                    tracing::error!(%action, %exc, "operator-portal action failed");
+                    tracing::error!(code = "LAMBDA-PORTAL-01", %action, %exc, "operator-portal action failed");
                     return action_failed(&action);
                 }
             };
@@ -1489,10 +2108,11 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             };
             let snap = parse_view(&stdout);
             let mh = shell.market_hours_now();
+            let dl = shell.data_destructive_locked_now();
             resp(
                 200,
                 &merged(
-                    json!({"ok": true, "action": "view", "instance_state": state, "market_hours": mh}),
+                    json!({"ok": true, "action": "view", "instance_state": state, "market_hours": mh, "data_destructive_locked": dl}),
                     &snap,
                 ),
             )
@@ -1510,16 +2130,37 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
                 );
             }
             let q = cap_sql_rows(&q);
-            let enc = url_quote(&q);
-            let cmds = [
-                "set +e".to_string(),
-                format!(
-                    "curl -fsS 'http://127.0.0.1:9000/exp?query={enc}&limit={SQL_MAX_ROWS}' 2>/dev/null | head -{} || echo 'query failed'",
-                    SQL_MAX_ROWS + 1
+            let cmds = [sql_query_command(&q)];
+            match read_sql_csv(
+                shell,
+                &cmds,
+                std::time::Duration::from_secs_f64(VIEW_TIMEOUT_SECS),
+            )
+            .await
+            .and_then(|csv| parse_sql_csv(&csv).map(|data| (csv, data)))
+            {
+                Ok((csv, data)) => resp(
+                    200,
+                    &json!({"ok": true, "action": "sql", "csv": csv, "columns": data.columns, "rows": data.rows}),
                 ),
-            ];
-            let out = shell.ssm_shell_sync(&cmds, VIEW_TIMEOUT_SECS).await;
-            resp(200, &json!({"ok": true, "action": "sql", "csv": out}))
+                Err(error) => {
+                    tracing::warn!(?error, "operator-portal SQL result unavailable");
+                    let (status, reason) = match error {
+                        SqlQueryError::TimedOut => {
+                            (504, "query timed out; no result was confirmed")
+                        }
+                        SqlQueryError::TooLarge => (
+                            502,
+                            "query result is too large; select fewer rows or columns",
+                        ),
+                        _ => (502, "query failed or returned an incomplete result"),
+                    };
+                    resp(
+                        status,
+                        &json!({"ok": false, "action": "sql", "error": reason}),
+                    )
+                }
+            }
         }
         "qdb_console_url" => {
             // READ-ONLY: mint a one-click 90s HMAC link to the B4 QuestDB
@@ -1568,6 +2209,33 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         // (cross_verify removed 2026-07-16 — the 15:31 IST Dhan live-vs-
         // historical comparer was deleted in PR-C3 2026-07-14; unknown-action
         // 400 now.)
+        "stock-movers" => {
+            let filter = match payload.get("filter") {
+                Some(value) => serde_json::from_value::<crate::operator_stock_movers_wire::Filter>(
+                    value.clone(),
+                ),
+                None => Ok(crate::operator_stock_movers_wire::Filter::default()),
+            };
+            let Ok(filter) = filter else {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            };
+            if !filter.valid() {
+                return resp(400, &json!({"error":"Invalid movers filter"}));
+            }
+            let reply = crate::operator_stock_movers::read(shell, &filter).await;
+            resp(
+                200,
+                &json!({"ok":true,"action":action,"movers":reply,"observed_at_epoch_secs":shell.now_epoch()}),
+            )
+        }
+        "fno-stocks" => {
+            let reply = crate::operator_movers::read(shell).await;
+            resp(
+                200,
+                &json!({"ok": true, "action": action, "movers": reply,
+                "observed_at_epoch_secs": shell.now_epoch()}),
+            )
+        }
         "feeds-view" => {
             // READ-ONLY: current per-feed enabled/lane state + per-feed
             // health, via SSM-curl of the app's local API (SG keeps :3001
@@ -1653,10 +2321,22 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
 /// it feeds are what the unit tests cover, exactly like the legacy oracle's
 /// boto3 glue).
 pub struct AwsShell {
+    stock_movers_cache: crate::operator_stock_movers::MoversCache,
+    movers_cache: crate::operator_movers::MoversCache,
     ec2: aws_sdk_ec2::Client,
+    /// Plan PR MV: reads the published movers universe.
+    s3: aws_sdk_s3::Client,
+    /// `LIVE_VIEW_BUCKET` (terraform); empty or invalid = no published universe.
+    live_view_bucket: String,
+    /// `BUDGET_ACCOUNT_ID` (terraform), the live-view bucket's expected owner;
+    /// empty or invalid = no published universe.
+    live_view_owner: String,
     ssm: aws_sdk_ssm::Client,
     cloudwatch: aws_sdk_cloudwatch::Client,
-    ce: aws_sdk_costexplorer::Client,
+    /// AWS Budgets (free) for the month-to-date cost, since 2026-10-22
+    /// (plan item 63, Quote 37; was Cost Explorer).
+    budgets: aws_sdk_budgets::Client,
+    budget_coords: Result<crate::budget_spend::BudgetCoordinates, String>,
     /// None when the client build failed (HTTP-CLIENT-01 class — logged
     /// loudly at build; provenance then degrades to "unknown", never a
     /// panic-class `Client::new()` fallback).
@@ -1670,6 +2350,49 @@ pub struct AwsShell {
     param_cache: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     /// legacy `_main_sha_cache` — (value, fetched_at).
     main_sha_cache: std::sync::Mutex<(String, Option<std::time::Instant>)>,
+    /// Audit M4: failed key attempts per source, this container only.
+    auth_failures: AuthFailureGuard,
+}
+
+/// The live-view bucket and its expected owner, when both are configured
+/// and well formed (plan PR MV review: a mis-set name or account is refused,
+/// never sent). O(len).
+fn live_view_target<'a>(bucket: &'a str, owner: &'a str) -> Result<(&'a str, &'a str), String> {
+    if !crate::operator_movers_universe::valid_live_view_bucket_name(bucket) {
+        return Err("no valid live-view bucket".to_string());
+    }
+    if !crate::operator_movers_universe::valid_account_id(owner) {
+        return Err("no valid bucket owner account".to_string());
+    }
+    Ok((bucket, owner))
+}
+
+/// Reads an S3 body, refusing more than `limit` bytes even when no length was
+/// sent. A one-chunk body is returned as is (no copy). O(bytes).
+async fn read_body_bounded(
+    mut body: aws_sdk_s3::primitives::ByteStream,
+    limit: usize,
+) -> Result<bytes::Bytes, String> {
+    let mut first: Option<bytes::Bytes> = None;
+    let mut joined: Vec<u8> = Vec::new();
+    let mut total = 0_usize;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| err.to_string())?;
+        total = total.saturating_add(chunk.len());
+        if total > limit {
+            return Err("too large".to_string());
+        }
+        match first.take() {
+            None if joined.is_empty() => first = Some(chunk),
+            None => joined.extend_from_slice(&chunk),
+            Some(head) => {
+                joined.reserve(total);
+                joined.extend_from_slice(&head);
+                joined.extend_from_slice(&chunk);
+            }
+        }
+    }
+    Ok(first.unwrap_or_else(|| bytes::Bytes::from(joined)))
 }
 
 fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1693,9 +2416,18 @@ impl AwsShell {
             .ok();
         Self {
             ec2: crate::clients::ec2(&config),
+            s3: crate::clients::s3(&config),
+            live_view_bucket: std::env::var("LIVE_VIEW_BUCKET").unwrap_or_default(),
+            live_view_owner: std::env::var(crate::budget_spend::BUDGET_ACCOUNT_ID_ENV)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
+            movers_cache: crate::operator_movers::MoversCache::default(),
             ssm: crate::clients::ssm(&config),
             cloudwatch: crate::clients::cloudwatch(&config),
-            ce: crate::clients::cost_explorer_us_east_1().await,
+            budgets: crate::clients::budgets_us_east_1().await,
+            budget_coords: crate::budget_spend::budget_coordinates_from_env(),
             http,
             instance_id: std::env::var("TV_INSTANCE_ID").unwrap_or_default(),
             secret_param: std::env::var("OPERATOR_CONTROL_SECRET_PARAM").unwrap_or_default(),
@@ -1705,6 +2437,7 @@ impl AwsShell {
             gh_token_param: std::env::var("OPERATOR_GITHUB_TOKEN_PARAM").unwrap_or_default(),
             param_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             main_sha_cache: std::sync::Mutex::new((String::new(), None)),
+            auth_failures: AuthFailureGuard::new(),
         }
     }
 
@@ -1773,12 +2506,66 @@ impl AwsShell {
 }
 
 impl OpsShell for AwsShell {
+    fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+        Some(&self.stock_movers_cache)
+    }
+    async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+        let (bucket, owner) = live_view_target(&self.live_view_bucket, &self.live_view_owner)?;
+        let out = self
+            .s3
+            .get_object()
+            .bucket(bucket)
+            .key(crate::operator_movers_universe::MOVERS_UNIVERSE_OBJECT_KEY)
+            .expected_bucket_owner(owner)
+            .send()
+            .await
+            .map_err(|err| aws_sdk_s3::error::DisplayErrorContext(&err).to_string())?;
+        if out.content_length().is_some_and(|n| {
+            n < 0 || n as u64 > crate::operator_movers_universe::MAX_UNIVERSE_BYTES as u64
+        }) {
+            return Err("too large".to_string());
+        }
+        read_body_bounded(
+            out.body,
+            crate::operator_movers_universe::MAX_UNIVERSE_BYTES,
+        )
+        .await
+    }
+    async fn put_viewer_heartbeat(&self, body: Vec<u8>) -> Result<(), String> {
+        let (bucket, owner) = live_view_target(&self.live_view_bucket, &self.live_view_owner)?;
+        self.s3
+            .put_object()
+            .bucket(bucket)
+            .key(crate::operator_movers_universe::MOVERS_VIEWER_OBJECT_KEY)
+            .expected_bucket_owner(owner)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(body))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| aws_sdk_s3::error::DisplayErrorContext(&err).to_string())
+    }
+    fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+        Some(&self.movers_cache)
+    }
+    fn auth_failures(&self) -> &AuthFailureGuard {
+        &self.auth_failures
+    }
+
     async fn control_secret(&self) -> String {
         self.cached_param(&self.secret_param).await
     }
 
     fn market_hours_now(&self) -> bool {
         is_market_hours(Utc::now())
+    }
+
+    fn data_destructive_locked_now(&self) -> bool {
+        is_data_destructive_locked(Utc::now())
+    }
+
+    fn data_wipes_authorized(&self) -> bool {
+        CONSOLE_DATA_WIPES_AUTHORIZED
     }
 
     fn now_epoch(&self) -> i64 {
@@ -1845,6 +2632,7 @@ impl OpsShell for AwsShell {
             .instance_ids(&self.instance_id)
             .document_name("AWS-RunShellScript")
             .parameters("commands", commands.to_vec())
+            .timeout_seconds(SSM_DELIVERY_TIMEOUT_SECS)
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
@@ -1876,7 +2664,7 @@ impl OpsShell for AwsShell {
             };
             if matches!(
                 status.as_str(),
-                "Success" | "Failed" | "Cancelled" | "TimedOut"
+                "Success" | "Failed" | "Cancelled" | "TimedOut" | "DeliveryTimedOut"
             ) {
                 return format!("{stdout}{stderr}");
             }
@@ -1931,40 +2719,25 @@ impl OpsShell for AwsShell {
 
     async fn month_to_date_cost(&self) -> String {
         // legacy `_month_to_date_cost` (handler.py:1492-1507) — "" on any
-        // failure. Lambda env clock is UTC (legacy date.today() parity).
-        let today = Utc::now().date_naive();
-        let Some(first) = today.with_day(1) else {
-            return String::new();
+        // failure. 2026-10-22 (plan item 63, operator Quote 37): read from the
+        // free AWS Budgets `DescribeBudget` (was paid Cost Explorer). AWS
+        // refreshes that figure about every 8 to 12 hours and it carries no
+        // month stamp, so on UTC day 1 it may still be last month's total;
+        // the console only shows it, it decides nothing.
+        let coords = match self.budget_coords.as_ref() {
+            Ok(coords) => coords,
+            Err(e) => {
+                tracing::warn!(error = %e, "operator-portal month-to-date cost: budget coordinates missing");
+                return String::new();
+            }
         };
-        let Some(end) = today.succ_opt() else {
-            return String::new();
-        };
-        let Ok(period) = aws_sdk_costexplorer::types::DateInterval::builder()
-            .start(first.format("%Y-%m-%d").to_string())
-            .end(end.format("%Y-%m-%d").to_string())
-            .build()
-        else {
-            return String::new();
-        };
-        let Ok(out) = self
-            .ce
-            .get_cost_and_usage()
-            .time_period(period)
-            .granularity(aws_sdk_costexplorer::types::Granularity::Monthly)
-            .metrics("UnblendedCost")
-            .send()
-            .await
-        else {
-            return String::new();
-        };
-        out.results_by_time()
-            .first()
-            .and_then(|r| r.total())
-            .and_then(|t| t.get("UnblendedCost"))
-            .and_then(|m| m.amount())
-            .and_then(|a| a.parse::<f64>().ok())
-            .map(|f| format!("{f:.2}"))
-            .unwrap_or_default()
+        match crate::budget_spend::describe_actual_spend(&self.budgets, coords).await {
+            Ok(usd) => format!("{usd:.2}"),
+            Err(e) => {
+                tracing::warn!(error = %e, "operator-portal month-to-date cost unavailable");
+                String::new()
+            }
+        }
     }
 
     async fn binary_sha(&self) -> String {
@@ -2328,9 +3101,7 @@ mod tests {
     use crate::operator_control_action_commands::{
         DOCKER_NUKE_BARE_COMMANDS, DOCKER_RESET_COMMANDS, WIPE_QUESTDB_COMMANDS,
     };
-    use crate::operator_control_commands::{
-        FEEDS_VIEW_COMMANDS, LATENCY_COMMANDS, REST_LATENCY_SQL, VIEW_COMMANDS,
-    };
+    use crate::operator_control_commands::{FEEDS_VIEW_COMMANDS, LATENCY_COMMANDS, VIEW_COMMANDS};
 
     // ------------------------------------------------------------ MockShell
     // The legacy tests monkeypatched module globals (`_control_secret`,
@@ -2339,8 +3110,21 @@ mod tests {
     // seam. Defaults mirror the legacy fixtures: secret "s3cret-token",
     // market CLOSED (WipeGate pins the clock off-hours), instance running.
     struct MockShell {
+        stock_movers_cache: crate::operator_stock_movers::MoversCache,
+        movers_cache: crate::operator_movers::MoversCache,
+        movers_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        last_movers_command: std::sync::atomic::AtomicBool,
         secret: String,
         market_hours: bool,
+        /// `None` = the data-destructive lock follows `market_hours` (every
+        /// pre-PR20 test's assumption); `Some(v)` pins it independently, for
+        /// the 09:00-09:15 and 15:40-15:45 edges where the two differ.
+        destructive_locked: Option<bool>,
+        /// `true` by default so the older tests keep exercising the gated
+        /// path a future dated quote would re-open; production returns
+        /// [`CONSOLE_DATA_WIPES_AUTHORIZED`] (`false`), pinned by
+        /// `test_regression_console_data_wipes_are_refused_at_any_hour`.
+        wipes_authorized: bool,
         now: i64,
         env: std::collections::HashMap<String, String>,
         ssm_result: Result<String, String>,
@@ -2355,13 +3139,28 @@ mod tests {
         cost: String,
         captured: std::sync::Mutex<Vec<Vec<String>>>,
         captured_sync: std::sync::Mutex<Vec<Vec<String>>>,
+        auth_failures: AuthFailureGuard,
+        /// Plan PR MV: the published movers universe object.
+        published_universe: Result<Vec<u8>, String>,
+        published_reads: std::sync::atomic::AtomicUsize,
+        /// Plan PR MV: how long reading it takes (paused-clock tests).
+        published_delay_ms: u64,
+        /// Plan PR MV review: viewer heartbeats written.
+        heartbeats: std::sync::Mutex<Vec<Vec<u8>>>,
+        clock_after_heartbeat: Option<i64>,
     }
 
     impl Default for MockShell {
         fn default() -> Self {
             Self {
+                stock_movers_cache: crate::operator_stock_movers::MoversCache::default(),
+                movers_cache: crate::operator_movers::MoversCache::default(),
+                movers_gate: None,
+                last_movers_command: std::sync::atomic::AtomicBool::new(false),
                 secret: AUTH_SECRET.to_string(),
                 market_hours: false,
+                destructive_locked: None,
+                wipes_authorized: true,
                 now: 1_780_000_000,
                 env: std::collections::HashMap::new(),
                 ssm_result: Ok("cid-1".to_string()),
@@ -2374,6 +3173,12 @@ mod tests {
                 cost: String::new(),
                 captured: std::sync::Mutex::new(Vec::new()),
                 captured_sync: std::sync::Mutex::new(Vec::new()),
+                auth_failures: AuthFailureGuard::new(),
+                published_universe: Err("absent".to_string()),
+                published_reads: Default::default(),
+                published_delay_ms: 0,
+                heartbeats: std::sync::Mutex::new(Vec::new()),
+                clock_after_heartbeat: None,
             }
         }
     }
@@ -2391,14 +3196,43 @@ mod tests {
     }
 
     impl OpsShell for MockShell {
+        fn stock_movers_cache(&self) -> Option<&crate::operator_stock_movers::MoversCache> {
+            Some(&self.stock_movers_cache)
+        }
+        async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+            self.published_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.published_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.published_delay_ms)).await;
+            }
+            self.published_universe.clone().map(bytes::Bytes::from)
+        }
+        async fn put_viewer_heartbeat(&self, body: Vec<u8>) -> Result<(), String> {
+            self.heartbeats.lock().unwrap().push(body);
+            Ok(())
+        }
+        fn movers_cache(&self) -> Option<&crate::operator_movers::MoversCache> {
+            Some(&self.movers_cache)
+        }
+        fn auth_failures(&self) -> &AuthFailureGuard {
+            &self.auth_failures
+        }
         async fn control_secret(&self) -> String {
             self.secret.clone()
         }
         fn market_hours_now(&self) -> bool {
             self.market_hours
         }
+        fn data_destructive_locked_now(&self) -> bool {
+            self.destructive_locked.unwrap_or(self.market_hours)
+        }
+        fn data_wipes_authorized(&self) -> bool {
+            self.wipes_authorized
+        }
         fn now_epoch(&self) -> i64 {
-            self.now
+            self.clock_after_heartbeat
+                .filter(|_| !self.heartbeats.lock().unwrap().is_empty())
+                .unwrap_or(self.now)
         }
         fn env(&self, key: &str) -> String {
             self.env.get(key).cloned().unwrap_or_default()
@@ -2431,18 +3265,41 @@ mod tests {
             if let Some(msg) = self.forbid_ssm {
                 panic!("{msg}");
             }
-            self.captured.lock().unwrap().push(commands.to_vec());
+            let movers = commands.len() == 1
+                && (commands[0] == crate::operator_control_action_commands::MOVERS_COMMAND
+                    || commands[0].starts_with("/opt/tickvault/bin/tv-movers --filter "));
+            self.last_movers_command
+                .store(movers, std::sync::atomic::Ordering::Relaxed);
+            if movers {
+                self.captured_sync.lock().unwrap().push(commands.to_vec());
+                if let Some(gate) = &self.movers_gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+            } else {
+                self.captured.lock().unwrap().push(commands.to_vec());
+            }
             self.ssm_result.clone()
         }
         async fn ssm_shell_sync(&self, commands: &[String], _timeout_secs: f64) -> String {
             self.captured_sync.lock().unwrap().push(commands.to_vec());
+            if let Some(gate) = &self.movers_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             self.sync_output.clone()
         }
         async fn command_invocation(
             &self,
             _command_id: &str,
         ) -> Result<(String, String, String), String> {
-            self.invocation.clone()
+            if self
+                .last_movers_command
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.invocation == Err("not registered".into())
+            {
+                Ok(("Success".into(), self.sync_output.clone(), String::new()))
+            } else {
+                self.invocation.clone()
+            }
         }
         async fn firing_alarms(&self) -> Option<Vec<String>> {
             self.alarms.clone()
@@ -2489,6 +3346,740 @@ mod tests {
 
     async fn post(shell: &MockShell, body: Value) -> Value {
         route(&post_event(&body, Some(AUTH_SECRET)), shell).await
+    }
+
+    #[tokio::test]
+    async fn movers_authentication_and_stopped_state_precede_any_private_request() {
+        let shell = MockShell::default();
+        let reply = route(&post_event(&json!({"action":"fno-stocks"}), None), &shell).await;
+        assert_eq!(status_of(&reply), 401);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        let reply = post(&stopped, json!({"action":"fno-stocks"})).await;
+        let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+        assert_eq!(body["movers"]["code"], "instance_stopped");
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+        assert!(stopped.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_fixed_command_cache_expires_and_never_forwards_user_input() {
+        use crate::operator_movers_wire::{BridgeError, Reply};
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(BridgeError::AppUnauthorized, now))
+                .unwrap(),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            let reply = post(&shell, json!({"action":"fno-stocks", "url":"https://invalid.example", "command":"ignored"})).await;
+            let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+            assert_eq!(body["movers"]["code"], "app_unauthorized");
+        }
+        assert_eq!(
+            shell.captured_sync.lock().unwrap().as_slice(),
+            &[vec![
+                crate::operator_control_action_commands::MOVERS_COMMAND.to_string()
+            ]]
+        );
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_concurrent_refresh_is_bounded_and_does_not_dispatch_twice() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased; post(&shell, json!({"action":"fno-stocks"})), async {
+            let response = post(&shell, json!({"action":"fno-stocks"})).await;
+            gate.add_permits(1);
+            response
+        });
+        let a: Value = serde_json::from_str(first["body"].as_str().unwrap()).unwrap();
+        let b: Value = serde_json::from_str(second["body"].as_str().unwrap()).unwrap();
+        assert_eq!(a["movers"]["code"], "bridge_unavailable");
+        assert_eq!(b["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn movers_stalled_bridge_times_out_and_releases_in_flight_exclusion() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let started = tokio::time::Instant::now();
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&reply)["movers"]["code"], "timeout");
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(18));
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        gate.add_permits(1);
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let retry = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(body_of(&retry)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn movers_valid_snapshot_preserves_prices_clock_and_declared_coverage() {
+        let now = MockShell::default().now;
+        let payload = json!({"version":1,"captured_at_epoch_secs":now,"result":"snapshot",
+            "snapshot":{"status":"live","market_open":true,"as_of_ist":"10:15:00",
+                "data_age_secs":2,"fno_stocks_total":236,"stocks_priced":1,"window_secs":900,
+                "value_basis":"day volume x average traded price / 1 crore","selection_limit":20,
+                "gainers_total":1,"losers_total":0,"losers":[],"gainers":[{
+                    "security_id":123,"segment":"NSE_EQ","name":"EXAMPLE","ltp":123.45,
+                    "prev_close":120.0,"change":3.45,"change_pct":2.875,"volume":1000,
+                    "value_cr":0.0123,"last_trade_ist":"10:15:00"}]}});
+        let shell = MockShell {
+            sync_output: payload.to_string(),
+            ..Default::default()
+        };
+        let reply = post(&shell, json!({"action":"fno-stocks"})).await;
+        assert_eq!(status_of(&reply), 200);
+        let body = body_of(&reply);
+        assert_eq!(body["movers"], payload);
+        assert_eq!(body["observed_at_epoch_secs"], now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        assert!(shell.captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_movers_auth_and_invalid_filter_never_reach_ssm() {
+        let shell = MockShell::default();
+        assert_eq!(
+            status_of(&route(&post_event(&json!({"action":"stock-movers"}), None), &shell).await),
+            401
+        );
+        for filter in [
+            json!({"offset":1}),
+            json!({"search":"x".repeat(33)}),
+            json!({"command":"evil"}),
+            json!(null),
+        ] {
+            assert_eq!(
+                status_of(&post(&shell, json!({"action":"stock-movers","filter":filter})).await),
+                400
+            );
+        }
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+        let stopped = MockShell {
+            instance_state: Ok("stopped".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            body_of(&post(&stopped, json!({"action":"stock-movers"})).await)["movers"]["code"],
+            "instance_stopped"
+        );
+        assert!(stopped.captured_sync.lock().unwrap().is_empty());
+    }
+    // ------------------------------------------------ plan PR MV: S3 fast path
+    fn published_universe(observed: i64, market_open: bool) -> Vec<u8> {
+        use crate::operator_movers_universe::*;
+        let listed = ListedStock {
+            security_id: 2,
+            segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+            name: "STOCK002".into(),
+        };
+        serde_json::to_vec(&MoversUniverse {
+            format_version: UNIVERSE_FORMAT_VERSION,
+            trading_date_ist: ist_date_of_epoch(observed).unwrap(),
+            observed_at_epoch_secs: observed,
+            read_at_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS,
+            market_open,
+            window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
+            prices: UniversePrices::Rows {
+                rows: vec![PriceRow {
+                    session_open: None,
+                    session_high: None,
+                    session_low: None,
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    ltp: 110.0,
+                    prev_close: Some(100.0),
+                    volume: Some(10),
+                    ts_ist_secs: observed + UNIVERSE_IST_OFFSET_SECS - 3,
+                }],
+            },
+            fno: Some(vec![listed.clone()]),
+            membership: Some(UniverseMembership {
+                mtf: None,
+                names: vec![listed],
+                indices: vec!["Nifty 50".into()],
+                by_stock: vec![StockIndices {
+                    security_id: 2,
+                    segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
+                    indices: vec![0],
+                }],
+                partial: false,
+            }),
+        })
+        .unwrap()
+    }
+    fn box_shell(published: Result<Vec<u8>, String>) -> MockShell {
+        MockShell {
+            sync_output: serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            published_universe: published,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn mtf_reads_a_valid_published_daily_list_without_an_extra_ssm_call() {
+        use crate::operator_movers_universe::{MoversUniverse, MtfTerms};
+        let now = MockShell::default().now;
+        let mut universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now - 3, false)).unwrap();
+        universe.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: now - 4,
+            leverage_by_security_id: [(2, 1.0)].into(),
+        });
+        let shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        let response = post(
+            &shell,
+            json!({"action":"stock-movers","filter":{"category":"mtf"}}),
+        )
+        .await;
+        let movers = &body_of(&response)["movers"];
+        assert_eq!(movers["snapshot"]["rows"][0]["mtf_leverage"], 1.0);
+        assert_eq!(movers["snapshot"]["mtf_coverage"]["assessed"], 1);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stock_movers_answer_from_a_fresh_published_universe_without_ssm() {
+        let now = MockShell::default().now;
+        for filter in [
+            json!({}),
+            json!({"fno_only":false,"sort_by":"name","sort_order":"asc"}),
+            json!({"fno_only":false,"index":"Nifty 50","direction":"gainers"}),
+        ] {
+            // 01:56 IST: the session is closed, as the universe says.
+            let shell = box_shell(Ok(published_universe(now - 3, false)));
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            let movers = &body_of(&response)["movers"];
+            assert_eq!(movers["result"], "snapshot", "{movers}");
+            assert_eq!(movers["captured_at_epoch_secs"], now - 3);
+            assert_eq!(movers["snapshot"]["rows"][0]["security_id"], 2);
+            assert!(
+                shell.captured_sync.lock().unwrap().is_empty(),
+                "no SSM round trip"
+            );
+        }
+    }
+
+    fn healthy_box_reply(now: i64, filter: &crate::operator_stock_movers_wire::Filter) -> String {
+        use crate::operator_movers_universe::{MoversUniverse, select, weekday_session_open_at};
+        let universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now, weekday_session_open_at(now))).unwrap();
+        serde_json::to_string(&select(&universe, filter)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stock_categories_refuse_an_older_box_reply_that_ignores_the_requested_category() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
+        for as_of in [None, Some("2026-11-03T15:29".to_owned())] {
+            let daily = Filter {
+                as_of,
+                ..Filter::default()
+            };
+            let mut shell = box_shell(Err("no published artifact".into()));
+            shell.sync_output = healthy_box_reply(shell.now, &daily);
+            for category in [
+                MoversCategory::Intraday,
+                MoversCategory::ExtremeOpenings,
+                MoversCategory::Mtf,
+            ] {
+                let request = Filter {
+                    category: Some(category),
+                    ..daily.clone()
+                };
+                assert_eq!(
+                    read(&shell, &request).await.outcome,
+                    Outcome::Error {
+                        code: BridgeError::InvalidResponse
+                    }
+                );
+            }
+            assert!(matches!(
+                read(&shell, &daily).await.outcome,
+                Outcome::Snapshot { .. }
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_live_capture_never_regresses_between_sources_until_clock_reset() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let t = shell.now;
+        let f = Filter::default();
+        shell.sync_output = healthy_box_reply(t, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t);
+        shell.now = t + 5;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 5);
+        // Losing S3 cannot resurrect the older cached box reply, or a newly
+        // requested box reply containing the same older payload.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.now = t + 8;
+        shell.published_universe = Err("offline".into());
+        assert_eq!(
+            read(&shell, &f).await.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        shell.sync_output = healthy_box_reply(shell.now, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        shell.published_universe = Ok(published_universe(t + 6, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+
+        // A chosen minute goes directly to the box and may have an older capture.
+        let history = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..f.clone()
+        };
+        shell.sync_output = healthy_box_reply(t, &history);
+        assert_eq!(read(&shell, &history).await.captured_at_epoch_secs, t);
+        // Fresh data on the corrected clock can establish a new ordering interval.
+        shell.now = t - 120;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        let reset = read(&shell, &f).await;
+        assert!(matches!(reset.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reset.captured_at_epoch_secs, t - 120);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_older_inflight_box_capture_cannot_replace_a_newer_published_one() {
+        use crate::operator_movers_universe::{MoversUniverse, UniversePrices};
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let t = MockShell::default().now;
+        let mut u: MoversUniverse = serde_json::from_slice(&published_universe(t, false)).unwrap();
+        // A duplicate outside Nifty forces F&O alone to consult the box.
+        let fno = u.fno.as_mut().unwrap();
+        let mut listing = fno[0].clone();
+        listing.security_id = 3;
+        fno.push(listing);
+        let UniversePrices::Rows { rows } = &mut u.prices else {
+            panic!("fixture prices")
+        };
+        let mut duplicate = rows[0].clone();
+        duplicate.security_id = 3;
+        rows.extend([duplicate.clone(), duplicate]);
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let filter = Filter::default();
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            sync_output: healthy_box_reply(t - 2, &filter),
+            ..box_shell(Ok(serde_json::to_vec(&u).unwrap()))
+        };
+        let index = Filter {
+            fno_only: false,
+            index: Some("Nifty 50".into()),
+            ..Filter::default()
+        };
+        let (older, newer) = tokio::join!(
+            biased;
+            read(&shell, &filter),
+            async {
+                assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+                let reply = read(&shell, &index).await;
+                gate.add_permits(1);
+                reply
+            }
+        );
+        assert!(matches!(newer.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(newer.captured_at_epoch_secs, t);
+        assert_eq!(
+            older.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_newer_success_invalidates_cached_box_error() {
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let filter = Filter::default();
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Error { .. }
+        ));
+        shell.now += 1;
+        // The previous error's stamp is newer than this valid observation.
+        // Error timestamps must never advance the live price watermark.
+        shell.published_universe = Ok(published_universe(shell.now - 3, false));
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Snapshot { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.published_universe = Err("offline".into());
+        shell.sync_output = healthy_box_reply(shell.now, &filter);
+        let reply = read(&shell, &filter).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, shell.now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_recheck_window_after_heartbeat_and_use_box_for_selection_errors() {
+        use crate::operator_movers_universe::{UNIVERSE_IST_OFFSET_SECS, weekday_session_open_at};
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let f = Filter::default();
+        // 29 October 2026 (Thursday), in IST.
+        let midnight = (1_793_252_730 + UNIVERSE_IST_OFFSET_SECS).div_euclid(86_400) * 86_400
+            - UNIVERSE_IST_OFFSET_SECS;
+        for boundary in [
+            midnight,
+            midnight + 9 * 3600,
+            midnight + 15 * 3600 + 40 * 60,
+        ] {
+            let now = boundary + 1;
+            let after = boundary - 1;
+            let mut shell = box_shell(Ok(published_universe(now, weekday_session_open_at(now))));
+            shell.now = now;
+            shell.clock_after_heartbeat = Some(after);
+            shell.sync_output = healthy_box_reply(after, &f);
+            let reply = read(&shell, &f).await;
+            assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+            assert_eq!(reply.captured_at_epoch_secs, after, "boundary {boundary}");
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        }
+
+        let t = MockShell::default().now;
+        let mut universe: crate::operator_movers_universe::MoversUniverse =
+            serde_json::from_slice(&published_universe(t, false)).unwrap();
+        let crate::operator_movers_universe::UniversePrices::Rows { rows } = &mut universe.prices
+        else {
+            panic!("fixture prices");
+        };
+        rows.push(rows[0].clone());
+        let mut shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        shell.sync_output = healthy_box_reply(t - 1, &f);
+        let reply = read(&shell, &f).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, t - 1);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_share_one_object_across_filters_and_refresh_on_expiry() {
+        use crate::operator_stock_movers::from_published;
+        use crate::operator_stock_movers_wire::Filter;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let now = MockShell::default().now;
+        let mut shell = box_shell(Ok(published_universe(now, false)));
+        shell.published_delay_ms = 100;
+        let fno = Filter::default();
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            fno_only: false,
+            ..Filter::default()
+        };
+        let (a, b) = tokio::join!(from_published(&shell, &fno), from_published(&shell, &index));
+        assert!(a.unwrap().valid_at(now, &fno));
+        assert!(b.unwrap().valid_at(now, &index));
+        assert_eq!(shell.published_reads.load(Relaxed), 1);
+
+        shell.published_universe = Err("offline".into());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(from_published(&shell, &index).await, Err("unavailable"));
+        shell.published_universe = Ok(published_universe(now - 20, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            now - 20
+        );
+        shell.now += 1;
+        assert_eq!(from_published(&shell, &fno).await, Err("stale"));
+        assert_eq!(shell.published_reads.load(Relaxed), 4);
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            shell.now
+        );
+        let historical = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..Filter::default()
+        };
+        assert_eq!(from_published(&shell, &historical).await, Err("as_of"));
+        assert_eq!(shell.published_reads.load(Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn test_from_published_refuses_every_unusable_universe_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let mut oversize = published_universe(now, true);
+        oversize.resize(
+            crate::operator_movers_universe::MAX_UNIVERSE_BYTES + 1,
+            b' ',
+        );
+        let cases: Vec<(&str, Result<Vec<u8>, String>, Value)> = vec![
+            ("unavailable", Err("NoSuchKey".into()), json!({})),
+            ("corrupt", Ok(b"{not json".to_vec()), json!({})),
+            ("too_large", Ok(oversize), json!({})),
+            ("stale", Ok(published_universe(now - 21, false)), json!({})),
+            (
+                "session_changed",
+                Ok(published_universe(now - 3, true)),
+                json!({}),
+            ),
+            (
+                "other_day",
+                Ok(published_universe(now - 86_400, false)),
+                json!({}),
+            ),
+            ("future", Ok(published_universe(now + 6, true)), json!({})),
+            (
+                "as_of",
+                Ok(published_universe(now, true)),
+                json!({"as_of":"2026-11-03T15:29"}),
+            ),
+        ];
+        for (reason, published, filter) in cases {
+            let shell = box_shell(published);
+            let parsed: crate::operator_stock_movers_wire::Filter =
+                serde_json::from_value(filter.clone()).unwrap();
+            assert_eq!(
+                crate::operator_stock_movers::from_published(&shell, &parsed).await,
+                Err(reason)
+            );
+            let response = post(&shell, json!({"action":"stock-movers","filter":filter})).await;
+            assert_eq!(
+                body_of(&response)["movers"]["code"],
+                "app_unavailable",
+                "{reason}: the box answered"
+            );
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1, "{reason}");
+        }
+        // A closed-session universe has the same 20 s bound as an open one
+        // (the publisher refreshes it every 5 s while viewed).
+        let shell = box_shell(Ok(published_universe(now - 120, false)));
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("stale")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_live_movers_call_writes_the_viewer_heartbeat_once_per_interval() {
+        use crate::operator_movers_universe::{VIEWER_HEARTBEAT_TTL_SECS, ViewerHeartbeat};
+        let now = MockShell::default().now;
+        let shell = box_shell(Err("absent".into()));
+        for _ in 0..3 {
+            let _ = post(&shell, json!({"action":"stock-movers","filter":{}})).await;
+        }
+        let beats = shell.heartbeats.lock().unwrap().clone();
+        assert_eq!(beats.len(), 1, "once per 30 s per container");
+        assert_eq!(
+            ViewerHeartbeat::parse(&beats[0]),
+            Some(ViewerHeartbeat {
+                until_epoch_secs: now + VIEWER_HEARTBEAT_TTL_SECS
+            })
+        );
+        // A chosen minute is always answered by the box: no heartbeat.
+        let shell = box_shell(Err("absent".into()));
+        let _ = post(
+            &shell,
+            json!({"action":"stock-movers","filter":{"as_of":"2026-11-03T15:29"}}),
+        )
+        .await;
+        assert!(shell.heartbeats.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_live_view_target_refuses_a_bad_bucket_or_owner() {
+        assert_eq!(
+            live_view_target("tv-prod-live-view", "123456789012"),
+            Ok(("tv-prod-live-view", "123456789012"))
+        );
+        assert!(live_view_target("", "123456789012").is_err());
+        assert!(live_view_target("Bad_Bucket", "123456789012").is_err());
+        assert!(live_view_target("tv-prod-live-view", "").is_err());
+        assert!(live_view_target("tv-prod-live-view", "12345").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_body_bounded_refuses_over_the_limit_and_keeps_one_chunk_whole() {
+        let limit = 64;
+        let one = aws_sdk_s3::primitives::ByteStream::from(vec![b'a'; limit]);
+        assert_eq!(read_body_bounded(one, limit).await.unwrap().len(), limit);
+        let over = aws_sdk_s3::primitives::ByteStream::from(vec![b'a'; limit + 1]);
+        assert!(read_body_bounded(over, limit).await.is_err());
+        let empty = aws_sdk_s3::primitives::ByteStream::from(Vec::new());
+        assert!(read_body_bounded(empty, limit).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_from_published_times_out_and_the_box_answers() {
+        let now = MockShell::default().now;
+        let shell = MockShell {
+            published_delay_ms: 2_500,
+            ..box_shell(Ok(published_universe(now, true)))
+        };
+        assert_eq!(
+            crate::operator_stock_movers::from_published(
+                &shell,
+                &crate::operator_stock_movers_wire::Filter::default()
+            )
+            .await,
+            Err("timeout")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn filtered_movers_cache_is_keyed_and_shell_receives_hex_only() {
+        use crate::operator_stock_movers_wire::{Filter, Reply};
+        let shell = MockShell {
+            sync_output: serde_json::to_string(&Reply::error(
+                crate::operator_movers_wire::BridgeError::AppUnavailable,
+                MockShell::default().now,
+            ))
+            .unwrap(),
+            ..Default::default()
+        };
+        let a = Filter {
+            search: "a'$(id);".into(),
+            ..Filter::default()
+        };
+        let b = Filter {
+            fno_only: false,
+            ..a.clone()
+        };
+        for f in [&a, &a, &b] {
+            let response = post(&shell, json!({"action":"stock-movers","filter":f})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "app_unavailable");
+        }
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        for (commands, f) in shell.captured_sync.lock().unwrap().iter().zip([&a, &b]) {
+            assert_eq!(commands.len(), 1);
+            let encoded = commands[0]
+                .strip_prefix("/opt/tickvault/bin/tv-movers --filter ")
+                .unwrap();
+            assert_eq!(Filter::from_hex(encoded), Some(f.clone()));
+            assert!(!commands[0].contains("$("));
+        }
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        let _response = post(&shell, json!({"action":"stock-movers","filter":b})).await;
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn filtered_movers_concurrent_filters_share_one_inflight_gate() {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let (first, second) = tokio::join!(biased;post(&shell,json!({"action":"stock-movers"})),async{let r=post(&shell,json!({"action":"stock-movers","filter":{"fno_only":false}})).await;gate.add_permits(1);r});
+        assert_eq!(body_of(&first)["movers"]["code"], "bridge_unavailable");
+        assert_eq!(body_of(&second)["movers"]["code"], "busy");
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_strict_read_payload_requires_ssm_success_and_never_returns_stderr() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            for (status, stderr, accepted) in [
+                ("Success", "", true),
+                ("Failed", "", false),
+                ("Unknown", "", false),
+                ("Cancelled", "", false),
+                ("TimedOut", "", false),
+                ("DeliveryTimedOut", "", false),
+                ("Success", "private server diagnostic", false),
+            ] {
+                let shell = MockShell {
+                    invocation: Ok((status.into(), payload.clone(), stderr.into())),
+                    ..Default::default()
+                };
+                let response = post(&shell, json!({"action":action})).await;
+                let body = body_of(&response);
+                assert_eq!(
+                    body["movers"]["code"] == "app_unauthorized",
+                    accepted,
+                    "{action} {status}"
+                );
+                assert!(!response.to_string().contains("private server diagnostic"));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_strict_read_payload_refuses_pending_stdout_at_the_deadline() {
+        for action in ["fno-stocks", "stock-movers"] {
+            let now = MockShell::default().now;
+            let payload = if action == "fno-stocks" {
+                serde_json::to_string(&crate::operator_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_string(&crate::operator_stock_movers_wire::Reply::error(
+                    crate::operator_movers_wire::BridgeError::AppUnauthorized,
+                    now,
+                ))
+                .unwrap()
+            };
+            let shell = MockShell {
+                invocation: Ok(("InProgress".into(), payload, String::new())),
+                ..Default::default()
+            };
+            let start = tokio::time::Instant::now();
+            let response = post(&shell, json!({"action":action})).await;
+            assert_eq!(body_of(&response)["movers"]["code"], "timeout");
+            assert_eq!(start.elapsed(), std::time::Duration::from_secs(18));
+        }
     }
 
     fn status_of(resp: &Value) -> i64 {
@@ -2570,29 +4161,396 @@ mod tests {
         // The pin REMAINS a content ratchet — any further unreviewed edit to
         // the console HTML still fails the build; it simply no longer claims
         // legacy-byte-identity.
+        //
+        // 2026-09-03 re-bless (47,467 -> 47,435 — SMALLER, which is the point):
+        // the Data tab's third bar, "contracts", is REMOVED along with the two
+        // VIEW_COMMANDS queries that fed it. `rest_option_contract_1m` has had
+        // no DDL caller and no writer since the 2026-08-21 Groww removal —
+        // MEASURED on the box the same day, the table does not exist — so that
+        // bar could only ever render blank, which an operator cannot tell from
+        // a real capture failure.
+        //
+        // The first two attempts at this re-bless landed at 47,634 and 47,490,
+        // and BOTH were caught by `browser_surface_and_toolchain_guard::
+        // javascript_volume_inside_script_tags_only_shrinks` (JS lines 339 ->
+        // 342, then -> 340). It was right to fail them: that budget is
+        // shrink-only, and a change whose whole point is DELETING a bar has no
+        // business growing the frontend carve-out to hold a comment about the
+        // deletion. The reasoning lives in `parse_view` above — a Rust file
+        // under no such budget — and the HTML keeps a one-line pointer to it.
+        //
+        // RE-BLESSED 2026-09-08 — the false-alarm fix.
+        //
+        // Three in-line edits, no new JS lines (the shrink-only volume budget
+        // is untouched, deliberately — see the two failed attempts recorded
+        // above for why that matters):
+        //
+        //   1. the feed card's `else` now checks `rest_audit_error` first, so
+        //      an unreadable read renders the reason verbatim instead of the
+        //      sentence "no official-candle pulls recorded today";
+        //   2. `rest_audit_error` joins the `errs` strip beside its two
+        //      siblings, which have carried their errors since they were
+        //      written;
+        //   3. the hero's `ticksbig` default changes from the literal `0` to
+        //      `—`, matching every pill on the same card. A render that never
+        //      reached `countUp` was showing a fabricated zero that an
+        //      operator could not tell from a measured one.
+        //
+        // The cost of not doing this, measured: on 2026-09-08 the console
+        // reported no official-candle pulls all morning while the cadence lane
+        // was persisting every minute — `tv_rest_1m_fire_heartbeat` read 1.0
+        // from 09:15 IST, and that gauge is set only after a flush ACK.
+        // RE-BLESSED 2026-09-17 — the SOCKETS-ONLY console re-point.
+        //
+        // 48,906 -> 46,394 bytes. The console SHRANK by 2,512, which is the
+        // shape a removal PR should have: three surfaces whose source tables
+        // lost their writers under the operator's narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12 and its dated
+        // correction) are gone, and nothing was added to explain them here —
+        // the reasoning lives in the Rust files, which carry no shrink-only
+        // budget. The two failed 2026-09-08 re-blesses recorded above are why
+        // that distinction is kept.
+        //
+        // What left the file:
+        //   1. the per-(broker, pull type) REST latency table and its caption
+        //      (`rest_fetch_audit`);
+        //   2. the feed card's "pulls today: N ok · N failed" line and its
+        //      `rest_audit_error` strip entry (same source);
+        //   3. nothing else — the Data tab was RE-POINTED in place, so its
+        //      bars, hero and dedup shield keep their markup and only their
+        //      keys, table names and the 4 -> 5 expectation moved.
+        //
+        // RE-BLESSED 2026-09-27 (audit PR20) — 46,394 -> 46,484 bytes, no new
+        // lines. Three labels told the operator a window the server does not
+        // enforce: the danger-zone lock said "until 3:40 PM" while the rule it
+        // enforces is 09:00-15:45 every day, and two stop/restart captions
+        // still said 3:30 PM, a close that moved to 3:40 on 2026-08-03. The
+        // danger-zone line now also reads the server's own
+        // `data_destructive_locked` flag, falling back to `market_hours` for a
+        // Lambda that predates it, so the label and the 409 cannot disagree.
+        //
+        // RE-BLESSED 2026-09-27 (audit PR28) — 46,484 -> 46,985 bytes, three new
+        // lines in `pollNuke`: a command SSM dropped because the box did not
+        // pick it up in time (`DeliveryTimedOut`, from the new delivery
+        // timeout) now says it was NOT run instead of polling for three
+        // minutes and reporting "still running", and a run refused by the
+        // on-box lock guard or stopped by the SEBI save now says so instead
+        // of "nuke finished (Failed)".
+        //
+        // RE-BLESSED 2026-09-27 (audit PR36a) — 46,985 -> 46,999 bytes, comment
+        // only, no new lines. The note above the `#key=` link reader no longer
+        // says a Telegram alert sends that link: the alert now carries the
+        // portal URL alone, because the key reached email and SMS history.
+        //
+        // RE-BLESSED 2026-10-04 (audit L4) — 46,999 -> 47,075 bytes, no new
+        // lines. The key moves from localStorage to sessionStorage (it no
+        // longer outlives the tab, and a key left by an older build is
+        // removed on load), and the two overview pills `p_inst` / `p_app`
+        // now pass the server's strings through `esc()` like every other
+        // field. Pinned separately by `console_escapes_both_overview_pills`
+        // and `console_never_writes_the_key_to_local_storage`.
+        //
+        // RE-BLESSED 2026-10-22 (plan item 63) — 47,075 -> 47,076 bytes,
+        // comment only, no new lines: the note above `loadAws` names the AWS
+        // Budgets call that replaced the Cost Explorer one.
+        //
+        // RE-BLESSED 2026-10-22 (plan item 64, operator Quote 37) — 47,076
+        // bytes, unchanged size: the stopped-box banner reads "auto-stops
+        // 16:30 IST" (was 17:30), the daily stop's new time.
+        // 2026-11-02 corrective proposal: SQL cells are parsed in Rust and
+        // rendered from structured columns/rows; failed reads remain errors.
+        //
+        // RE-BLESSED 2026-10-31 (owner-requested Top Movers) — 47,076 ->
+        // 53,229 bytes: the reviewed fourth tab adds bounded gainers/losers
+        // tables with conservative source age and explicit unavailable states.
+        // Its 23 Chromium fixtures are separate from this exact-content pin.
+        // 2026-11-02: reconstructed index/F&O filters and paging; frontend and
+        // SSM ceilings retained. Browser functions have separate local fixtures.
+        // 2026-11-02: full switch hit area and timer-stable invalid-search
+        // feedback; reviewed HTML6226059a passed28+1 page,54 switch and8 CSV
+        // browser controls. The existing JavaScript ceiling stays unchanged.
+        // 2026-11-03: the closed-market message now says the table shows the
+        // last stored prices of the latest session (owner: never a blank table
+        // after the close). Text only, no JavaScript change.
+        // 2026-11-03: date and IST time inputs on Stocks → Price Movers; the
+        // chosen minute goes out as the filter's `as_of` (rust-only lock §0.18).
+        // 2026-11-06 (plan PR MV): a movers refresh keeps the previous rows on
+        // screen under the loading status instead of blanking the table; a
+        // reply that fails the checks still clears it. Fewer script bytes.
+        // Review: while a refresh is in flight the table is inert and dimmed
+        // (rows, select-all, row checkboxes and sort buttons) and Previous,
+        // Next and Refresh are disabled, so a double Next cannot skip a page
+        // and a new sort mark never shows over old-order rows unmarked.
+        // `$$` is document.querySelectorAll, to stay inside the script budget.
+        // Combined review, same day: each accepted reply carries the filter
+        // generation it answered, and a snapshot from an older generation is
+        // reloaded instead of rendered, so an older filter's rows never show
+        // under newer controls (tab hidden mid-load was the path).
+        // RE-BLESSED 2026-11-17 (owner card "Remember 30 days", rust-only lock
+        // §0.20) — 85,542 -> 86,069 bytes: the key is remembered in this browser
+        // for 30 days (`tv_key` with an expiry) instead of per tab; Lock and a
+        // 401 forget it; the lock screen text says so. Pinned separately by
+        // `console_remembers_the_key_for_thirty_days_only`.
+        // 2026-11-25: timestamped Dhan index quotes and accurate disk-panel wording.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "31b3cc9bb1e436d9ae87b7b3844566dd3f969c2a9d07258b72a6db81af67c915"
+            "952e667b16bafc3522c8f57cef9dffd73a901633025c2109bdc3f1435c9121d1"
         );
-        assert_eq!(CONSOLE_HTML.len(), 47_467);
+        assert_eq!(CONSOLE_HTML.len(), 103_109);
+    }
+
+    #[test]
+    fn stocks_index_quote_query_respects_operator_read_policy_and_row_cap() {
+        let query = CONSOLE_HTML
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(r#"const query=""#)?
+                    .strip_suffix(r#"";"#)
+                    .filter(|sql| sql.contains("AS age_s") || sql.contains(" age_s"))
+            })
+            .expect("index quote SQL in the operator Stocks view");
+        assert!(is_safe_sql(query));
+        assert_eq!(cap_sql_rows(query), query);
+        assert!(query.contains("feed='dhan' AND segment='IDX_I'"));
+        assert!(query.contains("ts BETWEEN dateadd('m',329,now()) AND dateadd('m',330,now())"));
+        assert!(query.ends_with("LATEST ON ts PARTITION BY security_id LIMIT 5"));
+    }
+
+    // ------------------------------------------------ audit L4 source scans
+    /// The script line that writes pill `id`'s innerHTML.
+    fn pill_render_line(id: &str) -> &'static str {
+        let needle = format!("$('{id}').innerHTML=");
+        CONSOLE_HTML
+            .lines()
+            .find(|l| l.contains(&needle))
+            .unwrap_or_else(|| panic!("no render line for pill {id}"))
+    }
+
+    #[test]
+    fn console_escapes_both_overview_pills() {
+        // The server's strings reach innerHTML only through `esc()`.
+        assert!(pill_render_line("p_inst").contains("esc(j.instance_state"));
+        assert!(pill_render_line("p_app").contains("esc(j.app"));
+        // and the raw forms are gone
+        assert!(!CONSOLE_HTML.contains("+(j.instance_state"));
+        assert!(!CONSOLE_HTML.contains(":(j.app"));
+    }
+
+    #[test]
+    fn console_escape_helper_escapes_markup() {
+        // The helper both pills rely on still escapes the three markup
+        // characters (text position: quotes need no escaping there).
+        let helper = CONSOLE_HTML
+            .lines()
+            .find(|l| l.starts_with("function esc(s)"))
+            .expect("esc helper present");
+        for pair in ["'<':'&lt;'", "'>':'&gt;'", "'&':'&amp;'"] {
+            assert!(helper.contains(pair), "esc() lost {pair}");
+        }
+    }
+
+    #[test]
+    fn console_remembers_the_key_for_thirty_days_only() {
+        // Owner card 2026-11-17 "Remember 30 days (Recommended)": the key is
+        // remembered in THIS browser under `tv_key` with an expiry 30 days
+        // (2,592,000,000 ms) after it was pasted; an expired or unreadable
+        // record is removed and the lock screen shows. Lock removes it, and a
+        // 401 (wrong or rotated key) locks. Keys older builds left under
+        // `tv_token` (local or per-tab) are removed on load and never read.
+        assert_eq!(30_u64 * 24 * 3_600 * 1_000, 2_592_000_000);
+        assert!(CONSOLE_HTML.contains("e:Date.now()+2592e6"));
+        assert!(CONSOLE_HTML.contains("if(o.e>Date.now()&&typeof o.k==='string') return o.k; localStorage.removeItem('tv_key');"));
+        assert!(CONSOLE_HTML.contains("let TOKEN=keyLoad();"));
+        assert!(!CONSOLE_HTML.contains("getItem('tv_token')"));
+        assert!(!CONSOLE_HTML.contains("setItem('tv_token'"));
+        assert!(CONSOLE_HTML.contains(
+            "localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token');"
+        ));
+        let lock_fn = CONSOLE_HTML
+            .lines()
+            .find(|l| l.starts_with("function lock()"))
+            .expect("lock() present");
+        assert!(lock_fn.contains("localStorage.removeItem('tv_key')"));
+        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock();"));
+        assert_eq!(CONSOLE_HTML.matches("localStorage.setItem").count(), 1);
+        // A key arriving in the address is stripped from it after reading.
+        let reader = CONSOLE_HTML
+            .lines()
+            .position(|l| l.contains("location.hash.match(/key="))
+            .expect("address-key reader present");
+        let block: String = CONSOLE_HTML
+            .lines()
+            .skip(reader)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.contains("history.replaceState(null,'',location.pathname)"));
+    }
+
+    // ------------------------------------------------ audit M4 auth guard
+    fn post_from(source: &str, token: &str) -> Value {
+        let mut ev = post_event(&json!({"action": "status"}), Some(token));
+        ev["requestContext"]["http"]["sourceIp"] = json!(source);
+        ev
+    }
+
+    #[test]
+    fn source_ip_reads_request_context_and_defaults_to_unknown() {
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": "203.0.113.7"}}})),
+            "203.0.113.7"
+        );
+        assert_eq!(source_ip(&json!({})), "unknown");
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": "  "}}})),
+            "unknown"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(
+            source_ip(&json!({"requestContext": {"http": {"sourceIp": long}}})).len(),
+            64
+        );
+    }
+
+    #[test]
+    fn test_record_failure_locks_out_at_the_limit_and_releases_after_the_window() {
+        let g = AuthFailureGuard::new();
+        let t0 = 1_000;
+        for n in 1..AUTH_FAILURE_LIMIT {
+            assert_eq!(g.check("a", t0), AuthGate::Allowed);
+            assert_eq!(g.record_failure("a", t0), AuthFailureRecord::Counted(n));
+        }
+        assert_eq!(g.record_failure("a", t0), AuthFailureRecord::LockedOut);
+        assert_eq!(
+            g.check("a", t0 + 10),
+            AuthGate::Refused {
+                retry_after_secs: AUTH_FAILURE_WINDOW_SECS - 10
+            }
+        );
+        // Another source is unaffected.
+        assert_eq!(g.check("b", t0), AuthGate::Allowed);
+        // At the window's end the source is forgotten.
+        assert_eq!(
+            g.check("a", t0 + AUTH_FAILURE_WINDOW_SECS),
+            AuthGate::Allowed
+        );
+        assert_eq!(g.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn test_record_success_forgets_a_source_and_a_stale_window_restarts() {
+        let g = AuthFailureGuard::new();
+        for _ in 0..3 {
+            g.record_failure("a", 0);
+        }
+        // A failure after the window opens a fresh one.
+        assert_eq!(
+            g.record_failure("a", AUTH_FAILURE_WINDOW_SECS + 1),
+            AuthFailureRecord::Counted(1)
+        );
+        // A clock that steps back behind the window start also restarts it.
+        assert_eq!(g.record_failure("a", 0), AuthFailureRecord::Counted(1));
+        g.record_success("a");
+        assert_eq!(g.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn test_tracked_sources_is_bounded_and_prunes_expired_windows() {
+        let g = AuthFailureGuard::new();
+        for i in 0..AUTH_FAILURE_MAX_SOURCES {
+            g.record_failure(&format!("s{i}"), 0);
+        }
+        assert_eq!(g.tracked_sources(), AUTH_FAILURE_MAX_SOURCES);
+        // Full of live windows: a new source is not counted, and says so.
+        assert_eq!(
+            g.record_failure("new", 1),
+            AuthFailureRecord::Untracked { untracked_total: 1 }
+        );
+        assert_eq!(
+            g.record_failure("new2", 1),
+            AuthFailureRecord::Untracked { untracked_total: 2 }
+        );
+        assert_eq!(g.tracked_sources(), AUTH_FAILURE_MAX_SOURCES);
+        // Once those windows expire, the prune makes room.
+        assert_eq!(
+            g.record_failure("new", AUTH_FAILURE_WINDOW_SECS),
+            AuthFailureRecord::Counted(1)
+        );
+        assert_eq!(g.tracked_sources(), 1);
+    }
+
+    #[tokio::test]
+    async fn route_refuses_a_source_after_repeated_wrong_keys() {
+        let shell = MockShell::default();
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            let r = route(&post_from("198.51.100.9", "wrong"), &shell).await;
+            assert_eq!(status_of(&r), 401);
+        }
+        // Even the RIGHT key is refused from that source until the window ends.
+        let r = route(&post_from("198.51.100.9", AUTH_SECRET), &shell).await;
+        assert_eq!(status_of(&r), 429);
+        assert!(body_of(&r)["retry_after_secs"].as_i64().unwrap() > 0);
+        // A different source still gets in.
+        let r = route(&post_from("198.51.100.10", AUTH_SECRET), &shell).await;
+        assert_ne!(status_of(&r), 401);
+        assert_ne!(status_of(&r), 429);
+    }
+
+    #[tokio::test]
+    async fn route_does_not_count_wrong_keys_while_the_secret_is_unreadable() {
+        let shell = MockShell {
+            secret: String::new(),
+            ..MockShell::default()
+        };
+        for _ in 0..(AUTH_FAILURE_LIMIT * 2) {
+            let r = route(&post_from("198.51.100.9", "anything"), &shell).await;
+            // 503, never 401: the page forgets a remembered key on a 401, so
+            // our own read failure must not look like a wrong key.
+            assert_eq!(status_of(&r), 503);
+        }
+        assert_eq!(shell.auth_failures.tracked_sources(), 0);
+    }
+
+    #[tokio::test]
+    async fn route_clears_a_source_after_a_correct_key() {
+        let shell = MockShell::default();
+        for _ in 0..(AUTH_FAILURE_LIMIT - 1) {
+            route(&post_from("198.51.100.9", "wrong"), &shell).await;
+        }
+        let r = route(&post_from("198.51.100.9", AUTH_SECRET), &shell).await;
+        assert_ne!(status_of(&r), 401);
+        assert_eq!(shell.auth_failures.tracked_sources(), 0);
     }
 
     // --------------------------------------------------------- class ParseView
     #[test]
     fn test_parses_labeled_snapshot() {
-        // REST-era snapshot (2026-07-16): today's rows in the three LIVE
-        // tables, totals + per-feed split, the 4-column dedup-key count.
+        // LIVE-LANE snapshot (re-pointed 2026-09-17): today's rows in the two
+        // SOCKET tables, the total, the per-feed split, and the FIVE-column
+        // dedup-key count for `ticks`.
+        //
+        // The stdout deliberately still CARRIES the retired REST-era labels
+        // (`SPOT_TODAY` / `CHAIN_TODAY` / `CONTRACT_*` / `*_BY_FEED`). A box
+        // running an older Lambda build, or a stale in-flight SSM invocation,
+        // emits exactly that shape, and the parser must IGNORE an unknown
+        // label rather than surface it. That is why the fixture keeps them
+        // rather than being tidied to the new names only: the re-point is a
+        // rolling deploy, and the first minutes of it look like this.
         let stdout = concat!(
             "APP=active\n",
-            "SPOT_TODAY=1125\n",
-            "CHAIN_TODAY=42000\n",
+            "TICKS_TODAY=1125\n",
+            "DEPTH_TODAY=42000\n",
+            "SPOT_TODAY=7\n",
+            "CHAIN_TODAY=9\n",
             "CONTRACT_TODAY=9000\n",
-            "SPOT_BY_FEED=\"dhan\",750;\"groww\",375;\n",
+            "TICKS_BY_FEED=\"dhan\",750;\"groww\",375;\n",
+            "SPOT_BY_FEED=\"dhan\",4;\n",
             "CHAIN_BY_FEED=\"dhan\",21000;\"groww\",21000;\n",
             "CONTRACT_BY_FEED=\"groww\",9000;\n",
-            "DEDUP_KEYS=4\n",
+            "DEDUP_KEYS=5\n",
             "ERRORS_BEGIN\n",
             "Jun 01 11:00 tickvault: WARN something\n",
             "ERRORS_END\n",
@@ -2601,19 +4559,32 @@ mod tests {
         assert_eq!(out["app"], "active");
         assert_eq!(
             out["rows_today"],
-            json!({"spot": "1125", "chain": "42000", "contracts": "9000"})
+            json!({"ticks": "1125", "depth": "42000"})
         );
-        assert_eq!(out["rows_today_total"], "52125");
+        // 43125, NOT 52141: every retired label above is present in the stdout
+        // and must contribute nothing — the sum is the two LIVE counts alone.
+        assert_eq!(out["rows_today_total"], "43125");
         assert_eq!(
-            out["rows_by_feed"]["spot"],
+            out["rows_by_feed"]["ticks"],
             json!({"dhan": "750", "groww": "375"})
         );
-        assert_eq!(
-            out["rows_by_feed"]["chain"],
-            json!({"dhan": "21000", "groww": "21000"})
-        );
-        assert_eq!(out["rows_by_feed"]["contracts"], json!({"groww": "9000"}));
-        assert_eq!(out["dedup_key_columns"], "4");
+        // The retired legs render as ABSENT, never as an empty map: a `{}`
+        // would read as "the leg ran and captured nothing".
+        for gone in ["spot", "chain", "contracts"] {
+            assert!(
+                out["rows_by_feed"].get(gone).is_none(),
+                "rows_by_feed must not carry the retired `{gone}` leg"
+            );
+            assert!(
+                out["rows_today"].get(gone).is_none(),
+                "rows_today must not carry the retired `{gone}` leg"
+            );
+        }
+        // FIVE, not four — `DEDUP_KEY_TICKS` is
+        // (ts, security_id, segment, capture_seq, feed). The 4 the REST-era
+        // console expected would have shown a red schema-drift shield on a
+        // perfectly healthy box, every day.
+        assert_eq!(out["dedup_key_columns"], "5");
         assert_eq!(out["recent_errors"].as_array().unwrap().len(), 1);
         assert!(
             out["recent_errors"][0]
@@ -2629,24 +4600,19 @@ mod tests {
         let out = parse_view("");
         assert_eq!(out["app"], "");
         assert_eq!(out["dedup_key_columns"], "");
-        assert_eq!(
-            out["rows_today"],
-            json!({"spot": "", "chain": "", "contracts": ""})
-        );
+        assert_eq!(out["rows_today"], json!({"ticks": "", "depth": ""}));
         assert_eq!(out["rows_today_total"], "");
-        assert_eq!(
-            out["rows_by_feed"],
-            json!({"spot": {}, "chain": {}, "contracts": {}})
-        );
+        assert_eq!(out["rows_by_feed"], json!({"ticks": {}}));
         assert_eq!(out["recent_errors"], json!([]));
     }
 
     #[test]
     fn test_partial_counts_sum_only_parseable() {
         // One table unreachable (empty value) — the total sums the rest,
-        // never treating an unreachable count as 0-and-green.
-        let out = parse_view("SPOT_TODAY=100\nCHAIN_TODAY=\nCONTRACT_TODAY=23\n");
-        assert_eq!(out["rows_today_total"], "123");
+        // never treating an unreachable count as 0-and-green. The retired
+        // REST-era labels are fed in deliberately and must not be summed.
+        let out = parse_view("TICKS_TODAY=100\nDEPTH_TODAY=\nSPOT_TODAY=23\nCONTRACT_TODAY=23\n");
+        assert_eq!(out["rows_today_total"], "100");
     }
 
     #[test]
@@ -2695,19 +4661,21 @@ mod tests {
     fn test_html_contains_no_secret() {
         // The page is a static shell — it must NOT embed any token/secret.
         assert!(!CONSOLE_HTML.contains("Bearer s3cret"));
-        assert!(CONSOLE_HTML.contains("localStorage")); // token kept client-side only
+        // The key is kept client-side only: remembered in this browser for 30
+        // days (owner 2026-11-17), never in a link or in the page.
+        assert!(CONSOLE_HTML.contains("localStorage.setItem('tv_key'"));
     }
 
     #[test]
-    fn test_html_has_exactly_three_tabs() {
-        // 2026-07-02 redesign (operator: "webpage looks completely messy, too
-        // many buttons"): exactly Overview / Data / Admin — nothing else.
+    fn test_html_has_exactly_four_ordered_tabs() {
+        // 2026-10-31 continuation: the owner explicitly requested Top Movers
+        // on this portal. Keep the complete ordered tab list pinned.
         let re = regex::Regex::new(r#"data-t="(\w+)""#).unwrap();
         let tabs: Vec<&str> = re
             .captures_iter(CONSOLE_HTML)
             .map(|c| c.get(1).unwrap().as_str())
             .collect();
-        assert_eq!(tabs, ["overview", "data", "admin"]);
+        assert_eq!(tabs, ["overview", "movers", "data", "admin"]);
     }
 
     #[test]
@@ -2715,7 +4683,7 @@ mod tests {
         // A #key=... link must auto-unlock + strip the fragment from the URL.
         assert!(CONSOLE_HTML.contains("location.hash"));
         assert!(CONSOLE_HTML.contains("replaceState"));
-        assert!(CONSOLE_HTML.contains("tv_token"));
+        assert!(CONSOLE_HTML.contains("TOKEN=k; keySave(TOKEN);"));
     }
 
     #[test]
@@ -2747,27 +4715,57 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_key_query_targets_rest_spot_1m() {
-        // REST-era repoint (2026-07-16): the shield reads rest_spot_1m's
-        // 4-column key (ts, security_id, exchange_segment, feed per
-        // DEDUP_KEY_SPOT_1M_REST), not the retired ticks 5-column key.
+    fn test_dedup_key_query_targets_ticks() {
+        // RE-POINTED 2026-09-17 (renamed with its subject). It read
+        // `rest_spot_1m`'s 4-column key from 2026-07-16 until the operator's
+        // SOCKETS-ONLY narrowing removed that table's writer
+        // (`no-rest-except-live-feed-2026-06-27.md` \u00a712.12). The shield now
+        // reads `ticks`, whose key is FIVE columns
+        // (ts, security_id, segment, capture_seq, feed) per
+        // `DEDUP_KEY_TICKS`, pinned by `questdb_init_script_guard.rs`.
+        //
+        // The column COUNT matters as much as the table: a re-point that kept
+        // the 4-column expectation would have shown a red "schema drift"
+        // shield on a perfectly healthy box, every day.
         let dedup_cmd = VIEW_COMMANDS
             .iter()
             .find(|c| c.contains("DEDUP_KEYS="))
             .unwrap();
-        assert!(dedup_cmd.contains("table_columns(%27rest_spot_1m%27)"));
-        assert!(!dedup_cmd.contains("'ticks'"));
+        assert!(dedup_cmd.contains("table_columns(%27ticks%27)"));
+        assert!(!dedup_cmd.contains("rest_spot_1m"));
+        assert!(dedup_cmd.contains("upsertKey"));
     }
 
     #[test]
-    fn test_view_commands_target_live_rest_tables() {
+    fn test_view_commands_target_live_socket_tables() {
+        // RE-POINTED 2026-09-17 (renamed with its subject). It required
+        // `rest_spot_1m` and `rest_option_chain_1m` — the two per-minute REST
+        // tables — until the operator's SOCKETS-ONLY narrowing removed both
+        // writers (`no-rest-except-live-feed-2026-06-27.md` §12.12).
         let joined = VIEW_COMMANDS.join("\n");
-        for live in [
+        for live in ["FROM%20ticks", "FROM%20market_depth"] {
+            assert!(joined.contains(live), "{live}");
+        }
+        // The rule this test has always enforced, now pointed the other way:
+        // the view must query NOTHING that has no writer. It is the
+        // operator's read of "what did we capture today", and a query against
+        // a writerless table renders a permanent zero the operator cannot
+        // tell from a real capture failure.
+        //
+        // All three REST tables are RETAINED and hold real history, so these
+        // queries did not ERROR — they returned 0 for `today()`, forever,
+        // which is the WORSE shape. Re-adding any of them needs its writer
+        // back first.
+        for dead in [
             "rest_spot_1m",
             "rest_option_chain_1m",
             "rest_option_contract_1m",
+            "rest_fetch_audit",
         ] {
-            assert!(joined.contains(live), "{live}");
+            assert!(
+                !joined.contains(dead),
+                "the view queried `{dead}`, which has no writer"
+            );
         }
         // Today windows use the house `ts IN today()` convention.
         assert!(joined.contains("ts%20IN%20today()"));
@@ -2775,8 +4773,20 @@ mod tests {
 
     #[test]
     fn test_db_console_default_query_targets_live_table() {
-        assert!(CONSOLE_HTML.contains("SELECT * FROM rest_spot_1m ORDER BY ts DESC LIMIT 50"));
-        assert!(!CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
+        // ⚠ INVERTED 2026-09-17, same sign-flip as
+        // `test_view_sql_targets_no_dead_tables`: this test required
+        // `rest_spot_1m` and BANNED `ticks` — correct when the live feed was
+        // retired, and exactly backwards now that the SOCKETS-ONLY narrowing
+        // has removed the REST writers (§12.12).
+        //
+        // The RULE is unchanged and is why the default query matters at all:
+        // it is the first thing an operator sees when the Data tab opens, so
+        // it must hit a table that is guaranteed to have a writer. A default
+        // that returns a permanent empty result teaches them the button is
+        // broken; on a FRESH volume `rest_spot_1m` would not exist at all and
+        // the query would error outright.
+        assert!(CONSOLE_HTML.contains("SELECT * FROM ticks ORDER BY ts DESC LIMIT 50"));
+        assert!(!CONSOLE_HTML.contains("FROM rest_spot_1m"));
     }
 
     // ------------------------------------------------------- class RestLatency
@@ -2790,32 +4800,49 @@ mod tests {
         assert_eq!(avg_ns("", ""), None);
     }
 
-    #[test]
-    fn test_rest_latency_sql_filters_ok_and_sentinel() {
-        // outcome='ok' rows only; close_to_data_ms >= 0 drops the -1
-        // not-measured sentinel AND satisfies approx_percentile's
-        // non-negative-input requirement; today window + per-(feed, leg).
-        let sql = REST_LATENCY_SQL;
-        assert!(sql.contains("from rest_fetch_audit"));
-        assert!(sql.contains("outcome = 'ok'"));
-        assert!(sql.contains("close_to_data_ms >= 0"));
-        assert!(sql.contains("approx_percentile(close_to_data_ms, 0.5, 3)"));
-        assert!(sql.contains("approx_percentile(close_to_data_ms, 0.99, 3)"));
-        assert!(sql.contains("ts in today()"));
-        assert!(sql.contains("group by feed, leg"));
-    }
+    // ---- `test_rest_latency_sql_filters_ok_and_sentinel` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It pinned the shape of `REST_LATENCY_SQL`: `outcome = 'ok'` rows only,
+    // `close_to_data_ms >= 0` (which BOTH drops the -1 not-measured sentinel
+    // AND satisfies `approx_percentile`'s non-negative-input requirement), the
+    // `today()` window, and the `(feed, leg)` grouping.
+    //
+    // The const is gone with the rest of the `rest_fetch_audit` reads
+    // (`no-rest-except-live-teed-2026-06-27.md` §12.12, dated correction).
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing checks
+    // that a FUTURE percentile query filters its not-measured sentinel before
+    // aggregating. That rule is not obvious — a `-1` sentinel silently drags
+    // a p50 negative and `approx_percentile` rejects the input outright — so
+    // if any percentile-over-a-sentinel-bearing-column query is ever written,
+    // this test is the shape to restore.
 
     #[test]
     fn test_latency_commands_rest_era_bounded() {
         let joined = LATENCY_COMMANDS.join("\n");
-        // The audit aggregate is re-emitted as RESTLAT_ROW= labeled lines,
-        // every curl is --max-time bounded, and the box-wide probes are kept.
-        assert!(joined.contains("RESTLAT_ROW="));
-        assert!(joined.contains("rest_fetch_audit"));
+        // NARROWED 2026-09-17: the two `RESTLAT_ROW=` / `rest_fetch_audit`
+        // assertions are gone with the curl they pinned. Everything below is
+        // UNCHANGED and is why this test was narrowed rather than deleted —
+        // none of it ever depended on the REST leg.
+        //
+        // Every curl stays `--max-time` bounded, and the box-wide probes are
+        // kept: an operator asking "is the box slow?" still gets the QuestDB
+        // round-trip, the clock skew and the order-placement histogram.
         assert!(joined.contains("--max-time"));
         assert!(joined.contains("QDB="));
         assert!(joined.contains("SKEW="));
         assert!(joined.contains("tv_order_placement_duration_ns"));
+        // The per-socket live delivery lag is the tab's primary table now
+        // that the REST percentiles are gone — pinned so a future edit
+        // cannot leave the tab with no latency measurement at all.
+        assert!(joined.contains("WSLAT_RAW="));
+        // A retired table must never be read from this array again. The
+        // `rest_fetch_audit` needle is the one this test could not have
+        // caught before: it was an ASSERTED-PRESENT string until today.
+        assert!(!joined.contains("rest_fetch_audit"));
+        assert!(!joined.contains("rest_spot_1m"));
+        assert!(!joined.contains("rest_option_chain_1m"));
         // The retired live-feed probes must never be dialed again.
         assert!(!joined.contains("api-feed.dhan.co"));
         assert!(!joined.contains("socket-api.groww.in"));
@@ -2825,51 +4852,52 @@ mod tests {
 
     #[test]
     fn test_latency_timeout_reduced_with_margin() {
-        // No 25s WS-probe fan-out anymore — worst case is one 3s metrics curl
-        // + one 3s QDB probe + one 4s audit read + SSM registration.
-        assert_eq!(LATENCY_TIMEOUT_SECS, 15.0);
-        assert_eq!(REST_LAT_QUERY_MAX_SECS, 4);
-    }
-
-    #[test]
-    fn test_parse_rest_lat_row_happy() {
-        let row = parse_rest_lat_row("\"dhan\",\"spot_1m\",370,1450.04,5200.55").unwrap();
-        assert_eq!(
-            row,
-            json!({
-                "feed": "dhan",
-                "leg": "spot_1m",
-                "ok_rows": 370,
-                "p50_ms": 1450.0,
-                "p99_ms": 5200.6,
+        // RE-DERIVED 2026-09-17 with the rest_fetch_audit aggregate removed:
+        // three `--max-time 3` curls (order metrics, QuestDB probe, WS lag)
+        // = 9s + SSM registration. See the const's own docstring for why the
+        // superseded 15.0 was stale in the dangerous direction.
+        //
+        // The budget is asserted against the ARRAY, not against a copied
+        // number: a future curl added without raising the timeout fails here
+        // rather than silently eating the margin, which is exactly how the
+        // WSLAT curl slipped in under the old figure.
+        let curl_budget: f64 = LATENCY_COMMANDS
+            .iter()
+            .flat_map(|c| c.split("--max-time ").skip(1))
+            .filter_map(|rest| {
+                rest.split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<f64>().ok())
             })
+            .sum();
+        assert_eq!(curl_budget, 9.0, "LATENCY_COMMANDS curl budget");
+        assert_eq!(LATENCY_TIMEOUT_SECS, 12.0);
+        assert!(
+            LATENCY_TIMEOUT_SECS > curl_budget,
+            "the poll budget must outlast the commands it polls \
+             ({LATENCY_TIMEOUT_SECS} vs {curl_budget})"
         );
     }
 
-    #[test]
-    fn test_parse_rest_lat_row_null_percentiles_degrade_to_none() {
-        let row = parse_rest_lat_row("groww,chain_1m,0,null,NaN").unwrap();
-        assert_eq!(row["ok_rows"], 0);
-        assert_eq!(row["p50_ms"], Value::Null);
-        assert_eq!(row["p99_ms"], Value::Null);
-    }
-
-    #[test]
-    fn test_parse_rest_lat_row_rejects_malformed_and_bad_tokens() {
-        // Malformed on-box output yields NOTHING — never a fabricated row.
-        for bad in [
-            "",
-            "a,b",
-            "dhan,spot_1m,x,1,2",
-            "DH AN,leg,1,2,3",
-            "<script>,leg,1,2,3",
-            "dhan,<b>leg</b>,1,2,3",
-            "dhan,leg,-5,1,2",
-            "dhan,leg,1,2,3,4",
-        ] {
-            assert!(parse_rest_lat_row(bad).is_none(), "{bad:?}");
-        }
-    }
+    // ---- the three `parse_rest_lat_row` tests are RETIRED 2026-09-17 ----
+    //
+    // `..._happy`, `..._null_percentiles_degrade_to_none` and
+    // `..._rejects_malformed_and_bad_tokens` covered the `RESTLAT_ROW=` CSV
+    // parser, which went with its `rest_fetch_audit` producer
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction).
+    //
+    // The two rules they enforced are PRESERVED by the socket-lag tests that
+    // follow, which is why this is a tombstone and not a lost guarantee:
+    //   * a `null`/`NaN` percentile the database could not compute renders as
+    //     ABSENT, never as 0 (`..._degrade_to_none` → the `+Inf` and
+    //     missing-count arms below);
+    //   * a malformed on-box line yields NOTHING rather than a partially
+    //     parsed row (`..._rejects_malformed` →
+    //     `test_parse_ws_lag_rows_drops_malformed_lines`).
+    //
+    // The charset gate those tests also exercised (`is_token`) is retired with
+    // them; `FEED_NAME_RE` is the surviving, tighter equivalent and is
+    // exercised by the feed-name tests.
 
     /// Two sockets, one healthy and one badly late — the exact shape the panel
     /// exists to make visible, and the one a `{host}`-folded or per-endpoint
@@ -2929,6 +4957,78 @@ mod tests {
         assert!(parse_ws_lag_rows(&zero).is_empty());
     }
 
+    /// 2026-09-08: the operator's console showed two sockets of sixteen and a
+    /// "NaN ms" p99. Every socket the app tracks now gets a row — what it
+    /// holds, what it delivered, when — whether or not its lag histogram has
+    /// samples, and the numbers ride the same raw lines.
+    #[test]
+    fn test_parse_ws_lag_rows_carries_every_socket_with_its_held_and_delivered_counts() {
+        let raw: Vec<String> = [
+            // Socket 0: healthy main-feed socket with measured lag.
+            r#"tv_dhan_ws_conn_instruments{connection="0",endpoint="main_feed"} 4600"#,
+            r#"tv_dhan_ws_conn_frames{connection="0",endpoint="main_feed"} 120500"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="0",endpoint="main_feed"} 1"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="100"} 90"#,
+            r#"tv_dhan_ws_lag_ms_bucket{connection="0",le="+Inf"} 100"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="0"} 100"#,
+            // Socket 12: a depth-200 socket holding ONE contract that has
+            // never delivered — no lag samples at all. It must still appear,
+            // with NO age and NO percentile (never a zero).
+            r#"tv_dhan_ws_conn_instruments{connection="12",endpoint="depth_200"} 1"#,
+            r#"tv_dhan_ws_conn_frames{connection="12",endpoint="depth_200"} 0"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="12",endpoint="depth_200"} -1"#,
+            r#"tv_dhan_ws_lag_ms_count{connection="12"} 0"#,
+            // The drain's degrade bucket is not a socket and gets no row.
+            r#"tv_dhan_ws_lag_ms_count{connection="unknown"} 3"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 2, "one row per socket seen, none for `unknown`");
+
+        assert_eq!(rows[0]["connection"], "0");
+        assert_eq!(rows[0]["endpoint"], "main_feed");
+        assert_eq!(rows[0]["instruments"], 4600.0);
+        assert_eq!(rows[0]["frames"], 120_500.0);
+        assert_eq!(rows[0]["tick_age_secs"], 1.0);
+        assert_eq!(rows[0]["p50_ms"], 100.0);
+        assert_eq!(rows[0]["p99_ms"], "+Inf");
+
+        assert_eq!(rows[1]["connection"], "12");
+        assert_eq!(rows[1]["endpoint"], "depth_200");
+        assert_eq!(rows[1]["instruments"], 1.0);
+        assert_eq!(rows[1]["frames"], 0.0);
+        assert!(
+            rows[1]["tick_age_secs"].is_null(),
+            "-1 is 'never', not an age"
+        );
+        assert!(
+            rows[1]["p50_ms"].is_null(),
+            "no samples, no percentile — never a zero"
+        );
+        assert!(rows[1]["p99_ms"].is_null());
+    }
+
+    /// Sockets sort NUMERICALLY: "10" after "9", not after "1".
+    #[test]
+    fn test_parse_ws_lag_rows_orders_sockets_numerically() {
+        let raw: Vec<String> = [
+            r#"tv_dhan_ws_conn_frames{connection="10",endpoint="depth_200"} 5"#,
+            r#"tv_dhan_ws_conn_frames{connection="9",endpoint="depth_20"} 5"#,
+            r#"tv_dhan_ws_conn_frames{connection="1",endpoint="main_feed"} 5"#,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let order: Vec<String> = parse_ws_lag_rows(&raw)
+            .iter()
+            .map(|r| r["connection"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(order, ["1", "9", "10"]);
+    }
+
     #[test]
     fn test_parse_ws_lag_rows_drops_a_line_with_no_connection_label() {
         // Never default a malformed line into connection 0 — that would merge
@@ -2946,69 +5046,110 @@ mod tests {
 
     #[test]
     fn test_parse_latency_full() {
+        // NARROWED 2026-09-17: the two `RESTLAT_ROW=` lines and every
+        // assertion over `rest_latency` are gone with the `rest_fetch_audit`
+        // curl that produced them (`no-rest-except-live-feed-2026-06-27.md`
+        // §12.12, dated correction). The box-wide probes below are unchanged
+        // and are what this test now pins.
+        //
+        // One `RESTLAT_ROW=` line is KEPT in the fixture DELIBERATELY: a box
+        // running an older Lambda build still emits the prefix, and it must
+        // fall through the generic `k=v` arm into `fields` where nothing reads
+        // it — ignored, never rendered. The assertion below is that no
+        // `rest_latency` key reappears, which is what would happen if someone
+        // restored the arm without restoring its source.
         let stdout = concat!(
             "METRICS_BEGIN\n",
             "tv_order_placement_duration_ns_sum 5000\n",
             "tv_order_placement_duration_ns_count 10\n",
             "METRICS_END\n",
+            "QDB_PROBE={\"dataset\":[[1]]}\n",
             "QDB=0.0021\n",
             "SKEW=0.000123\n",
             "RESTLAT_ROW=\"dhan\",\"chain_1m\",374,1300.0,2100.0\n",
-            "RESTLAT_ROW=\"groww\",\"spot_1m\",372,900.0,1600.0\n",
         );
         let out = parse_latency(stdout);
         assert_eq!(out["questdb_ms"], "2.1");
         assert_eq!(out["clock_skew_ms"], "0.1");
         assert_eq!(out["order_place_avg_ns"], json!(500.0));
-        let rows = out["rest_latency"].as_array().unwrap();
-        let mut by_key = std::collections::HashMap::new();
-        for r in rows {
-            by_key.insert(
-                (
-                    r["feed"].as_str().unwrap().to_string(),
-                    r["leg"].as_str().unwrap().to_string(),
-                ),
-                r.clone(),
-            );
-        }
-        let keys: std::collections::HashSet<_> = by_key.keys().cloned().collect();
-        assert_eq!(
-            keys,
-            std::collections::HashSet::from([
-                ("dhan".to_string(), "chain_1m".to_string()),
-                ("groww".to_string(), "spot_1m".to_string()),
-            ])
-        );
-        assert_eq!(
-            by_key[&("dhan".to_string(), "chain_1m".to_string())]["ok_rows"],
-            374
-        );
-        assert_eq!(
-            by_key[&("dhan".to_string(), "chain_1m".to_string())]["p99_ms"],
-            json!(2100.0)
-        );
-        assert_eq!(
-            by_key[&("groww".to_string(), "spot_1m".to_string())]["p50_ms"],
-            json!(900.0)
+        assert!(
+            out.get("rest_latency").is_none(),
+            "a stale RESTLAT_ROW= line must not resurrect the retired field"
         );
     }
 
     #[test]
+    fn latency_requires_a_completed_query_with_the_expected_result() {
+        for probe in [
+            "",
+            "invalid",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[0]]}"#,
+            r#"{"dataset":[[1]],"error":"unavailable"}"#,
+        ] {
+            let output = parse_latency(&format!("QDB_PROBE={probe}\nQDB=0.001\n"));
+            assert_eq!(output["questdb_ms"], "", "{probe}");
+        }
+        for invalid in ["-0.1", "NaN", "inf", "1e308"] {
+            let output = parse_latency(&format!(
+                "QDB_PROBE={{\"dataset\":[[1]]}}\nQDB={invalid}\nSKEW=NaN"
+            ));
+            assert_eq!(output["questdb_ms"], "", "{invalid}");
+            assert_eq!(output["clock_skew_ms"], "");
+        }
+    }
+
+    #[test]
+    fn receive_buffer_bytes_require_a_current_positive_kernel_reading() {
+        let lines = [
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="0"} 1048576"#,
+            r#"tv_dhan_ws_conn_frames{connection="1"} 0"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="1"} -1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="1"} -1"#,
+            r#"tv_dhan_ws_conn_frames{connection="2"} 1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="3"} NaN"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="4"} 0"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="5"} 12.5"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="6"} 2147483648"#,
+        ];
+        let raw = lines.map(str::to_owned);
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["receive_buffer_bytes"], 1048576);
+        assert_eq!(rows[0]["never_received"], false);
+        assert!(rows[0]["frames"].is_null());
+        assert!(rows[1]["receive_buffer_bytes"].is_null());
+        assert_eq!(rows[1]["never_received"], true);
+        assert!(rows[2]["receive_buffer_bytes"].is_null());
+    }
+
+    #[test]
     fn test_parse_latency_empty() {
-        // Box stopped -> empty table + blank shields, never fabricated numbers.
+        // Box stopped -> blank shields, never fabricated numbers.
+        //
+        // 2026-09-17: `rest_latency` is asserted ABSENT rather than `[]`. An
+        // always-empty list would have read as "the pulls ran and were never
+        // late" — the zero-an-operator-cannot-distinguish class. `ws_latency`
+        // keeps the empty-list shape because its producer is live: `[]` there
+        // genuinely means the lane reported no sockets, and the console says
+        // so in words rather than showing a comforting zero.
         let out = parse_latency("");
-        assert_eq!(out["rest_latency"], json!([]));
+        assert!(out.get("rest_latency").is_none());
+        assert_eq!(out["ws_latency"], json!([]));
         assert_eq!(out["questdb_ms"], "");
         assert_eq!(out["clock_skew_ms"], "");
         assert_eq!(out["order_place_avg_ns"], Value::Null);
     }
 
-    #[test]
-    fn test_parse_latency_malformed_rest_rows_skipped() {
-        let out = parse_latency("RESTLAT_ROW=garbage\nRESTLAT_ROW=dhan,spot_1m,10,1.0,2.0\n");
-        assert_eq!(out["rest_latency"].as_array().unwrap().len(), 1);
-        assert_eq!(out["rest_latency"][0]["feed"], "dhan");
-    }
+    // ---- `test_parse_latency_malformed_rest_rows_skipped` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It fed `RESTLAT_ROW=garbage` beside one good row and asserted the
+    // garbage was DROPPED rather than half-parsed. The rule is intact and is
+    // enforced one panel over by
+    // `test_parse_ws_lag_rows_drops_malformed_lines`, on the parser that
+    // still has a producer.
 
     // ------------------------------------------------------ class ParseStorage
     #[test]
@@ -3142,6 +5283,41 @@ mod tests {
         assert_eq!(status_of(&resp), 409);
     }
 
+    /// Plan item 45g D10: while the zero-loss lock holds, every
+    /// data-deleting action is refused with 409 at ANY hour, with force and
+    /// the typed confirm word, and never reaches the box.
+    #[tokio::test]
+    async fn test_regression_console_data_wipes_are_refused_at_any_hour() {
+        const { assert!(!CONSOLE_DATA_WIPES_AUTHORIZED) };
+        // The production shell answers with the constant, not a copy of it.
+        let src = include_str!("operator_control.rs");
+        assert!(src.contains(concat!(
+            "fn data_wipes_authorized(&self) -> bool {\n",
+            "        CONSOLE_DATA_WIPES_AUTHORIZED\n"
+        )));
+        for locked in [false, true] {
+            let shell = MockShell {
+                wipes_authorized: CONSOLE_DATA_WIPES_AUTHORIZED,
+                market_hours: locked,
+                forbid_ssm: Some("a refused data-deleting action must never reach SSM"),
+                ..MockShell::default()
+            };
+            for resp in [
+                wipe(&shell, true, "WIPE").await,
+                docker_reset(&shell, true, "NUKE-DOCKER", AUTH_SECRET).await,
+                docker_nuke_bare(&shell, true, "ERASE").await,
+            ] {
+                assert_eq!(status_of(&resp), 409, "{resp}");
+                let body = body_of(&resp);
+                if !locked {
+                    assert_eq!(body["data_wipes_disabled"], json!(true), "{body}");
+                    assert_eq!(body["error"], json!(CONSOLE_DATA_WIPES_REFUSED_MSG));
+                }
+            }
+            assert!(shell.captured_joined().is_empty());
+        }
+    }
+
     #[test]
     fn test_wipe_is_in_destructive_set() {
         assert!(DESTRUCTIVE.contains(&"wipe-questdb"));
@@ -3204,7 +5380,9 @@ mod tests {
             disable_pos < rm_pos,
             "unit must be disabled before the wipe body"
         );
-        assert!(joined.contains("$0==\"prev_day_ohlcv\""));
+        // 2026-09-27 (audit PR28): prev_day_ohlcv is on the never-delete
+        // list and is no longer a wipe target.
+        assert!(!joined.contains("$0==\"prev_day_ohlcv\""));
         assert!(joined.contains("systemctl enable tickvault || true"));
     }
 
@@ -3217,7 +5395,8 @@ mod tests {
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
         // (a) dynamic table discovery — no hardcoded 6-table list.
         assert!(joined.contains("SELECT table_name FROM tables()"));
-        assert!(joined.contains("$0==\"ticks\" || index($0,\"candles_\")==1"));
+        assert!(joined.contains("$0==\"ticks\""));
+        assert!(joined.contains("index($0,\"candles_\")==1"));
         // (b) every feed's capture/replay source removed (feed-agnostic).
         for needle in ["/ws_wal", "/groww", "/spill", "/dlq", "live-ticks.ndjson"] {
             assert!(
@@ -3233,48 +5412,256 @@ mod tests {
         assert!(joined.contains("WIPE-PARTIAL"));
     }
 
+    /// Every equality-arm table in the wipe TARGET predicate must also be
+    /// counted by the verification tail, and vice versa.
+    ///
+    /// # The defect this closes (2026-09-05)
+    ///
+    /// `market_depth` was in NEITHER half. The action truncated everything
+    /// else and printed `WIPE-COMPLETE` with the largest table in the process
+    /// untouched — a measured 1,530,651,649 rows/session, 299 GB — which is
+    /// why that day's wipe had to drop the table by hand over EC2 Instance
+    /// Connect *after* this tool reported success. Quote 21 of the same day
+    /// names `market_depth` in the authorized wipe set, so the tool was
+    /// failing against the operator's own written scope.
+    ///
+    /// A symmetry test alone would NOT have caught it — absent from both
+    /// halves is symmetric. So this asserts symmetry AND names the two
+    /// market-data tables whose omission is the expensive one. Symmetry is
+    /// what stops the next addition from landing in one half only; the named
+    /// pair is what stops this specific regression.
     #[test]
-    fn test_wipe_questdb_truncates_live_rest_tables_too() {
-        // 2026-07-16 destructive-surface extension: a "fresh start" must also
-        // drop today's official minute candles + the fetch log — the four
-        // LIVE tables the REST pulls write. rest_fetch_audit is per-fetch
-        // forensics, NOT a SEBI never-delete table; the SEBI *_audit family
-        // stays preserved by the dynamic filter.
+    fn test_wipe_targets_and_verification_name_the_same_tables() {
         let joined = WIPE_QUESTDB_COMMANDS.join("\n");
-        // 2026-08-01: the target predicate is now an awk expression (the
-        // embedded interpreter program was retired). Each of the four LIVE
-        // REST tables must still appear as its own equality arm.
-        for live in [
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-            "rest_fetch_audit",
-        ] {
+
+        // The two market-data tables that carry essentially all the bytes.
+        // `ticks` was always present; `market_depth` was the omission.
+        for t in ["ticks", "market_depth"] {
             assert!(
-                joined.contains(&format!("$0==\"{live}\"")),
-                "wipe target predicate lost the {live} arm"
+                joined.contains(&format!("$0==\"{t}\"")),
+                "wipe TARGET predicate does not name `{t}` — the action would \
+                 report WIPE-COMPLETE while leaving it fully populated"
+            );
+            assert!(
+                joined.contains(&format!("$(qc {t})")),
+                "wipe VERIFICATION tail does not count `{t}` — WIPE-COMPLETE \
+                 would be printed without ever checking it reached zero"
             );
         }
-        // Review fix M2 (2026-07-16): honest completion verifies EVERY
-        // truncate-target family — the legacy pair AND all FOUR live REST
-        // tables.
-        for t in [
-            "ticks",
-            "candles_1m",
-            "rest_spot_1m",
-            "rest_option_chain_1m",
-            "rest_option_contract_1m",
-            "rest_fetch_audit",
-        ] {
-            assert!(joined.contains(&format!("$(qc {t})")), "{t}");
+
+        // Symmetry, discovered rather than listed: every `$0=="X"` equality
+        // arm in the predicate must have a `$(qc X)` in the tail, and every
+        // `$(qc X)` must have an arm. `candles_` is matched by `index(...)==1`
+        // (a prefix, not an equality arm) and is verified via `candles_1m`
+        // alone, so it is excluded from both directions deliberately.
+        let mut targets: Vec<String> = Vec::new();
+        for part in joined.split("$0==\"").skip(1) {
+            if let Some(end) = part.find('"') {
+                targets.push(part[..end].to_string());
+            }
         }
-        assert!(joined.contains("rest_spot_1m=${S:-?}"));
-        // Review fix M2: a missing/erroring count defaults to 0 (absent
-        // table = nothing left = wiped). The old default-to-1 made EVERY
-        // post-nuke wipe read WIPE-PARTIAL forever.
-        for default in [
-            "${T:-0}", "${C:-0}", "${S:-0}", "${O:-0}", "${K:-0}", "${A:-0}",
-        ] {
+        let mut verified: Vec<String> = Vec::new();
+        for part in joined.split("$(qc ").skip(1) {
+            if let Some(end) = part.find(')') {
+                verified.push(part[..end].to_string());
+            }
+        }
+        // 2026-09-27 (audit PR28): the equality arms are now `ticks` and
+        // `market_depth` only; the candle tables are the prefix arm.
+        assert!(
+            targets.len() >= 2 && verified.len() >= 3,
+            "wipe predicate/verification parse looks vacuous (targets={}, \
+             verified={}) — the scanner, not the commands, is broken",
+            targets.len(),
+            verified.len()
+        );
+        for t in &targets {
+            assert!(
+                verified.contains(t),
+                "wipe TARGETS `{t}` but never verifies it reached zero — \
+                 WIPE-COMPLETE would be printed on an untested table"
+            );
+        }
+        for v in &verified {
+            if v == "candles_1m" {
+                continue; // matched by the `index($0,"candles_")==1` prefix arm
+            }
+            assert!(
+                targets.contains(v),
+                "wipe VERIFIES `{v}` but never truncates it — the action would \
+                 report WIPE-PARTIAL forever on a table it does not touch"
+            );
+        }
+    }
+
+    /// `candles_named` is a VIEW that starts with the
+    /// `candles_` prefix the wipe uses to find candle TABLES. A `TRUNCATE
+    /// TABLE` on a view fails, prints TRUNCATE-FAILED on every wipe, and trains
+    /// the operator to ignore the line that would report a real failure. It is
+    /// excluded by name; the prefix arm still covers every real frame.
+    /// `candles_10m` was a view until 2026-09-22 and is now a real TABLE, so
+    /// it is deliberately NOT excluded — it must be truncated with the rest.
+    ///
+    /// 2026-09-22 — tightened in two directions, both of which the previous
+    /// form could not see:
+    ///
+    /// 1. **Semantics, not presence.** It asserted each `$0!="view"` string
+    ///    appeared ANYWHERE in the command. `index(..)==1 || $0!="candles_10m"`
+    ///    contains the same bytes and makes EVERY table (SEBI audit tables
+    ///    included) a truncate target. Now the prefix arm must be ONE
+    ///    parenthesised top-level `||` arm whose other conjuncts are exactly the
+    ///    view exclusions, ANDed — and no other arm may mention `candles_`.
+    /// 2. **Derived, not hard-coded.** The view list is read from the storage
+    ///    crate's `console_views.rs` (`pub const VIEW_*: &str = "candles_…"`),
+    ///    the file that CREATES the views. This crate does not depend on
+    ///    `tickvault-storage` (a Lambda should not link the storage stack), so
+    ///    the source is scanned rather than imported. A new `candles_*` view
+    ///    added there without an exclusion here now fails this test instead of
+    ///    printing TRUNCATE-FAILED on the next wipe.
+    #[test]
+    fn test_wipe_questdb_never_truncates_a_candle_view() {
+        // --- the source of truth: every console view named `candles_*` ---
+        let views_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../storage/src/console_views.rs");
+        let views_src = std::fs::read_to_string(&views_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", views_path.display()));
+        // 2026-09-22 (no views anywhere): console_views.rs no longer CREATES
+        // any view. It carries the list of RETIRED view names it drops at
+        // boot, and the subset of those names that are now real TABLES
+        // (`candles_10m`). A retired `candles_*` name that is still a view
+        // must be excluded; a name that became a table must NOT be — excluding
+        // it would leave a real candle table out of the wipe.
+        let quoted_list = |const_name: &str| -> Vec<String> {
+            let start = views_src
+                .find(&format!("pub const {const_name}"))
+                .unwrap_or_else(|| panic!("console_views.rs lost `{const_name}`"));
+            let body = &views_src[start..];
+            let eq = body.find("= [").expect("array literal") + 3;
+            let close = eq + body[eq..].find("];").expect("array end");
+            body[eq..close]
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//"))
+                .flat_map(|l| l.split(','))
+                .filter_map(|s| {
+                    s.trim()
+                        .strip_prefix('"')
+                        .and_then(|r| r.strip_suffix('"'))
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+        let retired = quoted_list("RETIRED_CONSOLE_VIEWS");
+        let now_tables = quoted_list("VIEW_NAMES_NOW_TABLES");
+        let mut candle_views: std::collections::BTreeSet<String> = retired
+            .iter()
+            .filter(|n| n.starts_with("candles_") && !now_tables.contains(n))
+            .cloned()
+            .collect();
+        // Anti-vacuity: a parser that matched nothing would make every
+        // assertion below trivially true.
+        assert!(
+            candle_views.contains("candles_named"),
+            "the view scan must find the candles_named view, found {candle_views:?}"
+        );
+        assert!(
+            now_tables.iter().any(|t| t == "candles_10m")
+                && retired.iter().any(|t| t == "candles_10m"),
+            "the scan must see candles_10m as a retired view that is now a table: \
+             retired={retired:?} now_tables={now_tables:?}"
+        );
+
+        // --- the awk program that selects truncate targets ---
+        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+        let program = joined
+            .split("awk '")
+            .skip(1)
+            .map(|rest| rest.split('\'').next().unwrap_or(""))
+            .find(|p| p.contains("index($0,\"candles_\")==1"))
+            .expect("the wipe must select targets with an awk program using the candles_ prefix");
+        let arms: Vec<&str> = program.split(" || ").map(str::trim).collect();
+
+        let prefix_arms: Vec<&&str> = arms.iter().filter(|a| a.contains("candles_")).collect();
+        assert_eq!(
+            prefix_arms.len(),
+            1,
+            "exactly one top-level `||` arm may mention candles_ — a second arm \
+             (e.g. a bare `$0!=\"candles_10m\"`) would admit every table: {arms:?}"
+        );
+        let arm = prefix_arms[0];
+        let inner = arm
+            .strip_prefix('(')
+            .and_then(|a| a.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("the candles_ arm must be parenthesised: {arm}"));
+        let mut conjuncts = inner.split(" && ").map(str::trim);
+        assert_eq!(
+            conjuncts.next(),
+            Some("index($0,\"candles_\")==1"),
+            "the arm must LEAD with the prefix test: {arm}"
+        );
+        for c in conjuncts {
+            let name = c
+                .strip_prefix("$0!=\"")
+                .and_then(|r| r.strip_suffix('"'))
+                .unwrap_or_else(|| {
+                    panic!("every other conjunct must be a view exclusion, got `{c}`")
+                });
+            assert!(
+                candle_views.remove(name),
+                "the wipe excludes `{name}`, which is not a candle view in console_views.rs \
+                 — a real candle TABLE excluded here is never truncated"
+            );
+        }
+        assert!(
+            candle_views.is_empty(),
+            "console_views.rs declares candle view(s) {candle_views:?} that the wipe does not \
+             exclude — TRUNCATE TABLE on a view fails on every wipe"
+        );
+    }
+    /// The wipe truncates market data only, never a table on the
+    /// never-delete list.
+    ///
+    /// Until 2026-09-27 it also truncated `prev_day_ohlcv` and the four
+    /// `rest_*` tables (a 2026-07-16 extension), and a test pinned that. All
+    /// five are on `DAY_PARTITIONED_TABLES`, the list the reset saves before
+    /// it deletes anything, and daily-universe Quote 21 names
+    /// `rest_fetch_audit` and the REST minute tables as KEPT by a fresh-start
+    /// wipe. The list is read from the storage source, so a table added to
+    /// the never-delete list later is covered without editing this test.
+    #[test]
+    fn test_wipe_never_targets_a_never_delete_table() {
+        let kept = never_delete_tables();
+        let joined = WIPE_QUESTDB_COMMANDS.join("\n");
+        let mut targets: Vec<String> = Vec::new();
+        for part in joined.split("$0==\"").skip(1) {
+            if let Some(end) = part.find('"') {
+                targets.push(part[..end].to_string());
+            }
+        }
+        assert!(
+            targets.iter().any(|t| t == "ticks"),
+            "the target scan found nothing — it is broken, not the commands: {targets:?}"
+        );
+        for t in &targets {
+            assert!(
+                !kept.contains(t),
+                "the wipe truncates `{t}`, which is on the never-delete list"
+            );
+        }
+        // The prefix arm must not reach a kept table either.
+        for k in &kept {
+            assert!(
+                !k.starts_with("candles_"),
+                "never-delete table `{k}` starts with `candles_`, so the wipe's prefix arm \
+                 would truncate it"
+            );
+            assert!(
+                !joined.contains(&format!("$(qc {k})")),
+                "the wipe verifies `{k}` reached zero, so it expects to empty a kept table"
+            );
+        }
+        // A missing count reads 0 (absent table = nothing left), never 1.
+        for default in ["${T:-0}", "${D:-0}", "${C:-0}"] {
             assert!(joined.contains(default), "{default}");
             assert!(
                 !joined.contains(&default.replace(":-0", ":-1")),
@@ -3282,6 +5669,203 @@ mod tests {
             );
         }
         assert!(joined.contains("TRUNCATE-FAILED"));
+    }
+
+    /// Every console command carries a short SSM delivery timeout, so a
+    /// command the box picks up late is dropped rather than run long after
+    /// the console's lock check passed.
+    #[test]
+    fn test_ssm_shell_sets_a_short_delivery_timeout() {
+        assert!(
+            (30..=600).contains(&SSM_DELIVERY_TIMEOUT_SECS),
+            "SSM accepts 30 s minimum; more than 10 minutes defeats the point"
+        );
+        let src = include_str!("operator_control.rs");
+        let send = src
+            .find(".document_name(\"AWS-RunShellScript\")")
+            .expect("ssm_shell sends AWS-RunShellScript");
+        let tail = &src[send..send + 400];
+        assert!(
+            tail.contains(".timeout_seconds(SSM_DELIVERY_TIMEOUT_SECS)"),
+            "ssm_shell lost its delivery timeout"
+        );
+    }
+
+    /// Every data-destructive action re-checks the 09:00–15:45 IST lock on
+    /// the box BEFORE it stops the app, with the same window as the console.
+    ///
+    /// The console refuses these actions inside the lock only at send time; a
+    /// command SSM delivers late would otherwise run inside it. Before
+    /// 2026-09-27 the reset and nuke checked the box clock only at the end of
+    /// their save, after the app was already stopped, and the wipe never
+    /// checked it at all.
+    #[test]
+    fn test_on_box_lock_guard_runs_before_the_first_stop() {
+        use crate::operator_control_action_commands::ON_BOX_LOCK_GUARD;
+        assert!(
+            ON_BOX_LOCK_GUARD.contains(&format!("-ge {DATA_DESTRUCTIVE_LOCK_OPEN_SECS}")),
+            "the on-box guard must open at DATA_DESTRUCTIVE_LOCK_OPEN_SECS"
+        );
+        assert!(
+            ON_BOX_LOCK_GUARD.contains(&format!("-lt {DATA_DESTRUCTIVE_LOCK_CLOSE_SECS}")),
+            "the on-box guard must close at DATA_DESTRUCTIVE_LOCK_CLOSE_SECS"
+        );
+        assert!(
+            ON_BOX_LOCK_GUARD.contains("+ 19800"),
+            "IST is UTC + 19,800 s"
+        );
+        assert!(
+            !ON_BOX_LOCK_GUARD.contains("exit 1"),
+            "exit 1 is reserved for sebi_abort in the reset's save step"
+        );
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let guard_at = cmds
+                .iter()
+                .position(|c| *c == ON_BOX_LOCK_GUARD)
+                .unwrap_or_else(|| panic!("{name} has no on-box lock guard"));
+            let stop_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl stop tickvault"))
+                .unwrap_or_else(|| panic!("{name} never stops the app"));
+            assert!(
+                guard_at < stop_at,
+                "{name}: the lock guard (element {guard_at}) must run before the first \
+                 stop (element {stop_at})"
+            );
+        }
+    }
+
+    /// SSM runs a command list as ONE script, so an `exit` in any element
+    /// ends the whole action. An exit after the app was disabled must
+    /// re-enable it in the same element, or the unit stays off and the
+    /// 15-minute autopilot reads that as intentional.
+    ///
+    /// Before 2026-09-27 the reset had `cd … || exit 0` and a
+    /// `docker-reset-FAILED; exit 1` branch that both left it disabled.
+    /// Allowed exits: the on-box lock guard (runs before anything is stopped),
+    /// the save step (its only `exit 1` is inside `sebi_abort`, which
+    /// re-enables; its `exit 2` leaves the box to the run holding the lock).
+    #[test]
+    fn test_every_exit_after_the_disable_re_enables_the_app() {
+        use crate::operator_control_action_commands::ON_BOX_LOCK_GUARD;
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            for (i, c) in cmds.iter().enumerate() {
+                if *c == ON_BOX_LOCK_GUARD {
+                    continue;
+                }
+                if c.contains("sebi_abort()") {
+                    // The save step's exits: `exit 1` only inside sebi_abort
+                    // (which re-enables), and `exit 2` only when another reset
+                    // holds the lock and will re-enable the app itself.
+                    let busy = c
+                        .lines()
+                        .filter(|l| l.contains("exit 2") && !l.trim_start().starts_with('#'))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        busy.len() == 1 && busy[0].contains("flock -n 9"),
+                        "{name}: `exit 2` must appear only on the flock-busy line: {busy:?}"
+                    );
+                    continue;
+                }
+                // Every `exit` word, bare or with a code: `exit`, `exit;`,
+                // `exit 0`. A word boundary on both sides keeps `exited` out.
+                let bytes = c.as_bytes();
+                let mut from = 0;
+                while let Some(off) = c[from..].find("exit") {
+                    let at = from + off;
+                    from = at + 4;
+                    let left_ok = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+                    let right_ok = bytes
+                        .get(at + 4)
+                        .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_');
+                    if !(left_ok && right_ok) {
+                        continue;
+                    }
+                    assert!(
+                        c[..at].contains("systemctl enable tickvault"),
+                        "{name} element {i}: an `exit` without re-enabling the app first: {c}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The reset and nuke refuse to delete the volume while a kept table is
+    /// on it unsaved, and copy the save off the box before deleting anything.
+    ///
+    /// Two holes closed on 2026-09-27: the export trusted ONE table-list
+    /// query, so a list cut short made a kept table read as absent and the
+    /// volume holding it was then deleted; and the save lived only on the
+    /// box's own disk.
+    #[test]
+    fn destructive_actions_refuse_an_unsaved_table_and_copy_the_save_off_the_box() {
+        for (name, cmds) in [
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let preserve = cmds
+                .iter()
+                .find(|c| c.contains("SEBI-PRESERVED"))
+                .unwrap_or_else(|| panic!("{name} has no save step"));
+            for needle in [
+                "MODE=export; EXPORTED=''",
+                "EXPORTED=\"$EXPORTED $t\"",
+                "case \" $EXPORTED \" in *\" $t \"*) continue ;; esac",
+                "SEBI-PRESERVE-UNLISTED:",
+                "its folders could not be read",
+            ] {
+                assert!(
+                    preserve.contains(needle),
+                    "{name}: save step lost `{needle}`"
+                );
+            }
+            // The folders QuestDB did not list are copied raw, after the
+            // export loop and before the upload.
+            let unlisted = preserve
+                .find("SEBI-PRESERVE-UNLISTED:")
+                .unwrap_or_else(|| panic!("{name}: no raw copy of unlisted folders"));
+            let copy_call = preserve[unlisted..]
+                .find("raw_copy")
+                .map(|o| unlisted + o)
+                .unwrap_or_else(|| panic!("{name}: unlisted folders are never copied"));
+            let upload = preserve
+                .find("| timeout \"$(left)\" aws s3 cp")
+                .unwrap_or_else(|| panic!("{name}: the save is never copied off the box"));
+            assert!(
+                preserve.contains("set -o pipefail; tar --totals"),
+                "{name}: the upload must fail when tar fails, not only when the upload does"
+            );
+            let compare = preserve
+                .find("[ \"$TBYTES\" = \"$RBYTES\" ] || sebi_abort")
+                .unwrap_or_else(|| panic!("{name}: the cloud copy is never checked"));
+            assert!(
+                copy_call < upload,
+                "{name}: unlisted folders must be copied before the upload"
+            );
+            let last_export = preserve
+                .rfind("SEBI-PRESERVED ")
+                .unwrap_or_else(|| panic!("{name}: no export line"));
+            assert!(
+                last_export < upload && upload < compare,
+                "{name}: save, then upload, then compare"
+            );
+            assert!(
+                preserve.trim_end().ends_with("lock_check"),
+                "{name}: the lock re-check must stay the save step's last act"
+            );
+            assert!(
+                !preserve.contains("rm -rf \"$OUT") && !preserve.contains("rm -rf $OUT"),
+                "{name}: the save step must never delete the box copy (daily-universe Quote 25)"
+            );
+        }
     }
 
     /// AUTO-START GUARANTEE ratchet (2026-08-20 incident).
@@ -3332,6 +5916,232 @@ mod tests {
             );
         }
     }
+    /// The set of tables this action MUST export, DERIVED from the
+    /// repository's own authoritative never-delete lists rather than restated
+    /// here.
+    ///
+    /// # Why derived, and not a list
+    ///
+    /// Until 2026-09-05 this guard carried a hardcoded four-name array — the
+    /// SAME four the shell block used. It therefore asserted a list against
+    /// itself and could not, even in principle, notice that 32 other tables
+    /// the repository declares as never-delete were being destroyed with the
+    /// volume while the action printed `SEBI-PRESERVED` four times and exited
+    /// 0. A guard that restates its subject is a copy, not a check.
+    ///
+    /// The authority is `partition_manager.rs`: `DAY_PARTITIONED_TABLES` (the
+    /// audit and daily-data tables the retention sweep detaches but never
+    /// drops) plus `RETENTION_EXEMPT_TABLES` (the pinned-timestamp masters it
+    /// never touches at all). `HOUR_PARTITIONED_TABLES` — `ticks` and
+    /// `market_depth` — is deliberately EXCLUDED: that is the market data this
+    /// action exists to destroy, and exporting it would turn a recovery tool
+    /// into an out-of-disk incident.
+    ///
+    /// Adding a table to either list now makes this test fail until the shell
+    /// block exports it too. That is the point.
+    fn never_delete_tables() -> Vec<String> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../storage/src/partition_manager.rs"),
+        )
+        .expect("partition_manager.rs must be readable — it is the authority for this test");
+
+        let mut out = Vec::new();
+        for konst in ["DAY_PARTITIONED_TABLES", "RETENTION_EXEMPT_TABLES"] {
+            let start = src
+                .find(konst)
+                .unwrap_or_else(|| panic!("{konst} must exist — if it was renamed, update this"));
+            let body = &src[start..];
+            let end = body
+                .find("\n];")
+                .unwrap_or_else(|| panic!("{konst} must be a terminated slice literal"));
+            let mut found = 0usize;
+            for line in body[..end].lines() {
+                let line = line.trim();
+                // A quoted entry at the start of a line is a table name; a
+                // quote inside a `//` comment is prose and must not count.
+                if line.starts_with("//") {
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix('"')
+                    && let Some((name, _)) = rest.split_once('"')
+                {
+                    out.push(name.to_owned());
+                    found += 1;
+                }
+            }
+            assert!(
+                found >= 5,
+                "parsed only {found} entries from {konst} — the parser is broken and this \
+                 guard would pass while exporting almost nothing"
+            );
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The 2026-08-25 finding: `wipe-questdb` allowlists only market-data
+    /// tables, so the 5-year regulatory tables survive it — while
+    /// `docker-reset` and `docker-nuke-bare` delete the whole QuestDB volume
+    /// and take them with it, with nothing exported first.
+    ///
+    /// Two things are asserted, and the second is the one that matters:
+    /// the export happens, and it happens BEFORE anything destructive. An
+    /// export placed after `docker volume rm` would pass a naive "contains"
+    /// check while preserving nothing.
+    #[test]
+    fn destructive_actions_export_the_sebi_tables_before_destroying_the_volume() {
+        let sebi = never_delete_tables();
+        assert!(
+            sebi.len() >= 30,
+            "derived only {} never-delete tables — the derivation is broken",
+            sebi.len()
+        );
+        for (name, cmds) in [
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let preserve_at = cmds
+                .iter()
+                .position(|c| c.contains("SEBI-PRESERVED"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} destroys the QuestDB volume without exporting the 5-year \
+                         regulatory tables first. `wipe-questdb` spares them by allowlist; \
+                         this action must export them, because it deletes the volume they \
+                         live in."
+                    )
+                });
+
+            // Every destructive step must come after the export.
+            for (i, c) in cmds.iter().enumerate() {
+                // `docker volume ls` alone is a READ (the preserve step lists
+                // volumes to find the database one, audit PR20); the bare
+                // nuke's destroying line pipes it into `docker volume rm`,
+                // which the first term catches.
+                let destroys = c.contains("docker volume rm")
+                    || c.contains("compose down -v")
+                    || c.contains("system prune");
+                assert!(
+                    !destroys || i > preserve_at,
+                    "{name}: step {i} destroys data but runs BEFORE the SEBI export at \
+                     step {preserve_at} — an export that runs afterwards preserves nothing"
+                );
+            }
+
+            let block = cmds.join("\n");
+            for t in &sebi {
+                assert!(
+                    block.contains(t.as_str()),
+                    "{name} must export the regulatory table `{t}` before destroying the volume"
+                );
+            }
+            // It must REFUSE when a table exists and cannot be exported —
+            // otherwise the export is decoration and the data is still lost.
+            assert!(
+                block.contains("SEBI-PRESERVE-FAILED") && block.contains("exit 1"),
+                "{name}: a failed export of an EXISTING regulatory table must abort the \
+                 action, not be logged and stepped over"
+            );
+            // An unreachable QuestDB is NOT "nothing to export" (audit
+            // PR20, 2026-09-27): the tables are still on the volume this
+            // action deletes. It must copy them off the volume, verified,
+            // and stop on any step it cannot prove — while staying the
+            // remedy for a wedged QuestDB.
+            assert!(
+                block.contains("SEBI-PRESERVE-UNAVAILABLE")
+                    && block.contains("SEBI-PRESERVED-RAW")
+                    && block.contains("docker stop tv-questdb"),
+                "{name}: an unreachable QuestDB must lead to a raw copy of the tables off \
+                 the stopped volume, never to deleting them unsaved"
+            );
+            assert!(
+                !block.contains("Proceeding, because"),
+                "{name}: the old 'QuestDB did not answer, proceeding' step-over is back — \
+                 that deletes every 5-year table unsaved (daily-universe Quote 25 REJECT)"
+            );
+            // Every exit path out of the preserve step that did not prove the
+            // tables saved must go through sebi_abort, which restores the box
+            // and pages. A bare `exit 1` would leave the app disabled.
+            let preserve = &cmds[preserve_at];
+            assert_eq!(
+                preserve.matches("exit 1").count(),
+                1,
+                "{name}: the only `exit 1` in the preserve step must be the one inside \
+                 sebi_abort, so every refusal restores the box and pages"
+            );
+            for needle in [
+                "code=LAMBDA-PORTAL-01",
+                "systemctl enable tickvault",
+                "systemctl start tickvault",
+                "aws sns publish",
+                "SELECT count() FROM",
+                // a copy is proven by file count and file bytes, not `du -sb`
+                // (which also counts directory entries and differs on a
+                // fresh copy)
+                "fbytes",
+                // an export only sees APPLIED rows; a table behind on its WAL
+                // is copied raw instead
+                "wal_tables()",
+                "SEBI-PRESERVE-WAL-BEHIND",
+                // a database restarted mid-copy is detected, not trusted
+                "qdb_quiet",
+                // one reset at a time, and inside the SSM timeout
+                "flock -n 9",
+                "BUDGET=2700",
+            ] {
+                assert!(
+                    preserve.contains(needle),
+                    "{name}: the preserve step lost `{needle}` — a refusal must restore the \
+                     app, page, and every save must be verified, not assumed"
+                );
+            }
+            // The lock is re-checked ON THE BOX as the preserve step's last
+            // act, right before the first deletion: the console checks it
+            // only when the action is sent, and a long save can run past
+            // 09:00 IST.
+            assert!(
+                preserve.trim_end().ends_with("lock_check"),
+                "{name}: the preserve step must end by re-checking the 09:00-15:45 IST \
+                 lock on the box, right before the first step that deletes anything"
+            );
+            assert!(
+                preserve.contains(&format!("\"$SOD\" -ge {DATA_DESTRUCTIVE_LOCK_OPEN_SECS} ]"))
+                    && preserve.contains(&format!(
+                        "\"$SOD\" -lt {DATA_DESTRUCTIVE_LOCK_CLOSE_SECS} ]"
+                    )),
+                "{name}: the on-box lock window drifted from \
+                 DATA_DESTRUCTIVE_LOCK_OPEN_SECS / _CLOSE_SECS"
+            );
+            // The app must be disabled before the save, or the 15-minute
+            // autopilot restarts it and it brings QuestDB back up mid-copy.
+            let disable_at = cmds
+                .iter()
+                .position(|c| c.contains("systemctl disable tickvault"))
+                .unwrap_or(usize::MAX);
+            assert!(
+                disable_at < preserve_at,
+                "{name}: tickvault must be DISABLED before the SEBI save (step {preserve_at}); \
+                 a stopped-but-enabled app is restarted by the autopilot"
+            );
+            // The export target must be outside every path this action wipes.
+            assert!(
+                block.contains("/opt/tickvault/data/sebi-preserve/"),
+                "{name}: the export must land outside the volume and outside every rm -rf \
+                 path in this action"
+            );
+            for c in cmds.iter() {
+                if c.contains("rm -rf") {
+                    assert!(
+                        !c.contains("sebi-preserve"),
+                        "{name}: an rm -rf step must never sweep the preservation directory"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_docker_reset_and_bare_nuke_remove_feed_capture_sources() {
         // The full nuke + bare nuke must ALSO sweep the feed capture/replay
@@ -3413,8 +6223,10 @@ mod tests {
     async fn test_docker_reset_forced_is_hardened_full_nuke() {
         // Regression 2026-06-05: "the nuke didn't wipe the data". The forced
         // docker-reset must (a) remove containers by VOLUME, (b) fail LOUD
-        // without recreating if the volume survives, and (c) wipe the HOST app
-        // caches the Docker nuke can't see (instrument-cache/spill/dlq).
+        // without recreating if the volume survives, and (c) wipe the HOST
+        // feed folders the Docker nuke can't see (spill/dlq). Since 2026-10-28
+        // (Quote 44 review) it keeps `instrument-cache`: its dated snapshot
+        // files may not have a verified cold-bucket copy yet.
         let shell = MockShell {
             ssm_result: Ok("cmd-123".to_string()),
             ..MockShell::default()
@@ -3426,8 +6238,9 @@ mod tests {
         assert!(joined.contains("--filter volume=tv-questdb-data"));
         // (b) hard fail-loud gate — must NOT recreate if the volume survives
         assert!(joined.contains("DOCKER-RESET-FAILED"));
-        // (c) host caches wiped too (the dirs the Docker nuke cannot see)
-        assert!(joined.contains("/opt/tickvault/data/instrument-cache"));
+        // (c) host feed folders wiped too (the dirs the Docker nuke cannot
+        // see); the instrument snapshot folder is kept.
+        assert!(!joined.contains("instrument-cache"));
         assert!(joined.contains("/opt/tickvault/data/spill"));
         assert!(joined.contains("/opt/tickvault/data/dlq"));
         // (d) the FULL-NUKE sequence: stop app → compose down -v → prune →
@@ -3435,8 +6248,35 @@ mod tests {
         assert!(joined.contains("systemctl stop tickvault"));
         assert!(joined.contains("docker compose down -v"));
         assert!(joined.contains("docker system prune -af --volumes"));
-        assert!(joined.contains("ensure-questdb.sh"));
+        assert!(joined.contains("tickvault-host ensure-questdb"));
         assert!(joined.contains("systemctl restart tickvault"));
+    }
+
+    #[test]
+    fn test_destructive_command_lists_keep_the_instrument_snapshot_folder() {
+        // Regression 2026-10-28 (Quote 44 review): wipe-questdb, docker-reset
+        // and docker-nuke-bare ran `rm -rf /opt/tickvault/data/instrument-cache`,
+        // which deleted dated instrument snapshot files (and their verified-copy
+        // markers) that might not have a cold-bucket copy yet. Quote 44 REJECTs
+        // sweeping a local artifact before its verified copy, so no destructive
+        // list may touch that folder; the feed folders are still wiped.
+        for (name, cmds) in [
+            ("wipe-questdb", WIPE_QUESTDB_COMMANDS.as_slice()),
+            ("docker-reset", DOCKER_RESET_COMMANDS.as_slice()),
+            ("docker-nuke-bare", DOCKER_NUKE_BARE_COMMANDS.as_slice()),
+        ] {
+            let joined = cmds.join("\n");
+            assert!(
+                !joined.contains("instrument-cache"),
+                "{name} must not remove the instrument snapshot folder"
+            );
+            for kept_wipe in ["/opt/tickvault/data/spill", "/opt/tickvault/data/dlq"] {
+                assert!(
+                    joined.contains(kept_wipe),
+                    "{name} must still wipe {kept_wipe}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3473,9 +6313,38 @@ mod tests {
         assert!(joined.contains("BARE-NUKE-RESULT"));
         assert!(joined.contains("bare-nuke-complete"));
         // the WHOLE POINT: it must NOT rebuild / restart the app
-        assert!(!joined.contains("ensure-questdb.sh"));
+        assert!(!joined.contains("ensure-questdb"));
         assert!(!joined.contains("systemctl restart tickvault"));
         assert!(!joined.contains("docker compose up"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_questdb_calls_the_binary_only_behind_the_version_check() {
+        // Audit D6d (2026-10-01): the self-heal moved from a shell script into
+        // the binary. A binary that predates the port would ignore the
+        // unknown subcommand and boot the whole app, so the call must sit
+        // behind the check for the new binary's log prefix.
+        let shell = MockShell {
+            ssm_result: Ok("cmd-rq".to_string()),
+            ..MockShell::default()
+        };
+        let resp = post(&shell, json!({"action": "restart-questdb"})).await;
+        assert_eq!(status_of(&resp), 200);
+        let joined = shell.captured_joined();
+        let guard = "grep -qaF 'ensure-questdb: ' /opt/tickvault/bin/tickvault-host";
+        let call = "then /opt/tickvault/bin/tickvault-host ensure-questdb;";
+        let guard_at = joined.find(guard).expect("version check present");
+        let call_at = joined.find(call).expect("binary call present");
+        assert!(guard_at < call_at, "the check must run before the call");
+        assert_eq!(joined.matches("tickvault-host ensure-questdb").count(), 1);
+        assert!(joined.contains("ENSURE-QUESTDB-SKIPPED"));
+        // The reset's two self-heal lines use the same guarded command.
+        use crate::operator_control_action_commands::{
+            DOCKER_RESET_COMMANDS, ENSURE_QUESTDB_COMMAND,
+        };
+        let reset = DOCKER_RESET_COMMANDS.join("\n");
+        assert_eq!(reset.matches(ENSURE_QUESTDB_COMMAND).count(), 2);
+        assert!(!reset.contains("bash /opt/tickvault/repo/scripts/ensure-questdb.sh ||"));
     }
 
     // ---------------------------------------------------- class HtmlWipeButton
@@ -3576,14 +6445,20 @@ mod tests {
 
     #[test]
     fn test_view_commands_query_live_tables_grouped_by_feed() {
-        for (label, table) in [
-            ("SPOT_BY_FEED=", "rest_spot_1m"),
-            ("CHAIN_BY_FEED=", "rest_option_chain_1m"),
-            ("CONTRACT_BY_FEED=", "rest_option_contract_1m"),
-        ] {
-            let cmd = VIEW_COMMANDS.iter().find(|c| c.contains(label)).unwrap();
-            assert!(cmd.contains("GROUP%20BY%20feed"));
-            assert!(cmd.contains(&format!("FROM%20{table}")));
+        // RE-POINTED 2026-09-17. Two by-feed splits became ONE: `CHAIN_BY_FEED`
+        // is not re-pointed at `market_depth` because one live by-feed split is
+        // the question the card asks (§12.12's mapping table), and the NAME
+        // moved with the query — an operator reading "spot" would have believed
+        // they were looking at the retired REST leg.
+        let cmd = VIEW_COMMANDS
+            .iter()
+            .find(|c| c.contains("TICKS_BY_FEED="))
+            .unwrap();
+        assert!(cmd.contains("GROUP%20BY%20feed"));
+        assert!(cmd.contains("FROM%20ticks"));
+        let joined = VIEW_COMMANDS.join("\n");
+        for gone in ["SPOT_BY_FEED=", "CHAIN_BY_FEED=", "CONTRACT_BY_FEED="] {
+            assert!(!joined.contains(gone), "retired label `{gone}` is back");
         }
     }
 
@@ -3592,8 +6467,8 @@ mod tests {
     fn test_parse_feeds_view_full() {
         let stdout = concat!(
             "FEEDS_BEGIN\n",
-            "{\"dhan_enabled\": true, \"groww_enabled\": false, ",
-            "\"dhan_lane_running\": true, \"groww_lane_running\": false}\n",
+            "{\"dhan_enabled\": true, \"truedata_enabled\": false, ",
+            "\"dhan_lane_running\": true, \"truedata_lane_running\": false}\n",
             "FEEDS_END\n",
             "FEEDS_HEALTH_BEGIN\n",
             "{\"market_open\": true, \"feeds\": [{\"feed\": \"dhan\", \"verdict\": \"ok\", ",
@@ -3605,7 +6480,7 @@ mod tests {
         assert_eq!(out["feeds_error"], "");
         assert_eq!(out["health_error"], "");
         assert_eq!(out["feeds"]["dhan_enabled"], true);
-        assert_eq!(out["feeds"]["groww_enabled"], false);
+        assert_eq!(out["feeds"]["truedata_enabled"], false);
         assert_eq!(out["feeds"]["dhan_lane_running"], true);
         assert_eq!(out["health"]["feeds"][0]["feed"], "dhan");
         assert_eq!(out["health"]["feeds"][0]["verdict"], "ok");
@@ -3665,54 +6540,35 @@ mod tests {
         assert_eq!(out["health_error"], "");
     }
 
-    #[test]
-    fn test_parse_feeds_view_rest_lane_fields() {
-        // The REST-lane pulse rides the same snapshot as labeled lines
-        // OUTSIDE the marker blocks (2026-07-16).
-        let stdout = concat!(
-            "FEEDS_BEGIN\n{}\nFEEDS_END\n",
-            "FEEDS_HEALTH_BEGIN\n{}\nFEEDS_HEALTH_END\n",
-            "REST_AUDIT=\"dhan\",\"ok\",370;\"dhan\",\"error\",3;\"groww\",\"ok\",372;\"groww\",\"rate_limited\",2;\n",
-            "REST_LAT_HOUR=\"dhan\",1450.04,5200.55;\"groww\",900.0,1600.0;\n",
-        );
-        let out = parse_feeds_view(stdout);
-        assert_eq!(out["rest_audit"]["dhan"], json!({"ok": 370, "error": 3}));
-        assert_eq!(
-            out["rest_audit"]["groww"],
-            json!({"ok": 372, "rate_limited": 2})
-        );
-        assert_eq!(
-            out["rest_lat_hour"]["dhan"],
-            json!({"p50_ms": 1450.0, "p99_ms": 5200.6})
-        );
-        assert_eq!(
-            out["rest_lat_hour"]["groww"],
-            json!({"p50_ms": 900.0, "p99_ms": 1600.0})
-        );
-    }
-
-    #[test]
-    fn test_parse_feeds_view_rest_lane_empty_or_garbage_is_empty() {
-        // Empty/absent/garbage values yield {} — the card then says
-        // "no pulls recorded today", never fabricated zeros (Rule 11).
-        let out = parse_feeds_view("FEEDS_BEGIN\n{}\nFEEDS_END\n");
-        assert_eq!(out["rest_audit"], json!({}));
-        assert_eq!(out["rest_lat_hour"], json!({}));
-        assert_eq!(
-            parse_rest_audit(";;garbage;a,b;<x>,ok,3;dhan,ok,x;"),
-            json!({})
-        );
-        assert_eq!(parse_rest_lat_hour(";;garbage;dhan,null,null;"), json!({}));
-    }
-
-    #[test]
-    fn test_parse_feeds_view_json_body_never_mistaken_for_labeled_line() {
-        // A '=' inside the marker-delimited JSON must not leak into the
-        // labeled-line scan.
-        let stdout = "FEEDS_BEGIN\n{\"note\": \"REST_AUDIT=fake\"}\nFEEDS_END\n";
-        let out = parse_feeds_view(stdout);
-        assert_eq!(out["rest_audit"], json!({}));
-    }
+    // ---- the REST-lane feeds-card tests are RETIRED 2026-09-17 ----
+    //
+    // Three tests went together, because they pinned one chain that no longer
+    // exists: `test_parse_feeds_view_rest_lane_fields`,
+    // `test_parse_feeds_view_distinguishes_absent_unreadable_and_genuinely_zero`,
+    // and `test_rest_audit_line_inside_json_body_is_not_parsed`. Their
+    // subject was the `REST_AUDIT=` / `REST_LAT_HOUR=` pulse on the feeds
+    // card, read from `rest_fetch_audit` — removed with the per-minute REST
+    // legs (`no-rest-except-live-feed-2026-06-27.md` §12.12).
+    //
+    // ONE of them is worth more than the code it tested, so its rule is
+    // restated here rather than lost with it. The three-outcome test was
+    // REWRITTEN on 2026-09-08 after the console told the operator that no
+    // official-candle pulls had been recorded, all morning, while the lane
+    // was healthy and flushing every minute. The old version asserted that
+    // "absent / unreadable / garbage all yield `{}`" and cited Rule 11 while
+    // pinning the exact conflation Rule 11 forbids: `{}` rendered as the
+    // SENTENCE "no pulls recorded today", so a blind read and an idle lane
+    // produced identical words.
+    //
+    // THE DURABLE RULE, which binds every future parser on this surface:
+    // ABSENT, UNPARSEABLE and GENUINELY-EMPTY are three different facts and
+    // must render as three different things. Avoiding a fabricated zero
+    // NUMBER while emitting a fabricated zero CLAIM is not honesty.
+    //
+    // `parse_feeds_view`'s surviving arms still hold that line — an
+    // unreachable box yields `Value::Null` + `BOX_UNREACHABLE`, invalid JSON
+    // yields `Null` + a structured error, and an empty body yields `{}` — and
+    // those three cases keep their own tests above.
 
     // -------------------------------------- class FeedsViewCommandsPinned
     // Review fixes M1 + M5 (2026-07-16): the feeds-card snapshot commands
@@ -3728,40 +6584,37 @@ mod tests {
             .flat_map(|c| re.captures_iter(c))
             .map(|m| m[1].parse::<i64>().unwrap())
             .sum();
-        assert_eq!(total, 24); // 2×8s app curls + 2×4s audit curls
+        // 2026-09-17: 24 → 16. The two 4s `rest_fetch_audit` curls went with
+        // the per-minute REST legs; the two 8s app curls are what remain.
+        assert_eq!(total, 16); // 2×8s app curls
         assert!(FEEDS_TIMEOUT_SECS > total as f64);
-        assert_eq!(FEEDS_TIMEOUT_SECS, 28.0);
+        assert_eq!(FEEDS_TIMEOUT_SECS, 20.0);
     }
 
-    #[test]
-    fn test_rest_audit_curl_targets_todays_fetch_log() {
-        let cmd = FEEDS_VIEW_COMMANDS
-            .iter()
-            .find(|c| c.contains("REST_AUDIT="))
-            .unwrap();
-        assert!(cmd.contains("from rest_fetch_audit"));
-        assert!(cmd.contains("ts in today()"));
-        assert!(cmd.contains("group by feed, outcome"));
-        assert!(cmd.contains("--data-urlencode"));
-    }
-
-    #[test]
-    fn test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel() {
-        let cmd = FEEDS_VIEW_COMMANDS
-            .iter()
-            .find(|c| c.contains("REST_LAT_HOUR="))
-            .unwrap();
-        // IST timebase: ts is IST-shifted while QuestDB now() is UTC — the
-        // window compares against dateadd('m', 330, now()) (2026-07-07 lesson).
-        assert!(cmd.contains("dateadd('m', 330, now())"));
-        assert!(cmd.contains("dateadd('h', -1,"));
-        // Successful pulls only + the -1 not-measured sentinel excluded.
-        assert!(cmd.contains("outcome = 'ok'"));
-        assert!(cmd.contains("close_to_data_ms >= 0"));
-        assert!(cmd.contains("from rest_fetch_audit"));
-        assert!(cmd.contains("approx_percentile(close_to_data_ms, 0.5, 3)"));
-        assert!(cmd.contains("approx_percentile(close_to_data_ms, 0.99, 3)"));
-    }
+    // ---- the two REST-curl shape tests are RETIRED 2026-09-17 ----
+    //
+    // `test_rest_audit_curl_targets_todays_fetch_log` and
+    // `test_rest_lat_hour_curl_ist_timebase_ok_filter_and_sentinel` pinned the
+    // two `rest_fetch_audit` curls in `FEEDS_VIEW_COMMANDS`, both removed with
+    // the per-minute REST legs (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.12).
+    //
+    // TWO rules they enforced are NOT obvious and are recorded here so a
+    // future query does not rediscover them the expensive way:
+    //
+    //   1. IST TIMEBASE. `ts` on these tables is IST-shifted while QuestDB's
+    //      `now()` is UTC, so an hour window must compare against
+    //      `dateadd('m', 330, now())`, never bare `now()` (the 2026-07-07
+    //      lesson). A query that forgets this is off by 5h30m and returns a
+    //      confident empty result.
+    //   2. THE -1 SENTINEL. `close_to_data_ms` stores -1 for "not measured",
+    //      so any aggregate over it needs `close_to_data_ms >= 0` — which
+    //      both drops the sentinel AND satisfies `approx_percentile`'s
+    //      non-negative-input requirement.
+    //
+    // Rule 1 still binds every remaining `today()`/window query on an
+    // IST-shifted table; rule 2 has no live consumer, which is why it is
+    // written out rather than pinned.
 
     // ---------------------------------------------- class FeedToggleValidation
     #[test]
@@ -3817,8 +6670,8 @@ mod tests {
 
     #[test]
     fn test_toggle_commands_target_correct_url_and_body() {
-        let joined = feed_toggle_commands("groww", true).join("\n");
-        assert!(joined.contains("http://127.0.0.1:3001/api/feeds/groww"));
+        let joined = feed_toggle_commands("truedata", true).join("\n");
+        assert!(joined.contains("http://127.0.0.1:3001/api/feeds/truedata"));
         assert!(joined.contains(r#"{"enabled": true}"#));
         assert!(joined.contains("-X POST"));
         let cmds_off = feed_toggle_commands("dhan", false).join("\n");
@@ -3844,14 +6697,14 @@ data-pull phase, so the system is never blinded mid-trade";
         let stdout = concat!(
             "FEED_TOGGLE_STATUS=200\n",
             "FEED_TOGGLE_BODY_BEGIN\n",
-            "{\"dhan_enabled\": true, \"groww_enabled\": true, ",
-            "\"dhan_lane_running\": true, \"groww_lane_running\": false}\n",
+            "{\"dhan_enabled\": true, \"truedata_enabled\": true, ",
+            "\"dhan_lane_running\": true, \"truedata_lane_running\": false}\n",
             "FEED_TOGGLE_BODY_END\n",
         );
         let out = parse_feed_toggle(stdout);
         assert_eq!(out["app_status"], 200);
         assert_eq!(out["error"], "");
-        assert_eq!(out["app_response"]["groww_enabled"], true);
+        assert_eq!(out["app_response"]["truedata_enabled"], true);
     }
 
     #[test]
@@ -3910,29 +6763,35 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     // ---------------------------------------------------- class DedupKeyShield
-    // The dedup shield reads rest_spot_1m's REAL 4-column upsert key
-    // (ts, security_id, exchange_segment, feed per DEDUP_KEY_SPOT_1M_REST in
-    // crates/storage/src/spot_1m_rest_persistence.rs) — repointed 2026-07-16
-    // from the retired ticks 5-column key.
+    // The dedup shield reads `ticks`'s REAL 5-column upsert key
+    // (ts, security_id, segment, capture_seq, feed per DEDUP_KEY_TICKS in
+    // crates/storage/src/tick_persistence.rs) — RE-POINTED 2026-09-17 from
+    // rest_spot_1m's 4-column key, which it had carried since 2026-07-16.
+    //
+    // This is the SECOND time this shield has moved, and the direction
+    // reversed: 2026-07-16 took it OFF `ticks` when the live feed was
+    // retired; today's SOCKETS-ONLY narrowing takes it back.
     #[test]
-    fn test_view_comment_names_the_four_real_key_columns() {
+    fn test_view_comment_names_the_five_real_key_columns() {
         // the legacy runtime scanned handler.py; the Rust twin lives in the commands
         // module's doc comment (the %3D rationale block).
         let src = include_str!("operator_control_commands.rs");
-        assert!(src.contains("(ts, security_id, exchange_segment, feed)"));
-        assert!(src.contains("DEDUP_KEY_SPOT_1M_REST"));
+        assert!(src.contains("(ts, security_id, segment, capture_seq, feed)"));
+        assert!(src.contains("DEDUP_KEY_TICKS"));
     }
 
     #[test]
     fn test_html_distinguishes_ok_disabled_drift_unreachable() {
-        // 4 = OK (green): the check compares against 4, not the stale 5.
-        assert!(CONSOLE_HTML.contains("dkN===4"));
-        assert!(!CONSOLE_HTML.contains("dkN===5"));
+        // 5 = OK (green): RE-POINTED 2026-09-17 with the shield itself. The
+        // comment here read "not the stale 5" — `ticks` is the live table
+        // again, so 5 is the correct expectation and 4 is now the stale one.
+        assert!(CONSOLE_HTML.contains("dkN===5"));
+        assert!(!CONSOLE_HTML.contains("dkN===4"));
         // 0 = DEDUP disabled entirely (RED).
         assert!(CONSOLE_HTML.contains("DEDUP disabled!"));
         assert!(CONSOLE_HTML.contains("'bad'"));
         // other = schema drift (amber).
-        assert!(CONSOLE_HTML.contains("schema drift (expected 4)"));
+        assert!(CONSOLE_HTML.contains("schema drift (expected 5)"));
         // fetch failure = "unreachable" (amber), never a fake 0/OLD.
         assert!(CONSOLE_HTML.contains("'unreachable'"));
     }
@@ -3971,18 +6830,20 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(!CONSOLE_HTML.contains("live feed? Ticks"));
     }
 
-    #[test]
-    fn test_failed_bucket_excludes_never_attempted_minutes() {
-        // Review fix L4 (2026-07-16): skipped / boundary_skipped audit rows
-        // are minutes the leg never ATTEMPTED — lumping them into "failed"
-        // inflated the failure count. no_token IS a real failure and stays
-        // counted.
-        assert!(CONSOLE_HTML.contains("k!=='skipped'"));
-        assert!(CONSOLE_HTML.contains("k!=='boundary_skipped'"));
-        // no_token must NOT be excluded from the failed fold.
-        assert!(!CONSOLE_HTML.contains("k!=='no_token'"));
-    }
-
+    // ---- `test_failed_bucket_excludes_never_attempted_minutes` is RETIRED
+    // ---- 2026-09-17 ----
+    //
+    // It pinned the REST-pull line's "failed" fold: `skipped` and
+    // `boundary_skipped` audit rows are minutes the leg never ATTEMPTED
+    // (trading-day gate, missed boundaries), so folding them into "failed"
+    // inflated the count — while `no_token` IS a real failure and stayed
+    // counted. Its subject is gone with `rest_fetch_audit`.
+    //
+    // THE DURABLE RULE, recorded because it is not obvious and cost a review
+    // round to find: a NOT-ATTEMPTED outcome and a FAILED outcome are
+    // different facts, and an error bucket that silently absorbs the former
+    // reports a healthy gated leg as broken. Any future per-outcome rollup on
+    // this console owes the same distinction.
     #[test]
     fn test_errors_render_verbatim_through_esc() {
         assert!(CONSOLE_HTML.contains("esc(j.feeds_error"));
@@ -3990,17 +6851,27 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     #[test]
-    fn test_feeds_card_shows_rest_pull_line_not_tick_counters() {
-        // 2026-07-16: the per-feed detail line is today's fetch-log pulse
-        // (ok/failed/rate-limited + last-hour p50/p99 after minute close),
-        // sourced from rest_fetch_audit — the old ticks/subscribed counters
-        // read frozen live-feed registries and are GONE.
-        assert!(CONSOLE_HTML.contains("j.rest_audit"));
-        assert!(CONSOLE_HTML.contains("j.rest_lat_hour"));
-        assert!(CONSOLE_HTML.contains("pulls today:"));
-        assert!(CONSOLE_HTML.contains("rate-limited"));
-        assert!(CONSOLE_HTML.contains("after minute close"));
-        assert!(CONSOLE_HTML.contains("no official-candle pulls recorded today"));
+    fn test_feeds_card_carries_no_writerless_pull_line() {
+        // ↺ REPLACES `test_feeds_card_shows_rest_pull_line_not_tick_counters`
+        // (2026-09-17). It REQUIRED the per-feed REST-pull line
+        // (ok/failed/rate-limited + last-hour p50/p99), sourced from
+        // `rest_fetch_audit` — removed with the per-minute legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12).
+        //
+        // Nothing replaces the line: there is no per-minute fetch left to
+        // count, and an always-empty "pulls today: 0 ok" would read as a
+        // failure rather than as an absence.
+        for gone in [
+            "j.rest_audit",
+            "j.rest_lat_hour",
+            "pulls today:",
+            "after minute close",
+            "no official-candle pulls recorded today",
+        ] {
+            assert!(!CONSOLE_HTML.contains(gone), "retired pull-line: {gone}");
+        }
+        // The ORIGINAL half of this test is UNCHANGED and still binds: the
+        // frozen live-feed registry counters must never come back either.
         assert!(!CONSOLE_HTML.contains("ticks_total"));
         assert!(!CONSOLE_HTML.contains("subscribed_total"));
         assert!(!CONSOLE_HTML.contains("' · ticks '"));
@@ -4019,22 +6890,36 @@ data-pull phase, so the system is never blinded mid-trade";
     }
 
     #[test]
-    fn test_html_has_rest_latency_table() {
-        assert!(CONSOLE_HTML.contains(r#"id="latrest""#));
-        assert!(CONSOLE_HTML.contains("how fast each official minute candle arrives"));
-        assert!(CONSOLE_HTML.contains("pull type"));
-        assert!(CONSOLE_HTML.contains("ok pulls today"));
-        assert!(CONSOLE_HTML.contains("p50 after close"));
-        assert!(CONSOLE_HTML.contains("p99 after close"));
+    fn test_html_latency_card_is_socket_only() {
+        // ↺ REPLACES `test_html_has_rest_latency_table` (2026-09-17). That
+        // test pinned the per-(broker, pull type) REST table, whose
+        // `rest_fetch_audit` source went with the per-minute legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.12, dated correction).
+        //
+        // It is REPLACED rather than deleted because the card must not end up
+        // with NO latency table at all: the per-socket live delivery lag is
+        // now the tab's only measurement, and this is what pins it there.
+        assert!(CONSOLE_HTML.contains(r#"id="latws""#));
+        assert!(CONSOLE_HTML.contains("p50 exchange→here"));
+        assert!(CONSOLE_HTML.contains("p99 exchange→here"));
+        assert!(CONSOLE_HTML.contains("instruments on wire"));
+        // The retired REST table must not come back without its source.
+        assert!(!CONSOLE_HTML.contains(r#"id="latrest""#));
+        assert!(!CONSOLE_HTML.contains("ok pulls today"));
+        assert!(!CONSOLE_HTML.contains("p50 after close"));
     }
 
     #[test]
     fn test_latency_card_iterates_rows_no_hardcoded_names() {
-        // Future-feeds ratchet: the table renders whatever j.rest_latency
-        // carries (feed+leg discovered from the fetch log at measure time) —
-        // NO feed/leg name may be hardcoded in the portal JS.
+        // RE-POINTED 2026-09-17 from `j.rest_latency` to `j.ws_latency`. The
+        // RATCHET is unchanged and is the reason this was re-pointed rather
+        // than retired: the table renders whatever the server sends (socket
+        // index + endpoint discovered at measure time), so a new socket, pool
+        // or broker gets its row with ZERO portal changes. No feed, leg or
+        // endpoint name may be hardcoded in the portal JS.
         let js = load_latency_js();
-        assert!(js.contains("j.rest_latency"));
+        assert!(js.contains("j.ws_latency"));
+        assert!(!js.contains("j.rest_latency"));
         let lower = js.to_lowercase();
         assert!(!lower.contains("dhan"));
         assert!(!lower.contains("groww"));
@@ -4044,8 +6929,17 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_empty_table_is_honest_not_fake_zero() {
-        assert!(CONSOLE_HTML.contains("no successful pulls recorded today"));
-        assert!(CONSOLE_HTML.contains("never fake"));
+        // NARROWED 2026-09-17: the REST "no successful pulls recorded today"
+        // string went with its table. The RULE is unchanged and is now pinned
+        // on the surface that still has a producer — an empty socket table
+        // must say so in words, never render as a comforting zero.
+        // Both surviving empty-state strings, on the two tables that still
+        // have producers: the socket table says an empty result is NOT a
+        // zero-latency reading, and the card caption says an empty table must
+        // never be read as "fast".
+        assert!(CONSOLE_HTML.contains("This is NOT a zero-latency reading."));
+        assert!(CONSOLE_HTML.contains(r#"never read that as "fast""#));
+        assert!(!CONSOLE_HTML.contains("no successful pulls recorded today"));
     }
 
     #[test]
@@ -4098,9 +6992,9 @@ data-pull phase, so the system is never blinded mid-trade";
             let body = body_of(&resp);
             assert_eq!(body["market_hours_locked"], true, "{action}");
             let err = body["error"].as_str().unwrap();
-            assert!(err.contains("locked during market hours"));
+            assert!(err.contains("locked 09:00-15:45 IST"));
             assert!(err.contains("never be re-fetched"));
-            assert!(err.contains("Run after 15:40"));
+            assert!(err.contains("Run after 15:45"));
         }
     }
 
@@ -4161,6 +7055,98 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(shell.captured_joined().contains("WIPE-COMPLETE"));
     }
 
+    /// Audit PR20 (2026-09-27): the data-destructive lock is its own window,
+    /// 09:00 ≤ t < 15:45 IST, on every day — wider than market hours at both
+    /// ends and not skipped at the weekend.
+    #[test]
+    fn test_is_data_destructive_locked_boundaries() {
+        // 2026-06-01 is a Monday, 2026-06-06 a Saturday; IST = UTC + 05:30.
+        let cases = [
+            ((1, 3, 29, 59), false), // Mon 08:59:59 IST
+            ((1, 3, 30, 0), true),   // Mon 09:00:00 IST — locked (market opens 09:15)
+            ((1, 3, 44, 59), true),  // Mon 09:14:59 IST — locked, market_hours is not
+            ((1, 10, 10, 0), true),  // Mon 15:40:00 IST — locked, market_hours is not
+            ((1, 10, 14, 59), true), // Mon 15:44:59 IST
+            ((1, 10, 15, 0), false), // Mon 15:45:00 IST — open
+            ((6, 5, 30, 0), true),   // Sat 11:00 IST — weekends are locked too
+            ((6, 12, 0, 0), false),  // Sat 17:30 IST
+        ];
+        for ((d, h, m, sec), locked) in cases {
+            let utc = Utc.with_ymd_and_hms(2026, 6, d, h, m, sec).unwrap();
+            assert_eq!(is_data_destructive_locked(utc), locked, "{utc}");
+        }
+        assert_eq!(DATA_DESTRUCTIVE_LOCK_OPEN_SECS, 32_400);
+        assert_eq!(DATA_DESTRUCTIVE_LOCK_CLOSE_SECS, 56_700);
+    }
+
+    /// The two constants are the rule's window, read from the rule file
+    /// itself so a later edit to either side fails here.
+    #[test]
+    fn test_data_destructive_lock_window_matches_the_rule_file() {
+        let rule = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
+        ))
+        .expect("the daily-universe rule file is the authority for this window");
+        assert!(
+            rule.contains("Runs the nuke inside 09:00–15:45 IST."),
+            "the rule's nuke window moved; move DATA_DESTRUCTIVE_LOCK_*_SECS with it"
+        );
+        let hhmm = |secs: u32| format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60);
+        assert_eq!(hhmm(DATA_DESTRUCTIVE_LOCK_OPEN_SECS), "09:00");
+        assert_eq!(hhmm(DATA_DESTRUCTIVE_LOCK_CLOSE_SECS), "15:45");
+        assert!(DATA_DESTRUCTIVE_LOCK_MSG.contains("09:00-15:45"));
+    }
+
+    /// 09:05 and 15:42: market_hours is false, the lock is on. Every
+    /// data-destructive action is refused even with force, and a lifecycle
+    /// action (which follows market hours) is not.
+    #[tokio::test]
+    async fn test_data_destructive_lock_holds_outside_market_hours_edges() {
+        let shell = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            forbid_ssm: Some("SSM must not be called inside the data-destructive lock"),
+            ..MockShell::default()
+        };
+        for (action, word) in [
+            ("wipe-questdb", "WIPE"),
+            ("docker-reset", "NUKE-DOCKER"),
+            ("docker-nuke-bare", "ERASE"),
+        ] {
+            let resp = post(
+                &shell,
+                json!({"action": action, "force": true, "confirm": word}),
+            )
+            .await;
+            assert_eq!(status_of(&resp), 409, "{action}");
+            assert_eq!(body_of(&resp)["market_hours_locked"], true, "{action}");
+        }
+        let lifecycle = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            ..MockShell::default()
+        };
+        let resp = post(&lifecycle, json!({"action": "reboot"})).await;
+        assert_ne!(
+            status_of(&resp),
+            409,
+            "reboot follows market hours, not the wipe lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_view_reports_the_data_destructive_lock() {
+        let shell = MockShell {
+            market_hours: false,
+            destructive_locked: Some(true),
+            ..MockShell::default()
+        };
+        let resp = post(&shell, json!({"action": "view"})).await;
+        assert_eq!(status_of(&resp), 200);
+        assert_eq!(body_of(&resp)["data_destructive_locked"], true);
+        assert_eq!(body_of(&resp)["market_hours"], false);
+    }
+
     #[test]
     fn test_boundary_minutes_pin_exact_semantics() {
         // Pinned lock window semantics: 09:15:00 ≤ t < 15:40:00 IST Mon-Fri.
@@ -4186,10 +7172,16 @@ data-pull phase, so the system is never blinded mid-trade";
     fn test_danger_zone_shows_lock_label_when_market_open() {
         // The label exists, starts hidden, and names the lock honestly.
         assert!(CONSOLE_HTML.contains(r#"id="dangerlock""#));
-        assert!(CONSOLE_HTML.contains("Locked until 3:40 PM IST"));
+        assert!(CONSOLE_HTML.contains("Locked 9:00 AM–3:45 PM IST, every day"));
         assert!(CONSOLE_HTML.contains("even with force"));
-        // loadOverview un-hides it from the server's market_hours flag.
-        assert!(CONSOLE_HTML.contains("dl.hidden=!j.market_hours"));
+        // loadOverview un-hides it from the server's own lock flag (the
+        // same predicate the 409 gate reads), falling back to market_hours.
+        assert!(CONSOLE_HTML.contains(
+            "dl.hidden=!(j.data_destructive_locked===undefined?j.market_hours:j.data_destructive_locked)"
+        ));
+        // No caption may name a close the server does not enforce.
+        assert!(!CONSOLE_HTML.contains("3:30 PM"));
+        assert!(!CONSOLE_HTML.contains("Locked until 3:40 PM"));
     }
 
     // ----------------------------------- class LegacyLiveFeedPanelsRemoved
@@ -4303,16 +7295,31 @@ data-pull phase, so the system is never blinded mid-trade";
 
     #[test]
     fn test_view_sql_targets_no_dead_tables() {
+        // ⚠ INVERTED 2026-09-17 for `ticks`, and that is the whole point of
+        // this note. This test was written when the live feed was retired and
+        // `ticks` was the DEAD table — it banned `FROM%20ticks` and
+        // `TICKS_TODAY` by name. The 2026-08-11 revival made `ticks` the live
+        // lane's primary table, and the SOCKETS-ONLY narrowing made the REST
+        // tables the dead ones, so a guard left as written would now be
+        // asserting the exact reverse of the truth: it would fail the build
+        // for querying the one table that is guaranteed to have a writer.
+        //
+        // The RULE is unchanged and is what survives: the view must query
+        // nothing that has no writer. Only the membership of "dead" moved.
         let joined = VIEW_COMMANDS.join("\n");
         for dead in [
-            "FROM%20ticks",
             "candles_1m",
             "tick_conservation_audit",
             "ws_event_audit",
-            "MAX_TPS",
-            "TICKS_TODAY",
             "CONSERVE",
             "WS_DISC",
+            // Retired with the per-minute REST legs (§12.12). RETAINED tables,
+            // so these return a permanent zero rather than erroring — the
+            // shape this guard exists to keep off the operator's console.
+            "rest_spot_1m",
+            "rest_option_chain_1m",
+            "rest_option_contract_1m",
+            "rest_fetch_audit",
         ] {
             assert!(!joined.contains(dead), "{dead}");
         }
@@ -4343,7 +7350,7 @@ data-pull phase, so the system is never blinded mid-trade";
     #[tokio::test]
     async fn test_logs_route_kept_for_mcp_server() {
         // The tickvault-logs MCP server POSTs {"action":"logs"} to this portal
-        // (scripts/mcp-servers/tickvault-logs/server.py) — the API route must
+        // (the retired reference implementation, formerly under scripts/mcp-servers/) — the API route must
         // survive the tab removal.
         let shell = MockShell {
             sync_output: "ERR_BEGIN\nERR_END\nAPP_BEGIN\nAPP_END\n".to_string(),
@@ -4446,7 +7453,7 @@ data-pull phase, so the system is never blinded mid-trade";
         // One calm banner replaces the per-shield "unreachable" scatter…
         assert!(CONSOLE_HTML.contains(r#"id="stoppedbanner""#));
         assert!(CONSOLE_HTML.contains(
-        "Box stopped (auto-stops 17:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
+        "Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start"
     ));
         assert!(CONSOLE_HTML.contains("$('stoppedbanner').hidden=running"));
         // …and the shield greys out as "—" ONLY when the box is not running.
@@ -4456,7 +7463,8 @@ data-pull phase, so the system is never blinded mid-trade";
         // banner must never hide genuine failures while running).
         assert!(CONSOLE_HTML.contains("'unreachable'"));
         assert!(CONSOLE_HTML.contains("DEDUP disabled!"));
-        assert!(CONSOLE_HTML.contains("schema drift (expected 4)"));
+        // 4 -> 5 with the shield's re-point (2026-09-17, §12.12).
+        assert!(CONSOLE_HTML.contains("schema drift (expected 5)"));
     }
 
     #[test]
@@ -4475,7 +7483,11 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(overview.contains("loadLatency()"));
         assert!(overview.contains("Measure now"));
         assert!(overview.contains(r#"id="latnet""#));
-        assert!(overview.contains(r#"id="latrest""#));
+        // 2026-09-17: `latrest` is gone with the REST latency table; `latws`
+        // (the per-socket live lag) is the card's measurement now, and is
+        // pinned so the overview can never lose its latency table entirely.
+        assert!(overview.contains(r#"id="latws""#));
+        assert!(!overview.contains(r#"id="latrest""#));
         // Strip is fed by the same aws_status action the old AWS tab used.
         assert!(CONSOLE_HTML.contains("call('aws_status')"));
     }
@@ -4682,5 +7694,365 @@ data-pull phase, so the system is never blinded mid-trade";
         assert!(body.contains("· portal"));
         assert!(body.contains("· main"));
         assert!(body.contains("<footer"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_send_failure_is_not_an_empty_success() {
+        let shell = MockShell {
+            ssm_result: Err("SSM unavailable".to_string()),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sql_terminal_failure_never_uses_partial_stdout() {
+        for status in [
+            "Failed",
+            "Cancelled",
+            "TimedOut",
+            "DeliveryTimedOut",
+            "Unexpected",
+        ] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+            assert_eq!(status_of(&response), 502, "{status}");
+            assert_eq!(body_of(&response)["ok"], false, "{status}");
+            assert!(body_of(&response).get("csv").is_none(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_poll_timeout_is_explicit() {
+        for invocation in [
+            Err("not registered".to_string()),
+            Ok(("InProgress".to_string(), String::new(), String::new())),
+        ] {
+            let shell = MockShell {
+                invocation,
+                ..MockShell::default()
+            };
+            let result = read_sql_csv(
+                &shell,
+                &["read-only fixture".to_string()],
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(result, Err(SqlQueryError::TimedOut));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sql_header_only_is_a_real_empty_result() {
+        let csv = "value\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT 1 LIMIT 0"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        assert_eq!(body_of(&response)["ok"], true);
+        assert_eq!(body_of(&response)["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_keeps_authorization_and_read_only_gates() {
+        let shell = MockShell {
+            forbid_ssm: Some("gates must run before SSM"),
+            ..MockShell::default()
+        };
+        let unauthorized = route(
+            &post_event(&json!({"action": "sql", "query": "SELECT 1"}), None),
+            &shell,
+        )
+        .await;
+        assert_eq!(status_of(&unauthorized), 401);
+        let write = post(
+            &shell,
+            json!({"action": "sql", "query": "DROP TABLE ticks"}),
+        )
+        .await;
+        assert_eq!(status_of(&write), 400);
+    }
+
+    #[test]
+    fn test_completed_sql_csv_rejects_missing_trailer_empty_and_oversized_results() {
+        assert_eq!(
+            completed_sql_csv("value\n1\n".to_string(), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(format!("{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::Incomplete)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("value\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                "curl failed"
+            ),
+            Err(SqlQueryError::Failed)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!(
+                    "{}{SQL_HTTP_OK}{SQL_COMPLETE}",
+                    "x".repeat(SQL_MAX_BYTES + 1)
+                ),
+                ""
+            ),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            completed_sql_csv(
+                format!("{}{SQL_HTTP_OK}{SQL_COMPLETE}", "x".repeat(SQL_MAX_BYTES)),
+                ""
+            )
+            .unwrap()
+            .len(),
+            SQL_MAX_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_status_gates_valid_multiline_csv() {
+        // Both statuses carry the same complete, valid result. Failure must
+        // come from transport status rather than malformed fixture content.
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        for status in ["Failed", "Success"] {
+            let shell = MockShell {
+                invocation: Ok((
+                    status.to_string(),
+                    format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                    String::new(),
+                )),
+                ..MockShell::default()
+            };
+            let response = post(
+                &shell,
+                json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+            )
+            .await;
+            let body = body_of(&response);
+            if status == "Failed" {
+                assert_eq!(status_of(&response), 502);
+                assert_eq!(body["ok"], false);
+                assert!(body.get("csv").is_none());
+                assert!(body.get("rows").is_none());
+                assert!(body.get("columns").is_none());
+                continue;
+            }
+            assert_eq!(status_of(&response), 200);
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["columns"], json!(["event", "detail"]));
+            assert_eq!(
+                body["rows"],
+                json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+            );
+            assert_eq!(body["csv"], csv);
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_quoted_commas_quotes_and_newlines() {
+        for (text, expected) in [
+            ("event,detail\nfilled,\"ACME, LTD\"\n", "ACME, LTD"),
+            ("event,detail\nfilled,\"said \"\"ok\"\"\"\n", "said \"ok\""),
+            (
+                "event,detail\r\nfilled,\"line 1\nline 2\"\r\n",
+                "line 1\nline 2",
+            ),
+            (
+                "event,detail\r\nfilled,\"line 1\r\nline 2\"\r\n",
+                "line 1\r\nline 2",
+            ),
+            ("\u{feff}event,detail\nfilled,\"₹ café\"\n", "₹ café"),
+            ("event,detail\nfilled,", ""),
+            ("event,detail\nfilled,\"\"", ""),
+        ] {
+            let data = parse_sql_csv(text).unwrap();
+            assert_eq!(data.columns, ["event", "detail"]);
+            assert_eq!(data.rows.len(), 1);
+            assert_eq!(data.rows[0], ["filled", expected]);
+        }
+    }
+
+    #[test]
+    fn test_sql_csv_syntax_valid_refuses_ambiguous_quotes() {
+        for text in [
+            "event,detail\nfilled,\"cut",
+            "event,detail\nfilled,bad\"quote",
+            "event,detail\nfilled,\"ok\"extra",
+        ] {
+            assert!(!sql_csv_syntax_valid(text));
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        assert!(sql_csv_syntax_valid(
+            "event,detail\nfilled,\"said \"\"ok\"\"\"\n"
+        ));
+    }
+
+    #[test]
+    fn test_parse_sql_csv_distinguishes_header_only_missing_and_wrong_width() {
+        assert_eq!(
+            parse_sql_csv("event,detail\r\n").unwrap(),
+            SqlQueryData {
+                columns: vec!["event".to_string(), "detail".to_string()],
+                rows: Vec::new(),
+            }
+        );
+        for text in [
+            "",
+            "\r\n",
+            "event,detail\nfilled\n",
+            "event,detail\nfilled,ok,extra\n",
+        ] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+    }
+
+    #[test]
+    fn test_parse_sql_csv_keeps_row_and_byte_bounds() {
+        let at_limit = format!("value\n{}", "x\n".repeat(1000));
+        assert_eq!(parse_sql_csv(&at_limit).unwrap().rows.len(), 1000);
+        assert_eq!(
+            parse_sql_csv(&format!("{at_limit}x\n")),
+            Err(SqlQueryError::TooLarge)
+        );
+        assert_eq!(
+            parse_sql_csv(&"x".repeat(SQL_MAX_BYTES + 1)),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_returns_structured_cells_and_original_download() {
+        let csv = "event,detail\r\nfilled,\"comma, quote \"\"ok\"\" and\nnewline\"\r\n";
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(
+            &shell,
+            json!({"action": "sql", "query": "SELECT * FROM order_audit LIMIT 1"}),
+        )
+        .await;
+        assert_eq!(status_of(&response), 200);
+        let body = body_of(&response);
+        assert_eq!(body["columns"], json!(["event", "detail"]));
+        assert_eq!(
+            body["rows"],
+            json!([["filled", "comma, quote \"ok\" and\nnewline"]])
+        );
+        assert_eq!(body["csv"], csv);
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_malformed_completed_csv() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("a,b\n1\n{SQL_HTTP_OK}{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        assert_eq!(body_of(&response)["ok"], false);
+        assert!(body_of(&response).get("rows").is_none());
+    }
+
+    #[test]
+    fn test_parse_sql_csv_never_drops_ambiguous_blank_records() {
+        for text in ["value\n\n", "value\r\n\r\n", "value\r\r", "\nvalue\n"] {
+            assert_eq!(parse_sql_csv(text), Err(SqlQueryError::InvalidCsv));
+        }
+        let empty = parse_sql_csv("value\r\n\"\"\r\n").unwrap();
+        assert_eq!(empty.rows, vec![vec![String::new()]]);
+        assert!(parse_sql_csv("value\r\n").unwrap().rows.is_empty());
+        assert_eq!(
+            parse_sql_csv("value\r\n\"line 1\r\n\r\nline 2\"\r\n")
+                .unwrap()
+                .rows[0][0],
+            "line 1\r\n\r\nline 2"
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_requires_exact_http_200_without_leaking_body() {
+        for status in [
+            "201", "204", "206", "301", "302", "307", "308", "400", "500",
+        ] {
+            let response = format!("private upstream body\nTV_SQL_HTTP_{status}\n{SQL_COMPLETE}");
+            assert_eq!(
+                completed_sql_csv(response, ""),
+                Err(SqlQueryError::Failed),
+                "{status}"
+            );
+        }
+        let csv = "value\n1\n";
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv.to_string())
+        );
+    }
+
+    #[test]
+    fn test_completed_sql_csv_preserves_embedded_markers_and_refuses_forged_boundary() {
+        let csv = format!("value\n\"{SQL_HTTP_OK}{SQL_COMPLETE}\"\n");
+        assert_eq!(
+            completed_sql_csv(format!("{csv}{SQL_HTTP_OK}{SQL_COMPLETE}"), ""),
+            Ok(csv)
+        );
+        // The capped stream can coincidentally end with an in-body HTTP200
+        // marker, but its body portion is then MAX+1 and cannot be accepted.
+        let captured = format!("{}{SQL_HTTP_OK}", "x".repeat(SQL_MAX_BYTES + 1));
+        assert_eq!(captured.len(), SQL_MAX_BYTES + SQL_HTTP_OK.len() + 1);
+        assert_eq!(
+            completed_sql_csv(format!("{captured}{SQL_COMPLETE}"), ""),
+            Err(SqlQueryError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_route_refuses_redirect_with_csv_shaped_body() {
+        let shell = MockShell {
+            invocation: Ok((
+                "Success".to_string(),
+                format!("private_header\nprivate_row\nTV_SQL_HTTP_302\n{SQL_COMPLETE}"),
+                String::new(),
+            )),
+            ..MockShell::default()
+        };
+        let response = post(&shell, json!({"action": "sql", "query": "SELECT 1"})).await;
+        assert_eq!(status_of(&response), 502);
+        let body = body_of(&response);
+        assert_eq!(body["ok"], false);
+        assert!(body.get("csv").is_none());
+        assert!(body.get("rows").is_none());
+        assert!(!body.to_string().contains("private_"));
     }
 }

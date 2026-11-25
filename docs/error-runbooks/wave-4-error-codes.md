@@ -13,7 +13,7 @@ paths:
   - "crates/core/src/auth/mid_session_watchdog.rs"
   - "crates/core/src/auth/token_health_gauge.rs"
   - "crates/core/src/auth/fast_boot_validation.rs"
-  - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"
+  - "crates/app/tests/fast_boot_token_validation_wiring_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-14 with fast_boot_validation; NOT ENFORCED
   - "crates/app/src/resource_monitor.rs"
   - "crates/storage/src/resource_monitor.rs"
 ---
@@ -375,13 +375,24 @@ churn (WS-GAP-05).
 ### RESOURCE-02 — resident memory bytes above threshold
 
 **Trigger:** process `VmRSS` (`/proc/self/status`) crossed the
-early-warning threshold (default 80% of the cgroup memory limit,
-`memory.max`). Distinct from the host-aggregate `mem_used_high` CloudWatch
-alarm — this is the tickvault process itself approaching its cgroup
+early-warning threshold (default 80% of the resolved memory ceiling).
+Distinct from the host-aggregate `mem_used_high` CloudWatch
+alarm — this is the tickvault process itself approaching its
 ceiling before the OOM killer (PROC-01) fires. `tv_process_rss_bytes`
-gauge. cgroup limit = `max` (unlimited) → skipped (no denominator).
-**Triage:** right-size the workload / investigate the leak; if it keeps
-climbing, PROC-01 (OOM kill) is imminent.
+gauge. *(CORRECTED 2026-09-02: this used to say "cgroup limit = `max`
+(unlimited) → skipped (no denominator)". That was the pre-2026-09-01
+behaviour and it was a false OK — with no memory directive on the systemd
+unit the check was never evaluated at all. The resolver now falls back to
+the machine's `MemTotal` when the cgroup reports `max`, and since
+2026-09-02 the unit carries `MemoryHigh=15G` so the ceiling is a real,
+reachable line rather than the whole host. Paged since 2026-09-02 via the
+`resource-02` entry in `error-code-alarms.tf`; dated row
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3p.)*
+**Triage:** right-size the workload / investigate the leak (the
+`tv_subsystem_memory_bytes` components say WHICH structure is growing);
+past `MemoryHigh` the kernel throttles the process rather than killing it
+(no `MemoryMax=` by design), but a throttled decoder loses ticks upstream,
+so treat a sustained page as a restart-in-the-next-quiet-window event.
 
 ### RESOURCE-03 — spill-directory free space below threshold
 
@@ -392,6 +403,19 @@ spill dir is caught before the zero-loss chain is at risk. Reuses the
 `disk_health_watcher::probe_disk_free_bytes` probe. `tv_spill_free_pct`
 gauge. **Triage:** `df -h data/spill/`; restore the QuestDB drain
 (cross-check DISK-WATCHER-01 / BOOT-01/02) or free disk.
+
+**Added 2026-10-12 (deep audit DA-12, S3-1) — `source = "disk_hours_left_low"`
+(a `warn!`, log only, no page).** The watcher keeps its last hour of
+free-space readings and projects how long the disk lasts at the rate it filled
+over that hour (`tv_disk_hours_left_at_fill_rate` on local `/metrics`; -1 means
+"not filling" or "under 10 minutes of readings"). The line fires once when, at that rate, the disk
+is full before capture ends at 15:40 IST (a longer projection is a normal
+session and never logs); it re-arms once the projection is 2 hours longer than
+the capture time left, or at the IST day change. **Triage:**
+check that the cold backup (raw frame upload) is keeping up, because frame logs
+are kept until a verified copy exists; then free disk or grow the volume. The
+probe itself is now one `statvfs` call, not the `df` tool, so a probe failure
+reads `reason = "statvfs_failed"`.
 
 ## OPER-01 — Dhan client-id changed in config (Wave-4-E3)
 

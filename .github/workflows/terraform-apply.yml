@@ -67,17 +67,57 @@ on:
   workflow_dispatch:
     inputs:
       confirm_market_hours:
-        description: 'Apply during market hours? Type "yes" to override the guard.'
+        description: 'Apply during market hours? Choose "yes" to override the guard.'
         required: false
         default: 'no'
+        type: choice
+        options: ['no', 'yes']
       skip_apply:
         description: 'Plan only, skip apply even on main. Type "yes" to skip.'
         required: false
         default: 'no'
+      force_unlock_lock_id:
+        description: 'DANGER: terraform force-unlock this state lock ID before planning. Leave EMPTY unless an ORPHANED lock from a killed run is blocking every terraform operation. Never use while an apply is genuinely running.'
+        required: false
+        default: ''
+      rotate_console_key:
+        description: 'Type "rotate" to replace the operator console key with a fresh one (needs skip_apply = no, outside market hours). The new key is written only to Parameter Store (operator control-secret) and is never sent; every device must paste it once. Leave EMPTY otherwise.'
+        required: false
+        default: ''
 
 concurrency:
-  group: terraform-apply-prod
-  cancel-in-progress: false # never interrupt a running apply
+  # PRs get their OWN per-branch group; every apply-capable event keeps the
+  # single global one. Rationale (2026-08-22): the global group was shared by
+  # PR plans and applies alike with cancel-in-progress false, so GitHub keeps
+  # only the most recent PENDING run per group and rapid pushes CANCELLED the
+  # queued plan — 3 of 6 consecutive commits had their terraform run cancelled,
+  # and because this lane is path-filtered it is not part of All Green, so a
+  # .tf change reached a green PR validated by nothing.
+  #
+  # The safety property is UNCHANGED: "never two terraform apply at once" is
+  # about APPLIES, and every event that can reach the apply job (push to main,
+  # workflow_dispatch, schedule) still serialises on terraform-apply-prod. A
+  # pull_request can never reach that job — see the Job 3 `if:` below.
+  # CORRECTED 2026-08-29 — `cancel-in-progress: true` for PR plans was right
+  # about the plan's OUTPUT and wrong about its SIDE EFFECT.
+  #
+  # A superseded plan's output is indeed worthless. But `terraform plan` takes
+  # a DynamoDB state lock, and a cancelled run is SIGKILLed without releasing
+  # it. An abandoned lock never expires, so it blocks EVERY terraform
+  # operation in this repository — including on main — until a human runs
+  # `force-unlock` against live prod state.
+  #
+  # That is not theoretical. On 2026-08-28 two rapid pushes cancelled runs 945
+  # and 946; lock 6f621e38-9bed-3c51-1c28-d1b7a513ca74 was created at 19:31:08Z
+  # by one of them and was still held hours later, having failed the plan on
+  # two different heads. The saving was a few runner minutes; the cost was a
+  # repo-wide terraform outage needing manual intervention.
+  #
+  # So PR plans now run to completion. They still get their own per-branch
+  # group, so a second push QUEUES behind the first instead of cancelling it —
+  # slower, and it orphans nothing.
+  group: ${{ github.event_name == 'pull_request' && format('terraform-plan-{0}', github.ref) || 'terraform-apply-prod' }}
+  cancel-in-progress: false # never cancel a run holding the state lock — see above
 
 permissions:
   id-token: write   # OIDC for AWS role assumption
@@ -86,7 +126,12 @@ permissions:
 
 env:
   TF_VAR_aws_region: ap-south-1
-  TF_VAR_operator_cidr: "0.0.0.0/0" # CI runs from GH IPs; SSH SG is locked by separate operator override
+  # Audit PR36c (2026-10-03, owner: "security yes"): this was "0.0.0.0/0",
+  # which opened SSH to the internet on every apply. Empty (the secret unset)
+  # means no SSH rule; shell access is SSM Session Manager. To allow one
+  # address: set the repository secret TF_VAR_OPERATOR_CIDR (e.g.
+  # 203.0.113.42/32) and re-run this workflow.
+  TF_VAR_operator_cidr: ${{ secrets.TF_VAR_OPERATOR_CIDR }}
   TF_VAR_operator_email: "sjparthi93@gmail.com" # registered alert destination
   TF_VAR_ami_id: ami-0fa0340d4a8bdd6ee
   # Operator portal: opt prod IN via CI (the terraform variable default stays
@@ -155,16 +200,30 @@ jobs:
       plan_exitcode: ${{ steps.plan.outputs.exitcode }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
+      # Audit PR36c (2026-10-03, owner: "security yes"): a pull request's plan
+      # job held the long-lived AWS keys, so any branch with a pull request
+      # had account-level credentials in a job it could edit. A pull request
+      # now gets NO AWS credentials: it checks formatting and validates the
+      # configuration offline (`init -backend=false` + `validate` below). The
+      # real plan, against the live state, runs on the push to main, before
+      # the apply, exactly as it always has. Undo: delete the `if:` lines that
+      # say `github.event_name != 'pull_request'` in this job and the two
+      # pull-request-only steps.
+      # Honest limit: the keys are still repository secrets, so a branch
+      # that edits this file in its own pull request can still read them.
+      # The barrier a branch cannot edit is moving them into the `prod`
+      # environment (Settings > Environments > prod), an owner setting.
       - name: Configure AWS credentials (OIDC if available, else access keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -173,6 +232,7 @@ jobs:
           role-session-name: tv-github-terraform-plan-${{ github.run_id }}
 
       - name: Resolve AWS account id
+        if: github.event_name != 'pull_request'
         id: aws_account
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -180,6 +240,7 @@ jobs:
           echo "Using AWS account ${ACCOUNT_ID}"
 
       - name: Bootstrap S3 state backend + DynamoDB lock (idempotent)
+        if: github.event_name != 'pull_request'
         run: bash scripts/aws-bootstrap-state-backend.sh "${{ steps.aws_account.outputs.account_id }}" "${{ env.AWS_REGION }}"
 
       # rust-only phase 2b-1 (2026-07-18): the 4 operational Lambdas
@@ -190,7 +251,8 @@ jobs:
       # `filename` + `file(".lambda-zips/source.digest")` at PLAN and APPLY
       # time, so this step runs on BOTH runners (the apply runner re-plans —
       # see the archive_file note on the apply step). source.digest hashes
-      # the Rust SOURCE (crate git tree + Cargo.lock), not the zip — Rust
+      # the Rust SOURCE (crate git tree, direct common wire imports and
+      # Cargo.lock), not the zip — Rust
       # builds are not bit-reproducible, so hashing the zip would churn
       # every apply with zero source change.
       #
@@ -215,7 +277,7 @@ jobs:
       # cargo-lambda install is absorbed by the adjacent actions/cache step
       # (tag-pinned @v4, this workflow's house action-pinning style).
       - name: Cache cargo-lambda
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
@@ -233,7 +295,7 @@ jobs:
           # reached Cargo.toml + terraform but not this list, so the run
           # rebuilt the EC2 box and then aborted red. Pinned by
           # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter aws-waste-check"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
@@ -274,7 +336,7 @@ jobs:
           for b in ${BINS}; do
             cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
           done
-          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs crates/common/src/operator_movers_universe.rs crates/common/src/mtf_receipt_json.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
           printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
           ls -la "${ZIP_DIR}"
 
@@ -296,6 +358,7 @@ jobs:
       # Rust guard asserts this file stays perl-free.
 
       - name: terraform init (with S3 backend)
+        if: github.event_name != 'pull_request'
         run: |
           terraform -chdir=${{ env.TF_DIR }} init \
             -backend-config="bucket=tv-terraform-state-${{ steps.aws_account.outputs.account_id }}" \
@@ -304,14 +367,78 @@ jobs:
             -backend-config="dynamodb_table=tv-terraform-locks" \
             -backend-config="encrypt=true"
 
+      # ------------------------------------------------------------------
+      # Stale-lock escape hatch (added 2026-08-29).
+      #
+      # A run killed mid-plan never releases its DynamoDB state lock, and
+      # nothing expires it, so ONE orphan blocks EVERY terraform operation in
+      # this repository. That is not hypothetical: lock
+      # 6f621e38-9bed-3c51-1c28-d1b7a513ca74 was created 2026-08-28 19:31:08Z
+      # by a cancelled run and blocked five consecutive runs across two days.
+      # The only documented remedy was "a human runs force-unlock manually",
+      # which is exactly why it stayed stuck through a weekend.
+      #
+      # The CAUSE is already fixed by `cancel-in-progress: false` above. This
+      # is the REMEDY for a lock that is already orphaned.
+      #
+      # Deliberately narrow, so it can never fire by accident:
+      #   * workflow_dispatch ONLY — never a push, a PR or a schedule
+      #   * empty by default — doing nothing is the default behaviour
+      #   * the exact lock ID must be typed in; terraform itself refuses a
+      #     mismatched id, so this cannot release a lock it was not aimed at
+      # Applies already serialise on the terraform-apply-prod concurrency
+      # group, so this cannot race a real apply.
+      # ------------------------------------------------------------------
+      - name: Force-unlock an orphaned state lock (opt-in, dispatch only)
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.force_unlock_lock_id != ''
+        env:
+          LOCK_ID: ${{ github.event.inputs.force_unlock_lock_id }}
+        run: |
+          set -euo pipefail
+          echo "::warning::force-unlock requested for state lock ${LOCK_ID}"
+          terraform -chdir=${{ env.TF_DIR }} force-unlock -force "${LOCK_ID}"
+          echo "state lock ${LOCK_ID} released; plan will now acquire its own"
+
+      - name: terraform init (offline, pull request only, no AWS credentials)
+        if: github.event_name == 'pull_request'
+        run: terraform -chdir=${{ env.TF_DIR }} init -backend=false -input=false
+
       - name: terraform validate
         run: terraform -chdir=${{ env.TF_DIR }} validate
 
+      # Audit PR30 (2026-09-27): while the budget-stop latch names the current
+      # UTC billing month, plan the daily-start rule as DISABLED so this
+      # apply never undoes a budget stop. Unreadable/malformed values fail
+      # closed; only a classified ParameterNotFound proves absence. Keep the
+      # provider body bounded/private and preserve the known absent/old default.
+      # Append a sentinel before shell capture strips trailing newlines; remove
+      # only that sentinel and one CLI newline, retaining malformed/oversize tails.
+      - name: Read the budget-stop latch
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail; export LC_ALL=C
+          if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
+            LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; if [[ "$LATCH" =~ ^released-([0-9]{4}-[0-9]{2})$ ]] && [ "$(LC_ALL=C date -u -d "${BASH_REMATCH[1]}-01" +%Y-%m 2>/dev/null)" = "${BASH_REMATCH[1]}" ]; then LATCH=; else [ "${#LATCH}" = 7 ] &&[ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing planning"; exit 1; }; fi
+          else
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing planning"; exit 1; fi
+          fi
+          MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
+            echo "::warning::budget-stop latch holds for ${MONTH} — planning the daily-start rule DISABLED"
+            echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
+          else echo "TF_BUDGET_FENCE confirmed absent or nonmatching — daily-start default unchanged"; fi
+
       - name: terraform plan
+        if: github.event_name != 'pull_request'
         id: plan
         run: |
           set +e
-          terraform -chdir=${{ env.TF_DIR }} plan -detailed-exitcode -no-color -out=tfplan
+          # -lock-timeout: wait for a legitimately-held lock (another branch
+          # planning) instead of failing fast. It does NOT rescue an ORPHANED
+          # lock — nothing releases that — which is why the real fix is the
+          # `cancel-in-progress: false` above. This is the contention half.
+          terraform -chdir=${{ env.TF_DIR }} plan -detailed-exitcode -no-color -lock-timeout=5m -out=tfplan
           EXIT_CODE=$?
           echo "exitcode=${EXIT_CODE}" >> $GITHUB_OUTPUT
           # 0 = no changes, 1 = error, 2 = changes pending
@@ -322,18 +449,17 @@ jobs:
           echo "Plan exit code: ${EXIT_CODE} (0=no-changes, 2=changes-pending)"
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/tfplan
           retention-days: 7
 
-      - name: Post plan summary on PR
+      - name: Report what a pull request checked
         if: github.event_name == 'pull_request'
         run: |
-          echo "Plan exit code: ${{ steps.plan.outputs.exitcode }} (0=no-changes, 2=changes-pending)"
-          # PR comment posting could be wired here via gh CLI; left as TODO
-          # to avoid pulling in an extra action. Plan output is in the job log.
+          echo "Pull request: format and offline validate passed. No AWS credentials were used; the plan against live state runs on the push to main." | tee -a "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────
   # Job 2: market-hours guard — blocks apply during 09:00-15:45 IST Mon-Fri
@@ -344,20 +470,33 @@ jobs:
     needs: [preflight, terraform-plan]
     if: needs.preflight.outputs.bootstrap_ready == 'true' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     steps:
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Check current IST time against market window
+        # SEC-7 (2026-10-12): a dispatch input reaches the script through env,
+        # never as an inline expression the runner pastes into the script.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
         run: |
           # No-deploy band 09:00-15:45 IST = 03:30-10:15 UTC (operator lock
           # 2026-06-03 — kept consistent with deploy-aws.yml: no prod mutation,
           # app OR infra, during 09:00 till 3.45 pm IST).
-          UTC_HOUR=$(date -u +%H)
-          UTC_MINUTE=$(date -u +%M)
-          UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
-          UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
+          # 1=Mon, 7=Sun. One line since 2026-10-26 (audit PR L4): the lines
+          # saved pay for the same check re-run right before `terraform apply`.
+          UTC_HOUR=$(date -u +%H); UTC_MINUTE=$(date -u +%M); UTC_DOW=$(date -u +%u); UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
 
           echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
 
-          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; then
-            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+          if [ "$MUHURAT" = "yes" ] || { [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 330 ] && [ "$UTC_TIME_NUM" -lt 1015 ]; }; then
+            if [ "${CONFIRM_MARKET_HOURS:-no}" = "yes" ]; then
               echo "WARNING: applying infra changes during market hours with explicit override"
             else
               echo "::error::BLOCK: applying infra changes during 09:00-15:45 IST is forbidden."
@@ -387,16 +526,16 @@ jobs:
       elastic_ip: ${{ steps.outputs.outputs.elastic_ip }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4
         with:
           terraform_version: 1.9.8
           terraform_wrapper: false
 
       - name: Configure AWS credentials (OIDC if available, else access keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -411,7 +550,7 @@ jobs:
           echo "account_id=${ACCOUNT_ID}" >> $GITHUB_OUTPUT
 
       - name: Download plan artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: terraform-plan-${{ github.sha }}
           path: ${{ env.TF_DIR }}/
@@ -423,7 +562,7 @@ jobs:
       # (2026-07-18 hostile-review r1 F1 fix — full rationale on the plan
       # job's twin step; KEEP the two Cache/Build steps textually identical).
       - name: Cache cargo-lambda
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.cargo/bin/cargo-lambda
           key: cargo-lambda-1.9.1-${{ runner.os }}-${{ runner.arch }}
@@ -441,7 +580,7 @@ jobs:
           # reached Cargo.toml + terraform but not this list, so the run
           # rebuilt the EC2 box and then aborted red. Pinned by
           # crates/common/tests/lambda_zip_bins_lockstep_guard.rs.
-          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter"
+          BINS="daily-budget-digest boot-heartbeat-gate market-hours-liveness-gate budget-killswitch telegram-webhook market-open-readiness deploy-watchdog start-watchdog hard-stop-guard qdb-console-proxy qdb-console-front operator-control dhan-token-minter aws-waste-check"
           # Zig toolchain for the cargo-zigbuild arm64 cross-compile.
           #
           # 2026-08-01 (operator directive — Rust-O(1)-only workspace): this
@@ -482,7 +621,7 @@ jobs:
           for b in ${BINS}; do
             cp "target/lambda/${b}/bootstrap.zip" "${ZIP_DIR}/${b}.zip"
           done
-          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
+          SRC_DIGEST=$( { git rev-parse "HEAD:crates/aws-lambdas"; sha256sum Cargo.lock crates/common/src/operator_movers_wire.rs crates/common/src/operator_stock_movers_wire.rs crates/common/src/operator_movers_universe.rs crates/common/src/mtf_receipt_json.rs | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )
           printf '%s' "${SRC_DIGEST}" > "${ZIP_DIR}/source.digest"
           ls -la "${ZIP_DIR}"
 
@@ -495,6 +634,24 @@ jobs:
             -backend-config="dynamodb_table=tv-terraform-locks" \
             -backend-config="encrypt=true"
 
+      # Audit PR30: the apply job RE-PLANS on its own runner (see the next
+      # step), and $GITHUB_ENV from the plan job does not cross jobs, so the
+      # latch is read again here. Without this step the real apply planned
+      # the daily-start rule ENABLED on every run and undid a budget stop.
+      # The same fail-closed read runs here; raw values/errors are never echoed.
+      - name: Read the budget-stop latch
+        run: |
+          set -euo pipefail; export LC_ALL=C
+          if LATCH=$(timeout -k 5 20 aws ssm get-parameter --name "/tickvault-guard/prod/budget-stop-month" --query 'Parameter.Value' --output text 2>&1 | tr '\000' '?' | head -c 4097; RC=$?; printf '.'; exit "$RC"); then
+            LATCH=${LATCH%.}; LATCH=${LATCH%$'\n'}; if [[ "$LATCH" =~ ^released-([0-9]{4}-[0-9]{2})$ ]] && [ "$(LC_ALL=C date -u -d "${BASH_REMATCH[1]}-01" +%Y-%m 2>/dev/null)" = "${BASH_REMATCH[1]}" ]; then LATCH=; else [ "${#LATCH}" = 7 ] &&[ "$(LC_ALL=C date -u -d "${LATCH}-01" +%Y-%m 2>/dev/null)" = "$LATCH" ] || { echo "::error::TF_BUDGET_FENCE invalid; refusing applying"; exit 1; }; fi
+          else
+            RC=$?; LATCH=${LATCH%.}; if { [ "$RC" = 254 ] || [ "$RC" = 255 ]; } && [ "${#LATCH}" -le 4096 ] && [[ "$LATCH" =~ ^[[:space:]]*(aws:\ \[ERROR\]:\ )?An\ error\ occurred\ \(ParameterNotFound\)\ when\ calling\ the\ GetParameter\ operation: ]]; then LATCH=; else echo "::error::TF_BUDGET_FENCE unavailable; refusing applying"; exit 1; fi
+          fi
+          MONTH=$(date -u +%Y-%m); if [ "$LATCH" = "$MONTH" ]; then
+            echo "::warning::budget-stop latch holds for ${MONTH} — applying the daily-start rule DISABLED"
+            echo "TF_VAR_daily_start_enabled=false" >> "$GITHUB_ENV"
+          else echo "TF_BUDGET_FENCE confirmed absent or nonmatching — daily-start default unchanged"; fi
+
       - name: terraform apply
         # Re-plan + apply on THIS runner instead of applying the saved tfplan.
         # WHY: the Lambda resources use `data "archive_file"` which builds the
@@ -506,7 +663,17 @@ jobs:
         # the zips locally. archive_file is deterministic, and apply only runs
         # after the plan job already passed + the market-hours guard, so a
         # same-commit re-plan is safe and idempotent.
-        run: terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
+        #
+        # 2026-10-26 (audit PR L4): the guard job ran before the Lambda build,
+        # which can take many minutes; an apply that passed the guard at 08:55
+        # could reach this step inside the 09:00-15:45 IST band. The same
+        # check (same override input) runs again immediately before applying.
+        env:
+          CONFIRM_MARKET_HOURS: ${{ github.event.inputs.confirm_market_hours }}
+        run: |
+          DOW=$(TZ='Asia/Kolkata' date +%u); HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM)); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if { [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 900 ] && [ "$HHMM" -lt 1545 ]; }; } && [ "${CONFIRM_MARKET_HOURS:-no}" != "yes" ]; then echo "::error::BLOCK: it is $HHMM IST, inside the 09:00-15:45 IST no-deploy band, at apply time. Re-run after 15:45 IST or with confirm_market_hours=yes."; exit 1; fi
+          terraform -chdir=${{ env.TF_DIR }} apply -auto-approve -no-color
 
       - name: Capture outputs
         id: outputs
@@ -520,13 +687,21 @@ jobs:
           echo "INSTANCE_ID=${INSTANCE_ID}"
           echo "ELASTIC_IP=${EIP}"
 
-      - name: Send ready-made operator-portal link to Telegram
-        # Zero-touch: if the portal is enabled, generate the device key in SSM
-        # (once), then DM the operator a single tappable link with the key in
-        # the URL fragment (#key=...). The fragment never reaches the server;
-        # the operator opens it and is unlocked with no typing. The key is
-        # NEVER printed to the Actions log — only published to the private
-        # SNS->Telegram channel.
+      - name: Send the operator-portal link to Telegram
+        # If the portal is enabled, generate the device key in SSM (once), then
+        # send the operator the portal URL. The KEY IS NEVER PUBLISHED (audit
+        # PR36a, 2026-09-27): the alerts topic also delivers to email and SMS,
+        # so a key in the message sat in plaintext mail and text history, and
+        # `add-mask` only ever hid the Actions log. The operator reads the key
+        # once from Parameter Store and pastes it on the portal's unlock page,
+        # which remembers it on that device.
+        #
+        # Rotation: a manual run with rotate_console_key = "rotate" overwrites
+        # the stored key with a fresh one. Both console Lambdas cache the key
+        # for 60 s, so the old key stops working within a minute. A failed
+        # rotation fails the step loudly; it never reports success.
+        env:
+          ROTATE_CONSOLE_KEY: ${{ github.event.inputs.rotate_console_key }}
         run: |
           set +e
           URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_portal_url 2>/dev/null)
@@ -534,24 +709,64 @@ jobs:
             echo "operator portal disabled — nothing to publish"; exit 0
           fi
           SECRET_NAME="/tickvault/prod/operator/control-secret"
-          if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+          ROTATED=no
+          # A key is only ever stored after it is checked to be 40 characters
+          # (30 random bytes, base64). An empty or short key fails the step.
+          new_console_key() {
             KEY=$(openssl rand -base64 30 | tr -d '\n')
+            if [ ${#KEY} -ne 40 ]; then
+              unset KEY
+              echo "::error::console key generation FAILED: openssl did not return a 40-character key; nothing was stored" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
             echo "::add-mask::${KEY}"
-            aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
-              --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null
-            echo "generated a new operator device key (stored in SSM SecureString)"
-          else
-            KEY=$(aws ssm get-parameter --name "$SECRET_NAME" --with-decryption \
-              --query Parameter.Value --output text --region ${{ env.AWS_REGION }})
-            echo "::add-mask::${KEY}"
+          }
+          if ! aws ssm get-parameter --name "$SECRET_NAME" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            new_console_key
+            PUT_ERR=$(aws ssm put-parameter --name "$SECRET_NAME" --type SecureString \
+                --value "$KEY" --region ${{ env.AWS_REGION }} 2>&1 >/dev/null)
+            PUT_RC=$?
+            unset KEY
+            if [ "$PUT_RC" -eq 0 ]; then
+              echo "generated a new operator device key (stored in SSM SecureString)"
+            elif printf '%s' "$PUT_ERR" | grep -q ParameterAlreadyExists; then
+              # The read above failed for another reason (throttle, network)
+              # but a key is stored; keep it. A requested rotation did not
+              # happen, so say so rather than report success.
+              if [ "$ROTATE_CONSOLE_KEY" = "rotate" ]; then
+                echo "::error::console key rotation FAILED: could not read the stored key; the old key is still in place" | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              echo "a device key already exists; kept it"
+            else
+              echo "::error::console key creation FAILED: no key is stored, so the portal cannot be unlocked" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          elif [ "$ROTATE_CONSOLE_KEY" = "rotate" ]; then
+            new_console_key
+            if ! aws ssm put-parameter --name "$SECRET_NAME" --type SecureString --overwrite \
+                --value "$KEY" --region ${{ env.AWS_REGION }} >/dev/null; then
+              unset KEY
+              echo "::error::console key rotation FAILED: the old key is still in place" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            unset KEY
+            ROTATED=yes
+            echo "rotated the operator device key (stored in SSM SecureString)"
           fi
-          LINK="${URL}#key=${KEY}"
+          if [ "$ROTATED" = "yes" ]; then
+            SUBJECT="Operator console key replaced"
+            MESSAGE="Your tickvault operator console key was replaced. The old key stops working within a minute. Open ${URL} on each device and paste the new key from AWS Parameter Store (operator control-secret). The key is never sent in a message."
+          else
+            SUBJECT="Operator portal ready"
+            MESSAGE="Your tickvault operator portal is live: ${URL} — open it and paste your device key (AWS Parameter Store, operator control-secret). The key is never sent in a message."
+          fi
           aws sns publish --region ${{ env.AWS_REGION }} \
             --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
-            --subject "Operator portal ready" \
-            --message "Your tickvault operator portal is live. Tap to open (your key is baked in — do NOT forward this message): ${LINK}" >/dev/null
-          echo "✅ Published the ready-made portal link to Telegram (key NOT shown here)."
-          echo "Operator portal URL (key sent privately via Telegram): ${URL}" >> "$GITHUB_STEP_SUMMARY"
+            --subject "$SUBJECT" \
+            --message "$MESSAGE" >/dev/null
+          echo "✅ Published the portal URL to Telegram (the key is never sent; rotated=${ROTATED})."
+          echo "Operator portal URL: ${URL} (key rotated: ${ROTATED})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Deploy gate: console shell GET / must return 200 within 5s"
         # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a
@@ -686,7 +901,7 @@ jobs:
       )
     steps:
       - name: Configure AWS credentials (OIDC if available, else access keys)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}

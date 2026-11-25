@@ -1,5 +1,5 @@
 //! Endpoint / path resolution — parity port of the configuration section
-//! of server.py (placeholder-aware env resolution + the committed
+//! of the retired reference implementation (placeholder-aware env resolution + the committed
 //! `config/claude-mcp-endpoints.toml` fallback).
 //!
 //! Every accessor is parameterized over an [`Env`] source so unit tests
@@ -242,7 +242,7 @@ pub fn state_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".claude").join("state")
 }
 
-/// Repo-root resolution (DELIBERATE DEVIATION from server.py, documented
+/// Repo-root resolution (DELIBERATE DEVIATION from the retired reference implementation, documented
 /// in lib.rs): `TICKVAULT_MCP_REPO_ROOT` env override (if resolved), else
 /// walk up from the current dir looking for `.mcp.json` or
 /// `config/claude-mcp-endpoints.toml`, else the current dir. The

@@ -2,7 +2,10 @@
 # EventBridge → SSM start/stop dead-letter queue + retry observability
 # =============================================================================
 # The daily_start (08:30 IST) / daily_stop (16:30 IST) EventBridge targets in
-# main.tf fire SSM AWS-StartEC2Instance / AWS-StopEC2Instance. Before this file
+# main.tf fire SSM AWS-StartEC2Instance / AWS-StopEC2Instance. (Since operator
+# Quote 31, 2026-10-21, the daily_stop target is the start-watchdog Lambda in
+# start-watchdog-lambda.tf, at 17:30 IST; it keeps this retry policy and DLQ.)
+# Before this file
 # those targets had NO retry policy and NO dead-letter queue, so a single
 # transient SSM/EC2 throttle silently dropped the invocation with zero retries
 # and nothing to inspect — the recurring "08:30 auto-start FAILED" incidents
@@ -72,22 +75,5 @@ resource "aws_sqs_queue_policy" "eventbridge_dlq" {
 # after the bounded 3-day inspect window above. The resource + alarm names
 # keep the historical "depth" wording deliberately — renaming would
 # delete/recreate the alarm for zero benefit.
-resource "aws_cloudwatch_metric_alarm" "eventbridge_dlq_depth" {
-  alarm_name          = "tv-${var.environment}-eventbridge-dlq-depth"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "NumberOfMessagesSent"
-  namespace           = "AWS/SQS"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "A NEW EC2 start/stop EventBridge invocation exhausted its retries and dead-lettered — the daily 08:30/16:30 IST schedule failed. Pages on new dead-letter arrival (edge-trigger, self-clears next period); the queue self-drains after the bounded 3-day inspect window. Inspect the DLQ message + CloudTrail StartInstances. See aws-startinstances-failed.md."
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    QueueName = aws_sqs_queue.eventbridge_dlq.name
-  }
-
-  alarm_actions = [aws_sns_topic.tv_alerts.arn]
-  ok_actions    = [aws_sns_topic.tv_alerts.arn]
-}
+# alarm "eventbridge_dlq_depth" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.

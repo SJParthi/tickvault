@@ -115,11 +115,11 @@ fn make_trade_frame(msg_code: u8, symbol_id: i32, seq_no: i32) -> Vec<u8> {
     b[T_OFF_TIMESTAMP..T_OFF_TIMESTAMP + 4].copy_from_slice(&1_754_000_000_i32.to_le_bytes());
     b[T_OFF_LTP..T_OFF_LTP + 4].copy_from_slice(&24_512.75_f32.to_le_bytes());
     b[T_OFF_VOLUME..T_OFF_VOLUME + 4].copy_from_slice(&75_i32.to_le_bytes());
-    b[T_OFF_ATP..T_OFF_ATP + 4].copy_from_slice(&24_500.50_f32.to_le_bytes());
+    b[T_OFF_ATP..T_OFF_ATP + 4].copy_from_slice(&24_500.5_f32.to_le_bytes());
     b[T_OFF_TOT_VOLUME..T_OFF_TOT_VOLUME + 8].copy_from_slice(&9_876_543_i64.to_le_bytes());
     b[T_OFF_OPEN..T_OFF_OPEN + 4].copy_from_slice(&24_400.00_f32.to_le_bytes());
     b[T_OFF_HIGH..T_OFF_HIGH + 4].copy_from_slice(&24_600.25_f32.to_le_bytes());
-    b[T_OFF_LOW..T_OFF_LOW + 4].copy_from_slice(&24_380.10_f32.to_le_bytes());
+    b[T_OFF_LOW..T_OFF_LOW + 4].copy_from_slice(&24_380.1_f32.to_le_bytes());
     b[T_OFF_PREV_CLOSE..T_OFF_PREV_CLOSE + 4].copy_from_slice(&24_350.00_f32.to_le_bytes());
     b[T_OFF_OI..T_OFF_OI + 8].copy_from_slice(&123_456_789_i64.to_le_bytes());
     b[T_OFF_PREV_OI..T_OFF_PREV_OI + 8].copy_from_slice(&123_000_000_i64.to_le_bytes());
@@ -127,7 +127,7 @@ fn make_trade_frame(msg_code: u8, symbol_id: i32, seq_no: i32) -> Vec<u8> {
     b[T_OFF_OHL] = b'H';
     b[T_OFF_SEQ_NO..T_OFF_SEQ_NO + 4].copy_from_slice(&seq_no.to_le_bytes());
     if msg_code == TD_MSG_CODE_TRADE {
-        b[T_OFF_BID..T_OFF_BID + 4].copy_from_slice(&24_512.50_f32.to_le_bytes());
+        b[T_OFF_BID..T_OFF_BID + 4].copy_from_slice(&24_512.5_f32.to_le_bytes());
         b[T_OFF_BID_QTY..T_OFF_BID_QTY + 4].copy_from_slice(&150_i32.to_le_bytes());
         b[T_OFF_ASK..T_OFF_ASK + 4].copy_from_slice(&24_513.00_f32.to_le_bytes());
         b[T_OFF_ASK_QTY..T_OFF_ASK_QTY + 4].copy_from_slice(&225_i32.to_le_bytes());

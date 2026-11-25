@@ -60,6 +60,13 @@ pub async fn wait_for_questdb_ready(
     questdb_config: &QuestDbConfig,
     deadline_secs: u64,
 ) -> Result<Duration, BootProbeError> {
+    // Seed at zero before the probe starts. A boot-deadline breach happens at
+    // most once per boot and may never happen for months, so this counter is
+    // the textbook case the CloudWatch agent's drop-the-first-unseen-sample
+    // rule destroys: the one occurrence that matters is the one discarded.
+    // Seeded here rather than at boot-wide scope because this IS the boot
+    // probe — the series appears exactly when the thing it measures runs.
+    metrics::counter!("tv_boot_deadline_exceeded_total").increment(0);
     let base_url = format!(
         "http://{}:{}/exec?query=SELECT%201",
         questdb_config.host, questdb_config.http_port

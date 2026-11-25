@@ -134,10 +134,17 @@ pub fn client_from_build_result<E: fmt::Display>(
 /// Returns [`HttpClientBuildError`] when the underlying
 /// `ClientBuilder::build()` fails (TLS backend init, resolver init, fd
 /// exhaustion). Callers degrade gracefully — they never panic.
+///
+/// Every caller talks to QuestDB on the local host or the Docker network, so
+/// the client ignores `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (audit K1):
+/// a proxy variable set for some other tool must never route a spill replay
+/// or a readiness probe through a proxy that answers 403/407 for it, which
+/// the replay would then read as a refusal.
 pub fn build_probe_client(timeout_secs: u64) -> Result<Client, HttpClientBuildError> {
     client_from_build_result(
         Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
+            .no_proxy()
             .build(),
     )
 }
@@ -524,6 +531,22 @@ mod tests {
         assert!(
             std::ptr::eq(a, b),
             "shared_probe_client must return the SAME static instance"
+        );
+    }
+
+    #[test]
+    fn test_regression_probe_client_ignores_proxy_variables() {
+        // Audit K1: a source pin, because the proxy is read from the process
+        // environment and mutating it in a parallel test run is unsound.
+        let src = include_str!("http_client.rs");
+        let start = src
+            .find("pub fn build_probe_client(")
+            .expect("build_probe_client exists"); // APPROVED: test
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("function end"); // APPROVED: test
+        assert!(
+            body[..end].contains(".no_proxy()"),
+            "the shared QuestDB client must call .no_proxy()"
         );
     }
 

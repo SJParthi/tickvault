@@ -137,33 +137,65 @@ fn dhan_feed_gap_detector_observes_before_aggregator_refusal() {
 }
 
 // ---------------------------------------------------------------------------
-// Orphan 4 — the 15:31 cross-verification (BLOCKING, not optional)
+// Orphan 4 — the 15:41 cross-verification — RETIRED 2026-09-17
 // ---------------------------------------------------------------------------
-
-#[test]
-fn dhan_feed_stack_spawns_the_daily_crossverify() {
-    assert!(
-        STACK_SRC.contains("spawn_daily_crossverify(&params.main_feed_instruments)"),
-        "the bring-up body must spawn the 15:31 comparator. The main feed has \
-         NO snapshot-on-subscribe and NO sequence number, so packet loss is \
-         undetectable at the protocol level and this cross-verify is the lane's \
-         only ground truth — the 2026-08-09 authorization requires it live from \
-         day one."
-    );
-}
-
-/// An un-provisioned comparator must refuse loudly, never skip quietly.
-#[test]
-fn dhan_feed_crossverify_refuses_loudly_when_unprovisioned() {
-    assert!(
-        STACK_SRC.contains("XVERIFY_UNPROVISIONED_COUNTER"),
-        "a missing cross-verify provider must increment a counter, not pass silently."
-    );
-    assert!(
-        STACK_SRC.contains("UNDETECTABLE"),
-        "the un-provisioned error must state the consequence in plain terms."
-    );
-}
+//
+// Two tests lived here and both are gone with their subject:
+//
+//   * `dhan_feed_stack_spawns_the_daily_crossverify` pinned
+//     `spawn_daily_crossverify(&params.main_feed_instruments)` in the bring-up
+//     body.
+//   * `dhan_feed_crossverify_refuses_loudly_when_unprovisioned` pinned
+//     `XVERIFY_UNPROVISIONED_COUNTER` and the word `UNDETECTABLE`, so a missing
+//     provider counted and said the consequence rather than skipping quietly.
+//
+// The operator's SOCKETS-ONLY narrowing removed the comparator
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10 — "Bro just remove per
+// minute price falls and 3.41 pm accuracy check alone dude okay"), and §12.10.3
+// settled the harder half deliberately: the BOOT FLOOR that gated all sixteen
+// sockets on the comparator being provisioned was REMOVED WITH IT, not
+// re-pointed at something else. A refusal floor whose subject the operator has
+// ordered deleted cannot stand — keeping it means `run_dhan_feed_stack`
+// refuses to dial, every session, forever.
+//
+// ## ⚠ THE CLAIM THIS SECTION USED TO MAKE, and what replaces it: NOTHING
+//
+// The retired test's own message is the honest record of what is now gone, and
+// it is repeated here verbatim rather than paraphrased, because this is the
+// last place in the tree that asserted it:
+//
+//     "The main feed has NO snapshot-on-subscribe and NO sequence number, so
+//      packet loss is undetectable at the protocol level and this cross-verify
+//      is the lane's only ground truth — the 2026-08-09 authorization requires
+//      it live from day one."
+//
+// Every word of that is still TRUE about the feed. What changed is that the
+// comparator is gone, so **there is now ZERO mechanism anywhere in this
+// workspace that compares captured market data against any external record**
+// (§12.10.4, which searched for another and found none: `tf_consistency_boot`
+// recomputes our own timeframes from our own candles, `rest_candle_fold` is a
+// disabled writer, `volume_semantics_probe` is QuestDB-only with zero callers,
+// and every cross-broker comparator was deleted in 2026-07-15 and 2026-08-21).
+//
+// What survives answers "did the machinery run", never "are the numbers right",
+// and must never be quoted as answering the second:
+//
+//   | survives                                   | answers                          |
+//   |--------------------------------------------|----------------------------------|
+//   | `dhan-no-ticks-flowing`                    | is data arriving at all          |
+//   | `dropped == spilled` on both loss families | did we keep what we received     |
+//   | `tv_aggregator_tick_refused_total`         | are the timestamps in-session    |
+//   | `tv_dhan_feed_depth_total{outcome=ghost}`  | is the vendor honouring unsubscribe |
+//
+// `websocket-connection-scope-lock.md` states that a non-zero `compared` was
+// "the ONLY evidence this repository can offer that the feed works". That
+// evidence source ends here. No PR may claim the feed is verified after this
+// point — §12.10.6's REJECT list names that claim explicitly.
+//
+// The FIVE other refusal floors in `run_dhan_feed_stack` are UNTOUCHED
+// (plan-build, the fold/lane exclusivity check, the capture/WAL floor, the
+// token-manager floor and the dual-instance lock), and §12.10.6 makes weakening
+// any of them a REJECT. Only the verification floor went.
 
 // ---------------------------------------------------------------------------
 // The gate stays shut
@@ -455,4 +487,122 @@ fn no_drain_flush_site_bypasses_the_feed_health_report() {
          reach feed-health, so that slice of the lane's output stops counting \
          toward liveness while the feed is genuinely delivering."
     );
+}
+
+// ---------------------------------------------------------------------------
+// PF-4b review round 2 — the depth rescue thread recycles its staged batch
+// ---------------------------------------------------------------------------
+
+/// The `tv-depth-rescue` thread must hand every spent staged batch back to
+/// the drain's spare lane (`rescue_sink.recycle(batch)`), inside its receive
+/// loop and after the rescue itself.
+///
+/// Why a source scan: the writer and rescue threads share ONE spare lane, so
+/// with this call deleted the drain still finds spares (the writer's) on most
+/// hand-offs and no counter moves; a stall then reserves a fresh 6 MiB batch
+/// per rescue. The storage DHAT gate `dhat_depth_book_hand_off` drives the
+/// sink's `recycle` itself, so it cannot see whether THIS loop calls it.
+/// Paired behaviour test: `dhat_depth_book_hand_off_allocates_nothing_with_batches_recycled`
+/// (the recycled allocation is the one the drain takes next).
+///
+/// Order: the tick twin (`tv-tick-rescue`) reports `finished()` BEFORE it
+/// recycles, so a shutdown deadline never counts a rescued batch as
+/// abandoned (PF-4 review round 2). The depth loop has no `finished()`
+/// today; if one is added, the recycle must stay after it.
+#[test]
+fn depth_rescue_thread_recycles_each_batch_after_rescuing_it() {
+    const SPAWN: &str = ".name(\"tv-depth-rescue\".to_owned())";
+    const EXIT: &str = "info!(\"depth rescue thread exiting";
+    let start = STACK_SRC
+        .find(SPAWN)
+        .expect("the tv-depth-rescue thread must exist");
+    let rest = &STACK_SRC[start..];
+    let end = rest
+        .find(EXIT)
+        .expect("the tv-depth-rescue thread must log its exit after its loop");
+    // Comments stripped, so a commented-out call cannot satisfy the scan.
+    let body: String = rest[..end]
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let looped = body
+        // 2026-11-07: the loop reads through `OffloadQueue` so an abandoned
+        // rescue thread is counted in rows (the tick path's J2).
+        .find("while let Some(batch) = rescue_queue.next() {")
+        .expect("the rescue thread must drain its queue in a receive loop");
+    let rescue = body
+        .find("rescue_sink.rescue(&batch);")
+        .expect("the rescue thread must rescue each batch");
+    let recycle = body.find("rescue_sink.recycle(batch);").expect(
+        "the tv-depth-rescue loop must call `rescue_sink.recycle(batch)`: without it a \
+         stall reserves a fresh staged batch on the drain for every rescue",
+    );
+    assert!(
+        looped < rescue && rescue < recycle,
+        "inside the receive loop, `rescue_sink.recycle(batch)` must follow \
+         `rescue_sink.rescue(&batch)` (the batch is spent only once rescued)"
+    );
+    if let Some(finished) = body.find(".finished()") {
+        assert!(
+            finished < recycle,
+            "the recycle must come after `finished()`, the order PF-4 settled on for the \
+             tick rescue thread"
+        );
+    }
+    assert_eq!(
+        body.matches("rescue_sink.recycle(").count(),
+        1,
+        "exactly one recycle per received batch"
+    );
+    // Only the receive loop's closing brace lies between the recycle and the
+    // exit log: the recycle is the loop's last statement, not after the loop.
+    let after = &body[recycle + "rescue_sink.recycle(batch);".len()..];
+    assert_eq!(
+        after.trim(),
+        "}",
+        "`rescue_sink.recycle(batch)` must be the last statement INSIDE the receive loop"
+    );
+}
+
+/// 2026-11-07 review: each rescue thread's shared queue handle is stored on
+/// the ingest only AFTER `spawn(...)?` returns. Stored before it, a failed
+/// spawn kept the receiver alive, so the producer's rescue `try_send` queued
+/// rows into a queue no thread reads and the shutdown never counted them
+/// (it returns early when there is no thread handle). Stored after it, the
+/// receiver closes with the failed closure and the producer falls back inline.
+#[test]
+fn rescue_queue_handle_is_stored_only_after_the_rescue_thread_exists() {
+    for name in ["tv-tick-rescue", "tv-depth-rescue"] {
+        let spawn = format!(".name(\"{name}\".to_owned())");
+        let at = STACK_SRC
+            .find(&spawn)
+            .unwrap_or_else(|| panic!("the {name} thread must exist"));
+        let before = &STACK_SRC[..at];
+        let open = before
+            .rfind("fn spawn_offload_writer")
+            .unwrap_or_else(|| panic!("{name} must be spawned inside spawn_offload_writer"));
+        assert!(
+            !before[open..].contains("self.rescue_queue = Some("),
+            "{name}: self.rescue_queue must not be set before the thread is spawned"
+        );
+        let after = &STACK_SRC[at..];
+        let spawned = after
+            .find("})?;")
+            .unwrap_or_else(|| panic!("{name}: the spawn must propagate its error with `?`"));
+        let stored = after
+            .find("self.rescue_queue = Some(")
+            .unwrap_or_else(|| panic!("{name}: the rescue queue handle must be stored"));
+        assert!(
+            stored > spawned,
+            "{name}: self.rescue_queue must be set after `spawn(...)?` succeeds"
+        );
+        assert!(
+            stored < after.find("Ok(())").unwrap_or(usize::MAX),
+            "{name}: the handle must be stored before spawn_offload_writer returns"
+        );
+    }
 }

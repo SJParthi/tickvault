@@ -72,6 +72,28 @@ use uuid::Uuid;
 /// Raising it is a deliberate, reviewable edit.
 pub const MAX_TRACKED_CORRELATIONS: usize = 50_000;
 
+/// Correlation ids generated AHEAD of use, on the cold path.
+///
+/// # Why (2026-10-30, the order-path sub-microsecond work)
+///
+/// Measured on the x86 dev container with the production metrics recorder
+/// installed: `Uuid::new_v4()` is one OS random-number call, about 290 ns of
+/// the 333 ns [`CorrelationTracker::generate_id`] took, and the paper
+/// placement as a whole was 1.18 µs at p50 and 5.5 µs at p99. The id is
+/// random either way; WHEN it is drawn does not change what it is. So
+/// [`CorrelationTracker::new`] and [`CorrelationTracker::clear`] (boot and the
+/// 16:00 IST daily reset, both cold) draw this many ids into a pool, and
+/// [`CorrelationTracker::next_id`] hands one out with no OS call.
+///
+/// Each pooled id is used once (popped) and is the same 30-character
+/// lowercase-hex UUID v4 prefix `generate_id` returns. A pool that runs dry
+/// (more than this many orders in one day) falls back to `generate_id`, so
+/// the worst case is exactly today's cost, never a refusal.
+///
+/// Space: 256 × 30 B = 7.5 KiB per tracker, fixed. Refill time: up to 256 OS
+/// calls (about 75 µs measured), at boot and at the daily reset only.
+pub const CORRELATION_ID_POOL_SIZE: usize = 256;
+
 /// Outcome of [`CorrelationTracker::track`].
 ///
 /// Deliberately NOT `#[must_use]`: existing call sites in the OMS engine
@@ -143,7 +165,9 @@ impl CorrelationKey {
 /// refuse-never-evict rationale.
 pub struct CorrelationTracker {
     /// Maps correlation_id (our UUID, inline) → order_id (Dhan's ID).
-    index: HashMap<CorrelationKey, String>,
+    index: HashMap<CorrelationKey, String, ahash::RandomState>,
+    /// Ids drawn ahead of use; see [`CORRELATION_ID_POOL_SIZE`].
+    id_pool: Vec<[u8; DHAN_CORRELATION_ID_MAX_LENGTH]>,
 }
 
 impl Default for CorrelationTracker {
@@ -155,9 +179,29 @@ impl Default for CorrelationTracker {
 impl CorrelationTracker {
     /// Creates a new empty tracker.
     pub fn new() -> Self {
-        Self {
-            index: HashMap::with_capacity(256),
+        let mut tracker = Self {
+            index: HashMap::with_capacity_and_hasher(256, ahash::RandomState::new()),
+            id_pool: Vec::with_capacity(CORRELATION_ID_POOL_SIZE),
+        };
+        tracker.refill_id_pool();
+        tracker.prefault_index();
+        tracker
+    }
+
+    /// Writes every page of the index's hash table once (cold, at
+    /// construction), so a placement's `track` never takes a first-touch page
+    /// fault; the same reason as the order book's prefault in `engine.rs`.
+    /// The index is empty again afterwards, with the same capacity.
+    // O(1) EXEMPT: bounded at CORRELATION_ID_POOL_SIZE inserts, cold path (construction only)
+    fn prefault_index(&mut self) {
+        let capacity = self.index.capacity().min(CORRELATION_ID_POOL_SIZE);
+        for index in 0..capacity {
+            let mut bytes = [0u8; DHAN_CORRELATION_ID_MAX_LENGTH];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            self.index
+                .insert(CorrelationKey { len: 8, bytes }, String::new());
         }
+        self.index.clear();
     }
 
     /// Generates a new correlation ID from UUID v4, truncated to 30 chars.
@@ -168,9 +212,38 @@ impl CorrelationTracker {
     /// # Returns
     /// A 30-character hex string (120 bits of entropy).
     pub fn generate_id(&self) -> String {
-        let uuid = Uuid::new_v4();
-        let hex = uuid.as_simple().to_string(); // 32 hex chars, no hyphens
-        hex[..DHAN_CORRELATION_ID_MAX_LENGTH].to_string()
+        correlation_id_string(&correlation_id_bytes(Uuid::new_v4()))
+    }
+
+    /// Returns a fresh correlation id from the pool drawn ahead of use, or
+    /// draws one now ([`Self::generate_id`]) when the pool is empty.
+    ///
+    /// Same value class as `generate_id`: a 30-character lowercase-hex prefix
+    /// of a fresh UUID v4. The engine's placement paths call this.
+    ///
+    /// # Performance
+    /// O(1): one `Vec::pop` and one 30-byte `String` allocation. No OS call
+    /// while the pool holds an id (see [`CORRELATION_ID_POOL_SIZE`]).
+    pub fn next_id(&mut self) -> String {
+        match self.id_pool.pop() {
+            Some(bytes) => correlation_id_string(&bytes),
+            None => self.generate_id(),
+        }
+    }
+
+    /// Ids left in the pool (tests only).
+    #[cfg(test)]
+    fn pooled_ids(&self) -> usize {
+        self.id_pool.len()
+    }
+
+    /// Tops the pool up to [`CORRELATION_ID_POOL_SIZE`]. Cold path only:
+    /// construction and the daily reset.
+    // O(1) EXEMPT: bounded refill of at most CORRELATION_ID_POOL_SIZE ids, cold path (boot and daily reset)
+    fn refill_id_pool(&mut self) {
+        while self.id_pool.len() < CORRELATION_ID_POOL_SIZE {
+            self.id_pool.push(correlation_id_bytes(Uuid::new_v4()));
+        }
     }
 
     /// Records a mapping from correlation ID to order ID.
@@ -187,7 +260,18 @@ impl CorrelationTracker {
     /// O(1) average: one hash + one bucket probe. The `String` argument is
     /// consumed and its allocation released — the stored key is inline.
     pub fn track(&mut self, correlation_id: String, order_id: String) -> TrackOutcome {
-        let Some(key) = CorrelationKey::new(&correlation_id) else {
+        self.track_ref(&correlation_id, order_id)
+    }
+
+    /// [`Self::track`] for a caller that keeps its correlation id: the key is
+    /// copied inline from the borrowed `&str`, so the caller need not clone
+    /// a `String` only for this call to drop it. Identical outcomes, counter,
+    /// and log lines.
+    ///
+    /// # Performance
+    /// O(1) average, as `track`; one fewer allocation for the caller.
+    pub fn track_ref(&mut self, correlation_id: &str, order_id: String) -> TrackOutcome {
+        let Some(key) = CorrelationKey::new(correlation_id) else {
             metrics::counter!("tv_oms_correlations_refused_total", "reason" => "id_too_long")
                 .increment(1);
             error!(
@@ -257,7 +341,26 @@ impl CorrelationTracker {
     /// Clears all tracked correlations (daily reset).
     pub fn clear(&mut self) {
         self.index.clear();
+        // The daily reset is cold, so the pool is topped up here and the
+        // next day's first placements do not wait on the OS.
+        self.refill_id_pool();
     }
+}
+
+/// The 30-byte correlation id for one UUID: the first
+/// [`DHAN_CORRELATION_ID_MAX_LENGTH`] characters of its hyphen-less lowercase
+/// hex form. Encoded on the stack (no allocation).
+fn correlation_id_bytes(uuid: Uuid) -> [u8; DHAN_CORRELATION_ID_MAX_LENGTH] {
+    let mut buffer = Uuid::encode_buffer();
+    let hex = uuid.as_simple().encode_lower(&mut buffer);
+    let mut bytes = [0u8; DHAN_CORRELATION_ID_MAX_LENGTH];
+    bytes.copy_from_slice(&hex.as_bytes()[..DHAN_CORRELATION_ID_MAX_LENGTH]);
+    bytes
+}
+
+/// One allocation: the id bytes are ASCII hex, so each byte is one `char`.
+fn correlation_id_string(bytes: &[u8; DHAN_CORRELATION_ID_MAX_LENGTH]) -> String {
+    bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -566,5 +669,111 @@ mod tests {
         assert_eq!(tracker.get_order_id("c1"), Some(&"o1".to_owned()));
         assert_eq!(tracker.get_order_id("c2"), Some(&"o2".to_owned()));
         assert_eq!(tracker.get_order_id("c3"), Some(&"o3".to_owned()));
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-10-30 — the id pool and the one-allocation encoder.
+    // -----------------------------------------------------------------
+
+    /// The pre-2026-10-30 encoder, kept verbatim as the oracle.
+    fn legacy_correlation_id(uuid: Uuid) -> String {
+        let hex = uuid.as_simple().to_string();
+        hex[..DHAN_CORRELATION_ID_MAX_LENGTH].to_string()
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_encoder_matches_the_legacy_two_allocation_form(
+            raw in proptest::prelude::any::<u128>()
+        ) {
+            let uuid = Uuid::from_u128(raw);
+            proptest::prop_assert_eq!(
+                correlation_id_string(&correlation_id_bytes(uuid)),
+                legacy_correlation_id(uuid)
+            );
+        }
+    }
+
+    #[test]
+    fn test_encoder_matches_the_legacy_form_at_the_extremes() {
+        for raw in [0_u128, u128::MAX, 1, 1 << 127] {
+            let uuid = Uuid::from_u128(raw);
+            assert_eq!(
+                correlation_id_string(&correlation_id_bytes(uuid)),
+                legacy_correlation_id(uuid)
+            );
+        }
+    }
+
+    #[test]
+    fn test_new_tracker_starts_with_a_full_pool() {
+        let tracker = CorrelationTracker::new();
+        assert_eq!(tracker.pooled_ids(), CORRELATION_ID_POOL_SIZE);
+        assert!(
+            tracker.is_empty(),
+            "a pooled id is not a tracked correlation"
+        );
+    }
+
+    #[test]
+    fn test_next_id_is_a_v4_prefix_of_the_dhan_length_and_never_repeats() {
+        let mut tracker = CorrelationTracker::new();
+        let mut seen = std::collections::HashSet::new();
+        // Past the pool, so the on-demand fallback is covered too.
+        for _ in 0..(CORRELATION_ID_POOL_SIZE + 64) {
+            let id = tracker.next_id();
+            assert_eq!(id.len(), DHAN_CORRELATION_ID_MAX_LENGTH);
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "not lowercase hex: {id}"
+            );
+            // Hex character 12 is the UUID version nibble.
+            assert_eq!(id.as_bytes()[12], b'4', "not a UUID v4 prefix: {id}");
+            assert!(seen.insert(id), "an id repeated");
+        }
+        assert_eq!(
+            tracker.pooled_ids(),
+            0,
+            "the pool drained, then the fallback served"
+        );
+    }
+
+    #[test]
+    fn test_clear_refills_the_pool_for_the_next_day() {
+        let mut tracker = CorrelationTracker::new();
+        for _ in 0..10 {
+            let _ = tracker.next_id();
+        }
+        assert_eq!(tracker.pooled_ids(), CORRELATION_ID_POOL_SIZE - 10);
+        tracker.clear();
+        assert_eq!(tracker.pooled_ids(), CORRELATION_ID_POOL_SIZE);
+    }
+
+    /// `track_ref` and `track` must agree on every outcome, for the same
+    /// sequence of calls on two trackers.
+    #[test]
+    fn test_track_ref_matches_track_outcomes_and_keeps_the_callers_id() {
+        let mut by_value = CorrelationTracker::new();
+        let mut by_ref = CorrelationTracker::new();
+        let too_long = "x".repeat(DHAN_CORRELATION_ID_MAX_LENGTH + 1);
+        let calls: [(&str, &str); 4] = [
+            ("corr-a", "order-1"),
+            ("corr-a", "order-2"),
+            ("corr-b", "order-3"),
+            (too_long.as_str(), "order-4"),
+        ];
+        for (corr, order) in calls {
+            let kept = corr.to_owned();
+            let outcome_ref = by_ref.track_ref(&kept, order.to_owned());
+            let outcome_value = by_value.track(corr.to_owned(), order.to_owned());
+            assert_eq!(outcome_ref, outcome_value, "outcomes differ for {corr}");
+            assert_eq!(kept, corr, "the caller keeps its id unchanged");
+        }
+        assert_eq!(by_ref.len(), by_value.len());
+        for corr in ["corr-a", "corr-b"] {
+            assert_eq!(by_ref.get_order_id(corr), by_value.get_order_id(corr));
+        }
+        assert_eq!(by_ref.get_order_id("corr-a"), Some(&"order-2".to_owned()));
     }
 }

@@ -46,11 +46,14 @@ scan_pattern() {
     # NOT hot: core/src/auth/, core/src/instrument/, core/src/notification/,
     # core/src/historical/ (cold path); trading/src/oms/ (order management is
     # network-I/O-bound, not per-tick latency-critical — documented exclusion).
-    # Dead-file alternatives removed truthfully: groww_bridge.rs (deleted
-    # 2026-07-15 with the Groww live feed) + tick_persistence.rs /
-    # tick_row_builder.rs (deleted 2026-07-17, stage-2 dead-WS sweep PR #1631).
+    # 2026-09-05: tick_persistence.rs and depth_persistence.rs are BACK in the
+    # list. They returned on 2026-08-26 with the Dhan live-WS revival and the
+    # full-depth capture authorization; the note that used to sit here still
+    # called them deleted. groww_bridge.rs stays out (deleted 2026-07-15 with
+    # the Groww live feed). Kept in lockstep with banned-pattern-scanner.sh,
+    # enforced by hot-path-scanner-selftest.sh.
     if [ "$is_hot_path" = "true" ]; then
-      if ! echo "$file" | grep -qE '^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$'; then
+      if ! echo "$file" | grep -qE '^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/depth_persistence\.rs$'; then
         continue
       fi
       # OMS is order management — I/O-bound, not latency-critical

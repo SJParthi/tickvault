@@ -4,6 +4,14 @@
 //! a separate tokio task, consuming ticks from a broadcast channel (cold path,
 //! does NOT pollute the hot tick processor).
 //!
+//! # DORMANT (2026-10-12, deep audit DYN-4)
+//! `spawn_trading_pipeline` has NO production caller: every call is in a
+//! test (pinned by `order_side_wiring_guard.rs`, recorded in
+//! `order_observability.rs`). So nothing in a running process consumes ticks
+//! here, and `StrategyHotReloader` is reached only from tests: no strategy is
+//! evaluated or reloaded live today. The text below describes the pipeline as
+//! it will run once it is wired again.
+//!
 //! # Safety: Paper Trading Only
 //! The OMS operates in `dry_run = true` mode by default. No real HTTP calls
 //! are ever made to Dhan. All orders are simulated with PAPER-xxx IDs.
@@ -82,6 +90,7 @@ use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_core::auth::token_manager::TokenHandle;
 
 use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
+use tickvault_trading::oms::types::resolve_order_segment_code;
 use tickvault_trading::oms::{
     OrderApiClient, OrderManagementSystem, OrderRateLimiter, PlaceOrderRequest,
 };
@@ -484,8 +493,18 @@ async fn run_trading_pipeline(
                                     let risk_result = risk_engine.check_order(tick.security_id, 1);
                                     match risk_result {
                                         RiskCheck::Approved => {
+                                            // I-P1-11 (audit M7): the order is placed in the
+                                            // tick's own segment; an unknown code is refused
+                                            // (counted + coded inside the resolver), never guessed.
+                                            let Some(order_segment) = resolve_order_segment_code(
+                                                tick.exchange_segment_code,
+                                                tick.security_id,
+                                            ) else {
+                                                continue;
+                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
+                                                exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Buy,
                                                 order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
@@ -560,8 +579,18 @@ async fn run_trading_pipeline(
                                     let risk_result = risk_engine.check_order(tick.security_id, -1);
                                     match risk_result {
                                         RiskCheck::Approved => {
+                                            // I-P1-11 (audit M7): the order is placed in the
+                                            // tick's own segment; an unknown code is refused
+                                            // (counted + coded inside the resolver), never guessed.
+                                            let Some(order_segment) = resolve_order_segment_code(
+                                                tick.exchange_segment_code,
+                                                tick.security_id,
+                                            ) else {
+                                                continue;
+                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
+                                                exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Sell,
                                                 order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
@@ -672,6 +701,7 @@ async fn run_trading_pipeline(
                         m_pipeline_lagged.increment(skipped);
                         if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::PipelineLag01TicksSkipped.code_str(),
                                 skipped,
                                 threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
                                 "trading pipeline SEVERE lag — >1k ticks skipped \
@@ -1905,6 +1935,7 @@ threshold = 25.0
         };
         let request = PlaceOrderRequest {
             security_id: tick.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -1931,6 +1962,7 @@ threshold = 25.0
         };
         let request = PlaceOrderRequest {
             security_id: tick.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -1973,6 +2005,7 @@ threshold = 25.0
         // Place a market order (simulating EnterLong)
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2035,6 +2068,7 @@ threshold = 25.0
         for i in 0..5_u32 {
             let request = PlaceOrderRequest {
                 security_id: 50000 + u64::from(i),
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: if i % 2 == 0 {
                     TransactionType::Buy
                 } else {
@@ -3407,6 +3441,7 @@ threshold = 70.0
         // Place a paper order first
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -3550,6 +3585,7 @@ threshold = 30.0
         for sec_id in [100_u64, 200, 300] {
             let request = PlaceOrderRequest {
                 security_id: sec_id,
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -4052,7 +4088,8 @@ threshold = 65.0
         let task_handle = spawn_trading_pipeline(config, tick_rx, order_rx, None);
 
         // Send 60 ticks with steadily decreasing prices to push RSI down.
-        // Use security_id = 5 (must be < MAX_INDICATOR_INSTRUMENTS = 200).
+        // Use security_id = 5 — must be < MAX_INDICATOR_INSTRUMENTS (read the
+        // constant; a literal here goes stale the moment the cap moves).
         for i in 0..60_u32 {
             let mut tick = ParsedTick::default();
             tick.security_id = 5;

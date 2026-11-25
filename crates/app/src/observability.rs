@@ -213,7 +213,7 @@ const TICK_NS_HISTOGRAM_BUCKETS: &[f64] = &[
 /// Grafana `histogram_quantile` queries show "No data".
 ///
 /// Range: 1 ms → 60 s, roughly log-spaced.
-const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
+pub(crate) const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
     1.0,      // 1 ms
     5.0,      // 5 ms
     10.0,     // 10 ms
@@ -255,6 +255,127 @@ const SPOT1M_SERVING_LAG_MS_BUCKETS: &[f64] = &[
     21_600_000.0, // 6 h
 ];
 
+/// How often the Prometheus exporter's upkeep (it drains every histogram)
+/// runs: the library's default, unchanged by plan item DT0.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const METRICS_UPKEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The library's own upkeep interval once DT0 runs the timed one: a year, so
+/// its loop is effectively idle (a second upkeep once a year is harmless).
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+const LIBRARY_UPKEEP_PUSHED_OUT: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Runs the exporter's upkeep once and records how long it took as the
+/// `metrics_upkeep` hot-path stage (plan item DT0, 2026-10-29). The upkeep
+/// runs on the MAIN tokio runtime, the one the frame drain shares, so its
+/// duration is time a main-runtime worker was not available to the drain.
+pub fn time_one_metrics_upkeep(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    handle.run_upkeep();
+    let took = started.elapsed();
+    tickvault_storage::hot_path_telemetry::record_stage(
+        tickvault_storage::hot_path_telemetry::Stage::MetricsUpkeep,
+        took,
+    );
+    took
+}
+
+/// The library's upkeep loop, timed: sleep [`METRICS_UPKEEP_INTERVAL`], then
+/// one [`time_one_metrics_upkeep`], forever.
+async fn run_timed_metrics_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    loop {
+        tokio::time::sleep(METRICS_UPKEEP_INTERVAL).await;
+        let _took = time_one_metrics_upkeep(&handle);
+    }
+}
+
+/// How often the ticks-lost tally renders this process's own `/metrics`.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for.
+pub const TICKS_LOST_TALLY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One tally: the sum of every `tv_ticks_lost_total` series in this
+/// process's own `/metrics`, published for the per-minute capacity row
+/// (2026-10-30). Returns the sum, or `None` when no series exists yet.
+pub fn tally_ticks_lost_once(
+    handle: &metrics_exporter_prometheus::PrometheusHandle,
+) -> Option<u64> {
+    let text = handle.render();
+    let total = tickvault_storage::host_capacity_minute::prometheus_counter_sum(
+        &text,
+        "tv_ticks_lost_total",
+    );
+    if let Some(total) = total {
+        tickvault_storage::host_capacity_minute::publish_ticks_lost_total(total);
+    }
+    total
+}
+
+/// Starts the `tv-metrics-tally` thread: every [`TICKS_LOST_TALLY_INTERVAL`]
+/// refresh socket receive buffers and run [`tally_ticks_lost_once`]. Its own
+/// OS thread, never the main runtime
+/// the frame drain shares; cold (one render every 30 s, the same work the
+/// CloudWatch agent's scrape already causes once a minute).
+fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    let spawned = std::thread::Builder::new()
+        .name("tv-metrics-tally".to_owned())
+        .spawn(move || {
+            loop {
+                tickvault_core::websocket::receive_buffer::refresh();
+                let _total = tally_ticks_lost_once(&handle);
+                // APPROVED-BLOCKING: this is the tally's own dedicated OS thread; sleeping here blocks nothing else.
+                std::thread::sleep(TICKS_LOST_TALLY_INTERVAL);
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(
+            error = %err,
+            "the metrics tally thread did not start: host_capacity_minute.ticks_lost stays NULL and socket receive buffers have only dial-time readings"
+        );
+    }
+}
+
+/// `PrometheusBuilder::install`, with the upkeep loop replaced by the timed
+/// one (DT0). Same two shapes as the library: inside a tokio runtime the
+/// exporter and the upkeep are spawned on it (production: the main
+/// runtime, as before); outside one they run on a dedicated thread with its
+/// own current-thread runtime.
+fn install_with_timed_upkeep(builder: PrometheusBuilder) -> Result<()> {
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        let (recorder, exporter) = {
+            let _entered = rt.enter();
+            builder.build()?
+        };
+        let handle = recorder.handle();
+        rt.spawn(exporter);
+        spawn_ticks_lost_tally(handle.clone());
+        rt.spawn(run_timed_metrics_upkeep(handle));
+        metrics::set_global_recorder(recorder)?;
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (recorder, exporter) = {
+            let _entered = runtime.enter();
+            builder.build()?
+        };
+        let handle = recorder.handle();
+        spawn_ticks_lost_tally(handle.clone());
+        std::thread::Builder::new()
+            .name("metrics-exporter-prometheus-http".to_owned())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::spawn(run_timed_metrics_upkeep(handle));
+                    exporter.await
+                })
+            })?;
+        metrics::set_global_recorder(recorder)?;
+    }
+    Ok(())
+}
+
 /// Initializes the Prometheus metrics exporter.
 ///
 /// Starts an HTTP server on `0.0.0.0:{metrics_port}` that serves `/metrics`
@@ -273,7 +394,7 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
     // Previously hard-coded to `0.0.0.0` which exposed
     // `tv_subsystem_memory_estimated_bytes` (and every other gauge) to
     // any peer in the VPC.
-    PrometheusBuilder::new()
+    let builder = PrometheusBuilder::new()
         .with_http_listener(std::net::SocketAddr::new(
             config.metrics_bind_addr,
             config.metrics_port,
@@ -299,8 +420,11 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
             SPOT1M_SERVING_LAG_MS_BUCKETS,
         )
         .context("failed to set histogram buckets for tv_spot1m_serving_lag_ms")?
-        .install()
-        .context("failed to install Prometheus metrics exporter")?;
+        // DT0 (2026-10-29): the library's own upkeep loop is pushed out to
+        // once a year; `install_with_timed_upkeep` runs the same upkeep
+        // every `METRICS_UPKEEP_INTERVAL` (the library default) and times it.
+        .upkeep_timeout(LIBRARY_UPKEEP_PUSHED_OUT);
+    install_with_timed_upkeep(builder).context("failed to install Prometheus metrics exporter")?;
 
     info!(
         bind_addr = %config.metrics_bind_addr,
@@ -429,6 +553,233 @@ pub fn init_app_log_appender(
     );
 
     Ok((non_blocking, guard))
+}
+
+/// Buffered-line bound for the sinks moved off the calling thread on
+/// 2026-09-26 (errors.log, stdout). Same figure as `tracing_appender`'s own
+/// default, stated here so the bound is a named, tested constant rather
+/// than a library default that could move under a version bump.
+pub const LOG_SINK_BUFFERED_LINES: usize = 128_000;
+
+/// The counter every lossy log sink publishes its dropped-line total on,
+/// labelled `sink`.
+pub const LOG_LINES_DROPPED_METRIC: &str = "tv_log_lines_dropped_total";
+
+/// How often [`publish_log_drop_counters`] runs.
+pub const LOG_DROP_PUBLISH_INTERVAL_SECS: u64 = 10;
+
+/// Wraps `writer` in a bounded, LOSSY, non-blocking appender.
+///
+/// **Why (2026-09-26 audit fix, PR1):** until this date errors.log was
+/// `.with_writer(std::sync::Mutex::new(file))` and stdout used the default
+/// `io::stdout` writer, so every WARN+ line was a blocking `write(2)` under a
+/// lock ON THE CALLING THREAD — including the frame-drain task that reads the
+/// sockets. A slow disk or a burst of warnings stalled tick draining. Now the
+/// caller only pushes onto a bounded channel; a dedicated thread writes.
+///
+/// Lossy is deliberate: when the channel is full a line is DROPPED and
+/// counted on [`LOG_LINES_DROPPED_METRIC`] rather than blocking the caller.
+/// A log line is never worth a tick. The panic path does not depend on this
+/// sink — see [`append_panic_line_sync`].
+///
+/// The caller MUST keep the returned `WorkerGuard` alive for the process.
+pub fn init_lossy_non_blocking<W>(
+    writer: W,
+    sink: &'static str,
+) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard)
+where
+    W: std::io::Write + Send + 'static,
+{
+    let (non_blocking, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(LOG_SINK_BUFFERED_LINES)
+        .thread_name("tv-log-sink")
+        .finish(writer);
+    register_log_drop_counter(sink, &non_blocking);
+    (non_blocking, guard)
+}
+
+/// Every registered lossy sink, published by [`publish_log_drop_counters`].
+/// Boot-time registration only (≤ 8 sinks), read on a slow timer.
+/// Each entry keeps the total last published so a NEW drop can be logged.
+static LOG_DROP_COUNTERS: std::sync::Mutex<
+    Vec<(
+        &'static str,
+        tracing_appender::non_blocking::ErrorCounter,
+        u64,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Registers a non-blocking sink's dropped-line counter under `sink`. Also
+/// used for the pre-existing app.log / errors.jsonl / category appenders,
+/// which were already lossy but whose drops nothing reported.
+pub fn register_log_drop_counter(
+    sink: &'static str,
+    writer: &tracing_appender::non_blocking::NonBlocking,
+) {
+    if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
+        sinks.push((sink, writer.error_counter(), 0));
+    }
+}
+
+/// Publishes each registered sink's cumulative dropped-line count. Called
+/// from a slow timer task in `main.rs`; O(sinks), sinks ≤ 8, never on the
+/// tick path.
+pub fn publish_log_drop_counters() {
+    if let Ok(mut sinks) = LOG_DROP_COUNTERS.lock() {
+        for (sink, counter, last) in sinks.iter_mut() {
+            let dropped = u64::try_from(counter.dropped_lines()).unwrap_or(u64::MAX);
+            metrics::counter!("tv_log_lines_dropped_total", "sink" => *sink).absolute(dropped);
+            if dropped > *last {
+                // At most one line per sink per publish interval. It goes
+                // through the same lossy sinks, which is fine: a drop burst
+                // ends, and the next interval reports the cumulative total.
+                tracing::warn!(
+                    sink = *sink,
+                    newly_dropped = dropped - *last,
+                    total_dropped = dropped,
+                    "log lines were DROPPED because a log sink's queue was full — \
+                     the tick path was not blocked; the lines are gone"
+                );
+                *last = dropped;
+            }
+        }
+    }
+}
+
+/// Appends one JSON line to `path` SYNCHRONOUSLY. Used only by the panic
+/// hook: under `panic = "abort"` the process dies before any non-blocking
+/// sink's worker thread can flush, so the one line that explains a crash
+/// must not ride a queue. Best-effort — a failure here is ignored because
+/// the default hook still prints the panic to stderr (journald).
+///
+/// The line is written with ONE `write_all` of the whole serialized line,
+/// never `writeln!`: `writeln!` on an unbuffered `File` issues one `write(2)`
+/// per formatted piece, and the errors.log worker thread, still alive while
+/// the hook runs, could interleave its own line between them (audit OBS-1,
+/// 2026-10-11).
+pub fn append_panic_line_sync(path: &std::path::Path, location: &str, payload: &str) {
+    let line = serde_json::json!({
+        "level": "ERROR",
+        "target": "tickvault_app::panic",
+        "fields": {
+            "message": "PANIC: tickvault crashed",
+            // Audit M3 (2026-10-06): the same code the tracing line carries,
+            // so a crash is findable by code in this file too.
+            "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+            "panic_location": location,
+            "panic_payload": payload,
+        },
+    });
+    append_whole_line_best_effort(path, &line);
+}
+
+/// The hourly `errors.jsonl` file the rolling appender writes at `now`:
+/// `{dir}/errors.jsonl.{YYYY-MM-DD-HH}`, the hour in UTC (tracing-appender
+/// names rolling files from `OffsetDateTime::now_utc()`). Pinned against a
+/// real `RollingFileAppender` by
+/// `test_errors_jsonl_hour_path_matches_the_rolling_appender_name`.
+#[must_use]
+pub fn errors_jsonl_hour_path(
+    dir: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PathBuf {
+    dir.join(format!(
+        "{ERRORS_JSONL_PREFIX}.{}",
+        now.format("%Y-%m-%d-%H")
+    ))
+}
+
+/// Appends the PROC-03 panic line SYNCHRONOUSLY to the current hourly
+/// `errors.jsonl` file in `dir` (audit OBS-1, 2026-10-11).
+///
+/// **Why:** the CloudWatch agent ships `errors.jsonl.2*` and `app.2*`, never
+/// `errors.log`. The coded tracing line rides the non-blocking errors.jsonl
+/// worker, which dies with the process under `panic = "abort"`, so until
+/// this date no shipped log row carried a crash's location or message. This
+/// writes the same flattened shape the errors.jsonl layer emits
+/// (`flatten_event(true)`: `code`, `message` at the top level), with a UTC
+/// RFC 3339 `timestamp`. That matches the rest of the file: the errors.jsonl
+/// layer sets no timer, so tracing-subscriber's default writes UTC with a
+/// `Z` suffix, which is what the agent's `"timezone": "UTC"` expects (pinned
+/// by `test_errors_jsonl_layer_keeps_the_default_utc_timer`). The CloudWatch
+/// agent is its own process and ships the line after the abort.
+///
+/// No alarm pages on it. The generic flat-schema error filter
+/// (`log-schema-flat-errors`) counts it, which can only hold
+/// `errcode-stream-silent` off, never trip it. A single panic is NOT paged:
+/// systemd restarts the unit within seconds (`Restart=always`,
+/// `RestartSec=3`), and `market-hours-liveness-missing` needs five missing
+/// 60 s periods inside 09:20-15:35 IST. Only a restart loop (past
+/// `StartLimitBurst` the unit stays failed) or an outage of five minutes or
+/// more in that window pages. A PROC-03 page is an open owner decision under
+/// the noise lock (corrected 2026-10-11, review of OBS-1).
+///
+/// Runs only inside the panic hook, once per process death: one directory
+/// create, one open, one `write_all`. Best-effort like
+/// [`append_panic_line_sync`]: a full disk loses it silently, and the default
+/// hook still prints the panic to stderr (journald). Under unwinding (tests,
+/// debug builds) the tracing line can also flush, giving two rows for one
+/// panic; in the release abort build the tracing line is normally lost.
+pub fn append_panic_jsonl_line_sync(dir: &std::path::Path, location: &str, payload: &str) {
+    let now = chrono::Utc::now();
+    let line = serde_json::json!({
+        "timestamp": now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        "level": "ERROR",
+        "target": "tickvault_app::panic",
+        "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+        "message": "PANIC: tickvault crashed",
+        "panic_location": location,
+        "panic_payload": payload,
+    });
+    append_whole_line_best_effort(&errors_jsonl_hour_path(dir, now), &line);
+}
+
+/// Appends the WAL drain outcome of a panic SYNCHRONOUSLY to the current
+/// hourly `errors.jsonl` file in `dir`, as a second PROC-03 line (review of
+/// audit OBS-1, 2026-10-11).
+///
+/// **Why:** the first panic line is written before the WAL drain, so it
+/// cannot say how the drain ended, and the coded tracing line that carries
+/// `wal_drain` dies with the process under `panic = "abort"`. The panic hook
+/// calls this after `drain_registered_for_abort` returns and before the
+/// default hook aborts, so the shipped stream says whether the WAL queue was
+/// emptied. Runs only in abort builds, once per process death: one open and
+/// one `write_all`. Best-effort like [`append_panic_jsonl_line_sync`].
+pub fn append_panic_wal_drain_jsonl_line_sync(dir: &std::path::Path, wal_drain: &str) {
+    let now = chrono::Utc::now();
+    let line = serde_json::json!({
+        "timestamp": now.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
+        "level": "ERROR",
+        "target": "tickvault_app::panic",
+        "code": tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+        "message": "PANIC: WAL drain before abort",
+        "wal_drain": wal_drain,
+    });
+    append_whole_line_best_effort(&errors_jsonl_hour_path(dir, now), &line);
+}
+
+/// Serializes `line`, appends `\n`, and writes it with ONE `write_all` to
+/// `path` opened for append, creating the parent directory first (the panic
+/// hook is installed before logging creates `data/logs/machine`). Every
+/// failure is ignored: these lines are best-effort by design.
+fn append_whole_line_best_effort(path: &std::path::Path, line: &serde_json::Value) {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        let _best_effort: std::io::Result<()> = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut text) = serde_json::to_string(line) else {
+        return;
+    };
+    text.push('\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        // Best-effort: the default hook still prints the panic to stderr.
+        let _best_effort: std::io::Result<()> = file.write_all(text.as_bytes());
+    }
 }
 
 /// 2026-05-02 — generic per-category log appender. Mirrors
@@ -678,6 +1029,307 @@ pub fn cap_errors_log_size(path: &std::path::Path, max_bytes: u64) -> std::io::R
 
 #[cfg(test)]
 mod tests {
+    // ----- 2026-09-26 audit fix PR1: non-blocking sinks -----
+
+    /// A writer that blocks forever on every write. If the appender wrote on
+    /// the calling thread, `write` below would never return.
+    struct BlockingWriter(std::sync::Arc<std::sync::Barrier>);
+    impl std::io::Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.wait();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_init_lossy_non_blocking_errors_log_writer_is_non_blocking() {
+        use std::io::Write as _;
+        // Barrier of 2 that the test never joins: the sink thread parks on
+        // its first write for the whole test.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (mut writer, guard) =
+            init_lossy_non_blocking(BlockingWriter(barrier.clone()), "test_blocking");
+        let started = std::time::Instant::now();
+        // Far more lines than the buffer holds: every one must return
+        // immediately, the overflow dropped rather than waited on.
+        for _ in 0..(LOG_SINK_BUFFERED_LINES + 1_000) {
+            let _ = writer.write(b"x\n");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a lossy non-blocking sink must never block the caller"
+        );
+        assert!(writer.error_counter().dropped_lines() > 0);
+        // Release the parked sink thread so the guard can drop cleanly.
+        barrier.wait();
+        std::mem::forget(guard);
+    }
+
+    #[test]
+    fn log_sink_buffer_bound_is_pinned() {
+        assert_eq!(LOG_SINK_BUFFERED_LINES, 128_000);
+        assert_eq!(LOG_LINES_DROPPED_METRIC, "tv_log_lines_dropped_total");
+        assert_eq!(LOG_DROP_PUBLISH_INTERVAL_SECS, 10);
+    }
+
+    #[test]
+    fn test_register_log_drop_counter_then_publish_log_drop_counters() {
+        let (writer, guard) = init_lossy_non_blocking(std::io::sink(), "test_sink");
+        register_log_drop_counter("test_sink_again", &writer);
+        publish_log_drop_counters();
+        {
+            let sinks = LOG_DROP_COUNTERS.lock().expect("registry lock");
+            let entry = sinks
+                .iter()
+                .find(|(name, _, _)| *name == "test_sink_again")
+                .expect("registered sink is tracked");
+            // Nothing was written, so nothing was dropped and the
+            // last-published total stays at zero.
+            assert_eq!(entry.2, 0);
+            assert_eq!(entry.1.dropped_lines(), 0);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn test_append_panic_line_sync_panic_hook_writes_errors_log_synchronously() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-panic-line-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("errors.log");
+        append_panic_line_sync(&path, "src/x.rs:1:2", "boom \"quoted\"");
+        // Readable immediately after return: no queue, no worker thread.
+        let body = std::fs::read_to_string(&path).expect("read");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim_end()).expect("one valid JSON line");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(line["fields"]["panic_location"], "src/x.rs:1:2");
+        assert_eq!(line["fields"]["panic_payload"], "boom \"quoted\"");
+        assert_eq!(line["fields"]["code"], "PROC-03");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn panic_test_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tv-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ))
+    }
+
+    // Audit OBS-1 (2026-10-11): the panic line reaches the shipped stream.
+    #[test]
+    fn test_append_panic_jsonl_line_sync_writes_flattened_proc03_into_the_hourly_file() {
+        // The directory does NOT exist yet: the hook runs before logging
+        // creates it, so the writer must create it itself.
+        let dir = panic_test_dir("panic-jsonl").join("machine");
+        let before = chrono::Utc::now();
+        append_panic_jsonl_line_sync(&dir, "src/y.rs:3:4", "boom \"quoted\"");
+        let after = chrono::Utc::now();
+        // Allow for an hour boundary between `before` and the write.
+        let body = [
+            errors_jsonl_hour_path(&dir, before),
+            errors_jsonl_hour_path(&dir, after),
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .expect("the panic line is in the current hourly errors.jsonl file");
+        assert_eq!(body.matches('\n').count(), 1, "exactly one whole line");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim_end()).expect("one valid JSON line");
+        // Flattened like the errors.jsonl layer (`flatten_event(true)`).
+        assert_eq!(line["code"], "PROC-03");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(line["message"], "PANIC: tickvault crashed");
+        assert_eq!(line["panic_location"], "src/y.rs:3:4");
+        assert_eq!(line["panic_payload"], "boom \"quoted\"");
+        let parsed = crate::feed_scoreboard_boot::parse_errors_jsonl_line(&body)
+            .expect("the shipped-stream reader parses the panic line");
+        assert_eq!(parsed.code, "PROC-03");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
+    }
+
+    // Review of OBS-1 (2026-10-11): in the abort build the only record of the
+    // WAL drain outcome is this second synchronous line.
+    #[test]
+    fn test_append_panic_wal_drain_jsonl_line_sync_writes_the_drain_outcome() {
+        let dir = panic_test_dir("panic-drain").join("machine");
+        let before = chrono::Utc::now();
+        append_panic_wal_drain_jsonl_line_sync(&dir, "Drained { records: 3 }");
+        let after = chrono::Utc::now();
+        let body = [
+            errors_jsonl_hour_path(&dir, before),
+            errors_jsonl_hour_path(&dir, after),
+        ]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .expect("the drain line is in the current hourly errors.jsonl file");
+        assert_eq!(body.matches('\n').count(), 1, "exactly one whole line");
+        let line: serde_json::Value =
+            serde_json::from_str(body.trim_end()).expect("one valid JSON line");
+        assert_eq!(line["code"], "PROC-03");
+        assert_eq!(line["level"], "ERROR");
+        assert_eq!(line["message"], "PANIC: WAL drain before abort");
+        assert_eq!(line["wal_drain"], "Drained { records: 3 }");
+        let ts = line["timestamp"].as_str().expect("timestamp");
+        assert!(
+            ts.ends_with('Z'),
+            "UTC like the layer's default timer: {ts}"
+        );
+        let parsed = crate::feed_scoreboard_boot::parse_errors_jsonl_line(&body)
+            .expect("the shipped-stream reader parses the drain line");
+        assert_eq!(parsed.code, "PROC-03");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap_or(&dir));
+    }
+
+    // Review of OBS-1 (2026-10-11): the panic lines build their timestamp by
+    // hand in UTC with a `Z`. That only matches the rest of errors.jsonl, and
+    // the agent's `"timezone": "UTC"`, while the layer keeps the default
+    // timer. An IST timer there would split the file into two clocks.
+    #[test]
+    fn test_errors_jsonl_layer_keeps_the_default_utc_timer() {
+        let main = include_str!("main.rs");
+        let at = main
+            .find("init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR)")
+            .expect("main.rs builds the errors.jsonl layer");
+        let block = &main[at..];
+        let end = block
+            .find("Some(Box::new(layer))")
+            .expect("the errors.jsonl layer block ends with Some(Box::new(layer))");
+        assert!(
+            !block[..end].contains(".with_timer("),
+            "the errors.jsonl layer must keep the default UTC timer; the panic \
+             lines in observability.rs write UTC `Z` timestamps to match it"
+        );
+    }
+
+    // Pins `errors_jsonl_hour_path` against tracing-appender's own naming,
+    // so a dependency change that renames the files fails here, not in prod.
+    #[test]
+    fn test_errors_jsonl_hour_path_matches_the_rolling_appender_name() {
+        use std::io::Write as _;
+        let dir = panic_test_dir("jsonl-name");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for _attempt in 0..3 {
+            let before = chrono::Utc::now();
+            let mut appender =
+                RollingFileAppender::new(Rotation::HOURLY, &dir, ERRORS_JSONL_PREFIX);
+            appender.write_all(b"{}\n").expect("write");
+            appender.flush().expect("flush");
+            drop(appender);
+            let after = chrono::Utc::now();
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .expect("read dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let expected = errors_jsonl_hour_path(&dir, after);
+            let expected_name = expected
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if errors_jsonl_hour_path(&dir, before) == expected {
+                assert_eq!(names, vec![expected_name]);
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+            // Crossed an hour boundary mid-attempt: start again.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+        }
+        panic!("three attempts crossed an hour boundary");
+    }
+
+    // Audit OBS-1 (2026-10-11): one `write_all` per line, never `writeln!`.
+    #[test]
+    fn test_append_panic_line_sync_writes_one_whole_line() {
+        let dir = panic_test_dir("panic-whole");
+        // The parent directory does not exist yet: the writer creates it.
+        let path = dir.join("machine").join("errors.log");
+        append_panic_line_sync(&path, "src/a.rs:1:1", "first");
+        append_panic_line_sync(&path, "src/b.rs:2:2", "second");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.ends_with('\n'));
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON line");
+            assert_eq!(v["fields"]["code"], "PROC-03");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Source scan: neither panic writer formats its line in pieces.
+        let src = include_str!("observability.rs");
+        for start in [
+            "pub fn append_panic_line_sync(",
+            "pub fn append_panic_jsonl_line_sync(",
+            "fn append_whole_line_best_effort(",
+        ] {
+            let at = src.find(start).expect("panic writer exists");
+            let body = &src[at..];
+            let end = body.find("\n\x7d\n").expect("function end");
+            assert!(
+                !body[..end].contains(concat!("writeln", "!(")),
+                "{start} must write the whole line with one write_all"
+            );
+        }
+
+        // Review of OBS-1 (2026-10-11): any piecewise formatted write brings
+        // the interleave back, not only `writeln!`. Every public panic writer
+        // goes through the one helper, and the helper writes one buffer.
+        let writers = [
+            "pub fn append_panic_line_sync(",
+            "pub fn append_panic_jsonl_line_sync(",
+            "pub fn append_panic_wal_drain_jsonl_line_sync(",
+        ];
+        let helper = "fn append_whole_line_best_effort(";
+        for start in writers.iter().chain(std::iter::once(&helper)) {
+            let at = src.find(start).expect("panic writer exists");
+            let body = &src[at..];
+            let end = body.find("\n\x7d\n").expect("function end");
+            let body = &body[..end];
+            for banned in [concat!("write", "!("), concat!("write", "_fmt(")] {
+                assert!(
+                    !body.contains(banned),
+                    "{start} must not use {banned}; write the whole line with one write_all"
+                );
+            }
+            if *start == helper {
+                assert!(
+                    body.contains("write_all(text.as_bytes())"),
+                    "the helper must write the serialized line with one write_all"
+                );
+            } else {
+                assert!(
+                    body.contains("append_whole_line_best_effort("),
+                    "{start} must write through append_whole_line_best_effort"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_rs_has_no_mutex_log_writer() {
+        let main = include_str!("main.rs");
+        assert!(
+            !main.contains("with_writer(std::sync::Mutex::new("),
+            "a Mutex-wrapped file writer logs synchronously on the calling thread"
+        );
+        assert!(main.contains("init_lossy_non_blocking(file, \"errors_log\")"));
+        assert!(main.contains("init_lossy_non_blocking(std::io::stdout(), \"stdout\")"));
+        assert!(main.contains("append_panic_line_sync("));
+    }
+
     use super::*;
     use tickvault_common::config::ObservabilityConfig;
 
@@ -1121,6 +1773,42 @@ mod tests {
         // Subsequent calls may fail because the global recorder is already set.
         // Either outcome is acceptable.
         let _ = result;
+    }
+
+    /// 2026-10-30: the tally sums every `tv_ticks_lost_total` series of the
+    /// process's own `/metrics`; with no series yet it publishes nothing.
+    #[test]
+    fn test_tally_ticks_lost_once_sums_every_series() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        assert_eq!(tally_ticks_lost_once(&handle), None);
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("tv_ticks_lost_total", "source" => "a").increment(2);
+            metrics::counter!("tv_ticks_lost_total", "source" => "b").increment(3);
+        });
+        assert_eq!(tally_ticks_lost_once(&handle), Some(5));
+        assert_eq!(
+            tickvault_storage::host_capacity_minute::ticks_lost_total(),
+            Some(5)
+        );
+        assert_eq!(
+            TICKS_LOST_TALLY_INTERVAL,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    /// DT0 (2026-10-29): one timed upkeep records one `metrics_upkeep`
+    /// sample and returns how long it took.
+    #[test]
+    fn test_time_one_metrics_upkeep_records_the_stage() {
+        use tickvault_storage::hot_path_telemetry::{Stage, stage_snapshot};
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let before = stage_snapshot(Stage::MetricsUpkeep).count;
+        let took = time_one_metrics_upkeep(&handle);
+        assert!(took < std::time::Duration::from_secs(5));
+        assert!(stage_snapshot(Stage::MetricsUpkeep).count > before);
+        assert_eq!(METRICS_UPKEEP_INTERVAL, std::time::Duration::from_secs(5));
     }
 
     #[test]

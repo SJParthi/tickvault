@@ -11,6 +11,8 @@
 //! shared `ws_event_audit` table (ILP appends are independent), so every
 //! WebSocket producer reuses this exact pattern with no boot refactor.
 
+use tickvault_core::websocket::audit_drop_latch::DropLatch;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{error, info};
 
 /// Bounded capacity for the WS-event audit channel. WS lifecycle events are
@@ -56,30 +58,592 @@ pub fn spawn_ws_event_audit_consumer(
 pub fn spawn_live_feed_lifecycle_audit(
     questdb_cfg: tickvault_common::config::QuestDbConfig,
 ) -> tokio::sync::mpsc::Sender<tickvault_core::websocket::pool_supervisor::WsLifecycleEvent> {
-    use tickvault_core::websocket::pool_supervisor::WsLifecycleEvent;
+    use tickvault_core::websocket::pool_supervisor::{
+        WsLifecycleEvent, WsSubscriptionAuditEvent, install_subscription_audit,
+    };
 
-    let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg);
+    let rows_tx = spawn_ws_event_audit_consumer(questdb_cfg.clone());
+    let gap_tx = spawn_feed_gap_audit_consumer(questdb_cfg);
     let (tx, mut rx) =
         tokio::sync::mpsc::channel::<WsLifecycleEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    // Audit M8 (2026-10-04): subscription changes (swap, resubscribe, ghost
+    // resend, 805 park) reach the same table through their own bounded
+    // channel. It is installed process-wide because every emit site runs on
+    // a connection task that holds no handle on this forwarder.
+    let (sub_tx, mut sub_rx) =
+        tokio::sync::mpsc::channel::<WsSubscriptionAuditEvent>(WS_EVENT_AUDIT_CHANNEL_CAPACITY);
+    let sub_installed = install_subscription_audit(sub_tx);
+    if !sub_installed {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "ws_subscription_audit_not_installed",
+            "ws_event_audit: a subscription-change channel was already installed, so this \
+             forwarder receives none; swap, resubscribe, ghost-resend and 805-park rows go \
+             to the first forwarder only"
+        );
+    }
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let now_ist_nanos = chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_default()
-                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-            if rows_tx
-                .try_send(lifecycle_row(event, now_ist_nanos))
-                .is_err()
-            {
-                metrics::counter!(
-                    "tv_ws_event_audit_dropped_total",
-                    "reason" => "live_feed_forward"
-                )
-                .increment(1);
+        // One latch per forwarder: a drop EPISODE is a property of this
+        // channel, and the page for it is said once per episode (see
+        // `record_forward_drop`).
+        let latch = DropLatch::new();
+        // 2026-10-02: the open gap per connection slot, so the reconnect row
+        // carries `down_secs` and every gap becomes one `feed_gap_audit` row.
+        // Fixed 32 slots, O(1) per event, allocation-free.
+        let mut gaps = GapTracker::new();
+        let mut stop_poll = tokio::time::interval(GAP_STOP_POLL_INTERVAL);
+        let mut stop_seen = false;
+        // Audit M8: every row this forwarder writes gets a STRICTLY increasing
+        // stamp, so two events on one socket inside one clock tick cannot
+        // share a DEDUP key and collapse into one row.
+        let mut stamp = StrictStamp::new();
+        let mut sub_open = sub_installed;
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    let now_ist_nanos = stamp.next(now_ist_nanos());
+                    let Some(event) = maybe else {
+                        // Every socket is gone: a gap still open is written
+                        // closed at this instant rather than lost.
+                        gaps.close_all(now_ist_nanos, |row| forward_gap_row(&gap_tx, row));
+                        break;
+                    };
+                    let step = gaps.on_event(&event, now_ist_nanos);
+                    if let Some(row) = step.closed {
+                        forward_gap_row(&gap_tx, row);
+                    }
+                    if is_shutdown_close(&event) {
+                        // Shutdown is process-wide: every gap still open
+                        // (a socket parked for the session, or one mid-
+                        // backoff) ends at this instant.
+                        gaps.close_all(now_ist_nanos, |row| forward_gap_row(&gap_tx, row));
+                    }
+                    match rows_tx.try_send(lifecycle_row(event, now_ist_nanos, step)) {
+                        Ok(()) => {
+                            let _ = record_forward_ok(&latch, &event);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "full");
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "closed");
+                        }
+                    }
+                }
+                maybe = sub_rx.recv(), if sub_open => {
+                    let Some(event) = maybe else {
+                        sub_open = false;
+                        continue;
+                    };
+                    let row = subscription_row(event, stamp.next(now_ist_nanos()));
+                    match rows_tx.try_send(row) {
+                        Ok(()) => {
+                            let _ = record_forward_ok(&latch, &event);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "full");
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            let _ = record_forward_drop(&latch, &event, "closed");
+                        }
+                    }
+                }
+                _ = stop_poll.tick(), if !stop_seen => {
+                    // A process stop with every socket already parked sends
+                    // no further lifecycle event, so the stop itself closes
+                    // the open gaps.
+                    if tickvault_core::websocket::pool_supervisor::SOCKET_STOP.is_requested() {
+                        stop_seen = true;
+                        gaps.close_all(now_ist_nanos(), |row| forward_gap_row(&gap_tx, row));
+                    }
+                }
             }
         }
     });
     tx
+}
+
+/// How often the forwarder checks whether the process asked its sockets to
+/// stop (one atomic load per tick).
+const GAP_STOP_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(GAP_STOP_POLL_SECS);
+
+/// [`GAP_STOP_POLL_INTERVAL`] in whole seconds.
+const GAP_STOP_POLL_SECS: u64 = 1;
+
+/// Connection slots tracked for open gaps: one per global connection index,
+/// the same 32 the supervisor's per-slot registers use.
+const GAP_SLOTS: usize = tickvault_core::websocket::pool_supervisor::GHOST_REDIAL_SLOTS;
+
+/// The wall clock as IST epoch nanos (the audit tables' convention).
+fn now_ist_nanos() -> i64 {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_default()
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+}
+
+/// Is this the close a socket makes when the process stops it?
+fn is_shutdown_close(event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent) -> bool {
+    event.kind == tickvault_common::ws_event_types::WsEventKind::Disconnected
+        && event.reason == tickvault_core::websocket::pool_supervisor::ParkReason::Shutdown.as_str()
+}
+
+/// The pool an endpoint's socket belongs to, as the audit tables name it.
+fn ws_type_of(
+    endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType,
+) -> tickvault_common::ws_event_types::WsType {
+    use tickvault_common::ws_event_types::WsType;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    match endpoint {
+        DhanEndpointType::Depth20 => WsType::Depth20,
+        DhanEndpointType::Depth200 => WsType::Depth200,
+        _ => WsType::MainFeed,
+    }
+}
+
+/// One connection slot's open gap: opened by its FIRST disconnect after a
+/// connect, closed by the next connect. `Copy`, so the tracker allocates
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenGap {
+    start_ist_nanos: i64,
+    endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType,
+    reason: &'static str,
+    dhan_code: Option<u16>,
+    instruments_held: u32,
+    attempts: u32,
+}
+
+/// What one lifecycle event contributes to the reconnect record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GapStep {
+    /// The closed gap's length, on the CONNECTED row that closed it; else 0.
+    down_secs: i64,
+    /// Failed dials inside the closed gap; else 0.
+    attempts: i64,
+    /// The `feed_gap_audit` row, when this event closed a gap.
+    closed: Option<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+}
+
+/// The open gap per connection slot, in a fixed array indexed by the global
+/// connection index: O(1) per event, no allocation, no map.
+#[derive(Debug)]
+struct GapTracker {
+    open: [Option<OpenGap>; GAP_SLOTS],
+}
+
+impl GapTracker {
+    const fn new() -> Self {
+        Self {
+            open: [None; GAP_SLOTS],
+        }
+    }
+
+    /// Feeds one lifecycle event. O(1).
+    ///
+    /// - A disconnect opens the slot's gap, unless one is already open: the
+    ///   FIRST close since the last connect is when the socket went dark (a
+    ///   socket parked for 805 and later released emits a second close row
+    ///   for the release, which must not move the start).
+    /// - A failed dial counts an attempt on the open gap.
+    /// - A connect (subscribe acked) closes the gap and returns its row.
+    /// - The close a socket makes at shutdown opens nothing; the caller ends
+    ///   every open gap at that instant through [`GapTracker::close_all`].
+    fn on_event(
+        &mut self,
+        event: &tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
+        now_ist_nanos: i64,
+    ) -> GapStep {
+        use tickvault_common::ws_event_types::WsEventKind;
+        let Some(slot) = self.open.get_mut(usize::from(event.connection_index)) else {
+            return GapStep::default();
+        };
+        match event.kind {
+            WsEventKind::Disconnected | WsEventKind::DisconnectedOffHours => {
+                if slot.is_none() && !is_shutdown_close(event) {
+                    *slot = Some(OpenGap {
+                        start_ist_nanos: now_ist_nanos,
+                        endpoint: event.endpoint,
+                        reason: event.reason,
+                        dhan_code: event.dhan_code,
+                        instruments_held: event.instruments_held,
+                        attempts: 0,
+                    });
+                }
+                GapStep::default()
+            }
+            WsEventKind::DialFailed => {
+                if let Some(gap) = slot.as_mut() {
+                    gap.attempts = gap.attempts.saturating_add(1);
+                }
+                GapStep::default()
+            }
+            WsEventKind::Connected => match slot.take() {
+                Some(gap) => {
+                    let row = gap_row(event.connection_index, gap, now_ist_nanos, false);
+                    GapStep {
+                        down_secs: row.down_secs(),
+                        attempts: row.attempts,
+                        closed: Some(row),
+                    }
+                }
+                None => GapStep::default(),
+            },
+            _ => GapStep::default(),
+        }
+    }
+
+    /// Ends every open gap at `now_ist_nanos` (shutdown), handing each row to
+    /// `emit`. O(`GAP_SLOTS`) = 32, once per stop. Returns how many it closed.
+    fn close_all(
+        &mut self,
+        now_ist_nanos: i64,
+        mut emit: impl FnMut(tickvault_storage::feed_gap_audit_persistence::FeedGapRow),
+    ) -> usize {
+        let mut closed = 0_usize;
+        // O(1) EXEMPT: begin — fixed 32-slot sweep, once per process stop
+        for (index, slot) in self.open.iter_mut().enumerate() {
+            if let Some(gap) = slot.take() {
+                let connection_index = u8::try_from(index).unwrap_or(u8::MAX);
+                emit(gap_row(connection_index, gap, now_ist_nanos, true));
+                closed = closed.saturating_add(1);
+            }
+        }
+        // O(1) EXEMPT: end
+        closed
+    }
+}
+
+/// Builds the `feed_gap_audit` row for a closed gap.
+fn gap_row(
+    connection_index: u8,
+    gap: OpenGap,
+    end_ist_nanos: i64,
+    open_at_shutdown: bool,
+) -> tickvault_storage::feed_gap_audit_persistence::FeedGapRow {
+    tickvault_storage::feed_gap_audit_persistence::FeedGapRow {
+        gap_start_ist_nanos: gap.start_ist_nanos,
+        gap_end_ist_nanos: end_ist_nanos,
+        feed: tickvault_common::feed::Feed::Dhan,
+        ws_type: ws_type_of(gap.endpoint),
+        connection_index: i64::from(connection_index),
+        reason: gap.reason,
+        dhan_code: gap.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        instruments_held: i64::from(gap.instruments_held),
+        attempts: i64::from(gap.attempts),
+        open_at_shutdown,
+    }
+}
+
+/// Bounded capacity of the gap-row channel. Gaps are rarer than lifecycle
+/// events, so the lifecycle bound covers them.
+const FEED_GAP_CHANNEL_CAPACITY: usize = WS_EVENT_AUDIT_CHANNEL_CAPACITY;
+
+/// Hands one gap row to its writer. `try_send`, never blocking the forwarder;
+/// a refused row is counted and logged (gap rows are a few a day, so one line
+/// per refusal cannot storm).
+fn forward_gap_row(
+    tx: &tokio::sync::mpsc::Sender<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+    row: tickvault_storage::feed_gap_audit_persistence::FeedGapRow,
+) {
+    if let Err(err) = tx.try_send(row) {
+        let reason = match err {
+            TrySendError::Full(_) => "full",
+            TrySendError::Closed(_) => "closed",
+        };
+        metrics::counter!("tv_feed_gap_audit_dropped_total", "reason" => reason).increment(1);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "feed_gap_audit_row_dropped",
+            reason,
+            ws_type = row.ws_type.as_str(),
+            connection_index = row.connection_index,
+            down_secs = row.down_secs(),
+            "feed_gap_audit: a reconnect-gap row was DROPPED before it reached the writer \
+             ({reason}); the gap is still visible as its two ws_event_audit rows"
+        );
+    }
+}
+
+/// Creates the gap-row channel and spawns its writer task, which ensures the
+/// table at start (the same boot self-heal `ws_event_audit` gets).
+fn spawn_feed_gap_audit_consumer(
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) -> tokio::sync::mpsc::Sender<tickvault_storage::feed_gap_audit_persistence::FeedGapRow> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        tickvault_storage::feed_gap_audit_persistence::FeedGapRow,
+    >(FEED_GAP_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        run_feed_gap_audit_consumer(rx, questdb_cfg).await;
+    });
+    tx
+}
+
+/// Drains gap rows into `feed_gap_audit`: ensure the table once, then
+/// append each row (and any rows already queued behind it, up to
+/// [`AUDIT_BATCH_MAX_ROWS`]) and flush the batch once. A failure is
+/// AUDIT-WS-01 (the same forensic class as `ws_event_audit`), never a
+/// recovery-path failure. After a failed flush the rows stay buffered and the
+/// next flush waits for [`FlushBackoff`] (5 s doubling to 60 s), whether or
+/// not more rows arrive, so an outage costs one request per backoff step
+/// instead of one per gap.
+async fn run_feed_gap_audit_consumer(
+    mut rx: tokio::sync::mpsc::Receiver<tickvault_storage::feed_gap_audit_persistence::FeedGapRow>,
+    questdb_cfg: tickvault_common::config::QuestDbConfig,
+) {
+    use tickvault_common::error_code::ErrorCode;
+    use tickvault_storage::feed_gap_audit_persistence::{
+        FeedGapAuditWriter, ensure_feed_gap_audit_table,
+    };
+
+    ensure_feed_gap_audit_table(&questdb_cfg).await;
+    let mut writer = FeedGapAuditWriter::new(&questdb_cfg);
+    let mut backoff = FlushBackoff::new();
+    let mut tally: LabelTally<&'static str> = LabelTally::new();
+    loop {
+        let (first, closed) = next_audit_row(&mut rx, backoff.wait_until(writer.pending())).await;
+        let batch = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()));
+        for row in batch.take(AUDIT_BATCH_MAX_ROWS) {
+            if let Err(err) = writer.append_row(&row) {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    ws_type = row.ws_type.as_str(),
+                    connection_index = row.connection_index,
+                    ?err,
+                    "feed_gap_audit: append failed"
+                );
+                metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "append")
+                    .increment(1);
+            } else {
+                tally.add(row.ws_type.as_str());
+            }
+        }
+        let pending = writer.pending();
+        // A blocking ILP-over-HTTP round trip: run it off the shared tokio
+        // worker (O(1) sweep, 2026-10-03).
+        match flush_step(
+            std::time::Instant::now(),
+            pending,
+            closed,
+            &mut backoff,
+            || crate::order_observability::blocking_flush(|| writer.flush()),
+        ) {
+            FlushStep::Flushed => {
+                tally.drain(|ws_type, n| {
+                    metrics::counter!("tv_feed_gap_audit_rows_total", "ws_type" => ws_type)
+                        .increment(n);
+                });
+            }
+            FlushStep::Failed { err, retry_in_secs } => {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    pending,
+                    retry_in_secs,
+                    ?err,
+                    "feed_gap_audit: flush failed; rows kept for the next try"
+                );
+                metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => "flush")
+                    .increment(1);
+                if writer.pending() == 0 {
+                    // The bounded buffer discarded them (counted by ilp_overflow).
+                    tally.clear();
+                }
+            }
+            FlushStep::Skipped => {}
+        }
+        if closed {
+            break;
+        }
+    }
+    info!("feed_gap_audit consumer: all producers dropped — exiting");
+}
+
+/// A socket-lifecycle audit row could NOT be handed to the consumer.
+///
+/// Counted EVERY time (the counter is the total), logged ONCE per episode
+/// (the latch's rising edge). Returns whether this call was the one that
+/// logged, so a test can assert the edge without a log subscriber.
+///
+/// # Why this is `error!` and not the bare counter it replaced (2026-09-02)
+///
+/// Before this, the forwarder's drop arm was `metrics::counter!` and nothing
+/// else — a counter that is not EMF-selected and sits on no dashboard. A
+/// wedged consumer therefore cost every socket-lifecycle row of a session
+/// with no operator-visible trace, which is the false-OK class `ws_event_audit`
+/// was created to prevent: the table's only job is to answer "which pool went
+/// dark and when?", and the one time it is most needed is exactly when the
+/// consumer behind it is stalled. The order-update socket's own drop arm has
+/// been `error!` since 2026-07-05; this path never inherited that.
+///
+/// HOT-PATH-02 is the persistence layer's existing filtered loss code (a
+/// `writer queue drop` is what this is); the `source` field scopes it, so no
+/// new metric name and no new alarm.
+fn record_forward_drop(
+    latch: &DropLatch,
+    event: &impl ForwardedEvent,
+    reason: &'static str,
+) -> bool {
+    metrics::counter!(
+        "tv_ws_event_audit_dropped_total",
+        "reason" => "live_feed_forward"
+    )
+    .increment(1);
+    let first_of_episode = latch.on_drop();
+    if first_of_episode {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            source = "ws_event_audit_row_dropped",
+            reason,
+            endpoint = event.endpoint().as_str(),
+            connection_index = event.connection_index(),
+            event_kind = event.kind().as_str(),
+            event_reason = event.reason(),
+            "ws_event_audit: a socket-lifecycle row was DROPPED before it reached the \
+             writer ({reason}) — the audit table is now MISSING this socket's history \
+             and will keep missing rows until the consumer drains. Counted on every \
+             drop, paged once per episode; a recovery line follows when a row lands"
+        );
+    }
+    first_of_episode
+}
+
+/// A socket-lifecycle audit row reached the consumer. Closes an open drop
+/// episode (one `info!` on the falling edge); routine otherwise. Returns
+/// whether this call closed an episode.
+fn record_forward_ok(latch: &DropLatch, event: &impl ForwardedEvent) -> bool {
+    let recovered = latch.on_ok();
+    if recovered {
+        info!(
+            endpoint = event.endpoint().as_str(),
+            connection_index = event.connection_index(),
+            event_kind = event.kind().as_str(),
+            "ws_event_audit: socket-lifecycle rows are reaching the writer again — the \
+             drop episode is over (rows dropped during it are gone; the count is in \
+             tv_ws_event_audit_dropped_total)"
+        );
+    }
+    recovered
+}
+
+/// The facts the forwarder's drop and recovery lines name, shared by the two
+/// event types it forwards (lifecycle and, since audit M8, subscription
+/// changes). Every accessor is a field read.
+trait ForwardedEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType;
+    fn connection_index(&self) -> u8;
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind;
+    fn reason(&self) -> &'static str;
+}
+
+impl ForwardedEvent for tickvault_core::websocket::pool_supervisor::WsLifecycleEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType {
+        self.endpoint
+    }
+    fn connection_index(&self) -> u8 {
+        self.connection_index
+    }
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind {
+        self.kind
+    }
+    fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl ForwardedEvent for tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent {
+    fn endpoint(&self) -> tickvault_core::websocket::pool_budget::DhanEndpointType {
+        self.endpoint
+    }
+    fn connection_index(&self) -> u8 {
+        self.connection_index
+    }
+    fn kind(&self) -> tickvault_common::ws_event_types::WsEventKind {
+        self.kind
+    }
+    fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+/// A strictly increasing IST-nanos stamp for the rows one forwarder writes
+/// (audit M8, 2026-10-04).
+///
+/// `ws_event_audit`'s DEDUP key is `(ts, trading_date_ist, feed, ws_type,
+/// connection_index, event_kind)`, so two events of one kind on one socket
+/// stamped with the same nanosecond would UPSERT into ONE row and the first
+/// would vanish. A swap whose refusal and retry land inside one clock tick
+/// is exactly that shape. Each stamp is `max(now, previous + 1)`: O(1), no
+/// allocation, and a backward clock step can only hold the stamp still
+/// (advanced one nanosecond per row), never move it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StrictStamp {
+    last: Option<i64>,
+}
+
+impl StrictStamp {
+    const fn new() -> Self {
+        Self { last: None }
+    }
+
+    fn next(&mut self, now_ist_nanos: i64) -> i64 {
+        let stamp = match self.last {
+            Some(last) if now_ist_nanos <= last => last.saturating_add(1),
+            _ => now_ist_nanos,
+        };
+        self.last = Some(stamp);
+        stamp
+    }
+}
+
+/// The authorized per-endpoint socket cap, as the audit row's `pool_size`.
+/// Not a live count: a row records ONE socket's event and must not imply a
+/// fleet-wide reading it cannot have.
+fn pool_size_of(endpoint: tickvault_core::websocket::pool_budget::DhanEndpointType) -> i64 {
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    let cap = match endpoint {
+        DhanEndpointType::Depth20 => tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+        DhanEndpointType::Depth200 => {
+            tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS
+        }
+        _ => tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+    };
+    i64::try_from(cap).unwrap_or(i64::MAX)
+}
+
+/// Widens one subscription-change event (audit M8, 2026-10-04) into the
+/// audit row, at a given instant. Split out of the spawn wrapper so the
+/// mapping is asserted without a runtime or a database.
+fn subscription_row(
+    event: tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent,
+    now_ist_nanos: i64,
+) -> tickvault_common::ws_event_types::WsEventAuditRow {
+    let nanos_per_day: i64 = 86_400 * 1_000_000_000;
+    tickvault_common::ws_event_types::WsEventAuditRow {
+        event_ts_ist_nanos: now_ist_nanos,
+        trading_date_ist_nanos: now_ist_nanos - now_ist_nanos.rem_euclid(nanos_per_day),
+        feed: tickvault_common::feed::Feed::Dhan,
+        ws_type: ws_type_of(event.endpoint),
+        connection_index: i64::from(event.connection_index),
+        pool_size: pool_size_of(event.endpoint),
+        event_kind: event.kind,
+        source: event.endpoint.as_str().to_string(),
+        reason: event.reason.to_string(),
+        dhan_code: event.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        // A subscription change never closes a feed gap.
+        down_secs: 0,
+        attempts: 0,
+        market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        subscription: event.detail,
+    }
 }
 
 /// Widens one socket lifecycle event into the audit row, at a given instant.
@@ -90,9 +654,9 @@ pub fn spawn_live_feed_lifecycle_audit(
 fn lifecycle_row(
     event: tickvault_core::websocket::pool_supervisor::WsLifecycleEvent,
     now_ist_nanos: i64,
+    step: GapStep,
 ) -> tickvault_common::ws_event_types::WsEventAuditRow {
-    use tickvault_common::ws_event_types::{WsEventAuditRow, WsType};
-    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_common::ws_event_types::WsEventAuditRow;
 
     let nanos_per_day: i64 = 86_400 * 1_000_000_000;
     WsEventAuditRow {
@@ -104,34 +668,31 @@ fn lifecycle_row(
         // sockets, so building the row from it would file a depth-200 park
         // under the main feed — and "which pool went dark?" is the only
         // question this table exists to answer.
-        ws_type: match event.endpoint {
-            DhanEndpointType::Depth20 => WsType::Depth20,
-            DhanEndpointType::Depth200 => WsType::Depth200,
-            _ => WsType::MainFeed,
-        },
+        ws_type: ws_type_of(event.endpoint),
         connection_index: i64::from(event.connection_index),
         // The authorized per-endpoint cap, not a live count: this row records
         // ONE socket's event and must not imply a fleet-wide reading it
         // cannot have.
-        pool_size: match event.endpoint {
-            DhanEndpointType::Depth20 => {
-                i64::try_from(tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS)
-                    .unwrap_or(i64::MAX)
-            }
-            DhanEndpointType::Depth200 => {
-                i64::try_from(tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS)
-                    .unwrap_or(i64::MAX)
-            }
-            _ => i64::try_from(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS)
-                .unwrap_or(i64::MAX),
-        },
+        pool_size: pool_size_of(event.endpoint),
         event_kind: event.kind,
         source: event.endpoint.as_str().to_string(),
         reason: event.reason.to_string(),
-        dhan_code: tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
-        down_secs: 0,
-        attempts: 0,
+        // The Dhan close code when the socket was closed with one; -1 otherwise.
+        dhan_code: event.dhan_code.map_or(
+            tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
+            i64::from,
+        ),
+        // On the CONNECTED row that ends a gap: how long the slot was dark and
+        // how many dials failed inside it. 0 on every other row.
+        down_secs: step.down_secs,
+        attempts: step.attempts,
         market_hours: tickvault_common::market_hours::is_within_market_hours_ist(),
+        // A lifecycle row carries no subscription change; its instrument
+        // count is recorded (audit M8, 2026-10-04).
+        subscription: tickvault_common::ws_event_types::WsSubscriptionDetail {
+            held: Some(event.instruments_held),
+            ..tickvault_common::ws_event_types::WsSubscriptionDetail::NONE
+        },
     }
 }
 
@@ -151,48 +712,396 @@ async fn run_ws_event_audit_consumer(
         WsEventAuditWriter, ensure_ws_event_audit_table,
     };
 
-    ensure_ws_event_audit_table(&questdb_cfg).await;
+    // Audit J3 (2026-10-26): a refused ensure starts the background re-run.
+    if !ensure_ws_event_audit_table(&questdb_cfg).await {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb_cfg);
+    }
     let mut writer = WsEventAuditWriter::new(&questdb_cfg);
-    while let Some(row) = rx.recv().await {
-        if let Err(err) = writer.append_row(&row) {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: append failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
-                .increment(1);
-            continue;
+    let mut backoff = FlushBackoff::new();
+    let mut tally: LabelTally<(&'static str, &'static str)> = LabelTally::new();
+    loop {
+        let (first, closed) = next_audit_row(&mut rx, backoff.wait_until(writer.pending())).await;
+        let batch = first
+            .into_iter()
+            .chain(std::iter::from_fn(|| rx.try_recv().ok()));
+        for row in batch.take(AUDIT_BATCH_MAX_ROWS) {
+            if let Err(err) = writer.append_row(&row) {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    ws_type = row.ws_type.as_str(),
+                    connection_index = row.connection_index,
+                    event_kind = row.event_kind.as_str(),
+                    ?err,
+                    "ws_event_audit: append failed"
+                );
+                metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "append")
+                    .increment(1);
+            } else {
+                tally.add((row.ws_type.as_str(), row.event_kind.as_str()));
+            }
         }
-        if let Err(err) = writer.flush() {
-            error!(
-                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
-                ws_type = row.ws_type.as_str(),
-                connection_index = row.connection_index,
-                event_kind = row.event_kind.as_str(),
-                ?err,
-                "ws_event_audit: flush failed"
-            );
-            metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
-                .increment(1);
-        } else {
-            metrics::counter!(
-                "tv_ws_event_audit_rows_total",
-                "ws_type" => row.ws_type.as_str(),
-                "event_kind" => row.event_kind.as_str(),
-            )
-            .increment(1);
+        let pending = writer.pending();
+        // A blocking ILP-over-HTTP round trip: run it off the shared tokio
+        // worker (O(1) sweep, 2026-10-03).
+        match flush_step(
+            std::time::Instant::now(),
+            pending,
+            closed,
+            &mut backoff,
+            || crate::order_observability::blocking_flush(|| writer.flush()),
+        ) {
+            FlushStep::Flushed => {
+                tally.drain(|(ws_type, event_kind), n| {
+                    metrics::counter!(
+                        "tv_ws_event_audit_rows_total",
+                        "ws_type" => ws_type,
+                        "event_kind" => event_kind,
+                    )
+                    .increment(n);
+                });
+            }
+            FlushStep::Failed { err, retry_in_secs } => {
+                error!(
+                    code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                    pending,
+                    retry_in_secs,
+                    ?err,
+                    "ws_event_audit: flush failed; rows kept for the next try"
+                );
+                metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => "flush")
+                    .increment(1);
+                if writer.pending() == 0 {
+                    // The bounded buffer discarded them (counted by ilp_overflow).
+                    tally.clear();
+                }
+            }
+            FlushStep::Skipped => {}
+        }
+        if closed {
+            break;
         }
     }
     info!("ws_event_audit consumer: all producers dropped — exiting");
 }
 
+// ---------------------------------------------------------------------------
+// Batched flush with backoff (2026-11-23, the open half of the 2026-10-30
+// O(1) sweep note on these two writers)
+// ---------------------------------------------------------------------------
+
+/// Most rows appended before one flush. Rows already queued behind the one
+/// just received go into the same request, so a reconnect storm costs one
+/// round trip per batch instead of one per event. A bound, so one flush never
+/// waits on an unbounded drain of the channel.
+const AUDIT_BATCH_MAX_ROWS: usize = 256;
+
+/// First wait after a failed flush. Doubles on each further failure.
+const AUDIT_FLUSH_RETRY_FIRST_SECS: u64 = 5;
+
+/// Longest wait between flush attempts while QuestDB keeps refusing.
+const AUDIT_FLUSH_RETRY_MAX_SECS: u64 = 60;
+
+/// When a failed audit flush may be tried again.
+///
+/// Before this, each consumer flushed after every event, so during a QuestDB
+/// outage every event re-sent every retained row: O(retained rows) per event,
+/// one request per event. Now a failure sets a retry time; rows that arrive
+/// before it are appended to the buffer and wait, and the retry fires at that
+/// time whether or not more rows came. O(1) per call.
+#[derive(Debug)]
+struct FlushBackoff {
+    retry_at: Option<std::time::Instant>,
+    delay_secs: u64,
+}
+
+impl FlushBackoff {
+    const fn new() -> Self {
+        Self {
+            retry_at: None,
+            delay_secs: AUDIT_FLUSH_RETRY_FIRST_SECS,
+        }
+    }
+
+    /// Whether a flush may run now.
+    fn may_flush(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// The retry time the consumer must wake for: set only while a failure
+    /// is waiting and rows are buffered.
+    fn wait_until(&self, pending: usize) -> Option<std::time::Instant> {
+        if pending == 0 { None } else { self.retry_at }
+    }
+
+    /// Record a failed flush; returns the wait it set, in seconds.
+    fn on_failure(&mut self, now: std::time::Instant) -> u64 {
+        let wait = self.delay_secs;
+        self.retry_at = Some(now + std::time::Duration::from_secs(wait));
+        self.delay_secs = wait.saturating_mul(2).min(AUDIT_FLUSH_RETRY_MAX_SECS);
+        wait
+    }
+
+    fn on_success(&mut self) {
+        self.retry_at = None;
+        self.delay_secs = AUDIT_FLUSH_RETRY_FIRST_SECS;
+    }
+}
+
+/// What one pass of the flush decision did.
+#[derive(Debug)]
+enum FlushStep {
+    /// Nothing buffered, or a backoff wait is still running.
+    Skipped,
+    /// The buffered rows were sent and acknowledged.
+    Flushed,
+    /// The flush failed; the rows stay buffered (bounded by the writer) and
+    /// the next try waits `retry_in_secs`.
+    Failed {
+        err: anyhow::Error,
+        retry_in_secs: u64,
+    },
+}
+
+/// Flush the buffered rows if any are buffered and the backoff allows it.
+/// `closing` (every producer dropped) ignores the backoff: it is the last
+/// chance to send the rows before the task exits.
+fn flush_step(
+    now: std::time::Instant,
+    pending: usize,
+    closing: bool,
+    backoff: &mut FlushBackoff,
+    flush: impl FnOnce() -> anyhow::Result<()>,
+) -> FlushStep {
+    if pending == 0 || !(closing || backoff.may_flush(now)) {
+        return FlushStep::Skipped;
+    }
+    match flush() {
+        Ok(()) => {
+            backoff.on_success();
+            FlushStep::Flushed
+        }
+        Err(err) => FlushStep::Failed {
+            err,
+            retry_in_secs: backoff.on_failure(now),
+        },
+    }
+}
+
+/// Wait for the next audit row, or for the backoff retry time when one is
+/// set. Returns the row (if one came) and whether every producer has gone.
+async fn next_audit_row<T>(
+    rx: &mut tokio::sync::mpsc::Receiver<T>,
+    retry_at: Option<std::time::Instant>,
+) -> (Option<T>, bool) {
+    match retry_at {
+        Some(at) => tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(row) => (Some(row), false),
+                None => (None, true),
+            },
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => (None, false),
+        },
+        None => match rx.recv().await {
+            Some(row) => (Some(row), false),
+            None => (None, true),
+        },
+    }
+}
+
+/// Rows appended since the last acknowledged flush, per counter label, so
+/// the "rows written" counters move only when QuestDB has the rows.
+///
+/// O(distinct labels) per row: a linear scan over a set bounded by the label
+/// enums (5 socket kinds, and 5 x the event kinds for `ws_event_audit`),
+/// not by the number of rows. Allocates only when a label is first seen.
+#[derive(Debug)]
+struct LabelTally<K> {
+    counts: Vec<(K, u64)>,
+}
+
+impl<K: Copy + PartialEq> LabelTally<K> {
+    const fn new() -> Self {
+        Self { counts: Vec::new() }
+    }
+
+    fn add(&mut self, key: K) {
+        if let Some(slot) = self.counts.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = slot.1.saturating_add(1);
+        } else {
+            self.counts.push((key, 1));
+        }
+    }
+
+    /// Hand every label's count to `emit`, then forget them.
+    fn drain(&mut self, mut emit: impl FnMut(K, u64)) {
+        for (key, n) in self.counts.drain(..) {
+            emit(key, n);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.counts.clear();
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> u64 {
+        self.counts.iter().map(|(_, n)| n).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- batched flush with backoff (2026-11-23) ------------------------
+
+    #[test]
+    fn test_flush_backoff_doubles_to_the_cap_and_resets_on_success() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        assert!(b.may_flush(t0));
+        assert_eq!(b.wait_until(3), None, "no failure yet: wait on rows only");
+        let waits: Vec<u64> = (0..6).map(|_| b.on_failure(t0)).collect();
+        assert_eq!(
+            waits,
+            [5, 10, 20, 40, 60, 60],
+            "doubles, then holds at the cap"
+        );
+        assert!(!b.may_flush(t0));
+        assert!(b.may_flush(t0 + std::time::Duration::from_secs(60)));
+        assert_eq!(b.wait_until(0), None, "nothing buffered: no timer");
+        assert!(
+            b.wait_until(1).is_some(),
+            "rows buffered: wake at the retry time"
+        );
+        b.on_success();
+        assert!(b.may_flush(t0));
+        assert_eq!(b.on_failure(t0), 5, "a success resets the ladder");
+    }
+
+    #[test]
+    fn test_flush_step_skips_when_nothing_is_buffered() {
+        let mut b = FlushBackoff::new();
+        let mut called = false;
+        let step = flush_step(std::time::Instant::now(), 0, true, &mut b, || {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(step, FlushStep::Skipped));
+        assert!(!called, "an empty buffer never costs a request");
+    }
+
+    #[test]
+    fn test_flush_step_waits_out_the_backoff_but_not_at_close() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        let step = flush_step(t0, 2, false, &mut b, || Err(anyhow::anyhow!("down")));
+        assert!(matches!(
+            step,
+            FlushStep::Failed {
+                retry_in_secs: 5,
+                ..
+            }
+        ));
+        let mut calls = 0;
+        let step = flush_step(
+            t0 + std::time::Duration::from_secs(1),
+            3,
+            false,
+            &mut b,
+            || {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(matches!(step, FlushStep::Skipped), "inside the 5 s wait");
+        assert_eq!(calls, 0);
+        let step = flush_step(
+            t0 + std::time::Duration::from_secs(1),
+            3,
+            true,
+            &mut b,
+            || {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(step, FlushStep::Flushed),
+            "the last chance ignores the wait"
+        );
+        assert_eq!(calls, 1);
+        assert!(b.may_flush(t0), "a success clears the wait");
+    }
+
+    /// The point of the change: a storm of events during an outage costs a
+    /// few requests, not one per event (before: 100 requests here).
+    #[test]
+    fn test_an_outage_storm_costs_a_few_requests_not_one_per_event() {
+        let t0 = std::time::Instant::now();
+        let mut b = FlushBackoff::new();
+        let mut requests = 0_u32;
+        let mut pending = 0_usize;
+        for i in 0..100_u64 {
+            pending += 1;
+            let now = t0 + std::time::Duration::from_millis(i * 100);
+            let _ = flush_step(now, pending, false, &mut b, || {
+                requests += 1;
+                Err(anyhow::anyhow!("questdb down"))
+            });
+        }
+        // 10 s of events: tries at 0 s, 5 s (then the wait is 10 s, past the storm).
+        assert_eq!(requests, 2, "one request per backoff step");
+    }
+
+    #[test]
+    fn test_label_tally_counts_per_label_and_drains_once() {
+        let mut t: LabelTally<(&str, &str)> = LabelTally::new();
+        t.add(("main_feed", "connected"));
+        t.add(("main_feed", "connected"));
+        t.add(("depth_20", "disconnected"));
+        assert_eq!(t.total(), 3);
+        let mut seen = Vec::new();
+        t.drain(|k, n| seen.push((k, n)));
+        assert_eq!(
+            seen,
+            [
+                (("main_feed", "connected"), 2),
+                (("depth_20", "disconnected"), 1)
+            ]
+        );
+        assert_eq!(t.total(), 0, "drained counts are not emitted twice");
+        t.add(("main_feed", "connected"));
+        t.clear();
+        assert_eq!(t.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_returns_rows_then_reports_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        tx.try_send(7).ok();
+        assert_eq!(next_audit_row(&mut rx, None).await, (Some(7), false));
+        drop(tx);
+        assert_eq!(next_audit_row(&mut rx, None).await, (None, true));
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_wakes_for_the_retry_time_with_no_row() {
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let at = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        assert_eq!(next_audit_row(&mut rx, Some(at)).await, (None, false));
+        assert!(std::time::Instant::now() >= at);
+    }
+
+    #[tokio::test]
+    async fn test_next_audit_row_with_a_retry_time_still_takes_a_row_and_a_close() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        tx.try_send(3).ok();
+        assert_eq!(next_audit_row(&mut rx, Some(far)).await, (Some(3), false));
+        drop(tx);
+        assert_eq!(next_audit_row(&mut rx, Some(far)).await, (None, true));
+    }
 
     /// A QuestDB config pointing at a port nothing listens on.
     ///
@@ -235,6 +1144,39 @@ mod tests {
     /// written. That is why this asserts on capacity and send-acceptance
     /// rather than on rows landing — a test claiming the latter without a
     /// database would be the false-OK this repo bans.
+    /// O(1) sweep 2026-10-03: both audit consumers flush through
+    /// `blocking_flush`, never bare on the shared tokio worker.
+    #[test]
+    fn test_audit_consumers_never_flush_bare_on_the_worker() {
+        let src = include_str!("ws_audit_consumer.rs");
+        let production = src.split(concat!("#[cfg(", "test)]")).next().unwrap_or(src);
+        let wrapped = production
+            .matches("blocking_flush(|| writer.flush())")
+            .count();
+        let all = production.matches("writer.flush()").count();
+        assert_eq!(wrapped, 2, "both consumers must flush off the worker");
+        // 2026-11-23: both consumers batch queued rows and back off after a
+        // failed flush, never flush once per received row.
+        assert_eq!(
+            production
+                .matches("batch.take(AUDIT_BATCH_MAX_ROWS)")
+                .count(),
+            2
+        );
+        assert_eq!(
+            production
+                .matches("next_audit_row(&mut rx, backoff.wait_until(")
+                .count(),
+            2
+        );
+        assert_eq!(production.matches("match flush_step(").count(), 2);
+        assert!(!production.contains("while let Some(row) = rx.recv().await"));
+        assert_eq!(
+            all, wrapped,
+            "a bare writer.flush() sits on the tokio worker"
+        );
+    }
+
     #[tokio::test]
     async fn test_spawn_returns_a_sender_with_the_bounded_capacity() {
         let tx = spawn_ws_event_audit_consumer(unreachable_questdb());
@@ -284,6 +1226,7 @@ mod tests {
             down_secs: 0,
             attempts: 0,
             market_hours: false,
+            subscription: tickvault_common::ws_event_types::WsSubscriptionDetail::NONE,
         };
 
         for i in 0..WS_EVENT_AUDIT_CHANNEL_CAPACITY {
@@ -332,8 +1275,11 @@ mod lifecycle_row_tests {
                     connection_index: 4,
                     kind: WsEventKind::Disconnected,
                     reason: "park_fatal",
+                    dhan_code: None,
+                    instruments_held: 0,
                 },
                 1_700_000_000_000_000_000,
+                super::GapStep::default(),
             );
             assert_eq!(row.ws_type, ws_type, "endpoint {endpoint:?}");
             assert_eq!(row.pool_size, pool, "the AUTHORIZED cap, not a live count");
@@ -361,13 +1307,386 @@ mod lifecycle_row_tests {
                 connection_index: 0,
                 kind: WsEventKind::Connected,
                 reason: "subscribe_acked",
+                dhan_code: None,
+                instruments_held: 0,
             },
             late,
+            super::GapStep::default(),
         );
         assert_eq!(row.event_ts_ist_nanos, late);
         assert_eq!(
             row.trading_date_ist_nanos, midnight,
             "the LAST nanosecond of a day must still belong to that day"
         );
+    }
+
+    fn park_event() -> WsLifecycleEvent {
+        WsLifecycleEvent {
+            endpoint: DhanEndpointType::Depth200,
+            connection_index: 2,
+            kind: WsEventKind::Disconnected,
+            reason: "park_fatal",
+            dhan_code: None,
+            instruments_held: 0,
+        }
+    }
+
+    /// 2026-09-02 (audit finding 9): a forwarder drop is LOUD exactly once per
+    /// episode. The first drop logs; the next thousand are counted and
+    /// silent; a landed row closes the episode; the drop after THAT is a new
+    /// episode and logs again. Before this the arm was a bare counter.
+    #[test]
+    fn a_forward_drop_is_loud_once_per_episode_and_re_arms_on_success() {
+        use super::{record_forward_drop, record_forward_ok};
+        use tickvault_core::websocket::audit_drop_latch::DropLatch;
+
+        let latch = DropLatch::new();
+        let event = park_event();
+
+        assert!(
+            !record_forward_ok(&latch, &event),
+            "a landed row with no open episode is routine, not a recovery"
+        );
+        assert!(
+            record_forward_drop(&latch, &event, "full"),
+            "the FIRST drop of an episode must be the one that logs"
+        );
+        for _ in 0..1_000 {
+            assert!(
+                !record_forward_drop(&latch, &event, "full"),
+                "later drops in the same episode are counted, never re-paged"
+            );
+        }
+        assert!(
+            record_forward_ok(&latch, &event),
+            "the first landed row after a drop closes the episode"
+        );
+        assert!(
+            record_forward_drop(&latch, &event, "closed"),
+            "after a recovery the next drop is a NEW episode and must log again"
+        );
+    }
+}
+
+/// 2026-10-02: reconnect gaps are durably recorded. A disconnect opens a gap
+/// per connection slot, the next connect closes it into one `feed_gap_audit`
+/// row and stamps `down_secs` / `attempts` on the `ws_event_audit` CONNECTED
+/// row, and a shutdown closes every gap still open at that instant.
+#[cfg(test)]
+mod feed_gap_tests {
+    use super::{GapStep, GapTracker, lifecycle_row};
+    use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsEventKind, WsType};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::{ParkReason, WsLifecycleEvent};
+    use tickvault_storage::feed_gap_audit_persistence::FeedGapRow;
+
+    const SEC: i64 = 1_000_000_000;
+    const T0: i64 = 1_790_000_000 * SEC;
+
+    fn event(
+        endpoint: DhanEndpointType,
+        slot: u8,
+        kind: WsEventKind,
+        reason: &'static str,
+        dhan_code: Option<u16>,
+    ) -> WsLifecycleEvent {
+        WsLifecycleEvent {
+            endpoint,
+            connection_index: slot,
+            kind,
+            reason,
+            dhan_code,
+            instruments_held: 4_000,
+        }
+    }
+
+    fn close_805(slot: u8) -> WsLifecycleEvent {
+        event(
+            DhanEndpointType::MainFeed,
+            slot,
+            WsEventKind::Disconnected,
+            "park_pool_overflow",
+            Some(805),
+        )
+    }
+
+    fn connected(slot: u8) -> WsLifecycleEvent {
+        event(
+            DhanEndpointType::MainFeed,
+            slot,
+            WsEventKind::Connected,
+            "subscribe_acked",
+            None,
+        )
+    }
+
+    #[test]
+    fn test_gap_down_secs_and_attempts_on_the_reconnect() {
+        let mut gaps = GapTracker::new();
+        assert_eq!(gaps.on_event(&close_805(3), T0), GapStep::default());
+        let failed = event(
+            DhanEndpointType::MainFeed,
+            3,
+            WsEventKind::DialFailed,
+            "dial_failed",
+            None,
+        );
+        assert_eq!(gaps.on_event(&failed, T0 + 5 * SEC), GapStep::default());
+        assert_eq!(gaps.on_event(&failed, T0 + 9 * SEC), GapStep::default());
+        let step = gaps.on_event(&connected(3), T0 + 47 * SEC + SEC / 2);
+        assert_eq!(step.down_secs, 47, "whole seconds, rounded down");
+        assert_eq!(step.attempts, 2, "two failed dials inside the gap");
+        let row = step
+            .closed
+            .expect("a connect after a disconnect closes the gap");
+        assert_eq!(row.gap_start_ist_nanos, T0);
+        assert_eq!(row.gap_end_ist_nanos, T0 + 47 * SEC + SEC / 2);
+        assert_eq!(row.ws_type, WsType::MainFeed);
+        assert_eq!(row.connection_index, 3);
+        assert_eq!(row.reason, "park_pool_overflow");
+        assert_eq!(row.dhan_code, 805);
+        assert_eq!(row.instruments_held, 4_000);
+        assert!(!row.open_at_shutdown);
+        // The slot is clear again: the next connect writes nothing.
+        assert_eq!(
+            gaps.on_event(&connected(3), T0 + 60 * SEC),
+            GapStep::default()
+        );
+    }
+
+    #[test]
+    fn test_gap_keeps_the_first_disconnect_as_its_start() {
+        // A socket parked for 805 and later released by the overflow probe
+        // emits a second close row; the gap still starts at the FIRST one.
+        let mut gaps = GapTracker::new();
+        let _ = gaps.on_event(&close_805(1), T0);
+        let bare = event(
+            DhanEndpointType::MainFeed,
+            1,
+            WsEventKind::Disconnected,
+            "reconnect_backoff",
+            None,
+        );
+        let _ = gaps.on_event(&bare, T0 + 300 * SEC);
+        let row = gaps
+            .on_event(&connected(1), T0 + 320 * SEC)
+            .closed
+            .expect("gap row");
+        assert_eq!(row.gap_start_ist_nanos, T0);
+        assert_eq!(row.down_secs(), 320);
+        assert_eq!(row.dhan_code, 805, "the code of the close that opened it");
+    }
+
+    #[test]
+    fn test_gap_open_at_shutdown_ends_at_the_shutdown_instant() {
+        let mut gaps = GapTracker::new();
+        let _ = gaps.on_event(&close_805(0), T0);
+        let depth = event(
+            DhanEndpointType::Depth200,
+            12,
+            WsEventKind::Disconnected,
+            "reconnect_backoff",
+            None,
+        );
+        let _ = gaps.on_event(&depth, T0 + 10 * SEC);
+        // The process stops: the shutdown close itself opens nothing.
+        let shutdown_at = T0 + 3_600 * SEC;
+        let stop = event(
+            DhanEndpointType::MainFeed,
+            4,
+            WsEventKind::Disconnected,
+            ParkReason::Shutdown.as_str(),
+            None,
+        );
+        assert!(super::is_shutdown_close(&stop));
+        assert_eq!(gaps.on_event(&stop, shutdown_at), GapStep::default());
+        let mut rows: Vec<FeedGapRow> = Vec::new();
+        let closed = gaps.close_all(shutdown_at, |row| rows.push(row));
+        assert_eq!(closed, 2, "both open gaps, and not the shutdown close");
+        for row in &rows {
+            assert_eq!(row.gap_end_ist_nanos, shutdown_at);
+            assert!(row.open_at_shutdown);
+        }
+        assert_eq!(rows[0].connection_index, 0);
+        assert_eq!(rows[0].down_secs(), 3_600);
+        assert_eq!(rows[1].connection_index, 12);
+        assert_eq!(rows[1].ws_type, WsType::Depth200);
+        assert_eq!(rows[1].dhan_code, WS_EVENT_NO_DHAN_CODE);
+        // Nothing left open: a second stop writes nothing.
+        assert_eq!(gaps.close_all(shutdown_at + SEC, |_| {}), 0);
+    }
+
+    #[test]
+    fn test_gap_connect_without_a_gap_and_out_of_range_slot_write_nothing() {
+        let mut gaps = GapTracker::new();
+        assert_eq!(gaps.on_event(&connected(2), T0), GapStep::default());
+        let _ = gaps.on_event(&close_805(200), T0);
+        assert_eq!(gaps.on_event(&connected(200), T0 + SEC), GapStep::default());
+        assert_eq!(gaps.close_all(T0 + 2 * SEC, |_| {}), 0);
+    }
+
+    #[test]
+    fn test_ws_event_audit_rows_carry_the_real_code_and_down_secs() {
+        let mut gaps = GapTracker::new();
+        let close = close_805(5);
+        let step = gaps.on_event(&close, T0);
+        let close_row = lifecycle_row(close, T0, step);
+        assert_eq!(close_row.dhan_code, 805, "no longer hard-coded to -1");
+        assert_eq!(close_row.down_secs, 0);
+
+        let reconnect = connected(5);
+        let step = gaps.on_event(&reconnect, T0 + 90 * SEC);
+        let open_row = lifecycle_row(reconnect, T0 + 90 * SEC, step);
+        assert_eq!(open_row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(open_row.down_secs, 90, "no longer hard-coded to 0");
+        assert_eq!(open_row.attempts, 0);
+        assert_eq!(open_row.event_kind, WsEventKind::Connected);
+    }
+}
+
+/// Audit M8 (2026-10-04): subscription changes reach `ws_event_audit`
+/// through this forwarder, every row it writes has a strictly increasing
+/// stamp, and a dropped subscription row is counted and paged like a
+/// lifecycle one.
+#[cfg(test)]
+mod subscription_row_tests {
+    use super::{StrictStamp, record_forward_drop, record_forward_ok, subscription_row};
+    use tickvault_common::types::ExchangeSegment;
+    use tickvault_common::ws_event_types::{
+        WS_EVENT_NO_DHAN_CODE, WsAuditInstrument, WsEventKind, WsSubscriptionDetail, WsType,
+    };
+    use tickvault_core::websocket::audit_drop_latch::DropLatch;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::WsSubscriptionAuditEvent;
+
+    fn swap_event() -> WsSubscriptionAuditEvent {
+        WsSubscriptionAuditEvent {
+            endpoint: DhanEndpointType::Depth200,
+            connection_index: 12,
+            kind: WsEventKind::SubscriptionSwapped,
+            reason: "applied",
+            dhan_code: None,
+            detail: WsSubscriptionDetail {
+                instrument: Some(WsAuditInstrument {
+                    security_id: 52_175,
+                    segment: ExchangeSegment::NseFno,
+                }),
+                new_instrument: Some(WsAuditInstrument {
+                    security_id: 52_176,
+                    segment: ExchangeSegment::NseFno,
+                }),
+                added: Some(1),
+                removed: Some(1),
+                held: Some(1),
+            },
+        }
+    }
+
+    #[test]
+    fn a_swap_row_names_its_pool_both_contracts_and_the_outcome() {
+        let row = subscription_row(swap_event(), 1_700_000_000_000_000_000);
+        assert_eq!(row.ws_type, WsType::Depth200);
+        assert_eq!(row.connection_index, 12);
+        assert_eq!(row.pool_size, 5, "the AUTHORIZED cap, not a live count");
+        assert_eq!(row.event_kind, WsEventKind::SubscriptionSwapped);
+        assert_eq!(row.reason, "applied");
+        assert_eq!(row.source, DhanEndpointType::Depth200.as_str());
+        assert_eq!(row.dhan_code, WS_EVENT_NO_DHAN_CODE);
+        assert_eq!(row.down_secs, 0, "a subscription change never closes a gap");
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.subscription, swap_event().detail);
+        assert_eq!(row.feed, tickvault_common::feed::Feed::Dhan);
+    }
+
+    #[test]
+    fn an_overflow_park_row_carries_the_805_code() {
+        let event = WsSubscriptionAuditEvent {
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: 3,
+            kind: WsEventKind::OverflowParked,
+            reason: "pool_overflow",
+            dhan_code: Some(805),
+            detail: WsSubscriptionDetail {
+                held: Some(4_200),
+                ..WsSubscriptionDetail::NONE
+            },
+        };
+        let row = subscription_row(event, 1_700_000_000_000_000_000);
+        assert_eq!(row.ws_type, WsType::MainFeed);
+        assert_eq!(row.dhan_code, 805);
+        assert_eq!(row.subscription.held, Some(4_200));
+        assert!(row.subscription.instrument.is_none());
+    }
+
+    #[test]
+    fn the_subscription_row_trading_date_is_the_events_own_ist_day() {
+        let nanos_per_day = 86_400_i64 * 1_000_000_000;
+        let midnight = 1_700_000_000_000_000_000_i64 - 1_700_000_000_000_000_000 % nanos_per_day;
+        let late = midnight + nanos_per_day - 1;
+        let row = subscription_row(swap_event(), late);
+        assert_eq!(row.event_ts_ist_nanos, late);
+        assert_eq!(row.trading_date_ist_nanos, midnight);
+    }
+
+    #[test]
+    fn the_stamp_is_strictly_increasing_even_when_the_clock_stalls_or_steps_back() {
+        let mut stamp = StrictStamp::new();
+        assert_eq!(
+            stamp.next(1_000),
+            1_000,
+            "the first stamp is the clock itself"
+        );
+        assert_eq!(
+            stamp.next(1_000),
+            1_001,
+            "a stalled clock still advances one ns"
+        );
+        assert_eq!(stamp.next(1_000), 1_002);
+        assert_eq!(
+            stamp.next(500),
+            1_003,
+            "a backward step never moves the stamp back"
+        );
+        assert_eq!(stamp.next(5_000), 5_000, "a clock ahead of the stamp wins");
+        let mut previous = i64::MIN;
+        for now in [7, 7, 6, 9, 9, 9, 3, 20] {
+            let next = stamp.next(now);
+            assert!(next > previous, "stamp {next} did not pass {previous}");
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn the_stamp_saturates_rather_than_wrapping_at_the_top_of_the_range() {
+        let mut stamp = StrictStamp::new();
+        assert_eq!(stamp.next(i64::MAX), i64::MAX);
+        assert_eq!(
+            stamp.next(i64::MAX),
+            i64::MAX,
+            "saturates, never wraps negative"
+        );
+    }
+
+    #[test]
+    fn a_dropped_subscription_row_is_loud_once_per_episode() {
+        let latch = DropLatch::new();
+        let event = swap_event();
+        assert!(!record_forward_ok(&latch, &event));
+        assert!(record_forward_drop(&latch, &event, "full"));
+        assert!(!record_forward_drop(&latch, &event, "full"));
+        assert!(record_forward_ok(&latch, &event));
+    }
+
+    /// The forwarder is the only production installer, so a source scan pins
+    /// that it installs the channel and writes the rows (the spawn wrapper
+    /// itself needs a runtime and a database).
+    #[test]
+    fn the_forwarder_installs_the_subscription_channel_and_writes_its_rows() {
+        let src = include_str!("ws_audit_consumer.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(prod.contains("install_subscription_audit(sub_tx)"));
+        assert!(prod.contains("maybe = sub_rx.recv(), if sub_open =>"));
+        assert!(prod.contains("subscription_row(event, stamp.next(now_ist_nanos()))"));
+        assert!(prod.contains("let now_ist_nanos = stamp.next(now_ist_nanos());"));
     }
 }

@@ -1,0 +1,4 @@
+security_id,segment,tick_paise,lot_size,symbol
+2885,NSE_EQ,5,1,RELIANCE-TEST
+1333,NSE_EQ,5,1,HDFCBANK-TEST
+49081,NSE_FNO,5,25,NIFTY-TEST-CE

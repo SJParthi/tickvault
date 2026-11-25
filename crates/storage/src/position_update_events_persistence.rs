@@ -148,9 +148,14 @@ const POSITION_UPDATE_EVENTS_COLUMNS: &[(&str, &str)] = &[
 /// HTTP-CLIENT-01-class consequence: a failed ensure leaves the table to be
 /// auto-created by the first ILP write WITHOUT dedup (a duplicate-row
 /// window until a later ensure succeeds).
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested; the 200/500/unreachable arms exercised via the mock-HTTP tokio tests below)
 // FINANCIAL-TEST-EXEMPT: idempotent DDL runner — no financial arithmetic
-pub async fn ensure_position_update_events_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_position_update_events_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -171,7 +176,7 @@ pub async fn ensure_position_update_events_table(questdb_config: &QuestDbConfig)
                  table not ensured (first ILP write may auto-create it WITHOUT \
                  dedup — duplicate-row window until the next successful boot)"
             );
-            return;
+            return false;
         }
     };
     let mut statements = vec![position_update_events_create_ddl()];
@@ -186,14 +191,16 @@ pub async fn ensure_position_update_events_table(questdb_config: &QuestDbConfig)
         "ALTER TABLE {POSITION_UPDATE_EVENTS_TABLE} DEDUP ENABLE UPSERT \
          KEYS({DEDUP_KEY_POSITION_UPDATE_EVENTS});"
     ));
-    for ddl in &statements {
+    let dedup_index = statements.len().saturating_sub(1);
+    let mut keyed = false;
+    for (index, ddl) in statements.iter().enumerate() {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => keyed |= index == dedup_index,
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -220,6 +227,7 @@ pub async fn ensure_position_update_events_table(questdb_config: &QuestDbConfig)
             }
         }
     }
+    keyed
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -246,6 +254,14 @@ impl PositionUpdateEventsWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_position_update_events_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed this writer's failure series — see the module note on why a
+        // built handle is not a published sample.
+        for stage in ["ensure_client_build", "ensure_ddl"] {
+            metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => stage)
+                .increment(0);
+        }
+        metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "position")
+            .increment(0);
         let conf = position_update_events_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -416,6 +432,27 @@ impl PositionUpdateEventsWriter {
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
+        //
+        // This increments when the row enters the BUFFER, before any flush. A
+        // failed flush discards the batch, so on a bad day this reads a number
+        // of rows the table does not contain. That is not hypothetical: on
+        // 2026-08-25 a disk-full session left this at 6 with the table EMPTY,
+        // and the operator found out by asking why his order was missing.
+        //
+        // The truth is derivable and the arithmetic is the point:
+        //   acked = <this> - <the *_rows_discarded_total sibling>
+        // Every failure path routes through `discard_pending`, which counts
+        // what it drops (pinned for every writer in the crate by
+        // `ilp_overflow_bound_guard::every_flushing_writer_declares_its_failure_treatment`),
+        // so the subtraction always closes.
+        //
+        // Deliberately NOT moved to the flush-success arm: this counter carries
+        // a per-row LABEL that a batch-sized increment at ack time cannot
+        // preserve, and re-pointing a live series at a different quantity makes
+        // its history incomparable across the change. Recording what it means
+        // is the honest fix; a second acked series is an operator decision with
+        // its own CloudWatch cost line.
         metrics::counter!("tv_position_update_events_rows_total", "feed" => r.feed.as_str())
             .increment(1);
         Ok(())
@@ -467,10 +504,17 @@ impl PositionUpdateEventsWriter {
 
     /// Drop every buffered-but-unflushed row (poisoned-buffer defense).
     /// Returns the discarded row count; counted so a discard is never silent.
+    ///
+    /// The `kind` label is what separates this from the ORDER writer, which
+    /// increments the same counter name. Without it a lost POSITION capture is
+    /// indistinguishable from a lost order capture in CloudWatch — and the two
+    /// have different causes and different triage. The label folds to `{host}`
+    /// in the EMF processor, so the alarm still fires on either; the label
+    /// survives in the log line, which is where triage reads it.
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_order_update_events_rows_discarded_total")
+            metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "position")
                 .increment(dropped as u64);
         }
         self.buffer.clear();
@@ -491,7 +535,7 @@ mod tests {
     fn sample_record() -> PositionUpdateEventRecord {
         PositionUpdateEventRecord {
             ts_ist_nanos: 1_770_000_900_000_000_000,
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             event_seq: 7,
             symbol_isin: "INE002A01018".to_string(),
             security_id: -1,
@@ -565,7 +609,7 @@ mod tests {
         assert_eq!(w.pending(), 1);
         let line = w.buffer_utf8();
         assert!(line.starts_with(POSITION_UPDATE_EVENTS_TABLE));
-        assert!(line.contains(",feed=groww"), "feed tag: {line}");
+        assert!(line.contains(",feed=truedata"), "feed tag: {line}");
         assert!(
             line.contains(",symbol_isin=INE002A01018"),
             "symbol_isin tag: {line}"
@@ -736,18 +780,27 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_position_update_events_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_position_update_events_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_position_update_events_table(&mock_cfg(port)).await,
+            "200 everywhere reads keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_position_update_events_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_position_update_events_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_position_update_events_table(&mock_cfg(port)).await,
+            "a refused DDL must not read keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_position_update_events_table_unreachable_degrades_without_panic() {
-        ensure_position_update_events_table(&unreachable_cfg()).await;
+        assert!(
+            !ensure_position_update_events_table(&unreachable_cfg()).await,
+            "unreachable must not read keyed"
+        );
     }
 
     #[tokio::test]

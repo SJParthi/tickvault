@@ -46,38 +46,82 @@ fn src(rel: &str) -> String {
 /// LIVE authority for the Groww futures leg (the rest of the file is dated
 /// historical audit per its 2026-07-13 retirement banner).
 fn rule_file_body() -> String {
-    let path =
-        repo_root().join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md");
+    let path = repo_root()
+        .join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {} failed: {e}", path.display()))
 }
 
+/// Quote 44 (2026-10-28): the daily `instrument_lifecycle` /
+/// `instrument_lifecycle_audit` write STOPPED and both tables are frozen as
+/// history. This test used to pin the bulk ILP writers; it now pins that no
+/// writer, DDL or UPDATE exists in the module, so one cannot come back
+/// without a fresh dated quote (and an edit here).
 #[test]
-fn lifecycle_persistence_uses_ilp_not_exec_url() {
-    let body = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+fn lifecycle_persistence_has_no_writer_after_quote_44() {
+    let body_src = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+    let body = production_part(&body_src);
+    for banned in [
+        "pub async fn append_instrument_lifecycle_rows",
+        "pub async fn append_instrument_lifecycle_audit_rows",
+        "pub async fn ensure_instrument_lifecycle_table",
+        "pub async fn ensure_instrument_lifecycle_audit_table",
+        "Sender::from_conf",
+        "CREATE TABLE",
+        "INSERT INTO",
+    ] {
+        assert!(
+            !body.contains(banned),
+            "instrument_lifecycle_persistence must not write (Quote 44): found `{banned}`"
+        );
+    }
+    // The identifier surface the keep-forever / retention / rebuild / wipe
+    // lists rely on must stay.
     assert!(
-        body.contains("pub async fn append_instrument_lifecycle_rows")
-            && body.contains("pub async fn append_instrument_lifecycle_audit_rows"),
-        "storage must expose the bulk lifecycle/audit append fns"
+        body.contains("pub const QUESTDB_TABLE_INSTRUMENT_LIFECYCLE: &str = \"instrument_lifecycle\";")
+            && body.contains(
+                "pub const QUESTDB_TABLE_INSTRUMENT_LIFECYCLE_AUDIT: &str = \"instrument_lifecycle_audit\";"
+            ),
+        "the frozen tables' name constants must stay"
     );
-    // The bulk writers MUST ingest via QuestDB ILP (port 9009) — the real
-    // ingestion pipe, like ticks/candles — NOT the /exec SQL/URL door. The
-    // /exec URL query string is capped by QuestDB's request buffer and
-    // overflowed at the ~79K-row F&O master (the "79190 write error(s)" /
-    // "connection closed" boot halts, 2026-05-29). ILP has no URL limit.
+    // And the rule file must carry the dated decision.
     assert!(
-        body.contains("build_ilp_conf_string")
-            && body.contains("Sender::from_conf")
-            && body.contains("build_lifecycle_ilp_row")
-            && body.contains("build_lifecycle_audit_ilp_row"),
-        "bulk lifecycle/audit writes must go through ILP (Sender/Buffer), not /exec URL"
+        rule_file_body().contains("THE DAILY `instrument_lifecycle` WRITER STOPS"),
+        "Quote 44 must be recorded in the daily-universe rule file"
     );
-    // Regression: the old size-bounded /exec SQL path MUST be gone — its
-    // presence means someone reverted ILP back to the URL door.
+}
+
+/// Audit QDB-2 (2026-10-11): the SEBI never-delete writers (lifecycle,
+/// lifecycle audit, index constituency) must use ILP over HTTP, which waits
+/// for QuestDB's answer on every flush. TCP ILP gets no reply: a refused line
+/// closed the socket while `flush()` still returned `Ok`, so the caller logged
+/// success for rows that were never stored.
+#[test]
+fn sebi_master_writers_use_acknowledged_http_ilp() {
+    // Production code only: each file's own test module quotes the same
+    // call line, so it is cut off before counting.
+    let lifecycle_src = src("crates/storage/src/instrument_lifecycle_persistence.rs");
+    let constituency_src = src("crates/storage/src/index_constituency_persistence.rs");
+    let lifecycle = production_part(&lifecycle_src);
+    let constituency = production_part(&constituency_src);
     assert!(
-        !body.contains("build_size_bounded_inserts")
-            && !body.contains("LIFECYCLE_INSERT_MAX_SQL_BYTES"),
-        "the /exec URL batch path must stay deleted — bulk writes are ILP-only"
+        lifecycle.contains("pub(crate) fn sebi_master_ilp_http_conf")
+            && lifecycle.contains("\"http::addr={}:{};protocol_version=1;"),
+        "the shared SEBI ILP conf must be HTTP"
     );
+    assert!(
+        constituency.contains("sebi_master_ilp_http_conf(questdb_config)"),
+        "the constituency bulk writer must use the HTTP ILP conf"
+    );
+    for (name, body) in [("lifecycle", lifecycle), ("constituency", constituency)] {
+        assert!(
+            !body.contains(concat!("build_ilp_", "conf_string")),
+            "{name}: the TCP ILP conf builder must not come back"
+        );
+        assert!(
+            !body.contains(concat!("tcp", "::addr")),
+            "{name}: a SEBI writer must never use unacknowledged TCP ILP"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,4 +306,11 @@ fn futidx_scope_legacy_gate_still_false() {
          operator retirement directive 2026-07-13); found it recreated at {}",
         path.display()
     );
+}
+
+/// The part of a source file above its `#[cfg(test)] mod tests` block.
+fn production_part(body: &str) -> &str {
+    body.split("\n#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap_or(body)
 }

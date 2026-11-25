@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ab5a39dd7f5b1689fb3268a9837cca2dea9cb211e2fe8387f85e75c948057294 # shrinks to rows = [RowSpec { name: Some("a"), suspended: Some(false), suspended_as_string: false, writer_txn: None, sequencer_txn: None, malformed: true }]
+cc 2c8fce3f6814fb3bc0560666240c55c0121c89eb8caffcc4dfa3b0927812a93d # shrinks to rows = [RowSpec { name: Some("_"), suspended: Some(false), suspended_as_string: false, writer_txn: None, sequencer_txn: None, malformed: false }], a = 1, b = 0

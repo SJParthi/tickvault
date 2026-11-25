@@ -1,16 +1,16 @@
-//! FNV-1a 64-bit signature hash — BIT-EXACT port of server.py's
+//! FNV-1a 64-bit signature hash — BIT-EXACT port of the retired reference implementation's
 //! `_signature_hash` (which itself mirrors the Rust summary_writer).
 //! Feed order: `code`, `"|"`, `target`, `"|"`, first-160-CHARS of message
 //! (UTF-8 bytes of each part).
 
-use crate::pycompat::py_slice_chars;
+use crate::legacy_compat::legacy_slice_chars;
 
 const FNV_OFFSET: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 
 /// 16 lowercase hex chars, identical to the legacy + summary_writer hash.
 pub fn signature_hash(code: Option<&str>, target: &str, message: &str) -> String {
-    let truncated = py_slice_chars(message, 160);
+    let truncated = legacy_slice_chars(message, 160);
     let mut h = FNV_OFFSET;
     let parts: [&[u8]; 5] = [
         code.unwrap_or("").as_bytes(),
@@ -32,7 +32,7 @@ pub fn signature_hash(code: Option<&str>, target: &str, message: &str) -> String
 mod tests {
     use super::*;
 
-    /// Golden vectors generated from the LIVE server.py on 2026-07-18:
+    /// Golden vectors generated from the LIVE the retired reference implementation on 2026-07-18:
     /// the legacy interpreter one-liner: `import server; server._signature_hash(...)` — see the
     /// PR 2c parity evidence. Bit-exactness is the load-bearing contract
     /// (list_novel_signatures / signature_history join on this hash).

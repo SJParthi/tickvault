@@ -207,6 +207,36 @@ for FINNIFTY + MIDCPNIFTY starting at 15:45 IST, post-market close.
 - Empty/missing/wrong token = 401 Unauthorized
 - Test: all `api_auth::tests::*`
 
+> **⚠ CORRECTED 2026-10-11 — the token does not come from `TV_API_TOKEN`.** It is
+> read only from SSM `/tickvault/<env>/api/bearer-token`; there is no env-var
+> fallback (pinned by `test_main_rs_uses_ssm_only_no_env_fallback`). The line
+> above is kept as history.
+
+### 2026-10-11 Update — weak bearer token (audit SEC-9)
+
+- **The floor.** Boot and rotation share one shape gate
+  (`middleware::is_acceptable_bearer_token`): 32 to 512 characters, every one
+  visible ASCII (`!` to `~`, so bytes equal characters), and not one character
+  repeated. A value outside visible ASCII could never be sent in the header,
+  so it would have locked every client out.
+- **At boot** (`middleware::bearer_token_boot_verdict`, unit-tested in all five
+  outcomes): an empty or weak token REFUSES to boot in live mode. In paper mode
+  (the deployed setting) an empty token disables auth and a weak token keeps
+  auth ON with that weak token; each logs one coded GAP-SEC-01 `error!`, which
+  is log-sink-only (no page).
+- **What the boot error means:** the publicly funnelled API port is guarded
+  only by the weak token until SSM holds a better one. Fix:
+  `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString --overwrite`
+  with a random value of 32 or more visible ASCII characters. The reload loop
+  swaps it in within 5 minutes, no restart.
+- **The reload loop.** A re-read equal to the loaded token is `unchanged`, even
+  when that token is weak, so a weak boot token does not count `rejected` every
+  cycle. `rejected` (and its one edge-latched `warn!`) means SSM holds a
+  DIFFERENT value that fails the gate; auth stays on the loaded token.
+- **Honest limit:** paper mode still boots on a weak token. Refusing it there
+  too waits on the owner confirming the stored value passes the gate, so the
+  morning boot cannot be stopped by it.
+
 ### 2026-07-10 Update — 401-burst counter + CloudWatch pager (wave-2 #2)
 
 Every bearer-auth rejection (all 3 arms of `require_bearer_auth` — invalid
@@ -325,7 +355,7 @@ Tests: `order_observability::tests::test_reconcile_verdict_*`.
 - `OrderRateLimiter::new(0)` must panic (fail-fast at config time)
 - SEBI limit: max 10 orders/sec enforced via GCRA algorithm
 - Burst capacity exhausted → `OmsError::RateLimited` (no retry — regulatory risk)
-- `DailyRequestTracker`: 5,000 orders/day, 100,000 data API calls/day
+- ~~`DailyRequestTracker`: 5,000 orders/day, 100,000 data API calls/day~~ — **CORRECTED 2026-08-22: this type does not exist.** A workspace scan returns zero occurrences of `DailyRequestTracker` anywhere. `OrderRateLimiter::check` enforces the per-SECOND burst only; there has never been a daily order budget in this codebase, and two documents (this rule and the exit-order lockout) named one as the bound on the OMS order maps. Those maps are now bounded by `OrderManagementSystem::MAX_TRACKED_ORDERS` (25,000, refused at placement). **RESOLVED 2026-08-22 (same day): `OrderBudget` in `oms/rate_limiter.rs` now enforces the vendor.s OTHER THREE documented tiers — 250/min, 1000/hr, 7000/day — beside the existing per-second GCRA. The figures come from `docs/dhan-ref/07-orders.md` §9.2, which is also why the 5,000 in this row was wrong: the vendor publishes 7,000. Fixed-window counters, O(1) time and genuinely O(1) SPACE (three counters, independent of orders placed). All-or-nothing consumption, so a refusal burns no tier.**
 - Counter must NOT exceed limit (saturating decrement on rejection)
 - `reset()` clears all counters to 0
 - Test: all `rate_limiter::tests::*` + integration `oms_rate_limiter::*`
@@ -357,6 +387,7 @@ Tests: `order_observability::tests::test_reconcile_verdict_*`.
 - Only 807 (AccessTokenExpired) requires token refresh
 - Naming per annexure: 808=AuthenticationFailed, 809=AccessTokenInvalid, 810=ClientIdInvalid
 - Test: integration `ws_disconnect_codes::*`
+- **Note (2026-10-06, scope lock "808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS"):** the lines above describe the RAW code helpers `DisconnectCode::is_reconnectable()` / `requires_token_refresh()`, which have no production caller. Supervisor POLICY is `pool_supervisor::classify_disconnect`: 807 and 809 refresh the token and redial; 808 refreshes once and redials, and parks only when the refreshed token is rejected too (or a cap trips); 806 and 810 park; 805 parks for the overflow probe; 804 takes one respawn.
 
 ## WS-GAP-02: Subscription Batching
 - `build_subscription_messages()` must clamp batch_size to [1, 100]
@@ -414,6 +445,21 @@ emit). Ratchet:
 - `reset()` clears all tracking state
 - Test: integration `risk_tick_gap::*`
 
+### 2026-11-11 note — the live silent-instrument page pages only real feed trouble
+
+Owner card "Only real feed trouble (Recommended)" (noise lock §2.19). The live
+lane's 30 s silence scan (`dhan_feed_stack.rs`, `silence_warrants_page`) now
+pages `RISK-GAP-03` only when at least 1% of tracked instruments are quiet
+together (`silence_page_floor`, `ceil(tracked / 100)`, at least 1) or a
+never-ticked instrument is new this session. Below that, the episode is one
+coded `warn!` (named instruments at `warn!` too), which the
+`errcode-risk-gap-03` filter (level ERROR only) never pages. Gauges, the
+2-scan confirmation and the 30-minute cooldown are unchanged. Evidence: on
+2026-11-11 seven pages each named 1 to 3 of 19,868 slow `NSE_EQ` stocks,
+`never_ticked = 0`. Tests: `test_silence_page_floor_is_one_percent_rounded_up_and_at_least_one`,
+`test_regression_silence_warrants_page_ignores_a_few_slow_stocks`,
+`test_regression_a_reported_never_ticked_set_does_not_lift_a_slow_stock_over_the_floor`.
+
 ---
 
 # Auth Gap Enforcement
@@ -428,6 +474,7 @@ emit). Ratchet:
 - Only `DisconnectCode::AccessTokenExpired` (807) triggers token refresh
 - All other codes do NOT trigger token refresh
 - Test: integration `ws_disconnect_codes::test_only_807_requires_refresh`
+- **Note (2026-10-06):** this mapping is the raw helper `requires_token_refresh()` (no production caller). The live socket supervisor (`classify_disconnect`) refreshes on 807 and 809, and on a first 808 (once; a second rejection of the refreshed token parks). See the WS-GAP-01 note.
 
 ---
 

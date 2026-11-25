@@ -30,13 +30,18 @@ fn test_<module>_<function>_<scenario>_<expected_outcome>()
 
 ## Coverage Thresholds
 - Single source of truth: `quality/crate-coverage-thresholds.toml` — ratcheted
-  per-crate LINE-coverage floors (app 63.3 · core 90.2 · storage 90.1 ·
-  trading 96.9 · api 98.6 · common 99.5 · default 63.0). Floors only move up
+  per-crate LINE-coverage floors (app 86.4 · core 94.5 · storage 93.7 ·
+  trading 97.1 · api 98.6 · common 99.4 · default 63.0; raised 2026-11-13, B3;
+  test code inside src counts as covered in these, so a second check floors
+  production-only coverage from the `[production]` table). Floors only move up
   (`coverage_threshold_lockdown.rs` ratchet); 100% remains the target.
   (storage 91.2 → 90.1 on 2026-07-17: truthful re-baseline after the stage-2
   dead-WS sweep deleted ~12K LoC of heavily-tested dead tick-chain code —
   measured 90.26% on PR #1631; dated record in the TOML + the lockdown test.)
-- Enforced post-merge by `scripts/coverage-gate.sh` (CI job `coverage-and-perf`);
+- ~~Enforced post-merge by `scripts/coverage-gate.sh` (CI job `coverage-and-perf`);~~
+  **⚠ CORRECTED 2026-10-11:** enforced on every PR by `scripts/coverage-gate.sh`
+  (CI job `coverage-and-perf`, which is in the `all-green` needs list, so a floor
+  breach blocks merge), and again on the merge commit;
   `make coverage` runs the SAME per-crate gate locally.
 
 ## Required Test Types (22 Categories — Mechanical Enforcement, SCOPED)
@@ -101,7 +106,8 @@ These test types run weekly (Monday) in CI, not on every push:
 - Run for minimum 1 hour per target per week
 
 ### Loom Concurrency
-- `cargo test -p tickvault-core --features loom --test loom_tick_dedup`
+- `cargo test -p tickvault-core --features loom --test loom_activity_watchdog --test loom_ghost_register --test loom_ws_decoupling`
+- Each core loom file drives the REAL production type (audit H3, 2026-10-06); `loom_tick_dedup` was deleted because every model in it was a hand-written copy of code that no longer exists
 - Feature-gated: replaces std atomics with Loom mocks for exhaustive interleaving
 - NOT in standard `cargo test` — requires separate compilation
 

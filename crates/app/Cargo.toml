@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "tickvault"
 path = "src/main.rs"
 
+[[bin]]
+name = "tv-movers"
+path = "src/bin/tickvault_operator_read.rs"
+
 [dependencies]
 tickvault-common = { path = "../common" }
 tickvault-core = { path = "../core" }
@@ -20,7 +24,17 @@ tickvault-trading = { path = "../trading" }
 tickvault-storage = { path = "../storage" }
 tickvault-api = { path = "../api" }
 tokio = { workspace = true }
-governor = { workspace = true }
+papaya = { workspace = true }
+# ahash: the faster hasher for the per-tick maps (`PrevCloseStore`,
+# `SpotPriceStore`), audit plan PR10. Already a pinned workspace dep (core's
+# `TickGapDetector` uses it); no new crate enters the build.
+ahash = { workspace = true }
+# governor was removed 2026-09-17: its only app-crate user was
+# `dhan_data_api_limiter.rs`, the Data-API rate limiter for the per-minute
+# REST legs, deleted under the operator's sockets-only narrowing
+# (`no-rest-except-live-feed-2026-06-27.md` §12.11). It stays a pinned
+# workspace dep — `trading` (the OMS order rate limiter) and `api` (the
+# public-route guard) both still use it; only this crate stopped.
 axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -46,6 +60,13 @@ reqwest = { workspace = true }
 # the instance role already holds the permissions; ZERO IAM change).
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+# 2026-10-01 (audit D6c): `tickvault holiday-gate` stamps the holiday-stop
+# marker (SSM), pages the operator (SNS) and stops this instance (EC2), the
+# three AWS CLI calls the shell gate made. All three are existing workspace
+# pins; ssm and sns were already in this binary through tickvault-core.
+aws-sdk-ec2 = { workspace = true }
+aws-sdk-sns = { workspace = true }
+aws-sdk-ssm = { workspace = true }
 # Event-driven (zero-poll) file watching for the Groww bridge tick-file tail
 # (operator 2026-06-28: "true zero latency, no polling"). Same crate + pin the
 # strategy hot-reloader uses (`crates/trading/src/strategy/hot_reload.rs`) —
@@ -66,6 +87,14 @@ tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 dhat = { workspace = true }
 
+# Depth-20 steering (2026-08-26): the operator's standing ask is every
+# permutation of exception and condition, and hand-written cases cannot
+# reach that set — three defects in this module were found by attacking its
+# output, not by enumerating shapes. proptest generates the combinations
+# nobody wrote down. An existing workspace pin used by core/trading/storage
+# already, so no new dependency root.
+proptest = { workspace = true }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (and its sha2
 # optional dep) was DELETED with the Dhan instrument-download chain
@@ -77,11 +106,46 @@ default = []
 # order/position PUSH channel + the common-side gate/config surface so the
 # Stage D app consumer (`groww_order_observability`) can compile. NEVER in
 # `default` — a default build carries no Groww order code.
-groww_orders = ["tickvault-trading/groww_orders", "tickvault-common/groww_orders"]
 
 [[bench]]
 name = "order_gate"
 harness = false
 
+[[bench]]
+name = "live_fill"
+harness = false
+
+[[bench]]
+name = "feed_drain"
+harness = false
+
+[[bench]]
+name = "order_path"
+harness = false
+
+# The per-tick side stores on the frame drain (plan ITEM DT, 2026-10-30),
+# each with a p99 gate.
+[[bench]]
+name = "spot_price_store"
+harness = false
+
+[[bench]]
+name = "backup_dedup"
+harness = false
+
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "clap", "signal-hook"]
+ignored = ["clap", "signal-hook"]
+
+# Explicit name so the documented invocation works. Cargo derives a bin name
+# from the FILE name, giving `tv_guarantees`, while this binary's own docs --
+# and every operator-facing mention of it -- say `tv-guarantees`. A tool whose
+# documented command errors out is a tool nobody runs twice.
+[[bin]]
+name = "tv-guarantees"
+path = "src/bin/tv_guarantees.rs"
+
+# Plan item LF-8 (2026-11-12): the offline live-fill replay. Paper only, never
+# on the live path; see `src/live_fill/replay/mod.rs`.
+[[bin]]
+name = "tv-live-fill-replay"
+path = "src/bin/tv_live_fill_replay.rs"

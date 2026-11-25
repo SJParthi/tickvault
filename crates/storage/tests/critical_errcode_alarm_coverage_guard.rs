@@ -112,13 +112,6 @@ const UNWIRED_ALLOWLIST: &[(&str, &str)] = &[
         "BLOCKED: Dhan-scoped (Dhan Data-API connection cap) — same §2/§3 noise-lock gate \
          as AUTH-GAP-01",
     ),
-    // --- Structurally un-emittable in a default build.
-    (
-        "GROWW-OCO-02",
-        "dormant-by-construction: compiled out by the non-default `groww_orders` cargo \
-         feature (Gate 2 of the groww-second-feed-scope §39 lattice), so an alarm would be \
-         a dead monitor until that feature ships",
-    ),
 ];
 
 // ---------------------------------------------------------------------
@@ -505,7 +498,7 @@ fn allowlist_never_grows() {
     // Shrinking ratchet. Covering a code = DELETE its row and lower this
     // number in the same PR. Raising it requires a stated reason in the
     // row itself and review sign-off.
-    const MAX_UNWIRED: usize = 7;
+    const MAX_UNWIRED: usize = 6;
     assert!(
         UNWIRED_ALLOWLIST.len() <= MAX_UNWIRED,
         "UNWIRED_ALLOWLIST grew to {} (ratchet ceiling {MAX_UNWIRED}) — this allowlist may \
@@ -564,7 +557,7 @@ fn no_emit_site_critical_codes_are_tracked_not_alarmed() {
     // gain an alarm (dead monitor), and the count is pinned so the set
     // cannot silently grow — a NEW no-emit Critical means someone deleted
     // an emit site without retiring the variant.
-    const MAX_NO_EMIT_CRITICAL: usize = 14;
+    const MAX_NO_EMIT_CRITICAL: usize = 13;
     let sources = collect_prod_rs_sources();
     let covered = covered_codes(&strip_hcl_comments(&read(
         "deploy/aws/terraform/error-code-alarms.tf",

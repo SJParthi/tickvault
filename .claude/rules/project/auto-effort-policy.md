@@ -42,6 +42,46 @@ with the `aws-budget.md` cost discipline).
 | 🔧 **Standard** | a focused change in one crate, a small bug fix, a single-file feature | normal reasoning, scoped tests, no full agent panel |
 | 🚀 **Heavy** | multi-crate or >1,000 LoC changes, hot-path / OMS / risk / auth / persist code, anything "must not break," **every PR before merge** | deep reasoning + adversarial 3-agent review (hot-path + security + hostile) per `operator-charter-forever.md` §E + `wave-4-shared-preamble.md` §3 |
 
+### Reasoning-effort levels per tier (operator 2026-10-26, permanent)
+
+Operator, 2026-10-26: *"based on the tasks difficulties fucntionalisties scneairosx even set the model effrots startign. low till max dude ... set this as the permantn solutions dude okay?"*
+
+Wherever a tool accepts an explicit reasoning effort (today: the Workflow
+tool's `agent(..., {effort})` option), Claude sets it from the task, not a
+single fixed value:
+
+| Effort | Use it for | Examples in this repo |
+|---|---|---|
+| `low` | mechanical, no judgement | listing files, counting lines, running a named test and pasting the result, formatting |
+| `medium` | one-file reading or a narrow check | summarising one module, checking one guard, a doc correction |
+| `high` | normal audit or a single-crate change | per-slice code audit, a fix inside one crate with its tests |
+| `xhigh` | risky or cross-cutting | hot path, WAL/persistence, WebSocket reconnect, auth, OMS, money arithmetic, any change touching >3 crates |
+| `max` | the final word on a claim that will be relied on | adversarial verification of a critical finding, the judge in a panel, a "never loses a tick" proof |
+
+Honest limits (Verified 2026-10-26): the Agent tool and cloud-session
+creation (`create_session`) take no effort parameter, so those inherit the
+session's effort; the session-wide level is the user's `/effort` setting.
+For those, Claude scales effort through the prompt (scope, required proof,
+number of verifiers) instead. Cost guard unchanged: never `xhigh`/`max` on
+`low` work.
+
+### Usage guard: model tier and concurrency (operator 2026-10-26, permanent)
+
+Operator, 2026-10-26: *"bro why the usage is becoming massive dude ... take care of this effort models starting low till max dude always"*.
+Measured that day: 35 Opus cloud sessions at once, each fanning out 4-6
+sub-agents plus 2 verifiers per finding, took the 5-hour plan limit from
+40% to 69% in about three minutes. Every agent also starts with about
+250,000 tokens of auto-loaded rules (`first_request_input_tokens: 251,905`
+in a cloud session log), so agent COUNT is the main cost multiplier.
+
+| Lever | Rule |
+|---|---|
+| Model | **Opus 5.5 only, always** (operator 2026-10-26: *"never evr use haiku dude always sue opus 5.5 alpne only"*). Never Haiku or Sonnet, for any task, session, sub-agent or workflow agent. Cost is controlled by effort level and agent count, never by a cheaper model. |
+| Effort (Workflow `agent()` only) | low / medium / high / xhigh / max per the table above |
+| Concurrency | At most 5 cloud sessions running at once; fan-out inside a session at most 4 sub-agents |
+| Budget check | Before any fan-out larger than 5 agents, ask for or check the plan usage. Above 60% of the 5-hour limit: pause new fan-out and resume after the reset. |
+| Prompt size | Name the exact files and lines in each brief so agents do not re-read whole crates |
+
 **Token-aware guardrail:** never burn Heavy effort on Light work. The 3-agent
 panel is reserved for the Heavy tier (the charter already mandates it there).
 

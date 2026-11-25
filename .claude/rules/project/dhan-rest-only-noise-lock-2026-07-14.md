@@ -1,344 +1,66 @@
-# Dhan REST-Only Noise Lock — Operator Lock 2026-07-14
+# Dhan REST-Only Noise Lock — Operator Lock 2026-07-14 — SUMMARY STUB
 
-> **Authority:** CLAUDE.md > `operator-charter-forever.md` §D/§F >
-> `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §A.1 (the
-> 2026-07-14 subsection recording the same quote) >
-> `no-rest-except-live-feed-2026-06-27.md` §8 (the retained spot-1m +
-> option-chain grant) > this file > defaults.
-> **Scope:** PERMANENT. Every PR, every branch, every future Claude/Cowork
-> session.
-> **Operator-locked:** 2026-07-14 (verbatim quote below).
-> **Auto-load trigger:** Always loaded (path is in `.claude/rules/project/`).
+> **Full text:** `docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md` (moved verbatim 2026-09-26 to keep the auto-loaded context small). **Read the full file before adding, removing, rewording or re-routing ANY Dhan-scoped Telegram page, `NotificationEvent`, `error_code_alerts` entry, CloudWatch alarm, metric filter or EMF metric — and before any change with CloudWatch/AWS cost impact.** It holds the contract table (§2 and §2.1/§2.2), the live-lane family (§2.3 and its addenda), the dated COST NOTES / CORRECTED / MEASURED budget sections, and §2.4–§2.8. It is a dated log; later sections supersede earlier ones. Where this summary and the full file differ, the full file wins. Guards (`live_lane_paging_lockstep_guard.rs`, `dhan_exit_order_lockout_guard.rs`) read the FULL file.
 
----
+**Authority:** CLAUDE.md > `operator-charter-forever.md` §D/§F > `websocket-connection-scope-lock.md` "2026-07-13 Amendment" §A.1 > `no-rest-except-live-feed-2026-06-27.md` > this file > defaults. **Scope:** PERMANENT.
 
-## §0. The verbatim operator demand (preserve exactly, do not paraphrase — expletives included)
+**Operator quote (2026-07-14):** "for Dhan except spot 1m and option chain nothing else should work… these fucking issues of mid profile and all other fucking issues of Dhan should be entirely removed… always make the telegram messages/notifications cleaner, always mention precisely which broker."
 
-**Quote (2026-07-14, relayed verbatim via the coordinator session):**
+**The rule (§1):** only an enumerated set of Dhan-scoped Telegram alerts may ever fire; every other Dhan-era page, probe, watchdog Telegram and dead alarm is deleted or silenced; "the token machinery self-heals SILENTLY."
 
-> "for Dhan except spot 1m and option chain nothing else should work… these
-> fucking issues of mid profile and all other fucking issues of Dhan should be
-> entirely removed… always make the telegram messages/notifications cleaner,
-> always mention precisely which broker."
+**Current allowed set:**
+- Families (1) spot-1m and (2) option-chain — **RETIRED 2026-09-17 (§2.4)**; their producers were removed by the SOCKETS-ONLY narrowing.
+- (3) token could not be obtained — `AuthenticationFailed` / `TokenRenewalFailed` (Critical).
+- (4) `tv-<env>-token-remaining-low` CloudWatch 4h early warning.
+- (§2.2) the cadence expiry cross-broker DISAGREEMENT page.
+- (5, §2.3, 2026-08-14) LIVE-LANE INTEGRITY alarms (lane down, ticks dropped, socket parked, drain respawn cap, and later dated rows). Latency is dimensioned "per WebSocket connection — 16 fixed slots — never per instrument" (cost: per-instrument metrics would trip the budget kill-switch).
+- (§2.5, 2026-09-24) the three `ws-gap-03-xverify-{vacuous,failed,diverged}` alarms, restored with the 1-minute cross-verification. (2026-10-06 note: `xverify_failed` gains `reason` values `marker_not_written` and `audit_rows_lost`; no new alarm, filter, source or page. 2026-10-06 51d note: four readiness `reason` values and two unfiltered warn sources, `xverify_attempt_not_ready` and `xverify_unsettled_final`; no new page. 2026-10-30 51e-g note, owner card "Yes, add the 4 reasons (Recommended)": four coverage `reason` values `coverage_short`, `coverage_unknown`, `fallback_universe`, `worker_never_reported` on the existing page, at most once a day; no new alarm, filter, source or page.)
+- (§2.6, 2026-09-25) `dhan-feed-delay-high`, `dhan-main-reconnect-slow`, `dhan-depth-new-contract-blank` — `notBreaching`, no `ok_actions`, no per-connection/per-instrument dimension.
+- (§2.6-iv, 2026-11-06, owner card "Index feed only (Recommended)") `dhan-feed-delay-high` reads `tv_dhan_ws_lag_max_ms_by_class` with `class = "index_spot"` only (one EMF series from a second declaration; stock options dashboard-only), and only NEW trades are lag samples (never the first packet after a subscribe, a stale regression or a repeat). Statistic, threshold, periods, `notBreaching` and no `ok_actions` unchanged.
+- (§2.16, 2026-11-06, owner card "Yes, quieter (Recommended)") NO new page: `questdb-disconnected` fires on 3 bad minutes out of 5 (`evaluation_periods = 5`, `datapoints_to_alarm = 3`); `errcode-risk-gap-03` period 3600 → 300 s, so it clears 5 minutes after the condition ends (30-minute emit cooldown and `ok_recovery = false` unchanged). Honest limit: the cooldown covers the per-instrument silence page only; the dead-class report (once per class per episode) and the detector-blind line (once per process) can page separately.
+- (§2.7, 2026-09-27) `errcode-aggregator-stall-01` — the live feed waited at least 1 s on a stalled disk while writing a refused candle itself; at most one line a minute, no `ok_actions`, ungated.
+- (§2.8, 2026-10-02, owner-approved "go ahead approved everyhtign dude okay?") `errcode-hot-path-stall-01` — in session, a tokio runtime or the frame drain made no progress for 2 s, or one hot-path step took 2 s; edge-triggered per signal, at most one line a minute, no `ok_actions`, 09:00–15:40 IST only.
+- (§2.9, 2026-10-04, owner tapped "Page me" on the data-at-risk card) five pages over ten counters: `cold-backup-failing` (2 of 3 × 900 s), `disk-kept-not-backed-up`, `order-update-dropped`, `log-lines-dropped`, `feed-thread-wrote-to-disk` — `notBreaching`, no `ok_actions`, `host` dimension only, every counter registered at 0 at boot. (§2.9-i, 2026-10-10, a narrowing: log-lines-dropped is to read only the shipped sinks `app_log` + `errors_jsonl`, through a metrics-log filter into `tv_log_lines_dropped_shipped_total`; the filter lands first, the alarm switches only after a measured match.)
+- (§2.10, 2026-10-05, owner tapped "Turn on" on the H1/N3 card) six loss-group pages over 55 counters through `/metrics` log filters (no EMF name): `market-data-refused`, `subscription-coverage-lost`, `audit-rows-lost`, `durability-sync-failing` (2 of 3 × 300 s), `order-path-dropped`, `safety-bound-or-monitor-blind` — `notBreaching`, no `ok_actions`, `host` dimension only, one `tv_loss_*` derived metric per group, every counter registered at 0 at boot.
+- (§2.10-a, 2026-10-11, owner tapped "Logs and alarms" on the card "Prepare which AWS cost changes from the audit as code?", option "I write the S3 log export and fold the uncovered counters into the existing loss pages; no standby.") NO new page: 14 more counters join five of the six §2.10 groups (69 counters, 75 of the 100 filters on the metrics log group, kept at or under 95), each registered at 0 at boot. The app and Lambda log groups are copied to the cold bucket under `logs/` by two Firehose streams. That copy is a data copy, not a page: no alarm, no Telegram, and its role can delete nothing. (2026-10-22, plan item 62: the four `top_volume` counters left with their writer, so 65 counters.)
+- (§2.12, 2026-10-06, owner "Go ahead with whatever you want dude" / "See do everything whatever is recommended dude okay?", and 2026-10-10 "Why idle go ahead fully") an 808 refreshes the token once before it parks: `dhan-socket-parked` now fires on 808 only at the terminal park (definition, `host` dimension and no `ok_actions` unchanged; description text only); the family-(3) body from `force_renewal_unless_replaced` names 807, 808 or 809 and still names Dhan; a healed main-feed 808 can still trip `dhan-main-reconnect-slow` like 807; no new alarm, page, EMF name or filter (`reason="auth_rejected"` rides the reconnect counter; `tv_token_renew_failure_reused_total` is Prometheus only).
+- (§2.13, 2026-10-10, owner: "Go ahead with whatever you want dude" / "See do everything whatever is recommended dude okay?" (2026-10-06) / "Why idle go ahead fully" (2026-10-10)) NO new page: per-kind frame-silence redials (main 60 s / depth-20 90 s with two live siblings, depth-200 900 s backstop + cross-feed check, shadow by default) leave `dhan-worst-socket-deaf` (600 s) and `dhan-main-reconnect-slow` (15,000 ms) unchanged; the four new series are local `/metrics` only.
+- (§2.14, 2026-10-22, operator Quote 37 "remove alarms that watch switched-off parts … 127 → about 60", review in `docs/audits/2026-10-alarm-review.md`) REMOVED: `depth-steering-stalled`, `depth-rescue-abandoned`, `dhan-depth-new-contract-blank`, `errcode-ws-gap-02-swap-emptied-socket` (§2.3m) (depth switched off 2026-10-21) and `order-fill-lag-high` (no emit site, disarmed); the depth-account minter's errors alarm is GATED on `dhan_depth_account_enabled`; four depth names leave the EMF selector. So §2.6 now carries two pages, not three.
 
----
+- (§2.15, 2026-10-30, owner: "go ahead and fix the muhurat risk dude") NO new page: on a calendar Muhurat date (`config/base.toml` `[[trading.muhurat_trading_dates]]`, the one source) the market-hours gate gets one dated open at session start + 20 min and one dated close at the session end, arming `ALARM_NAMES` less the three weekday-only did-it-run alarms (`skip_alarms`, subset only). REJECT: a new family, page, filter or EMF name; arming on an ordinary weekend or holiday or by a weekly cron; arming the did-it-run alarms on a Muhurat date; opening earlier than start + 20 min. Note (2026-11-11, Quote 53, §2.21): two of the three did-it-run alarms were removed, so the skip list holds only `boot-heartbeat-gate-not-invoked` (KEPT); every did-it-run alarm left in `ALARM_NAMES` must still be skipped.
+- (§2.17, 2026-11-08, owner card "Quiet on planned restarts (Recommended)": "Only the planned evening restart logs it quietly (still counted and visible in logs). Any other start that hits the limit still pages you, and a real data problem always pages.") NO new page: `WS-SPILL-01` `replay_frame_cap` on a boot the evening drain marked as its own planned restart (one boot, unreadable state = not planned) is a coded `warn!` `source = "replay_frame_cap_planned"`, counter kept; every other boot keeps the ERROR and the page; a replayed row that landed nowhere pages as `replay_rows_lost` (split from `replay_ack_wait_timeout`), including order-book rows deferred to the after-close pass (`confirmed = true`, batch archived); the planned mark is claimed before the boot replay and handed out only when its clearing write succeeds. REJECT: quieting the cap on any non-planned boot or for more than one boot; quieting `replay_rows_lost` or folding it back; dropping the counter; a new page, alarm, filter, `ok_actions` or EMF name, or editing `ws-spill-01` to exclude these sources.
+  - (§2.17 note, 2026-11-11, same owner card, extension confirmed by the owner the same day on "Yes, quiet them too (Recommended)"; 2026-11-09 live evidence: every planned evening-drain restart at 3:54, 4:34 and 5:14 PM IST paged twice) on the planned evening-drain boot the two replay DEFERRAL lines (`WS-SPILL-01` `replay_deferred`, `WS-SPILL-02` replay budget deferral; nothing lost, deferred segments stay `*.wal`) are coded `warn!` with sources `replay_deferred_planned` / `replay_budget_deferred_planned`, same code, counters kept; a WS-SPILL-02 MEMORY-guard stop keeps the ERROR on every boot; every other boot keeps the ERROR (same fields and text, log `target` moved). Owner confirmed this extension 2026-11-11 ("Yes, quiet them too (Recommended)"); this extension is not a precedent. REJECT: quieting either line on a non-planned boot; quieting `replay_rows_lost`; dropping a counter; any new page, alarm, filter or EMF name.
+- (§2.18, 2026-11-11, owner card "Yes, daily waste check (Recommended)") ONE new page family, AWS waste: a read-only Rust Lambda once a day (outside 09:00–15:40 IST) lists volumes available for over 48 h, owned snapshots older than 30 days, unassociated Elastic IPs, and the top 5 services by month-to-date cost (one Cost Explorer query, ~$0.30 a month); one message only when a finding is new, never repeated, at most one a day; each run writes `s3://tv-<env>-cold/cost-audit/<date>.json`. REJECT: any delete/release/modify/stop permission or action on a finding; more than one message a day or repeating an unchanged set; more than one Cost Explorer query a day; per-resource metrics or alarms; a non-Rust Lambda.
+- (§2.19, 2026-11-11, owner card "Only real feed trouble (Recommended)") NO new page: the silent-instrument `RISK-GAP-03` page fires only when the instruments that ticked and then went quiet (`silent - never`) reach 1% of tracked instruments (`ceil(tracked/100)`, at least 1) or a never-ticked instrument is new this session; below that it is one coded `warn!` per episode (named instruments at `warn!`), gauges and cooldown unchanged. Live evidence: seven pages on 2026-11-11 each named 1 to 3 of 19,868 slow stocks, `never_ticked = 0`. REJECT: paging below the 1% floor; dropping the never-ticked page; removing the gauges or the `warn!` record; a new page, alarm, filter or EMF name; changing the floor without a fresh dated quote.
+  - (§2.19 note, 2026-11-15, 15 Nov audit finding live-1, narrows a false page only) the page's session gate ends at the 15:30 IST continuous close, not the 15:40 capture end (the options stopping at 15:30 paged every trading day at 15:31); capture, gauges, floor, cooldown and alarm unchanged. REJECT: ending it after 15:30 on a regular day; using this note for any other page.
+- (§2.20, 2026-11-11, owner card "Page only if stuck (Recommended)", after the 8:33 AM IST SOS "safety capture hit a limit") NO new page: the WAL replay frame-cap line and the two replay deferral lines (`WS-SPILL-01` `replay_frame_cap` / `replay_deferred`, `WS-SPILL-02` byte-budget deferral) are a coded `warn!` with source suffix `_shrinking` on ANY start whose waiting WAL backlog is strictly lower than the previous start's (count kept in `data/state/wal-backlog-trend.state`); a first start, unreadable or future-dated record, unknown count, or an equal or higher count keeps the ERROR and the page; the planned evening restart stays `*_planned` and saves no count (2026-11-11 review fix: every other start compares with the previous start that was not a planned evening restart, a start whose own save fails pages, the record carries a CRC-32; second review fix: a count taken while segments wait without a trusted, bounded applied watermark is saved as `unknown`, so it and the next start page); every counter kept. REJECT: saving the planned restart's count; saving a known count taken without a trusted, bounded applied watermark; quieting a start whose save failed; quieting `replay_rows_lost`, `replay_ack_wait_timeout` or a memory-guard stop; quieting when the backlog did not shrink or either count is unknown; dropping a counter; a new page, alarm, filter or EMF name.
 
-## §1. The rule (one line)
+- (§2.21, 2026-11-11, operator Quote 53 "Cut alarms 93 → ~30 (Recommended)") NO new page: the Quote 53 alarm review removes pages from the §2.3, §2.3f/g/h, §2.3p/q, §2.6 (`dhan-feed-delay-high`, `dhan-main-reconnect-slow`), §2.9 (`disk-kept-not-backed-up`, `feed-thread-wrote-to-disk`) and §2.13 (`dhan-worst-socket-deaf`) families; each has its row (what still covers it) in `docs/audits/2026-11-alarm-review.md`, and the coded lines and local `/metrics` are unchanged. Not removed (each the only page for a KEPT failure): `errcode-stream-silent` and its two schema filters (§2.3s), `live-universe-fallback`, `tick-spill-quarantined`, `wal-suspension-probe-blind`, `deploy-provenance-blind`, and (second review) `boot-heartbeat-gate-errors` and `boot-heartbeat-gate-not-invoked` (they watch the gate that arms the kept `boot-heartbeat-missing`). `wal-replay-restore-failed` stays removed; its data-loss path pages through the coded `WS-SPILL-02` ERROR and the kept `errcode-ws-spill-02`. The §2.6/§2.9/§2.13 rows below stay in force for any alarm of those names that comes back. REJECT: re-adding a removed alarm without a fresh dated quote here first; removing a page §2.21 names as the remaining cover or as not removed; narrowing the `errcode-ws-spill-02` filter while `wal-replay-restore-failed` stays removed.
 
-**The ONLY Dhan-scoped Telegram alerts that can ever fire are: (1) the DHAN
-spot-1m pull failing/recovered, (2) the DHAN option-chain pull
-failing/recovered, (3) the DHAN token-unobtainable Critical, (4) the
-CloudWatch 4h token-remaining early-warning, and (5 — added 2026-07-16 per
-the §2.2 dated row) the cadence expiry cross-broker DISAGREEMENT page (a
-cross-broker data-integrity page naming BOTH brokers, not a Dhan-failure
-family) — every other Dhan-era page, probe, watchdog
-Telegram, and dead alarm is deleted or silenced; the token machinery
-self-heals SILENTLY.**
+- (§2.22, 2026-11-12, owner card "Page if 5 min in a row (Recommended)", Quote 57) ONE new page: the clock offset from Amazon Time Sync, sampled once a minute into the database, pages once (coded ERROR, edge-triggered, no recovery page) when it stays over 1 ms for 5 consecutive minutes inside 09:00–15:40 IST. REJECT: fewer than 5 readings, outside the session, a recovery page or `ok_actions`, more than one page per episode, any other page under §2.22.
 
----
+- (§2.22-a, 2026-11-12, owner: "Monitor log track capture db save audit log visualised dashboard alrm ring do everything") NO new page: the paper-order log `live_order_events` joins the audit disk tier. Its spill-refused, quarantined and replay-failed rows page through the existing §2.10 `audit-rows-lost` group (generic `tv_audit_spill_{refused_rows,quarantined_rows,replay_failed}_total`); its chain-lost rows (`tv_order_audit_chain_lost_total{source="live_order_events_spill_lost"}`) and a 30-minute stuck backlog (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`) page through the existing `order-audit-chain-loss` alarm. No new alarm. REJECT: a separate page, alarm, filter or EMF name for it; paging a refused row.
+- (§2.23, 2026-11-15, audit live-2) NO new page: below 90% used, a limited pass that freed a partition resets the disk-pressure stall instead of counting toward `STORAGE-GAP-05`; at 90%+ it still counts (PR DP review M1), and a stall pages only at or above high water (75%); a pass that freed nothing still pages. Between 75% and 90% `disk-used-high` and `spill-dir-free-low` still cover a disk that fills faster than one partition a pass. REJECT: counting a pass that freed a partition toward the stall below 90%; not counting it at 90%+; paging a stall below high water; removing the page for a pass that freed nothing.
 
-## §2. The contract table (the final 4-item Dhan alert set + the §2.2 2026-07-16 cross-broker addition)
+**REJECT (§3, verbatim headlines):**
+- Adds ANY new Dhan-scoped Telegram page outside the allowed set without a fresh dated operator quote HERE first.
+- Re-introduces the mid-session profile / forced-re-mint Telegram pages, the REST canary, the no-tick watchdog, the fast-boot validation call, or the order-update spawn.
+- Removes the SILENT self-heal machinery (900s profile probe, AUTH-GAP-05 forced re-mint + GAP-04 latch re-arm, GAP-02 REST-stack token sweep, token-health gauge poller, `tv-<env>-token-remaining-low`).
+- Downgrades / removes the family-(3) Critical on a terminally-dead token.
+- Makes a Dhan-scoped Telegram body stop naming the broker.
+- (§2.6) alarms the feed-delay gauge on `Maximum`; includes depth endpoints in the reconnect gauge; pages on a single `silent_window`; adds `ok_actions`; adds a per-connection or per-instrument dimension.
+- (§2.6-iv) pages on or ships the `fno` lag class without a further dated row; counts a first packet after a subscribe, a stale regression or a repeat as a lag sample; adds a per-instrument or per-connection dimension to the shipped series.
+- (§2.16) lowers `questdb-disconnected` below 3 of 5 bad minutes; raises the `RISK-GAP-03` period above 300 s, adds an OK page to it, or removes its 30-minute emit cooldown.
+- (§2.7) adds `ok_actions` to the stall alarm; logs every wait instead of once a minute; reads the clock on the normal queued path; drops or buffers seals without bound to avoid the wait; routes the wait through `AGGREGATOR-DROP-01`.
+- (§2.8) adds `ok_actions` or a per-connection/per-instrument dimension to the hot-path stall alarm; emits it level-triggered or more than once a minute; pages on the small dashboard stall budgets; removes the session gate or the broker name.
+- (§2.9) adds `ok_actions` or a dimension beyond `host` to the five data-at-risk alarms; splits a group into per-counter alarms; drops the cold-backup alarm to one period; drops a counter's boot-time zero registration; adds a counter to a group without a dated row.
+- (§2.9-i) widens the log-drop slice to an unshipped sink or points the alarm back at the raw sum; switches the alarm before a measured match.
+- (§2.10) adds `ok_actions` or a dimension beyond `host` to the six loss-group alarms; publishes a group under a raw counter name; splits a group into per-counter alarms; drops the durability alarm to one period; drops a counter's boot-time zero registration; adds a counter to a group or widens a slice without a dated row.
+- (§2.10-a) changes a §2.10 row; folds a counter another alarm already pages, or the cross-verify abandon or exit-order counters; takes the metrics log group past 95 filters; adds a page or alarm for the S3 log export; gives its role a Delete, lifecycle or versioning action; exports the raw metrics scrapes without a dated row.
+- (§2.12) adds `ok_actions` or a dimension beyond `host` to `dhan-socket-parked`; adds a separate page for a first 808; EMF-selects `reason="auth_rejected"` or `tv_token_renew_failure_reused_total`.
+- (§2.13) lowers `dhan-worst-socket-deaf` below 600 s or edits either the deaf or the reconnect-slow `alarm_description` without a further dated row; ships the frame-silence redial / would-redial counters or the per-socket gap gauge to CloudWatch without a dated row.
+- (§2.14) turns depth on without restoring the four depth pages and their four selector names in the same change; removes any other alarm under cover of §2.14; re-adds `order-fill-lag-high` without an emitter; deletes the depth-account minter's errors alarm instead of gating it.
 
-| # | Allowed Dhan alert | Variant(s) / route | Fires when |
-|---|---|---|---|
-| 1 | Spot-1m pull failing / recovered | `Spot1mFetchDegraded` (High) / `Spot1mFetchRecovered` (Info) / `Spot1mSidNotServed` (High) / `Spot1mSidServedRecovered` (Info) | the per-minute spot leg's persist-gated 3-minute escalation edge (`rest-1m-pipeline-error-codes.md`) |
-| 2 | Option-chain pull failing / recovered | `ChainFetchDegraded` (High) / `ChainFetchRecovered` (Info) / `ChainEntitlementAbsent`/`Confirmed` / `ChainExpirylistFailed` (High) / **`Chain1mUnderlyingNotServed` (High) / `Chain1mUnderlyingServedRecovered` (Info) — added 2026-07-14 per the §2.1 dated directive (the Dhan mirror of the Groww #1537 per-underlying detector)** | the chain leg's own edges (`rest-1m-pipeline-error-codes.md`) |
-| 3 | Token could not be obtained | `AuthenticationFailed` / `TokenRenewalFailed` (both Critical; reworded 2026-07-14 to plain English naming DHAN + the consequence: "the Dhan spot-1m and option-chain pulls will stop until this is fixed") | mint/renewal is TERMINALLY dead — the mid-session watchdog pages **ONCE PER FAILING EPISODE** (H1a latch, 2026-07-14 fix round — never the pre-fix ~30-min repeat) on EITHER (a) a forced re-mint failing terminally OR (b) the H1b attempt cap: `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-mints all "succeeded" yet the profile stayed REAL-invalid (dead-dataPlan/segment class — the body names the N re-logins + that the spot-1m/chain pulls are blocked). The latch resets on a clean profile cycle. (Its terminal arm emits `AuthenticationFailed` directly, since `force_renewal` -> `acquire_token` pages nothing on a non-RESILIENCE-03 permanent failure; the Telegram body is redacted + truncated via the house sanitizer — M2.) |
-| 4 | Token expires soon (4h early warning) | CloudWatch alarm `tv-<env>-token-remaining-low` on `tv_token_remaining_seconds` → SNS → Telegram Lambda | the renewal loop stopped renewing (the watchdog-of-the-renewal-loop). The Lambda's wording is ANOTHER session's scope. |
-
-**§2.1 — 2026-07-14 (same day, second directive): the family-(2) row gains the per-underlying
-not-served pair.** Coordinator-relayed operator directive (verbatim intent, labeled as such —
-the §38.0-Context-3 convention): *"make the Dhan option-chain capture complete and precise,
-cross-cover the Groww gaps, and be loud on any empty or partial chain — never a silent gap."*
-The motivating incident is the 2026-07-14 Groww NIFTY expiry-day cutoff (14:54 IST, 2xx/zero
-strikes, `ok=2/empty=1` all afternoon, ZERO pages — PR #1537); the Dhan chain leg carries the
-IDENTICAL blind spot (`chain_minute_fully_failed` requires `ok == 0`). Per this directive the
-family-(2) row is extended with `Chain1mUnderlyingNotServed` (High, one page per underlying per
-episode, edge-latched, ~10-minute detection latency) + `Chain1mUnderlyingServedRecovered` (Info,
-falling edge). This is a variant EXTENSION of family (2), not a 5th family: it still means
-"the Dhan option-chain pull is failing" — scoped to one index. Everything else in §2 stands;
-the deleted/silenced table is untouched.
-
-**§2.2 — 2026-07-16: the cadence expiry cross-broker DISAGREEMENT page joins the allowed
-set.** Authority: the OPERATOR's 2026-07-16 cadence/expiry-disagreement directive, relayed
-via the coordinator session (verbatim intent, labeled as such per the house §38.0-Context-3
-convention — this dated row is the rule-file edit §3 demands before any new Dhan-scoped
-page): a cross-broker expiry split must page the operator as a real Telegram alert, never a
-log-only line. The coordinator's implementation ruling relaying it (verbatim): *"R6 —
-expiry cross-broker disagreement must be a REAL typed
-NotificationEvent Telegram page (not log-only) + a dated 2026-07-16 row in
-dhan-rest-only-noise-lock-2026-07-14.md §2."* The cadence scheduler's pre-market expiry
-resolution (`cadence-error-codes.md` §0) can find Dhan's and Groww's contract lists
-DISAGREEING on today's policy expiry for one underlying — Dhan's exchange-sourced date WINS
-and keys BOTH lanes. The new page is `NotificationEvent::CadenceExpiryDisagreement` (High):
-edge-latched ONCE per underlying per day (the day-locked store's `newly_disagreeing` latch),
-body names BOTH brokers + both dates + that the Dhan date now keys both lanes (plain English
-per the 10 commandments). This is a CROSS-BROKER data-integrity page, not a Dhan-failure
-family: it fires only when both brokers resolved and their answers split — never per wave,
-never on a single-broker outage (those stay the log-only `expiry_unresolved` stage + the
-pre-market deadline page). Emit site: the `newly_disagreeing` arm in
-`crates/core/src/cadence/runner.rs`; sink threaded from boot via `cadence_boot.rs`.
-
-| Component | Disposition |
-|---|---|
-| Mid-session profile watchdog Telegram pages (`MidSessionProfileInvalidated` Critical + `TokenForcedRemintTriggered` High) | **Variants DELETED.** The 900s `/v2/profile` probe + the AUTH-GAP-05 forced re-mint machinery are KEPT and run SILENTLY (coded `error!` + counters only); a terminal re-mint failure routes to the family-(3) Critical. |
-| AUTH-GAP-05 latch re-arm (GAP-04, 2026-07-14 backstop) | **ADDED, silent:** while a failing episode persists, `decide_remint` re-arms the retry-once latch every 2nd failing 900s cycle (~30 min retry cadence), still honoring the ~125s mint cooldown + the RESILIENCE-03 lock refusals — **BOUNDED (H1b, fix round) at `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) mints per episode**; the cap fires the once-per-episode family-(3) Critical when the profile is still invalid, closing the silent dead-dataPlan loop (~48 silent mints/day pre-fix). A persisting LOCK-LOST episode re-logs the RESILIENCE-01 refusal at the same ~30-min cadence (log-only, no mint, no Telegram from that arm). No routine Telegram from this path. |
-| REST-stack stale-token sweep (GAP-02, 2026-07-14 backstop) | **ADDED, silent:** `dhan_rest_stack` Phase 3 runs `force_renewal_if_stale(14400)` every 900s (`DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`) — the renewal-loop-halt backstop the lane's 4h sweep used to be. Not market-hours-gated. Terminal failure pages via family-(3). SUPERVISED (fix round: the house respawn pattern — a silent sweep death would re-open the audited gap; unwind-build self-heal only, release panics abort). Honest wording note (fix round): the ~23h renewal loop is NOT an independent retry — it HALTS PERMANENTLY after its circuit-breaker cycles; this sweep + the AUTH-GAP-05 watchdog are the retries. |
-| Shared mint-cooldown gate (H3, 2026-07-14 fix round) | **ADDED, silent:** `TokenManager::renew_with_fallback` — the ONE shared re-mint entry (watchdog + GAP-02 sweep + renewal loop + `force_renewal*`) — SKIPS the `generateAccessToken` fallback with a coded warn + typed refusal (`mint-cooldown` prefix; never a page, never burns the episode latch) while a previous mint ATTEMPT is younger than the ~125s Dhan cooldown. Closes the AG5-R2-1 flagged residual the 900s sweep had tightened 16x. The boot-time `initialize` retry loop is deliberately UNGATED (calls `acquire_token` directly; owns its own >=130s floor — no boot deadlock; source-scan pinned). |
-| Token-health gauge poller supervision + pre-#1522 residual (GAP-06 + M6, fix round) | The re-homed poller is SUPERVISED like the sweep. **ACCEPTED residual (M6):** on a hypothetical `dhan_enabled=true` boot BEFORE #1522 merges, the LANE path no longer spawns the poller (its main.rs spawn sites are deleted) and the stack does not run — so `tv_token_valid` would go unpublished for that boot shape. Accepted because prod is dhan-OFF (config + the Phase-A 409 refusal) and #1522 (which deletes the lane's fast arm) merges FIRST; this PR rebases after. |
-| REST canary (`rest_canary_boot.rs`, REST-CANARY-01 probes 09:05/12:00/15:25 IST) | **Module + both spawn sites + the `rest-canary-01` CloudWatch filter/alarm DELETED.** The legs self-detect REST death in ~3-4 min via their own escalation edges — strictly better than 3 fixed slots. `ErrorCode::RestCanary01ProbeFailed` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
-| No-tick watchdog (`no_tick_watchdog.rs`, `NoLiveTicksDuringMarketHours` Critical) | **Module + variant + both spawn sites DELETED.** Its heartbeat was fed ONLY by the retired Dhan tick pipeline; Groww stall detection is FEED-STALL-01 + the market-hours-liveness alarm. |
-| Fast-boot cached-token validation (`fast_boot_validation.rs`, AUTH-GAP-06) | **Module + sole call site DELETED** (the Dhan-gated fast arm is dead with `dhan_enabled=false` and dies in #1522). `ErrorCode::AuthGap06…` variant retained until C4 — **DELETED in the C4 sweep (2026-07-15)**. |
-| Token-health gauge poller (`token_health_gauge.rs`, `tv_token_valid` + live `tv_token_remaining_seconds`) | **RE-HOMED (GAP-06, 2026-07-14 — supersedes the same-day delete ruling):** the module is KEPT; the lane/fast-arm spawn sites in main.rs are DELETED; `dhan_rest_stack` Phase 3 spawns it, so the gauges stay alive on dhan-off boots even after a renewal-loop circuit-breaker halt (which kills the 30s in-loop gauge writer) — keeping alarm #4 sighted. |
-| Order-update WS spawn (`dhan_rest_stack` Phase 5a) + its 2 alarms (`tv-<env>-order-update-ws-inactive`, `tv-<env>-order-update-reconnect-storm`) | **Spawn + alarms DELETED** per `websocket-connection-scope-lock.md` §A.1. The core module `order_update_connection.rs` is RETAINED DORMANT (unit tests stay) for the live-trading re-wire — re-spawn or module deletion needs a fresh dated quote in the scope-lock file first. |
-| `observability-architecture.md` paging list | REST-CANARY-01 removed from the Filtered+alarmed set (dated note; the paging drift guard pins tf↔doc↔emit). |
-
-### §2a. Order-execution family (cluster C, PR #1554 — a SEPARATE landed family, NOT a Dhan REST alert)
-
-The §2 4-item set is the **Dhan REST-only surface** (spot-1m / option-chain /
-token). Distinct from it, the **order-execution family** — the cluster-C
-order-side observability that landed on `main` in **PR #1554** — dispatches its
-OWN typed Telegram events from `crates/app/src/order_observability.rs`
-(the order-side consumer's `OmsAlertBridge` / `RiskAlertBridge` sinks):
-`NotificationEvent::OrderRejected`, `NotificationEvent::CircuitBreakerOpened`,
-and `NotificationEvent::RiskHalt`. These fire on the OMS order path (order
-rejects, circuit-breaker transitions, risk halts) in the paper/dry-run layer —
-NOT on the Dhan REST data-pull surface — so they are **outside** the §2 count
-and are NOT governed by the §3 "new Dhan-scoped REST Telegram page" REJECT.
-
-**This subsection is a rebase-reconciliation note (2026-07-14):** it DOCUMENTS
-the pre-existing, landed #1554 dispatch sites so the exit-order lockout guard
-(`dhan_exit_order_lockout_guard::exit_layer_emits_no_telegram_dispatch`) — which
-requires this file to carry an `order execution` family row once any order-path
-`NotificationEvent` dispatch site exists — reconciles cleanly with `main`. It
-introduces NO new emit. **The 🔷 DHAN exit-order layer itself stays
-Telegram-free** (engine exit region + `exit_rules.rs` + `exit_execution.rs` are
-sink-free; EXIT-ORDER-01 / EXIT-VERIFY-01 remain log-sink-only) — the guard's
-part (a) still enforces that verbatim. Any FUTURE change that routes the exit
-layer's own signals to Telegram remains a REJECT under §3 until an operator
-dated quote lands here.
-
----
-
-## §3. What a PR that violates this lock looks like (REJECT)
-
-- Adds ANY new Dhan-scoped Telegram page outside the §2 4-item set without a
-  fresh dated operator quote HERE first.
-- Re-introduces the mid-session profile / forced-re-mint Telegram pages, the
-  REST canary, the no-tick watchdog, the fast-boot validation call, or the
-  order-update spawn (each needs a fresh dated quote; the order-update
-  re-wire additionally needs the scope-lock §A.1 edit).
-- Removes the SILENT self-heal machinery this lock deliberately KEEPS: the
-  900s profile probe, the AUTH-GAP-05 forced re-mint + its GAP-04 latch
-  re-arm, the GAP-02 REST-stack token sweep, the re-homed token-health gauge
-  poller, or the `tv-<env>-token-remaining-low` alarm.
-- Downgrades / removes the family-(3) Critical on a terminally-dead token
-  (silent terminal failure = Rule-11 false-OK).
-- Makes a Dhan-scoped Telegram body stop naming the broker (the operator's
-  "always mention precisely which broker" — the 🔷 DHAN badge and/or the word
-  Dhan in the body).
-
-Any such PR MUST be rejected in review even if the operator approves verbally
-— the operator must update this rule file FIRST with a dated quote.
-
----
-
-## §4. Honest envelope (mandatory per operator-charter §F)
-
-> "100% inside the tested envelope, with ratcheted regression coverage: a dead
-> Dhan token is detected within minutes by the legs' own persist-gated
-> escalation edges (SPOT1M-01 / CHAIN-02 → the family-(1)/(2) High pages), and
-> a SINGLE-underlying vendor cutoff (the 2026-07-14 class) pages within ~10
-> counted minutes via the family-(2) `Chain1mUnderlyingNotServed` edge (a
-> mid-day task respawn restarts the streak — worst case ~doubles that
-> latency), and it
-> self-heals SILENTLY via three retained mechanisms (the 900s profile probe's
-> AUTH-GAP-05 forced re-mint with the GAP-04 ~30-min latch re-arm, the GAP-02
-> 900s `force_renewal_if_stale(4h)` stack sweep, and the ~23h renewal loop);
-> a TERMINALLY-unobtainable token pages ONE family-(3) Critical PER FAILING
-> EPISODE naming Dhan + the consequence (H1a latch; re-armed only by a clean
-> profile cycle), and a token whose re-mints "succeed" while the profile
-> stays invalid (dead dataPlan/segment) pages the SAME once-per-episode
-> Critical after `REMINT_MAX_ATTEMPTS_PER_EPISODE` (= 3) re-logins (H1b cap)
-> instead of re-minting silently forever. NOT claimed: (a) same-day heal of a Dhan-side-KILLED but
-> locally-fresh token AFTER market close — the profile probe is
-> market-hours-gated and the 4h sweep only re-mints on <4h local headroom, so
-> the post-close 15:33:30 spot sweep can still fail on such a token until the
-> next boot's init re-mints (bounded to one post-close window; the in-session
-> surface is covered); (b) detection latency below the legs' 3-minute edges —
-> the deleted REST canary's 3 fixed probe slots were strictly slower, not
-> faster, than the always-on edges; (c) any order-update capture — the socket
-> is deliberately closed until live trading (dry_run=true, events were
-> counted-then-discarded); (d) `tv_token_valid`/`tv_token_remaining_seconds`
-> publication on a dhan-ON lane boot BEFORE #1522 merges — the lane's poller
-> spawn sites are deleted and the stack does not run on that boot shape
-> (M6 ACCEPTED residual: prod is dhan-off and #1522 merges first)."
-
----
-
-## §5. Auto-driver / Insta-reel explanation
-
-> Sir, the Dhan supplier now does exactly TWO jobs for the juice shop: once a
-> minute he phones in the official price card (spot 1m) and the option-coupon
-> sheet (option chain). So the phone should ring about Dhan for exactly FOUR
-> reasons: the price card stopped coming, the coupon sheet stopped coming, the
-> shop KEY could not be cut at all, or the key expires in 4 hours. Everything
-> else — the old "checking his pulse three times a day", the "no fruit prices
-> heard" siren from the removed live board, the confirmation line that kept
-> ringing about a phone nobody uses — is ripped out. If the key jams, the boy
-> quietly re-cuts it himself every half hour; you only hear about it if the
-> key genuinely cannot be cut. And every message now says WHICH supplier it is
-> about — Dhan or Groww — right at the top.
-
----
-
-## §6. Trigger (auto-loaded paths)
-
-Always loaded. Reinforced on any session editing:
-- `crates/app/src/dhan_rest_stack.rs`
-- `crates/core/src/auth/mid_session_watchdog.rs`
-- `crates/core/src/auth/token_health_gauge.rs`
-- `crates/core/src/notification/events.rs` (any Dhan-scoped variant)
-- `deploy/aws/terraform/error-code-alarms.tf` / `app-alarms.tf`
-- Any file containing `MidSessionProfileInvalidated`,
-  `TokenForcedRemintTriggered`, `NoLiveTicksDuringMarketHours`,
-  `rest_canary`, `fast_boot_validation`, `run_order_update_connection`, or
-  `DHAN_REST_STACK_TOKEN_SWEEP_INTERVAL_SECS`
-(2026-07-16, operator directive events 38df2073 + 157f7cd0) The paper-mode, receive-only order-update re-spawn is AUTHORIZED (config `[dhan_order_push] enabled = false`, default OFF). The channel is Telegram-SILENT (`notifier: None`) — the 4-item Dhan Telegram family is UNCHANGED and the 2 deleted CloudWatch alarms STAY deleted. Observability is coded logs + counters (`tv_dhan_order_updates_total`, `tv_dhan_order_push_respawn_total`) + ws_event_audit + order_audit rows only. Live order fire remains locked.
-
-### 2026-07-21 — [dhan_order_push] PAPER ACTIVATION prep (DRAFT PR; operator-go pending)
-
-Prep lane (coordinator-routed, 2026-07-21): `config/base.toml [dhan_order_push]
-enabled` flips to `true` so the authorized (2026-07-16, events 38df2073 + 157f7cd0)
-receive-only paper order-update re-spawn from `dhan_rest_stack` begins capturing.
-The channel stays Telegram-SILENT (`notifier: None`) — the 4-item Dhan alert family is
-UNCHANGED and the 2 deleted CloudWatch alarms STAY deleted; observability remains coded
-logs + `tv_dhan_order_updates_total` / `tv_dhan_order_push_respawn_total` +
-ws_event_audit + order_audit mode='paper' rows. Serde default stays OFF; live order
-fire remains locked. The operator's go for the merge lands here verbatim:
-<OPERATOR-GO-HERE>
-
----
-
-## §2.3 — 2026-08-14: the REVIVED LIVE-LANE alert family joins the allowed set
-
-**The verbatim operator authorization (2026-08-14, typed directly in-session — preserve
-EXACTLY, typos included):**
-
-> "Go ahead with the entire fixes dude okay? Not per Sid cloudwatch right per websocket
-> connections or entire webscoket connections right dude ami right dude"
-
-Given in DIRECT response to a message whose priority table listed, as item 3 of eight,
-*"Stop the console lying + wire alarms"* — for a lane the same message had just shown to
-have **zero CloudWatch alarms and zero Telegram events**. This dated row is the rule-file
-edit §3 demands before any new Dhan-scoped page, and it is recorded BEFORE the terraform
-lands.
-
-**Why this file, when its §1 governs the REST-only surface.** When this lock was written
-on 2026-07-14 the Dhan live WebSocket had been retired for a day, so "Dhan-scoped alert"
-and "Dhan REST alert" were the same set. The 2026-08-09 revival re-created a Dhan surface
-this lock never contemplated. Rather than let a whole live lane page the operator through
-a gap in an unrelated file's wording, the family is declared HERE, under the same
-discipline as the other four.
-
-**The new family (5) — LIVE-LANE INTEGRITY.** Four alarms, all on metrics that **already
-exist and are already shipped to CloudWatch today with nothing consuming them**:
-
-| Metric | Alarm fires when | Why it is not noise |
-|---|---|---|
-| `tv_dhan_feed_stack_up` | `< 1` | The lane is down. Today this can only be discovered by opening a console that reports a hardcoded constant. |
-| `tv_ticks_dropped_total` | non-zero over a window | The repo's own EMF notes call this "the single largest tick-loss window". It is billed and shipped today with **no alarm** — paying to publish a number nobody watches. |
-| `tv_dhan_ws_park_total` | non-zero | A socket has parked PERMANENTLY on a fatal disconnect and will never dial again. Silent today. |
-| `tv_dhan_feed_drain_respawn_total` | exceeds its restart cap | The drain died repeatedly; the lane is carrying nothing. |
-
-**Deliberately NOT alarmed, and the reason recorded so it is not "fixed" later:**
-per-instrument latency and per-instrument silence. Latency alarms on a per-instrument
-basis would page constantly, because Dhan's LTT is last-TRADE time and a thin option is
-legitimately minutes stale — that is the instrument being quiet, not the feed being
-broken. Silence is already owned by `scan_silence` → `RISK-GAP-03`. Adding a second
-signal for the same condition would produce two contradicting pages for one event.
-
-**Cardinality is bounded by design (the operator's own correction, second sentence of the
-quote above):** latency is dimensioned **per WebSocket connection — 16 fixed slots** —
-never per instrument. Per-instrument figures live in RAM and are served over the existing
-API. This is not a preference: 4,565 per-instrument CloudWatch metrics ≈ $1,369/mo
-against a budget whose AUTOMATIC action is `STOP_EC2_INSTANCES`, i.e. the observability
-feature would stop the trading box. 16 dimensions ≈ $4.80/mo.
-
-**Cost:** +4 alarms + the per-connection latency dimensions ≈ **$6–7/mo**. This is
-inside the operator's ₹7,500/mo ceiling ONLY alongside the Elastic-IP release he already
-approved on 2026-07-19 (−₹361/mo); without that lever the high-side envelope sits ~₹118
-under the ceiling, which is not real margin. Stated plainly rather than absorbed
-silently.
-
-**The §2 four-item REST family is UNCHANGED.** This family covers the LIVE lane only.
-Every "deleted or silenced" row in §2's second table stays deleted and silenced — the
-mid-session profile pages, the REST canary, the no-tick watchdog, and the two
-order-update alarms are NOT revived by this row.
-
-**What a PR that violates §2.3 looks like (REJECT):** adds a per-INSTRUMENT CloudWatch
-dimension for latency or any other live-lane signal; adds a live-lane page outside the
-four metrics above without its own dated row here; re-introduces any of the §2 deleted
-alarms under cover of this family; or claims sub-second latency accuracy anywhere in an
-operator-facing surface (the ±1 s floor is structural — Dhan's LTT is whole seconds).
-
-### §2.3a — 2026-08-15 amendment: the DURABLE FLOOR joins family (5), and one row of §2.3 was wrong
-
-**The verbatim operator authorization (2026-08-15, typed directly in-session):**
-
-> "fix evryhtign dude okay?"
-
-Given in DIRECT response to a table whose top open row read **"No loss counter pages
-you — High — alarms need the market-hours gate's named list"**. That row is the scope
-this quote authorizes, and this dated edit lands BEFORE the terraform, per §3.
-
-**First, a correction to my own §2.3 (Rule 11 — a stale row manufactures false work).**
-§2.3 lists four metrics, and the fourth is **`tv_dhan_feed_drain_respawn_total` "exceeds
-its restart cap"**. That metric **has ZERO emit sites** — verified by source scan
-2026-08-15 — and is not in the EMF allowlist, because **the drain is not respawned at
-all**. If it dies the lane is over, and `tv_dhan_feed_stack_up` falls to 0, which
-family-(5) alarm #1 already pages on. Building the fourth alarm as written would have
-created a filter that can never match: a permanently-green dead monitor, which is the
-`ws-reinject-01` / `tick-conserve-01` precedent this repo has retired twice before.
-**That row is WITHDRAWN.** The correct signal for a dead drain is alarm #1.
-
-**Second, the metric §2.3 should have named instead — `tv_dhan_ws_wal_dropped_total`.**
-It is the most serious counter in the lane and it is unalarmed today:
-
-| | `tv_ticks_dropped_total` (alarmed 2026-08-14) | `tv_dhan_ws_wal_dropped_total` (this row) |
-|---|---|---|
-| Where the loss happens | between the WAL and QuestDB | **before the WAL** |
-| Is the frame on disk? | yes | **no** |
-| Recoverable in principle | yes — the bytes exist | **no — they were never written** |
-
-So the alarm that shipped watches the *recoverable* half of the loss chain while the
-*unrecoverable* half watches nothing. `WalRingSink` counts a drop when the durable
-floor — the capture-at-receipt guarantee this entire architecture is built on — did not
-hold, and there is no other signal for it: the frame is simply gone, with no payload to
-count downstream and no error anywhere later.
-
-**Third, RISK-GAP-03 (`instruments never ticked / gone silent`) joins as log-filter.**
-The 2026-08-12 note that wired `scan_silence` recorded plainly that its `error!` is
-**log-sink-only**, and that alarming the gauges "needs the market-hours window gate". It
-does not: the app already gates the emit to the CONTINUOUS session and edge-latches it
-to one per episode, so a **coded-error log filter** carries the same signal with no gate
-Lambda change, no threshold baseline, and a sparse near-free derived metric. A
-silently-failed subscribe has **no other evidence in the entire system** — no payload,
-no parse failure, no log line of its own — so absence measured against a seeded key is
-the only thing that can ever report it.
-
-**Family (5) is therefore SIX signals, not four:** lane down · socket parked · ticks
-dropped · **durable floor breached (new)** · **connected-but-silent (new)** · [the
-withdrawn drain-respawn row]. Cost: **+1 metric alarm ≈ $0.10/mo** and **+1 errcode
-log-filter alarm ≈ $0.10/mo** (sparse, dimensionless, billed only in hours the code
-fires) — **~$0.20/mo total** against the $100 kill-ceiling whose 90% line is $90.
-
-**Still NOT claimed:** `tv_dhan_ws_subscribe_failed_total`, `tv_dhan_ws_ring_full_total`,
-`tv_dhan_ws_ring_bytes_full_total`, `tv_tick_persist_errors_total`,
-`tv_tick_rows_refused_total` and `tv_dhan_feed_seals_dropped_total` remain **visible but
-unpageable** — charted on the operator dashboard since 2026-08-15, alarmed by nothing.
-That is a deliberate stopping point rather than an oversight: each would add ~$0.10/mo,
-several are downstream symptoms that the two alarms above would already have fired for,
-and a family of eleven pagers for one subsystem trains an operator to ignore all of
-them. Listed here so the gap is a decision on the record, not something to be discovered
-from a quiet dashboard.
+"Any such PR MUST be rejected in review even if the operator approves verbally — the operator must update this rule file FIRST with a dated quote."
+- (§2.24, 2026-11-20, owner cards "Yes, page me (Recommended)", "After correction (Recommended)", "Yes, one a day (Recommended)") ONE new page code `DHAN-FEED-TIME-01`, two causes, each at most once per IST day, 09:15–15:30 IST (or the Muhurat window), live drain only: (A) in 2 scans in a row, ≥20 index ticks and ≥50% with a trade time (after the time correction) outside 09:00–15:40 or >5 min from receipt; (B) 10 minutes of main-feed frames with no candle sealed. No `ok_actions`, no recovery page; latch persisted off the drain; a firing day is auto-held (Quote 63). Plus one notice a day when the time correction arms. REJECT: outside the gate or from replay; judging A on raw time; more than once per cause per day; fewer than 20 ticks / 2 scans for A or under 10 min for B; a per-instrument dimension; persisting on the drain; more than one notice a day.
+- (§2.24-a, 2026-11-21, owner card "Yes, always UTC (Recommended)"; Dhan ticket #6684672 says UTC epoch is permanent) the §2.24 daily notice is retired; a third reason on `DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`: the reversion guard sees an IST-epoch verdict on raw live prints, at most once per segment per IST day per process, live drain only, 09:00–15:40 IST (or the Muhurat window), same alarm and filter, no `ok_actions`; in `act` the day is auto-held (Quote 63) by the drain's 30 s scan handing it to the feed-time latch thread, off the drain. §2.24 rows that differ for this reason only (basis: the "Yes, always UTC" card and Quote 63): the 09:15–15:30 gate (09:00–15:40 instead), the persisted per-cause latch (a RAM latch per segment, so a restart can page again; the second hold is a no-op), and judging on raw time (this reason must read the raw format). Limitation: the hold lands up to 30 s after the page. REJECT: more than once per segment per day per process; outside the window or from replay; a page on a `Utc` verdict; an `act` page that does not hand its day to the hold writer; a second `DHAN-FEED-TIME-01` line from the hand-off; a new alarm, filter or EMF name; the daily notice back without a fresh dated quote.

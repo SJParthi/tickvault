@@ -80,3 +80,7 @@ this note is now its rule-file home) changes FAILURE MODE, not substance:
   deferred SHA surfaces within a day.
 - **Immediate in-window delivery** remains available ONLY via the loud
   `workflow_dispatch` with `confirm_market_hours=yes` — kept by design.
+
+## 2026-10-30 Update — a calendar Muhurat date is a no-deploy day
+
+Owner: "go ahead and fix the muhurat risk dude" (record: `daily-universe-scope-expansion-2026-05-27.md` Quote 49). The deploy band above is Monday to Friday; the 2026-11-08 Muhurat session is a Sunday. Every workflow market-hours guard now also refuses the whole IST date listed under `[[trading.muhurat_trading_dates]]` in `config/base.toml` (same overrides), and the failed-deploy auto-stop leaves the box running that day. Ratchet: `crates/common/tests/muhurat_workflow_freeze_guard.rs`.

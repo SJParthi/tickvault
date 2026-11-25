@@ -134,6 +134,11 @@ impl DisconnectCode {
     ///
     /// Reconnectable: 800 (transient server error), 807 (token expired — refresh first).
     /// NOT reconnectable: all others (config/credential/request errors — fix the root cause).
+    ///
+    /// NOT the live feed's policy: the supervised sockets classify a close with
+    /// `pool_supervisor::classify_disconnect`, where 809 refreshes the token
+    /// like 807 and, since 2026-10-06, a first 808 refreshes once before it
+    /// may park. This helper has no production caller.
     pub fn is_reconnectable(&self) -> bool {
         match self {
             Self::InternalServerError | Self::AccessTokenExpired => true,
@@ -152,6 +157,10 @@ impl DisconnectCode {
     }
 
     /// Whether this disconnect code requires a token refresh before reconnect.
+    ///
+    /// Not the live feed's policy: see `pool_supervisor::classify_disconnect`
+    /// (807 and 809 refresh; a first 808 refreshes once, scope lock
+    /// 2026-10-06). This helper has no production caller.
     pub fn requires_token_refresh(&self) -> bool {
         matches!(self, Self::AccessTokenExpired)
     }
@@ -233,6 +242,13 @@ pub struct SubscriptionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TwoHundredDepthSubscriptionRequest {
     /// Feed request code (23 = subscribe, 25 = unsubscribe).
+    ///
+    /// 25 is the value Dhan's Annexure documents (its table reads 23 then 25,
+    /// skipping 24). A 2026-09-10 session proved 25 IGNORED on the wire; 24 was
+    /// then tried on 2026-09-11 and was ignored IDENTICALLY — 80 lines, 40/40
+    /// across both endpoints, all ten sockets. Two codes failing the same way is
+    /// evidence the code is not the variable, so we ship the documented one.
+    /// See `FEED_UNSUBSCRIBE_TWENTY_DEPTH`.
     #[serde(rename = "RequestCode")]
     pub request_code: u8,
     /// Exchange segment string (e.g., "NSE_EQ", "NSE_FNO").
@@ -867,14 +883,19 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_unsubscribe_request_code_25() {
+    fn test_two_hundred_depth_unsubscribe_request_code_is_the_documented_25() {
+        // 25 -> 24 (2026-09-10, when 25 was proven ignored) -> 25 again
+        // (2026-09-11, when the vendor's own Feed Request Code table was shown
+        // to go 23 -> 25 with no 24 anywhere in 10,263 lines of v2 docs).
+        // Both codes were ignored identically; we ship the documented one.
         let request = TwoHundredDepthSubscriptionRequest {
-            request_code: 25,
+            request_code: tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH,
             exchange_segment: "NSE_EQ".to_string(),
             security_id: "2885".to_string(),
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"RequestCode\":25"));
+        assert!(!json.contains("\"RequestCode\":24"));
     }
 
     #[test]

@@ -242,12 +242,16 @@ pub fn spawn_supervised_orphan_position_watchdog(
                 // it broke out unexpectedly — respawn it.
                 Ok(()) => {
                     error!(
+                        code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                        source = "orphan_watchdog_exited",
                         "orphan watchdog loop exited unexpectedly — respawning \
                          the daily 15:25 IST open-position safety gate"
                     );
                 }
                 Err(join_err) if join_err.is_panic() => {
                     error!(
+                        code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                        source = "orphan_watchdog_panicked",
                         "orphan watchdog loop PANICKED — respawning the daily \
                          15:25 IST open-position safety gate"
                     );
@@ -309,6 +313,8 @@ async fn orphan_watchdog_loop(
                     // 11) — mirrors the existing no-token degraded arm's
                     // un-coded Custom-Critical style.
                     error!(
+                        code = ErrorCode::OrphanPosition01Detected.code_str(),
+                        source = "no_broker_session",
                         "orphan watchdog: no broker session at 15:25 IST — the \
                          orphan-position check could NOT run (no live-lane or \
                          global token manager registered); operator must check \
@@ -352,6 +358,8 @@ async fn run_orphan_check_once(
             Some(state) => Zeroizing::new(state.access_token().expose_secret().to_string()),
             None => {
                 error!(
+                    code = ErrorCode::OrphanPosition01Detected.code_str(),
+                    source = "no_session_token",
                     "orphan watchdog: no active session token at 15:25 IST — cannot \
                      verify open positions; operator must check Dhan manually before \
                      the 15:30 close (degraded — NOT reported as flat)"
@@ -369,6 +377,8 @@ async fn run_orphan_check_once(
         Ok(positions) => positions,
         Err(safe_reason) => {
             error!(
+                code = ErrorCode::OrphanPosition01Detected.code_str(),
+                source = "positions_fetch_failed",
                 reason = %safe_reason,
                 "orphan watchdog: get_positions FAILED after one retry at 15:25 IST — \
                  operator must verify open positions manually before the 15:30 close \

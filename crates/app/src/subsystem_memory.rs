@@ -24,6 +24,26 @@
 //!
 //! at a glance, with the alert pointing at the offending component.
 //!
+//! # NOT on the paid CloudWatch surface (2026-08-29)
+//!
+//! `tv_subsystem_memory_estimated_bytes` was EMF-selected (~$0.30/mo) and
+//! charted on the operator dashboard until 2026-08-29, and a live
+//! `cloudwatch list-metrics` returned `[]` for it — the series has never
+//! existed in the account. The cause is right above: every component gauge is
+//! `f64::NAN` until a [`SubsystemMemorySampler::register_source`] closure is
+//! wired, `register_source` has ZERO production call sites (its last two died
+//! with the TickStorage/PrevDayCache sweep on 2026-07-19, the same day the
+//! sourceless `tick_storage` label was dropped), and NaN is correctly dropped
+//! by the CloudWatch agent. It was structurally incapable of publishing.
+//!
+//! The scaffolding stays — the contract is worth keeping and the sampler's
+//! heartbeat and market-hours gauges carry real values on the local exporter.
+//! What is gone is paying for, and drawing an always-empty line for, a
+//! measurement nothing takes. Re-add the name to the EMF selector and the
+//! dashboard together with a real `register_source` call site;
+//! `crates/app/tests/subsystem_memory_emf_guard.rs` enforces that pairing in
+//! both directions.
+//!
 //! # Honest measurement caveat (L121)
 //!
 //! Per-component values are `len() × size_of` *estimates*, not raw
@@ -50,7 +70,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, counter, gauge};
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::metrics_catalog::{
     ALLOWED_SUBSYSTEM_COMPONENTS, IN_MEM_EVICTIONS_COUNTER_NAME, MARKET_HOURS_ACTIVE_GAUGE_NAME,
@@ -61,6 +81,10 @@ use crate::metrics_catalog::{
 /// the heartbeat. Aligned with the Prometheus default scrape window
 /// per the plan: HYBRID `len() × size_of` lazy at the 10 s cadence.
 pub const SAMPLER_INTERVAL_SECS: u64 = 10;
+
+/// Backoff before respawning the sampler after an unexpected exit. Matches
+/// the house supervisors (`disk_pressure_boot`, the clock-skew poller).
+pub const SAMPLER_RESPAWN_BACKOFF_SECS: u64 = 5;
 
 /// Reconciliation tolerance — sum of per-component estimates must
 /// fall within ±5 % of the kernel-measured process RSS gauge.
@@ -295,24 +319,65 @@ impl SubsystemMemorySampler {
         self.handles.set_market_hours_active(market_hours_active);
     }
 
-    /// Spawn the sampler task on the current `tokio` runtime.
+    /// Spawn the sampler task on the current `tokio` runtime, SUPERVISED.
     ///
     /// Uses `tokio::time::interval` so the cadence is robust against
-    /// system suspend / clock skew. Returns a `JoinHandle` so the
-    /// caller can `abort()` on shutdown if desired (`tokio` aborts
-    /// background tasks on runtime drop anyway).
+    /// system suspend / clock skew. Returns a `JoinHandle` for the
+    /// supervisor, so an `abort()` on shutdown stops the whole thing.
+    ///
+    /// # Why supervised (added 2026-08-26)
+    ///
+    /// This was a bare `tokio::spawn` of the loop. `SUBSYSTEM_MEMORY_GAUGE_NAME`
+    /// is EMF-shipped and charted, and a `metrics` gauge with no idle timeout
+    /// renders its LAST value on every scrape — so a dead sampler does not
+    /// produce a gap in the chart. It produces a flat, dense, healthy-looking
+    /// line that never moves again, which is indistinguishable from a process
+    /// whose memory happens to be stable. Exactly the false-green found in the
+    /// clock-skew poller hours earlier, on a panel added the day before.
+    ///
+    /// `touch_heartbeat` exists precisely so death is detectable — and
+    /// `SAMPLER_HEARTBEAT_GAUGE_NAME` is in NO EMF selector and NO alarm, so
+    /// today it detects nothing. Shipping and alarming it would need its own
+    /// dated operator note under the noise lock; supervising the task needs
+    /// none and removes the failure instead of watching for it. Recorded so
+    /// the heartbeat gap is a decision on the record rather than an oversight.
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let interval_secs = SAMPLER_INTERVAL_SECS;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                let now_unix_secs = unix_now_secs_f64();
-                let active = tickvault_common::market_hours::is_within_market_hours_ist();
-                self.sample_once(now_unix_secs, active);
+                let me = Arc::clone(&self);
+                let handle = tokio::spawn(async move { me.run_sampler_loop().await });
+                match handle.await {
+                    Ok(()) => {
+                        warn!("subsystem-memory sampler exited cleanly — respawning");
+                    }
+                    Err(err) => {
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::Resource02ResidentMemoryHigh
+                                .code_str(),
+                            ?err,
+                            "subsystem-memory sampler died — respawning (its gauges are \
+                             frozen at their last values until it returns, and a frozen \
+                             gauge charts as a flat healthy line)"
+                        );
+                    }
+                }
+                metrics::counter!("tv_subsystem_memory_sampler_respawn_total").increment(1);
+                tokio::time::sleep(Duration::from_secs(SAMPLER_RESPAWN_BACKOFF_SECS)).await;
             }
         })
+    }
+
+    /// The sample loop itself. Never returns on its own — the supervisor
+    /// treats a return as a failure precisely because of that.
+    async fn run_sampler_loop(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(SAMPLER_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let now_unix_secs = unix_now_secs_f64();
+            let active = tickvault_common::market_hours::is_within_market_hours_ist();
+            self.sample_once(now_unix_secs, active);
+        }
     }
 }
 
@@ -639,6 +704,57 @@ mod tests {
         let join = Arc::clone(&sampler).spawn();
         assert!(!join.is_finished(), "sampler task must be running");
         join.abort();
+    }
+
+    /// The sampler must be SUPERVISED, because a dead one is invisible.
+    ///
+    /// A `metrics` gauge with no idle timeout renders its LAST value on every
+    /// scrape, so a dead sampler does not leave a gap — it leaves a flat,
+    /// dense line that never moves again, indistinguishable from a process
+    /// whose memory is simply stable.
+    ///
+    /// CORRECTED 2026-08-29: this said `SUBSYSTEM_MEMORY_GAUGE_NAME` "is
+    /// EMF-shipped and charted". It was shipped and charted, and it had never
+    /// once published — a live `list-metrics` returned `[]` for it, because
+    /// every component gauge is NaN until [`SubsystemMemorySampler::
+    /// register_source`] is called and nothing in production calls it. The
+    /// name is off the paid surface now; the reasoning above still holds and
+    /// now rests on the two gauges that DO carry real values, the sampler
+    /// heartbeat and the market-hours flag, which are local-exporter-only.
+    ///
+    /// Found on 2026-08-26 by sweeping every long-lived `tokio::spawn`
+    /// against the twenty-one `tv_*_respawn_total` counters that already
+    /// existed. Same defect as the clock-skew poller found hours earlier, on
+    /// a panel added the day before that.
+    ///
+    /// Source-scan rather than behavioural, for the same reason as the
+    /// clock-skew twin: killing an inner task from outside needs a
+    /// fault-injection hook, and adding one to production code to prove a
+    /// property about production code is worse than reading the shape.
+    #[test]
+    fn test_sampler_is_supervised_not_bare_spawned() {
+        let src = include_str!("subsystem_memory.rs");
+        let body = src
+            .split("pub fn spawn(self: Arc<Self>)")
+            .nth(1)
+            .expect("spawn must exist"); // APPROVED: test
+
+        for needle in [
+            "handle.await",
+            "tv_subsystem_memory_sampler_respawn_total",
+            "SAMPLER_RESPAWN_BACKOFF_SECS",
+            // A CLEAN return is a failure too: the inner loop never returns
+            // on its own, so Ok(()) is a failure wearing a success type.
+            "exited cleanly",
+        ] {
+            assert!(
+                body.contains(needle),
+                "SubsystemMemorySampler::spawn must SUPERVISE its loop (missing `{needle}`). \
+                 A bare tokio::spawn means a dead sampler leaves its gauges frozen, and a \
+                 frozen gauge charts as a flat healthy line rather than a gap. Follow the \
+                 house shape in disk_pressure_boot."
+            );
+        }
     }
 
     #[test]

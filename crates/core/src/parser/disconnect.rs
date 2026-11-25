@@ -13,6 +13,7 @@ use super::types::{PacketHeader, ParseError};
 /// # Performance
 /// O(1) — one `from_le_bytes` read + enum match.
 #[inline]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: constant offsets bounded by DISCONNECT_PACKET_SIZE check
 pub fn parse_disconnect_packet(
     raw: &[u8],
@@ -31,6 +32,7 @@ pub fn parse_disconnect_packet(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)] // APPROVED: fixed-offset read; the caller/guard above proves the length
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets
 mod tests {
     use super::*;

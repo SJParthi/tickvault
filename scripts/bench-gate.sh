@@ -11,18 +11,18 @@
 #
 # Env:
 #   BENCH_BUDGET_MULTIPLIER (float, default 1.0) — scales the ABSOLUTE ns
-#   budgets from quality/benchmark-budgets.toml for slower runner classes
-#   (the "runner-class multiplier" remediation documented in bench.yml's
-#   header). The TOML values stay the dev-hardware truth and are NEVER
-#   edited; the multiplier is the explicit, logged hardware adjustment.
-#   It does NOT touch the regression arm (max_regression_pct is unchanged).
+#   budgets from quality/benchmark-budgets.toml. It does not affect regression checks.
+#   BENCH_REQUIRE_ALL_BUDGETS=1 requires a matching result for every budget key.
+#   BENCH_RECORD_VERDICT=1 writes the measured return code to GITHUB_OUTPUT.
 #
-# Exit codes (consumed by .github/workflows/bench.yml baseline-ratchet logic):
-#   0 = clean — all benchmarks within budget, no confident regression
-#   1 = absolute-budget breach ONLY (per-element ns budget exceeded)
-#   2 = regression breach (>max_regression_pct, CI-lower-bound confident) —
-#       wins over 1 when both breach, so a regressed run can never be
-#       mistaken for a mere hardware-calibration misfit.
+# Measured verdicts are 0 (clean), 1 (absolute budget breached), and
+# 2 (confident regression, including when absolute budgets also fail).
+# Exit 3 means the directory, estimates, or budget matches were missing.
+# Input and tool errors can also return nonzero, so CI requires a verdict
+# from the evaluator before allowing its data to become a baseline.
+# A measured 1 can advance a baseline on a slower runner; a measured 2
+# needs an explicit reset. Cases H and I in the self-test cover missing
+# estimates and zero budget matches, which used to quietly pass.
 #
 # Regression semantics: a benchmark FAILS the regression arm only when the
 # LOWER bound of Criterion's 95% confidence interval for the mean change
@@ -47,25 +47,16 @@
 #   (which would blind the gate to real 30% regressions) and than resetting the
 #   baseline (which re-breaks on the next rotation).
 #
-# Spread re-calibration (2026-08-07, SAME DAY — the drift fix did not fire):
-#   The suppressor above shipped with spread = max - min, and then FAILED to
-#   suppress the very next rotation. Live on main @026c7b63 (bench run
-#   31182757999 attempt 2): 31 of 31 benches regressed, share 100%, every
-#   absolute budget passed — yet drift was NOT declared, because ONE outlier
-#   (ws_reader_dispatch_ticker, a 13ns bench, +111.6%) dragged max-min to
-#   88.0 pts against the 15 pt bar. The other 30 sat between +23.6% and
-#   +42.9%. max-min is a WORST-CASE statistic: a single noisy sub-30ns
-#   benchmark destroys it, which is exactly the population this gate measures.
-#   Same commit, minutes earlier (attempt 1), only 1 of 31 "regressed" — the
-#   two attempts differed by RUNNER, not by code (the merge touched zero files
-#   under crates/core, where the attempt-1 bench lives).
-#   Fix: spread is now the INTERQUARTILE RANGE (Q3-Q1) of the regressions —
-#   a robust statistic that ignores the tails by construction. On the live
-#   failing data IQR = 2.6 pts (vs max-min 88.0). The threshold, the count and
-#   share rules, and the absolute arm are all UNCHANGED; only the estimator
-#   changed. Case C of the self-test (8 benches genuinely fanned +6%..+80%,
-#   IQR 24 pts) still FAILS, so the discriminating power is preserved, and the
-#   full min..max range is still PRINTED for the operator.
+# Spread uses the interquartile range: in run 31182757999 attempt 2 (026c7b63),
+# a single noisy 13ns bench gave a full range of 88 points while the IQR was
+# 2.6. Case C of the self-test covers a genuine 24-point IQR and still fails.
+#
+# Regression noise floor (2026-10-11): sub-10ns benches failed the relative arm
+# on noise (oms_invalid_transition ~3ns, CI lower bound +10.6% = 0.3ns). A
+# regression whose confident size, median x lb/(1+lb), is under the TOML
+# min_regression_delta_ns is printed as NOISE and left out (absent key = 0 =
+# off). Absolute budgets still gate. Honest limit: a real sub-floor slowdown
+# on a tiny bench passes the relative arm.
 # =============================================================================
 
 set -euo pipefail
@@ -86,6 +77,11 @@ HARDWARE_DRIFT_SPREAD_PCT=15    # INTERQUARTILE RANGE (Q3-Q1) of the regressions
                                 # single-handedly veto a textbook drift shape
                                 # (live: IQR 2.6 pts vs max-min 88.0 pts).
 
+# Clear a previous verdict before a same-runner recheck can fail partway.
+if [[ ${BENCH_RECORD_VERDICT:-} == 1 ]]; then
+  echo 'measured_rc=unmeasured' >> "${GITHUB_OUTPUT:?}"
+fi
+
 # Validate the multiplier early and loudly: digits and at most one dot only
 # (rejects empty, negative, and non-numeric garbage before it reaches the evaluator).
 case "$BENCH_BUDGET_MULTIPLIER" in
@@ -96,9 +92,8 @@ case "$BENCH_BUDGET_MULTIPLIER" in
 esac
 
 if [ ! -d "$CRITERION_DIR" ]; then
-  echo "INFO: No criterion results found at $CRITERION_DIR — skipping bench gate."
-  echo "  Run 'cargo bench --workspace' first to generate benchmark data."
-  exit 0
+  echo "ERROR: Missing Criterion directory: $CRITERION_DIR. Zero budgets measured." >&2
+  exit 3
 fi
 
 if [ ! -f "$BUDGETS_FILE" ]; then
@@ -112,32 +107,47 @@ echo "╚═══════════════════════�
 echo ""
 
 # Find all new/estimates.json files from Criterion
-ESTIMATE_FILES=$(find "$CRITERION_DIR" -name "estimates.json" -path "*/new/*" 2>/dev/null || true)
+ESTIMATE_FILES=$(find "$CRITERION_DIR" -type f -path "*/new/estimates.json" | sort)
+CHANGE_FILES=$(find "$CRITERION_DIR" -type f -path "*/change/estimates.json" | sort)
 
 if [ -z "$ESTIMATE_FILES" ]; then
-  echo "INFO: No benchmark estimates found — skipping."
-  exit 0
+  echo "ERROR: No benchmark estimates found under $CRITERION_DIR."
+  echo "       ZERO latency budgets were enforced — this run proves nothing."
+  echo "       Likely causes: cargo bench did not run, failed to build, or its"
+  echo "       Criterion output was not restored into the expected directory."
+  exit 3
+fi
+
+# A failed comparison can still leave a fresh median and a successful Criterion
+# exit. Only prior benchmarks that ran again must produce a change estimate.
+if [[ -n ${BENCH_BASELINE_MANIFEST:-} && -n ${BENCH_AB_BASELINE_KEY:-} ]]; then
+  if [[ ! -s "$BENCH_BASELINE_MANIFEST" ]]; then
+    echo "ERROR: No benchmarks listed for the restored baseline: $BENCH_BASELINE_MANIFEST" >&2
+    exit 3
+  fi
+  while IFS= read -r baseline; do
+    bench_dir="$CRITERION_DIR/${baseline%/base}"
+    if [[ -f "$bench_dir/new/estimates.json" && ! -f "$bench_dir/change/estimates.json" ]]; then
+      echo "ERROR: Missing comparison with restored baseline: ${baseline%/base}" >&2
+      exit 3
+    fi
+  done < "$BENCH_BASELINE_MANIFEST"
 fi
 
 
-# =============================================================================
-# Rust-only purge Phase 2a-2 (2026-07-18): the inline interpreter walker below
-# was replaced by jq (per-file JSON extraction) + awk (TOML parse, budget
-# matching, float comparisons, verdicts). Numeric semantics preserved:
-# every comparison and every printed number is computed on IEEE-754 doubles
-# exactly as the evaluator was (json floats, per-element division, budget x
-# multiplier, pct x 100, printf %.0f / %+.1f / %g are the same C-double
-# operations in both). Per-line output content and exit codes are
-# unchanged; LINE ORDER is now deterministic (sorted paths, all absolute-
-# budget lines before regression lines) where the legacy walker's order was
-# filesystem-dependent.
-# =============================================================================
+# Rust-only purge Phase 2a-2 (2026-07-18): jq extracts per-file JSON and awk
+# does the TOML parse, budget matching and verdicts, on IEEE-754 doubles
+# exactly as the retired evaluator did. Line order is deterministic: absolute
+# lines first, then regression lines.
 
 RECORDS_FILE="$(mktemp)"
 trap 'rm -f "$RECORDS_FILE"' EXIT
 
 # N <tab> <rel-root> <tab> <median_ns>            (from */new/estimates.json)
 # C <tab> <rel-root> <tab> <point> <tab> <lb|NA>  (from */change/estimates.json)
+criterion_filter='def finite_number: type == "number" and isfinite and (isnan | not);
+  def estimate: if length == 1 and (.[0] | type) == "object" then .[0]
+                else error("expected one Criterion estimate object") end;'
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel="${f#"$CRITERION_DIR"/}"
@@ -147,50 +157,48 @@ while IFS= read -r f; do
   # explicit JSON null into 0ns — a corrupt estimates.json silently PASSED
   # every budget. The old evaluator raised TypeError there (exit 1); restore
   # that fail-closed contract with a named error instead of a stack trace.
-  median=$(jq -r '(try .median.point_estimate catch null)
-                  | if type == "number" then . else "CORRUPT" end' "$f")
+  median=$(jq -sr "$criterion_filter"'estimate | (try .median.point_estimate catch null)
+                  | if finite_number and . >= 0 then . else "CORRUPT" end' "$f")
   if [ "$median" = "CORRUPT" ] || [ -z "$median" ]; then
-    echo "ERROR: $f: median.point_estimate is null/missing/non-numeric — corrupt Criterion output; refusing to treat it as 0ns (fail closed)" >&2
+    echo "ERROR: $f: median.point_estimate must be a finite, nonnegative duration in nanoseconds" >&2
     exit 1
   fi
   printf 'N\t%s\t%s\n' "$rel" "$median" >> "$RECORDS_FILE"
-done < <(printf '%s\n' "$ESTIMATE_FILES" | sort)
+done <<< "$ESTIMATE_FILES"
 
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   rel="${f#"$CRITERION_DIR"/}"
   rel="${rel%/estimates.json}"
-  # mean.point_estimate defaults to 0 when absent; the CI lower bound is NA
-  # when confidence_interval is absent, not an object, or lower_bound is
-  # null (the evaluator's isinstance(ci, dict) + .get() semantics).
-  # FAIL CLOSED on a PRESENT null/non-numeric mean.point_estimate or a
-  # present NON-NULL non-numeric lower_bound (review round 2 fix,
-  # 2026-07-18): the previous `// 0` / awk `+0` coerced them to 0, so a
-  # real +30% regression with a corrupt lower_bound silently PASSED. The
-  # old evaluator crashed there (TypeError, exit 1). Parity kept byte-
-  # identical everywhere else: an ABSENT mean/point_estimate is still 0
-  # (documented legacy-parity), and a null/absent lower_bound (or a
-  # non-object confidence_interval) still takes the NA fallback.
-  vals=$(jq -r '[ ((.mean // {}) as $m
+  # Full-workspace changes must be real Criterion intervals. A cold run has
+  # no change file. Criterion reports new/old - 1, whose minimum is -1.
+  # Scoped historical records retain the point-only fallback.
+  vals=$(jq -sr "$criterion_filter"'estimate |
+      if env.BENCH_REQUIRE_ALL_BUDGETS == "1" then
+        .mean.confidence_interval as $ci |
+        if ([.mean.point_estimate, $ci.lower_bound, $ci.upper_bound] | all(finite_number and . >= -1))
+           and $ci.lower_bound <= $ci.upper_bound then .
+        else error("invalid Criterion change estimate or confidence interval") end
+      else . end | [ ((.mean // {}) as $m
                    | if ($m | type) == "object" and ($m | has("point_estimate"))
                      then ($m.point_estimate
-                           | if type == "number" then . else "CORRUPT" end)
+                           | if finite_number then . else "CORRUPT" end)
                      else 0 end),
                   ((.mean.confidence_interval // {}) as $ci
                    | if ($ci | type) == "object"
                      then ($ci.lower_bound as $lb
                            | if $lb == null then "NA"
-                             elif ($lb | type) == "number" then ($lb | tostring)
+                             elif ($lb | finite_number) then ($lb | tostring)
                              else "CORRUPT" end)
                      else "NA" end) ] | @tsv' "$f")
   case "$vals" in
     *CORRUPT*)
-      echo "ERROR: $f: mean.point_estimate or confidence_interval.lower_bound is present but non-numeric — corrupt Criterion output; refusing to coerce it to 0 (fail closed)" >&2
+      echo "ERROR: $f: mean.point_estimate or confidence_interval.lower_bound is present but is not a finite number" >&2
       exit 1
       ;;
   esac
   printf 'C\t%s\t%s\n' "$rel" "$vals" >> "$RECORDS_FILE"
-done < <(find "$CRITERION_DIR" -name "estimates.json" -path "*/change/*" 2>/dev/null | sort)
+done <<< "$CHANGE_FILES"
 
 LC_ALL=C awk -F'\t' \
   -v budgets_file="$BUDGETS_FILE" \
@@ -228,14 +236,14 @@ BEGIN {
 # ---- stripped, [elements] ints, max_regression_pct anywhere) ----
 FILENAME == budgets_file {
   line = trim($0)
-  if (line ~ /^max_regression_pct/) {
+  if (line ~ /^(max_regression_pct|min_regression_delta_ns)/) {
     eq = index(line, "=")
-    if (eq == 0) { print "ERROR: malformed max_regression_pct line in " budgets_file > "/dev/stderr"; died = 1; exit 1 }
-    max_regression_raw = trim(substr(line, eq + 1))
-    if (max_regression_raw !~ /^[0-9]+(\.[0-9]+)?$/) {
-      print "ERROR: max_regression_pct is not a plain decimal: " max_regression_raw > "/dev/stderr"; died = 1; exit 1
+    if (eq == 0) { print "ERROR: malformed knob line in " budgets_file ": " line > "/dev/stderr"; died = 1; exit 1 }
+    raw = trim(substr(line, eq + 1))
+    if (raw !~ /^[0-9]+(\.[0-9]+)?$/) {
+      print "ERROR: knob is not a plain decimal: " line > "/dev/stderr"; died = 1; exit 1
     }
-    max_regression = max_regression_raw + 0
+    if (line ~ /^max/) { max_regression_raw = raw; max_regression = raw + 0 } else min_delta_ns = raw + 0
     next
   }
   if (line == "[budgets]")  { in_budgets = 1; in_elements = 0; next }
@@ -276,6 +284,7 @@ $1 == "N" {
   gsub(/\//, "_", bench)
   bench = tolower(bench)
   median_ns = $3 + 0
+  med[bench] = median_ns          # for the regression noise floor
 
   # Per-element normalization: budgets are PER-ELEMENT; batch benches divide
   # the batch median by their [elements] count (default 1). First TOML-order
@@ -298,6 +307,7 @@ $1 == "N" {
   }
 
   if (budget_found) {
+    if (index(bench, bkey[j]) > 0) measured_budget[j] = 1
     checked++
     unit = (n_elements > 1) ? sprintf(" (%.0fns / %d)", median_ns, n_elements) : ""
     effective_ns = budget_ns * multiplier
@@ -325,28 +335,41 @@ $1 == "C" {
   bench = tolower(bench)
   point_pct = ($3 + 0) * 100
   lb = $4
-  cmp_total++
-  if (lb != "NA") {
-    lower_pct = (lb + 0) * 100
-    if (lower_pct > max_regression) {
-      reg_n++
-      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
-      reg_lower[reg_n] = lower_pct; reg_kind[reg_n] = "ci"
-    }
-  } else {
+  if (lb == "NA")
     printf "  NOTE: %s: change/estimates.json has no confidence_interval — falling back to point estimate\n", bench
-    if (point_pct > max_regression) {
-      reg_n++
-      reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
-      reg_lower[reg_n] = point_pct; reg_kind[reg_n] = "point"
-    }
+  frac = (lb != "NA") ? lb + 0 : $3 + 0
+  # Noise floor: the confident slowdown in ns, from the new median. -1 when
+  # unknown (no matching new/ median), so an unknown size is never NOISE.
+  delta_ns = ((bench in med) && frac > -1) ? med[bench] * frac / (1 + frac) : -1
+  if (frac * 100 > max_regression && delta_ns >= 0 && delta_ns < min_delta_ns) {
+    printf "  NOISE: %s: %+.1f%% is %.2fns, under the %gns floor (absolute budget still gates)\n", bench, point_pct, delta_ns, min_delta_ns
+    next
+  }
+  cmp_total++
+  if (frac * 100 > max_regression) {
+    reg_n++
+    reg_bench[reg_n] = bench; reg_point[reg_n] = point_pct
+    reg_lower[reg_n] = frac * 100; reg_kind[reg_n] = (lb != "NA") ? "ci" : "point"
   }
   next
 }
 END {
   if (died) exit 1
-  if (checked == 0)
-    print "  INFO: No benchmarks matched budget entries — gate passed (no violations)."
+  if (ENVIRON["BENCH_REQUIRE_ALL_BUDGETS"] == "1") {
+    for (j = 1; j <= nb; j++) {
+      if (!(j in measured_budget)) {
+        print "  ERROR: No current measurement for configured budget: " bkey[j]
+        incomplete = 1
+      }
+    }
+    if (incomplete) exit 3
+  }
+  if (checked == 0) {
+    print "  ERROR: No benchmark matched any budget key in quality/benchmark-budgets.toml."
+    print "         ZERO absolute latency budgets were enforced — this run proves nothing."
+    print "         Likely cause: a Criterion bench id drifted away from its budget key."
+    exit 3
+  }
 
   # ---- hardware-drift classification (2026-08-07) --------------------------
   # A CODE regression hits a FEW RELATED benchmarks. A runner/toolchain change
@@ -398,14 +421,16 @@ END {
   print ""
   if (reg_failed) {
     print "  Benchmark budget gate FAILED (confident regression)."
-    exit 2
+    rc = 2
   } else if (abs_failed) {
     print "  Benchmark budget gate FAILED (absolute budget breach)."
-    exit 1
+    rc = 1
   } else {
     print "  All benchmarks within budget."
-    exit 0
+    rc = 0
   }
+  if (ENVIRON["BENCH_RECORD_VERDICT"] == "1") print "measured_rc=" rc >> ENVIRON["GITHUB_OUTPUT"]
+  exit rc
 }
 ' "$BUDGETS_FILE" "$RECORDS_FILE"
 

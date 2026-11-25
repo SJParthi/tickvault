@@ -84,177 +84,58 @@ fn normalize_ws(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Comment-stripped, whitespace-normalized production region.
-fn scan_region(rel: &str) -> String {
-    let src = app_src(rel);
-    normalize_ws(&strip_line_comments(production_region(&src)))
-}
+// ---- `scan_region` is RETIRED 2026-09-17 ----
+//
+// The composed "comment-stripped + whitespace-normalized production
+// region" helper. Its callers were pins 1-4, retired on 2026-09-16 with
+// the cadence mark producer; the two surviving order-runtime tests compose
+// `strip_line_comments(production_region(..))` inline and deliberately do
+// NOT normalize, because their needles are string literals carrying
+// `\`-continuations and each sits on one physical line.
+//
+// `normalize_ws` itself is KEPT — the scanner self-check still pins it, so
+// a future guard that needs wrapped-shape matching has a proven primitive
+// rather than a fresh one.
 
-#[test]
-fn test_groww_cadence_executor_forwards_marks_after_persist_confirm() {
-    let scan = scan_region("src/groww_cadence_executor.rs");
-
-    // EXACTLY TWO forward sites (the 1-tap-per-seam discipline of
-    // order_runtime_spawn_site_guard::ratchet_groww_rest_leg_mark_taps_pinned
-    // applied to the cadence producer; widened 1 → 2 on 2026-07-18 for
-    // the chain seam): a THIRD site would mean a non-own-fire arm
-    // started producing marks (the stale-price class).
-    let forwards = scan.matches(".mark_forward(").count();
-    assert_eq!(
-        forwards, 2,
-        "groww_cadence_executor.rs production region must forward marks at \
-         EXACTLY TWO sites (the spot persist-confirm seam + the chain \
-         persist-confirm seam — 2026-07-18 deliberate widening) — found \
-         {forwards}; fewer re-opens the PR #1624 producer-less mark \
-         channel class (paper fills + P&L marks silently dead), more \
-         means a non-own-fire arm started producing marks (the \
-         stale-price class)"
-    );
-
-    // Option-gate pin: the tap must be a no-op when [order_runtime] is off.
-    assert!(
-        scan.contains("if let Some(forwarder) = self.mark_forwarder.as_ref()"),
-        "groww_cadence_executor.rs lost the Option-gate on the mark forward \
-         — the tap must be a no-op when [order_runtime] is disabled"
-    );
-
-    // Source-order pin: persist (append) → flush ACK → heartbeat → fold
-    // handoff → mark forward. First occurrences all live in the spot
-    // fetch; a mark forwarded BEFORE the flush ACK would reference a
-    // price the audit record does not back.
-    let needles = [
-        "writer.append_row(&row)",
-        "flush_off_worker(|| writer.flush())",
-        "if flush_ok {",
-        "metrics::gauge!(\"tv_rest_1m_fire_heartbeat\")",
-        "send_confirmed_bars(",
-        ".mark_forward(",
-    ];
-    let mut last = 0usize;
-    for needle in needles {
-        let at = scan.find(needle).unwrap_or_else(|| {
-            panic!("groww_cadence_executor.rs production region lost `{needle}`")
-        });
-        assert!(
-            at > last,
-            "ordering violated: `{needle}` at byte {at} must come after the \
-             previous needle (byte {last}) — the persist → flush-ACK → \
-             heartbeat → fold → mark contract"
-        );
-        last = at;
-    }
-}
-
-#[test]
-fn test_groww_cadence_chain_seam_forwards_resolved_marks_after_flush_ack() {
-    // Item 3 (2026-07-18): the CHAIN mark tap. Ordering pin scoped to the
-    // fetch_chain region (sliced from the chain writer's own
-    // `append_row_ext(` anchor so the SPOT seam's needles can never
-    // vacuously satisfy it): persist append → flush → the
-    // persist-gated Option-gate → mark forward.
-    let scan = scan_region("src/groww_cadence_executor.rs");
-    let chain_at = scan
-        .find(".append_row_ext(")
-        .expect("groww_cadence_executor.rs lost the chain writer append_row_ext anchor");
-    let chain_region = &scan[chain_at..];
-    let needles = [
-        "flush_off_worker(|| writer.flush())",
-        "if !persist_failed && let Some(forwarder) = self.mark_forwarder.as_ref()",
-        ".mark_forward(",
-    ];
-    let mut last = 0usize;
-    for needle in needles {
-        let at = chain_region.find(needle).unwrap_or_else(|| {
-            panic!("groww_cadence_executor.rs chain-seam region lost `{needle}`")
-        });
-        assert!(
-            at > last,
-            "chain-seam ordering violated: `{needle}` at byte {at} must come \
-             after the previous needle (byte {last}) — the persist → \
-             flush-ACK → mark contract"
-        );
-        last = at;
-    }
-    // Identity discipline: REAL exchange_token ids via the day-cached
-    // master-derived index (never a synthetic id), unresolved legs
-    // COUNTED (never guessed), and the index built OFF the chain fire's
-    // critical path (piggybacked on the expiry-list master download).
-    for needle in [
-        "resolve_groww_contract_books(",
-        "build_contract_mark_index(",
-        "tv_cadence_option_mark_unresolved_total",
-    ] {
-        assert!(
-            scan.contains(needle),
-            "groww_cadence_executor.rs production region lost `{needle}` — \
-             the chain mark tap's real-identity/counted-unresolved contract"
-        );
-    }
-}
-
-#[test]
-fn test_dhan_cadence_executor_carries_no_mark_tap() {
-    // ID-SPACE BAN: the paper book keys on the Groww-native u64 id space
-    // (bit-62 `stable_index_security_id` indices — order-runtime-dryrun.md
-    // §3/E9). Dhan cadence spot sids are the Dhan IDX_I space (NIFTY=13,
-    // BANKNIFTY=25, SENSEX=51). Feeding Dhan marks alongside Groww marks
-    // would DOUBLE-KEY the same instrument as two book entries — invisible
-    // to the first-seen-SEGMENT tripwire, because both entries carry the
-    // SAME segment code (IDX_I) under different ids. Marks come from the
-    // GROWW lane only.
-    let scan = scan_region("src/dhan_cadence_executor.rs");
-    for needle in ["mark_forward", "MarkForwarder", "mark_forwarder"] {
-        assert!(
-            !scan.contains(needle),
-            "dhan_cadence_executor.rs production region mentions `{needle}` \
-             — the Dhan cadence lane must NEVER produce order-runtime marks \
-             (cross-ID-SPACE double-keying of the paper book; see the \
-             rationale comment in this test)"
-        );
-    }
-}
-
-#[test]
-fn test_main_threads_forwarder_into_cadence_boot() {
-    let src = strip_line_comments(&app_src("src/main.rs"));
-    let at = src
-        .find("spawn_cadence_scheduler(")
-        .expect("main.rs lost the spawn_cadence_scheduler call");
-    let window = &src[at..(at + 400).min(src.len())];
-    assert!(
-        window.contains("order_runtime_mark_forwarder"),
-        "the main.rs spawn_cadence_scheduler call must pass \
-         order_runtime_mark_forwarder — without it the cadence Groww \
-         executor has no mark tap and the order runtime's mark channel is \
-         producer-less at boot (the PR #1624 regression)"
-    );
-}
-
-#[test]
-fn test_cadence_boot_passes_forwarder_to_groww_executor_only() {
-    let scan = scan_region("src/cadence_boot.rs");
-    // The GROWW constructor window carries the forwarder…
-    let groww_at = scan
-        .find("GrowwCadenceExecutor::new(")
-        .expect("cadence_boot.rs lost GrowwCadenceExecutor::new(");
-    let groww_window = &scan[groww_at..(groww_at + 200).min(scan.len())];
-    assert!(
-        groww_window.contains("groww_mark_forwarder"),
-        "cadence_boot.rs must pass groww_mark_forwarder into \
-         GrowwCadenceExecutor::new — the sole live mark producer"
-    );
-    // …and the DHAN constructor window must NOT (the id-space ban).
-    let dhan_at = scan
-        .find("DhanCadenceExecutor::new(")
-        .expect("cadence_boot.rs lost DhanCadenceExecutor::new(");
-    let dhan_window = &scan[dhan_at..(dhan_at + 300).min(scan.len())];
-    assert!(
-        !dhan_window.contains("mark_forwarder"),
-        "cadence_boot.rs passes a mark forwarder into the DHAN executor — \
-         forbidden (cross-ID-SPACE double-keying of the paper book)"
-    );
-}
-
+// ---- Pins 1-4 RETIRED 2026-09-16: there is no cadence mark producer ----
+//
+// `test_dhan_cadence_executor_is_now_the_mark_producer`,
+// `test_main_threads_forwarder_into_cadence_boot` and
+// `test_cadence_boot_passes_the_forwarder_to_the_sole_executor` pinned the
+// mark tap onto the cadence executor and the forwarder's route from main.rs
+// through cadence_boot. All three subjects are gone: the operator's
+// SOCKETS-ONLY narrowing removed the per-minute price pulls
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), and `CadenceExecutor`
+// declared exactly the three removed fetch methods, so the scheduler, its
+// boot and the executor went with them.
+//
+// ⚠ THE INCIDENT IN THE MODULE DOCBLOCK ABOVE IS NOT HISTORICAL — IT IS THE
+// SHAPE THIS BRANCH WALKED INTO AGAIN, FROM THE OTHER DIRECTION.
+//
+// PR #1624 stood the legacy legs down while they carried the only
+// `mark_forward` call sites, so the order runtime's mark channel had zero
+// producers, the sole sender dropped, and the Fix-F arm read the closed
+// channel as the benign day-complete state. Paper fills and unrealized-P&L
+// marks died silently.
+//
+// This removal deleted the cadence executor that #1624 had made the
+// producer — and the sender was MOVED BY VALUE into the cadence spawn, so
+// deleting that spawn left the binding alive in `async_main`'s frame for the
+// process lifetime. The channel would therefore NEVER close, `recv()` would
+// pend forever, and the producer-less warn at the Fix-F arm could not fire:
+// the same silent stall as #1624, except that #1624 was at least loud at the
+// 180s AwaitingMark timeout. `main.rs` now explicitly drops
+// `order_runtime_mark_forwarder` so the channel CLOSES and the arm pinned
+// below is reachable. §12.10.7(a) carries the measurement.
+//
+// So pins 1-4 are retired and pins 5+ are KEPT AND LOAD-BEARING: they are
+// the only pins on the never-any-mark and abnormal-death arms, and this
+// branch is the reason those arms are the live signal rather than a
+// fallback. Deleting this whole file to make the suite green would have
+// removed the guard on the exact defect the removal re-created.
+//
+// NOT claimed: that a mark producer exists. None does. The paper book runs
+// unmarked and now SAYS SO, which is the whole difference.
 #[test]
 fn test_order_runtime_fix_f_distinguishes_never_any_mark() {
     // The Fix-F closed-channel arm must not claim "day complete" when NO

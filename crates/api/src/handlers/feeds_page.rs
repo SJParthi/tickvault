@@ -91,11 +91,13 @@ const FEEDS_PAGE_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <h1>TickVault — Feed Control</h1>
-  <p class="sub"><b>📊 Market data is captured by the per-minute REST cadence
-     pulls (Dhan + Groww) — that capture runs regardless of the switches
-     below.</b> Today's numbers are on the <a href="/board">Live Board</a>.</p>
-  <p class="sub">The switches below control only the RETIRED live-WS lanes —
-     they are OFF by design and safe to leave alone.</p>
+  <p class="sub"><b>📊 Market data comes from two places: the live Dhan
+     price feed, and the per-minute Dhan catch-up pulls. Both run regardless
+     of the switches below.</b> Today's numbers are on the
+     <a href="/board">Live Board</a>.</p>
+  <p class="sub">The switches below do <b>not</b> start or stop the live
+     price feed — that is set before start-up and reported here, not
+     controlled here. Leave them alone unless you have been told otherwise.</p>
 
   <div class="token-row">
     <input id="token" type="password" placeholder="API token (required to toggle feeds)"
@@ -215,14 +217,12 @@ function render(data, health) {
 
     const metaDiv = document.createElement("div");
     metaDiv.className = "meta" + (laneStalled ? " warn" : "");
-    // Groww cold-starts its lane at runtime on enable (no restart) — a brief
-    // not-yet-running window while it ensures tables + auth + builds the watch-list.
-    // Other feeds (Dhan) are config+restart for cold start; the toggle only
-    // pauses/resumes a running pool, so they still need a restart if off at boot.
+    // 2026-08-21: the runtime cold-start branch here belonged to the removed
+    // second feed — every remaining feed is config+restart for cold start (the
+    // toggle only pauses/resumes an already-running pool), so a stalled lane
+    // has exactly one honest explanation.
     metaDiv.textContent = laneStalled
-      ? (f.key === "groww"
-          ? "Enabled — cold-starting now (preparing the watch-list); it begins streaming in a few seconds, no restart needed."
-          : "Enabled, but the feed was not started at boot — set it on in config and restart to actually stream.")
+      ? "Enabled, but the feed was not started at boot — set it on in config and restart to actually stream."
       : f.note;
 
     left.appendChild(nameDiv);
@@ -355,9 +355,16 @@ struct FeedRowDescriptor {
 /// Build the per-feed UI note generically (no per-feed hardcoded copy) so any
 /// future feed gets an accurate description automatically.
 fn feed_note(feed: Feed) -> String {
-    // Operator-scare fix (2026-07-20): the retired live-WS lanes must never
-    // read as a fault — OFF is the designed runtime; the per-minute REST
-    // cadence pulls are the market-data capture now.
+    // Operator-scare fix (2026-07-20): a retired live-WS lane must never read
+    // as a fault — OFF is the designed runtime; the per-minute REST cadence
+    // pulls are the market-data capture for such a lane.
+    //
+    // UNREACHABLE as of 2026-08-22 and deliberately kept: `live_ws_retired()`
+    // returns false for every feed since the Dhan lane was revived
+    // (2026-08-09/11 operator quotes). Keeping the branch means a future
+    // retirement is one predicate arm away with no page edit; deleting it
+    // would put this copy back in a hardcoded per-feed `if`, which is what
+    // the generic `feed_note` exists to avoid.
     if feed.live_ws_retired() {
         return format!(
             "{} live-WS lane (retired) — off by design. Market data arrives \
@@ -404,6 +411,7 @@ fn render_feeds_page_html() -> String {
 /// `/api/feeds` endpoints. Ships `X-Frame-Options: SAMEORIGIN` + a CSP with
 /// `frame-ancestors 'self'` to block click-jacking (security-review). The feed rows
 /// are rendered dynamically from [`Feed::ALL`].
+// WIRING-EXEMPT: wired at crates/api/src/lib.rs as `get(handlers::feeds_page::feeds_page)`. An axum route handler is passed by REFERENCE and never called by us, so the guard's `name(` call-shape matcher cannot see it — true of every page handler here, not a dormancy claim.
 pub async fn feeds_page() -> impl IntoResponse {
     (
         [
@@ -429,14 +437,25 @@ mod tests {
             "has the title"
         );
         // Operator-scare fix (2026-07-20): the REST cadence capture status is
-        // the prominent line; the retired live-WS switches are secondary.
+        // RE-POINTED 2026-08-26. These two pinned "per-minute REST cadence"
+        // and "RETIRED live-WS lanes". The second was the harmful one: the
+        // Dhan live lane was revived 2026-08-09 and runs, so the page told the
+        // operator that the switch beside his RUNNING feed was retired and
+        // safe to ignore — and this assertion is what kept that sentence
+        // there. The page must now say the live feed exists and that these
+        // switches do not control it.
         assert!(
-            FEEDS_PAGE_HTML.contains("per-minute REST cadence"),
-            "prominent REST-cadence capture line present"
+            FEEDS_PAGE_HTML.contains("live Dhan") && FEEDS_PAGE_HTML.contains("catch-up pulls"),
+            "the page must name BOTH market-data sources"
         );
         assert!(
-            FEEDS_PAGE_HTML.contains("RETIRED live-WS lanes"),
-            "retired live-WS framing present"
+            FEEDS_PAGE_HTML.contains("do <b>not</b> start or stop the live"),
+            "the page must say plainly that these switches do not control the \
+             live feed"
+        );
+        assert!(
+            !FEEDS_PAGE_HTML.contains("RETIRED live-WS lanes"),
+            "the live-WS lane is not retired — it was revived 2026-08-09"
         );
     }
 
@@ -490,9 +509,12 @@ mod tests {
             "dhan row present (rendered)"
         );
         assert!(
-            html.contains("\"key\":\"groww\""),
-            "groww row present (rendered)"
+            html.contains("\"key\":\"truedata\""),
+            "truedata row present (rendered)"
         );
+        // Retargeted from the groww row on 2026-08-21: the claim under test is
+        // that EVERY Feed::ALL member is server-rendered as its own switch, so
+        // the second row has to be whatever the second feed is today.
         // PR-E: BOTH feeds are live-toggleable now (Dhan disable is safety-gated
         // server-side; the page shows the API's 409 + re-syncs on a gated reject).
         assert!(

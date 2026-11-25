@@ -108,34 +108,9 @@ impl Serialize for RuntimeMetricMap {
 /// and a live spawn site with no row here.
 pub const LIVE_RUNTIME_SUBSYSTEMS: &[RuntimeSubsystem] = &[
     RuntimeSubsystem {
-        name: "cadence_scheduler",
-        status: STATUS_UNWIRED,
-        metric: "tv_cadence_runner_respawn_total",
-    },
-    RuntimeSubsystem {
         name: "dhan_rest_stack",
         status: STATUS_UNWIRED,
         metric: "tv_token_remaining_seconds",
-    },
-    RuntimeSubsystem {
-        name: "dhan_spot_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_spot1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "dhan_option_chain_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_chain1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "groww_spot_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_spot1m_persist_errors_total",
-    },
-    RuntimeSubsystem {
-        name: "groww_option_chain_1m",
-        status: STATUS_UNWIRED,
-        metric: "tv_groww_chain1m_persist_errors_total",
     },
     RuntimeSubsystem {
         name: "seal_writer",
@@ -192,9 +167,9 @@ pub const STATUS_UNWIRED: &str = "unwired";
 ///
 /// | field              | today            | why                                          |
 /// |--------------------|------------------|----------------------------------------------|
-/// | `websocket`        | `retired`        | live feeds retired 2026-07-13 / 2026-07-15   |
+/// | `websocket`        | live since 22 Aug | the revived Dhan lane pushes its socket count |
 /// | `pipeline`         | `retired`        | `spawn_trading_pipeline` has no call site    |
-/// | `tick_persistence` | `retired`        | `tick_persistence.rs` deleted 2026-07-17     |
+/// | `tick_persistence` | live since 22 Aug | the lane reports each flush outcome            |
 /// | `order_update`     | live             | wired 2026-08-10 — see below                 |
 ///
 /// The `order_update` row WAS the one genuine wiring gap: `dhan_rest_stack`
@@ -231,6 +206,26 @@ pub const STATUS_UNWIRED: &str = "unwired";
 /// `SystemHealthStatus`, which has no setter for any of them, so any
 /// boolean here would be invented. Naming the real series is the honest,
 /// actionable answer; a `true` would be a fabrication.
+///
+/// # ⚠ CORRECTED 2026-09-16 — the count above was ALREADY wrong, and the
+/// # removal makes it wrong again
+///
+/// "The `runtime` array now lists all nine" was written on 2026-08-11 and
+/// the array has held **seven** rows ever since — the count was never true.
+/// It is the stale-count class this repository keeps recording, sitting in
+/// the doc comment of the one constant whose entire job is to answer "what
+/// runs?".
+///
+/// Today's removal takes it to **four**: `cadence_scheduler`,
+/// `dhan_spot_1m` and `dhan_option_chain_1m` went with the per-minute price
+/// pulls and the cadence scheduler, so their spawn sites no longer exist.
+/// Leaving them would have failed `health_subsystem_boot_parity_guard`,
+/// which checks BOTH directions — that guard is doing its job and is the
+/// reason this list cannot drift silently.
+///
+/// The number is NOT restated here as a literal a third time. The array is
+/// the count; read it. A hand-copied count in a doc comment is a claim with
+/// no way to stay true, which is exactly how the first one went stale.
 pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthResponse> {
     let health = state.health_status();
 
@@ -251,7 +246,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             // scripts that read a bounded body (the api contract test caps
             // at 1 KiB), and the full explanation lives in this handler's
             // doc comment where it costs no bytes on the wire.
-            detail: Some("live feeds retired 2026-07-13/15".to_string()),
+            detail: Some("no feed lane reporting".to_string()),
         }
     };
 
@@ -332,7 +327,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
     } else {
         SubsystemInfo {
             status: STATUS_RETIRED,
-            detail: Some("tick writer deleted 2026-07-17".to_string()),
+            detail: Some("no writer reporting".to_string()),
         }
     };
 
@@ -592,14 +587,24 @@ mod tests {
 
         // 2026-08-09: an unreported websocket explains WHY there is no count
         // instead of printing a made-up "0 connections".
+        //
+        // CORRECTED 2026-08-22: this asserted the detail contains the word
+        // "retired". It did -- "live feeds retired 2026-07-13/15" -- and that
+        // sentence had been false since the operator revived the lane on
+        // 2026-08-09. The STATUS is still `retired` on a boot where nothing
+        // reports, which is true and is what this asserts now; the DETAIL
+        // explains the absence without asserting a retirement that was
+        // reversed. A test pinning stale copy keeps the copy, not the
+        // invariant.
+        assert_eq!(response.subsystems.websocket.status, "retired");
         let ws_detail = response
             .subsystems
             .websocket
             .detail
-            .expect("retired websocket must explain itself");
+            .expect("an unreported websocket must explain itself");
         assert!(
-            ws_detail.contains("retired"),
-            "websocket detail must name the retirement, got: {ws_detail}"
+            !ws_detail.is_empty(),
+            "websocket detail must say why there is no count, got: {ws_detail}"
         );
         // Subsystems with real writers still carry no detail when idle.
         assert!(response.subsystems.questdb.detail.is_none());

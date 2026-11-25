@@ -26,6 +26,7 @@
 //! | 7 | `corrupt_tail_is_counted_not_silently_lost` | undecodable bytes are reported, never swallowed |
 //! | 8 | `runner_boot_drain_reports_pending_honestly_when_db_is_down` | the production `SealWriterRunner` seam, dead DB, honest reporting |
 //! | 9 | `real_rescue_path_end_to_end_is_recovered` | seals rescued by the REAL `drain_once` cascade are recovered |
+//! | 10 | `a_refused_append_keeps_the_file_staged_and_is_counted` | a seal the writer refuses is never archived as landed |
 //!
 //! No live QuestDB and no `unsafe`: the ILP side is exercised through the
 //! `SealSink` seam (`ShadowCandleWriter::for_test()` is permanently
@@ -40,7 +41,8 @@ use tickvault_storage::seal_dlq::{SealDlqRecord, SealDlqWriter};
 use tickvault_storage::seal_spill::{SealSpillWriter, SerializedSeal};
 use tickvault_storage::seal_writer_runner::SealWriterRunner;
 use tickvault_storage::seal_writer_task::{
-    SEAL_ARCHIVE_SUBDIR, SEAL_REPLAYING_SUBDIR, SealSink, drain_once, drain_recovered_seals,
+    SEAL_ARCHIVE_SUBDIR, SEAL_REFUSED_FILE_RETRY_SECS, SEAL_REFUSED_SUBDIR, SEAL_REPLAYING_SUBDIR,
+    SealSink, drain_once, drain_recovered_seals,
 };
 use tickvault_storage::shadow_candle_writer::ShadowCandleWriter;
 use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
@@ -70,6 +72,8 @@ struct FakeSink {
     flushes: usize,
     /// How many times `discard_pending` was called.
     discards: usize,
+    /// When set, `append_seal` refuses the seal with this security id.
+    refuse_append_for: Option<u64>,
 }
 
 impl FakeSink {
@@ -95,6 +99,9 @@ impl FakeSink {
 
 impl SealSink for FakeSink {
     fn append_seal(&mut self, seal: &BufferedSeal) -> anyhow::Result<()> {
+        if self.refuse_append_for == Some(seal.security_id) {
+            return Err(anyhow::anyhow!("row refused by the buffer"));
+        }
         self.buffered.push((
             seal.security_id,
             seal.exchange_segment_code,
@@ -141,7 +148,24 @@ fn cleanup(spill: &Path, dlq: &Path) {
     }
     let _ = std::fs::remove_dir_all(dlq);
 }
+/// IST-epoch seconds for 09:15:00 on a real trading date, the base every
+/// candle fixture in this file counts minutes from. See `mk_seal`.
+const CANDLE_FIXTURE_BUCKET_BASE: u32 = 1_716_023_700;
 
+/// Build a seal whose bucket is a REAL IST epoch, not a seconds-of-day value.
+///
+/// `bucket_start_ist_secs` is a full IST epoch — `ShadowSealRow` converts it
+/// with `* 1_000_000_000` and nothing adds a date. The fixtures here used
+/// `34_200` (and `40_000`), which read as 09:30 and 11:06 seconds-of-day and
+/// are in fact **1970-01-01**. That was invisible until the session-window
+/// gate landed on 2026-09-05: its plausible-epoch band refused them, the
+/// refusal returns `Ok`, and two tests that meant to prove "a dead DB commits
+/// nothing" started reporting three commits. The fixture was measuring the
+/// band check, not the database.
+///
+/// So the epoch base below is deliberate and load-bearing: `1_716_023_700`
+/// is 09:15:00 by the seconds-of-day arithmetic the gate actually uses
+/// (1_716_023_700 % 86_400 = 33_300), and it sits inside the plausible band.
 fn mk_seal(sid: u64, bucket: u32) -> BufferedSeal {
     let mut state = LiveCandleState::empty();
     state.bucket_start_ist_secs = bucket;
@@ -161,7 +185,7 @@ fn spill_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     let writer = SealSpillWriter::with_spill_dir_for_test(dir.to_path_buf());
     let mut keys = Vec::new();
     for i in 0..n {
-        let seal = mk_seal(1000 + i, 34_200 + (i as u32) * 60);
+        let seal = mk_seal(1000 + i, CANDLE_FIXTURE_BUCKET_BASE + (i as u32) * 60);
         writer
             .append_seal(&SerializedSeal::from(&seal), NOW)
             .expect("spill append");
@@ -180,7 +204,7 @@ fn dlq_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     let writer = SealDlqWriter::with_dlq_dir_for_test(dir.to_path_buf());
     let mut keys = Vec::new();
     for i in 0..n {
-        let seal = mk_seal(7000 + i, 40_000 + (i as u32) * 60);
+        let seal = mk_seal(7000 + i, CANDLE_FIXTURE_BUCKET_BASE + 600 + (i as u32) * 60);
         let record = SealDlqRecord::from(&SerializedSeal::from(&seal));
         writer.append_record(&record, NOW).expect("dlq append");
         keys.push((
@@ -193,14 +217,18 @@ fn dlq_n(dir: &Path, n: u64) -> Vec<(u64, u8, u32)> {
     keys
 }
 
-/// Count of live (un-staged) `seals-*` files directly in `dir`.
+/// Count of live (un-staged) seal files directly in `dir` - the current
+/// `seals_v4-*` name AND the legacy `seals-*` name the drain still globs.
 fn live_file_count(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.path().is_file())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("seals-"))
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("seals_v4-") || n.starts_with("seals-")
+        })
         .count()
 }
 
@@ -321,6 +349,86 @@ fn flush_failure_leaves_file_staged_then_recovers_next_boot() {
 }
 
 // ---------------------------------------------------------------------------
+// 10 — a refused append is never archived as if it had landed (audit PR31)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_refused_append_keeps_the_file_staged_and_is_counted() {
+    let (spill, dlq) = unique_dirs("refused");
+    let expected = spill_n(&spill, 6);
+    let refused = expected[2].0;
+
+    // Boot #1: the database is up, but the writer refuses one seal.
+    let mut sink = FakeSink {
+        refuse_append_for: Some(refused),
+        ..FakeSink::healthy()
+    };
+    let first = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+    assert_eq!(first.seals_recovered, 6);
+    assert_eq!(first.seals_reingested, 5, "the five good seals landed");
+    assert_eq!(first.seals_append_failed, 1, "the refusal is counted");
+    assert_eq!(first.files_archived, 0, "never archived as if all landed");
+    assert_eq!(first.files_left_pending, 1);
+    assert_eq!(first.seals_left_pending, 1, "the refused seal is pending");
+    assert_eq!(subdir_file_count(&spill, SEAL_REPLAYING_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
+
+    // Boot #2: the writer accepts it. The whole file is re-read, so every
+    // seal lands and the file is archived; the database's DEDUP key
+    // collapses the five that were sent twice.
+    let mut healthy = FakeSink::healthy();
+    let second = drain_recovered_seals(&mut healthy, &spill, &dlq, 4);
+    assert_eq!(second.seals_reingested, 6);
+    assert_eq!(second.seals_append_failed, 0);
+    assert_eq!(second.files_archived, 1);
+    assert_eq!(healthy.committed_keys(), expected);
+
+    cleanup(&spill, &dlq);
+}
+
+/// The retry is BOUNDED: a file whose seals were refused and which is older
+/// than the retry window is moved out (to `refused/`, kept for good; PR40b-f)
+/// instead of being re-read, and re-sent over newer bars, on every boot forever.
+#[test]
+fn a_refused_append_in_a_file_past_the_retry_window_is_archived_not_retried() {
+    let (spill, dlq) = unique_dirs("refused-old");
+    let expected = spill_n(&spill, 3);
+    let refused = expected[1].0;
+    let aged = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(SEAL_REFUSED_FILE_RETRY_SECS + 3_600);
+    for entry in std::fs::read_dir(&spill).expect("spill dir") {
+        let path = entry.expect("entry").path();
+        if path.is_file() {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open spill file")
+                .set_modified(aged)
+                .expect("age the spill file");
+        }
+    }
+
+    let mut sink = FakeSink {
+        refuse_append_for: Some(refused),
+        ..FakeSink::healthy()
+    };
+    let outcome = drain_recovered_seals(&mut sink, &spill, &dlq, 4);
+    assert_eq!(outcome.seals_reingested, 2);
+    assert_eq!(outcome.seals_append_failed, 1, "still counted");
+    assert_eq!(outcome.files_left_pending, 0, "not kept for another boot");
+    assert_eq!(outcome.files_archived, 1, "moved out, bytes kept");
+    assert_eq!(
+        (outcome.files_refused, outcome.seals_unrecovered),
+        (1, 1),
+        "the given-up seal is reported once"
+    );
+    assert_eq!(subdir_file_count(&spill, SEAL_REFUSED_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
+
+    cleanup(&spill, &dlq);
+}
+
+// ---------------------------------------------------------------------------
 // 4 — tier 3: the NDJSON DLQ is drained too
 // ---------------------------------------------------------------------------
 
@@ -435,8 +543,11 @@ fn corrupt_tail_is_counted_not_silently_lost() {
         "the legacy-format record is COUNTED, not silently decoded"
     );
     // The torn tail is not a record at all — it is truncated, so it is not
-    // counted as a decodable-but-bad record. The bytes survive in archive/.
-    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 1);
+    // counted as a decodable-but-bad record. The bytes survive in refused/,
+    // which the retention sweep never deletes (PR40b-f).
+    assert_eq!(outcome.seals_unrecovered, 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_REFUSED_SUBDIR), 1);
+    assert_eq!(subdir_file_count(&spill, SEAL_ARCHIVE_SUBDIR), 0);
 
     cleanup(&spill, &dlq);
 }
@@ -507,8 +618,10 @@ fn boot_drain_stays_wired_into_the_writer_loop() {
         .split_once("#[cfg(test)]")
         .expect("seal_writer_runner.rs must contain a test module marker");
     assert!(
-        runner_prod.contains("drain_recovered_seals("),
-        "SealWriterRunner::boot_drain must delegate to drain_recovered_seals"
+        runner_prod.contains("drain_recovered_seals_for_replay(")
+            && runner_prod.contains("&mut self.replay,"),
+        "SealWriterRunner::boot_drain must delegate to drain_recovered_seals_for_replay \
+         with its own mid-session replay (DA-13a review)"
     );
 }
 
@@ -528,7 +641,7 @@ fn real_rescue_path_end_to_end_is_recovered() {
     let mut writer = ShadowCandleWriter::for_test();
     let mut expected = Vec::new();
     for i in 0..8u64 {
-        let seal = mk_seal(2000 + i, 34_200 + (i as u32) * 60);
+        let seal = mk_seal(2000 + i, CANDLE_FIXTURE_BUCKET_BASE + (i as u32) * 60);
         expected.push((
             seal.security_id,
             seal.exchange_segment_code,

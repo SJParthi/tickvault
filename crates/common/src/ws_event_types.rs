@@ -34,24 +34,11 @@ pub enum WsType {
     Depth200,
     /// `wss://api-order-update.dhan.co` order-update feed (always 1 conn).
     OrderUpdate,
-    /// The Groww second feed (operator §32) — NOT a Dhan binary WS but a
-    /// legacy-sidecar NDJSON tail bridge. A distinct `ws_type` keeps the broker
-    /// meaning of the SYMBOL honest: a `where ws_type='groww_bridge'` query reads
-    /// cleanly, and re-using a Dhan label (`main_feed`/`order_update`) would
-    /// silently mix two brokers in operator filters. Pairs with `feed='groww'`.
-    GrowwBridge,
-    /// The Groww order/position PUSH channel (Stage A, 2026-07-16) — the
-    /// receive-only NATS-over-WS order/position-update session. A distinct
-    /// `ws_type` keeps the broker + purpose meaning of the SYMBOL honest:
-    /// `where ws_type='groww_order_update'` reads cleanly and never mixes
-    /// with the Dhan `order_update` label or the retired market-data
-    /// `groww_bridge` rows. Pairs with `feed='groww'`.
-    GrowwOrderUpdate,
     /// The TrueData live-tick feed (feed #4, operator lock 2026-07-24) —
     /// the `wss://push.truedata.in` binary-tick market-data WebSocket. A
     /// distinct `ws_type` keeps the broker meaning of the SYMBOL honest:
     /// `where ws_type='truedata_feed'` reads cleanly and never mixes with
-    /// a Dhan/Groww label. Pairs with `feed='truedata'`.
+    /// a Dhan label. Pairs with `feed='truedata'`.
     TruedataFeed,
 }
 
@@ -64,8 +51,6 @@ impl WsType {
             Self::Depth20 => "depth_20",
             Self::Depth200 => "depth_200",
             Self::OrderUpdate => "order_update",
-            Self::GrowwBridge => "groww_bridge",
-            Self::GrowwOrderUpdate => "groww_order_update",
             Self::TruedataFeed => "truedata_feed",
         }
     }
@@ -73,14 +58,12 @@ impl WsType {
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness
     /// without drifting from the enum.
     #[must_use]
-    pub const fn all() -> [WsType; 7] {
+    pub const fn all() -> [WsType; 5] {
         [
             Self::MainFeed,
             Self::Depth20,
             Self::Depth200,
             Self::OrderUpdate,
-            Self::GrowwBridge,
-            Self::GrowwOrderUpdate,
             Self::TruedataFeed,
         ]
     }
@@ -114,6 +97,77 @@ pub enum WsEventKind {
     /// `stall_never_streamed` / `stall_auth_stale` / `stall_entitlement` —
     /// see `crate::feed_blame::STALL_SOURCE_*`), never raw child text.
     StallRestarted,
+    /// The lane began dialing this connection.
+    ///
+    /// ADDED 2026-08-29. Every other kind presupposes a socket that OPENED,
+    /// so a connection that failed every dial produced no row anywhere and
+    /// was absent from the daily per-connection record — indistinguishable
+    /// from a connection that was never planned. On 2026-08-12 the main feed
+    /// failed twelve dials with `HTTP 400` and never handshook all session;
+    /// it appeared in that record as nothing at all.
+    ///
+    /// This is the one kind that fires BEFORE the socket can deliver, so it
+    /// establishes SET MEMBERSHIP and nothing else. It deliberately does NOT
+    /// set `saw_any_event` in the rollup: that flag means "the socket did
+    /// something", and a dial that failed is precisely the socket doing
+    /// nothing.
+    DialStarted,
+    /// A dial attempt FAILED, before any handshake completed.
+    ///
+    /// ADDED 2026-08-29, and it is the reason half of `DialStarted`. That kind
+    /// records that we tried; this one records why we did not get through, and
+    /// the `reason` travels into `ws_event_audit.reason` as one of the
+    /// transport's bounded labels — `no_token`, `tls_config`, `bad_url`,
+    /// `timeout`, `connect`, and (2026-10-06) `upgrade_refused` for a
+    /// response other than 101, which was `connect` before.
+    ///
+    /// The classification already existed. It went to a counter labelled
+    /// `endpoint` + `reason`, and the EMF processor folds label values into one
+    /// summed series per host — so CloudWatch could say twelve dials failed and
+    /// could not say which endpoint or why. The answer to "why did connection 3
+    /// never come up" existed in the process for a microsecond and reached no
+    /// queryable surface at all.
+    ///
+    /// Like `DialStarted` it must NOT set `saw_any_event`: a failed dial is the
+    /// socket doing nothing, which is exactly what makes the day not clean.
+    DialFailed,
+    /// An in-place one-for-one instrument swap on a live socket
+    /// (`LiveSubscriptionCommand::Swap`: unsubscribe `old`, then subscribe
+    /// `new`, no redial).
+    ///
+    /// ADDED 2026-10-04 (audit M8). Before this, every swap reached a log line
+    /// and a counter only, and CloudWatch keeps logs for 14 days; the SEBI
+    /// audit trail of WHICH contract a depth socket carried WHEN lived
+    /// nowhere durable. The row carries the old instrument in
+    /// `security_id`/`segment`, the new one in `new_security_id`/`new_segment`,
+    /// and the outcome slug (`applied`, `refused`, `wire_failed`, ...) in
+    /// `reason`. Not an up kind and not a disconnect: the socket stayed open.
+    SubscriptionSwapped,
+    /// An in-place multi-instrument change on a live socket
+    /// (`LiveSubscriptionCommand::Resubscribe`: unsubscribes, then
+    /// subscribes, no redial). ADDED 2026-10-04 (audit M8).
+    ///
+    /// Carries COUNTS (`instruments_added` / `instruments_removed`, what
+    /// landed) rather than a list: a main-feed change can name thousands of
+    /// instruments and a forensic row must stay bounded. When exactly one
+    /// instrument left or arrived it is also named in the instrument columns.
+    SubscriptionResubscribed,
+    /// The unsubscribe for a ghost contract (one this socket was told to drop
+    /// and still delivers) was sent AGAIN on the live socket
+    /// (`resend_ghost_unsubscribe`). ADDED 2026-10-04 (audit M8). The ghost is
+    /// named in `security_id`/`segment`; `reason` is the resend outcome
+    /// (`sent`, `wire_failed`, `timed_out`, `held_again`, `halted_805`).
+    GhostUnsubscribeResent,
+    /// A market-data socket was parked because Dhan closed it with 805 (too
+    /// many connections) and joined its pool's overflow episode. ADDED
+    /// 2026-10-04 (audit M8).
+    ///
+    /// The generic `disconnected` row with reason `pool_overflow` is still
+    /// written for the same park; this kind is the distinct, queryable marker
+    /// of the 805 episode itself (`where event_kind = 'overflow_parked'`), and
+    /// it carries how many instruments the socket held when it went dark. Not
+    /// an up kind.
+    OverflowParked,
 }
 
 impl WsEventKind {
@@ -128,12 +182,32 @@ impl WsEventKind {
             Self::SleepEntered => "sleep_entered",
             Self::SleepResumed => "sleep_resumed",
             Self::StallRestarted => "stall_restarted",
+            Self::DialStarted => "dial_started",
+            Self::DialFailed => "dial_failed",
+            Self::SubscriptionSwapped => "subscription_swapped",
+            Self::SubscriptionResubscribed => "subscription_resubscribed",
+            Self::GhostUnsubscribeResent => "ghost_unsubscribe_resent",
+            Self::OverflowParked => "overflow_parked",
         }
+    }
+
+    /// Whether this kind records a change to WHAT a live socket is subscribed
+    /// to (audit M8, 2026-10-04) rather than a connection lifecycle step.
+    /// These rows never open or close a feed gap.
+    #[must_use]
+    pub const fn is_subscription_change(self) -> bool {
+        matches!(
+            self,
+            Self::SubscriptionSwapped
+                | Self::SubscriptionResubscribed
+                | Self::GhostUnsubscribeResent
+                | Self::OverflowParked
+        )
     }
 
     /// All variants — lets tests assert exhaustiveness + wire-label uniqueness.
     #[must_use]
-    pub const fn all() -> [WsEventKind; 7] {
+    pub const fn all() -> [WsEventKind; 13] {
         [
             Self::Connected,
             Self::Disconnected,
@@ -142,12 +216,67 @@ impl WsEventKind {
             Self::SleepEntered,
             Self::SleepResumed,
             Self::StallRestarted,
+            Self::DialStarted,
+            Self::DialFailed,
+            Self::SubscriptionSwapped,
+            Self::SubscriptionResubscribed,
+            Self::GhostUnsubscribeResent,
+            Self::OverflowParked,
         ]
     }
 }
 
 /// `dhan_code` sentinel meaning "no Dhan disconnect code" (transport error).
 pub const WS_EVENT_NO_DHAN_CODE: i64 = -1;
+
+/// One instrument named on a `ws_event_audit` row, by its composite key.
+///
+/// `security_id` alone is not unique (I-P1-11): the segment always travels
+/// with it, and the row stores both (`security_id` LONG + `segment` SYMBOL).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WsAuditInstrument {
+    /// Dhan `SecurityId`.
+    pub security_id: crate::types::SecurityId,
+    /// The instrument's exchange segment.
+    pub segment: crate::types::ExchangeSegment,
+}
+
+/// The subscription facts a `ws_event_audit` row can carry (audit M8,
+/// 2026-10-04). Every field is optional and an absent one is written as
+/// NULL (the column is simply left out of that ILP row), so a lifecycle row
+/// that has none of them reads exactly as it did before the columns existed.
+///
+/// `Copy`, no heap: building one allocates nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WsSubscriptionDetail {
+    /// The instrument that LEFT (swap `old`, the ghost, or the single
+    /// unsubscribed instrument of a resubscribe). Columns `security_id`,
+    /// `segment`.
+    pub instrument: Option<WsAuditInstrument>,
+    /// The instrument that ARRIVED (swap `new`, or the single subscribed
+    /// instrument of a resubscribe). Columns `new_security_id`, `new_segment`.
+    pub new_instrument: Option<WsAuditInstrument>,
+    /// How many instruments were subscribed by the change (what landed).
+    /// Column `instruments_added`.
+    pub added: Option<u32>,
+    /// How many instruments were unsubscribed by the change (what landed).
+    /// Column `instruments_removed`.
+    pub removed: Option<u32>,
+    /// How many instruments the socket held after the event. Column
+    /// `instruments_held`.
+    pub held: Option<u32>,
+}
+
+impl WsSubscriptionDetail {
+    /// No subscription facts: every column NULL.
+    pub const NONE: Self = Self {
+        instrument: None,
+        new_instrument: None,
+        added: None,
+        removed: None,
+        held: None,
+    };
+}
 
 /// One WebSocket lifecycle event, ready for the `ws_event_audit` table.
 ///
@@ -166,8 +295,8 @@ pub struct WsEventAuditRow {
     pub event_ts_ist_nanos: i64,
     /// The trading day — IST midnight nanoseconds.
     pub trading_date_ist_nanos: i64,
-    /// Broker feed source (`dhan` / `groww`). Per-feed identity (2026-06-23):
-    /// a Dhan and a Groww connection can share `(ws_type, connection_index)`,
+    /// Broker feed source (`dhan`). Per-feed identity (2026-06-23):
+    /// two connections can share `(ws_type, connection_index)`,
     /// so `feed` is part of the audit's DEDUP key — their lifecycle events are
     /// distinct rows, never collapsed.
     pub feed: crate::feed::Feed,
@@ -191,6 +320,9 @@ pub struct WsEventAuditRow {
     pub attempts: i64,
     /// `true` when the event happened inside [09:00, 15:30) IST.
     pub market_hours: bool,
+    /// Instruments and counts for a subscription-change row (audit M8,
+    /// 2026-10-04); [`WsSubscriptionDetail::NONE`] on every other row.
+    pub subscription: WsSubscriptionDetail,
 }
 
 #[cfg(test)]
@@ -209,8 +341,6 @@ mod tests {
                 "depth_20",
                 "depth_200",
                 "order_update",
-                "groww_bridge",
-                "groww_order_update",
                 "truedata_feed"
             ]
         );
@@ -232,6 +362,12 @@ mod tests {
                 "sleep_entered",
                 "sleep_resumed",
                 "stall_restarted",
+                "dial_started",
+                "dial_failed",
+                "subscription_swapped",
+                "subscription_resubscribed",
+                "ghost_unsubscribe_resent",
+                "overflow_parked",
             ]
         );
         let unique: HashSet<&str> = labels.iter().copied().collect();
@@ -246,8 +382,68 @@ mod tests {
     fn test_all_arrays_match_variant_counts() {
         // If a variant is added, `all()` must be updated — these pin the count so
         // a new WS type / event kind cannot silently escape the audit schema.
-        assert_eq!(WsType::all().len(), 7);
-        assert_eq!(WsEventKind::all().len(), 7);
+        assert_eq!(WsType::all().len(), 5);
+        // 7 -> 8 -> 9 on 2026-08-29 with `DialStarted` then `DialFailed`.
+        // This ratchet is why either addition could not be silent: the
+        // `all()` array drives the persistence
+        // round-trip test, so a kind missing from it would never have had its
+        // ILP append exercised.
+        // 9 -> 13 on 2026-10-04 (audit M8): the four subscription-change kinds.
+        assert_eq!(WsEventKind::all().len(), 13);
+    }
+
+    #[test]
+    fn test_dial_started_is_not_an_up_kind_and_has_its_own_label() {
+        // `dial_started` fires BEFORE the socket can deliver anything. Any
+        // consumer that string-matches it as a connection-up signal would
+        // report a socket healthy the instant it began dialing -- which is
+        // the exact failure the kind was added to expose, inverted.
+        let label = WsEventKind::DialStarted.as_str();
+        assert_eq!(label, "dial_started");
+        for reserved in [
+            "connected",
+            "reconnected",
+            "sleep_resumed",
+            "disconnected",
+            "disconnected_off_hours",
+            "stall_restarted",
+        ] {
+            assert_ne!(
+                label, reserved,
+                "dial_started must not collide with an existing lifecycle label"
+            );
+        }
+        assert!(
+            WsEventKind::all().contains(&WsEventKind::DialStarted),
+            "a kind absent from all() never gets its ILP append exercised"
+        );
+    }
+
+    #[test]
+    fn test_dial_failed_carries_its_own_label_and_is_not_an_up_kind() {
+        let label = WsEventKind::DialFailed.as_str();
+        assert_eq!(label, "dial_failed");
+        // A failed dial is the socket doing NOTHING. Any consumer that reads
+        // it as activity would report a connection healthy on the strength of
+        // it having failed.
+        for reserved in [
+            "connected",
+            "reconnected",
+            "sleep_resumed",
+            "disconnected",
+            "disconnected_off_hours",
+            "stall_restarted",
+            "dial_started",
+        ] {
+            assert_ne!(
+                label, reserved,
+                "dial_failed must not collide with an existing lifecycle label"
+            );
+        }
+        assert!(
+            WsEventKind::all().contains(&WsEventKind::DialFailed),
+            "a kind absent from all() never gets its ILP append exercised"
+        );
     }
 
     #[test]
@@ -267,6 +463,73 @@ mod tests {
         ] {
             assert_ne!(label, reserved);
         }
+    }
+
+    /// Audit M8 (2026-10-04): every subscription-change kind round-trips
+    /// to its own stable label, is classified as a subscription change, and
+    /// never collides with a lifecycle label a consumer string-matches.
+    #[test]
+    fn test_subscription_change_kinds_round_trip_and_are_distinct() {
+        let expected = [
+            (WsEventKind::SubscriptionSwapped, "subscription_swapped"),
+            (
+                WsEventKind::SubscriptionResubscribed,
+                "subscription_resubscribed",
+            ),
+            (
+                WsEventKind::GhostUnsubscribeResent,
+                "ghost_unsubscribe_resent",
+            ),
+            (WsEventKind::OverflowParked, "overflow_parked"),
+        ];
+        for (kind, label) in expected {
+            assert_eq!(kind.as_str(), label);
+            assert!(kind.is_subscription_change(), "{label}");
+            assert!(
+                WsEventKind::all().contains(&kind),
+                "a kind absent from all() never gets its ILP append exercised"
+            );
+            // Round trip: the label resolves back to exactly this kind.
+            let back: Vec<WsEventKind> = WsEventKind::all()
+                .into_iter()
+                .filter(|k| k.as_str() == label)
+                .collect();
+            assert_eq!(back, vec![kind]);
+        }
+        // The nine lifecycle kinds are NOT subscription changes, so a gap
+        // tracker keyed on them is unaffected.
+        let lifecycle = WsEventKind::all()
+            .into_iter()
+            .filter(|k| !k.is_subscription_change())
+            .count();
+        assert_eq!(lifecycle, 9);
+    }
+
+    #[test]
+    fn test_subscription_detail_none_is_all_null_and_default() {
+        assert_eq!(WsSubscriptionDetail::NONE, WsSubscriptionDetail::default());
+        assert!(WsSubscriptionDetail::NONE.instrument.is_none());
+        assert!(WsSubscriptionDetail::NONE.new_instrument.is_none());
+        assert!(WsSubscriptionDetail::NONE.added.is_none());
+        assert!(WsSubscriptionDetail::NONE.removed.is_none());
+        assert!(WsSubscriptionDetail::NONE.held.is_none());
+    }
+
+    #[test]
+    fn test_audit_instrument_is_the_composite_key() {
+        // I-P1-11: the same id in two segments is two instruments.
+        use crate::types::ExchangeSegment;
+        let a = WsAuditInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::IdxI,
+        };
+        let b = WsAuditInstrument {
+            security_id: 27,
+            segment: ExchangeSegment::NseEquity,
+        };
+        assert_ne!(a, b);
+        let set: HashSet<WsAuditInstrument> = [a, b].into_iter().collect();
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

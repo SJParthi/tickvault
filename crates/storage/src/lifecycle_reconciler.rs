@@ -16,6 +16,16 @@
 //! **Feature-gated** under `daily_universe_fetcher` per rule §21 —
 //! dormant in the default build.
 //!
+//! **⚠ DORMANT, 2026-10-28 (owner Quote 44).** No production code calls
+//! this module. Its one consumer (the Groww shared master writer) was
+//! deleted with the Groww feed on 2026-08-21, and the daily
+//! `instrument_lifecycle` write it would feed stopped under Quote 44; both
+//! tables are frozen history. The module is kept as the written decision
+//! rules behind the frozen rows (what "expired", "split" and "segment moved"
+//! meant when they were recorded). The paragraphs above describe the design
+//! as it was meant to run, not code that runs today. Wiring a caller back
+//! needs a fresh dated quote first (Quote 44 REJECT list).
+//!
 //! # Cross-references
 //!
 //! * Rule §5 (daily orchestrator algorithm) / §6 (transition_kind) /

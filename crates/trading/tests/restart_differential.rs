@@ -1,0 +1,901 @@
+//! Randomized restart differential for the candle fold (plan ITEM 47,
+//! review rounds 18 to 21).
+//!
+//! One market is folded twice. The TRUTH run folds every packet live, as a
+//! process that never stopped would. The RESTART run is what production does
+//! after a crash: a previous process folded every packet received by the
+//! crash (and stored what it sealed); the new process replays that WAL, with
+//! random frames unreadable, hands over at a capture start after the crash,
+//! and folds live from there. Each instrument's socket starts listening at
+//! its own time at or after the capture start, so a packet received in the
+//! downtime is lost, and a subscribe may re-send its latest state or a STALE
+//! copy of the last trade the previous process received (review round 20). Packets
+//! arrive late, out of trade order, repeated, and some never at all.
+//!
+//! In about 3 cases in 10 the previous process does not crash but EXITS
+//! cleanly mid-session (audit PR31b-2), as a deploy or a restart does: its
+//! exit seals the buckets a catch-up sweep would and withholds every bucket
+//! still open. Its old exit seal (`force_seal_all` at any hour) wrote those
+//! buckets truncated, and check 5 fails on it within a second.
+//!
+//! In about 3 of the other cases in 10 the market is in the session's last
+//! minutes (each instrument's last trade at 15:39:59) and both runs take the
+//! close seal (plan item PR23): every sweep from 15:44:05 also takes the
+//! session end plus the longest bucket (the app's close term, mirrored), and
+//! the run ends with a sweep at 15:44:05 or later and a crash with no
+//! day-close seal. `close_seal_cases_seal_buckets_the_usual_cutoff_leaves_open`
+//! pins that such a case seals buckets the usual cutoff leaves open.
+//!
+//! Every bar the restart writes is compared with the truth, and with what the
+//! previous process stored (a third run, live up to the crash):
+//!
+//! 1. no bar ever carries MORE volume than the truth (a double count);
+//! 2. a bucket the previous process stored is written identical to the truth
+//!    or to the stored row itself,
+//!    net volume included, or not written;
+//! 3. any other bar that is written equals the truth in volume and OHLC, and
+//!    a bar that classifies its net volume carries the truth's (an
+//!    unclassified one says the direction is unknown, which is honest);
+//! 4. a bucket missing after the crash started by the moment its instrument
+//!    was known to be captured (the confirmed capture start, or the receipt
+//!    of the packet that ended its gap: neither a repeat of its last
+//!    replayed trade nor stale), or holds its first trade that added volume
+//!    after that packet, which may have been a stale copy;
+//! 5. a row the previous process stored for a bucket that had not ended when
+//!    it stopped, and that the restart left in place, equals the truth.
+//!
+//! Beyond the envelope, a bucket holding a trade received after the crash and
+//! more than the catch-up margin (240 s) after the bucket ended is checked by
+//! 1 only: even the uninterrupted process takes such a trade as a late
+//! amendment, and a restart may have lost it in the downtime or refuse to
+//! amend a bar that began before its capture start. The generator produces
+//! such lags rarely (review rounds 21 and 22: about 1 event in 500, so the
+//! exactness checks still cover nearly every bucket); production's measured
+//! maximum is 199 s.
+//!
+//! No bar is exempt from 3. Until review round 19 the bar holding the first
+//! live trade was, and that hid a real defect: a bucket that began in the
+//! downtime was written without the downtime's trades and prices. A withheld
+//! bar is counted (`tv_candle_refold_partial_suppressed_total`); a wrong bar
+//! would overwrite a stored row or publish a wrong one, which is what this
+//! file exists to catch.
+//!
+//! 256 cases per run. Measured on the round-21 fix: 20,000 cases with zero
+//! failures, in about 56 s in a release build. The round-18 aggregator failed
+//! these checks 32,761 times over 20,000 cases; the round-19 one fails in
+//! under a second once stale re-sends are generated.
+
+use std::collections::{HashMap, HashSet};
+
+use proptest::prelude::*;
+use tickvault_common::feed::Feed;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::candles::aggregator_cell::FeedStrategy;
+use tickvault_trading::candles::multi_tf_aggregator::MultiTfAggregator;
+use tickvault_trading::candles::{LiveCandleState, TfIndex};
+
+/// An IST trading day's midnight, in IST epoch seconds.
+const DAY: u32 = 1_779_321_600;
+/// 09:16:00 IST: the first trade second.
+const START: u32 = DAY + 33_360;
+/// The live catch-up margin production runs with.
+const MARGIN: u32 = 240;
+/// A capture start well before the session, for the uninterrupted runs.
+const EARLY_CAPTURE: u32 = DAY + 32_000;
+/// IST minus UTC, in milliseconds.
+const IST_OFFSET_MS: i64 = 19_800_000;
+/// The fold's clock-skew allowance (`REPLAY_FRONTIER_SKEW_SECS`).
+const SKEW_SECS: u64 = 5;
+/// Out of 100: a replayed WAL frame below this is unreadable.
+const UNREADABLE_PERCENT: u8 = 4;
+
+#[derive(Clone, Debug)]
+struct Event {
+    dt: u8,
+    size: u16,
+    price_steps: i8,
+    lag_ms: u32,
+    resend_ms: Option<u16>,
+    delivered: bool,
+    /// Delivered on its own lag, possibly after a later trade of the same
+    /// instrument (review round 23: two downtime trades that arrive late and
+    /// out of order after the socket listens).
+    out_of_order: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Case {
+    instruments: Vec<Vec<Event>>,
+    crash_per_mille: u16,
+    start_after_crash: u32,
+    listen_after_start: Vec<u32>,
+    unreadable: Vec<u8>,
+    /// Per instrument, what its subscribe re-sends at the listen instant:
+    /// 0 nothing, 1 its latest state (the last packet received before it
+    /// listened), 2 a STALE copy of the last trade the previous process
+    /// received (review round 20), which looks exactly like a true re-send.
+    resend_on_subscribe: Vec<u8>,
+    /// Both runs end with the day-close seal (`force_seal_all`) instead of a
+    /// final catch-up sweep (review round 24: the day-close seal judged
+    /// bars after clearing each instrument's capture start, and no run here
+    /// ever reached it).
+    day_close: bool,
+    /// Every stock's cumulative starts just below `u32::MAX` and wraps
+    /// (review round 25: no run here ever came near the top of the range).
+    near_wrap: bool,
+    /// The previous process EXITED cleanly mid-session instead of crashing
+    /// (audit PR31b-2): it sealed what a catch-up sweep would at that
+    /// instant and withheld every bucket still open. Before, its exit seal
+    /// wrote those truncated buckets as complete bars.
+    clean_exit: bool,
+    /// Both runs end with the close seal (plan item PR23): once the wall
+    /// passes the session end plus the margin, one catch-up sweep to the end
+    /// plus the longest bucket, then a stop with no day-close seal (a crash
+    /// after the close seal). Only when `day_close` is off.
+    close_crash: bool,
+}
+
+fn event() -> impl Strategy<Value = Event> {
+    (
+        1u8..=20,
+        0u16..=40,
+        -3i8..=3,
+        prop_oneof![500 => 0u32..=10_000, 16 => 10_001u32..=200_000, 1 => 240_001u32..=400_000],
+        prop_oneof![9 => Just(None), 1 => (0u16..=3_000).prop_map(Some)],
+        prop_oneof![9 => Just(true), 1 => Just(false)],
+        prop_oneof![14 => Just(false), 1 => Just(true)],
+    )
+        .prop_map(
+            |(dt, size, price_steps, lag_ms, resend_ms, delivered, out_of_order)| Event {
+                dt,
+                size,
+                price_steps,
+                lag_ms,
+                resend_ms,
+                delivered,
+                out_of_order,
+            },
+        )
+}
+
+fn case() -> impl Strategy<Value = Case> {
+    (
+        prop::collection::vec(prop::collection::vec(event(), 1..150), 2..=4),
+        50u16..=950,
+        0u32..=30,
+        prop::collection::vec(0u32..=20, 4),
+        prop::collection::vec(0u8..100, 64..600),
+        prop::collection::vec(0u8..3, 4),
+        prop::bool::weighted(0.35),
+        prop::bool::weighted(0.2),
+        prop::bool::weighted(0.3),
+        prop::bool::weighted(0.3),
+    )
+        .prop_map(
+            |(
+                instruments,
+                crash_per_mille,
+                start_after_crash,
+                listen_after_start,
+                unreadable,
+                resend_on_subscribe,
+                day_close,
+                near_wrap,
+                clean_exit,
+                close_crash,
+            )| Case {
+                instruments,
+                crash_per_mille,
+                start_after_crash,
+                listen_after_start,
+                unreadable,
+                resend_on_subscribe,
+                day_close,
+                near_wrap,
+                clean_exit,
+                close_crash,
+            },
+        )
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Packet {
+    instrument: usize,
+    trade: u32,
+    /// The true day-cumulative on a monotonic 64-bit axis. The packet the
+    /// fold sees carries its low 32 bits, as the vendor's `u32` field does,
+    /// so a run that starts near the top of the range wraps (review round 25).
+    cumulative: u64,
+    price: f32,
+    high: f32,
+    low: f32,
+    open: f32,
+    received_ms: u64,
+}
+
+/// Instrument 0 is an index (NSE index segment, volume always 0); the rest
+/// are stocks.
+fn security_id(instrument: usize) -> u64 {
+    if instrument == 0 {
+        13
+    } else {
+        100 + instrument as u64
+    }
+}
+
+fn tick(p: &Packet, received_ms: u64) -> ParsedTick {
+    ParsedTick {
+        security_id: security_id(p.instrument),
+        exchange_segment_code: u8::from(p.instrument != 0),
+        last_traded_price: p.price,
+        exchange_timestamp: p.trade,
+        volume: u32::try_from(p.cumulative % (1_u64 << 32)).unwrap_or(0),
+        day_open: p.open,
+        day_close: 1_000.0,
+        day_high: p.high,
+        day_low: p.low,
+        received_at_nanos: (received_ms as i64 - IST_OFFSET_MS) * 1_000_000,
+        ..Default::default()
+    }
+}
+
+/// Every delivered packet, in receipt order.
+fn packets(c: &Case) -> Vec<Packet> {
+    let mut out = Vec::new();
+    for (instrument, events) in c.instruments.iter().enumerate() {
+        // Stocks of a near-wrap case start 300 units below `u32::MAX`, so their
+        // counter wraps early in the day (review round 25).
+        let base = if c.near_wrap && instrument != 0 {
+            u64::from(u32::MAX) - 300
+        } else {
+            0
+        };
+        // A close-seal case (PR23 review) puts each instrument's trades in
+        // the session's last minutes: its last trade is at 15:39:59, so the
+        // closing 1, 3, 5, 10, 15, 30 and 60 minute buckets all hold trades
+        // and only the close seal can seal them before a crash.
+        let first = if c.closes_with_the_close_seal() {
+            let total: u32 = events.iter().map(|e| u32::from(e.dt)).sum();
+            SESSION_END - 1 - total
+        } else {
+            START
+        };
+        let (mut trade, mut cumulative, mut price) = (first, base, 1_000.0f32);
+        let (mut high, mut low, mut open, mut last_received) = (0f32, f32::MAX, 0f32, 0u64);
+        for (k, e) in events.iter().enumerate() {
+            trade += u32::from(e.dt);
+            if instrument != 0 {
+                cumulative += u64::from(e.size);
+            }
+            price = (price + f32::from(e.price_steps) * 0.05).max(1.0);
+            if open == 0.0 {
+                open = price;
+            }
+            high = high.max(price);
+            low = low.min(price);
+            if !e.delivered {
+                continue;
+            }
+            let own = u64::from(trade) * 1000 + u64::from(e.lag_ms);
+            // Stocks only: a stock packet older than one already accepted is
+            // refused by its cumulative, so either process drops it the same
+            // way. An index (volume always 0) cannot be refused like that, and
+            // whether a late one amends a bar or is discarded depends on packets
+            // the restart lost in the downtime (a recorded limit). Only a trade
+            // the next one adds volume after: a real stock packet with an equal
+            // cumulative is the same last trade, at the same price, while this
+            // generator moves a price with no volume (pre-open quotes), which
+            // would make an older packet indistinguishable from a newer one.
+            let out_of_order = e.out_of_order
+                && instrument != 0
+                && events.get(k + 1).is_some_and(|next| next.size > 0);
+            let received_ms = if out_of_order {
+                own
+            } else {
+                last_received = last_received.max(own);
+                last_received
+            };
+            let p = Packet {
+                instrument,
+                trade,
+                cumulative,
+                price,
+                high,
+                low,
+                open,
+                received_ms,
+            };
+            out.push(p);
+            if let Some(resend) = e.resend_ms {
+                let again = if out_of_order {
+                    received_ms + u64::from(resend)
+                } else {
+                    last_received += u64::from(resend);
+                    last_received
+                };
+                out.push(Packet {
+                    received_ms: again,
+                    ..p
+                });
+            }
+        }
+    }
+    out.sort_by_key(|p| (p.received_ms, p.instrument, p.cumulative));
+    out
+}
+
+/// `(security_id, timeframe ordinal, bucket start)`.
+type Key = (u64, usize, u32);
+
+#[derive(Default)]
+struct Written {
+    last: HashMap<Key, LiveCandleState>,
+    max_volume: HashMap<Key, u64>,
+}
+
+impl Written {
+    fn put(&mut self, sid: u64, tf: TfIndex, bar: LiveCandleState) {
+        let key = (sid, tf.as_ordinal(), bar.bucket_start_ist_secs);
+        let max = self.max_volume.entry(key).or_insert(0);
+        *max = (*max).max(bar.volume);
+        self.last.insert(key, bar);
+    }
+}
+
+fn aggregator() -> MultiTfAggregator {
+    let mut agg = MultiTfAggregator::with_capacity(FeedStrategy::DEFAULT, 16);
+    agg.set_catch_up_margin_secs(MARGIN);
+    agg.seed_watermark_at_least(DAY);
+    agg
+}
+
+/// The live catch-up sweep the app runs: `min(watermark, wall) - margin`,
+/// and, when `close` (a close-seal case), the larger of that and the close
+/// term ([`close_term`]), as `LiveIngest::catch_up_cutoff` takes it.
+fn sweep(agg: &mut MultiTfAggregator, wall_secs: u32, close: bool, out: &mut Written) {
+    let watermark = agg.watermark_secs();
+    let mut cutoff = watermark.min(wall_secs).saturating_sub(MARGIN);
+    if close {
+        cutoff = cutoff.max(close_term(wall_secs, watermark));
+    }
+    agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+}
+
+/// The session start (09:00 IST), where the fold starts admitting trades.
+const SESSION_START: u32 = DAY + 32_400;
+/// The session end (15:40 IST), where the fold stops admitting trades.
+const SESSION_END: u32 = DAY + 56_400;
+/// The close term's delay: the margin plus one 5 s sweep interval (the app's
+/// `close_seal::CLOSE_SEAL_DELAY_SECS`, 245 s).
+const CLOSE_DELAY: u32 = MARGIN + 5;
+
+/// The longest bucket the fold carries (the app's `LONGEST_BUCKET_SECS`).
+fn longest_bucket_secs() -> u32 {
+    TfIndex::ALL
+        .iter()
+        .map(|tf| tf.seconds_per_bucket())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The app's close term (`close_seal::close_seal_cutoff` for a regular day):
+/// the session end plus the longest bucket once the wall is the delay past
+/// the end and a trade of the session was folded, else 0. The app crate
+/// depends on this one, so the rule is mirrored here; the app's own value is
+/// pinned by `close_seal.rs` and `close_seal_tests.rs`.
+fn close_term(wall_secs: u32, watermark: u32) -> u32 {
+    if SESSION_END + CLOSE_DELAY <= wall_secs && watermark >= SESSION_START {
+        SESSION_END + longest_bucket_secs()
+    } else {
+        0
+    }
+}
+
+impl Case {
+    /// Both runs take the close term and end with a crash after the close
+    /// seal (no day-close seal).
+    fn closes_with_the_close_seal(&self) -> bool {
+        self.close_crash && !self.day_close
+    }
+}
+
+/// How a run ends.
+#[derive(Clone, Copy)]
+enum End {
+    /// The day-close seal (`force_seal_all`).
+    DayClose,
+    /// A final catch-up sweep to this cutoff.
+    CatchUp(u32),
+    /// The close seal (plan item PR23): every sweep takes the close term from
+    /// 15:44:05, and the run ends with one sweep at 15:44:05 (or the last
+    /// receipt, if later), then a crash (no day close).
+    CloseCrash,
+}
+
+impl End {
+    fn of(c: &Case, end_cutoff: u32) -> Self {
+        if c.day_close {
+            Self::DayClose
+        } else if c.close_crash {
+            Self::CloseCrash
+        } else {
+            Self::CatchUp(end_cutoff)
+        }
+    }
+
+    /// Sweeps take the close term.
+    fn close(self) -> bool {
+        matches!(self, Self::CloseCrash)
+    }
+}
+
+/// Ends a run whose last sweep was at `last_wall`.
+fn finish(agg: &mut MultiTfAggregator, end: End, last_wall: u32, out: &mut Written) {
+    match end {
+        End::DayClose => {
+            agg.force_seal_all(|_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CatchUp(cutoff) => {
+            agg.catch_up_seal_all(cutoff, |_, sid, _, tf, bar| out.put(sid, tf, bar));
+        }
+        End::CloseCrash => {
+            sweep(agg, last_wall.max(SESSION_END + CLOSE_DELAY), true, out);
+        }
+    }
+}
+
+/// Folds `packets` live from a capture start before the session.
+fn fold_live<'a>(
+    packets: impl Iterator<Item = &'a Packet>,
+    close: bool,
+    out: &mut Written,
+) -> MultiTfAggregator {
+    let mut agg = aggregator();
+    agg.set_live_capture_start(EARLY_CAPTURE);
+    for p in packets {
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(p, p.received_ms),
+            None,
+            |_, sid, _, tf, bar| out.put(sid, tf, bar),
+        );
+        sweep(&mut agg, (p.received_ms / 1000) as u32, close, out);
+    }
+    agg
+}
+
+fn same(a: &LiveCandleState, b: &LiveCandleState, with_net: bool) -> bool {
+    a.volume == b.volume
+        && a.open == b.open
+        && a.high == b.high
+        && a.low == b.low
+        && a.close == b.close
+        && (!with_net
+            || (a.net_volume_signed == b.net_volume_signed
+                && a.net_volume_classified == b.net_volume_classified))
+}
+
+fn describe(bar: Option<&LiveCandleState>) -> String {
+    bar.map_or_else(
+        || "absent".to_string(),
+        |b| {
+            format!(
+                "v{} o{} h{} l{} c{} net {} {}",
+                b.volume,
+                b.open,
+                b.high,
+                b.low,
+                b.close,
+                b.net_volume_signed,
+                b.net_volume_classified
+            )
+        },
+    )
+}
+
+fn check(c: &Case) -> Result<(), TestCaseError> {
+    let all = packets(c);
+    let (Some(first), Some(last)) = (all.first(), all.last()) else {
+        return Ok(());
+    };
+    let end_cutoff = all.iter().map(|p| p.trade).max().unwrap_or(START) + 10_000;
+
+    let end = End::of(c, end_cutoff);
+    let close = end.close();
+    let mut truth = Written::default();
+    let mut truth_agg = fold_live(all.iter(), close, &mut truth);
+    finish(
+        &mut truth_agg,
+        end,
+        (last.received_ms / 1000) as u32,
+        &mut truth,
+    );
+
+    let crash_ms = first.received_ms
+        + (last.received_ms - first.received_ms) * u64::from(c.crash_per_mille) / 1000;
+    let crash_secs = (crash_ms / 1000) as u32;
+    let capture_start = crash_secs + 1 + c.start_after_crash;
+    let listen: Vec<u32> = (0..c.instruments.len())
+        .map(|i| capture_start + c.listen_after_start[i])
+        .collect();
+
+    // The previous process: live up to the crash. What it sealed is what
+    // the database holds for the restart to overwrite.
+    let mut stored = Written::default();
+    let mut previous = fold_live(
+        all.iter().filter(|p| p.received_ms <= crash_ms),
+        close,
+        &mut stored,
+    );
+    if c.clean_exit {
+        // The lane's mid-session exit seal (audit PR31b-2).
+        sweep(&mut previous, crash_secs, close, &mut stored);
+        let _ = previous.withhold_open_buckets();
+    }
+
+    // The restarted process: replay the WAL (some frames unreadable), hand
+    // over, then fold what each socket receives once it listens.
+    let mut restart = Written::default();
+    let mut agg = aggregator();
+    agg.set_replay_mode(true);
+    // Per instrument, the last replayed packet the fold accepted (a stale one,
+    // whose cumulative went backwards, is refused).
+    let mut last_replayed: HashMap<usize, Packet> = HashMap::new();
+    let mut gap = true;
+    for (k, p) in all.iter().filter(|p| p.received_ms <= crash_ms).enumerate() {
+        if c.unreadable[k % c.unreadable.len()] < UNREADABLE_PERCENT {
+            gap = true;
+            continue;
+        }
+        if last_replayed
+            .get(&p.instrument)
+            .is_none_or(|l| p.cumulative >= l.cumulative)
+        {
+            last_replayed.insert(p.instrument, *p);
+        }
+        if std::mem::replace(&mut gap, false) {
+            agg.mark_replay_gap();
+        }
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(p, p.received_ms),
+            None,
+            |_, sid, _, tf, bar| restart.put(sid, tf, bar),
+        );
+    }
+    agg.set_live_capture_start(capture_start);
+    agg.finish_replay(gap, |_, sid, _, tf, bar| restart.put(sid, tf, bar));
+    sweep(&mut agg, capture_start, close, &mut restart);
+
+    // `(receipt ms, order, packet)`: a subscribe re-send (order 0) arrives
+    // at the listen instant, before anything else received then.
+    let mut live: Vec<(u64, u8, Packet)> = all
+        .iter()
+        .filter(|p| {
+            p.received_ms > crash_ms && p.received_ms >= u64::from(listen[p.instrument]) * 1000
+        })
+        .map(|p| (p.received_ms, 1, *p))
+        .collect();
+    for (i, &resend) in c
+        .resend_on_subscribe
+        .iter()
+        .enumerate()
+        .take(c.instruments.len())
+    {
+        let listen_ms = u64::from(listen[i]) * 1000;
+        let sent_by = match resend {
+            1 => listen_ms,
+            2 => crash_ms + 1,
+            _ => 0,
+        };
+        if let Some(p) = all
+            .iter()
+            .rfind(|p| p.instrument == i && p.received_ms < sent_by)
+        {
+            live.push((listen_ms, 0, *p));
+        }
+    }
+    live.sort_by_key(|(received, order, p)| (*received, *order, p.instrument, p.cumulative));
+    // Per instrument: the first live packet's `(trade second, receipt ms)`.
+    // Per instrument, the receipt of the first live packet that ends its
+    // hand-over gap: not a repeat of the last replayed trade (a stale copy
+    // cannot be told from one, review round 20) and not stale itself.
+    let mut gap_ended: HashMap<usize, u64> = HashMap::new();
+    // The cumulative of the packet that ended each instrument's gap (or
+    // seeded it: every boot here is mid-session), and the trade second of the first later packet that
+    // added volume, whose bars are withheld because the gap packet may have
+    // been a stale copy (review round 20).
+    // It is the running baseline from then on.
+    let mut gap_cum: HashMap<usize, u64> = HashMap::new();
+    // Every packet that added volume while the gap packet was untrusted,
+    // `(trade second, receipt ms)`: each one that traded no later than the
+    // instrument's listen time plus the skew, and the first that traded later
+    // (review round 23). Their bars are withheld.
+    let mut tainted: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
+    let mut taint_done: HashSet<usize> = HashSet::new();
+    // The instrument's later packets after the last of those: a late one's
+    // volume is carried into the bucket its timeframe has open, or opens next,
+    // when that bucket seals (review round 22), so that bucket is withheld too.
+    let mut after_add: HashMap<usize, Vec<(u32, u64)>> = HashMap::new();
+    let mut first_live: HashMap<usize, (u32, u64)> = HashMap::new();
+    for (received, _, p) in &live {
+        let repeats_or_stale = last_replayed.get(&p.instrument).is_some_and(|l| {
+            p.cumulative < l.cumulative
+                || (p.trade == l.trade
+                    && p.cumulative == l.cumulative
+                    && p.price.to_bits() == l.price.to_bits())
+        });
+        if let Some(cum) = gap_cum.get_mut(&p.instrument) {
+            if taint_done.contains(&p.instrument) {
+                let last = tainted
+                    .get(&p.instrument)
+                    .and_then(|t| t.last())
+                    .map_or(0, |t| t.0);
+                // A later trade, not a re-delivered copy of that one.
+                if p.trade > last {
+                    after_add
+                        .entry(p.instrument)
+                        .or_default()
+                        .push((p.trade, *received));
+                }
+            } else if p.cumulative > *cum {
+                *cum = p.cumulative;
+                tainted
+                    .entry(p.instrument)
+                    .or_default()
+                    .push((p.trade, *received));
+                let listen_secs = gap_ended.get(&p.instrument).map_or(0, |r| r / 1000);
+                if u64::from(p.trade) > listen_secs + SKEW_SECS {
+                    taint_done.insert(p.instrument);
+                }
+            }
+        } else if !repeats_or_stale {
+            gap_ended.entry(p.instrument).or_insert(*received);
+            // A gap packet that traded after the instrument's first live
+            // receipt cannot be a stale copy (review round 21); a seeding
+            // packet of an instrument the replay never saw always may be.
+            let first_receipt_secs =
+                first_live.get(&p.instrument).map_or(*received, |f| f.1) / 1000;
+            let trusted = last_replayed.contains_key(&p.instrument)
+                && u64::from(p.trade) > first_receipt_secs + SKEW_SECS;
+            if !trusted {
+                gap_cum.insert(p.instrument, p.cumulative);
+            }
+        }
+        first_live
+            .entry(p.instrument)
+            .or_insert((p.trade, *received));
+        agg.consume_tick(
+            Feed::Dhan,
+            &tick(p, *received),
+            None,
+            |_, sid, _, tf, bar| restart.put(sid, tf, bar),
+        );
+        sweep(&mut agg, (*received / 1000) as u32, close, &mut restart);
+    }
+    let last_wall = live
+        .last()
+        .map_or(capture_start, |(received, _, _)| (*received / 1000) as u32);
+    finish(&mut agg, end, last_wall, &mut restart);
+    // The first live receipt of ANY instrument confirms the capture start.
+    let confirmed_start = live.first().map_or(capture_start, |(received, _, _)| {
+        capture_start.max((*received / 1000) as u32)
+    });
+
+    for (i, &listen_at) in listen.iter().enumerate() {
+        let sid = security_id(i);
+        for tf in TfIndex::ALL {
+            let mut starts: Vec<u32> = truth
+                .last
+                .keys()
+                .chain(restart.last.keys())
+                .filter(|k| k.0 == sid && k.1 == tf.as_ordinal())
+                .map(|k| k.2)
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            for start in starts {
+                let key = (sid, tf.as_ordinal(), start);
+                let end = start + tf.seconds_per_bucket();
+                let (t, r) = (truth.last.get(&key), restart.last.get(&key));
+                // The latest instant the fold can treat as "before this
+                // instrument was captured": the confirmed capture start, or
+                // the receipt of the packet that ended the instrument's gap. An
+                // instrument whose gap never ended never confirmed at all.
+                let captured_from = gap_ended
+                    .get(&i)
+                    .map(|&received| confirmed_start.max((received / 1000) as u32));
+                let context = format!(
+                    "sid {sid} {tf:?} bucket +{}..+{}, crash +{}, capture start +{}, \
+                     listen +{}, first live {:?}: restart {} | truth {}",
+                    start as i64 - START as i64,
+                    end as i64 - START as i64,
+                    crash_secs as i64 - START as i64,
+                    capture_start - START,
+                    listen_at - START,
+                    first_live.get(&i),
+                    describe(r),
+                    describe(t)
+                );
+                // 1. Never more volume than the truth, at any emission.
+                if let Some(&max) = restart.max_volume.get(&key) {
+                    prop_assert!(
+                        max <= t.map_or(0, |t| t.volume),
+                        "over-count ({max}): {context}"
+                    );
+                }
+                // Beyond the envelope: a trade of this bucket received after the
+                // crash and after the catch-up margin past the bucket's end, so
+                // the catch-up may already have sealed it. Even the uninterrupted
+                // process takes such a trade as a late amendment, and a restart
+                // may have lost it in the downtime or refuse to amend a bar that
+                // began before the capture start; only 1 is checked for such a
+                // bucket (production's measured maximum lag is 199 s).
+                let beyond_margin = all.iter().any(|p| {
+                    p.instrument == i
+                        && p.trade >= start
+                        && p.trade < end
+                        && p.received_ms > crash_ms
+                        && (p.received_ms >= (u64::from(end) + u64::from(MARGIN)) * 1000
+                            // A close-seal case: a trade received at or after the
+                            // close term started (15:44:05, more than 245 s after
+                            // any session trade) may find its bucket sealed by it,
+                            // in both runs; the same envelope as the margin above.
+                            || (close
+                                && p.received_ms >= u64::from(SESSION_END + CLOSE_DELAY) * 1000))
+                });
+                if beyond_margin {
+                    continue;
+                }
+                let Some(r) = r else {
+                    // 5. A row the previous process stored for a bucket that
+                    // had not ended when it stopped, and that the restart left
+                    // in place, is what the database keeps, so it must be the
+                    // truth (audit PR31b-2: a clean exit's seal wrote such
+                    // buckets truncated, and nothing else checked them). A
+                    // bucket that ended before the stop may miss a late trade
+                    // received after it; check 2 already allows that.
+                    if let Some(s) = stored
+                        .last
+                        .get(&key)
+                        .filter(|_| u64::from(end) * 1000 > crash_ms)
+                    {
+                        prop_assert!(
+                            t.is_some_and(|t| same(s, t, true)),
+                            "a stored row left in place is wrong ({}): {context}",
+                            describe(Some(s))
+                        );
+                        continue;
+                    }
+                    // 4. Missing after the crash: only a bucket that started
+                    // before the instrument was known to be captured.
+                    if t.is_some() && u64::from(end) * 1000 > crash_ms {
+                        // The bucket that holds the first volume trade, or
+                        // that its carried volume settles into: ending after
+                        // it, and starting by the first later packet whose own
+                        // bucket of this timeframe the catch-up cannot yet
+                        // have sealed when it arrived (a bucket open then, or
+                        // opened by it, takes the carry).
+                        let secs = tf.seconds_per_bucket();
+                        let settles_by = after_add.get(&i).and_then(|later| {
+                            later.iter().find_map(|&(trade, received)| {
+                                let open_until = u64::from(tf.bucket_start(trade) + secs + MARGIN);
+                                (open_until * 1000 > received).then_some(trade)
+                            })
+                        });
+                        // The range runs from the first tainted trade's bucket
+                        // to the last one's, and past it only when that trade
+                        // was late (its own bucket sealable when it arrived).
+                        let holds_first_add = tainted.get(&i).is_some_and(|adds| {
+                            let (Some(&(first, _)), Some(&(last, last_rx))) =
+                                (adds.first(), adds.last())
+                            else {
+                                return false;
+                            };
+                            let last_late =
+                                u64::from(tf.bucket_start(last) + secs + MARGIN) * 1000 <= last_rx;
+                            let upto = if last_late { settles_by } else { Some(last) };
+                            first < end && upto.is_none_or(|next| start <= next)
+                        });
+                        prop_assert!(
+                            holds_first_add || captured_from.is_none_or(|from| start <= from),
+                            "withheld without cause: {context}"
+                        );
+                    }
+                    continue;
+                };
+                if let Some(s) = stored.last.get(&key) {
+                    // 2. Stored by the previous process: identical to the truth,
+                    // or to the row already stored (rewriting a row with its own
+                    // content changes nothing: a late trade lost in the downtime
+                    // is missing from both), or absent.
+                    prop_assert!(
+                        t.is_some_and(|t| same(r, t, true)) || same(r, s, true),
+                        "a stored bucket was rewritten differently: {context}"
+                    );
+                } else {
+                    // 3. Stored nowhere else: exact, and a classified net
+                    // volume is the truth's (an unclassified one says the
+                    // direction is unknown, which is honest, not wrong).
+                    prop_assert!(
+                        t.is_some_and(
+                            |t| same(r, t, false) && (!r.net_volume_classified || same(r, t, true))
+                        ),
+                        "a wrong bar was written: {context}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    #[test]
+    fn a_restart_never_writes_a_wrong_bar(c in case()) {
+        check(&c)?;
+    }
+}
+
+/// PR23 review (2026-11-22): a close-seal case is not vacuous. Its trades end
+/// at 15:39:59, so with the usual cutoff alone (`min(watermark, wall) -
+/// margin`) the closing buckets of every timeframe stay open at 15:44:05,
+/// and only the close term seals them. Before this, the close-seal arm put
+/// every trade near 09:16 and sealed exactly what the plain end did.
+#[test]
+fn close_seal_cases_seal_buckets_the_usual_cutoff_leaves_open() {
+    let events: Vec<Event> = (0..40)
+        .map(|_| Event {
+            dt: 7,
+            size: 5,
+            price_steps: 1,
+            lag_ms: 300,
+            resend_ms: None,
+            delivered: true,
+            out_of_order: false,
+        })
+        .collect();
+    let c = Case {
+        instruments: vec![events.clone(), events],
+        crash_per_mille: 500,
+        start_after_crash: 0,
+        listen_after_start: vec![0; 4],
+        unreadable: vec![99; 64],
+        resend_on_subscribe: vec![0; 4],
+        day_close: false,
+        near_wrap: false,
+        clean_exit: false,
+        close_crash: true,
+    };
+    assert!(c.closes_with_the_close_seal());
+    let all = packets(&c);
+    let last_trade = all.iter().map(|p| p.trade).max().unwrap_or(0);
+    assert_eq!(last_trade, SESSION_END - 1, "the last trade is 15:39:59");
+    let at_close = SESSION_END + CLOSE_DELAY;
+
+    let mut usual = Written::default();
+    let mut agg = fold_live(all.iter(), false, &mut usual);
+    sweep(&mut agg, at_close, false, &mut usual);
+    let mut closed = Written::default();
+    let mut agg = fold_live(all.iter(), true, &mut closed);
+    sweep(&mut agg, at_close, true, &mut closed);
+
+    for tf in TfIndex::ALL {
+        let key = (security_id(1), tf.as_ordinal(), tf.bucket_start(last_trade));
+        assert!(
+            !usual.last.contains_key(&key),
+            "{tf:?}: the usual cutoff already sealed the closing bucket"
+        );
+        assert!(
+            closed.last.contains_key(&key),
+            "{tf:?}: the close term must seal the closing bucket"
+        );
+    }
+    assert_eq!(
+        agg.force_seal_all(|_, _, _, _, _| {}),
+        0,
+        "nothing is left open after the close seal"
+    );
+}

@@ -3,7 +3,7 @@
 //! The PR-C2 (#1522) Dhan-lane deletion and the #1581 Groww live-feed
 //! deletion removed the ONLY call sites of the candle-table DDL chain
 //! (`drop_legacy_candle_objects` → `ensure_shadow_candle_tables` →
-//! `ensure_named_views`) while the REST-era bar-fold KEPT writing the
+//! the console-view ensure) while the REST-era bar-fold KEPT writing the
 //! `candles_*` tables — so a fresh QuestDB volume auto-created them via
 //! ILP WITHOUT `DEDUP ENABLE UPSERT KEYS` (silent duplicate-row window).
 //!
@@ -14,7 +14,8 @@
 //!    `candle_ddl_boot::run_candle_ddl_at_boot` BEFORE the
 //!    `spawn_seal_writer_loop` call (DDL-before-first-ILP ordering).
 //! 2. `candle_ddl_boot.rs` actually calls the three storage DDL fns in
-//!    the load-bearing drop → ensure → views order (stub-guard).
+//!    the load-bearing view-drop → legacy-drop → ensure order (stub-guard;
+//!    since 2026-09-22 the app creates NO view).
 //! 3. Every LIVE-writer table's ensure fn keeps ≥1 production call site
 //!    (the writer → table → ensure → boot-call-site coverage table).
 
@@ -31,12 +32,72 @@ fn read_src(rel: &str) -> String {
 
 /// Production region = everything above the first column-0 `#[cfg(test)]`
 /// line (the house source-scan convention), so test-module mentions can
-/// never satisfy a production pin.
+/// never satisfy a production pin — WITH `//` comments stripped.
+///
+/// 2026-09-22: without the strip, a COMMENTED-OUT call satisfied every pin in
+/// this file. `// candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await`
+/// contains the needle byte-for-byte, so deleting the real call and leaving
+/// the line behind as a comment — the most natural way to "temporarily"
+/// disable something — kept the guard green while the DDL never ran. It was
+/// not hypothetical for the coverage table below: its needles are BARE fn
+/// names, and `candle_ddl_boot.rs`'s own `//!` header names
+/// `ensure_shadow_candle_tables` and the (since retired) view creator (checked
+/// 2026-09-22), so those two rows were satisfied by documentation alone.
 fn production_region(src: &str) -> String {
-    match src.find("\n#[cfg(test)]") {
-        Some(idx) => src[..idx].to_string(),
-        None => src.to_string(),
+    let region = match src.find("\n#[cfg(test)]") {
+        Some(idx) => &src[..idx],
+        None => src,
+    };
+    strip_line_comments(region)
+}
+
+/// Removes `//`, `///` and `//!` comments, line by line, keeping every newline
+/// so line structure survives.
+///
+/// A whole-line comment becomes an empty line. A TRAILING comment is cut only
+/// when the `//` sits outside a string literal on that line (an even count of
+/// unescaped `"` before it), so `"https://…"` inside a string is kept.
+///
+/// Honest limits: string state is tracked per LINE, so a `//` on the
+/// continuation line of a multi-line string with no quote before it is cut.
+/// That can only REMOVE string text — never add a needle — so its failure
+/// direction is a false red, never a false green. Block comments (`/* */`)
+/// are not stripped; none of the scanned files contains `/*` (checked
+/// 2026-09-22 — re-check if a scanned file gains one).
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        if body.trim_start().starts_with("//") {
+            out.push_str(newline);
+            continue;
+        }
+        let bytes = body.as_bytes();
+        let mut in_str = false;
+        let mut cut = body.len();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_str => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_str = !in_str,
+                b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&body[..cut]);
+        out.push_str(newline);
     }
+    out
 }
 
 #[test]
@@ -59,7 +120,7 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 
     // The CALL site (not the fn definition) — the argument form is unique
     // to the build_shared_infra call.
-    let seal_call = "spawn_seal_writer_loop(&config.questdb);";
+    let seal_call = "spawn_seal_writer_loop(&config.questdb, &config.tick_storage);";
     let seal_pos = main_src.find(seal_call).unwrap_or_else(|| {
         panic!("main.rs production region must call `{seal_call}` in build_shared_infra")
     });
@@ -73,23 +134,82 @@ fn test_candle_ddl_boot_awaited_before_seal_writer_spawn_in_main() {
 }
 
 #[test]
-fn test_candle_ddl_boot_calls_drop_ensure_views_in_order() {
+fn test_candle_ddl_boot_drops_views_then_legacy_objects_then_ensures_tables() {
     let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
 
+    let views_pos = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .expect("candle_ddl_boot must drop the retired console views");
     let drop_pos = boot_src
         .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
         .expect("candle_ddl_boot must run the retired-object drop sweep");
     let ensure_pos = boot_src
         .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
-        .expect("candle_ddl_boot must ensure the 21 candle tables (DEDUP)");
-    let views_pos = boot_src
-        .find("console_views::ensure_named_views(questdb).await")
-        .expect("candle_ddl_boot must ensure the analyst console views");
+        .expect("candle_ddl_boot must ensure the candle tables (DEDUP)");
 
     assert!(
-        drop_pos < ensure_pos && ensure_pos < views_pos,
-        "load-bearing order: drop legacy objects (free squatted names) -> \
-         ensure candle tables -> named views (validate column refs)"
+        views_pos < drop_pos && drop_pos < ensure_pos,
+        "load-bearing order: drop retired views (a `candles_10m` VIEW squats the \
+         `candles_10m` TABLE name) -> drop legacy objects -> ensure candle tables"
+    );
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. The app creates no view; the
+    // retired creator must never come back on the boot path.
+    assert!(
+        !boot_src.contains("ensure_named_views"),
+        "a view creator is back on the candle boot path"
+    );
+}
+
+/// The one-shot fresh-start reset (`2026-09-19-fresh-start`) must run AFTER
+/// the readiness gate and BEFORE every table DDL: it DROPS the allowlisted
+/// tables, and the ensures below are what recreate them on the new schema in
+/// the same boot. Run after the ensures, it would drop freshly-created tables
+/// and leave them absent until the next boot; run before readiness, a
+/// still-starting QuestDB reads as an unreadable log (safe, but it would
+/// defer the reset for a whole day).
+///
+/// And `build_shared_infra` — which awaits this boot fn — must precede the
+/// feed-stack spawn in `main.rs`, so no writer is live while the drops run.
+#[test]
+fn the_fresh_start_reset_runs_once_before_every_table_ddl() {
+    const CALL: &str = "fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await";
+    let boot_src = production_region(&read_src("src/candle_ddl_boot.rs"));
+    assert_eq!(
+        boot_src.matches(CALL).count(),
+        1,
+        "the fresh-start reset must be awaited exactly once in the candle boot"
+    );
+    let reset_pos = boot_src.find(CALL).unwrap();
+    let ready_gate = boot_src
+        .find("if !ready {")
+        .expect("the readiness gate must exist");
+    let legacy = boot_src
+        .find("shadow_persistence::drop_legacy_candle_objects(questdb).await")
+        .unwrap();
+    let ensure = boot_src
+        .find("shadow_persistence::ensure_shadow_candle_tables(questdb).await")
+        .unwrap();
+    let views = boot_src
+        .find("console_views::drop_retired_views(questdb).await")
+        .unwrap();
+    assert!(
+        ready_gate < reset_pos && reset_pos < views && views < legacy && legacy < ensure,
+        "order: readiness gate -> fresh-start reset -> retired-view drop -> legacy \
+         sweep -> candle ensure"
+    );
+
+    let main_src = production_region(&read_src("src/main.rs"));
+    let infra = main_src
+        .find("= build_shared_infra(")
+        .expect("main must call build_shared_infra");
+    let feed = main_src
+        .find("dhan_feed_stack::spawn_dhan_feed_stack(")
+        .expect("main must spawn the feed stack");
+    assert!(
+        infra < feed,
+        "build_shared_infra (which runs the reset's DROPs) must complete before the \
+         feed stack spawns — a live writer during a DROP auto-creates the table \
+         without its DEDUP key"
     );
 }
 
@@ -103,54 +223,97 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
     let coverage: &[(&str, &str)] = &[
         // candles_* (21 tables) — seal chain writer (rest_candle_fold)
         ("ensure_shadow_candle_tables", "src/candle_ddl_boot.rs"),
-        // analyst console views (read-only projections)
-        ("ensure_named_views", "src/candle_ddl_boot.rs"),
-        // spot_1m_rest — Dhan/Groww/cadence spot legs
-        ("ensure_spot_1m_rest_table", "src/spot_1m_rest_boot.rs"),
-        ("ensure_spot_1m_rest_table", "src/cadence_boot.rs"),
-        ("ensure_spot_1m_rest_table", "src/groww_spot_1m_boot.rs"),
-        // option_chain_1m — chain legs
-        (
-            "ensure_option_chain_1m_table",
-            "src/option_chain_1m_boot.rs",
-        ),
-        (
-            "ensure_option_chain_1m_table",
-            "src/groww_option_chain_1m_boot.rs",
-        ),
-        ("ensure_option_chain_1m_table", "src/cadence_boot.rs"),
-        // option_contract_1m_rest — contract leg
-        (
-            "ensure_option_contract_1m_rest_table",
-            "src/groww_contract_1m_boot.rs",
-        ),
+        // retired console views (2026-09-22 SECOND — the app creates no view;
+        // this sweep must stay, or an old `candles_10m` VIEW blocks the table)
+        ("drop_retired_views", "src/candle_ddl_boot.rs"),
+        // ---- The five REST-leg ensure rows are RETIRED 2026-09-17 ----
+        //
+        // They covered `spot_1m_rest` (×2 callers), `option_chain_1m` (×2) and
+        // `rest_fetch_audit` (×1). Every one of those five CALLERS and all
+        // three ensure FNS are gone: the operator's SOCKETS-ONLY narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10) removed the
+        // per-minute REST legs, and because each persistence module held its
+        // writer, its DDL and its table constant in ONE file, the modules were
+        // deleted whole. `grep -rn "fn ensure_spot_1m_rest_table" crates/`
+        // returns zero.
+        //
+        // ## Why these are RETIRED and not RE-HOMED
+        //
+        // §12.10.5 #6 of that rule file requires a DDL caller to be re-homed
+        // for every RETAINED table. Its premise — stated in §12.8(g) — is that
+        // the ensure fns survive and merely lose their callers. Measured
+        // false, above. So the choice was not "move a call" but "resurrect a
+        // CREATE TABLE for a table nothing will ever write again".
+        //
+        // That was REFUSED, and the decision is recorded with its reasoning in
+        // §12.11 of the same rule file (written BEFORE this edit, per the
+        // rule-file-first law). The short form: an empty table makes a reader
+        // report a measured zero where the truth is "there is no leg" — which
+        // is the blank-bar false-OK `operator_control_commands.rs` already
+        // paid for on 2026-09-03 with `rest_option_contract_1m`, where the
+        // house answer was to delete the QUERIES, not create the table. The
+        // requirement's PURPOSE ("no reader left erroring") is satisfied the
+        // other way: §12.11 names every surviving reader and its disposition.
+        //
+        // WHAT THIS TEST NO LONGER WATCHES, stated rather than implied: nothing
+        // here now asserts that a RETAINED-but-writer-less table has a DDL
+        // entry point. That is deliberate — for these three the honest state on
+        // a fresh volume is "absent", because on a fresh volume they would hold
+        // nothing either way. The rows BELOW are unchanged and still bind, and
+        // every one of them covers a table with a LIVE writer, which is the
+        // only case where a missing DEDUP key is silent corruption rather than
+        // an honest absence.
+        // ticks — the live lane's own table. Its 5-key DEDUP
+        // (ts, security_id, segment, capture_seq, feed) is what makes a WAL
+        // replay idempotent; an ILP-auto-created table has none of it.
+        // Ensured through the bounded retry loop since 2026-09-08 — a single
+        // fire-and-forget attempt left the key missing for a whole session.
+        ("ensure_ticks_table", "src/candle_ddl_boot.rs"),
         // market_depth — the depth-20 + depth-200 common table (2026-08-15).
         // Its DEDUP key carries a `depth_kind` discriminator no other table
         // needs; an ILP-auto-created table arrives without it and the two
-        // depth pools begin silently overwriting each other's levels.
-        ("ensure_market_depth_table", "src/main.rs"),
-        // rest_fetch_audit — every REST leg's forensics
-        ("ensure_rest_fetch_audit_table", "src/spot_1m_rest_boot.rs"),
+        // depth pools begin silently overwriting each other's levels. Same
+        // retry loop as `ticks`, so neither is retried without the other.
+        ("ensure_market_depth_table", "src/candle_ddl_boot.rs"),
+        // (the four `top_volume_<tf>` ensure row retired 2026-10-22, plan item
+        // 62, operator Quote 34: nothing writes those tables, and ensuring them
+        // would re-create them on a fresh volume.)
+        // feed_aux_packets (2026-10-02, item 45h) — the OI, previous-close,
+        // market-status, disconnect, out-of-window-tick and connect-snapshot
+        // rows. They ride the tick writer's buffer from the first frame, so an
+        // un-ensured table is ILP-auto-created without its 6-key DEDUP
+        // (ts, security_id, segment, kind, capture_seq, feed) and every replay
+        // duplicates. Same retry loop as `ticks`.
+        ("ensure_feed_aux_table", "src/candle_ddl_boot.rs"),
+        ("run_live_table_ddl_at_boot", "src/main.rs"),
+        // (the `rest_fetch_audit` ensure row retired 2026-09-17 with the four
+        // REST-leg rows above — same removal, same reasoning, §12.11.)
         // tf_consistency_audit — 15:40 IST verifier
         (
             "ensure_tf_consistency_audit_table",
             "src/tf_consistency_boot.rs",
-        ),
-        // spot_crossverify_* — 15:47 IST comparator
-        (
-            "ensure_spot_crossverify_tables",
-            "src/spot_crossverify_boot.rs",
-        ),
-        // brutex_crossverify_* — 15:50 IST comparator
-        (
-            "ensure_brutex_crossverify_tables",
-            "src/brutex_crossverify_boot.rs",
         ),
         // order_audit / pnl_audit — order-side observability consumers
         ("ensure_order_audit_table", "src/order_observability.rs"),
         ("ensure_pnl_audit_table", "src/order_observability.rs"),
         // ws_event_audit — SEBI-retentioned lifecycle forensics
         ("ensure_ws_event_audit_table", "src/ws_audit_consumer.rs"),
+        // feed_gap_audit — one row per reconnect gap (2026-10-02), ensured by
+        // its own writer task before the first row, like ws_event_audit.
+        ("ensure_feed_gap_audit_table", "src/ws_audit_consumer.rs"),
+        // hot_path_latency_minute — one row per hot-path stage per minute
+        // (2026-10-30), ensured beside its writer thread at boot (main.rs
+        // calls `start_hot_path_proof`).
+        (
+            "ensure_hot_path_latency_minute_table",
+            "src/hot_path_proof_boot.rs",
+        ),
+        // expiry_scope_audit — the 15:50 IST daily expiry-scope check
+        // (2026-10-28), ensured by its own task before the first row.
+        (
+            "ensure_expiry_scope_audit_table",
+            "src/expiry_scope_check.rs",
+        ),
         // scoreboard tables — 15:45 IST aggregation
         (
             "ensure_feed_scoreboard_tables",
@@ -167,6 +330,25 @@ fn test_every_live_table_ensure_fn_keeps_its_boot_call_site() {
         (
             "ensure_index_constituency_table",
             "src/index_constituency_boot.rs",
+        ),
+        // (instrument_lifecycle + instrument_lifecycle_audit rows RETIRED
+        // 2026-10-28, owner Quote 44: the daily writer and both ensures were
+        // deleted; the tables are frozen SEBI history, never written again.
+        // `no_production_code_writes_the_frozen_lifecycle_tables` below pins
+        // that no writer comes back.)
+        // order_update_events / position_update_events / order_leg_pnl —
+        // order-side capture tables, each ensured by its own consumer.
+        (
+            "ensure_order_update_events_table(&questdb).await",
+            "src/order_update_events_boot.rs",
+        ),
+        (
+            "ensure_position_update_events_table(&questdb).await",
+            "src/order_update_events_boot.rs",
+        ),
+        (
+            "ensure_order_leg_pnl_table(&questdb).await",
+            "src/order_leg_pnl_boot.rs",
         ),
     ];
 
@@ -189,4 +371,485 @@ fn test_production_region_split_excises_test_modules() {
     let region = production_region(fixture);
     assert!(region.contains("fn prod"));
     assert!(!region.contains("needle()"));
+}
+
+/// Scanner self-test: a COMMENTED-OUT call must NOT satisfy a pin, while the
+/// same call as live code must — and a `//` inside a string literal is text,
+/// not a comment. Bite-proves `strip_line_comments` in both directions.
+#[test]
+fn test_production_region_ignores_commented_out_calls() {
+    const NEEDLE: &str = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let commented = format!(
+        "fn main() {{\n    // {NEEDLE};\n    /// {NEEDLE}\n    //! {NEEDLE}\n    \
+         let x = 1; // {NEEDLE}\n}}\n"
+    );
+    assert!(
+        !production_region(&commented).contains(NEEDLE),
+        "a commented-out call must not satisfy a production pin"
+    );
+
+    let live = format!("fn main() {{\n    {NEEDLE};\n}}\n");
+    assert_eq!(
+        production_region(&live).matches(NEEDLE).count(),
+        1,
+        "the live call must survive the strip exactly once"
+    );
+
+    let url = "fn f() { let u = \"https://example.invalid/x\"; g(u); } // tail\n";
+    let region = production_region(url);
+    assert!(
+        region.contains("\"https://example.invalid/x\"; g(u); }"),
+        "a `//` inside a string literal is text, not a comment: {region:?}"
+    );
+    assert!(!region.contains("tail"), "the trailing comment must be cut");
+
+    let escaped = "let s = \"a\\\"b // still string\"; real(); // gone\n";
+    let region = production_region(escaped);
+    assert!(
+        region.contains("still string") && region.contains("real();") && !region.contains("gone"),
+        "an escaped quote must not end the string early: {region:?}"
+    );
+}
+
+/// The candle DDL must be awaited BEFORE the live-table DDL.
+///
+/// ## Why this ordering is load-bearing
+///
+/// `run_candle_ddl_at_boot` carries two things the live-table DDL depends on:
+///
+/// * the **fresh-start schema reset**, which drops the retired market-data
+///   tables and views (including the four direct `top_volume_<tf>` tables and
+///   the pre-2026-09-22 views of the same names). Ensuring the live tables
+///   FIRST would create them and then have the reset drop them, so the session
+///   would run on ILP-auto-created tables with no DEDUP key;
+/// * the **legacy view sweep**, which drops the four `top_volume_rank_*`
+///   views that still name a table this repository renamed away.
+///
+/// The two calls sit far apart in one very long function. Swapping them
+/// COMPILES GREEN. Until 2026-09-22 this guard pinned the same order for a
+/// different reason (a `top_volume_rank` → `top_volume` RENAME that no longer
+/// runs); the order outlived the rename because the reset now needs it.
+#[test]
+fn the_candle_ddl_is_awaited_before_the_live_table_ddl() {
+    let main_src = production_region(&read_src("src/main.rs"));
+
+    let sweep = "candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await";
+    let live = "candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await";
+
+    // COUNTED before compared. A `find` on a string that occurs zero times
+    // would panic with a clear message, but one that occurs TWICE would pin the
+    // first occurrence and silently ignore a second call site placed anywhere —
+    // including one placed on the wrong side of the live-table DDL.
+    assert_eq!(
+        main_src.matches(sweep).count(),
+        1,
+        "main.rs must await the candle DDL exactly once in production; this \
+         guard compares its position against the live-table DDL below, and two call \
+         sites would make that comparison meaningless"
+    );
+    assert_eq!(
+        main_src.matches(live).count(),
+        1,
+        "main.rs must await the live-table DDL exactly once in production"
+    );
+
+    let sweep_pos = main_src
+        .find(sweep)
+        .expect("counted above, so this cannot fail");
+    let live_pos = main_src
+        .find(live)
+        .expect("counted above, so this cannot fail");
+
+    assert!(
+        sweep_pos < live_pos,
+        "`run_candle_ddl_at_boot` (fresh-start reset + legacy view sweep) must \
+         be awaited BEFORE `run_live_table_ddl_at_boot` (which ensures ticks, \
+         market_depth and the feed-aux tables). Swapped, the reset \
+         would drop tables the ensure just created. Found the candle DDL at byte \
+         {sweep_pos} and the live-table DDL at byte {live_pos}."
+    );
+}
+
+/// The live-table DDL loop creates NO view (2026-09-22 SECOND — NO VIEWS
+/// ANYWHERE), and its success return still requires EVERY live table.
+///
+/// Until 2026-09-22 this loop re-ran a view pass whenever a base table of the
+/// `_named` views appeared. Those views are retired; a re-ensure call returning
+/// here would recreate a view the boot just dropped.
+#[test]
+fn the_live_table_loop_creates_no_view_and_requires_every_table() {
+    let boot = production_region(&read_src("src/candle_ddl_boot.rs"));
+    let start = boot
+        .find(concat!("pub async ", "fn run_live_table_ddl_at_boot"))
+        .expect("the live-table boot fn must exist");
+    let body = &boot[start..];
+    assert!(
+        !body.contains("ensure_named_views") && !body.contains("ViewBaseTables"),
+        "a view pass is back inside the live-table DDL loop"
+    );
+    assert!(
+        body.contains("if ticks_ok && depth_ok && feed_aux_ok {"),
+        "the boot-complete return must still require every live table"
+    );
+}
+
+/// EVERY offload writer thread the lane spawns must be joined at shutdown and
+/// must have a seeded `writer=` label on the abandonment counter.
+///
+/// ## The gap this closes
+///
+/// The lane spawns THREE writer threads — ticks, depth, and (since 2026-09-07)
+/// top-volume snapshots. The first two have had shutdown accounting since
+/// 2026-08-28: the queue is closed, the thread is joined against a shared
+/// deadline, and a timeout or panic increments
+/// `tv_offload_writer_shutdown_incomplete_total{writer=...}` beside a coded
+/// error. §2.3n of the noise lock was written for exactly that, in its own
+/// words because "a thread that never got to run its drain increments neither"
+/// loss series.
+///
+/// The third writer simply never joined the pattern. It was spawned with
+/// `Ok(_handle) =>` — the handle discarded — so at every 17:30 stop and every
+/// mid-session redeploy up to `TOP_VOLUME_FLUSH_QUEUE_DEPTH` batches plus the
+/// one in flight were abandoned with no counter, no log and no alarm. The
+/// magnitude grew on the branch that removed the top-250 persistence cut, which
+/// made a batch market-bounded rather than <= 500 rows.
+///
+/// This guard is deliberately about SYMMETRY rather than about the third
+/// writer: the defect was not that someone forgot a join, it was that nothing
+/// noticed a new writer arriving without one. A fourth writer now fails the
+/// build until it is accounted for.
+#[test]
+fn every_offload_writer_is_joined_and_labelled_at_shutdown() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+
+    // The labels that must be SEEDED, so the CloudWatch agent's
+    // dropped-first-sample rule cannot swallow a series on the one day it
+    // fires. An unseeded counter publishes NOTHING the first time it moves.
+    // `top_volume` left this list on 2026-10-22 (plan item 62) with its
+    // writer; the remaining offload writers are tick and depth.
+    for writer in ["tick", "depth"] {
+        let seed = format!(
+            "metrics::counter!(OFFLOAD_SHUTDOWN_INCOMPLETE_COUNTER, \"writer\" => \"{writer}\").increment(0)"
+        );
+        assert!(
+            lane.contains(&seed),
+            "the `{writer}` abandonment series must be SEEDED at zero at \
+             construction. The agent drops the first sample of a series it has \
+             never seen, so a counter seeded only by its own first event \
+             reports nothing on the one day it matters"
+        );
+    }
+
+    // A spawned writer whose handle is DISCARDED cannot be joined. The exact
+    // spelling that hid the third writer was `Ok(_handle) =>`.
+    //
+    // Asserted POSITIVELY — that the handle is bound and handed over — rather
+    // than by banning the discard spelling. The first draft did ban the string,
+    // and it went red against CORRECT code: the fix's own explanatory comment
+    // quotes `Ok(_handle)` to say what it replaced, and a source scan cannot
+    // tell prose from code. A guard that forbids naming the defect it prevents
+    // makes the defect undocumentable, which is a bad trade for a pin that the
+    // positive form gives anyway.
+    assert!(
+        !lane.contains("with_top_volume_writer("),
+        "the top-volume writer was removed on 2026-10-22 (plan item 62, Quote 34); \
+         re-adding it needs a fresh dated operator quote"
+    );
+
+    // All three joins must be present, and against the SAME deadline: `main`
+    // gives the whole task ONE flush budget, so independent graces would SUM
+    // past it -- the arithmetic the compile-time assert in main.rs keeps honest.
+    for join in [
+        "ingest.shutdown_offload_writer(offload_deadline)",
+        "ingest.shutdown_depth_offload_writer(offload_deadline)",
+    ] {
+        assert!(
+            lane.contains(join),
+            "the shutdown tail must call `{join}` -- every offload queue is \
+             closed before any join begins, so the three threads drain in \
+             parallel and the total wait is the MAX of the three, never the sum"
+        );
+    }
+}
+
+/// The top-volume writer threads and their bounded join went with
+/// `top_volume` on 2026-10-22 (plan item 62, operator Quote 34). Until then
+/// this test pinned that `shutdown_top_volume_writer` polled `is_finished()`
+/// to the shared deadline before joining. It now pins the removal: the child
+/// module that held the threads is gone and nothing in the lane names it.
+#[test]
+fn the_top_volume_writer_threads_are_gone() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        !manifest
+            .join("src/dhan_feed_stack/top_volume_threads.rs")
+            .exists(),
+        "the top-volume writer threads module was removed with top_volume"
+    );
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+    for gone in ["mod top_volume_threads;", "shutdown_top_volume_writer("] {
+        assert!(!lane.contains(gone), "`{gone}` must stay removed");
+    }
+}
+
+/// The ranking daily-reset fires ONLY on a real IST midnight crossing.
+///
+/// `ranking_day` starts at 0, so the first 30-second tick of every drain enters
+/// the `ranking_day != today` branch. The `!= 0` sentinel silenced the LOG —
+/// correctly, no midnight was crossed — while the reset sat OUTSIDE it and ran
+/// anyway, wiping the leaderboard, `PrevCloseStore` and `SpotPriceStore` thirty
+/// seconds into every session.
+///
+/// Harmless at the 08:30 boot (the stores are empty at 08:30:30 and the code-6
+/// PrevClose burst arrives with the 09:00 connect). On a MID-SESSION restart the
+/// burst lands within seconds of connect, this wiped it, and code-6 is one-shot
+/// per subscribe — so every gainer verdict read `Unknown` for the rest of the
+/// day, the filter published an empty board, and both depth pools held their
+/// boot dial. The only detector is a log-sink-only latch.
+///
+/// The discriminator is ORDER, because both the correct and the broken form
+/// contain all three statements — only their sequence differs.
+#[test]
+fn the_ranking_daily_reset_fires_only_on_a_real_midnight_crossing() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+
+    const GUARD: &str = "if ranking_day != 0 {";
+    // 2026-10-01: the midnight branch calls `roll_trading_day()`, which seals
+    // the candle fold and then runs `reset_ranking_daily()`. Its own body is
+    // pinned by `the_day_roll_seals_the_fold_before_resetting_the_ranking`.
+    const RESET: &str = "ingest.roll_trading_day();";
+    const ADOPT: &str = "ranking_day = today;";
+
+    for (needle, what) in [
+        (GUARD, "the midnight-crossing guard"),
+        (RESET, "the ranking reset call"),
+        (ADOPT, "the day adoption"),
+    ] {
+        assert_eq!(
+            lane.matches(needle).count(),
+            1,
+            "expected exactly one {what} (`{needle}`) in the production half. A \
+             different count means this guard is anchored on the wrong \
+             occurrence and its ordering assertions below prove nothing"
+        );
+    }
+
+    let guard_at = lane.find(GUARD).expect("counted above");
+    let reset_at = lane.find(RESET).expect("counted above");
+    let adopt_at = lane.find(ADOPT).expect("counted above");
+
+    assert!(
+        guard_at < reset_at && reset_at < adopt_at,
+        "`roll_trading_day()` (which runs `reset_ranking_daily()`) must sit INSIDE the `ranking_day != 0` block, \
+         before `ranking_day = today;`. Outside it, the reset runs on the first \
+         30-second tick of every drain and destroys the one-shot code-6 \
+         PrevClose burst on any mid-session restart — leaving every gainer \
+         verdict Unknown and both depth pools frozen on their boot dial for the \
+         rest of the session"
+    );
+}
+
+/// The midnight roll seals the candle fold BEFORE it resets the ranking.
+///
+/// Regression: 2026-10-01 (reality check). The midnight branch reset only the
+/// ranking stores, so the fold kept yesterday's cumulative and wrote every
+/// next-day bar below it at volume 0. `roll_trading_day` runs the day-close
+/// seal first; reversed, the seal would write yesterday's bars into the
+/// ranking history the reset had just cleared.
+#[test]
+fn the_day_roll_seals_the_fold_before_resetting_the_ranking() {
+    let lane = production_region(&read_src("src/dhan_feed_stack.rs"));
+    let start = lane
+        .find("pub fn roll_trading_day(&mut self)")
+        .expect("`roll_trading_day` must exist in the production half");
+    let body_end = lane[start..]
+        .find("\n    }\n")
+        .expect("the method body must close");
+    let body = &lane[start..start + body_end];
+
+    let seal_at = body
+        .find("self.seal_open_buckets_at_close()")
+        .expect("the roll must run the day-close seal");
+    let reset_at = body
+        .find("self.reset_ranking_daily()")
+        .expect("the roll must reset the ranking stores");
+    assert!(
+        seal_at < reset_at,
+        "`roll_trading_day` must seal the fold before resetting the ranking"
+    );
+}
+
+/// Owner Quote 44 (2026-10-28): the daily `instrument_lifecycle` /
+/// `instrument_lifecycle_audit` write STOPPED; both tables are frozen SEBI
+/// history. This replaces the audit-J3 pin (which held the write back on an
+/// unkeyed table): there is no write left to hold back, and none may come
+/// back without a fresh dated quote. Scans every production `.rs` file in the
+/// app crate (comments and test modules stripped) for any lifecycle writer.
+#[test]
+fn no_production_code_writes_the_frozen_lifecycle_tables() {
+    assert!(
+        !manifest_dir().join("src/dhan_lifecycle.rs").exists(),
+        "the daily lifecycle writer module must stay deleted (Quote 44)"
+    );
+    let mut files = Vec::new();
+    collect_rs_files(&manifest_dir().join("src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the scan must actually walk the app crate (found {} files)",
+        files.len()
+    );
+    let banned = [
+        concat!("write_dhan_", "lifecycle"),
+        concat!("append_instrument_", "lifecycle"),
+        concat!("ensure_instrument_", "lifecycle"),
+        concat!("dhan_", "lifecycle::"),
+        concat!("mod dhan_", "lifecycle"),
+    ];
+    for path in &files {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        // Every `#[cfg(test)]` item is stripped, not only the first test
+        // module, so a function after a test module is still scanned.
+        let prod = strip_line_comments(&strip_cfg_test_items(&src));
+        for needle in banned {
+            assert!(
+                !prod.contains(needle),
+                "{} writes a frozen lifecycle table (`{needle}`): Quote 44 stopped that write",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Quote 44, the broader half: no production code in the app OR storage crate
+/// may write either frozen table by ANY route, not only through the deleted
+/// helpers' names. Bans, outside the one file that defines the table-name
+/// constants:
+/// - the constants `QUESTDB_TABLE_INSTRUMENT_LIFECYCLE(_AUDIT)` (an ILP
+///   `.table(…)` or a formatted SQL statement would need them), and
+/// - a literal ILP `.table("instrument_lifecycle…")` or a literal SQL write
+///   (`INSERT INTO` / `UPDATE` / `ALTER TABLE` / `DELETE FROM` / `TRUNCATE
+///   TABLE` / `DROP TABLE` followed by `instrument_lifecycle`), case-insensitive.
+///
+/// The scan strips every `#[cfg(test)]` item (not only the first test module),
+/// so a production function written AFTER a test module is still read.
+#[test]
+fn no_production_code_in_app_or_storage_names_a_route_into_the_frozen_tables() {
+    const DEFINING_FILE: &str = "instrument_lifecycle_persistence.rs";
+    let constant_needles = [
+        concat!("QUESTDB_TABLE_INSTRUMENT_", "LIFECYCLE"),
+        concat!("QUESTDB_TABLE_INSTRUMENT_", "LIFECYCLE_AUDIT"),
+    ];
+    let sql_verbs = [
+        "insert into ",
+        "update ",
+        "alter table ",
+        "delete from ",
+        "truncate table ",
+        "drop table ",
+    ];
+    let table = concat!("instrument_", "lifecycle");
+    let mut files = Vec::new();
+    collect_rs_files(&manifest_dir().join("src"), &mut files);
+    collect_rs_files(&manifest_dir().join("../storage/src"), &mut files);
+    assert!(
+        files.len() > 100,
+        "the scan must walk both crates (found {} files)",
+        files.len()
+    );
+    for path in &files {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let prod = strip_line_comments(&strip_cfg_test_items(&src));
+        let lower = prod.to_ascii_lowercase();
+        let defining = path.file_name().is_some_and(|n| n == DEFINING_FILE);
+        if !defining {
+            for needle in constant_needles {
+                assert!(
+                    !prod.contains(needle),
+                    "{} names `{needle}` in production code: Quote 44 froze that table",
+                    path.display()
+                );
+            }
+        }
+        for verb in sql_verbs {
+            let statement = format!("{verb}{table}");
+            assert!(
+                !lower.contains(&statement),
+                "{} carries a literal `{statement}`: Quote 44 froze that table",
+                path.display()
+            );
+        }
+        assert!(
+            !lower.contains(&format!(".table(\"{table}")),
+            "{} writes ILP rows to a frozen lifecycle table",
+            path.display()
+        );
+    }
+}
+
+/// Drops every item tagged `#[cfg(test)]` at column 0: a block item (its
+/// header line ends with `{`) up to its column-0 closing `}` (rustfmt puts
+/// nothing else at column 0 inside it), a one-line item (`use …;`) alone.
+fn strip_cfg_test_items(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut lines = src.lines();
+    while let Some(line) = lines.next() {
+        if line != "#[cfg(test)]" {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Further attributes on the same item.
+        let mut header = lines.next();
+        while header.is_some_and(|h| h.starts_with("#[")) {
+            header = lines.next();
+        }
+        let Some(header) = header else { break };
+        if header.trim_end().ends_with('{') {
+            for inner in lines.by_ref() {
+                if inner == "}" {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `strip_cfg_test_items` must keep a production function that follows a
+/// test module, and drop both the module and a one-line test item.
+#[test]
+fn strip_cfg_test_items_keeps_code_after_a_test_module() {
+    let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n    }\n}\nfn b() {}\n#[cfg(test)]\nuse x::y;\nfn c() {}\n";
+    let kept = strip_cfg_test_items(src);
+    assert!(kept.contains("fn a()"), "{kept}");
+    assert!(
+        kept.contains("fn b()"),
+        "code after a test module is kept: {kept}"
+    );
+    assert!(kept.contains("fn c()"), "{kept}");
+    assert!(
+        !kept.contains("fn t()"),
+        "the test module is dropped: {kept}"
+    );
+    assert!(
+        !kept.contains("use x::y"),
+        "a one-line test item is dropped: {kept}"
+    );
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", dir.display()))
+            .path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
 }

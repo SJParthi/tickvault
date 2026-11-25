@@ -90,6 +90,16 @@
 //! against TRANSIENT failures comes from the internal retry-forever loops
 //! (every failure arm is a typed-error `match`, no unwrap/expect).
 //!
+//! **⚠ CHANGED 2026-10-11 (audit CONC-4) — a clean stop now releases the
+//! lock.** The heartbeat's shutdown `Notify` and `JoinHandle` are kept in a
+//! static, and main calls [`release_instance_lock_at_shutdown`] after the
+//! WAL floor has drained and before the notifier flush, bounded at
+//! `INSTANCE_LOCK_RELEASE_BUDGET_SECS`. The heartbeat flips the held flag
+//! off (so the RESILIENCE-03 tripwire refuses any late mint) and deletes the
+//! parameter only if this process still owns it. A crash, a SIGKILL or a
+//! release past the budget still relies on the 90s TTL, and the text below
+//! describes that case. Kept as written:
+//!
 //! **Graceful-shutdown honest envelope:** the SSM lock heartbeat here has no
 //! shutdown-notify chain (the lane's Item 19f bridge is lane-scoped), so a
 //! process stop leaves the lock parameter in SSM until the 90s TTL clears
@@ -152,6 +162,189 @@ const DHAN_REST_STACK_TOKEN_RETRY_FLOOR_SECS: u64 = 130;
 /// twice (N stacks = N heartbeats + N renewal loops + N spot/chain
 /// families). First caller wins; later calls log INFO and return `None`.
 static DHAN_REST_STACK_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// The lock heartbeat's shutdown signal and task, kept so a clean stop can
+/// release the dual-instance lock instead of leaving it for the 90s TTL
+/// (audit CONC-4, 2026-10-11). Set once, when the stack acquires the lock;
+/// taken once, at shutdown.
+type HeartbeatSlot = std::sync::Mutex<
+    Option<(
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<instance_lock::HeartbeatExit>,
+    )>,
+>;
+
+/// See [`HeartbeatSlot`].
+static INSTANCE_LOCK_HEARTBEAT: HeartbeatSlot = std::sync::Mutex::new(None);
+
+/// Whether the shutdown has stopped everything that needs the lock (CONC-4
+/// review, 2026-10-11). The lock keeps a peer from dialling Dhan while this
+/// process still can, so it is released only once no socket is left open and
+/// the live lane stopped inside its budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownLockGate {
+    /// Sockets the socket-stop step reported still open.
+    pub sockets_left_open: usize,
+    /// The live lane returned cleanly inside its budget (or never ran).
+    pub lane_stopped_cleanly: bool,
+}
+
+impl ShutdownLockGate {
+    /// True when nothing that needs the lock can still run. O(1).
+    #[must_use]
+    pub const fn is_safe(self) -> bool {
+        self.sockets_left_open == 0 && self.lane_stopped_cleanly
+    }
+}
+
+/// What [`release_instance_lock_at_shutdown`] found (audit CONC-4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockReleaseAtShutdown {
+    /// No heartbeat is running, or it had nothing of ours to delete: the
+    /// lock was never acquired in this process, the heartbeat had already
+    /// exited (lost ownership), or the parameter was already gone or held by
+    /// another process.
+    NotHeld,
+    /// The heartbeat deleted our SSM parameter inside the budget.
+    Released,
+    /// The heartbeat's release failed (an SSM error, a value that is not a
+    /// lock, or a panicked heartbeat); the 90s TTL clears the lock instead
+    /// (CONC-4 review, 2026-10-11 — these were counted as `released`).
+    ReleaseFailed,
+    /// The heartbeat did not finish inside the budget; the 90s TTL clears
+    /// the lock instead.
+    TimedOut,
+    /// Not released: a socket was still open or the lane overran its budget,
+    /// so this process could still dial. The heartbeat keeps renewing until
+    /// exit and the 90s TTL clears the lock after the process is gone
+    /// (CONC-4 review, 2026-10-11).
+    SkippedUnsafe,
+}
+
+impl LockReleaseAtShutdown {
+    /// Label for `tv_instance_lock_release_at_shutdown_total{outcome}`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotHeld => "not_held",
+            Self::Released => "released",
+            Self::ReleaseFailed => "release_failed",
+            Self::TimedOut => "timed_out",
+            Self::SkippedUnsafe => "skipped_unsafe",
+        }
+    }
+}
+
+/// Release the dual-instance lock on a clean stop (audit CONC-4, 2026-10-11).
+///
+/// Signals the lock heartbeat, which flips the held flag off and deletes the
+/// SSM parameter if this process still owns it, then waits for it at most
+/// `budget`. Until this date nothing signalled the heartbeat, so every clean
+/// stop (deploy, restart, the 17:30 stop) left the lock in SSM for the 90s
+/// TTL plus the takeover settle, and a restart inside market hours opened no
+/// Dhan socket for that window.
+///
+/// Releases only when `gate` says nothing that needs the lock can still run
+/// (CONC-4 review, 2026-10-11): a socket left open, or a lane that overran
+/// its budget, keeps the lock until the process exits, and the TTL clears it
+/// after. Releasing then would let a waiting peer dial while this process can
+/// still dial too. Cold path; a local counter only, no page and no alarm.
+pub async fn release_instance_lock_at_shutdown(
+    gate: ShutdownLockGate,
+    budget: Duration,
+) -> LockReleaseAtShutdown {
+    let outcome = release_registered_gated(&INSTANCE_LOCK_HEARTBEAT, gate, budget).await;
+    metrics::counter!(
+        "tv_instance_lock_release_at_shutdown_total",
+        "outcome" => outcome.as_str()
+    )
+    .increment(1);
+    match outcome {
+        LockReleaseAtShutdown::Released => {
+            info!("Dhan REST-only stack: dual-instance lock released on shutdown");
+        }
+        LockReleaseAtShutdown::NotHeld => {
+            debug!("Dhan REST-only stack: no dual-instance lock to release on shutdown");
+        }
+        LockReleaseAtShutdown::ReleaseFailed | LockReleaseAtShutdown::TimedOut => {
+            // Same level as the heartbeat's own failed release: the TTL
+            // still clears the lock, so this is degraded, not lost.
+            warn!(
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                stage = "release_at_shutdown_incomplete",
+                outcome = outcome.as_str(),
+                budget_secs = budget.as_secs(),
+                "Dhan REST-only stack: the dual-instance lock was not released on shutdown                  — the next boot waits for the 90s TTL instead"
+            );
+        }
+        LockReleaseAtShutdown::SkippedUnsafe => {
+            warn!(
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                stage = "release_at_shutdown_skipped",
+                sockets_left_open = gate.sockets_left_open,
+                lane_stopped_cleanly = gate.lane_stopped_cleanly,
+                "Dhan REST-only stack: dual-instance lock kept on shutdown because a socket                  or the live lane may still be running — the next boot waits for the 90s TTL"
+            );
+        }
+    }
+    outcome
+}
+
+/// [`release_registered`] behind the [`ShutdownLockGate`]. An unsafe gate
+/// leaves the slot untouched, so the heartbeat keeps renewing until exit.
+///
+/// # Complexity
+/// O(1) plus one bounded wait.
+async fn release_registered_gated(
+    slot: &HeartbeatSlot,
+    gate: ShutdownLockGate,
+    budget: Duration,
+) -> LockReleaseAtShutdown {
+    if !gate.is_safe() {
+        return LockReleaseAtShutdown::SkippedUnsafe;
+    }
+    release_registered(slot, budget).await
+}
+
+/// The body of [`release_instance_lock_at_shutdown`], over an explicit slot so
+/// tests can drive it. The slot's lock is held only for the take, never across
+/// an `.await`.
+///
+/// # Complexity
+/// O(1) plus one bounded wait.
+async fn release_registered(slot: &HeartbeatSlot, budget: Duration) -> LockReleaseAtShutdown {
+    let taken = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let Some((shutdown, handle)) = taken else {
+        return LockReleaseAtShutdown::NotHeld;
+    };
+    if handle.is_finished() {
+        // Exited on lost ownership: there is nothing of ours to release.
+        return LockReleaseAtShutdown::NotHeld;
+    }
+    shutdown.notify_one();
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(exit)) => lock_release_from_heartbeat_exit(exit),
+        // A panicked or cancelled heartbeat released nothing we can vouch
+        // for (CONC-4 review: this was counted as `released`).
+        Ok(Err(_join_error)) => LockReleaseAtShutdown::ReleaseFailed,
+        Err(_) => LockReleaseAtShutdown::TimedOut,
+    }
+}
+
+/// Maps how the heartbeat ended to the shutdown outcome. O(1).
+const fn lock_release_from_heartbeat_exit(
+    exit: instance_lock::HeartbeatExit,
+) -> LockReleaseAtShutdown {
+    match exit {
+        instance_lock::HeartbeatExit::Released => LockReleaseAtShutdown::Released,
+        instance_lock::HeartbeatExit::ReleaseFailed => LockReleaseAtShutdown::ReleaseFailed,
+        instance_lock::HeartbeatExit::NothingToRelease
+        | instance_lock::HeartbeatExit::LostOwnership => LockReleaseAtShutdown::NotHeld,
+    }
+}
 
 /// Process-global once-guard for the Dhan-REST SCHEDULED TASK FAMILY
 /// (spot_1m_rest + option_chain_1m; the REST canary left the family
@@ -222,6 +415,18 @@ pub struct DhanRestStackParams {
     >,
     /// Order-leg P&L sink threaded from main.rs boot (None = feature OFF).
     pub leg_pnl_tx: Option<tokio::sync::mpsc::Sender<crate::order_runtime::LegPnlEvent>>,
+    /// The dual-instance lock verdict, SHARED with the live tick lane.
+    ///
+    /// Created by the boot and handed to BOTH stacks. This stack stores
+    /// `true` on `AcquireOutcome::Acquired` and the heartbeat clears it if the
+    /// lock is ever lost; the tick lane REFUSES to dial while it reads `false`
+    /// (`dhan_feed_stack::run_dhan_feed_stack`). Until 2026-09-08 the flag was
+    /// created INSIDE this task and reached the lane only implicitly — the
+    /// lane waited for the token manager, which this stack registers after
+    /// acquiring the lock — so a lost lock left the lane dialing on a second
+    /// box's token with nothing checking. Sharing the flag makes the ordering
+    /// a check rather than a coincidence.
+    pub instance_lock_held: Arc<AtomicBool>,
 }
 
 /// Capacity of the order-update ws-audit tee channel (2026-08-10). Sized to
@@ -263,6 +468,14 @@ pub fn dhan_rest_retry_should_log(attempt: u32) -> bool {
 #[must_use]
 pub fn dhan_rest_peer_page_due(attempt: u32, already_paged: bool) -> bool {
     !already_paged && attempt >= DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
+}
+
+/// True while an AlreadyHeld streak is still inside the window where the
+/// holder is most plausibly THIS machine's previous process whose 90s TTL
+/// has not yet lapsed — the same boundary the Telegram page waits for
+/// ([`DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT`]). Pure — unit-tested.
+fn held_is_expected_self_stale(attempt: u32) -> bool {
+    attempt < DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
 }
 
 /// PARK decision for the lock-acquire loop (2026-07-13 lurk-and-steal fix):
@@ -309,6 +522,12 @@ pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task:
         );
         return None;
     }
+    // LF-6b: the live PAPER fill chain boots here, once, synchronously and
+    // BEFORE main spawns the feed stack, because both stacks take their half
+    // of the chain from slots this fills (the order runtime's link below,
+    // the drain's tap at the lane setup). Off by default; idle until an
+    // approved brutex strategy engine exists.
+    let _live_fill = crate::live_fill::boot(&params.config);
     let inner = tokio::spawn(run_dhan_rest_stack(params));
     Some(tokio::spawn(async move {
         // Exit monitor: the bring-up task normally COMPLETES after spawning
@@ -319,6 +538,8 @@ pub fn spawn_dhan_rest_stack(params: DhanRestStackParams) -> Option<tokio::task:
             && !join_err.is_cancelled()
         {
             error!(
+                code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                source = "bring_up_died",
                 ?join_err,
                 "Dhan REST-only stack bring-up task died before completing — the retained \
                  Dhan REST surface (spot_1m_rest / option_chain_1m) may be absent \
@@ -350,7 +571,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // that cannot acquire the lock simply stays down (loud, coalesced) while
     // Groww + shared infra keep running.
     // -----------------------------------------------------------------------
-    let instance_lock_held = Arc::new(AtomicBool::new(false));
+    // Shared with the live tick lane (see `DhanRestStackParams::instance_lock_held`).
+    let instance_lock_held = Arc::clone(&params.instance_lock_held);
     let ssm_client = Arc::new(secret_manager::create_ssm_client_public().await);
 
     let env = {
@@ -362,6 +584,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::Resilience03MintRefusedLockNotHeld.code_str(),
+                            source = "env_unresolved",
                             attempt,
                             error = %err,
                             "Dhan REST-only stack: cannot resolve environment for the \
@@ -449,7 +673,28 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 }
                 Ok(instance_lock::AcquireOutcome::AlreadyHeld { holder }) => {
                     held_attempt = held_attempt.saturating_add(1);
-                    if dhan_rest_retry_should_log(held_attempt) {
+                    if dhan_rest_retry_should_log(held_attempt)
+                        && held_is_expected_self_stale(held_attempt)
+                    {
+                        // 2026-09-23: a deploy/daily restart finds its OWN
+                        // predecessor's lock (the heartbeat never releases
+                        // on stop — module docs) until the 90s TTL lapses.
+                        // That is expected, not a dual instance, so it is
+                        // not an ERROR. Measured 05:08 IST 2026-09-23: an
+                        // ERROR fired on a routine redeploy against the
+                        // previous pid's own entry.
+                        warn!(
+                            stage = "already_held_self_stale_window",
+                            peer = %holder,
+                            lock_key = %lock_key,
+                            attempt = held_attempt,
+                            waited_secs = held_wait_secs,
+                            "Dhan REST-only stack: the dual-instance lock is still \
+                             held — expected right after a restart while the previous \
+                             process's entry ages out (90s); retrying, no mint before \
+                             the lock"
+                        );
+                    } else if dhan_rest_retry_should_log(held_attempt) {
                         error!(
                             code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
                             severity = ErrorCode::Resilience01DualInstanceDetected
@@ -521,18 +766,22 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         }
     }
 
-    // Lock held — spawn the heartbeat. The shutdown Notify is deliberately
-    // never notified (this stack lives for the process lifetime; see the
-    // module-docs graceful-shutdown honest envelope: the 90s TTL clears the
-    // lock for the next boot).
+    // Lock held — spawn the heartbeat. Its shutdown Notify and handle are
+    // kept so a clean stop releases the lock (audit CONC-4, 2026-10-11; this
+    // said "deliberately never notified" until then, which left every clean
+    // stop's lock in SSM for the 90s TTL).
     let heartbeat_shutdown = Arc::new(tokio::sync::Notify::new());
-    let _heartbeat_handle = instance_lock::spawn_instance_lock_heartbeat(
+    let heartbeat_handle = instance_lock::spawn_instance_lock_heartbeat(
         Arc::clone(&ssm_client),
         env.clone(),
         host_id.clone(),
-        heartbeat_shutdown,
+        Arc::clone(&heartbeat_shutdown),
         Arc::clone(&instance_lock_held),
     );
+    *INSTANCE_LOCK_HEARTBEAT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((heartbeat_shutdown, heartbeat_handle));
 
     // -----------------------------------------------------------------------
     // Phase 2: TokenManager (SSM creds → TOTP → JWT), the SAME wiring the
@@ -588,6 +837,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::AuthGapTokenExpiry.code_str(),
+                            source = "auth_timeout",
                             timeout_secs = TOKEN_INIT_TIMEOUT_SECS,
                             attempt,
                             "Dhan REST-only stack authentication timed out — Dhan API may be \
@@ -734,6 +985,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                     attempt = attempt.saturating_add(1);
                     if dhan_rest_retry_should_log(attempt) {
                         error!(
+                            code = ErrorCode::AuthGapTokenExpiry.code_str(),
+                            source = "client_id_fetch",
                             attempt,
                             error = %err,
                             "Dhan REST-only stack: client-id fetch failed — retrying in \
@@ -764,6 +1017,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // ever fires, the invariant is broken — stay down loudly.
     if !claim_post_market_task_family_once() {
         error!(
+            code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+            source = "double_claim",
             "Dhan REST-only stack: the Dhan-REST scheduled task family is ALREADY \
              claimed this process — refusing to double-spawn \
              spot_1m_rest/option_chain_1m; the sole-claimant invariant is broken, \
@@ -843,19 +1098,38 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
             let health_for_audit = params.health.clone();
             tokio::spawn(async move {
                 use tickvault_common::ws_event_types::WsEventKind;
+                // One drop episode = one log line (audit J3, 2026-10-26); the
+                // counter below still counts every dropped row.
+                let drop_latch = tickvault_core::websocket::audit_drop_latch::DropLatch::new();
                 while let Some(row) = tee_rx.recv().await {
                     let connected = match row.event_kind {
                         WsEventKind::Connected
                         | WsEventKind::Reconnected
-                        | WsEventKind::SleepResumed => true,
+                        | WsEventKind::SleepResumed
+                        // Audit M8: these happen on an OPEN socket and never
+                        // on the order-update socket; never a down signal.
+                        | WsEventKind::SubscriptionSwapped
+                        | WsEventKind::SubscriptionResubscribed
+                        | WsEventKind::GhostUnsubscribeResent => true,
                         WsEventKind::Disconnected
                         | WsEventKind::DisconnectedOffHours
                         | WsEventKind::SleepEntered
-                        | WsEventKind::StallRestarted => false,
+                        | WsEventKind::StallRestarted
+                        // A dial has BEGUN; nothing has connected yet. `false`
+                        // is the only honest answer, and the exhaustive match
+                        // is why this had to be decided rather than defaulted:
+                        // a `_ => true` arm would have reported the order-update
+                        // socket healthy the instant it started dialing.
+                        | WsEventKind::DialStarted
+                        // A dial FAILED — emphatically not connected.
+                        | WsEventKind::DialFailed
+                        // An 805 park: the socket is down.
+                        | WsEventKind::OverflowParked => false,
                     };
                     // Health first: it is the operator-facing verdict and
                     // must not depend on the forensic write succeeding.
                     health_for_audit.set_order_update_connected(connected);
+                    let row_kind = row.event_kind.as_str();
                     if persist_tx.try_send(row).is_err() {
                         metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(1);
                         // Counted AND said out loud. Until 2026-08-12 this arm
@@ -874,11 +1148,32 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                         // forensic depth, not liveness. Paper-mode order-update
                         // capture today; this becomes materially more serious
                         // when live order events flow through it.
-                        warn!(
-                            "order-update audit row DROPPED — the persist channel \
-                             was full. The WebSocket health verdict is unaffected, \
-                             but this lifecycle transition will be missing from \
-                             ws_event_audit and cannot be reconstructed later."
+                        //
+                        // ⚠ CHANGED 2026-10-26 (audit J3): this logged one
+                        // uncoded line per dropped row, so a full channel
+                        // wrote a line per transition and coded-error triage
+                        // never found it. It now carries AUDIT-WS-01 and logs
+                        // once per drop EPISODE (the `DropLatch` shape the
+                        // live-feed forwarder uses); the counter above still
+                        // counts every row.
+                        if drop_latch.on_drop() {
+                            warn!(
+                                code = ErrorCode::AuditWs01EventWriteFailed.code_str(),
+                                source = "order_update_ws_audit_row_dropped",
+                                event_kind = row_kind,
+                                "order-update audit row DROPPED — the persist channel \
+                                 was full. The WebSocket health verdict is unaffected, \
+                                 but this lifecycle transition will be missing from \
+                                 ws_event_audit and cannot be reconstructed later. \
+                                 Logged once per drop episode; every dropped row is \
+                                 counted on tv_order_update_ws_audit_dropped_total."
+                            );
+                        }
+                    } else if drop_latch.on_ok() {
+                        info!(
+                            "order-update audit rows reach the persist channel again — \
+                             the drop episode is over (rows dropped during it are gone; \
+                             the count is on tv_order_update_ws_audit_dropped_total)"
                         );
                     }
                 }
@@ -933,11 +1228,15 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
     // is byte-identical to the post-#1532 noise-lock shape.
     // -----------------------------------------------------------------------
     if config.order_runtime.enabled {
-        // Stack-local broadcast channel (capacity mirrors the legacy 256).
+        // Stack-local broadcast channel, sized by
+        // `ORDER_UPDATE_BROADCAST_CAPACITY` (4,096 since 2026-10-11, audit
+        // PR14; it was a literal 256, about 25 s of order events).
         // The construction receiver IS the runtime's first receiver — there
         // is no earlier producer to order against (no socket, no drain).
         let (order_update_sender, first_order_update_rx) =
-            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+                tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+            );
         // The auth seam: never notified today (no socket) — the runtime's
         // one-shot reconcile-on-auth arm idles by construction; kept so the
         // gated live re-arm wires the socket's auth signal into the SAME
@@ -958,6 +1257,8 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 // runtime — the leaked sender keeps the dummy channel open
                 // so the mark arm just idles.
                 error!(
+                    code = ErrorCode::OrderReady01GateRefused.code_str(),
+                    source = "mark_receiver_missing",
                     "order runtime: mark receiver slot was EMPTY at spawn — running \
                      mark-less (paper fills defer until marks return; investigate the \
                      boot wiring)"
@@ -981,6 +1282,10 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
                 client_id: client_id.clone(),
                 auth_notify: auth_signal,
                 leg_pnl_tx: params.leg_pnl_tx.clone(),
+                // LF-6b: the live paper fill chain's link; `None` unless the
+                // boot built the chain (an approved strategy engine; never
+                // today).
+                live_fill: crate::live_fill::take_paper_link(),
             });
         info!(
             "Dhan REST-only stack: DRY-RUN order runtime spawned (socket-free — \
@@ -990,99 +1295,37 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
         );
     }
 
-    // REST-health canary (DHAN-REST-400) DELETED 2026-07-14 (operator Dhan
-    // noise lock): the spot-1m + option-chain legs self-detect a dead REST
-    // surface within ~3-4 minutes via their own escalation edges.
-
-    // Spot→chain sequencing signal — created ONLY when BOTH halves are
-    // enabled (byte-identical to the spawn_post_market_tasks wiring).
-    let (spot_minute_done_tx, spot_minute_done_rx) =
-        if config.spot_1m_rest.enabled && config.option_chain_1m.enabled {
-            let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-    // 2026-07-14 operator pacing directive: configure the shared Dhan
-    // Data-API limiter cap from `[dhan_data_api] target_rps` BEFORE any
-    // REST task spawns (idempotent; validate() already rejected an
-    // out-of-range value at boot).
-    crate::dhan_data_api_limiter::configure_shared_dhan_data_api_limiter(
-        config.dhan_data_api.target_rps,
-    );
-
-    if config.spot_1m_rest.enabled {
-        let _spot1m_supervisor = crate::spot_1m_rest_boot::spawn_supervised_spot_1m_rest(
-            crate::spot_1m_rest_boot::Spot1mRestTaskParams {
-                token_handle: Arc::clone(&token_handle),
-                notifier: params.notifier.clone(),
-                calendar: Arc::clone(&params.calendar),
-                questdb: config.questdb.clone(),
-                rest_api_base_url: config.dhan.rest_api_base_url.clone(),
-                minute_done_tx: spot_minute_done_tx,
-                diagnostics_enabled: config.spot_1m_rest.diagnostics,
-                diagnostics_second_probe_secs_of_day_ist: config
-                    .spot_1m_rest
-                    .diagnostics_second_probe_secs_of_day_ist,
-                fetch_mode: config.spot_1m_rest.fetch_mode,
-                batch_interval_minutes: config.spot_1m_rest.batch_interval_minutes,
-            },
-        );
-        info!(
-            "spot_1m_rest: per-minute spot 1m REST pipeline spawned \
-             (fires each minute close 09:16:00–15:30:00 IST)"
-        );
-    } else {
-        info!("spot_1m_rest: disabled by config — per-minute spot fetch not spawned");
-    }
-
-    {
-        let chain_params = crate::option_chain_1m_boot::OptionChain1mTaskParams {
-            token_handle: Arc::clone(&token_handle),
-            notifier: params.notifier.clone(),
-            calendar: Arc::clone(&params.calendar),
-            questdb: config.questdb.clone(),
-            rest_api_base_url: config.dhan.rest_api_base_url.clone(),
-            client_id: client_id.clone(),
-            spot_minute_done: spot_minute_done_rx,
-            cadence_enabled: config.cadence.enabled,
-        };
-        if config.option_chain_1m.enabled {
-            let _chain1m_supervisor =
-                crate::option_chain_1m_boot::spawn_supervised_option_chain_1m(chain_params);
-            info!(
-                "option_chain_1m: per-minute option-chain REST pipeline spawned \
-                 (expirylist warmup, then each minute close right after the spot leg)"
-            );
-        } else if config.option_chain_1m.probe_and_report {
-            let probe_handle = tokio::spawn(
-                crate::option_chain_1m_boot::run_option_chain_1m_probe(chain_params),
-            );
-            let _probe_monitor = tokio::spawn(async move {
-                if let Err(join_err) = probe_handle.await
-                    && !join_err.is_cancelled()
-                {
-                    error!(
-                        code = ErrorCode::Chain04ExpirylistFailed.code_str(),
-                        stage = "probe_task_exit",
-                        ?join_err,
-                        "CHAIN-04: the option-chain entitlement probe task died (panic) — \
-                         no verdict today; tomorrow's boot re-probes"
-                    );
-                }
-            });
-            info!(
-                "option_chain_1m: pipeline disabled by config — boot-time entitlement \
-                 probe spawned (verdict via Telegram)"
-            );
-        } else {
-            info!(
-                "option_chain_1m: disabled by config (probe_and_report off) — no \
-                 option-chain REST activity"
-            );
-        }
-    }
+    // ---- the two per-minute market-data REST legs: REMOVED 2026-09-16 ----
+    //
+    // This block spawned the supervised spot-1m fetcher
+    // (`POST /v2/charts/intraday`, interval "1") and the option-chain
+    // fetcher (`POST /v2/optionchain` + `/expirylist`), plus the
+    // spot→chain sequencing watch channel and the shared Dhan Data-API
+    // rate limiter they paced through.
+    //
+    // All of it is gone under the operator's 2026-09-16 directive, recorded
+    // BEFORE the code in `no-rest-except-live-feed-2026-06-27.md` §12.10:
+    // "Bro just remove per minute price falls and 3.41 pm accuracy check
+    // alone dude okay". The sixteen sockets have carried the same
+    // instruments live since the 2026-08-11 flip, so these legs were a
+    // duplicate of the live lane rather than its source.
+    //
+    // KEPT, deliberately, and NOT part of that removal: everything above
+    // and below this point in the stack — the instance lock, the TOTP mint
+    // and renewal, the silent mid-session profile watchdog, the GAP-02
+    // token sweep, the token-health gauge and the /health token writer.
+    // §2 of this file's own noise lock records why: a socket cannot dial
+    // without the JWT those phases produce (`build_feed_url` embeds it in
+    // the URL), so removing them dials nothing.
+    //
+    // The REST-health canary (DHAN-REST-400) was deleted earlier, on
+    // 2026-07-14, on the grounds that "the spot-1m + option-chain legs
+    // self-detect a dead REST surface within ~3-4 minutes via their own
+    // escalation edges". Those legs are now gone too, so nothing detects a
+    // dead Dhan REST surface — which is correct, because there is no longer
+    // a Dhan REST market-data surface to be dead. The token family-(3)
+    // Critical and the CloudWatch token-remaining-low alarm still cover the
+    // AUTH surface that survives.
 
     // Phase 0 Item 20 note (merge resolution, 2026-07-14): the 15:25 IST
     // orphan-position watchdog is NOT spawned from this stack. The PR-C2
@@ -1099,38 +1342,12 @@ async fn run_dhan_rest_stack(params: DhanRestStackParams) {
 
     metrics::gauge!("tv_dhan_rest_stack_up").set(1.0);
     info!(
-        spot_1m_rest_enabled = config.spot_1m_rest.enabled,
-        option_chain_1m_enabled = config.option_chain_1m.enabled,
-        option_chain_1m_probe = config.option_chain_1m.probe_and_report,
-        "DHAN REST-ONLY STACK UP — lock + token + renewal + silent mid-session watchdog + \
-         token sweep + token-health gauge + /health token writer + spot_1m_rest + \
-         option_chain_1m arms spawned WITHOUT any Dhan WebSocket (operator directives \
-         2026-07-13 + 2026-07-14; the 15:25 orphan watchdog is process-global in main.rs)"
+        "DHAN REST STACK UP — lock + token + renewal + silent mid-session watchdog + \
+         token sweep + token-health gauge + /health token writer, WITHOUT any Dhan \
+         WebSocket and WITHOUT any market-data REST leg (the per-minute spot-1m and \
+         option-chain pulls were removed 2026-09-16 per the operator's sockets-only \
+         directive; the 15:25 orphan watchdog is process-global in main.rs)"
     );
-
-    // M3 (2026-07-14 fix round): with BOTH per-minute legs disabled the
-    // stack has ZERO leg-level pager coverage — a total Dhan REST death
-    // would page nothing except the token family-(3) Critical + the
-    // CloudWatch token-remaining-low early warning. Loud at boot so the
-    // operator can never discover this from silence.
-    if rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled, config.option_chain_1m.enabled) {
-        warn!(
-            spot_1m_rest_enabled = false,
-            option_chain_1m_enabled = false,
-            "Dhan REST stack up with ZERO legs enabled — no pager coverage: a total \
-             Dhan REST death would fire NO leg alert (only the token family-(3) \
-             Critical + the tv-token-remaining-low CloudWatch alarm remain); enable \
-             [spot_1m_rest] / [option_chain_1m] if this is not intentional"
-        );
-    }
-}
-
-/// M3 (2026-07-14 fix round). Pure. True iff NEITHER per-minute Dhan REST
-/// leg is enabled — the configuration under which the stack has zero
-/// leg-level pager coverage (the boot-time warn above fires).
-#[must_use]
-pub(crate) fn rest_stack_has_zero_pager_legs(spot_enabled: bool, chain_enabled: bool) -> bool {
-    !spot_enabled && !chain_enabled
 }
 
 /// GAP-02 sweep body (extracted for the supervisor): every
@@ -1208,6 +1425,8 @@ where
                 Err(_) => "panic",
             };
             error!(
+                code = ErrorCode::FeedSupervisor01Respawned.code_str(),
+                source = "task_died",
                 task,
                 reason,
                 backoff_secs,
@@ -1227,6 +1446,214 @@ where
 
 #[cfg(test)]
 mod tests {
+    use tickvault_core::instance_lock::HeartbeatExit;
+
+    /// Audit CONC-4: the shutdown release signals the heartbeat and waits for
+    /// it to finish.
+    #[tokio::test]
+    async fn release_registered_notifies_the_heartbeat_and_waits_for_it() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let notify = std::sync::Arc::clone(&notify);
+            let released = std::sync::Arc::clone(&released);
+            tokio::spawn(async move {
+                notify.notified().await;
+                released.store(true, std::sync::atomic::Ordering::Release);
+                HeartbeatExit::Released
+            })
+        };
+        *slot.lock().expect("slot") = Some((notify, task));
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::Released);
+        assert!(released.load(std::sync::atomic::Ordering::Acquire));
+        assert!(slot.lock().expect("slot").is_none(), "taken exactly once");
+    }
+
+    /// CONC-4 review (2026-10-11): a heartbeat that ends without deleting our
+    /// parameter, or panics, is never counted as `released`.
+    #[tokio::test]
+    async fn release_registered_counts_only_a_real_delete_as_released() {
+        for (exit, expected) in [
+            (
+                HeartbeatExit::ReleaseFailed,
+                super::LockReleaseAtShutdown::ReleaseFailed,
+            ),
+            (
+                HeartbeatExit::NothingToRelease,
+                super::LockReleaseAtShutdown::NotHeld,
+            ),
+        ] {
+            let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            let task = {
+                let notify = std::sync::Arc::clone(&notify);
+                tokio::spawn(async move {
+                    notify.notified().await;
+                    exit
+                })
+            };
+            *slot.lock().expect("slot") = Some((notify, task));
+            let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+            assert_eq!(outcome, expected, "{exit:?}");
+        }
+        // A panicked heartbeat.
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let notify = std::sync::Arc::clone(&notify);
+            tokio::spawn(async move {
+                notify.notified().await;
+                panic!("heartbeat panicked during its release");
+            })
+        };
+        *slot.lock().expect("slot") = Some((notify, task));
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::ReleaseFailed);
+    }
+
+    /// CONC-4 review (2026-10-11): a socket left open or a lane that overran
+    /// keeps the lock; the heartbeat is not signalled and keeps running.
+    #[tokio::test]
+    async fn release_registered_gated_keeps_the_lock_while_anything_could_still_dial() {
+        for gate in [
+            super::ShutdownLockGate {
+                sockets_left_open: 1,
+                lane_stopped_cleanly: true,
+            },
+            super::ShutdownLockGate {
+                sockets_left_open: 0,
+                lane_stopped_cleanly: false,
+            },
+        ] {
+            let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+            let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+            let task = tokio::spawn(async {
+                std::future::pending::<()>().await;
+                HeartbeatExit::Released
+            });
+            *slot.lock().expect("slot") = Some((notify, task));
+            let outcome =
+                super::release_registered_gated(&slot, gate, std::time::Duration::from_secs(3))
+                    .await;
+            assert_eq!(outcome, super::LockReleaseAtShutdown::SkippedUnsafe);
+            let kept = slot.lock().expect("slot").take();
+            let (_notify, task) = kept.expect("the heartbeat is left in place");
+            assert!(!task.is_finished(), "the heartbeat keeps renewing");
+            task.abort();
+        }
+        assert!(
+            super::ShutdownLockGate {
+                sockets_left_open: 0,
+                lane_stopped_cleanly: true,
+            }
+            .is_safe()
+        );
+    }
+
+    /// CONC-4 review (2026-10-11): the public entry point. With no heartbeat
+    /// registered it returns at once, and an unsafe gate skips the release.
+    #[tokio::test(start_paused = true)]
+    async fn release_instance_lock_at_shutdown_on_an_empty_slot_is_not_held() {
+        let started = tokio::time::Instant::now();
+        let safe = super::ShutdownLockGate {
+            sockets_left_open: 0,
+            lane_stopped_cleanly: true,
+        };
+        assert_eq!(
+            super::release_instance_lock_at_shutdown(safe, std::time::Duration::from_secs(3)).await,
+            super::LockReleaseAtShutdown::NotHeld
+        );
+        let unsafe_gate = super::ShutdownLockGate {
+            sockets_left_open: 2,
+            lane_stopped_cleanly: true,
+        };
+        assert_eq!(
+            super::release_instance_lock_at_shutdown(
+                unsafe_gate,
+                std::time::Duration::from_secs(3)
+            )
+            .await,
+            super::LockReleaseAtShutdown::SkippedUnsafe
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// Audit CONC-4: a heartbeat that ignores the signal costs the budget,
+    /// never more.
+    #[tokio::test(start_paused = true)]
+    async fn release_registered_gives_up_at_the_budget() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            HeartbeatExit::Released
+        });
+        *slot.lock().expect("slot") = Some((notify, task));
+        let started = tokio::time::Instant::now();
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::TimedOut);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+    }
+
+    /// Audit CONC-4: nothing registered (lock never acquired) does not wait.
+    #[tokio::test(start_paused = true)]
+    async fn release_registered_on_an_empty_slot_is_not_held() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let started = tokio::time::Instant::now();
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::NotHeld);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// Audit CONC-4: a heartbeat that already exited (lost ownership) has
+    /// nothing of ours to release.
+    #[tokio::test]
+    async fn release_registered_after_the_heartbeat_exited_is_not_held() {
+        let slot: super::HeartbeatSlot = std::sync::Mutex::new(None);
+        let task = tokio::spawn(async { HeartbeatExit::LostOwnership });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        *slot.lock().expect("slot") = Some((std::sync::Arc::new(tokio::sync::Notify::new()), task));
+        let outcome = super::release_registered(&slot, std::time::Duration::from_secs(3)).await;
+        assert_eq!(outcome, super::LockReleaseAtShutdown::NotHeld);
+    }
+
+    #[test]
+    fn test_shutdown_lock_gate_is_safe_only_when_nothing_can_dial() {
+        use super::ShutdownLockGate as G;
+        let gate = |sockets_left_open, lane_stopped_cleanly| G {
+            sockets_left_open,
+            lane_stopped_cleanly,
+        };
+        assert!(gate(0, true).is_safe());
+        assert!(!gate(1, true).is_safe());
+        assert!(!gate(0, false).is_safe());
+        assert!(!gate(usize::MAX, false).is_safe());
+    }
+
+    #[test]
+    fn test_lock_release_at_shutdown_labels() {
+        use super::LockReleaseAtShutdown as L;
+        assert_eq!(L::NotHeld.as_str(), "not_held");
+        assert_eq!(L::Released.as_str(), "released");
+        assert_eq!(L::ReleaseFailed.as_str(), "release_failed");
+        assert_eq!(L::TimedOut.as_str(), "timed_out");
+        assert_eq!(L::SkippedUnsafe.as_str(), "skipped_unsafe");
+    }
+
+    /// Audit CONC-4: the stack keeps the heartbeat's handle instead of
+    /// discarding it, so the shutdown can release the lock.
+    #[test]
+    fn the_heartbeat_handle_is_kept_for_the_shutdown_release() {
+        let src = include_str!("dhan_rest_stack.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(!prod.contains("let _heartbeat_handle"));
+        assert!(prod.contains("Some((heartbeat_shutdown, heartbeat_handle))"));
+    }
+
     use super::*;
 
     /// `dhan_rest_stack_backoff_secs` — the documented 10→20→40→80→160→300
@@ -1291,6 +1718,24 @@ mod tests {
             DHAN_REST_STACK_ALREADYHELD_PATIENCE_SECS
         ));
         assert!(dhan_rest_lock_park_due(u64::MAX), "no overflow / saturates");
+    }
+
+    #[test]
+    fn test_held_self_stale_window_is_exactly_the_pre_page_window() {
+        // The warn-not-error window and the Telegram-page gate are the SAME
+        // boundary: every attempt either reads as a restart's own stale entry
+        // (warn) or is eligible to page (error) — never both, never neither.
+        for attempt in 1..=DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT + 3 {
+            assert_ne!(
+                held_is_expected_self_stale(attempt),
+                dhan_rest_peer_page_due(attempt, false),
+                "attempt {attempt}"
+            );
+        }
+        assert!(held_is_expected_self_stale(1));
+        assert!(!held_is_expected_self_stale(
+            DHAN_REST_STACK_PEER_PAGE_MIN_ATTEMPT
+        ));
     }
 
     /// Foreign-machine (genuine live peer) arm: the page fires ONCE, only
@@ -1613,75 +2058,29 @@ mod tests {
         );
     }
 
-    /// Source-scan pin of the #1499-mirrored spot→chain contract
-    /// (2026-07-13 sequencing merge): PR #1499 rewrote the spot-1m fetch
-    /// internals (day-window + backfill + the 15:31 post-session sweep)
-    /// WITHOUT changing the spawn surface this REST-only stack mirrors
-    /// from main.rs's `spawn_post_market_tasks`. The stack therefore
-    /// inherits the sweep by construction — this test fails the build if
-    /// either side of that contract drifts (a sweep moved OUT of the
-    /// shared task, a params-field rename, or the stack dropping the
-    /// spot→chain sequencing channel) so the mirror can never diverge
-    /// silently again.
-    #[test]
-    fn test_dhan_rest_stack_mirrors_spot_chain_contract_post_1499() {
-        // The shared spot-1m module still owns the sweep + sequencing
-        // signal (the #1499 semantics both spawn paths inherit).
-        let spot_src = include_str!("spot_1m_rest_boot.rs");
-        for needle in [
-            "run_post_session_sweep(",
-            "pub minute_done_tx",
-            "send_replace",
-            // TEST-EXEMPT: string-literal ratchet needle (not a fn declaration) — pub-fn-test-guard grep false positive
-            "pub fn spawn_supervised_spot_1m_rest",
-        ] {
-            assert!(
-                spot_src.contains(needle),
-                "spot_1m_rest_boot.rs lost `{needle}` — the #1499-mirrored \
-                 contract drifted; re-check dhan_rest_stack's spawn mirror"
-            );
-        }
-
-        // This module's PRODUCTION region (split at the test-module marker
-        // so these assertion literals can never satisfy themselves) still
-        // spawns the same supervised task and builds the sequencing
-        // channel the lane path uses.
-        let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
-        for needle in [
-            "spawn_supervised_spot_1m_rest(",
-            "spawn_supervised_option_chain_1m(",
-            "watch::channel::<Option<u32>>",
-            "minute_done_tx",
-        ] {
-            assert!(
-                prod.contains(needle),
-                "dhan_rest_stack.rs production region lost `{needle}` — the \
-                 REST-only stack no longer mirrors spawn_post_market_tasks"
-            );
-        }
-    }
-
-    /// M3 (2026-07-14 fix round): zero-pager-legs truth table + the boot
-    /// warn stays wired in the production region.
-    #[test]
-    fn test_rest_stack_zero_pager_legs_truth_table_and_warn_wired() {
-        assert!(rest_stack_has_zero_pager_legs(false, false));
-        assert!(!rest_stack_has_zero_pager_legs(true, false));
-        assert!(!rest_stack_has_zero_pager_legs(false, true));
-        assert!(!rest_stack_has_zero_pager_legs(true, true));
-        let own_src = include_str!("dhan_rest_stack.rs");
-        let (prod, _) = own_src
-            .split_once("#[cfg(test)]")
-            .expect("dhan_rest_stack.rs must keep its test module marker");
-        assert!(
-            prod.contains("rest_stack_has_zero_pager_legs(config.spot_1m_rest.enabled"),
-            "the boot-time zero-legs warn must stay wired — with both legs \
-             disabled a total Dhan REST death is otherwise pageless (M3)"
-        );
-    }
+    // ---- the spot→chain mirror tests: REMOVED 2026-09-16 with the legs ----
+    //
+    // Two tests lived here and both pinned the per-minute REST legs this
+    // stack no longer spawns:
+    //
+    //   * `test_dhan_rest_stack_mirrors_spot_chain_contract_post_1499` —
+    //     a source-scan pin that this module kept mirroring
+    //     `spawn_post_market_tasks`' spot→chain spawn surface. Both sides
+    //     of that mirror are gone: the shared `spot_1m_rest_boot` module
+    //     it read with `include_str!` no longer exists, so the test could
+    //     not compile, let alone pass.
+    //   * `test_rest_stack_zero_pager_legs_truth_table_and_warn_wired` —
+    //     pinned a boot warn that fired when BOTH legs were disabled. With
+    //     the legs removed outright that condition is permanent, so the
+    //     warn would have fired on every boot forever: the "one error per
+    //     boot" shape that trains an operator to discount a counter.
+    //     `rest_stack_has_zero_pager_legs` is deleted with it.
+    //
+    // Authority: `no-rest-except-live-feed-2026-06-27.md` §12.10 (operator
+    // 2026-09-16, "Bro just remove per minute price falls and 3.41 pm
+    // accuracy check alone dude okay"). The coverage question the second
+    // test raised is not answered by a test — it is recorded honestly in
+    // §12.10.4 of that file as a LOSS.
 
     /// L-fix (2026-07-14 fix round): the supervisor respawns a dying inner
     /// task (clean-exit class) with the configured backoff. 0s backoff so
@@ -1738,7 +2137,8 @@ mod tests {
         }
         // Keep the original loop shape below vacuous-proof: assert the
         // supervisor helper itself exists in the production region.
-        for needle in ["fn spawn_supervised_stack_task"] {
+        {
+            let needle = "fn spawn_supervised_stack_task";
             assert!(
                 prod.contains(needle),
                 "dhan_rest_stack.rs production region lost `{needle}` — the \

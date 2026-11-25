@@ -15,27 +15,85 @@
 
 ## 🧃 The one-line story
 
-> Imagine a juice shop that takes a million orders a second. Not one order
-> is ever lost. The shop never jams. If the fridge breaks, a backup fridge
-> catches every fruit. If the lights go out, every order is written on paper
-> so nothing is forgotten. And a phone rings the instant anything wobbles —
-> before the customer even notices.
+> Imagine a juice shop that takes a million orders a second.
+> ~~Not one order is ever lost. The shop never jams.~~ If the fridge breaks, a
+> backup fridge catches the fruit. If the lights go out, ~~every order is
+> written on paper so nothing is forgotten~~ the orders already written on
+> paper are kept. And a phone rings the instant anything wobbles — before the
+> customer even notices.
 >
 > tickvault is that juice shop, for stock-market price ticks.
+>
+> **⚠ CORRECTED 2026-10-11:** "not one order is ever lost" and "nothing is
+> forgotten" were too strong. Every loss we can see is counted and rings your
+> phone, but a loss can still happen (section 1 lists the ways). A power cut
+> can lose up to about a second of updates, and a full disk loses new updates
+> until space comes back.
 
 ---
 
-## 1. "Not a single tick is ever lost"
+## 1. ~~"Not a single tick is ever lost"~~ "Every tick loss we can see is counted and rings your phone"
+
+> **⚠ CORRECTED 2026-10-11:** the heading above promised no loss at all. The
+> honest promise is narrower: most failures lose nothing, every loss we can
+> see is counted and pages you, and the losses we cannot count are written
+> down below.
 
 | In plain words | The honest truth |
 |---|---|
-| Every price update is written to disk **first**, before anything else can drop it. | Even if everything downstream jams or crashes, the update is already safe on disk and replays when we restart. **Zero lost.** |
-| If the database goes down, updates pile into a safety net (memory → disk → backup file). | Tested: database down → **0 lost**. Disk full → a backup text file catches them → **0 lost**. Power-kill mid-write → replays on restart → **0 lost**. |
-| The only way to truly lose one | Memory full **and** disk full **and** backup file unwritable — all at the same instant. That's physics, not a bug. **And the moment it happens, your phone rings** (a dedicated alarm) — it is never silent. |
+| Every price update is ~~written to disk **first**, before anything else can drop it~~ handed to the disk log the moment it arrives, before anything else touches it. | ~~Even if everything downstream jams or crashes, the update is already safe on disk and replays when we restart. **Zero lost.**~~ **⚠ CORRECTED 2026-10-11:** if the program crashes, updates the log had already written replay when we restart. An update can still be refused before it reaches the log (see the list below), and a power cut loses what the disk had not yet saved. |
+| If the database goes down, updates pile into a safety net (memory → disk → backup file). | Tested: database down → **0 lost**. ~~Disk full → a backup text file catches them → **0 lost**. Power-kill mid-write → replays on restart → **0 lost**.~~ **⚠ CORRECTED 2026-10-11:** a full disk is a loss, not a save: new updates are refused until space comes back, and each one is counted and pages you. A power cut can lose up to about a second of updates (plus however long the disk takes to save), and nothing can count those. |
+| The only way to truly lose one | ~~Memory full **and** disk full **and** backup file unwritable — all at the same instant. That's physics, not a bug.~~ *(corrected below)* **And the moment it happens, your phone rings** (a dedicated alarm) — it is never silent. |
+
+> **⚠ CORRECTED 2026-10-11** — the last row above was too strong. A price
+> update can be lost without everything failing at once. Any ONE of these is
+> enough:
+>
+> 1. the save queue is full for a moment;
+> 2. the disk-saving helper has stopped;
+> 3. the backup files have reached their size limit;
+> 4. the main log write failed after the update had been set aside to save
+>    later;
+> 5. the database writer gave up on rows after a failed write.
+>
+> Each of these is counted, and each one rings your phone. One kind of loss we
+> cannot see at all: if our reader falls behind, the broker skips ahead to its
+> newest prices and sends no sequence number, so the updates it skipped never
+> reach us and nothing can count them.
+>
+> **⚠ CORRECTED 2026-10-11 (later the same day):** the five-item list above
+> is not the whole list, and item 5 is usually not a loss. Read from the code
+> on 2026-10-11, the ways an update can be lost **include (this is
+> not a complete list)**:
+>
+> - **the disk log AND the memory queue both refused it.** This is the one
+>   with no way back: the update was never written anywhere. It pages you.
+> - items 1 to 4 above;
+> - rows the database writer was still holding when the program shut down;
+> - a shutdown that ran out of time before the writers finished;
+> - updates read back from the log after a restart that could not be queued
+>   again;
+> - a message from the broker too large to accept.
+>
+> Each of these is counted and pages you. Item 5 above (the database writer
+> giving up on rows after a failed write) usually is NOT a loss: those rows are
+> normally saved to a backup file or put back from the log on the next
+> restart, and the page for it fires only when both of those also fail.
+>
+> Two more losses cannot be counted at all: up to about a second of updates
+> (plus however long the disk takes to save) on a power cut or a forced stop
+> of the machine, and updates still waiting in memory for the log when the
+> program is killed.
 
 > **Picture it:** a fruit on a conveyor belt. Before it can fall off, a net is
-> already under it. Then a second net. Then a third. Only if all three nets
-> tear at once does a fruit drop — and a siren goes off instantly.
+> already under it. Then a second net. Then a third. ~~Only if all three nets
+> tear at once does a fruit drop — and a siren goes off instantly.~~
+>
+> **⚠ CORRECTED 2026-10-11:** a fruit can also drop when just ONE net is full
+> or broken for a moment — the nets do not all have to tear together. Every
+> such drop still sets off the siren. And if the truck bringing the fruit
+> skips some on the road, those never reach the belt, so no net and no siren
+> can know about them.
 
 ---
 
@@ -45,7 +103,7 @@
 |---|---|
 | Looking up any instrument takes the **same tiny time** whether we track 4 or 4 million — it never slows down as we grow. | Measured: ~10 billionths of a second. Same speed for a found item and a missing item — proof it doesn't slow down with size. |
 | Reading a price packet | ~15 billionths of a second, fixed — never changes with input. |
-| Processing one tick end-to-end inside the shop | ~5 billionths of a second per tick. |
+| ~~Processing one tick end-to-end inside the shop~~ ~~Reading a packet's label and sending it the right way~~ Reading a whole price packet and sending it the right way | ~5 billionths of a second per tick. **⚠ CORRECTED 2026-10-11:** this row said "end-to-end". ~~About 5 billionths is only the time to decode a packet's header and route it.~~ **⚠ CORRECTED 2026-10-11 (later the same day):** ~5 billionths is the time to decode the whole packet (header and body) and route it, measured on a mixed batch of small and full-size packets. It comes from a different measurement than the ~15 billionths row above, so the two numbers do not add up. It does not include writing the update to the log, building candles or queueing the database row. That whole path has not been measured. |
 | The honest edge | The *network* trip to the exchange is ~thousandths of a second — that's the speed of the internet, which no software can beat. Inside our shop, everything is blink-fast. |
 
 > **"O(1)" in human words:** the time to do the job does **not** grow when the
@@ -106,8 +164,8 @@
 
 | What people wish for | What we actually promise (and prove) |
 |---|---|
-| "Never lose a tick, ever" | Zero loss in every real failure — slow db, db down, crash, restart, disk full. The one physical edge (memory **and** disk **and** backup all full at once) is **alarmed, never silent.** |
-| "Infinitely fast" | Blink-fast inside the shop (billionths of a second, measured). The network trip to the exchange is the internet's speed — nobody beats that. |
+| "Never lose a tick, ever" | ~~Zero loss in every real failure — slow db, db down, crash, restart, disk full. The one physical edge (memory **and** disk **and** backup all full at once) is **alarmed, never silent.**~~ **⚠ CORRECTED 2026-10-11:** zero loss in the failures we test (slow database, database down, crash, restart). An update CAN be lost when any one save step is full or stopped for a moment (see section 1); each such loss is counted and **rings your phone, never silent**. Updates the broker skips when our reader falls behind never reach us and cannot be counted. **⚠ CORRECTED 2026-10-11 (later):** "crash" above holds only for updates the log had already written; a crash can lose updates still waiting in memory for the log, and a power cut can lose up to about a second, and neither can be counted (section 1). |
+| "Infinitely fast" | Blink-fast inside the shop (billionths of a second, measured — for reading and routing a packet; the full path to the database is not yet measured, see section 2). The network trip to the exchange is the internet's speed — nobody beats that. |
 | "Never breaks" | We can't stop a third party or the internet from hiccuping. But we **detect it in seconds, recover automatically, and ring your phone.** |
 | "Trust me, it's safe" | No "trust me." Every promise on this page has a real automated test behind it (see the engineer's version). If a test goes missing, the build fails. |
 
@@ -115,7 +173,12 @@
 
 ## 🎤 The 5-second version
 
-> Not one tick lost. Blink-fast. Never a duplicate. If anything wobbles, your
+> ~~Not one tick lost.~~ Every tick loss we can see rings your phone.
+> Blink-fast. Never a duplicate. If anything wobbles, your
 > phone rings in seconds — automatically. Deploys itself. Tested ~6,600 ways
 > on every change. And every promise here is backed by a real test, not a
 > "trust me." That's tickvault.
+>
+> **⚠ CORRECTED 2026-10-11:** "not one tick lost" was struck. Most failures
+> lose nothing, but section 1 lists the ways a tick can still be lost, and a
+> power cut can lose up to about a second.

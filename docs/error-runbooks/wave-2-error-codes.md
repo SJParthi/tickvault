@@ -247,6 +247,54 @@ history only):
   follow-up) are DISJOINT classes — the orders-rejected alarm and the
   OrderRejected Telegram are two routes, not one signal chain.
 
+### 2026-10-01 note — the order push consumer fell behind (audit PR42a)
+
+`crates/app/src/dhan_order_push_observability.rs` logs AUDIT-06 with
+`source = "order_push_lagged"` when the paper order-push consumer falls more
+than `DHAN_ORDER_PUSH_CHANNEL_CAPACITY` (1,024) updates behind the broadcast.
+The skipped updates are never written to `order_audit` or
+`order_update_events`, and the broker does not replay them. This was an
+uncoded `warn!` until 2026-10-01.
+
+- **Counters:** `tv_dhan_order_push_lagged_total` (count of skipped updates,
+  local on `/metrics`) and the shipped
+  `tv_order_audit_chain_lost_total{source="order_push_lagged"}`, both seeded
+  at 0 when the consumer is spawned.
+- **Paging:** `tv_order_audit_chain_lost_total` is summed into the
+  `tv-<env>-order-audit-chain-loss` alarm. The same counter also carries
+  `source="pnl_audit_discarded"` and `source="order_leg_pnl_discarded"`
+  (P&L and leg P&L rows discarded by their writers), which reached no alarm
+  before the same change. CloudWatch sees only the sum; the coded log line
+  names the source.
+- **DO:** record the window from the log line; the rows are gone. The
+  usual cause is the QuestDB flush stalling the consumer, which flushes once
+  per update: check the ILP flush latency and the WAL-suspended gauge.
+- **Honest limit:** nothing reconciles the skipped updates. The consumer
+  holds no copy of the paper OMS order map, and fetching the broker order
+  book is REST outside the allowed classes. That reconcile is plan item
+  PR42c and needs an owner decision.
+
+### 2026-11-12 note — the paper order event log (plan item LF-5)
+
+`crates/storage/src/live_order_events_persistence.rs` also logs AUDIT-06,
+always with `table = "live_order_events"`. Stages: `ensure_client_build` /
+`ensure_ddl` (the table's boot DDL), `append` (a row refused before the
+buffer because a price, quantity, charge, identity or timestamp column is
+negative, or an ILP append error) and `flush` (rows discarded after a failed
+flush AND a refused disk-tier write). A failed flush normally goes to
+`data/spill/audit/live_order_events/` and is replayed, like `order_audit`.
+
+- **Counters (local `/metrics` only):** `tv_live_order_events_rows_total{event}`,
+  `tv_live_order_events_rows_refused_total{column}`,
+  `tv_live_order_events_rows_discarded_total`,
+  `tv_live_order_events_persist_errors_total{stage}`. The disk tier's
+  generic `tv_audit_spill_*{table="live_order_events"}` counters and the
+  chain counter source `live_order_events_spill_lost` are shared with the
+  other audit tables.
+- **DO:** a `column` refusal is a bug in the paper chain that built the row
+  (a negative money or quantity value); the row is not written. A discard
+  means the rows are gone; record the window.
+
 ## STORAGE-GAP-03 — audit-table write failure (any table)
 
 **Trigger:** any audit-table writer hit an unrecoverable error after the
@@ -254,6 +302,102 @@ ring + spill backoff exhausted. Coalesces AUDIT-01..06.
 
 **Triage:** see specific AUDIT-NN code emitted alongside.
 **Source:** `crates/storage/src/{phase2,depth_rebalance,ws_reconnect,boot,selftest,order}_audit_persistence.rs`
+
+### 2026-10-11 note — SEBI lifecycle and constituency writes (audit OBS-2)
+
+Three failed writes to the SEBI never-delete tables were coded WS-GAP-03 (a
+socket state code) until 2026-10-11, so a search for STORAGE-GAP-03 missed
+them. They now carry STORAGE-GAP-03 with these `source` values:
+
+| `source` | Table | Counter (local `/metrics` only) |
+|---|---|---|
+| `lifecycle_persist_failed` | `instrument_lifecycle` | `tv_instrument_lifecycle_persist_failed_total` |
+| `lifecycle_audit_persist_failed` | `instrument_lifecycle_audit` | `tv_instrument_lifecycle_audit_failed_total` |
+| `rider_constituency_persist_failed` | `index_constituency` | `tv_index_constituency_persist_failed_total` |
+
+Each runs once a day. Nothing is deleted; the next day's write is
+DEDUP-idempotent and re-writes what did not land. **What to do:** check
+QuestDB health, then read the `err` field on the line. Since the same date
+(audit QDB-2) these writers use acknowledged HTTP ILP, so a line QuestDB
+refused fails here instead of being reported as written. The three counters
+are not in any loss-group alarm; adding them is an owner decision that needs
+a dated row in the noise lock first. No page, no new alarm.
+
+**⚠ CORRECTED 2026-10-11 (review of QDB-2, same day).** "The next day's
+write is DEDUP-idempotent and re-writes what did not land" was true of
+`instrument_lifecycle` only:
+
+- `instrument_lifecycle_audit` rows are derived by comparing today's rows
+  with what the table held before. When the lifecycle rows were written
+  first and the audit rows after, a failed audit chunk was lost for good: the
+  next run read the new state and found nothing to record. The writer is now
+  audit-first: a lifecycle row whose audit row did not land is held back, so
+  the table keeps yesterday's state for it and the next run (a restart the
+  same day, or the next day) records the same transition again, stamped with
+  that run's date. A refused lifecycle chunk no longer stops the chunks after
+  it; the pass stops only after 2 failed chunks in a row (a database that is
+  down). `lifecycle_persist_failed` now carries the counts: audit rows not
+  written, lifecycle rows held back, lifecycle rows not written.
+- `index_constituency` is a per-date point-in-time row. Tomorrow's run writes
+  tomorrow's date; today's row stays missing. Nothing re-writes it.
+
+All three writers now retry a transport failure or a 5xx answer for 10 s
+before giving up on a chunk (they shipped with no retry). A 4xx refusal (a
+bad row) is never retried. The counters are seeded at 0 at boot.
+
+**⚠ CHANGED 2026-10-28 (owner Quote 44).** The daily `instrument_lifecycle`
+and `instrument_lifecycle_audit` write is stopped and its code deleted, so
+the `lifecycle_persist_failed` and `lifecycle_audit_persist_failed` sources
+and their two counters no longer exist. Both tables are kept, frozen as
+history. Only `rider_constituency_persist_failed` remains in the table above.
+
+### 2026-10-28 note — daily instrument snapshot copies (owner Quote 44)
+
+Each trading morning, after a successful daily build, the dated artifact
+files in `data/instrument-cache` (`dhan-nse-mapping-`, `dhan-contracts-`,
+`dhan-fno-underlyings-`, `dhan-ntm-spot-<date>.json`) are gzipped and copied
+to `s3://tv-<env>-cold/instrument-snapshots/<date>/<file>.gz`, verified by
+length and SHA-256, and recorded by a marker in
+`data/instrument-cache/uploaded/`. Kept forever. A failed copy logs
+STORAGE-GAP-04 with `source = "instrument_snapshot_upload"` (or
+`instrument_snapshot_no_bucket` when no cold bucket resolves) and counts on
+`tv_instrument_snapshot_upload_total{outcome="failed"|"no_bucket"}` (local
+`/metrics` only, no page). The 7-day local sweep keeps any dated file without
+a verified copy and counts it on `tv_instrument_snapshot_sweep_held_total`.
+A pass is bounded at 30 minutes and stops after 3 S3 time-outs in a row
+(each logged as above, `file = "pass"`). A request that finds a pass still
+running is counted on `outcome="skipped_busy"` and the running pass runs once
+more; two such requests in a row log a coded STORAGE-GAP-04 `warn!` with
+`source = "instrument_snapshot_pass_busy"`. A folder entry that cannot be read
+is skipped and counted on `outcome="entry_unreadable"`.
+**What to do:** check S3 reachability from the box
+(`aws s3 ls s3://tv-prod-cold/instrument-snapshots/`); the next day's pass
+retries every date still missing. Never delete a local artifact by hand
+before its copy exists. Since the 2026-10-28 review the console's QuestDB wipe
+and Docker reset/nuke actions keep `data/instrument-cache` (they used to remove
+it whole). The local sweep now runs inside the copy task, after a pass that
+re-checked every marked file's copy with a HeadObject: a copy the bucket no
+longer holds (a bucket-wide delete) drops its marker, counts on
+`outcome="copy_gone"`, logs a coded STORAGE-GAP-04 `warn!` with
+`source = "instrument_snapshot_copy_gone"`, and is copied again; a re-check the
+bucket does not answer counts on `outcome="recheck_failed"`, logs
+`source = "instrument_snapshot_recheck_failed"`, and that pass sweeps nothing.
+
+### 2026-09-22 note — the one-shot fresh-start reset emits this code
+
+`crates/storage/src/fresh_start_reset.rs` logs STORAGE-GAP-03 with
+`source = "fresh_start_reset"` on four arms. None of them drops a SEBI table;
+those are unreachable by a build-time assertion.
+
+| Message starts | Meaning | What to do |
+|---|---|---|
+| `fresh-start reset REFUSED: the reset log could not be created or read` | QuestDB did not answer the log read within 6 tries 5 s apart. Nothing was dropped; the session runs on the OLD schema. | Nothing today. The next boot outside 08:55–15:45 IST runs the reset and drops today's rows with it. |
+| `fresh-start reset DEFERRED` | Boot was inside 08:55–15:45 IST on a volume that still holds reset tables. Nothing was dropped. | Same as above. A bare-nuked volume does NOT defer: it logs `nothing to wipe` at INFO and records the id. |
+| `these objects could NOT be dropped` | Named objects kept refusing their DROP after 2 retry rounds. They keep the old schema; the id is written anyway so the wipe never repeats. | Outside market hours: `DROP TABLE IF EXISTS <name>;` for each one named, then restart. The boot recreates it. |
+| `the reset id could NOT be written and read back` | The drops ran but 3 attempts to write the id failed. The NEXT out-of-session boot re-runs the whole wipe. | Before that boot: `INSERT INTO schema_reset_log (reset_id, ts) VALUES ('2026-09-19-fresh-start', now());` then check with `SELECT * FROM schema_reset_log;`. |
+
+Counter: `tv_fresh_start_reset_total{outcome}` (local `/metrics` only; no
+alarm). This path is log-sink-only, like the other STORAGE-GAP-03 emitters.
 
 ### 2026-07-14 note — pnl_audit rebuild emits this code (cluster-C)
 
@@ -287,6 +431,66 @@ QuestDB partition to S3 and the upload failed. Idempotency-key
 3. Check Glacier 90-day minimum was honored — partition not re-archived.
 
 **Source:** `crates/storage/src/s3_archive.rs` (Wave 2 Item 9.4)
+
+**`source = "brutex_daily_export"` (owner Quote 60, 2026-11-14).** The daily
+Brutex export gave up on a day (3 attempts with a 15/30/60-minute backoff;
+from 20:45 IST the session day is retried as a catch-up day, without a hold)
+and wrote no `DONE`, so Brutex sees the day as not exported. Nothing was
+deleted or overwritten. Log-only: no CloudWatch filter matches STORAGE-GAP-04,
+and the export adds no page. Each failed attempt is a coded `warn!` with the
+same code and the reason (recount mismatch while rows still landed, the
+scratch volume under 2 GiB free, S3 unreachable, a content-addressed key
+already holding other bytes).
+1. Look in S3: `questdb-partitions/_daily/<D>/` lists every attempt's
+   `manifest-<n>.json`; a `DONE` there means the day is sealed after all.
+2. A later poll or process retries the day as a catch-up day: a past day
+   runs once nothing delays it, and anyway (sealed `complete = false`,
+   the manifest naming what was pending) once it is 2 days old, so a
+   weekend never hides it. A day that still leaves the 7-day window with no
+   `DONE` logs `source = "brutex_daily_export_left_window"` (below).
+3. Turn it off with `[partition_retention] brutex_export_enabled = false`
+   (the archiver keeps sorting only against an existing object, or one it
+   cannot rule out, and only outside 08:30-15:40 IST, so it still reuses
+   what the export placed; amend records continue for every day that already
+   has a `DONE`).
+
+**`source = "brutex_daily_export_left_window"`.** A session day left the
+7-day catch-up window with no `DONE`. Logged ONCE PER PROCESS for every
+session day up to a week past the window (from 2026-11-14 on), so each boot
+and evening-drain restart of that week logs it again (about 7 to 28 identical
+lines for one missed day). Brutex never gets that day from the export; its
+partitions still reach S3 through the archive and appear as amend records.
+Log-only: until a noise-lock row adds a page, the app logs (or Brutex finding
+no `DONE`) are the only way the owner learns of a missed export.
+
+**`source = "brutex_daily_export_incomplete"`.** The day was sealed with
+`complete = false`; the manifest's `incomplete_reasons` name what was still
+pending. On the session day the manifest also names, per arrival-time
+table, the hours left out because they could still take rows
+(`open_from_ist`, `open_partitions_left_out`; not a reason, `complete` is
+unchanged) and, per object, whether its rows are sorted
+(`ordered_by_dedup_key`). The possible reasons: `wal_not_applied:<t>` including `partition_archive_audit`,
+`spill_pending:<t>`, `wal_backlog:<n>` or `wal_backlog_unreadable` (frames
+shed during the session that no replay reached tonight),
+`deferred_depth_marks_floor_blocked`, `contract_names_repair_failed`,
+`contract_names_repair_pending` (a forced catch-up day after the session
+day's midnight, before a repair run reached it), a hard gate on a forced
+catch-up day,
+`archived_copy_unconfirmed:<t>/<p>`, or `no_ticks_captured` on a forced
+catch-up day. DONE is final; later copies appear only as amend records
+`_daily/<D>/amend-*.json` (every verified archiver copy of an export-table
+partition gets one, a reuse included). Log-only, like the line above.
+
+**Stopped, not failed.** An attempt stops (not counted, nothing sealed)
+when the window would close before the next partition could finish (30
+minutes before 08:30 IST on a session day) or when the scratch volume is
+under the after-close depth pass's floor or the disk-pressure line
+(`pressure_high_water_pct`, whichever is larger) plus the partition's size (retried
+15 minutes later, so the export never pushes the disk toward the 5% line
+where pinned WAL segments are deleted, and never holds the quiesce lock a
+pressure archive pass needs).
+Source: `crates/storage/src/partition_archive/daily_export.rs`,
+`crates/app/src/brutex_export_boot.rs`.
 
 ## STORAGE-GAP-05 — disk pressure could not be relieved
 
@@ -337,6 +541,28 @@ whole chain exists to prevent.
 `crates/app/src/disk_pressure_boot.rs` (the supervised loop),
 `crates/storage/src/partition_archive.rs` (the unchanged verified drop path).
 
+**2026-11-06 incident (archiver export blocked writes) — regression check.**
+On 2026-11-06 the pressure pass's `/exp` exports held QuestDB's one HTTP
+thread for minutes, and ILP writes and `/exec` probes waited behind them
+(BOOT-01 lines, reconnects, tick rows rescued to spill). PR DP gave QuestDB
+its own HTTP workers (3, export limit 2) and gated the in-session pass. The
+weekly chaos lane re-checks the worker side against a real QuestDB started
+from the compose file (plan item TG-4): it exports a seeded `market_depth`
+hour while writing ticks and probing `/exec`, and fails if a write takes over
+5 s or a probe over 2 s. A red run means exports are blocking writes again:
+check `QDB_HTTP_WORKER_COUNT` and `QDB_HTTP_EXPORT_CONNECTION_LIMIT` in
+`deploy/docker/docker-compose.yml` (workers must stay above the export
+limit). Run it by hand with:
+
+```text
+docker compose -f deploy/docker/docker-compose.yml up -d tv-questdb
+TV_QDB_REAL_HTTP=127.0.0.1:9000 TV_QDB_REAL_REQUIRED=1 cargo test -p tickvault-storage \
+    --lib tg4_archiver_export_contention -- --ignored --nocapture
+```
+
+Starting QuestDB with `TV_QDB_HTTP_WORKERS=0` (the pre-fix setting) should
+make it fail; that has not been tried yet.
+
 ## DISK-WATCHER-01 — spill disk-health watcher respawned (zero-tick-loss PR-5, G3)
 
 **Trigger:** the spill disk-health watcher task
@@ -376,3 +602,34 @@ monitoring — the operator inspects the `reason` + backtrace at leisure).
 **Source:** `crates/storage/src/disk_health_watcher.rs::spawn_supervised_spill_disk_health_watcher`,
 `crates/common/src/error_code.rs::DiskWatcher01Respawned`. Boot wiring:
 `crates/app/src/main.rs` (the `_disk_health_watcher_supervisor` spawn).
+
+### 2026-10-01 note — order and P&L audit rows go to disk when QuestDB is down (audit PR42b)
+
+A failed flush of `order_audit`, `pnl_audit` or `order_leg_pnl` no longer throws the rows
+away. They are written to `data/spill/audit/<table>/` and one drain task per table sends them
+to QuestDB once it answers (at once, then every 60 s). Each step logs AUDIT-06:
+
+- "written to the disk tier, not lost" — the rows are on disk and will be replayed. Nothing to do.
+- "QuestDB is not accepting the <table> spill backlog" — logged once per episode while the
+  replay keeps failing. DO: check QuestDB health (`make doctor`); the rows wait on disk.
+- "rows have waited on local disk for at least 1800s" — the oldest waiting file is 30 minutes
+  old. This pages the order-audit chain-loss alarm once per backlog episode
+  (`tv_order_audit_persist_errors_total{stage="spill_backlog"}`). The rows are kept, not lost.
+  DO: check QuestDB health and whether `/write` accepts rows for that table.
+- "the disk tier refused the batch" — the waiting files reached 64 MiB or 50,000 (quarantine
+  is not counted), or the write failed. These rows ARE lost and reach the order-audit
+  chain-loss alarm (`tv_order_audit_rows_discarded_total` for `order_audit`,
+  `tv_order_audit_chain_lost_total` for the two P&L tables). DO: check disk space and why the
+  backlog is not draining.
+- "QuestDB permanently refused an audit spill file" — the file moved to `quarantine/` and its
+  rows count as lost. DO: read the file by hand; it is kept, never deleted.
+- "never finished (crash between write and rename)" — a `.tmp` file older than one hour was set
+  aside in `quarantine/` and its rows count as lost. DO: read it by hand.
+
+Counters (box only, not shipped): `tv_audit_spill_rows_total{table}`,
+`tv_audit_spill_replayed_rows_total{table}`, `tv_audit_spill_refused_rows_total{table}`,
+`tv_audit_spill_quarantined_rows_total{table}`, `tv_audit_spill_replay_failed_total{table}`.
+Before replaying a backlog the drain re-runs the table's own create-and-DEDUP step, so a boot
+whose first attempt failed cannot let the replay create the table without its DEDUP key.
+Honest limit: the daily reconcile counts a spilled row as appended while it is still on disk;
+the 30-minute backlog page is what covers that window.

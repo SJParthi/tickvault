@@ -16,28 +16,59 @@
 //!   (operator 2026-06-19, "same tables + feed column") keeps Dhan and
 //!   Groww candles for the same minute/instrument distinct, never merged.
 //!
-//! ## Schema (15 columns)
+//! ## Schema (22 columns)
+//!
+//! Column ORDER is the operator's, verbatim (2026-09-19): `ts` first, then
+//! the three READABLE delays, then identity, then OHLCV, then the two
+//! percentages, and the three exact `_ns` twins LAST. A reader scanning left
+//! to right meets the bar's identity and its freshness before a price.
 //!
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS candles_1m (
+//!     ts                       TIMESTAMP,
+//!     open_latency             VARCHAR,
+//!     close_latency            VARCHAR,
+//!     window_span_latency      VARCHAR,
 //!     feed                     SYMBOL,
 //!     segment                  SYMBOL,
 //!     security_id              LONG,
-//!     ts                       TIMESTAMP,
+//!     contract                 SYMBOL,
 //!     open                     DOUBLE,
 //!     high                     DOUBLE,
 //!     low                      DOUBLE,
 //!     close                    DOUBLE,
-//!     volume                   LONG,
+//!     volume                   LONG,   -- SIGNED: see the note below
 //!     oi                       LONG,
 //!     tick_count               LONG,
-//!     close_pct_from_prev_day  DOUBLE,
-//!     open_pct                 DOUBLE,
-//!     change_pct               DOUBLE,
-//!     open_gap_pct             DOUBLE
+//!     percentage_change        DOUBLE,
+//!     open_percentage_change   DOUBLE,
+//!     total_buy_qty            LONG,
+//!     total_sell_qty           LONG,
+//!     open_latency_ns          LONG,
+//!     close_latency_ns         LONG,
+//!     window_span_latency_ns   LONG
 //! ) timestamp(ts) PARTITION BY DAY
 //!   DEDUP UPSERT KEYS(ts, security_id, segment, feed);
 //! ```
+//!
+//! # `volume` is SIGNED, and `net_volume` is gone (2026-09-18)
+//!
+//! `volume` carries the bar's GROSS traded quantity with the bar's DIRECTION
+//! in its sign: negative when this bar's close is below the previous bar's
+//! close of the SAME timeframe, positive otherwise — including a flat bar, a
+//! session's first bucket, and an unorderable previous close, none of which
+//! means "the close rose". `abs(volume)` is exactly what this column held
+//! before it was signed, which is what keeps a derived `10m` bar summable and
+//! lets a view render the chart-exact zero-on-flat form.
+//!
+//! ⚠ It is NOT net order flow. The tick-rule flow column `net_volume` is
+//! DELETED — from this `CREATE`, from its `ADD COLUMN IF NOT EXISTS`
+//! self-heal, and from the `candles_named` view, all in one change so the next
+//! boot cannot re-add it. Existing tables keep the column with its historical
+//! rows; nothing drops it, and nothing writes it again. The operator ruling
+//! and what it costs are recorded in
+//! `.claude/rules/project/websocket-connection-scope-lock.md`
+//! § "2026-09-18 (FOURTH)".
 //!
 //! `close_pct_from_prev_day` (re-added 2026-05-28, PR-4b) is the seal-time
 //! price % vs the previous-day close, sourced live from the tick `close`
@@ -72,8 +103,6 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::{TF_COUNT, TfIndex};
-
-use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 
 // ---------------------------------------------------------------------------
 // QuestDB table names — one per timeframe.
@@ -113,6 +142,42 @@ use crate::shadow_candle_writer::CANDLE_FEED_DHAN;
 /// re-enabling DEDUP — so post-migration same-minute re-seals upsert cleanly.
 pub const DEDUP_KEY_CANDLES: &str = "ts, security_id, segment, feed";
 
+/// Every candle column the CREATE below still declares, paired with its type,
+/// for the boot self-heal that brings an OLDER table up to the current shape.
+///
+/// ⚠ This list holds ONLY columns that are in the CREATE. A removed column
+/// must never appear here: QuestDB can add a column but never drop or rename
+/// one, so a self-heal naming a removed column re-adds on the next boot
+/// exactly what the reset took out — the trap this repository already recorded
+/// for `net_volume`. `change_pct`, `open_pct`, `open_gap_pct`,
+/// `close_pct_from_prev_day` and `net_volume` are absent on purpose.
+///
+/// `ts` is excluded because it is the designated timestamp, which
+/// `ALTER TABLE ... ADD COLUMN` cannot create.
+pub(crate) const CANDLE_SELF_HEAL_COLUMNS: &[(&str, &str)] = &[
+    ("open_latency", "VARCHAR"),
+    ("close_latency", "VARCHAR"),
+    ("window_span_latency", "VARCHAR"),
+    ("feed", "SYMBOL"),
+    ("segment", "SYMBOL"),
+    ("security_id", "LONG"),
+    ("contract", "SYMBOL"),
+    ("open", "DOUBLE"),
+    ("high", "DOUBLE"),
+    ("low", "DOUBLE"),
+    ("close", "DOUBLE"),
+    ("volume", "LONG"),
+    ("oi", "LONG"),
+    ("tick_count", "LONG"),
+    ("percentage_change", "DOUBLE"),
+    ("open_percentage_change", "DOUBLE"),
+    ("total_buy_qty", "LONG"),
+    ("total_sell_qty", "LONG"),
+    ("open_latency_ns", "LONG"),
+    ("close_latency_ns", "LONG"),
+    ("window_span_latency_ns", "LONG"),
+];
+
 // ---------------------------------------------------------------------------
 // Public helpers — aggregate the table names for downstream consumers.
 // ---------------------------------------------------------------------------
@@ -139,6 +204,105 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
     names
 }
 
+/// The candle tables that are actually WRITTEN — one per fold frame.
+///
+/// ## Why this exists separately from [`candle_table_names`]
+///
+/// `candle_table_names()` MUST stay `[_; TF_COUNT]` and ordinal-aligned: the
+/// seal-writer chain indexes its `[Sender; TF_COUNT]` ILP sender array by
+/// `TfIndex as usize`, so narrowing that array would silently re-point every
+/// frame at the wrong table. This function is the DDL/retention view of the
+/// same set — a `Vec`, never an ordinal index.
+///
+/// ## 2026-09-19 — this is now every frame, and that is the point
+///
+/// It used to filter on `TfIndex::is_operator_requested`, because the enum
+/// carried fifteen frames the operator had retired and the predicate was what
+/// kept their tables from being created. The operator's 2026-09-19 directive
+/// deleted those variants outright (`TF_COUNT` 24 → 9), so the predicate
+/// became tautologically true and was removed — a gate that can only return
+/// true reads as a live filter to the next author.
+///
+/// The surviving ten are `1s 3s 5s 1m 3m 5m 10m 15m 30m 60m`. `10m` was a
+/// derived VIEW over `candles_1m` until 2026-09-22 and is now a folded table
+/// like the rest (the operator's "no views anywhere" directive).
+#[must_use]
+// TEST-EXEMPT: pure map over the ordinal array; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+pub fn emitted_candle_table_names() -> Vec<&'static str> {
+    TfIndex::ALL.iter().map(|tf| tf.table_name()).collect()
+}
+
+/// Candle tables this deployment once created and must now DROP.
+///
+/// Fed to [`drop_retired_candle_tables`].
+///
+/// ## Why this is a HAND-WRITTEN list, reversing what this doc used to say
+///
+/// Until 2026-09-19 this was derived — `TfIndex::ALL` filtered on the inverse
+/// of `is_operator_requested` — under a doc that read *"Derived, never a
+/// hand-written list — a hand-written list is what goes stale the next time
+/// the operator moves the frame set."* That reasoning held while the retired
+/// frames were still enum variants carrying a false predicate. It stops
+/// holding the moment those variants are DELETED: a derivation over the
+/// surviving nine returns the EMPTY set, `drop_retired_candle_tables` returns
+/// early on `retired.is_empty()`, and fifteen orphan tables sit on a live box
+/// forever while every test still passes.
+///
+/// So this is a HISTORICAL FACT about what was once created, fixed at fifteen
+/// FOREVER, and NOT a mirror of `TfIndex::ALL`. Same shape, and for the same
+/// reason, as the scope lock's legacy `top_volume_rank_{1s,3s,5s,1m}` view
+/// sweep: *"fixed at four FOREVER — it is a historical fact about what was
+/// once created, not a mirror of `SnapshotCadence`."*
+///
+/// A tenth frame retired in the future ADDS an entry here (and bumps
+/// [`RETIRED_CANDLE_DROP_SWEEP_VERSION`]); it never rebuilds the list from the
+/// enum.
+///
+/// ⚠ Two names that must NEVER appear here:
+/// - `candles_10m` — a live folded TABLE (it was a derived view until 2026-09-22);
+/// - any survivor. Note `candles_15s` (retired) against `candles_15m`
+///   (survivor): the sweep matches EXACT names, never a prefix.
+const RETIRED_CANDLE_TABLES: [&str; 15] = [
+    // The day frame.
+    "candles_1d",
+    // The second-scale frames retired by the 2026-09-19 nine-frame directive.
+    "candles_2s",
+    "candles_4s",
+    "candles_6s",
+    "candles_7s",
+    "candles_8s",
+    "candles_9s",
+    "candles_10s",
+    "candles_11s",
+    "candles_12s",
+    "candles_13s",
+    "candles_14s",
+    "candles_15s",
+    "candles_30s",
+    // The two-minute frame.
+    "candles_2m",
+];
+
+/// See [`RETIRED_CANDLE_TABLES`] — the fifteen tables that must not exist.
+#[must_use]
+// TEST-EXEMPT: pure const-array accessor; pinned by test_emitted_and_retired_partition_the_ordinal_set.
+pub fn retired_candle_table_names() -> Vec<&'static str> {
+    RETIRED_CANDLE_TABLES.to_vec()
+}
+
+/// Candle tables NO fold frame writes any more but whose partitions on the box
+/// are still copied to S3 by the retention sweep (2026-10-22, plan item 62).
+///
+/// `candles_3s` and `candles_5s` were removed from `TfIndex` by operator
+/// Quote 34 (2026-10-21, `daily-universe-scope-expansion-2026-05-27.md`). That
+/// quote lets the tables be DROPPED only after every partition still on the box
+/// is in `s3://tv-prod-cold/questdb-partitions/` and verified, so they are on
+/// NEITHER the emitted list (nothing creates or writes them) NOR the retired
+/// drop list ([`RETIRED_CANDLE_TABLES`]; nothing drops them). The archive and
+/// the detach sweep keep visiting them on the intraday window, exactly as when
+/// they were written, until the 2026-10-22 rebuild leaves them behind.
+pub const ARCHIVE_ONLY_CANDLE_TABLES: [&str; 2] = ["candles_3s", "candles_5s"];
+
 // ---------------------------------------------------------------------------
 // DDL setup — idempotent CREATE + DEDUP UPSERT.
 //
@@ -151,18 +315,50 @@ pub fn candle_table_names() -> [&'static str; TF_COUNT] {
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Create all 21 plain candle tables + the per-seal audit table if they
-/// do not already exist, with DEDUP UPSERT enabled on each.
+/// Set once `ensure_shadow_candle_tables` has had EVERY key-bearing statement
+/// accepted in this process. Never cleared: a table that has its DEDUP key keeps
+/// it, and the only DDL that could remove one (the retired-object drops) runs
+/// at boot BEFORE the ensure.
 ///
-/// Idempotent: safe to call on every boot. Failures are logged at
-/// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
-/// Rule 5) but do NOT block boot — the writer falls back to ring/spill
-/// on subsequent ILP errors.
+/// Read by `ShadowCandleWriter::flush`, which refuses to send a row until it is
+/// set (2026-09-27, audit PR31a). An ILP row reaching a candle table that does
+/// not exist yet makes QuestDB create it WITHOUT `DEDUP UPSERT KEYS`, and every
+/// replayed bar then duplicates into it for the life of the table. Refused rows
+/// take the seal writer's rescue path to the disk spill, which is replayed once
+/// the tables are keyed. One Acquire load per flush, never per row.
+pub(crate) static CANDLE_TABLES_KEYED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Create every plain candle table + the per-seal audit table if they do not
+/// already exist, with DEDUP UPSERT enabled on each.
 ///
-/// Requires a running QuestDB; covered by boot integration in CI and
-/// by manual `make doctor` post-boot.
+/// Idempotent: safe to call on every boot, and safe to call repeatedly within
+/// one boot — every statement is `IF NOT EXISTS`, an `ADD COLUMN IF NOT
+/// EXISTS`, or an idempotent `DEDUP ENABLE`.
+///
+/// # The returned verdict
+///
+/// `true` when every KEY-BEARING statement was accepted: each table's
+/// `CREATE ... DEDUP UPSERT KEYS` and each `DEDUP ENABLE`. The six
+/// `ADD COLUMN IF NOT EXISTS` self-heals for older schemas are best-effort and
+/// do not affect it -- a missing back-filled column is a gap in old rows, not
+/// a table that dedups wrongly forever.
+///
+/// Added 2026-09-09. Until then this returned nothing and its caller could not
+/// retry, while its sibling `run_live_table_ddl_at_boot` had been given a
+/// six-attempt loop for exactly this hazard: the readiness probe answers
+/// `SELECT 1`, which a QuestDB still replaying its own WAL answers happily and
+/// then refuses the DDL. A refused CREATE here is worse than elsewhere,
+/// because a table that is missing when the seal writer sends its first ILP row
+/// is auto-created with NO dedup key, and every replay then duplicates into it
+/// for the life of the table, silently. (Until 2026-09-28, audit PR53, the
+/// legacy drop sweep that runs just before this also dropped `candles_1s` on
+/// any boot whose sweep version moved; it no longer drops any kept table.)
+///
+/// Requires a running QuestDB; covered by boot integration in CI and by manual
+/// `make doctor`.
 // TEST-EXEMPT: requires a running QuestDB; tested via boot integration in CI and by `make doctor`. WIRING-EXEMPT: boot wiring lives in crates/app/src/main.rs alongside ensure_instrument_tables.
-pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
+pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -189,31 +385,104 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 "site" => "shadow_ensure_tables"
             )
             .increment(1);
-            return;
+            return false;
         }
     };
 
-    for table in candle_table_names() {
+    let mut all_keyed = true;
+    let mut self_heal_refused: usize = 0;
+    // 2026-09-18 — the EMITTED set, not all TF_COUNT ordinals. `drop_retired_candle_tables`
+    // drops the other fifteen; creating them here in the same boot would undo that drop
+    // silently and leave a keyless auto-create window behind it.
+    for table in emitted_candle_table_names() {
         // Schema self-heal: candle tables created before the
         // security_id LONG fix have `security_id` / `tick_count` typed
         // INT. The ILP seal writer sends them via `column_i64` (LONG);
         // QuestDB rejects every row on the type mismatch, so the table
         // stays empty. QuestDB cannot ALTER a column's type — drop the
         // (broken, empty) table and let the corrected CREATE rebuild it.
+        //
+        // 2026-10-02 (zero-loss audit): "empty" was an assumption this code
+        // never checked, and it runs every boot over every candle table. The
+        // drop now needs the table PROVEN empty; a table holding rows, or one
+        // whose count cannot be read, is kept and reported. No market-data
+        // delete without a copy (operator quotes 27/28, 2026-09-29).
         if candle_table_has_int_security_id(&client, &base_url, table).await {
-            let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
-            run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
-            info!(
-                table,
-                "candle table dropped — security_id INT→LONG self-heal"
-            );
+            if candle_table_is_empty(&client, &base_url, table).await {
+                let drop_ddl = format!("DROP TABLE IF EXISTS {table};");
+                run_drop_ddl(&client, &base_url, table, &drop_ddl).await;
+                info!(
+                    table,
+                    "candle table dropped — security_id INT→LONG self-heal (it was empty)"
+                );
+            } else {
+                metrics::counter!("tv_candle_int_self_heal_refused_total").increment(1);
+                warn!(
+                    table,
+                    "candle table has security_id INT but is not proven empty — KEPT, not \
+                     dropped; new candles for it will be refused until an operator migrates it"
+                );
+            }
         }
+        // ── The 2026-09-19 fresh-scratch candle row ──────────────────────
+        //
+        // Column ORDER is the operator's, verbatim (2026-09-19, recorded in
+        // `websocket-connection-scope-lock.md`): `ts` first, then the three
+        // READABLE delays, then feed / segment / security_id / contract, then
+        // OHLCV, then the percentages, and the three exact `_ns` twins LAST.
+        // A reader scanning left to right meets the bar's identity and its
+        // freshness before a single price. Reordering these is a REJECT.
+        //
+        // `ts` is the window OPEN, stamped from the EXCHANGE trade clock and
+        // nothing else (`fold_clock_ist_secs` is the identity on
+        // `exchange_timestamp` since 2026-09-18). The six delay columns MEASURE
+        // our receipt against that window; they never MOVE a trade into a
+        // different bar. That is the whole reason they exist: with the bar
+        // anchored on the vendor's clock, a bar built from data that arrived
+        // four seconds late is byte-identical to one built instantly, and these
+        // columns are the only surface that separates them.
+        //
+        // `volume` is SIGNED — one column that accepts a minus, matching the
+        // vendor's net volume with no derivation anywhere downstream.
+        //
+        // `contract` is the instrument's NAME, resolved O(1) ONCE PER SEALED
+        // BAR (never per tick) and left EMPTY when unresolved — a fabricated
+        // name is a REJECT. It carries the same column name as
+        // `top_volume.contract` so the two tables read and join identically.
+        //
+        // REMOVED here and NEVER self-healed back: `open_gap_pct`,
+        // `close_pct_from_prev_day` (a byte-identical duplicate of
+        // `change_pct` — `shadow_seal_columns::from_buffered_seal` fills both
+        // from the SAME `state.close_pct_from_prev_day`), and `net_volume`.
+        // RENAMED: `change_pct` -> `percentage_change`, `open_pct` ->
+        // `open_percentage_change`.
+        //
+        // ⚠ CORRECTED 2026-09-19, hours after the first draft of this block
+        // was written. That draft claimed `open_gap_pct` has "zero SQL
+        // readers, verified". THAT CLAIM IS FALSE and the same sentence went
+        // into the scope-lock rule file. `console_views.rs::candles_named_view_ddl`
+        // selects it, along with all three of the other percentages, so the
+        // `candles_named` view would have failed to create on a fresh volume
+        // and the operator would have lost the entire named candle face — the
+        // exact failure that file's own doc warns about for `net_volume`.
+        // `close_pct_from_prev_day` had a SECOND reader the draft also missed:
+        // `depth_rebalance.rs` ranks the depth-steering board from it, so a
+        // missed rename returns nothing, the board ranks nothing, and every
+        // counter and alarm stays green. Both readers are repointed in the
+        // same change as this correction. The reusable half: a claim that a
+        // column has no readers is one `grep -rn` away and must be RE-RUN at
+        // the moment of writing, never carried forward from a scan taken
+        // against a different column.
         let create_ddl = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\
+                ts                          TIMESTAMP, \
+                open_latency                VARCHAR, \
+                close_latency               VARCHAR, \
+                window_span_latency         VARCHAR, \
                 feed                        SYMBOL, \
                 segment                     SYMBOL, \
                 security_id                 LONG, \
-                ts                          TIMESTAMP, \
+                contract                    SYMBOL, \
                 open                        DOUBLE, \
                 high                        DOUBLE, \
                 low                         DOUBLE, \
@@ -221,67 +490,68 @@ pub async fn ensure_shadow_candle_tables(questdb_config: &QuestDbConfig) {
                 volume                      LONG, \
                 oi                          LONG, \
                 tick_count                  LONG, \
-                close_pct_from_prev_day     DOUBLE, \
-                open_pct                    DOUBLE, \
-                change_pct                  DOUBLE, \
-                open_gap_pct                DOUBLE\
+                percentage_change           DOUBLE, \
+                open_percentage_change      DOUBLE, \
+                total_buy_qty               LONG, \
+                total_sell_qty              LONG, \
+                open_latency_ns             LONG, \
+                close_latency_ns            LONG, \
+                window_span_latency_ns      LONG\
             ) timestamp(ts) PARTITION BY DAY \
             DEDUP UPSERT KEYS({DEDUP_KEY_CANDLES});"
         );
-        run_ddl(&client, &base_url, table, &create_ddl).await;
+        all_keyed &= run_ddl(&client, &base_url, table, &create_ddl).await;
 
-        // Schema self-heal: candle tables created before the
-        // close_pct_from_prev_day column existed (pre-2026-05-28 Engine-B
-        // 10-col schema) auto-migrate. QuestDB ignores the ADD when the
-        // column already exists, so running every boot is free (per
-        // observability-architecture.md "Schema self-heal at boot").
-        let alter_ddl =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS close_pct_from_prev_day DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_ddl).await;
+        // Schema self-heal, for the NEW column set ONLY.
+        //
+        // ⚠ The distinction this turns on, because the first draft of this
+        // rewrite got it wrong and CI caught it: self-healing a column the
+        // CREATE above STILL DECLARES is REQUIRED — without it an upgraded
+        // deployment keeps its old table and every new column stays empty
+        // forever, silently. Self-healing a column the CREATE above REMOVED
+        // is the opposite error: QuestDB can add a column but never drop or
+        // rename one, so such a statement re-adds on the next boot exactly
+        // what the reset just took out — the trap this repository already
+        // recorded for `net_volume`.
+        //
+        // Every name in `CANDLE_SELF_HEAL_COLUMNS` therefore appears in the
+        // CREATE above, and none of the removed names does: `change_pct`,
+        // `open_pct`, `open_gap_pct`, `close_pct_from_prev_day` and
+        // `net_volume` are absent on purpose, and adding any of them back is
+        // a REJECT. On a table this CREATE just made, every statement here is
+        // a no-op.
+        for (column, ty) in CANDLE_SELF_HEAL_COLUMNS {
+            let add = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};");
+            // Best-effort, as this fn's doc says: a missing back-filled column
+            // is a gap in old rows, not a table that dedups wrongly. It must
+            // not fold into `all_keyed`, because that verdict now opens the
+            // candle writer's gate (audit PR31a), and one refused self-heal
+            // would otherwise hold every candle out of QuestDB all session.
+            // `run_ddl` logs the refusal itself.
+            if !run_ddl(&client, &base_url, table, &add).await {
+                self_heal_refused = self_heal_refused.saturating_add(1);
+            }
+        }
 
-        // §31 Option 2 (2026-06-01): self-heal the `open_pct` column for
-        // tables created before it existed. Free on every boot.
-        let alter_open_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_open_pct).await;
-
-        // Operator request 2026-06-02: self-heal the `change_pct` +
-        // `open_gap_pct` columns for tables created before they existed.
-        // Free on every boot (QuestDB ignores ADD when the column exists).
-        let alter_change_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS change_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_change_pct).await;
-        let alter_open_gap_pct =
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS open_gap_pct DOUBLE;");
-        run_ddl(&client, &base_url, table, &alter_open_gap_pct).await;
-        // Feed-provenance label (operator 2026-06-19, "same tables + feed
-        // column"): broker source (`'dhan'`/`'groww'`). It IS part of the DEDUP
-        // key now (`DEDUP_KEY_CANDLES` includes `feed`), so a Dhan candle and a
-        // Groww candle for the same minute/instrument are BOTH kept. MUST run
-        // BEFORE the DEDUP-ENABLE migration below so the key column exists on
-        // pre-existing tables. Additive + idempotent.
-        let alter_feed = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS feed SYMBOL;");
-        run_ddl(&client, &base_url, table, &alter_feed).await;
-        // Brownfield NULL-feed backfill (worst-case coverage, no-hallucination):
-        // rows persisted under the OLD 3-col key have `feed=NULL`. Without this,
-        // a new `feed='dhan'` row for the same `(ts, security_id, segment)` is a
-        // DISTINCT key (NULL != 'dhan') → a DUPLICATE, not an upsert. Stamping
-        // `feed='dhan'` on every legacy NULL row BEFORE re-enabling DEDUP closes
-        // that overlap window. Idempotent + cheap on every subsequent boot:
-        // `WHERE feed IS NULL` matches nothing once backfilled. MUST run BEFORE
-        // the DEDUP-ENABLE below (UPDATE on the live key column is cleanest
-        // before the key is re-applied).
-        let backfill_feed =
-            format!("UPDATE {table} SET feed = '{CANDLE_FEED_DHAN}' WHERE feed IS NULL;");
-        run_ddl(&client, &base_url, table, &backfill_feed).await;
-        // Brownfield DEDUP migration: re-enable the UPSERT key with `feed`
-        // included so EXISTING candle tables (created before the feed-in-key
-        // change) get the new 4-col key. Idempotent — re-enabling the same key
-        // is a no-op; greenfield tables already have it from the CREATE DDL.
+        // Re-assert the UPSERT key. Idempotent — re-enabling the same key is a
+        // no-op, and a table this CREATE just made already carries it. Kept
+        // because it is the one statement that can still repair a table whose
+        // key was somehow lost, and it adds no column.
         let dedup_enable =
             format!("ALTER TABLE {table} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_CANDLES});");
-        run_ddl(&client, &base_url, table, &dedup_enable).await;
+        all_keyed &= run_ddl(&client, &base_url, table, &dedup_enable).await;
     }
+    if self_heal_refused > 0 {
+        warn!(
+            self_heal_refused,
+            "candle ensure: some column self-heals were refused — old rows keep a gap \
+             in those columns; the DEDUP key verdict is unaffected"
+        );
+    }
+    if all_keyed {
+        CANDLE_TABLES_KEYED.store(true, std::sync::atomic::Ordering::Release);
+    }
+    all_keyed
 }
 
 /// Returns `true` if `table` already exists with `security_id` typed
@@ -310,6 +580,102 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
     }
 }
 
+/// `true` only when QuestDB answers that `table` holds zero rows. Any failure
+/// (unreachable, non-success, unparseable body) is `false`: a table the boot
+/// cannot prove empty is never dropped.
+async fn candle_table_is_empty(client: &Client, base_url: &str, table: &str) -> bool {
+    let query = format!("SELECT count() FROM {table}");
+    match client
+        .get(base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            exec_body_reports_zero_rows(&resp.text().await.unwrap_or_default())
+        }
+        _ => false,
+    }
+}
+
+/// Reads a QuestDB `/exec` answer to `SELECT count()`: zero rows reads as a
+/// dataset of `[[0]]`. Anything else, including a missing dataset, is `false`.
+fn exec_body_reports_zero_rows(body: &str) -> bool {
+    body.split("\"dataset\":")
+        .nth(1)
+        .is_some_and(|rest| rest.trim_start().starts_with("[[0]]"))
+}
+
+/// What a `SELECT count() FROM <table>` answer says about dropping the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetiredTableState {
+    /// QuestDB answered with zero rows: dropping loses nothing.
+    Empty,
+    /// QuestDB answered with rows: the table is KEPT (zero loss, operator
+    /// Quotes 27 + 28, plan item 45g).
+    HasRows,
+    /// QuestDB refused the query as written (4xx), which is its answer for a
+    /// table that does not exist. Nothing to drop.
+    Absent,
+    /// No answer (transport failure or 5xx): decide at the next boot.
+    Unknown,
+}
+
+fn classify_count_answer(status: Option<u16>, body: &str) -> RetiredTableState {
+    match status {
+        Some(code) if (200..300).contains(&code) => {
+            if exec_body_reports_zero_rows(body) {
+                RetiredTableState::Empty
+            } else {
+                RetiredTableState::HasRows
+            }
+        }
+        Some(code) if (400..500).contains(&code) => RetiredTableState::Absent,
+        _ => RetiredTableState::Unknown,
+    }
+}
+
+/// Drops a RETIRED table only when QuestDB proves it empty (plan item 45g:
+/// no market data is deleted without a copy). A retired table that still
+/// holds rows is kept, logged once per boot sweep and counted on
+/// `tv_retired_table_drop_refused_total`; its name stays taken, which costs
+/// nothing because no live code writes to it. Returns whether QuestDB
+/// answered, with the same meaning as [`run_drop_ddl`]: a kept table is a
+/// final answer, so the sweep's marker is still written.
+async fn run_drop_retired_table_if_empty(client: &Client, base_url: &str, table: &str) -> bool {
+    let query = format!("SELECT count() FROM {table}");
+    let (status, body) = match client
+        .get(base_url)
+        .query(&[("query", query.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            (Some(status), resp.text().await.unwrap_or_default())
+        }
+        Err(_) => (None, String::new()),
+    };
+    match classify_count_answer(status, &body) {
+        RetiredTableState::Empty => {
+            let ddl = format!("DROP TABLE IF EXISTS {table};");
+            run_drop_ddl(client, base_url, table, &ddl).await
+        }
+        RetiredTableState::Absent => true,
+        RetiredTableState::HasRows => {
+            metrics::counter!("tv_retired_table_drop_refused_total").increment(1);
+            warn!(
+                table,
+                "retired table still holds rows — KEPT, not dropped (zero loss: no \
+                 market data is deleted without a copy). Export it, then drop it by hand \
+                 if it is truly unwanted."
+            );
+            true
+        }
+        RetiredTableState::Unknown => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #T1b — drop legacy candle objects (Engine A + Engine C teardown).
 //
@@ -333,7 +699,7 @@ async fn candle_table_has_int_security_id(client: &Client, base_url: &str, table
 /// longer correspond to any live timeframe enum.
 ///
 /// NOTE: any future `candles_*` prefix sweep MUST exclude `*_named` views
-/// (`console_views::VIEW_TICKS_NAMED` / `VIEW_CANDLES_NAMED`).
+/// (`candles_named` — listed in `console_views::RETIRED_CONSOLE_VIEWS`).
 const LEGACY_CANDLE_TF_SUFFIXES: [&str; 9] =
     ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
@@ -366,7 +732,31 @@ const LEGACY_EXTRA_CANDLE_MATVIEW_NAMES: [&str; 1] = ["candles_7d"];
 /// SEBI 5-year retention obligation and must never be auto-dropped; the
 /// other audit tables were already retired with their own boot wiring in
 /// #T2. This list is ONLY the instrument / misc / greeks tables.
-const RETIRED_QUESTDB_TABLES: [&str; 18] = [
+/// # ⚠ A name here is DROPPED at boot. Verify it has no live writer first.
+///
+/// 2026-09-05: `market_depth` was in this list and had been since #T4, when
+/// depth genuinely had no writer. Depth came back on 2026-08-15 and is now the
+/// LARGEST table in the process — measured 1,530,651,649 rows/session, 24x the
+/// tick volume — while its name sat in a `DROP TABLE IF EXISTS` sweep. It was
+/// the only one of the eighteen names THEN on the list (now seventeen) with a
+/// live `CREATE TABLE IF NOT EXISTS` anywhere in the tree.
+///
+/// It never fired, for one reason: the versioned marker file suppresses the
+/// sweep after its first successful run. That is not a safety property. Two
+/// documented, ordinary actions re-arm it — bumping `LEGACY_DROP_SWEEP_VERSION`
+/// (which this list's own workflow expects whenever the list is extended), and
+/// the operator `rm`-ing the marker, which the doc comment on
+/// `drop_legacy_candle_objects` explicitly tells them to do. Either would drop
+/// a populated depth table at the next boot, before `ensure_market_depth_table`
+/// runs, and a successful DROP logs nothing alarming.
+///
+/// `deep_market_depth` stays: it has no live DDL and no writer, so dropping it
+/// is the cleanup this list is for.
+///
+/// Pinned by `retired_drop_list_never_names_a_live_table` — a name that gains a
+/// `CREATE TABLE IF NOT EXISTS` anywhere in `crates/*/src` now fails the build
+/// rather than waiting for a marker bump to notice.
+const RETIRED_QUESTDB_TABLES: [&str; 17] = [
     // #T3 — instrument tables
     "fno_underlyings",
     "derivative_contracts",
@@ -374,7 +764,8 @@ const RETIRED_QUESTDB_TABLES: [&str; 18] = [
     "instrument_build_metadata",
     "index_constituents",
     // #T4 — misc tables
-    "market_depth",
+    // `market_depth` REMOVED 2026-09-05 — it has a live writer again; see the
+    // note on this constant.
     "previous_close",
     "nse_holidays",
     // PR #3 — greeks tables
@@ -445,7 +836,9 @@ fn retired_movers_object_names() -> Vec<String> {
 /// 1. Candle materialized views — every one of the 21 Engine-B
 ///    `candles_<tf>` names (a stale matview squatting the name makes
 ///    `CREATE TABLE` 400) plus the legacy sub-minute / 7-day matviews.
-/// 2. The `candles_1s` base table.
+/// 2. (Removed 2026-09-28, audit PR53: this step dropped the `candles_1s`
+///    base table, which is now a kept fold table. No sweep may drop a kept
+///    table; `no_drop_sweep_names_a_kept_candle_table` pins it.)
 /// 3. The 9 `candles_<tf>_shadow` tables.
 /// 4. The `aggregator_seal_audit` table (#T2a table cleanup).
 /// 5. The instrument / misc / greeks tables retired by #T3, #T4 and the
@@ -454,7 +847,10 @@ fn retired_movers_object_names() -> Vec<String> {
 ///    — matview drop THEN table drop per name (era-dependent object kind).
 ///
 /// Each statement is `DROP … IF EXISTS`, so this is safe to call on every
-/// boot regardless of which objects actually exist. Failures are logged at
+/// boot regardless of which objects actually exist. The one-shot marker is
+/// written only when QuestDB answered every DROP (a 2xx, or a 4xx such as a
+/// form mismatch); a transport failure or a 5xx leaves it unwritten so the
+/// sweep re-runs at the next boot. Failures are logged at
 /// `error!` level (Telegram-routable per `error_level_meta_guard.rs`
 /// Rule 5) but do NOT block boot.
 ///
@@ -541,6 +937,12 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
         }
     };
 
+    // Every DROP below reports whether QuestDB ANSWERED it (a 2xx, or a 4xx
+    // such as a form mismatch). The marker is written only when every one
+    // was answered: a boot that runs while QuestDB is down or erroring must
+    // not record the clean-up as done (audit PR53).
+    let mut answered = true;
+
     // 1. Drop legacy candle MATERIALIZED VIEWS FIRST — before the base
     //    table they cascade from, AND before `ensure_shadow_candle_tables`
     //    runs its `CREATE TABLE` loop.
@@ -555,41 +957,35 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    21 every boot is idempotent.
     for view in candle_table_names() {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
-        run_drop_ddl(&client, &base_url, view, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
     //    Plus the legacy sub-minute / 7-day matviews that have no
     //    Engine-B counterpart and would otherwise leak forever.
     for view in LEGACY_EXTRA_CANDLE_MATVIEW_NAMES {
         let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {view};");
-        run_drop_ddl(&client, &base_url, view, &ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, view, &ddl).await;
     }
 
-    // 2. Drop the Engine-A `candles_1s` base table.
-    run_drop_ddl(
-        &client,
-        &base_url,
-        "candles_1s",
-        "DROP TABLE IF EXISTS candles_1s;",
-    )
-    .await;
+    // 2. (REMOVED 2026-09-28, audit PR53.) This step used to run
+    //    a table DROP of the Engine-A `candles_1s` base table.
+    //    `candles_1s` has been a KEPT fold table since the nine-frame
+    //    directive, so any sweep-version bump, or a lost or unreadable
+    //    marker, would have dropped every 1-second candle at the next boot.
+    //    Step 1 already frees the name from any legacy matview, and the
+    //    ensure's `ADD COLUMN IF NOT EXISTS` + `DEDUP ENABLE` bring an old
+    //    table to the current schema, so nothing needs the drop. Pinned by
+    //    `no_drop_sweep_names_a_kept_candle_table`.
 
     // 3. Drop the 9 legacy Wave-6 `candles_<tf>_shadow` tables.
     for sfx in LEGACY_CANDLE_TF_SUFFIXES {
         let table = format!("candles_{sfx}_shadow");
-        let ddl = format!("DROP TABLE IF EXISTS {table};");
-        run_drop_ddl(&client, &base_url, &table, &ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, &table).await;
     }
 
     // 4. Drop the retired `aggregator_seal_audit` forensic table (#T2a —
     //    QuestDB table cleanup). The per-seal audit module is deleted; the
     //    table itself is dropped here so existing deployments converge.
-    run_drop_ddl(
-        &client,
-        &base_url,
-        "aggregator_seal_audit",
-        "DROP TABLE IF EXISTS aggregator_seal_audit;",
-    )
-    .await;
+    answered &= run_drop_retired_table_if_empty(&client, &base_url, "aggregator_seal_audit").await;
 
     // 5. Drop the instrument / misc / greeks tables retired by the
     //    table-cleanup plan (#T3, #T4) and the PR #3 greeks teardown.
@@ -597,8 +993,7 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    tables on pre-existing deployments so the live QuestDB schema
     //    converges to the 24-table KEEP set with no manual migration.
     for table in RETIRED_QUESTDB_TABLES {
-        let ddl = format!("DROP TABLE IF EXISTS {table};");
-        run_drop_ddl(&client, &base_url, table, &ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, table).await;
     }
 
     // 6. Drop the dead per-timeframe movers grid (Track A, 2026-07-18).
@@ -616,11 +1011,19 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
     //    idempotent; a form mismatch is a logged warn, never a blocker.
     for name in retired_movers_object_names() {
         let view_ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
+        answered &= run_drop_ddl(&client, &base_url, &name, &view_ddl).await;
     }
     for name in retired_movers_object_names() {
-        let table_ddl = format!("DROP TABLE IF EXISTS {name};");
-        run_drop_ddl(&client, &base_url, &name, &table_ddl).await;
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, &name).await;
+    }
+
+    if !answered {
+        warn!(
+            path = LEGACY_DROP_MARKER_PATH,
+            "legacy candle clean-up: QuestDB did not answer every DROP — marker NOT \
+             written, the sweep re-runs at the next boot"
+        );
+        return;
     }
 
     // PR #798 (operator-locked 2026-05-25) — write one-shot marker so
@@ -659,6 +1062,156 @@ pub async fn drop_legacy_candle_objects(questdb_config: &QuestDbConfig) {
 /// legacy matviews), delete the file.
 const LEGACY_DROP_MARKER_PATH: &str = "data/state/legacy_candle_objects_dropped.marker";
 
+// ---------------------------------------------------------------------------
+// Retired-timeframe candle tables (operator directive 2026-09-18)
+// ---------------------------------------------------------------------------
+
+/// One-shot marker for the retired-timeframe sweep.
+///
+/// DELIBERATELY SEPARATE from [`LEGACY_DROP_MARKER_PATH`], and the reason is
+/// the whole design of this sweep: when it was written, bumping
+/// `LEGACY_DROP_SWEEP_VERSION` to re-arm the legacy loop would also have
+/// re-run its step 2, an unconditional `DROP TABLE IF EXISTS candles_1s` —
+/// and `candles_1s` is a table the operator KEEPS. That step was removed on
+/// 2026-09-28 (audit PR53), but the separate marker stays: re-arming one
+/// sweep should never re-run another. Like the legacy marker, this one is
+/// written only when QuestDB answered every DROP.
+const RETIRED_CANDLE_DROP_MARKER_PATH: &str = "data/state/retired_candle_tables_dropped.marker";
+
+/// Bump when [`retired_candle_table_names`] GAINS a name, so every deployment
+/// re-runs the sweep exactly once for the wider set and then re-parks.
+/// Version history:
+/// - 1: the fifteen ordinals left non-emitting by the 2026-09-18 nine-frame
+///   directive (`D1`, `S2 S4 S6 S7 S8 S9 S10 S11 S12 S13 S14 S15 S30`, `M2`).
+const RETIRED_CANDLE_DROP_SWEEP_VERSION: u32 = 1;
+
+fn retired_candle_marker_content() -> String {
+    format!(
+        "retired candle table drop sweep complete on this deployment.\n\
+         sweep_version={RETIRED_CANDLE_DROP_SWEEP_VERSION}\n"
+    )
+}
+
+fn retired_candle_marker_is_current(content: &str) -> bool {
+    content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("sweep_version="))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        >= RETIRED_CANDLE_DROP_SWEEP_VERSION
+}
+
+/// Drop every candle table whose timeframe no longer emits.
+///
+/// MUST be awaited at boot BEFORE [`ensure_shadow_candle_tables`], which is
+/// now filtered to [`emitted_candle_table_names`] and will therefore not
+/// recreate what this drops. Running it AFTER the ensure would be harmless
+/// today but leaves the ordering fragile; the boot wiring pins the order.
+///
+/// Both object forms are swept for each name. A `candles_<tf>` name can be a
+/// plain table (Engine-B, every era since 2026-05) or a MATERIALIZED VIEW (the
+/// pre-#T1 architecture), and `DROP ... IF EXISTS` against the wrong form is a
+/// logged warn, never a blocker. Matviews go first: a base table with live
+/// dependents refuses to drop.
+///
+/// ## What this does NOT do (Rule 11 — no false-OK)
+///
+/// It does not reclaim the rows of a frame that is still emitting, and it does
+/// not touch `ticks`, `market_depth` or any SEBI table. Eleven of the fifteen
+/// names have had no writer since the 2026-09-05 wipe and are expected to be
+/// absent entirely — for those the DROP is a 2xx no-op and the reclaimed bytes
+/// are metadata, not gigabytes. The four that DID hold data (`candles_10s`,
+/// `candles_15s`, `candles_30s`, `candles_2m`) emitted between 2026-09-05 and
+/// 2026-09-18 under the earlier twelve-frame gate, so this is a one-off
+/// reclaim of that window, never a recurring saving.
+// TEST-EXEMPT: requires a running QuestDB; the name set and the marker gate are unit-tested, the DDL round-trip is boot-integration + `make doctor`. WIRING-EXEMPT: boot wiring lives in crates/app/src/candle_ddl_boot.rs, pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn drop_retired_candle_tables(questdb_config: &QuestDbConfig) {
+    let marker_path = std::path::Path::new(RETIRED_CANDLE_DROP_MARKER_PATH);
+    if marker_path.exists()
+        && let Ok(content) = std::fs::read_to_string(marker_path)
+        && retired_candle_marker_is_current(&content)
+    {
+        tracing::debug!(
+            marker = RETIRED_CANDLE_DROP_MARKER_PATH,
+            version = RETIRED_CANDLE_DROP_SWEEP_VERSION,
+            "retired candle tables already swept at the current version — skipping"
+        );
+        return;
+    }
+
+    let retired = retired_candle_table_names();
+    if retired.is_empty() {
+        return;
+    }
+
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = match Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                error = %err,
+                code = tickvault_common::error_code::ErrorCode::HttpClient01BuildFailed.code_str(),
+                "HTTP-CLIENT-01 reqwest client build failed — retired-candle sweep skipped \
+                 this boot (marker not written, so the next boot retries)"
+            );
+            metrics::counter!(
+                "tv_http_client_build_failed_total",
+                "site" => "shadow_drop_retired_candles"
+            )
+            .increment(1);
+            return;
+        }
+    };
+
+    let mut answered = true;
+    for name in &retired {
+        let ddl = format!("DROP MATERIALIZED VIEW IF EXISTS {name};");
+        answered &= run_drop_ddl(&client, &base_url, name, &ddl).await;
+    }
+    for name in &retired {
+        answered &= run_drop_retired_table_if_empty(&client, &base_url, name).await;
+    }
+
+    if !answered {
+        warn!(
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "retired candle sweep: QuestDB did not answer every DROP — marker NOT \
+             written, the sweep re-runs at the next boot"
+        );
+        return;
+    }
+
+    if let Some(parent) = marker_path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            ?err,
+            path = %parent.display(),
+            "failed to create data/state/ dir for the retired-candle marker"
+        );
+        return;
+    }
+    if let Err(err) = std::fs::write(marker_path, retired_candle_marker_content()) {
+        tracing::warn!(
+            ?err,
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "failed to write the retired-candle marker (sweep repeats next boot)"
+        );
+    } else {
+        tracing::info!(
+            dropped = retired.len(),
+            path = RETIRED_CANDLE_DROP_MARKER_PATH,
+            "retired candle tables swept — marker written"
+        );
+    }
+}
+
 /// Track A (2026-07-18) — the one-shot marker is now VERSIONED. Bump this
 /// integer whenever the drop set is EXTENDED (new retired tables/matviews)
 /// so every existing deployment re-runs the sweep exactly once for the new
@@ -694,17 +1247,46 @@ fn marker_records_current_version(content: &str) -> bool {
 /// Same GET-based transport as [`run_ddl`]. A non-2xx response is logged
 /// at `warn!` (a missing object on a fresh deploy is benign because the
 /// statement is `IF EXISTS`); a transport error is logged at `error!`.
-async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) {
+///
+/// Returns whether QuestDB ANSWERED the statement, per
+/// [`drop_status_counts_as_answered`]. The sweeps write their one-shot
+/// marker only when every DROP was answered (audit PR53).
+async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) -> bool {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!(object, "legacy candle object dropped (or already absent)");
+            true
         }
         Ok(resp) => {
             warn!(object, status = %resp.status(), "legacy candle DROP non-2xx");
+            drop_status_counts_as_answered(Some(resp.status().as_u16()))
         }
         Err(err) => {
-            error!(object, ?err, "legacy candle DROP request failed");
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "legacy_candle_drop",
+                object,
+                ?err,
+                "legacy candle DROP request failed"
+            );
+            drop_status_counts_as_answered(None)
         }
+    }
+}
+
+/// Whether a DROP's outcome means QuestDB answered it.
+///
+/// `None` is a transport failure (connection refused, timeout): the database
+/// never saw the statement. A 2xx is a drop or an `IF EXISTS` no-op. A 4xx is
+/// the database refusing the statement as written — the expected answer to
+/// `DROP MATERIALIZED VIEW` on a name that is a plain table — so it counts as
+/// answered, as it did before this gate existed. A 5xx means the database
+/// failed while handling it, so the object may still be there.
+fn drop_status_counts_as_answered(status: Option<u16>) -> bool {
+    match status {
+        Some(code) => code < 500,
+        None => false,
     }
 }
 
@@ -714,17 +1296,35 @@ async fn run_drop_ddl(client: &Client, base_url: &str, object: &str, ddl: &str) 
 /// `405 Method Not Allowed` for POST. The `query` parameter is
 /// URL-encoded by reqwest's query-string builder. (The #T1a precursor
 /// briefly switched this to POST to keep DDL out of access logs — that
-/// regressed every candle-table DDL to 405; reverted here.)
-async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
+/// Runs one DDL statement. Returns whether QuestDB accepted it.
+///
+/// The verdict was added 2026-09-09 and matters for exactly two of the eight
+/// statements this runs: the `CREATE TABLE ... DEDUP UPSERT KEYS` and the
+/// `DEDUP ENABLE`. If either is refused and the boot continues anyway, the
+/// seal writer's first ILP row AUTO-CREATES the table without its key, and
+/// every replayed or re-flushed bar then duplicates instead of collapsing --
+/// silently, for the life of that table. The `ADD COLUMN IF NOT EXISTS`
+/// statements are self-heal for older schemas and stay best-effort.
+async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) -> bool {
     match client.get(base_url).query(&[("query", ddl)]).send().await {
         Ok(resp) if resp.status().is_success() => {
             info!(table, "candle table ready");
+            true
         }
         Ok(resp) => {
             warn!(table, status = %resp.status(), "DDL non-2xx");
+            false
         }
         Err(err) => {
-            error!(table, ?err, "DDL request failed");
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "candle_ddl",
+                table,
+                ?err,
+                "DDL request failed"
+            );
+            false
         }
     }
 }
@@ -736,6 +1336,65 @@ async fn run_ddl(client: &Client, base_url: &str, table: &str, ddl: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-02 (zero-loss audit): the INT self-heal drop needs a table
+    /// PROVEN empty. Only a dataset of exactly `[[0]]` qualifies; a row count,
+    /// an error body, or a missing dataset keeps the table.
+    #[test]
+    fn test_regression_only_a_zero_count_proves_a_candle_table_empty() {
+        assert!(exec_body_reports_zero_rows(
+            r#"{"query":"SELECT count() FROM candles_1m","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[0]],"count":1}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"query":"x","columns":[],"dataset":[[1234]],"count":1}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"query":"x","columns":[],"dataset":[[10]],"count":1}"#
+        ));
+        assert!(exec_body_reports_zero_rows(r#"{"dataset": [[0]]}"#));
+        assert!(!exec_body_reports_zero_rows(
+            r#"{"error":"table does not exist"}"#
+        ));
+        assert!(!exec_body_reports_zero_rows(""));
+    }
+
+    /// The self-heal list and the candle `CREATE` must name the SAME columns,
+    /// with the SAME types, in the SAME order. A name only in the CREATE is a
+    /// column an upgraded table never gets (it stays empty forever, silently);
+    /// a name only in the list re-adds, every boot, a column the reset removed.
+    /// Read from this file's own source so the pin cannot drift from the DDL.
+    #[test]
+    fn the_self_heal_list_is_the_candle_create_column_for_column() {
+        let src = include_str!("shadow_persistence.rs");
+        let start = src
+            .find("CREATE TABLE IF NOT EXISTS {table} (")
+            .expect("candle CREATE present");
+        let body = &src[start..];
+        let end = body.find(") timestamp(ts)").expect("CREATE terminator");
+        let mut create: Vec<(String, String)> = Vec::new();
+        for line in body[..end].lines().skip(1) {
+            let cleaned = line
+                .trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches(',');
+            let mut parts = cleaned.split_whitespace();
+            if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
+                create.push((name.to_string(), ty.to_string()));
+            }
+        }
+        assert_eq!(create.first().map(|c| c.0.as_str()), Some("ts"));
+        let create: Vec<(String, String)> = create.into_iter().skip(1).collect();
+        let heal: Vec<(String, String)> = CANDLE_SELF_HEAL_COLUMNS
+            .iter()
+            .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+            .collect();
+        assert_eq!(
+            create, heal,
+            "candle CREATE (minus ts) and CANDLE_SELF_HEAL_COLUMNS diverged"
+        );
+        assert_eq!(heal.len(), 21, "22-column candle contract = ts + 21");
+    }
 
     // ========================================================================
     // P2c (coverage-gaps #1076): DDL-walk + legacy-drop arm coverage via a
@@ -778,7 +1437,12 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_shadow_candle_tables_with_mock_200() {
         let port = p2c_spawn_mock_http(P2C_HTTP_200).await;
-        ensure_shadow_candle_tables(&p2c_cfg(port)).await;
+        assert!(ensure_shadow_candle_tables(&p2c_cfg(port)).await);
+        // Audit PR31a: a fully accepted ensure opens the candle writer's gate.
+        // Only the set direction is asserted: the latch is process-wide and
+        // never cleared, so "still false after a refusal" is not observable
+        // once any test in this binary has run this one.
+        assert!(CANDLE_TABLES_KEYED.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// P2c: a 400-everything QuestDB exercises every error/warn arm of the
@@ -823,7 +1487,8 @@ mod tests {
     #[test]
     fn test_candle_table_names_has_tf_count_entries() {
         assert_eq!(candle_table_names().len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        // 2026-10-22 (plan item 62): 3s and 5s removed, 10 -> 8.
+        assert_eq!(TF_COUNT, 8);
     }
 
     #[test]
@@ -943,8 +1608,9 @@ mod tests {
     }
 
     #[test]
-    fn test_retired_questdb_tables_count_is_eighteen_and_unique() {
-        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 18);
+    fn test_retired_questdb_tables_count_is_seventeen_and_unique() {
+        // 18 -> 17 on 2026-09-05: `market_depth` removed, it has a live writer.
+        assert_eq!(RETIRED_QUESTDB_TABLES.len(), 17);
         let mut seen = std::collections::HashSet::new();
         for table in RETIRED_QUESTDB_TABLES {
             assert!(seen.insert(table), "duplicate retired table: {table}");
@@ -963,6 +1629,133 @@ mod tests {
                 "approved retired table missing from the drop list: {expected}"
             );
         }
+    }
+
+    /// A name in the DROP list must have NO live writer anywhere in the tree.
+    ///
+    /// # Why a scan and not a hand-checked list
+    ///
+    /// `market_depth` sat in this list from #T4, when depth had no writer, and
+    /// stayed there through the 2026-08-15 revival that made it the largest
+    /// table in the process. Nothing noticed, because nothing was looking: the
+    /// list is checked by a count test and a name-presence test, and neither
+    /// asks the only question that matters — is this table still dead?
+    ///
+    /// The sweep never fired only because a marker file suppresses it after its
+    /// first run. That is luck, not a bound: bumping the sweep version (the
+    /// documented workflow for EXTENDING this list) and `rm`-ing the marker (the
+    /// documented workflow for re-running it) each re-arm it, and a successful
+    /// DROP of a populated table logs nothing alarming.
+    ///
+    /// So the question is asked mechanically, of the code rather than of a
+    /// reviewer: a `CREATE TABLE IF NOT EXISTS <name>` anywhere in `crates/*/src`
+    /// means something intends to write it, and a table something intends to
+    /// write must not be in a boot-time drop sweep.
+    #[test]
+    fn retired_drop_list_never_names_a_live_table() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        // Every tracked .rs under crates/*/src, concatenated once.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args([
+                "ls-files",
+                "--",
+                "crates/*/src/**/*.rs",
+                "crates/*/src/*.rs",
+            ])
+            .output()
+            .expect("git ls-files must run");
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let mut corpus = String::new();
+        let mut files = 0usize;
+        for rel in listing.lines().filter(|l| !l.is_empty()) {
+            // This file DEFINES the list, so its own doc comments naming a
+            // table must not be mistaken for a writer.
+            if rel.ends_with("shadow_persistence.rs") {
+                continue;
+            }
+            if let Ok(body) = std::fs::read_to_string(root.join(rel)) {
+                corpus.push_str(&body);
+                files += 1;
+            }
+        }
+        assert!(
+            files >= 50,
+            "only {files} source files read — the scan is broken, not the code"
+        );
+
+        // Resolve `const NAME: &str = "table";` FIRST.
+        //
+        // The first version of this guard matched the table name as a LITERAL
+        // after `CREATE TABLE IF NOT EXISTS`, and it passed green on the very
+        // defect it was written for: the real DDL is
+        // `"CREATE TABLE IF NOT EXISTS {MARKET_DEPTH_TABLE} ("`, where the name
+        // is a const IDENTIFIER interpolated by `format!`. That is the house
+        // style, and it is the third time in one day a literal-only scan in
+        // this workspace reported on its own vocabulary rather than on the
+        // code. A scan that cannot read the codebase's own idiom is not a scan.
+        let mut aliases: Vec<(String, String)> = Vec::new();
+        for (i, _) in corpus.match_indices("const ") {
+            let after = &corpus[i + "const ".len()..];
+            let Some((decl, rest)) = after.split_once('=') else {
+                continue;
+            };
+            let Some((ident, ty)) = decl.split_once(':') else {
+                continue;
+            };
+            let ident = ident.trim();
+            if !ty.contains("str") || ident.is_empty() || ident.contains(char::is_whitespace) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            if let Some(v) = rest.strip_prefix('"').and_then(|r| r.split_once('"')) {
+                aliases.push((ident.to_owned(), v.0.to_owned()));
+            }
+        }
+        assert!(
+            aliases.len() >= 20,
+            "resolved only {} string consts — the const resolver is broken, \
+             which would make this guard silently blind",
+            aliases.len()
+        );
+
+        // A table is LIVE if its own name, or any const identifier holding that
+        // name, follows `CREATE TABLE IF NOT EXISTS`. Test code is deliberately
+        // NOT excluded: a false positive costs someone removing a dead name
+        // from a cleanup list, a false negative drops a populated table.
+        let live: Vec<&str> = RETIRED_QUESTDB_TABLES
+            .iter()
+            .filter(|t| {
+                let mut names: Vec<String> = vec![(*t).to_string()];
+                names.extend(
+                    aliases
+                        .iter()
+                        .filter(|(_, v)| v == *t)
+                        .map(|(ident, _)| format!("{{{ident}}}")),
+                );
+                names
+                    .iter()
+                    .any(|n| corpus.contains(&format!("CREATE TABLE IF NOT EXISTS {n}")))
+            })
+            .copied()
+            .collect();
+
+        assert!(
+            live.is_empty(),
+            "these tables are in the boot DROP sweep AND have a live \
+             CREATE TABLE IF NOT EXISTS: {live:?}\n\n\
+             A drop sweep is for tables nothing writes any more. A name that \
+             regained a writer must be REMOVED from the list — the marker file \
+             that suppresses the sweep today is not a bound: bumping the sweep \
+             version or removing the marker re-arms it, and dropping a \
+             populated table logs nothing alarming."
+        );
     }
 
     #[test]
@@ -1034,40 +1827,33 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_table_names_canonical_ordering_1m_to_1d() {
+    fn test_candle_table_names_canonical_ordering() {
         let names = candle_table_names();
-        // C3: legacy 5-frame prefix (ordinals 0..=4) byte-stable, the 16
-        // second-scale frames APPENDED after candles_1d (ordinals 5..=20).
+        // 2026-09-19 nine-frame collapse: the four-frame legacy prefix is
+        // unchanged, `candles_1d` is GONE, and the second-scale block that
+        // followed it is now exactly 1s/3s/5s. `candles_15s` (retired) and
+        // `candles_15m` (kept) differ by one letter — this list is the exact
+        // set, never a prefix match. 2026-09-22: `candles_10m` appended at
+        // ordinal 9 (it was a view; now a folded table).
         let expected = [
             "candles_1m",
             "candles_3m",
             "candles_5m",
             "candles_15m",
-            "candles_1d",
             "candles_1s",
-            "candles_2s",
-            "candles_3s",
-            "candles_4s",
-            "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with TfIndex::{M2, M30, M60} — the three
-            // frames of the operator's thirteen (Quote 13, 2026-08-08) that
-            // previously had no enum variant.
-            "candles_2m",
             "candles_30m",
             "candles_60m",
+            "candles_10m",
         ];
         assert_eq!(names, expected);
+        // 2026-10-22 (plan item 62): archive-only, never emitted, never dropped.
+        for t in ARCHIVE_ONLY_CANDLE_TABLES {
+            assert!(!names.contains(&t), "{t} must not be a fold table");
+            assert!(
+                !retired_candle_table_names().contains(&t),
+                "{t} must not be on the drop list before its S3 copy"
+            );
+        }
     }
 
     /// PR #798 (operator-locked 2026-05-25) — marker constant is set
@@ -1096,5 +1882,137 @@ mod tests {
     #[test]
     fn test_legacy_drop_marker_filename_is_descriptive() {
         assert!(LEGACY_DROP_MARKER_PATH.ends_with("legacy_candle_objects_dropped.marker"));
+    }
+
+    /// Audit PR53 (2026-09-28). The legacy sweep's step 2 was an
+    /// unconditional `DROP TABLE IF EXISTS candles_1s`, a table the fold still
+    /// writes. It lay dormant behind the marker, and a sweep-version bump or a
+    /// lost marker would have fired it on the next boot.
+    ///
+    /// Asked two ways, because either alone has a gap. The NAME SETS every
+    /// sweep drops by table must not meet the live candle tables; and neither
+    /// sweep's body may carry a literal `DROP TABLE IF EXISTS candles_`
+    /// statement, which is the shape step 2 had and no name set would list.
+    #[test]
+    fn no_drop_sweep_names_a_kept_candle_table() {
+        use std::collections::BTreeSet;
+
+        let kept: BTreeSet<String> = candle_table_names()
+            .iter()
+            .chain(emitted_candle_table_names().iter())
+            .map(|name| (*name).to_string())
+            .collect();
+        assert!(
+            kept.contains("candles_1s"),
+            "the kept set must include candles_1s, the table this guard was written for"
+        );
+
+        let mut dropped: BTreeSet<String> = BTreeSet::new();
+        for sfx in LEGACY_CANDLE_TF_SUFFIXES {
+            dropped.insert(format!("candles_{sfx}_shadow"));
+        }
+        dropped.insert("aggregator_seal_audit".to_string());
+        dropped.extend(RETIRED_QUESTDB_TABLES.iter().map(|t| (*t).to_string()));
+        dropped.extend(retired_movers_object_names());
+        dropped.extend(
+            retired_candle_table_names()
+                .iter()
+                .map(|t| (*t).to_string()),
+        );
+
+        let overlap: Vec<_> = kept.intersection(&dropped).collect();
+        assert!(
+            overlap.is_empty(),
+            "a boot drop sweep names a candle table the fold still writes: {overlap:?}"
+        );
+
+        let src = include_str!("shadow_persistence.rs");
+        for sweep in [
+            concat!("pub async ", "fn drop_legacy_candle_objects("),
+            concat!("pub async ", "fn drop_retired_candle_tables("),
+        ] {
+            let start = src.find(sweep).expect("sweep fn present");
+            let body_len = src[start..].find("\n}\n").expect("sweep fn body end");
+            let body = &src[start..start + body_len];
+            let literal = concat!("DROP TABLE IF EXISTS ", "candles_");
+            assert!(
+                !body.contains(literal),
+                "{sweep} carries a literal candle-table DROP; every candle table \
+                 it may drop must come from a name set this test checks"
+            );
+        }
+    }
+
+    /// Plan item 45g (D8): a retired table is dropped only when QuestDB says
+    /// it is empty. Rows, an unreadable answer or no answer never read as
+    /// empty.
+    #[test]
+    fn test_regression_a_retired_table_with_rows_is_kept() {
+        let empty = r#"{"query":"SELECT count() FROM t","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[0]],"count":1}"#;
+        let full = r#"{"query":"SELECT count() FROM t","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[1530651649]],"count":1}"#;
+        assert_eq!(
+            classify_count_answer(Some(200), empty),
+            RetiredTableState::Empty
+        );
+        assert_eq!(
+            classify_count_answer(Some(200), full),
+            RetiredTableState::HasRows
+        );
+        // A 2xx body that cannot be read is never taken for empty.
+        assert_eq!(
+            classify_count_answer(Some(200), ""),
+            RetiredTableState::HasRows
+        );
+        assert_eq!(
+            classify_count_answer(Some(200), r#"{"dataset":[[10]]}"#),
+            RetiredTableState::HasRows
+        );
+        // QuestDB answers 400 for a table that does not exist.
+        assert_eq!(
+            classify_count_answer(Some(400), r#"{"error":"table does not exist [table=t]"}"#),
+            RetiredTableState::Absent
+        );
+        assert_eq!(
+            classify_count_answer(Some(500), empty),
+            RetiredTableState::Unknown
+        );
+        assert_eq!(classify_count_answer(None, ""), RetiredTableState::Unknown);
+    }
+
+    /// Plan item 45g (D8): neither boot sweep may issue a bare `DROP TABLE`;
+    /// every table drop goes through the empty check.
+    #[test]
+    fn test_regression_boot_sweeps_drop_tables_only_through_the_empty_check() {
+        let src = include_str!("shadow_persistence.rs");
+        for sweep in [
+            concat!("pub async ", "fn drop_legacy_candle_objects("),
+            concat!("pub async ", "fn drop_retired_candle_tables("),
+        ] {
+            let start = src.find(sweep).expect("sweep fn present");
+            let body_len = src[start..].find("\n}\n").expect("sweep fn body end");
+            let body = &src[start..start + body_len];
+            assert!(
+                !body.contains(concat!("DROP ", "TABLE")),
+                "{sweep} issues a DROP TABLE that skips the empty check"
+            );
+            assert!(
+                body.contains("run_drop_retired_table_if_empty("),
+                "{sweep} no longer routes table drops through the empty check"
+            );
+        }
+    }
+
+    /// Audit PR53: a sweep marker means QuestDB answered every DROP. A
+    /// transport failure or a 5xx must not count, or a boot during an outage
+    /// records the clean-up as done and it never re-runs.
+    #[test]
+    fn drop_status_counts_as_answered_only_when_questdb_answered() {
+        assert!(!drop_status_counts_as_answered(None));
+        for answered in [200, 204, 400, 404, 409, 499] {
+            assert!(drop_status_counts_as_answered(Some(answered)), "{answered}");
+        }
+        for failed in [500, 502, 503, 504, 599] {
+            assert!(!drop_status_counts_as_answered(Some(failed)), "{failed}");
+        }
     }
 }

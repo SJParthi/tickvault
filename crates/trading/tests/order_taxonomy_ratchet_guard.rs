@@ -205,6 +205,7 @@ fn ratchet_stop_all_cooldown_is_60s_per_annexure_rule_12() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn ratchet_readiness_staleness_constants_relation() {
     assert!(
         ORDER_READINESS_MAX_AGE_SECS > 2 * ORDER_READINESS_REFRESH_INTERVAL_SECS,

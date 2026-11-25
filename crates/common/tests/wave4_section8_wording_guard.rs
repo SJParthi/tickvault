@@ -36,7 +36,8 @@
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
 //!   exists at `crates/core/tests/ws_sleep_resilience.rs:93,173`.
 //!   The literal "70h" wording was off by 5 hours; the real chaos
-//!   test is 65h.
+//!   test is 65h. (2026-10-09: it is a CALENDAR test, not a chaos
+//!   test; it holds no socket. See the last test in this file.)
 //! - The >65h long-holiday wake (e.g. Fri → Tue across a Mon holiday,
 //!   ~92h) is NOT yet pinned and is queued as Wave-6 item W6-2.
 //!
@@ -52,7 +53,11 @@ const MATRIX_PATH: &str = "../../.claude/rules/project/per-wave-guarantee-matrix
 // matrix row 1 + §F honest-100% template were re-pointed to the live
 // seal-ring envelope in the same sweep — pin them here so they cannot
 // silently regress to the retired tick-ring wording.
-const CHARTER_PATH: &str = "../../.claude/rules/project/operator-charter-forever.md";
+const CHARTER_PATH: &str = "../../docs/claude-rules-full/project/operator-charter-forever.md";
+// 2026-10-11 (review of G10-docs): the compliance audit's 7-row table carried
+// the same retired "papaya + SPSC bounded" hot-path claim the matrix was
+// corrected for, and nothing scanned it.
+const COMPLIANCE_AUDIT_PATH: &str = "../../docs/architecture/100-percent-compliance-audit.md";
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -92,8 +97,12 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
         // It required the literal "200,000-seal ring buffer capacity" in all
         // three rule files. `SEAL_BUFFER_CAPACITY` is not 200,000 and has not
         // been since 2026-08-10: it derives as `AGGREGATOR_MAX_SLOTS ×
-        // TF_COUNT`, which was 525,000 at TF_COUNT=21 and is 600,000 now that
-        // TF_COUNT is 24. So this guard was actively HOLDING THE OPERATOR-
+        // TF_COUNT`, which was 525,000 at TF_COUNT=21 and 600,000 at
+        // TF_COUNT=24. (It moved a THIRD time on 2026-09-19: the nine-frame
+        // collapse took TF_COUNT to 9 and the capacity to 225,000. This note
+        // deliberately does not chase it again — the assertion below pins the
+        // DERIVATION, which is why nothing here had to change.)
+        // So this guard was actively HOLDING THE OPERATOR-
         // FACING CLAIM AT A FIGURE 3× BELOW REALITY, and failing any attempt
         // to correct it — a ratchet enforcing a falsehood is worse than no
         // ratchet, because it makes the falsehood look verified.
@@ -106,8 +115,9 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
             "{label} ({path}) must state the seal-ring envelope as the \
              DERIVATION `AGGREGATOR_MAX_SLOTS × TF_COUNT`, not as a literal \
              row count. A literal goes stale the next time TF_COUNT moves — \
-             it already did, twice (200,000 → 525,000 → 600,000), and this \
-             guard previously pinned the oldest of the three."
+             it already did, three times (200,000 → 525,000 → 600,000 → \
+             225,000), and this \
+             guard previously pinned the oldest of the four."
         );
         assert!(
             text.contains("`SEAL_BUFFER_CAPACITY`"),
@@ -139,13 +149,13 @@ fn section8_keeps_seal_ring_claim_with_evidence_pointer() {
 }
 
 #[test]
-fn section8_keeps_65h_weekend_chaos_claim_with_evidence_pointer() {
+fn section8_keeps_65h_weekend_calendar_claim_with_evidence_pointer() {
     for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
         let text = read(path);
         assert!(
             text.contains("65h Fri 16:00 IST"),
-            "{label} ({path}) must cite the 65h weekend sleep/wake \
-             chaos test by its actual duration (Fri 16:00 → Mon 09:00 \
+            "{label} ({path}) must cite the 65h weekend sleep-until-open \
+             calendar test by its actual duration (Fri 16:00 → Mon 09:00 \
              IST), not the legacy 70h claim."
         );
         assert!(
@@ -178,5 +188,120 @@ fn section8_still_rejects_literal_never_promises() {
         preamble.contains("REJECT IN REVIEW"),
         "wave-4-shared-preamble.md §8 must keep the REJECT IN REVIEW \
          clause for literal 'never' promises without envelope."
+    );
+}
+
+/// Regression: 2026-10-09 (stress audit TG-3). The three honest-100%
+/// templates called `ws_sleep_resilience.rs` a "chaos-tested 65h ...
+/// sleep/wake". That file's own header says it pins only the calendar
+/// arithmetic in `secs_until_next_market_open`: no socket is opened, held
+/// or woken, and the production box is stopped overnight and at weekends.
+/// A template citing it as a chaos test claims a resilience it never
+/// measured, so the phrase is banned and the calendar wording is required.
+#[test]
+fn templates_call_the_weekend_test_calendar_maths_not_a_chaos_test() {
+    for (label, path) in [
+        ("preamble", PREAMBLE_PATH),
+        ("matrix", MATRIX_PATH),
+        ("charter", CHARTER_PATH),
+    ] {
+        let text = read(path);
+        for banned in ["chaos-tested 65h", "chaos sweep only exercises"] {
+            assert!(
+                !text.contains(banned),
+                "{label} ({path}) contains {banned:?}: ws_sleep_resilience.rs \
+                 is calendar arithmetic only and holds no socket. Say \
+                 \"calendar-tested\" instead."
+            );
+        }
+        assert!(
+            text.contains("calendar-tested 65h Fri 16:00 IST"),
+            "{label} ({path}) must describe the weekend test as \
+             \"calendar-tested 65h Fri 16:00 IST\"."
+        );
+    }
+}
+
+/// Remove every `~~…~~` span on a line. Struck text is corrected history,
+/// not a live claim.
+fn without_struck(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("~~") {
+        let after_open = &rest[open + 2..];
+        match after_open.find("~~") {
+            Some(close) => {
+                out.push_str(&rest[..open]);
+                rest = &after_open[close + 2..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Regression: 2026-10-11 (audit TRU-5). The 7-row resilience matrix, which
+/// every plan item copies, named three mechanisms that no longer exist: a
+/// "ring 2M" (the frame ring is bounded by `FRAME_RING_CAPACITY` and
+/// `FRAME_RING_MAX_BYTES`), "core_affinity Core 0" (the crate was removed
+/// 2026-08-10; the read workers pin to core 1 through libc) and an "SPSC
+/// bounded" ring (it is one bounded channel with many producers). A table
+/// row may carry those words only inside a `~~strike~~`.
+#[test]
+fn resilience_matrix_rows_carry_no_retired_mechanisms() {
+    assert_eq!(without_struck("a ~~b~~ c ~~d~~"), "a  c ");
+    assert_eq!(without_struck("a ~~b"), "a ~~b");
+    for (label, path) in [
+        ("matrix", MATRIX_PATH),
+        ("charter", CHARTER_PATH),
+        ("compliance audit", COMPLIANCE_AUDIT_PATH),
+    ] {
+        let text = read(path);
+        let rows: Vec<&str> = text.lines().filter(|l| l.starts_with('|')).collect();
+        assert!(
+            rows.len() >= 10,
+            "{label} ({path}) has too few table rows to check"
+        );
+        for row in rows {
+            let live = without_struck(row);
+            for banned in ["ring 2M", "core_affinity Core 0", "SPSC bounded"] {
+                assert!(
+                    !live.contains(banned),
+                    "{label} ({path}) table row still claims {banned:?} unstruck:\n{row}\n\
+                     Strike it and add a dated correction naming what exists."
+                );
+            }
+        }
+    }
+}
+
+/// Regression: 2026-10-11 (review of G10-docs). The matrix's "Zero ticks
+/// lost" row still gave the tick envelope as "→ spill NDJSON → DLQ" (the
+/// tick tier has no DLQ; only the candle seal tier does) and listed five loss
+/// paths in a way that read as complete, leaving out the one with no
+/// recovery: WAL and ring both refused. The row may not claim a tick DLQ
+/// outside a `~~strike~~`, and its loss list must say it is not exhaustive
+/// and name the WAL-and-ring case.
+#[test]
+fn zero_ticks_lost_row_claims_no_tick_dlq_and_no_complete_loss_list() {
+    let text = read(MATRIX_PATH);
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("| Zero ticks lost"))
+        .expect("the matrix has a Zero ticks lost row");
+    let live = without_struck(row);
+    assert!(
+        !live.contains("spill NDJSON → DLQ"),
+        "the Zero ticks lost row still gives the tick envelope a DLQ unstruck:\n{row}"
+    );
+    assert!(
+        live.contains("not an exhaustive list"),
+        "the Zero ticks lost row must say its loss list is not exhaustive:\n{row}"
+    );
+    assert!(
+        live.contains("WAL and ring both refused"),
+        "the Zero ticks lost row must name the one loss with no recovery \
+         (WAL and ring both refused):\n{row}"
     );
 }

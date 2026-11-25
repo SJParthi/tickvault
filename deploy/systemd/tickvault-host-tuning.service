@@ -49,6 +49,40 @@ RemainAfterExit=yes
 # Then: `systemctl restart tickvault-host-tuning` (and re-enable irqbalance if
 # it was stopped: `systemctl enable --now irqbalance`).
 EnvironmentFile=-/etc/tickvault/host-tuning.env
+# MONDAY 2 NOV 2026 MEASURED DAY (plan ITEM DT-S1; owner, Fri 30 Oct 2026
+# ~17:45 IST: "Own-core ON for Monday 2 Nov only, never-sleeping sorter OFF,
+# measured minute by minute"): QuestDB alone on core 0 on this 2-core box.
+# `host-tuning apply` writes the QuestDB cpuset into the compose .env at boot;
+# the app's boot compose-up recreates QuestDB with it. Read at unit start only,
+# never during a session. Review with the 16:15 IST verdict; delete this line
+# to switch off (the next boot restores the operator's previous values).
+Environment=TV_QDB_CORE_ISOLATION=1
+# NIC RECEIVE COALESCING OFF FOR ONE MEASURED DAY (owner card, Fri 13 Nov 2026:
+# "Yes, measure 1 day (Recommended)" — "About 0–20 µs per packet faster,
+# slightly more CPU. Applied outside market hours; easy to undo."). While
+# today (IST) is on or before TV_NIC_RX_COALESCE_UNTIL, `host-tuning apply`
+# sets the default-route NIC to rx-usecs 0 / adaptive-rx off through the
+# ethtool ioctl (no shell), after saving the values it found to
+# /opt/tickvault/nic-coalesce.before. The first run after that date puts the
+# saved values back and deletes the file (an EC2 stop/start also resets the
+# driver). This unit runs at every boot and on every deploy (an emergency
+# deploy can override the 09:00-15:45 IST deploy block), so the code itself
+# never STARTS the trial between 09:00 and 15:45 IST: such a run logs "not
+# touched" and the next run outside that window applies it. UNDO: set
+# TV_NIC_RX_COALESCE=keep in /etc/tickvault/host-tuning.env, which wins over
+# these lines and is read at each start, then `systemctl restart
+# tickvault-host-tuning`. Only the env-file route survives a deploy: every
+# deploy copies this unit from the repo over the box copy, reloads systemd and
+# restarts the unit, and deleting these two lines does not undo it either,
+# because the code's own defaults are also `off` and the same date. A quicker
+# undo that lasts only until the next deploy: change `off` to `keep` on the
+# next line, then `systemctl daemon-reload && systemctl restart
+# tickvault-host-tuning` (without the daemon-reload systemd keeps the cached
+# unit and the restart re-applies the trial). Move the date if the deploy
+# slips past Mon 16 Nov. How to read the day:
+# docs/runbooks/hot-path-capacity-proof.md "NIC coalescing trial".
+Environment=TV_NIC_RX_COALESCE=off
+Environment=TV_NIC_RX_COALESCE_UNTIL=2026-11-16
 
 WorkingDirectory=/opt/tickvault
 
@@ -71,7 +105,9 @@ ExecStart=/usr/bin/install -m 0644 -o root -g root /opt/tickvault/repo/deploy/aw
 # Leading `-` plus the modprobe guard: if tcp_bbr is unavailable, writing the
 # value would make `sysctl --system` below fail WHOLESALE and strip the receive
 # buffers along with it — trading a missing optimisation for a missing floor.
-ExecStart=-/bin/sh -c 'modprobe tcp_bbr 2>/dev/null && { echo "net.ipv4.tcp_congestion_control = bbr" > /etc/sysctl.d/99-tickvault-bbr.conf; echo tcp_bbr > /etc/modules-load.d/tickvault-bbr.conf; }'
+# Was an inline /bin/sh -c until 2026-10-01 (audit D6b); now the app binary
+# does the same thing: modprobe, and write both drop-ins only if that worked.
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning bbr
 
 # NIC receive ring.
 #
@@ -94,18 +130,50 @@ ExecStart=/sbin/sysctl --system
 
 # 3. Verify EVERY load-bearing value and write the verdict where it outlives the
 #    boot log. Non-zero exit here is a REPORT, not a failure — see below.
-ExecStart=-/opt/tickvault/repo/deploy/aws/sysctl/verify-net-tuning.sh
+#
+# Steps bbr, verify and apply were shell scripts until 2026-10-01 (audit D6b);
+# they are now subcommands of the app binary, run from its own root-owned copy
+# `bin/tickvault-host`, never from `bin/tickvault`. The deploy refreshes that
+# copy after the smoke test; the deploy ROLLBACK restores only `bin/tickvault`.
+# A pre-port binary does not know these subcommands and would ignore the
+# arguments and boot the whole trading app, here as root, in a oneshot that
+# `tickvault.service` waits behind. Keeping the subcommand binary separate means
+# a rollback can never put one of those here.
+#
+# On a brand-new instance the copy does not exist until the first deploy, so
+# user-data's first start of this unit skips those three (the leading `-`); the
+# deploy installs the copy and then restarts this unit, which applies them.
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning verify
 
 # 4. The non-sysctl half: THP (a /sys write, lost on every reboot — the single
 #    strongest reason this unit exists) and the clock discipline check, without
 #    which every latency number the system reports is untrustworthy.
-ExecStart=-/opt/tickvault/repo/deploy/aws/host-tuning/apply-host-tuning.sh
+ExecStart=-/opt/tickvault/bin/tickvault-host host-tuning apply
+
+# 5. Keep the CloudWatch agent off the hot core (owner card Thu 12 Nov 2026
+#    ~16:15 IST: "Yes, both, measure 1 day (Recommended)" — "...and keep the
+#    monitoring agent on core 0"). Measured 12 Nov: the agent was seen running
+#    on core 1, where only the socket reader and the frame drain belong (every
+#    other app thread and QuestDB are on core 0). `set-property --runtime`
+#    writes a runtime cgroup setting, applied at once if the agent runs and at
+#    its start if it does not; it is gone at reboot, and this unit re-applies it
+#    every boot. Not a shell (no `sh -c`). Leading `-`: a box without the agent
+#    must not fail this unit. Undo: delete this line (the next boot restores
+#    the default) or `systemctl set-property --runtime
+#    amazon-cloudwatch-agent.service AllowedCPUs=` now.
+ExecStart=-/usr/bin/systemctl set-property --runtime amazon-cloudwatch-agent.service AllowedCPUs=0
 
 # A tuning failure must NEVER keep the trading app down. A host with default
 # buffers is slower; a host with no app is blind. The `-` prefixes above and
 # this line encode that ordering of harms deliberately — the failures are loud
 # in the journal and in net-tuning.status, and they do not gate the feed.
 SuccessExitStatus=0 1
+
+# A oneshot has no start timeout by default, and `tickvault.service` is ordered
+# after this unit, so a step that hangs would keep the app down indefinitely.
+# Five minutes is far above the normal run (seconds, plus a 2 s chrony settle);
+# past it systemd kills the step and the app starts on whatever tuning landed.
+TimeoutStartSec=300
 
 StandardOutput=journal
 StandardError=journal

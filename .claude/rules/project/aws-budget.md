@@ -9,7 +9,9 @@ paths:
   - "crates/trading/src/strategy/**"
 ---
 
-# AWS Budget Enforcement — r8g.xlarge LOCKED ~₹5,824–7,382/mo
+# AWS Budget Enforcement — r8g.large LOCKED (Quotes 32/33, estimate ~$70–75/mo, not a cap)
+
+> **⚠ TITLE CHANGED 2026-10-21 (operator Quotes 32/33, `daily-universe-scope-expansion-2026-05-27.md` §0).** The lock moves from **r8g.xlarge** (4 vCPU / 32 GiB, ~₹5,824–7,382/mo, Quote 13) to **r8g.large** (2 vCPU / 16 GiB), multi-AZ kept, with a fresh 150 GB root, on the 2026-10-22 rebuild. The owner's estimate is about $70–75 a month; it is an estimate from the 1–13 Oct bill, not a maximum. The only hard maximum is the budget stop (Quotes 36/37 below). The old title is kept in the banner below as history.
 
 > **⚠ TITLE CORRECTED 2026-08-12 (operator Quote 15 — "this is our finalsied
 > instancue dude okay? just sue this evrywhere neitlrey").** This H1 read
@@ -37,6 +39,147 @@ paths:
 > **⚠ LIVE-VOLUME CORRECTION 2026-07-19:** the banner above's "live 50 GB root" premise was factually WRONG — `aws ec2 describe-volumes vol-073ccaa417a0f344b` (run live 2026-07-19 via the coordinator session) returned **30 GiB gp3 (3000 IOPS / 125 MiB/s), in-use**, attached to `i-0b956d0209231a48b` at `/dev/xvda` since 2026-05-24. The 2026-07-13 approved 30→50 GB grow (COST NOTE below) was RECORDED but **never physically applied**. Corrected interim bill: EBS $0.0912 × 30 = $2.74; subtotal $6.05 + $3.60 + $2.74 + $0.18 + $0.28 = $12.85 → ₹1,092 → ×1.18 GST = **~₹1,289/mo** at 270 hrs (was stated ~₹1,471/mo; the ~176-hr figure is ~₹1,077, was stated ~₹1,260). Post-recreate figures unchanged (~₹1,197 / ~₹986 — they assumed 20 GB). **FLAGGED FOLLOW-UP:** the disk-pressure remediation the grow was approved for is UNAPPLIED — the 82%-disk-pressure risk may recur; applying the grow (or formally accepting 30 GB) is an operator/infra decision, deliberately NOT taken in the docs-only PR carrying this note. *(RESOLVED same day by the 2026-07-19 OPERATOR RULING below: 30 GB is formally ACCEPTED and the 30→50 grow is CANCELLED.)* Full arithmetic + authority: `daily-universe-scope-expansion-2026-05-27.md` §7 (2026-07-19 correction note) + §0 (2026-07-19 approvals bullet).
 >
 > **⚠ OPERATOR RULING 2026-07-19 — 30 GB accepted, t4g.medium as-of-now, NEW HARD TARGET < ₹1,000/mo:** verbatim quote + the itemized sub-1K path live in the dedicated "OPERATOR RULING 2026-07-19" section below. The base bill alone (~₹1,077/mo at the ~176-hr auto-schedule basis) EXCEEDS the target — <₹1,000 is UNREACHABLE without at least one operator-gated lever; see the lever table.
+
+## NOTE 2026-11-16 — the hard-stop guard now logs how old the Budgets figure is (no behaviour change)
+
+Measured 16 Nov 2026: the budget's `LastUpdatedTime` read 14 Nov 06:29 UTC, so the month-to-date figure the hourly hard-stop guard compares with the stop line trailed the bill by about two days, and a stop at the December $62 line can fire days after spend crosses it. The guard now reads `Budget.LastUpdatedTime` from the same free `DescribeBudget` call and adds two fields to its decision log line and result: `budget_data_age_hours` and `estimated_spend_now_usd` (spend projected at the figure's own daily rate; an ESTIMATE, labelled as one; left empty when the figure is stamped on UTC day 1 or 2, when it may still be last month's total). The stopped-box path (holding a budget stop) gets the warning below but adds no field to its own line. When the figure is over 48 hours old it writes one `LAMBDA-AWS-01` warning per run. **Nothing about when the box stops changed:** the stop still compares only `ActualSpend` with the line, pinned by `test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields`. No new page, alarm, metric filter or EMF name; no metric filter reads the guard's log group (Verified in `deploy/aws/terraform`, 2026-11-16). Cost $0 (same call, a few more log bytes). Code: `crates/aws-lambdas/src/budget_spend.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs` (`mtd_reading`).
+
+## COST NOTE 2026-11-14 — the daily Brutex export and its read-only role (Quote 60)
+
+Owner, 2026-11-14: "yes build the daily export and read-only login dude"; cards "Everything daily, kept forever", "CSV.gz, same as now (Recommended)", "Role your Mac login switches into (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 60. The first card priced a second copy of every day (about $4.5 more each month, breaking the ₹5,500 cap within months); the build does NOT make a second copy: it writes each partition to the archive's own key and the archive later reuses it.
+
+| Cost | Size | Basis |
+|---|---|---|
+| Manifest, counts file and DONE per day | about $0 (kilobytes a day) | Assumed |
+| Partitions in S3 earlier than the archive would put them (ticks ~15 days, candles ~90) while still on the box | roughly $1–2 a month | Assumed, sizes not measured |
+| PUT/HEAD/LIST requests | a few hundred a day, cents a month | Assumed |
+| Content-addressed copies for partitions changed after the export | Unknown | depends on late rows after 15:45; the export now waits for the evening WAL replay and for the after-close depth pass while it can still write (2026-11-14 review), which removes the regular cases. *(2026-11-14 evening audit: until then only the session day waited for the evening replay; a catch-up day 2 or more days old ran anyway, so shed frames of it replayed later made a second copy. A forced catch-up day now waits for that replay too, except on its last chance (no later trading day keeps it inside the 7-day window, so a weekend or holiday counts), when it still runs so it never leaves the window with no DONE. A replay counts as pending while one runs on the box, and on the planned evening restart until the drain hold first reports. Replayed rows of a day on its last chance can still make a second copy.)* |
+| **Largest hour export, unmeasured** (2026-11-14 evening audit): the sorted export of one `market_depth_book` hour (largest seen 607,945,897 B gzipped, 2026-11-12T09) must finish inside the 600 s export timeout | if it does not, that day gets no DONE after 3 attempts (no extra AWS cost, Brutex sees the day as not exported); QuestDB memory for the sort is Unknown | **Unknown, to be measured on the first live run (Mon 16 Nov)**. *(⚠ CHANGED 2026-11-15: the ordered export is now 10-minute `ts` slices of an hour (1 hour of a day), each its own request with its own 600 s timeout, the header written once, the same bytes as the single query (`partition_archive::sliced_export`, stub-tested for byte identity). The 600 s limit is now per slice (about a sixth of the hour's rows each), and a whole partition's export stops at 1,800 s. Whether one slice of that hour finishes in 600 s, and QuestDB's memory for it, are still Unknown until the first live run.)* |
+| **Disk-pressure archiving during the session** (2026-11-14 review): inside 08:30 to 15:40 IST the archiver never sorts, so a pressure pass that moves an hour whose ordered export object already sits at the canonical key writes a full content-addressed second copy of it (counted on `tv_partition_archive_export_unordered_in_session_total`) | once the export has run about 15 days, every hour moved under pressure during the session is a full second copy (100% of the bytes moved in session that day) | **Open owner decision, NOT accepted by any quote** (third review, 2026-11-14: this row said "accepted trade") *(⚠ CHANGED 2026-11-16: ACCEPTED by the owner, Quote 62 in `daily-universe-scope-expansion-2026-05-27.md`: "Ok whatever is recommended do it dude okay?", option (1). A weekly read-only check reports the month's `.sha-` copy size; past 20 GB in a month the owner is asked again. The schema/QuestDB-change row below stays open.)*; Unknown size, read the counter. Outside pressure a failed ordered export now keeps the partition, and a failed HeadObject no longer causes a copy. *(⚠ CHANGED 2026-11-15: a pressure pass inside that window now asks one HeadObject per candidate of an export table BEFORE the per-run cap (200), fills the cap with the partitions that have NOTHING at their canonical key, and gives an already-exported one only a slot they left; once one not-yet-exported partition has been dropped in that pass, every further exported one is left for a later pass (this also covers the uncapped passes from 08:30 to 08:45 and before a weekend Muhurat gate). So the copy now happens only when no not-yet-exported candidate of that pass was dropped before it: every candidate was already exported, or the others were held, failed or had their table's WAL behind; still counted on the same counter. That is the case, for example, before any of today's hours is 4 hours old (today's hours are exported only after the close); how often is Assumed, not measured. Cost: one HeadObject per eligible partition of an export table on each such pass (a few hundred with a 15-day backlog; cents a month, Assumed). The owner decision stays open.)* |
+| **Schema or QuestDB change** (third review): a column added to an export table, or a QuestDB upgrade that renders a value differently, makes every partition exported and not yet archived (about 15 days of hour tables, 90 days of candles) differ from its export object, so each goes up a second time, kept forever | one-time, up to about 15 days of tick and depth data plus 90 days of candles | **Open owner decision before any such change**; the manifest records each table's CSV header (`columns`) |
+| Box held until 18:00 while the session day waits for its soft gates with nothing else moving (the one-hour stall rule no longer releases a due export; never past its 20:45 horizon) | at most about 1.5 hours on such a day | Assumed, about $0.30 on that day |
+| **Box kept up after the close while the export runs** | **15 to 45 minutes a trading day at the r8g.large rate (the export waits for the hourly 15:15 candle, sealed about 16:19, so it runs about 16:20 to 16:45; the box stops after it, past 16:30)** | **Assumed, to be measured; this is the real added cost (about $0.05 to $0.15 a trading day, Assumed from the ~$0.19 per held hour figure)** |
+| Brutex downloads to the Mac | about $0.11/GB beyond the 100 GB a month free transfer; Glacier IR reads of `raw-frames/` older than 30 days about $0.03/GB more | Assumed; the one line Brutex's own use can move |
+
+December's $62 line (Quote 54) is unchanged.
+
+## OPERATOR RULING 2026-11-14 — November 2026 only: stop at $140 so the box keeps running; December onward stays $62 with GST (Quote 59)
+
+Owner, 2026-11-14: "dont sto pthis month dude let it run but by the srticter law stick to 5500 inr from decoemebr onwards with the strict estiamtion strict law taht to oafetr atx charegs dude okay?", then tapped "$140 (Recommended)" on the card "November: AWS has spent $60.83 so far and forecasts $126, so the current $90 stop would shut the server late this month." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 59.
+
+| | Before (Quote 52) | After (Quote 59) |
+|---|---|---|
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$140**, November 2026 (UTC month) only |
+| From 1 December 2026 | $62, GST included (Quote 54) | **unchanged: $62 from 1 December**, GST included (about ₹5,500); native `limit_amount` "140" -> "62" on or after 1 December |
+
+## OPERATOR RULING 2026-11-11 (later) — from 1 December 2026 the stop line is $62, GST included (Quote 54)
+
+Owner, 2026-11-11, asked on a decision card "From December, should the AWS bill be hard-capped at ₹5,000 a month?", chose "Cap ₹5,500": "Stop line $62 (about ₹5,500 with GST). A bit of headroom above the expected bill, still close to ₹5,000." Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 54. It supersedes Quote 53's "keep the $75 stop" row only; Quote 53's other rows (alarms, shipped metrics, dashboard, raw-frame storage class) stand.
+
+| | Before (Quotes 37 and 52) | After (Quote 54) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (code clamp) | $75 from 1 December | **$62 from 1 December 2026**, GST included (the live budget counts tax, Quote 36) |
+| November 2026 (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $90 | **$90** (unchanged) |
+| October 2026 | $185 | $185 (unchanged, history) |
+| Native `limit_amount` (budget.tf) | "90" now, "75" on or after 1 December | "90" now, **"62"** in a follow-up on or after 1 December, never before; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December unless it reads exactly 62 |
+| Expected bill | ~$56 a month with tax (Quote 53 estimate, Assumed) | unchanged; ₹5,000 is that estimate, not a guarantee. The hard maximum is the $62 stop |
+
+## OPERATOR RULING 2026-11-11 — November 2026 only: stop at $90; the owner deletes the leftover disks
+
+Owner, 2026-11-11: tapped "Raise Nov to $90 only (Recommended)" and "Delete all (Recommended)" after a one-off Cost Explorer read showed 1–11 Nov at $46.11, of which about $21 (tax included) was two volumes attached to nothing (the 600 GB old root left from Quote 47 and a 30 GB May root) plus two old snapshots. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 52.
+
+| | Before (Quote 37) | After (Quote 52) |
+|---|---|---|
+| November 2026 line (`NOVEMBER_2026_KILL_USD`, code clamp + native `limit_amount`) | $75 | **$90**, November 2026 (UTC month) only |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 December 2026** onward (code clamp by itself; native `limit_amount` back to "75" in a follow-up on or after 1 December; `budget_ceiling_lockstep_guard.rs` fails the build from 1 December while it still reads 90) *(⚠ SUPERSEDED the same day by Quote 54 above: the standing line is $62 from 1 December, and the native `limit_amount` moves to "62", not "75".)* |
+| Leftover volumes and snapshots | billed | deleted by the owner in the console; no repository role gets a volume or snapshot delete permission |
+
+## OPERATOR RULING 2026-10-28 — October 2026 only: stop at $185 (supersedes "October 2026 stays capped at $170" below)
+
+Owner, 2026-10-28: tapped "Raise Oct to $185 (Recommended)" after the Budgets API read $157.18 spent and $175.88 forecast against $170. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 45.
+
+| | Before (Quote 37) | After (Quote 45) |
+|---|---|---|
+| October 2026 line (`OCTOBER_2026_KILL_USD`, four lockstep sites) | $170 | **$185**, October 2026 only |
+| `STANDING_BUDGET_KILL_USD` | $75 from 1 November | **$75 from 1 November** (unchanged) *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
+
+## COST NOTE 2026-11-11 — Quote 53: fewer alarms, fewer shipped metrics, no CloudWatch dashboard, raw frames to Glacier Instant Retrieval ($75 stop unchanged)
+
+Owner, 2026-11-11: ticked "Cut alarms 93 → ~30 (Recommended)", "Trim CloudWatch metrics (Recommended)", "Cheaper S3 class for old raw frames (Recommended)" and "Delete the CloudWatch dashboard"; kept the $75 stop. Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 53. Per-alarm rows and the estimate: `docs/audits/2026-11-alarm-review.md`.
+
+| | Before | After |
+|---|---|---|
+| CloudWatch alarms (prod) | 119 | 82 (the KEPT list in Quote 53 does not allow ~30) |
+| EMF names shipped | 109 + 1 class series | 46 |
+| CWAgent host metrics | disk, memory, CPU | disk |
+| CloudWatch dashboard | 1 (the "dashboard kept" of Quote 37) | 0 |
+| `raw-frames/` after 30 days | Deep Archive | Glacier Instant Retrieval |
+
+Estimate (Assumed, never measured): about $11–14 a month less before tax. **Risk:** Glacier Instant Retrieval costs more per GB than the Deep Archive class it replaces for `raw-frames/` (about $0.50 a month more per month of raw frames kept, Assumed); it buys reads at once instead of a 12-hour restore. Read the December bill.
+
+## OPERATOR RULING 2026-10-21 (latest) — stop at $75, GST included, from 1 November (supersedes the $85 and $100 lines below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "so that the max alogn with 18 percnetage gst also it shdou lneve revr cross maximised price of 75 dudde okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 37 (also: free Budgets API lookups, alarm squeeze, dashboard kept, 16:30 IST stop).
+
+| | Before (Quote 36) | After (Quote 37) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $85 from 1 November | **$75 from 1 November 2026**, GST included; October 2026 stays capped at $170 *(⚠ superseded: $90 for November 2026 by Quote 52, $62 from 1 December 2026 by Quote 54)* |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $85 | $170 until 1 November, then **$75** (a follow-up change on or after that date) |
+
+## OPERATOR RULING 2026-10-21 (later) — stop at $85 from 1 November (supersedes the $100 line below)
+
+Owner, 2026-10-21 (verbatim, typos preserved): "okay set it with maximum 85 udde but why it even crosses mroe than 85 dude thats my question dude okay?". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 36.
+
+| | Before (Quote 33) | After (Quote 36) |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the guard Lambda's line, in code) | $100 from 1 November | **$85 from 1 November 2026**; October 2026 stays capped at $170 |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 until 1 November, then $100 | $170 until 1 November, then **$85** (a follow-up change on or after that date) |
+
+Measured live the same evening: the budget `tv-prod-monthly-budget-v2` has `IncludeTax = true`, so the line is the bill paid, 18% GST included (the "pre-GST" wording in the older notes below and in `budget.tf` is stale). October: $120.31 spent on 1–21 Oct, AWS forecast $175.68 against the $170 line.
+
+## OPERATOR RULING 2026-10-21 — stop at $100 from 1 November; disk speed 500 → 125 MiB/s tonight
+
+Owner, 2026-10-21 (verbatim, typos preserved): "Do everything now dude not Saturday brro do it now okay?", then the decision cards "Cut tonight anyway" (disk speed) and, after a correction that a $100 line in October would stop the box at once ($119.20 spent by 20 Oct), "$100 from 1 November (Recommended)". Full record and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 33.
+
+| | Before | After |
+|---|---|---|
+| `STANDING_BUDGET_KILL_USD` (the line the hard-stop guard applies in code) | $170 | **$100 from 1 November 2026**; October 2026 stays capped at $170 (`OCTOBER_2026_KILL_USD`) |
+| Four lockstep sites (terraform `limit_amount` = native 100% stop) | $170 | $170 until 1 November; lowering `limit_amount` to $100 is a follow-up change on or after that date |
+| Disk throughput (live `vol-0c6ab6e593e39d8c8`) | 500 MiB/s | **125 MiB/s**, applied 2026-10-21 17:04 IST by `grow-ebs-volume.yml` run 7; size 600 GB and IOPS 3,000 unchanged |
+
+Honest limits: until the terraform line follows, November's native AWS stop is still at $170 and the $100 stop is the guard Lambda's alone. Depth stays on until the depth-off PR merges, and on 13 Oct the disk was measured at ~149 MiB/s for most of a session, so the 125 MiB/s cap can slow the feed until then.
+
+Owner, 2026-10-13 (verbatim, typos preserved): "bro nto for claude dude im talkign about aws per month shdou leb inr 15 dude okay?", then two decision cards: "Stop at ₹15,000 + trim (Recommended)" and, after a correction naming the 90% early stop, "Stop at ₹15k + cut unused disk (Recommended)". Full record, measurements and REJECT list: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 30.
+
+| | Before | After |
+|---|---|---|
+| Four lockstep sites + `STANDING_BUDGET_KILL_USD` | $150 | **$170** (≈₹15,000 at an Assumed ~₹88/USD) |
+| Native `STOP_EC2_INSTANCES` actions | at 90% ($135) and 100% ($150) | **one, at 100% ($170)** |
+| Disk IOPS | 6,000 | **3,000** (free baseline); throughput stays 500 MiB/s |
+| October projection | ~$173–175, stopped ~23 Oct | ~$165 (Assumed), no stop |
+
+Measured 13 Oct: IOPS ~1,000 average after 10:00 IST (peak 3,658 during start-up); the instance's EBS burst balance was 0% from about 10:00 IST and the disk was held at ~149 MiB/s for the rest of the session. Alarm trim was measured at ~$0.40/mo of truly unused alarms and is not taken here.
+
+Honest limit: a stop does not stop the bill. The volume, alarms and IP keep billing (~$3.5/day), so a month that trips the $170 stop ends a little above it.
+
+## OPERATOR RULING 2026-09-23 — September kill-ceiling $150 → $225; October clamped back to $150
+
+Operator, 2026-09-23 (verbatim, typos preserved):
+
+> "see as of now for this month alone accept this billing but from next mponth onwards try to keep it within 150 usd and monitor track cpature evruthign entirley dude okay?"
+
+Full record, measured position and lever table: `daily-universe-scope-expansion-2026-05-27.md` §0 Quote 23.
+
+| | Value |
+|---|---|
+| September actual / forecast (2026-09-23) | $141.36 / $188.45 |
+| Four lockstep sites for September | **$225** (native 90% line $202.50) |
+| Standing cap from October | **$150** — enforced in `hard_stop_guard::effective_budget_kill_usd` (UTC billing month), and the four sites revert to $150 by a scheduled 1-Oct PR |
+| October projection at today's config | ~$150 pre-tax, ~$175–180 with tax — **over $150 unless an operator lever is taken** |
+
+Honest limit: until the 1-Oct revert PR merges, the native budget notifications and actions sit at percentages of $225. The code clamp is what holds October at $150 in the meantime.
+
+2026-10-01 (audit PR30b): the revert. All four sites read $150; the native 90% action line is $135.00 again.
 
 ## OPERATOR RULING 2026-08-19 — kill-ceiling RAISED $100 → $130 (gp3 IOPS 3000→6000 + throughput 125→500)
 
@@ -923,6 +1066,60 @@ high one. It widens the runway; the pressure-triggered archival landing alongsid
 what bounds the disk, and even that escalates rather than deletes when two days of data
 exceeds the volume. **One-way door:** gp3 grows online and can never shrink.
 
+### 2026-08-21 — BOTH raises are APPLIED AND VERIFIED LIVE, and the first full-scale session measured the burn
+
+Verified post-close (box stopped, 17:47 IST) against the live account, not inferred:
+
+| Fact | Live reading |
+|---|---|
+| Root volume | **`vol-0c6ab6e593e39d8c8`** — 200 GiB gp3, **6000 IOPS**, **500 MiB/s**, in-use |
+| Instance | `i-0c3fe906dad5492fc`, r8g.xlarge, ap-south-1b, stopped |
+| IOPS modification | 3000 → 6000, state `completed`, started 2026-08-20T12:15:58Z |
+| Filesystem followed? | **yes** — `tv_spill_dir_free_bytes` read **200.6 GB free** at 09:30 IST |
+
+So Quote 16 (size) and Quote 17 (IOPS + throughput) are both LIVE, and the
++$9.12 + $30.00 = **$39.12/mo** they authorize is now actually being billed. The
+$130 ceiling raised in the same change is what covers it.
+
+**⚠ The volume id recorded in the rule files was the RETIRED box's.**
+`vol-073ccaa417a0f344b` is gone with `i-0b956d0209231a48b`. Any volume operation
+must re-describe first; a fail-closed `confirm_volume_id` guard fed from a rule
+file would have targeted a volume that no longer exists.
+
+**The measurement that matters more than the grow — the burn rate.**
+`tv_spill_dir_free_bytes` across the first full-universe Full-mode session:
+
+| 2026-08-21 IST | Free |
+|---|---|
+| 09:30 | 200.6 GB |
+| 11:30 | 179.3 GB |
+| 13:30 | 158.0 GB |
+| 15:30 | 138.1 GB |
+
+**~71 GB consumed in one session** (209.5 GB free at 00:00Z → 138.1 GB at 10:00Z),
+against **~10–20 GB/day** for the whole week of 14–18 August. That is a **4–7×
+step change**, and it is not a surprise: Full mode went live 2026-08-19 (162 B
+packets replacing 50 B — the 3.24× this file predicted) and the ~24,600-contract
+universe landed on top of it. The modelled range in the Quote 16 note was
+21 GB/day at one depth snapshot per second and 104 GB/day at five; the measured
+71 GB/day sits inside it, nearer the top.
+
+**Runway, stated plainly.** Usable filesystem ≈ 210 GB. The `tv-prod-disk-used-high`
+alarm fires at 75% ≈ 157.5 GB used, i.e. ~52.5 GB free. From Friday's close at
+138.1 GB free, one more session of this size lands near that line. What is
+supposed to prevent it is the STORAGE-GAP-05 pressure archival added 2026-08-19,
+which frees partitions past its 2-day floor — at 71 GB/day that implies a steady
+state near 142 GB resident, about 68% of usable, roughly **15 GB under the alarm**.
+Thin, by design, and **UNMEASURED across a weekend**: free space did NOT visibly
+reclaim between 20 and 21 August (209.5 → 209.5 GB), so whether the archival keeps
+pace at this new rate is a Monday measurement, not a claim.
+
+**NOT claimed:** that a further grow is needed, or authorized. Quote 17's own
+warning binds here — the $130 ceiling clears the $112.72 bill by **$4.28**, so the
+next cost increase of any size must raise the ceiling in the same change. If
+Monday shows archival failing to keep pace, the choice between growing again
+(one-way, and over the ceiling) and cutting ingest scope is the operator's.
+
 ## COST NOTE 2026-08-19 — STORAGE-GAP-05 pressure-archival alarm (+~$0.10/mo)
 
 Authority: feed-hardening plan Item 5 design addendum. The Critical-severity
@@ -952,3 +1149,711 @@ them), so "the disk is healthy again" is a true statement worth sending.
 **NOT claimed:** that this prevents a full disk. It reports that the automation has
 reached the end of what it is permitted to do. The remedy — grow the volume, or cut
 ingest scope — is the operator's, deliberately.
+
+## COST NOTE 2026-08-25 — cross-verify blind pages + 6 unwatched Lambdas (+~$0.80/mo)
+
+Authority: operator 2026-08-25, *"Fix wbrytjonf dude oaku"*, recorded verbatim in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3f BEFORE this terraform, per the
+rule-file-first law.
+
+**+8 alarms ≈ $0.80/mo.** TWO errcode log-filter alarms
+(`ws-gap-03-xverify-vacuous` + `-failed`, `error-code-alarms.tf`) plus six `AWS/Lambda` `Errors`
+alarms. **Zero new EMF names and zero user-data bytes** — the errcode lane derives
+its metric from a log stream that already exists, and the Lambda alarms read an AWS
+namespace we do not publish.
+
+**Measured against the live account the same day**, rather than against the planning
+envelope: August MTD actual **$48.87**, AWS forecast **$61.51**, ceiling **$130**
+with the 90% `STOP_EC2_INSTANCES` action line at **$117**. The Quote 19 hard maximum
+is $150. Eighty cents is inside every one of those with room to spare, and it is
+named here rather than absorbed because this file's own history shows round "it's
+only a dime" additions accumulating into the ~$3.27/mo CloudWatch line that the
+2026-07-31 ruling then had to account for.
+
+**Why the cross-verify dime earns itself.** The 15:41 comparison is the only ground
+truth the revived Dhan feed has — the one check that distinguishes a lane that is
+capturing real ticks from one that is merely dialling. Both of its failure verdicts
+reached nothing: the counter is in neither EMF selector copy, and the log line
+carries `WS-GAP-03`, a code with ~50 emit sites. A vacuous run reporting "no
+mismatches" is the false-OK class this repo has retired twice.
+
+**Why the six Lambda dimes earn themselves.** They were not a decision. 13
+`aws_lambda_function` resources, 7 alarmed, 6 not — each of the six created by a PR
+that did not think to add one. Among them: the Lambda that STARTS the trading box
+every morning, and the one that force-stops it when it runs out of window or over
+budget. A throwing invocation writes to its own log group and stops there.
+
+**The ratchet is the part that lasts.** Six alarms fix today's list;
+`every_lambda_has_an_errors_alarm_or_a_declared_exemption` stops the seventh Lambda
+arriving unwatched, which is how these six accumulated in the first place.
+
+**NOT claimed:** an `Errors` alarm catches a Lambda that THROWS. A Lambda that
+returns success having done nothing useful is invisible to it — `start_watchdog`'s
+separate not-invoked alarm exists precisely because a dropped schedule produces no
+error at all, and that class is unchanged.
+
+## COST NOTE 2026-08-25 (SECOND, same day) — the two disk/WAL gauges that were shipping unwatched (+~$0.20/mo)
+
+**Authorization:** `dhan-rest-only-noise-lock-2026-07-14.md` §2.3g (operator
+2026-08-25, naming "disk rpessure ... ram wal disk spill" and ruling out human
+monitoring). Recorded there before the terraform, per the rule-file-first law.
+
+**What was added:** two CloudWatch alarms, `tv-prod-spill-dir-free-low`
+(`tv_spill_dir_free_bytes` ≤ 20 GiB) and `tv-prod-questdb-wal-suspended`
+(`tv_questdb_wal_suspended_tables` ≥ 1).
+
+**Cost: +2 alarms × $0.10 = ~$0.20/mo. NO new EMF metric name and no
+user-data byte** — both gauges were ALREADY EMF-selected and already reaching
+CloudWatch. This is the cheapest class of fix available on this account, and
+it is the only class available at all: the user-data template renders at
+exactly its 15,872-byte budget with **zero** free (§2.3d-ii of the noise lock),
+so an alarm needing a new EMF name cannot ship today.
+
+**Why it was worth spending.** MEASURED from the live account, 2026-08-25:
+
+| IST | free bytes | suspended tables |
+|---|---:|---:|
+| 08:30 | 38.8 GB | 0 |
+| 09:30 | 14.5 GB | 0 |
+| 10:30 | **20,480** | 3 |
+| 11:30 | 20,480 | **15** |
+| 13:30 | 58.6 GB | 0 |
+
+The account was already paying to publish both series. Neither had an alarm,
+so the hour of warning between 38.8 GB and 14.5 GB reached nobody, and a
+three-hour full disk that suspended fifteen tables surfaced only when the
+operator asked why a table was empty. Paying $0.30/mo to ship a number and
+$0.00 to watch it is the worst of both.
+
+**Bill impact.** The measured high-side month on the current configuration is
+$118.28 (Quote 19 arithmetic: 22 weekdays × $4.06 + 8 weekend days × $2.48,
+plus the 300 GB grow). This adds $0.20 → **$118.48**, still under the operator's
+$125 hard cap (Quote 18) and still **$1.48 ABOVE** the budget's automatic
+`STOP_EC2_INSTANCES` line at 90% of the $130 `limit_amount` = $117.00.
+
+That last figure is unchanged in kind by this note but worth restating rather
+than letting a fifth small addition hide it: **a maximal month now projects
+above the line that switches the trading box off.** August itself is nowhere
+near it (actual $49.90 / forecast $65.42, read live the same day), so nothing
+fires today. The two levers remain what Quote 19 recorded — release the Elastic
+IP (already approved in principle by Quote 10, −$3.60/mo) or align
+`limit_amount` with the $125 cap, which cannot be done as written because 90%
+of 125 is $112.50, below the projected bill.
+
+**⚠ And the kill-switch state is still unverifiable, for the fifth time:**
+`budgets:DescribeBudgetActionsForBudget` remains `AccessDenied` for
+`user/claude-code-agent`, so whether the two `STOP_EC2_INSTANCES` actions
+recorded in `EXECUTION_FAILURE` on 2026-07-31 still fail is **Unknown**. If
+they are broken the $117 line is arithmetic about a switch that does not
+throw; if they are fixed the box gets stopped mid-month. A broken safety net
+is never a reason to cross a threshold.
+
+## COST NOTE 2026-08-25 (THIRD, same day) — the byte budget that blocked three counters was already freed (+~$1.00/mo)
+
+Authorization: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3h, operator quote
+2026-08-25 ("Yes go ahead fix and resolve everything"), recorded before the
+change per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_wal_suspension_probe_failed_total` EMF name | $0.30 |
+| `tv_candle_session_high_recovered_total` EMF name | $0.30 |
+| `tv_candle_session_low_recovered_total` EMF name | $0.30 |
+| `tv-<env>-questdb-wal-probe-failed` alarm | $0.10 |
+| **Total** | **~$1.00/mo** |
+
+**Zero user-data bytes**, which is the part worth recording. Every prior note on
+this surface priced an EMF name at 33 bytes against a template with none to
+spare — §2.3d-ii measured it at exactly 15,872 of 15,872 on 2026-08-22. #1815
+then moved the selector OUT of `user-data.sh.tftpl` into
+`deploy/aws/cloudwatch-agent.json`, `cp`'d in after the Step 5 clone, and
+`cw_agent_selector_lockstep_guard` now FORBIDS a second copy. The template
+renders **13,869** today. The byte cost of an EMF name is now nil, and the
+figure that said otherwise was repeated by citation four times after it stopped
+being true.
+
+**Two names deliberately NOT shipped**, saving $0.60/mo:
+`tv_candle_day_high_adopted_total` and `day_low_adopted_total` fire on the first
+bucket of a session only — 0 and 3 today against the session counters' 2,632 and
+247. Same mechanism at ~1% of the resolution.
+
+**Budget position, stated rather than absorbed.** The COST NOTE above (SECOND,
+same day) put a maximal month at **$118.28** against the 90%
+`STOP_EC2_INSTANCES` line of **$117.00** at the live `limit_amount` of $130 —
+already $1.28 over. This takes it to **~$119.28**, about $2.28 over. The live
+account is far below that (MTD **$48.87**, forecast **$61.51**, both measured
+2026-08-25), so no stop is imminent, but the maximal-month arithmetic crosses
+the automatic action line and widens with each addition. The levers are
+unchanged and neither is taken here: the already-approved Quote 10 EIP release
+(−$3.60/mo, bundled with an instance recreate), or an operator decision on
+`limit_amount` — which Quote 18 forbids raising above 125, and which cannot be
+set to 125 because 90% of that is $112.50, below the bill.
+
+---
+
+## ⚠ CORRECTED 2026-09-06 — the four `EXECUTION_FAILURE` flags in this file are STALE
+
+The automatic budget actions are NOT failing. Read live 2026-09-06 with
+`describe-budget-actions-for-budget` (a call this file records as permanently
+`AccessDenied`): the read **succeeds**, and both actions are **`STANDBY`** —
+armed and healthy — targeting `i-0c3fe906dad5492fc`, firing at 90% ($135.00) and
+100% ($150.00) of the $150 limit.
+
+The live September forecast is **$142.24**, i.e. **$7.24 past the line that
+automatically stops the production trading box**.
+
+Measured driver (Cost Explorer, Sep 1-6): **EBS $88.92/mo (rate-derived from live usage)** at the live
+600 GB / 6000 IOPS / 500 MiB/s volume — 66% of the action line before compute.
+The Elastic IP is **$3.60/mo** and does not close the gap alone.
+
+Full record: `dhan-rest-only-noise-lock-2026-07-14.md`, same date. The four flags
+below are retained verbatim per house convention; where they conflict with this
+banner, the banner wins.
+
+---
+
+## RAM NOTE 2026-09-10 — tick-rule net volume (+~15 MB host RAM, +$0.00/mo)
+
+**Why this note exists at all.** Two compile-time asserts in `crates/trading`
+carry the instruction *"update aws-budget.md before raising"*, and both FIRED
+on this change rather than being remembered afterwards. This is that update.
+The guards did their job: an 8-byte field that looks free multiplies by
+`AGGREGATOR_MAX_SLOTS × TF_COUNT`, and the number below is what that
+multiplication actually comes to.
+
+**The change.** `LiveCandleState` gains `net_volume_signed: i64` — the tick-rule
+net-volume accumulator that replaced a seal-time derivation which had the WRONG
+SIGN whenever a bar's flow and its close disagreed. Struct size **128 → 136
+bytes**, MEASURED, not estimated.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` (`aggregator_cell.rs`) | `TF_COUNT × 128 × 2 + …` = 6,400 B/instrument | `TF_COUNT × 136 × 2 + …` = 6,784 B/instrument | ~160 MB → **~170 MB** at the 25,000-slot ceiling |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 144 B | ≤ **152** B | ring is `SEAL_BUFFER_CAPACITY` (600,000) × this: 86.4 MB → **91.2 MB** |
+| **Total** | | | **~+15 MB** |
+
+> **⚠ CORRECTED 2026-09-19 — every figure in the table above fell by 2.67×,
+> and the one that matters is the ring.** The 2026-09-18 governing directive's
+> nine-frame collapse took `TF_COUNT` **24 → 9** on 2026-09-19, and both
+> budgets are DERIVED from it:
+>
+> | Budget | as written 2026-09-10 | after the collapse |
+> |---|---|---|
+> | `SEAL_BUFFER_CAPACITY` = `AGGREGATOR_MAX_SLOTS × TF_COUNT` | 600,000 | **225,000** |
+> | ring at ≤ 144 B | 86.4 MB | **32.4 MB** |
+> | ring at ≤ 152 B | 91.2 MB | **34.2 MB** |
+> | the raise's own fleet delta | +4.8 MB | **+1.8 MB** |
+> | `MAX_AGGREGATOR_CELL_BYTES` at 136 B | 6,784 B/instrument *(see below)* | **2,797 B/instrument** |
+> | aggregator table at the 25,000-slot ceiling | ~170 MB | **~70 MB** |
+> | **Total delta of the 2026-09-10 raise** | ~+15 MB | **~+5.4 MB** |
+>
+> **The RAISE is unchanged in shape — it is the ring that shrank**, so nothing
+> about the 2026-09-10 decision is revisited here; only its fleet arithmetic
+> is re-derived. Dollar cost remains **ZERO**: no instance change, no EBS
+> change, no new CloudWatch metric, no new alarm, no EMF name.
+>
+> Recorded as a dated correction rather than an edit in place because
+> `seal_ring.rs`'s own module header carried this same product as a literal
+> and went stale **twice in five weeks** (2026-08-14 at 21 → 24, and again
+> today at 24 → 9). The three struct-size asserts that point here
+> (`live_candle_state.rs`, `seal_ring.rs` ×2) each say *"update aws-budget.md
+> before raising"*, so this file is the one that tracks it — and a figure in
+> this file is a product of `TF_COUNT`, not a constant. **Verify against
+> `TF_COUNT` rather than trusting these numbers if you are reading them long
+> after 2026-09-19.**
+>
+> **⚠ A SECOND, INDEPENDENT staleness found while re-deriving, recorded
+> because it is the more dangerous of the two.** The `6,784 B/instrument`
+> above does not match the live formula at TF_COUNT=24 either — that formula,
+> `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160`, gives **7,192** at 24. The
+> per-frame scalar term widened (`× 4` → `× 21`) after 2026-09-10 and this
+> table was never re-derived, so the row understated the per-instrument budget
+> by ~6% on the day it was written and no one noticed for nine days. The
+> "after the collapse" column is computed from the formula **as it stands
+> today**, not by scaling the stale figure: 9 × 272 + 9 × 21 + 160 = **2,797**,
+> and 2,797 × 25,000 = **~70 MB**. The 2026-09-10 raise's own delta likewise
+> re-derives from the formula rather than from the old total: at TF_COUNT=9 the
+> 128-byte form is 2,653 and the 136-byte form is 2,797, so **+144 B per
+> instrument = +3.6 MB** at the ceiling, plus the ring's +1.8 MB = **+5.4 MB**.
+>
+> The lesson is narrower than "numbers go stale": this row is a product of
+> **two** inputs that each moved independently, and scaling the recorded total
+> by the one you noticed silently carries the other's error forward. Re-derive
+> from the constants, never from the previous row.
+
+Against the r8g.xlarge's 32 GiB (operator Quote 13) that is **0.046%** of the
+host. The aggregator table moves 0.49% → 0.52% of the machine.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new CloudWatch
+metric, no new alarm, no EMF name. The September position is unmoved: read live
+2026-09-06, `limit_amount` **$150**, the 90% `STOP_EC2_INSTANCES` action line
+**$135.00**, forecast **$142.24** — already $7.24 over that line, and this
+change neither helps nor worsens it.
+
+**Why both budgets keep a LITERAL rather than `size_of::<LiveCandleState>()`.**
+Deriving a budget from the thing it bounds makes it unable to fail on exactly
+the change it exists to catch — it would still catch a change to the CELL's own
+layout while silently permitting unbounded growth of the state inside it. Both
+asserts are stated at the sites; a budget that cannot fail is not a budget, and
+these two are the reason this note has a measured number in it instead of a
+guess.
+
+**What is NOT claimed.** This is a RAM note, not a disk note. The `net_volume`
+column already existed in the candle DDL and is written as before, so
+`market_data` storage is unchanged. The 128-byte on-disk seal-spill record is
+UNCHANGED and byte-full, so a spilled-and-replayed bar persists `net_volume =
+NULL` rather than carrying the accumulator — recorded as outstanding in
+`seal_spill.rs`, because a format bump plus a mixed-stride reader is not a
+change to make beside a hot-path one.
+
+## RAM NOTE 2026-09-11 — unattributed volume carry (+10.8 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` carries the instruction
+*"update aws-budget.md before raising"*, and it FIRED on this change. This is
+that update — the same discipline as the 2026-09-10 note above, and the second
+time in two days that assert has turned an invisible per-field cost into a
+measured fleet number before the change shipped rather than after.
+
+**The change.** `AggregatorCell` gains a per-timeframe carry for volume a
+frame was told about by a tick it could not fold — `[u64; TF_COUNT]` gross,
+`[i64; TF_COUNT]` signed, `[bool; TF_COUNT]` unclassified — so a late tick's
+units land in a bar instead of no bar at all. Plus one more
+`[bool; TF_COUNT]`: a per-frame flag recording that a cumulative-counter
+restart has broken that frame's right-endpoint chain, so the next bucket it
+opens anchors on the live counter rather than on a number from the erased axis.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 136 × 2 + TF_COUNT × 4 + 160` = 6,784 B allowed, **6,568 B actual** | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 7,192 B allowed, **7,000 B actual** | ~164 MB → **~175 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
+
+Both actuals are MEASURED with `size_of`, not estimated. Against the
+r8g.xlarge's 32 GiB (operator Quote 13) the delta is **0.03%** of the host.
+`BufferedSeal` and `SEAL_BUFFER_CAPACITY` are UNCHANGED — the carry lives on
+the cell and never enters a sealed bar or the spill record.
+
+**What it buys, measured rather than argued.** Security 68407, 2026-09-11:
+`candles_1s` gross 1,068,340 against `candles_5s` and `candles_1m` 1,071,330 —
+the seconds frame **2,990 units and 650 of net short** of the minute frame, on
+the same ticks, because a frame that refused a late tick had nowhere to put its
+volume. 10 MB for conservation across all 24 frames is the cheapest line in
+this budget.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new alarm, no new
+EMF name. `tv_candle_volume_carried_unattributed_total` is deliberately local
+`/metrics` only: a rising value is NORMAL (~10% of live ticks arrive late) and
+it measures the mechanism WORKING, so a series would chart ordinary behaviour
+at ~$0.30/mo. The September position is unmoved and is restated rather than
+inherited — read live 2026-09-06, `limit_amount` **$150**, the 90%
+`STOP_EC2_INSTANCES` action line **$135.00**, forecast **$142.24**, already
+$7.24 over that line. This change neither helps nor worsens it, and the noise
+lock's standing rule (the next addition arrives with a LEVER, not a cost note)
+is the reason no EMF name ships here.
+
+**What is NOT claimed.** A RAM note, not a disk note: no candle column is added
+and the on-disk seal-spill record is unchanged in size and format. The carry is
+process state only — it never crosses the day boundary, and a counter restart
+drops it deliberately, because it is a difference measured against a baseline
+the restart erased.
+
+---
+
+## RAM NOTE 2026-09-19 — per-bucket receipt stamps for the three delay pairs (+10.8 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` carries the instruction
+*"update aws-budget.md before raising"*, and it FIRED again. This is that
+update — the third time in nine days that assert has turned an invisible
+per-field cost into a measured fleet number before the change shipped. This
+time `BufferedSeal`'s own bound in `crates/trading/src/candles/seal_ring.rs`
+fired alongside it, so BOTH budgets move in one change.
+
+**The change.** `LiveCandleState` gains exactly TWO `i64` fields —
+`first_receipt_ist_nanos` and `last_receipt_ist_nanos` — so a sealed bar can
+answer three questions the candles table now has columns for: how long after
+the window opened the first trade in it reached us, how long before the window
+closed the last one did, and how far apart those two arrivals were.
+
+**Two, not three, and that is the point.** The three delays are DERIVED at seal
+time from those two stamps plus the bucket's own start and its timeframe's
+length. Storing the three answers per OPEN bucket would have paid for them
+`× TF_COUNT × AGGREGATOR_MAX_SLOTS` — fleet RAM for arithmetic that costs
+nothing once, at the one moment a bar is sealed.
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `MAX_AGGREGATOR_CELL_BYTES` (`aggregator_cell.rs`) | `TF_COUNT × 136 × 2 + TF_COUNT × 21 + 160` = 2,797 B allowed, **2,632 B actual** | `TF_COUNT × 152 × 2 + TF_COUNT × 21 + 160` = 3,085 B allowed, **2,920 B actual** | 65.8 MB → **73.0 MB** at `AGGREGATOR_MAX_SLOTS` (25,000) |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 152 B, **152 B actual** | ≤ 168 B, **168 B actual** | 34.2 MB → **37.8 MB** at `SEAL_BUFFER_CAPACITY` (225,000) |
+| **Total** | | | **+10.8 MB**, 0.0314% of the 32 GiB host |
+
+Every actual above is MEASURED with `size_of` on 2026-09-19, not estimated:
+`LiveCandleState` 152 · `AggregatorCell` 2,920 · `BufferedSeal` 168 ·
+`TF_COUNT` 9 · `AGGREGATOR_MAX_SLOTS` 25,000 · `SEAL_BUFFER_CAPACITY` 225,000.
+
+> **⚠ 2026-09-27 (audit PR40a) — these are the 2026-09-19 figures, and one
+> input has moved since.** `M10` became a native frame on 2026-09-22, so
+> `TF_COUNT` is **10** and `SEAL_BUFFER_CAPACITY` is **250,000**: the ring at
+> 168 B is **42.0 MB**, not 37.8 MB. The same capacity sizes the writer
+> channel (lazy, up to ~42 MB) and the escalation queue (committed up front,
+> ~36 MB), so up to **750,000** sealed candles can sit in memory at once
+> across the three, and a crash loses whatever they hold. Audit PR40a counts
+> that loss (`tv_seal_unwritten`, and a marker the next boot reports); it
+> does not change any of these sizes.
+
+**The figures are RE-DERIVED from those constants, never scaled from the row
+above.** The 2026-09-11 note's fleet numbers (~164 MB → ~175 MB) were correct
+when written at `TF_COUNT = 24` and are now arithmetically stale — the
+operator's nine-frame collapse cut the cell array to nine entries the same
+week. Scaling that row forward would have carried a second, independent error
+into this one; that exact failure is what `aws-budget.md` already records
+against itself, so this note starts from `TF_COUNT` and re-multiplies.
+
+**⚠ `BufferedSeal` now sits EXACTLY on its bound with zero slack.** 168 allowed,
+168 actual. The next field added to `LiveCandleState` fails the const-assert on
+the first build, which is the assert working — but it means the next change in
+this area is a budget decision, not an incidental one. The doc comment above
+that struct still read *"Sized ≤ 128 bytes"* until today, two raises behind the
+assert; it is corrected in the same change.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new CloudWatch
+metric, no alarm, no EMF name — the three delays land as columns in a table the
+operator already reads, which is why they cost nothing to observe. The
+September position is restated rather than inherited: read live 2026-09-06,
+`limit_amount` **$150**, the 90% `STOP_EC2_INSTANCES` action line **$135.00**,
+forecast **$142.24** — already $7.24 over that line. This change neither helps
+nor worsens it, and the noise lock's standing rule (the next addition arrives
+with a LEVER, not a cost note) is the reason no EMF name ships here.
+
+**What is NOT claimed.** A RAM note, not a disk note: the on-disk seal-spill
+record is unchanged in SIZE (`SEAL_SPILL_RECORD_SIZE = 128`, byte-for-byte
+full) and the two stamps are deliberately NOT carried in it — a spilled-and-
+replayed seal arrives with both at `0`, which is already the documented
+`WAL_RECEIPT_UNKNOWN_NANOS` convention, so all six delay columns render NULL
+rather than claiming a zero delay. No format bump, no stride change, no new
+flag. The candles table's own row width DOES grow by six columns; that is a
+disk figure and it is not measured here.
+
+---
+
+## RAM NOTE 2026-10-01 — the open's trade second, `open_ts_ist_secs` (plan item R6) (+6.0 MB host RAM, +$0.00/mo)
+
+**Why this note exists.** Both budget asserts fired again, as the 2026-09-19
+note above predicted ("the next field added to `LiveCandleState` fails the
+const-assert on the first build"): `MAX_AGGREGATOR_CELL_BYTES` in
+`crates/trading/src/candles/aggregator_cell.rs` and `BufferedSeal`'s bound in
+`crates/trading/src/candles/seal_ring.rs`. This is the update both ask for.
+
+**The change.** `LiveCandleState` gains ONE `u32`, `open_ts_ist_secs`: the
+exchange second of the trade that set the bar's `open`. With it, both fold
+paths (the open bucket and the late amendment of the last sealed bar) give the
+open to a STRICTLY earlier trade, as they already gave the close to the latest
+one. Before it, the open was the first tick to ARRIVE, and the feed reorders
+inside a bucket. `0` pins the exchange's official day open. The field is NOT
+persisted: the seal-spill record keeps its 128 bytes.
+
+**Why one `u32` costs eight bytes.** The payload was 149 bytes padded to 152,
+so 3 bytes of slack. One more `u32` makes 153, padded to 160. The
+`net_volume_classified` flag no longer sits in free padding on its own; the two
+share the last 8-byte word (pinned by
+`the_classified_marker_and_the_open_stamp_share_one_word`).
+
+| Budget | Was | Now | Fleet delta |
+|---|---|---|---|
+| `LiveCandleState` | 152 B | **160 B** | per state |
+| `MAX_AGGREGATOR_CELL_BYTES` | `TF_COUNT × 152 × 2 + TF_COUNT × 21 + 160` = 3,410 B allowed, **3,248 B actual** | `TF_COUNT × 160 × 2 + TF_COUNT × 21 + 160` = 3,570 B allowed, **3,408 B actual** | +160 B per instrument; 81.2 MB → **85.2 MB** at `AGGREGATOR_MAX_SLOTS` (25,000), **+4.0 MB** |
+| `BufferedSeal` (`seal_ring.rs`) | ≤ 168 B, **168 B actual** | ≤ 176 B, **176 B actual** | 42.0 MB → **44.0 MB** at `SEAL_BUFFER_CAPACITY` (250,000), **+2.0 MB** |
+| **Total** | | | **+6.0 MB**, 0.017% of the 32 GiB host |
+
+Every "Now" actual is MEASURED with `size_of` on 2026-10-01:
+`LiveCandleState` 160 · `AggregatorCell` 3,408 · `BufferedSeal` 176 ·
+`TF_COUNT` 10 · `AGGREGATOR_MAX_SLOTS` 25,000 · `SEAL_BUFFER_CAPACITY` 250,000.
+The "Was" cell actual is derived (3,408 − 10 × 8 × 2), not separately
+measured. Re-derived from the constants at `TF_COUNT = 10`, not scaled from
+the 2026-09-19 row (which was written at `TF_COUNT = 9`).
+
+The same `SEAL_BUFFER_CAPACITY` also sizes the writer channel and the
+escalation queue (see the 2026-09-27 box above). Each holds `BufferedSeal`s,
+so each grows by the same 8 B per entry, up to a further ~2.0 MB apiece at
+capacity. That is not counted in the total above.
+
+**`BufferedSeal` is again EXACTLY on its bound with zero slack.** 176 allowed,
+176 actual. The `AggregatorCell` bound keeps the 162 B of slack it had.
+
+**Dollar cost: ZERO.** No instance change, no EBS change, no new metric, alarm
+or EMF name. This is RAM on the existing host.
+
+---
+
+## COST NOTE 2026-09-24 — `tv_dhan_ws_lag_max_ms`, the worst feed delay per minute (+~$0.30/mo, NO alarm)
+
+**Authorization:** operator, 2026-09-24, verbatim: *"i dont want any agps ir any
+issues dude can you coevr all tehse dude okay?Always achieve O(1) everywhere."*
+Given in direct response to the Feed Watchtower report, whose first open row was
+*"Feed delay is not in CloudWatch — it is on the box only."* Recorded here before
+the selector change, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_dhan_ws_lag_max_ms` EMF name | $0.30 |
+| Alarm | **none** — $0.00 |
+| **Total** | **~$0.30/mo** |
+
+**Why one gauge, not the histogram.** The per-socket histogram
+`tv_dhan_ws_lag_ms` has 16 connection labels; the EMF processor folds labels
+to `{host}` by summing, so shipping it would publish a meaningless sum of
+sixteen distributions. One window-maximum answers the question an operator asks
+— "was any socket slow in the last minute?" — for one name.
+
+**Budget position, read live 2026-09-24, not inherited.** September: actual
+**$149.68**, forecast **$192.09**, limit **$225** (the one-month Quote 23
+ceiling). October returns to **$150**, enforced in code by
+`effective_budget_kill_usd`, and the October projection sits at about that
+line. This note adds 0.2% of it.
+
+**§2.3n's lever rule is NOT satisfied, and this note does not pretend
+otherwise.** No lever is taken. That is also why NO alarm ships: an alarm is
+the part that needs a lever, and the gauge alone is visible on the dashboard at
+a third of the price. Paging on it is a separate decision.
+
+**What is NOT claimed.** That the number is the network's delay: it is receipt
+time minus the vendor's last-trade stamp, whole-second resolution, so it
+includes the ±1 s truncation floor. For about the first minute after a restart
+it can show a quiet contract's age rather than a delay — the first packet of a
+contract never seen before carries its old trade time. Repeats are excluded
+(2026-09-23 FIFTH), and WAL-replayed frames are excluded.
+
+---
+
+## COST NOTE 2026-09-25 — three delay pages: feed delay, main-feed reconnect time, blank new depth contracts (+~$1.30/mo)
+
+**Authorization:** operator, 2026-09-25, verbatim: *"go ahead with all of these
+dude okay?"*. Given in direct response to a list whose first row priced this
+work at *"about ₹40 a month each"*. The full contract is in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.6. It is recorded here before the
+terraform, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| `tv_dhan_ws_main_reconnect_recovery_max_ms` EMF name | $0.30 |
+| `tv_depth_first_packet_silent_total` EMF name | $0.30 |
+| `tv_depth_first_packet_arrived_total` EMF name | $0.30 |
+| `dhan-feed-delay-high` alarm (1 metric) | $0.10 |
+| `dhan-main-reconnect-slow` alarm (1 metric) | $0.10 |
+| `dhan-depth-new-contract-blank` alarm (metric math over 2 metrics) | $0.20 |
+| **Total** | **~$1.30/mo** (the operator's figure was ~₹40 × 3 ≈ $1.40) |
+
+**Budget position, read live 2026-09-25, not inherited.** September: actual
+**$154.24**, forecast **$192.79**, limit **$225** (the one-month Quote 23
+ceiling). October returns to **$150**, enforced in code by
+`effective_budget_kill_usd`. The October projection is already about $150 before
+tax, so this change adds about 0.9% to a month that is projected at the line
+without it.
+
+**§2.3n's lever rule is NOT satisfied.** No lever is taken here. The operator
+authorized the spend knowing the price. The October overrun is a separate open
+decision, and it existed before this change. The largest recorded lever is still
+the gp3 IOPS/throughput revert (−$34.20/mo). That lever has a tick-loss
+consequence, so it remains the operator's call.
+
+**What is NOT claimed.** That the three thresholds are measured-optimal (see
+§2.6). That these alarms reduce cost or risk; they only make delay visible.
+
+## COST NOTE 2026-09-29 — raw WAL frames to S3, no expiry, versioning on (+$6–12/mo, Assumed)
+
+**Authorization:** operator Quotes 27 + 28, 2026-09-29, recorded verbatim in
+`docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
+("NOTHING IS EVER MISSED OR DELETED"). That section says this cost is "Recorded
+in `aws-budget.md`"; it was not, until this note (added 2026-10-01, Item 48 of
+`active-plan-feed-hardening.md`).
+
+| Item | Basis | Cost |
+|---|---|---:|
+| Raw WAL segments in `s3://tv-prod-cold/raw-frames/` (ITEM 45e) | MEASURED input on the box 2026-09-29: 25.0 GB raw per session, gzip-1 ratio 0.46, so about 11.5 GB per session and about 250 GB per month, tiered to Deep Archive after 30 days | ~$6–12/mo in year one |
+| S3 expiration removed, versioning enabled on `tv-prod-cold` (ITEM 45f) | existing objects stop expiring; overwritten or deleted objects keep a prior version | included above; grows each year |
+
+**Status on 2026-10-01: NOT YET SPENT.** Neither 45e nor 45f has landed (no
+`raw-frames/` uploader exists and `main.tf` still carries
+`expiration { days = 1825 }`), so October pays nothing for this yet.
+
+**UPDATED 2026-10-01 (later the same day) — 45f has landed.** `main.tf` now
+carries no expiration on `tv-prod-cold`, versioning is `Enabled`, and
+`raw-frames/` moves to Deep Archive after 30 days. Its own cost this month is
+close to nothing: no object in the bucket is near five years old, and a
+version is kept only when an object is overwritten or deleted, which today
+happens only to per-commit deploy binaries under unique keys. The raw-frames
+line above still costs nothing until the 45e uploader exists.
+
+**What is NOT claimed.** The figure is Assumed until one month is billed, as the
+full rule file requires. It does not fit inside the $150 October line, which
+was already projected at about $150 before this (COST NOTE 2026-09-25); if the
+forecast goes over, that is a separate dated quote, per Quote 27's own
+"What this does NOT change" row.
+
+## COST NOTE 2026-10-01 — one order-audit loss counter shipped (+$0.30/mo)
+
+**Authorization:** the operator's standing go-ahead of 2026-10-01 ("don't block
+anything, everything is good to go ahead") and the zero-missing-data
+requirement of the same day, applied to plan item PR42 of
+`active-plan-audit-fixes-2026-09-26.md`.
+
+| Item | Cost |
+|---|---:|
+| `tv_order_audit_chain_lost_total` EMF name | $0.30 |
+| Sixth leg on the existing `order-audit-chain-loss` metric-math alarm | ~$0.10 |
+| **Total** | **~$0.40/mo** |
+
+Three SEBI-row losses reached no alarm: P&L audit rows discarded, leg P&L rows
+discarded, and order-push updates skipped by a consumer that fell behind. They
+share ONE new counter, labelled by `source`, instead of three EMF names: the
+agent folds the label into one summed series, the alarm needs only the sum,
+and each arm's coded log line names the source. Three names would have cost
+$0.90.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. October is projected at
+about the $150 line before this (COST NOTE 2026-09-25); this adds about 0.3%.
+
+## COST NOTE 2026-10-04 — five data-at-risk pages over ten counters (+$3.50–4.00/mo)
+
+**Authorization:** the operator tapped "Page me" on the 2026-10-04 decision
+card, which named these counters and priced them at about $3 to $4 a month.
+Recorded in `dhan-rest-only-noise-lock-2026-07-14.md` §2.9 before the
+terraform, per the rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 10 EMF names (3 cloud upload, 3 prune refused for no copy, order-update broadcast drops, log lines dropped, tick and depth inline fallback) | $3.00 |
+| 5 alarms (two 3-leg composites, one 2-leg composite, two single) | $0.50, or $1.00 if billed per referenced metric |
+| **Total** | **$3.50–4.00/mo** |
+
+**Budget position: NOT read live.** The session that wrote this had no
+read-only AWS key. The October ceiling is $150 (Quote 23) and the 2026-09-25
+note projected October at about that line before this change, so this adds
+about 2.5% to a month already projected at the line.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.
+
+## COST NOTE 2026-10-05 — six loss-group pages over 55 counters (+$2.40/mo)
+
+**Authorization:** the operator tapped "Turn on" on the 2026-10-05 decision
+card ("Turn on the six extra phone alarms (H1) and the N3 counters?"), whose
+consequence priced the change at about $2.40 a month. Recorded in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.10 before the terraform, per the
+rule-file-first law.
+
+| Item | Cost |
+|---|---:|
+| 6 derived metrics (one `tv_loss_*` per group, `host` dimension) | $1.80 |
+| 6 alarms | $0.60 |
+| 55 log metric filters on `/tickvault/<env>/metrics` | $0.00 |
+| EMF names added | 0 |
+| **Total** | **$2.40/mo (upper bound)** |
+
+Derived metrics bill only for hours with datapoints; the seeded counters
+publish a zero every scrape while the box runs, so the box's running hours set
+the real figure, at or under the line above.
+
+**Budget position: NOT read live.** The session that wrote this could not run
+a CloudWatch or Cost Explorer read. The standing ceiling is $150 from October
+(Quote 23); this adds about 1.6% of it. Against the operator's ₹15,000 cap,
+$2.40 is about ₹205 at ~₹85/$ (Assumed rate).
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The operator chose the
+spend knowing the price.
+
+## COST NOTE 2026-10-10 — log-drop page narrowed to the shipped sinks (+$0.30/mo, net $0 after stage 3)
+
+**Authorization:** `dhan-rest-only-noise-lock-2026-07-14.md` §2.9-i, recorded
+before the terraform, per the rule-file-first law. It narrows the existing
+`tv-<env>-log-lines-dropped` page (§2.9) to the two log files shipped to
+CloudWatch; it adds no page.
+
+| Item | Cost |
+|---|---:|
+| 1 filter-derived metric `tv_log_lines_dropped_shipped_total` (`host` dimension) | $0.30 |
+| 1 log metric filter on `/tickvault/<env>/metrics` | $0.00 |
+| Alarms added | 0 |
+| **Stage 1 total** | **+$0.30/mo (upper bound)** |
+| Stage 3: `tv_log_lines_dropped_total` leaves the EMF selector | −$0.30 |
+| **Net after stage 3** | **$0** |
+
+If stage 3 is skipped, the +$0.30 stays. Derived metrics bill only for hours
+with datapoints; both sliced labels are seeded at 0 at boot, so the box's
+running hours set the real figure. Metric filters on the metrics log group go
+from 60 to 61 of the 100 AWS allows per log group.
+
+**Budget position: NOT read live.** The session that wrote this had no AWS
+read. The standing ceiling is $150 (Quote 23); +$0.30 is 0.2% of it, and the
+net after stage 3 is zero.
+
+**§2.3n's lever rule is NOT met.** No lever is taken; the change is net zero
+once complete.
+
+## COST NOTE 2026-10-11 — S3 log export and 14 more loss-page counters (Assumed, at most about $5/mo)
+
+**Authorization:** the owner tapped "Logs and alarms" on the card "Prepare
+which AWS cost changes from the audit as code?", option "I write the S3 log
+export and fold the uncovered counters into the existing loss pages; no
+standby." (2026-10-11 10:26 UTC). Recorded in
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.10-a before the terraform, per
+the rule-file-first law. The export is a data copy, not a page.
+
+| Item | Cost |
+|---|---:|
+| 14 more log metric filters on `/tickvault/<env>/metrics` (61 to 75 of 100) | $0.00 |
+| Derived metrics, alarms and EMF names added | 0 |
+| 2 Firehose streams, app and Lambda logs to `s3://tv-<env>-cold/logs/` | at most about $4.70 (Assumed) |
+| S3 Standard storage for the copied logs, growing each month | about $0.40 more each month (Assumed) |
+| 1 log group for Firehose delivery errors (14-day retention) | about $0 (written only on a failure) |
+| **Total** | **at most about $5/mo in the first month (Assumed)** |
+
+**How the Firehose figure is bounded (Assumed, not measured).** Firehose bills
+per GB it receives, each record rounded up to 5 KB, at about $0.029/GB
+(us-east-1 list price; the Mumbai price was not read). The account-wide
+`logs-ingestion-runaway` alarm pages above 5 GiB a day, so the copied volume
+stays under about 161 GB a month unless that alarm is already firing. 161 GB
+at $0.029 is about $4.70. The real volume is far lower, because the metrics
+scrape group (the biggest) is not exported and the records arrive gzipped.
+No normal-day volume was read.
+
+**How the S3 figure is bounded (Assumed).** The copies stay gzipped, assumed
+about a tenth of the ingested bytes, so at most about 16 GB a month at about
+$0.025/GB-month. Nothing is deleted (Quote 27), so this line grows by about
+that much each month until a lifecycle transition is approved.
+
+**Budget position: NOT read live.** The session that wrote this had no AWS
+read. The standing ceiling is $150 (Quote 23); the upper bound above is about
+3% of it.
+
+**§2.3n's lever rule is NOT met.** No lever is taken. The owner chose the
+change knowing it adds an S3 copy.
+
+## COST NOTE 2026-10-21 — the box stays up after the close until the day's data is in the database (Quote 31, +$0–6/mo, Assumed)
+
+**Authorization:** operator Quote 31 (2026-10-21), recorded in
+`daily-universe-scope-expansion-2026-05-27.md` §0 before any code: *"until or
+unelss movign all tehse dtaa to db never evr shut down"*. The schedule
+08:30–17:30 IST becomes 08:30 until the drain hold is released, never past
+07:30 IST the next morning. Disk throughput is NOT raised (the owner declined
+it: *"why raisign budget limit spee"*).
+
+| Item | Cost |
+|---|---:|
+| Extra r8g.xlarge hours after 17:30 (about $0.19/h, from the 13 Oct record) | $0 on an evening with nothing left; ~$0.40 an evening at 2 h (Assumed) |
+| SSM writes of the hold (Standard parameter, one every 5 min while held) | $0.00 |
+| Lambda invocations (the 17:30 stop now runs through the start watchdog) | $0.00 |
+| Alarms, metrics, filters, EMF names added | 0 |
+| **Total** | **$0 to ~$6/mo (Assumed: 0–3 h on ~22 trading evenings)** |
+
+**Budget position, read live 2026-10-21 (Cost Explorer, Verified):** October
+1–20 is **$119.20** (estimated). Daily cost 13–20 Oct: $6.06, $5.52, $5.49,
+$5.53, $3.27 (Sat), $3.30 (Sun), $5.52, $4.89 (the holiday morning stop).
+Projection at that rate with NO extra hours: 8 more weekdays × ~$5.5 + 3
+weekend days × ~$3.3 ≈ $54, so **October lands near $173, above the $170 stop
+(Assumed; the tax line may be trued up at month end).** The longer evenings add
+about $0.19 per held hour on top. The $170 budget stop is NOT gated by the hold
+(Quote 31), so if October crosses it the box stops for the rest of the month,
+hold or no hold. This is reported to the owner, not acted on: raising the kill
+line needs its own dated quote.
+
+**§2.3n's lever rule is NOT met.** No lever is taken.

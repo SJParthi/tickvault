@@ -108,6 +108,7 @@ These represent missed ticks during the trading session.
 
 - **Historical REST API**: returns UTC epoch seconds → add +19800 (IST offset) before storing
 - **Live WebSocket**: `exchange_timestamp` is IST epoch seconds → store directly, NO offset
+- ⚠ 2026-11-21: from a WAL receipt of 2026-11-20 00:00 IST, Dhan sends the live LTT as UTC epoch (permanent, ticket #6684672); the core dispatcher adds exactly +19,800 s to the trade time before `ts` is computed, so `ts` is still IST epoch nanos and "NO offset" in the `ts` computation still holds (scope lock §"2026-11-21").
 - **QuestDB `ts`**: always IST epoch nanos (both sources produce same representation)
 
 ## Backfill Worker: DELETED (2026-04-17)

@@ -1,4 +1,5 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]
@@ -81,15 +82,22 @@ mod global_qcfg_tests {
     }
 }
 
+// PR AA (owner Quote 51, 2026-11-07): the lock every writer that can post into
+// an old hour shares, and the partition archiver holds alone while it copies
+// and drops one partition. Cold path, O(1) per call.
+pub mod archive_quiesce;
 pub mod boot_probe;
-// Human-readable analyst console views (`ticks_named` / `candles_named`) —
-// plain QuestDB views LEFT-joining ticks/candles_1m against the
-// instrument_lifecycle master. Cold-path console tooling only (O(join) at
-// SELECT time, honestly O(N); zero hot-path impact). (The
-// `daily_universe_fetcher` feature that once gated the lifecycle-ensure
-// call inside was deleted in PR-C3, 2026-07-14 — everything here is
-// unconditional now.)
+// 2026-09-22 ("no views anywhere"): `console_views` no longer creates any
+// view. It DROPS every retired console view name at boot, before any table
+// DDL, so a leftover `candles_10m` VIEW cannot squat the name of the real
+// `candles_10m` table. Cold path, one statement per retired name.
+// 2026-09-22: the day's option-contract names, published by the app and
+// read once per sealed bar to fill `candles_<tf>.contract`.
+pub mod candle_contract_labels;
 pub mod console_views;
+// 2026-10-10 (item 53): puts the `contract` name back on rows a boot rewrote
+// blank on 9 Oct. Cold path, once a day after the close.
+pub mod contract_name_repair;
 // C2 (2026-07-03): HTTP-CLIENT-01 — panic-free reqwest client construction.
 // Shared OnceLock probe client for the repeating QuestDB readiness probes
 // (boot + every-5s pool watchdog + every-10s SLO scheduler); typed
@@ -97,6 +105,8 @@ pub mod console_views;
 // panic fallback (Client::new() panics on TLS/resolver/fd init failure —
 // a silent tokio-task death).
 pub mod http_client;
+pub mod ilp_flush_reconnect;
+pub mod ilp_overflow;
 // SP5 (parity plan, operator directive 2026-06-02 narrowed cross-verify): ONE
 // unified post-market live-vs-backtest 1m parity audit table + writer + CSV
 // (`feed` IN the DEDUP key). Merges the two former siloed modules
@@ -104,26 +114,17 @@ pub mod http_client;
 // Groww — both DELETED in SP5). Both feeds write here. See live-feed-purity.md
 // rule 11 + docs/design/sp5-unified-parity-audit-design.md. The two old physical
 // QuestDB tables are RETAINED on disk (SEBI 5y) but no longer written.
-/// BruteX↔TickVault daily cross-verification (operator 2026-07-11): the two
-/// forensic tables — one row per divergent CELL + one per-day summary row
-/// with a keep-better outcome guard — written via ILP-over-HTTP (per-flush
-/// server ACK). See `.claude/rules/project/brutex-crossverify-error-codes.md`.
-pub mod brutex_crossverify_persistence;
-/// Cadence cross-fill visibility (operator 2026-07-20): one forensic row per
-/// cross-fill / Groww-fallback event with the precise minute + latency —
-/// the "every day, week, month, precisely at what time" system-of-record.
-/// See `.claude/rules/project/cadence-error-codes.md` §4 (CADENCE-04).
-pub mod cross_fill_audit_persistence;
-/// Daily 15:31 IST Dhan LIVE-vs-REST cross-verification audit (the revived
-/// Dhan live feed's ONLY ground truth — the wire carries no sequence number,
-/// so Dhan's own 1m tape is the only packet-loss proxy available). Cell-level
-/// findings + a daily run row whose `blind` outcome makes a zero-comparison
-/// run structurally incapable of reading as a pass (the PR #1474 lesson).
+/// Daily post-market Dhan LIVE-vs-REST 1-minute cross-verification audit.
+/// Deleted 2026-09-16, RESTORED 2026-09-24 (`no-rest-except-live-feed-2026-06-27.md`
+/// §12.15): the only external check on the captured candles, and the gate the
+/// daily S3 archive waits on.
 pub mod dhan_live_crossverify_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): one classified row per feed
 /// EPISODE (disconnect / stall / process death) with the blame verdict
 /// persisted — the month-end "who caused it" system-of-record.
 pub mod feed_episode_audit_persistence;
+// 2026-10-02: one row per live-feed reconnect gap (gap start, end, code).
+pub mod feed_gap_audit_persistence;
 /// Dual-feed scoreboard (operator 2026-07-10): the per-day per-feed
 /// scoreboard row + the per-instrument coverage detail table.
 pub mod feed_scoreboard_persistence;
@@ -131,12 +132,36 @@ pub mod feed_scoreboard_persistence;
 /// finding cell where a stored higher-TF candle disagrees with its
 /// recomputed-from-1m value (TF-VERIFY-01/02).
 pub mod tf_consistency_audit_persistence;
+// Top-volume ranking snapshots: `top_volume_rank_persistence` DELETED
+// 2026-10-22 (plan item 62, operator Quote 34). Nothing writes the four
+// `top_volume_<tf>` tables now; their partitions on the box stay on the
+// retention sweep (archive, then detach) until copied. The delay renderer the
+// candle writer shares moved to `delay_render`.
+/// Human-readable delay strings for the candle delay columns (relocated from
+/// the deleted top-volume writer, 2026-10-22).
+pub mod delay_render;
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up):
 // `tick_conservation_audit_persistence` module DELETED — the Rust WRITER
 // only; the `tick_conservation_audit` QuestDB TABLE is RETAINED on disk
 // per SEBI 5y retention (no DDL drop anywhere). The 15:40 IST audit's
 // inputs all died with the live-WS retirements + the stage-2 tick-chain
 // deletion (#1631).
+// RESTORED 2026-10-26 (plan item K4): the Dhan live lane writes `ticks`
+// again, so the daily conservation check writes new rows into the retained
+// table. `tick_conservation_ledger` is the process-side count it reads.
+/// The one-off 20 Nov repair's own audit table (daily-universe Quote 63).
+pub mod day_repair_audit_persistence;
+pub mod day_repair_coverage;
+/// The daily expiry-scope check's audit table (owner 2026-10-28).
+pub mod expiry_scope_audit_persistence;
+/// The daily live paper fill calibration report's summary row (plan item LF-7).
+pub mod live_fill_report_persistence;
+/// The once-per-session TCP + TLS handshake timing table (plan item LF-6a).
+pub mod network_rtt_session_persistence;
+pub mod table_storage_probe;
+pub mod tick_conservation_audit_persistence;
+pub mod tick_conservation_ledger;
+pub mod ws_connection_daily_persistence;
 pub mod ws_event_audit_persistence;
 // PR-E (2026-05-26): `candle_persistence` module deleted alongside the
 // `historical_candles` QuestDB table. The module had no live consumers
@@ -153,6 +178,11 @@ pub mod oom_monitor;
 // BP-08 (2026-07-01): RESOURCE-01/02/03 fd / RSS / spill-free early-warning
 // monitors — supervised poll mirroring oom_monitor + disk_health_watcher.
 pub mod resource_monitor;
+// Plan item 4 (2026-10-30): heartbeats for the long-lived background tasks the
+// hot-path telemetry does not watch, and the memory action ladder that
+// publishes them on the `tv-task-watch` thread.
+pub mod memory_watchdog;
+pub mod task_heartbeat;
 // W2 PR#6 (2026-07-10, audit follow-up row 10): WAL-SUSPEND-01 per-table
 // QuestDB WAL-apply suspension probe — supervised 60s wal_tables() poll
 // mirroring disk_health_watcher / oom_monitor / resource_monitor. A
@@ -161,13 +191,6 @@ pub mod resource_monitor;
 // questdb_health check reachability/connection, not per-table apply).
 pub mod wal_auto_resume;
 pub mod wal_suspension_watcher;
-// Sub-PR #10b-ε (2026-05-27): instrument_fetch_audit table contract —
-// schema constants + DEDUP key + FetchOutcome enum. Feature-gated under
-// `daily_universe_fetcher` per
-// `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-// Groww second-feed live-tick persistence (operator lock 2026-06-19 §32).
-// Isolated `groww_*` namespace; the Dhan path is untouched.
-pub mod groww_persistence;
 // Groww second-feed 1-minute candle persistence (operator lock §32).
 // (SP5) The Groww live-vs-backtest 1m parity audit writer was merged into a
 // unified `feed_parity_1m_audit_persistence` module, then DELETED 2026-07-15
@@ -180,17 +203,22 @@ pub mod groww_persistence;
 // partition_manager sweep-list string, per the retirement banner in
 // daily-universe-instr-fetch-error-codes.md).
 // Lifecycle table contracts (§5/§6 SEBI never-delete) — schema constants
-// + DEDUP keys + LifecycleState/TransitionKind enums + DDL/Row/append
-// helpers. PR-C3 (2026-07-14): compiles unconditionally (feature gate
-// deleted); the live writer is the Groww shared_master_writer.
+// + DEDUP keys + LifecycleState/TransitionKind enums. PR-C3 (2026-07-14):
+// compiles unconditionally (feature gate deleted). 2026-10-28 (owner Quote
+// 44): NO writer. The DDL/Row/append helpers were deleted with the daily
+// write; both tables are frozen history, kept on every keep list.
 pub mod instrument_lifecycle_persistence;
 // §31 item 2 (NTM Map-A, 2026-06-06): full index→constituents mapping table —
 // queryable both directions. Map-only (does NOT change the subscription).
 // PR-C3 (2026-07-14): compiles unconditionally (feature gate deleted).
 pub mod index_constituency_persistence;
 // Daily lifecycle reconciler — PURE decision logic (§5/§6/§23). PR-C3
-// (2026-07-14): compiles unconditionally (feature gate deleted); consumed
-// by the Groww shared_master_writer's classify_transition path.
+// (2026-07-14): compiles unconditionally (feature gate deleted). DORMANT:
+// its only consumer, the Groww shared master writer, was deleted with the
+// Groww feed (2026-08-21), and the daily lifecycle write it would feed
+// stopped under owner Quote 44 (2026-10-28). No production caller; kept as
+// the documented decision rules for reading the frozen rows. Restarting a
+// caller needs a fresh dated quote (Quote 44 REJECT list).
 pub mod lifecycle_reconciler;
 // PR #3 (2026-05-19): `greeks_persistence` module DELETED. greeks
 // pipeline retired alongside the indices-only universe. The
@@ -214,10 +242,37 @@ pub mod partition_manager;
 // row-count- and size-verified; gated on [partition_retention]
 // archive_enabled (serde default false).
 pub mod partition_archive;
+// Daily-universe Quote 63 (2026-11-20): days held out of the archiver, the
+// Brutex export and the cross-check catch-up until a verified repair.
+pub mod held_days;
+// Scope lock 2026-11-20: Dhan sent trade times as UTC; the armed per-day
+// correction table, record, detector and controller.
+pub mod ltt_correction;
+pub mod s3_cold;
+/// Read-only fetch of a published brutex strategy (rule brutex-strategy-host-2026-10-29.md).
+pub mod strategy_recipe_fetch;
+// Plan item 45e-1 (2026-10-02): raw WAL segments uploaded to the cold bucket,
+// verified, and marked, before any WAL prune may delete them.
+pub mod raw_frame_upload;
+// Plan item LF-8 (2026-11-12): read-only fetch of one day of raw segments
+// for the offline live-fill replay (List + Get only).
+pub mod raw_frame_fetch;
+// Plan item 66 (2026-10-21, Quotes 32/33/34): the one-off 2026-10-22
+// rebuild's file-copy and restore primitives were DELETED 2026-10-29 with
+// the rebuild and wipe tools that used them (rust-only lock §§0.13/0.14).
 // Cluster-C order-side observability (2026-07-14): SEBI 5y order-lifecycle
 // audit — rebuild of the table deleted in #T4 (2026-05-20) on the modern
 // ILP-over-HTTP template with event-in-key DEDUP (AUDIT-06).
 pub mod order_audit_persistence;
+// Plan item LF-5 (2026-11-12, owner Quote 57): the paper order event log of
+// the live signal-timing work. One row per event; treated like order_audit
+// (never deleted, audit disk tier on a failed flush).
+pub mod live_order_events_persistence;
+// Audit PR42b (2026-10-01): disk tier for the four order-side audit writers
+// (order_audit, pnl_audit, order_leg_pnl, and live_order_events since
+// 2026-11-12, plan item LF-5) — a failed flush is written to
+// data/spill/audit/<table>/ and replayed by one drain task per table.
+pub mod audit_spill;
 // Full-fidelity order/position push-event capture (design 2026-07-18;
 // ORDER-EVT-01): one row per received broker push event, BOTH feeds —
 // the capture companions of the lossy 11-field BrokerOrderEvent seam.
@@ -232,10 +287,13 @@ pub mod pnl_audit_persistence;
 // — zero callers since its sole feeder `prev_day_ohlcv_boot.rs` died in
 // PR-C3 (2026-07-14). The `prev_day_ohlcv` TABLE stays read-only (forensic;
 // partition_manager sweep string retains it).
+// One-shot `2026-09-19-fresh-start` schema reset (scope lock: "THIS TIME ALONE").
+pub mod fresh_start_reset;
 pub mod questdb_health;
 pub mod seal_absorption;
 pub mod seal_dlq;
 pub mod seal_spill;
+pub(crate) mod seal_spill_ledger;
 pub mod seal_writer_loop;
 pub mod seal_writer_runner;
 pub mod seal_writer_task;
@@ -246,23 +304,11 @@ pub mod seal_writer_task;
 pub mod shadow_candle_writer;
 pub mod shadow_persistence;
 pub mod shadow_seal_columns;
-// Per-minute spot 1m REST pipeline (operator grant 2026-07-12, PR-2 — the
-// SPOT half; SPOT1M-02): the `spot_1m_rest` table DDL + ILP-over-HTTP writer.
-pub mod spot_1m_rest_persistence;
-pub mod spot_crossverify_persistence;
-// Per-minute option-chain REST pipeline (operator grant 2026-07-12, PR-3 —
-// the OPTION-CHAIN half; CHAIN-03): the `option_chain_1m` table DDL +
-// ILP-over-HTTP writer.
-pub mod option_chain_1m_persistence;
 // Per-contract 1m candle leg of the Groww per-minute REST pipeline
 // (operator grant 2026-07-13, PR-4 — the fill-model leg): the
 // `option_contract_1m_rest` table DDL + ILP-over-HTTP writer (feed in the
 // DEDUP key; retention registered in partition_manager.rs).
 pub mod option_contract_1m_rest_persistence;
-// Per-fetch forensics for the per-minute REST legs (operator scope addition
-// 2026-07-13, Groww REST plan PR-2): the `rest_fetch_audit` table DDL +
-// ILP-over-HTTP writer — one row per (target minute, symbol, feed, leg).
-pub mod rest_fetch_audit_persistence;
 // Stage-2 dead-WS sweep (2026-07-17): `tick_flush_worker` / `tick_persistence`
 // / `tick_row_builder` / `tick_spill_drain` were DELETED with the dead Dhan
 // tick chain (`run_tick_processor` died in PR-C2/C3; the Groww live feed
@@ -282,10 +328,99 @@ pub mod rest_fetch_audit_persistence;
 // second-granular Dhan timestamps collapse every tick but the last in each
 // second).
 pub mod depth_persistence;
+// Length-framed depth spill tier (plan item 49e, 2026-10-09): records carry
+// their own length and CRC, so a binary ILP v2 batch is never cut at a
+// newline on replay. Step 1 of the depth array-row switch.
+pub mod depth_spill_frame;
+// Plan item PF-4b (2026-11-06): the depth book writer's staged rows; the frame
+// drain stages typed `market_depth_book` rows and the writer and rescue
+// threads write the ILP text.
+pub mod depth_stage;
+// Plan item 45h (2026-10-02): the feed packets the parser decodes and the fold
+// does not use (open interest, previous close, market status, disconnect, the
+// no-trade-today packet, out-of-window ticks). Rows ride the `ticks` writer's
+// buffer, offload thread and spill tier.
+pub mod feed_aux_persistence;
+// Operator Quote 61 (2026-11-14): exact repeats of a contract's
+// `no_trade_today` row are skipped; O(1) per packet, 25,000 keys, cleared daily.
+pub mod feed_aux_repeat;
+// Real-time proof that the live path is not waiting (2026-10-02): per-stage
+// latency buckets, stall counters and task heartbeats, Prometheus only.
+pub mod hot_path_telemetry;
+// 2026-11-07: which spilled tables this process may POST over ILP. The spill
+// replay holds a file until its table was ensured here, so QuestDB can never
+// auto-create one of them with the wrong designated timestamp.
+pub mod ilp_table_gate;
+// Live audit F2/F5/F6 (2026-10-29): the durable market-data floor. Spill
+// replay sets aside rows older than the last reset instead of posting them.
+pub mod market_data_floor;
+// Plan item DT0 (2026-10-29): per-hot-thread scheduling-wait evidence,
+// read once a second on the `tv-telemetry` thread.
+pub mod hot_thread_sched;
+// Owner 2026-10-30: per-minute host evidence (CPU wait, CPU, disk, QuestDB
+// backlog, ticks) and the daily "is the 4-core box needed" verdict.
+pub mod host_capacity_minute;
+// Owner 2026-10-30: one row per hot-path stage per minute (p50/p99/p99.9,
+// max, samples over 1,024 ns), the live proof table, written off the hot path.
+pub mod hot_path_latency_minute;
+// Moves the current tokio worker aside for one blocking step (sweep S1/S5).
+// Public since S5 so the app's cold loops share the one helper.
+pub mod off_worker;
+/// Our own ILP encoder and sender for the tick writer (plan ITEM DT).
+pub mod tick_ilp;
 pub mod tick_persistence;
+// Plan item PF-4 (2026-11-06): the tick writer's staged rows; the frame drain
+// stages typed rows and the writer and rescue threads write the ILP text.
+pub mod tick_stage;
+// Plan item M5 (2026-10-27, owner Quote 41): repeat quotes (no new trade) go
+// to `tick_quotes`, stamped at arrival; same tick writer and buffer.
+pub mod tick_quotes_persistence;
+// Plan item M1 (2026-10-26): counts where each `ticks` row lands against the
+// newest row written (append, late in its hour, older hour partition).
+pub mod tick_ts_placement;
+// Automatic drain for the live-tick spill tier (2026-08-21): posts spilled
+// ILP bodies back to QuestDB's /write endpoint and truncates on success, so
+// the ITEM 24 rescue recovers without a human running curl. Reinstates the
+// `tick_spill_drain` deleted in the 2026-07-17 stage-2 sweep (see above).
+pub mod tick_spill_replay;
 // `valkey_cache` module DELETED in #O4 (2026-05-24) — no production caller
 // remained after PR #764 migrated the dual-instance lock to SSM.
 pub mod ws_frame_spill;
+// K4 (2026-10-26): the previous process's last WAL receipt, read at boot.
+pub mod wal_last_receipt;
+// Quote 31 (2026-10-21): seal the WAL writer's open segment on request.
+pub mod wal_idle_seal;
+// PR M / M4 (2026-10-26): the WAL writer polls while frames flow, so the
+// socket read task never pays a futex wake to hand it a frame.
+pub mod wal_writer_wait;
+// PR W review round 7: count a WAL record written past the reorder slack.
+pub mod wal_reorder_guard;
+// PR RD-1 (2026-11-08, Quote 41): the per-boot replay frame cap in force,
+// raised once to 5x for a planned evening-drain boot.
+pub mod wal_replay_frame_cap;
+// Noise lock §2.20 (2026-11-11): is the WAL replay backlog shrinking between
+// two starts? A replay-limit line pages only when it is not.
+pub mod wal_backlog_trend;
+// Applied-watermark for the frame WAL (2026-09-05): a restart must never replay
+// frames whose rows already reached the database. Sibling of `ws_frame_spill`.
+pub mod wal_applied_watermark;
+// Deferred-depth marks (2026-09-29, plan item 45a): frames whose depth rows the
+// ingest shed skipped are kept from the WAL prunes until written back.
+pub mod wal_deferred_depth;
+// Frame fate (2026-10-04, audit M1): a shed frame whose WAL record the writer
+// then loses is counted as a lost frame, not a WAL hiccup.
+pub mod wal_frame_fate;
+// Wall-clock steps seen by this process (PR AA review, finding 2): the archive
+// holds an hour whose frame sequences a step moved away from its receipt hour.
+pub(crate) mod wal_clock_step;
+// WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
+// only after the durability lag and two clean QuestDB probes.
+pub mod wal_replay_settle;
+mod wal_segment_move;
+// Bounded WAL unapplied ranges (2026-10-20, plan item PR W): the backlog guard,
+// the boot fold and an inherited overflow become at most 32 ranges in a sidecar,
+// so the WAL stops growing behind an unbounded overflow bit.
+pub mod wal_unapplied_ranges;
 
 // Stage-2 dead-WS sweep (2026-07-17): the `tick_persistence_testing` shim and
 // `spill_dir_test_lock` (both consumed only by the deleted tick benches/DHAT

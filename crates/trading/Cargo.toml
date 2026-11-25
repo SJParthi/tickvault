@@ -12,35 +12,28 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# sha256 of published strategy files (brutex_host manifest check), 2026-10-29.
+sha2 = { workspace = true }
 toml = { workspace = true }
 notify = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 uuid = { workspace = true }
 governor = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 metrics = { workspace = true }
 papaya = { workspace = true }
+# ahash: the faster hasher for the candle fold's per-tick slot index, audit
+# plan PR10. Already a pinned workspace dep; no new crate enters the build.
+ahash = { workspace = true }
 parking_lot = { workspace = true }
 loom = { workspace = true, optional = true }
-# Order-push Stage B (2026-07-16): NATS-over-WS transport deps for the gated
-# `oms/groww/push` module — optional, pulled in ONLY by `groww_orders`.
-aws-lc-rs = { workspace = true, optional = true }
-tokio-tungstenite = { workspace = true, optional = true }
-# Order-push Stage C (2026-07-16): SinkExt/StreamExt for the supervised
-# runner's split WebSocket read/write halves. Already workspace-pinned
-# (0.3.32, used by tickvault-core) — optional, pulled in ONLY by
-# `groww_orders`.
-futures-util = { workspace = true, optional = true }
+# The NATS-over-WS transport deps (aws-lc-rs, tokio-tungstenite,
+# futures-util) were pulled in ONLY by the Groww order-push module and are
+# removed with it (2026-08-21). They stay workspace-pinned for other crates.
 
 [features]
 loom = ["dep:loom"]
-# Gate 2 of the Groww order-side live-fire lattice (groww-second-feed-scope
-# §39.2). NON-DEFAULT: a default build excludes the entire
-# crates/trading/src/oms/groww subtree. Order-push Stage B adds the transport
-# deps (ed25519 nkey signing + the WS client for Stage C).
-groww_orders = ["dep:aws-lc-rs", "dep:tokio-tungstenite", "dep:futures-util"]
 
 [dev-dependencies]
 # (bruteX trading-core parity oracle removed 2026-08-07 — its upstream rev was
@@ -62,9 +55,31 @@ harness = false
 name = "obi"
 harness = false
 
+[[bench]]
+name = "candle_fold"
+harness = false
+
+# Plan item PF-7 (2026-11-06): the same fold with the slot out of the CPU
+# cache (25,000-slot tables, several times the L3).
+[[bench]]
+name = "candle_fold_cold"
+harness = false
+
+# brutex host order-side helpers (worst-case fill model, marketable limit,
+# send queue), 2026-11-12. No budget key yet; the bench prints p50/p99.
+[[bench]]
+name = "worst_fill"
+harness = false
+
+# brutex_host live strategy candles (2026-11-12): on_tick over 500 keys x 3
+# frames, plus a manual p50/p99/p99.9/max loop. No budget key yet.
+[[bench]]
+name = "live_candles"
+harness = false
+
 # bar_cache_lookup bench DELETED with the dead `in_mem::bar_cache` module
 # (dead live-WS sweep stage 1, 2026-07-17); its `bar_cache_lookup` budget
 # key was removed from quality/benchmark-budgets.toml in the same PR.
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "aws-lc-rs", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tokio-tungstenite", "tracing", "uuid"]
+ignored = ["anyhow", "aws-lc-rs", "chrono", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tokio-tungstenite", "tracing", "uuid"]

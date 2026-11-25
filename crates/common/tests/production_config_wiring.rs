@@ -114,16 +114,17 @@ fn test_production_rest_only_no_live_feeds() {
         "production.toml must NOT disable the Dhan live WS feed — reverting \
          needs a fresh dated operator quote + this guard updated in the same PR"
     );
+    // REPLACED 2026-08-21 — the pair of pins here used to assert the second
+    // feed's enable key was present-and-false. The 2026-08-21 directive removed
+    // that feed entirely, so `FeedsConfig` has no field left to bind the key
+    // to and serde (no `deny_unknown_fields`) would silently ignore it: a line
+    // reading like a live switch that controls nothing. The pin is therefore
+    // strengthened from "false" to "absent", in EITHER direction.
     assert!(
-        prod.contains("groww_enabled = false"),
-        "production.toml must keep the Groww live feed disabled — the runtime \
-         is REST-only (operator directive 2026-07-15: remove the whole Groww \
-         live feed; keep only spot 1m and option chain for both brokers)"
-    );
-    assert!(
-        !prod.contains("groww_enabled = true"),
-        "production.toml must not re-enable the retired Groww live feed \
-         (operator directive 2026-07-15)"
+        !prod.contains("groww_enabled"),
+        "production.toml must not carry an enable key for the removed feed — \
+         it binds to no FeedsConfig field, so serde ignores it and the line \
+         reads as a switch that still does something"
     );
 
     // base.toml carries the same Dhan setting so a TV_ENVIRONMENT=dev/local
@@ -216,5 +217,25 @@ fn test_staging_and_dev_configs_are_retired() {
     assert!(
         !workspace_root().join("config").join("dev.toml").exists(),
         "there must be no config/dev.toml (single prod env)"
+    );
+}
+
+// 2026-11-06 (plan PR PF, item PF-1): production runs our own ILP encoder.
+// The encoder's text is byte-identical to the library's (proptests in
+// `tick_ilp` / `tick_row_identity_tests`); this pins the switch so a later
+// edit cannot turn the live box back to the slower path unnoticed.
+#[test]
+fn test_production_turns_on_the_own_ilp_encoder() {
+    let content = std::fs::read_to_string(workspace_root().join("config").join("production.toml"))
+        .unwrap_or_else(|e| panic!("production.toml not readable: {e}")); // APPROVED: test
+    let section = content
+        .split_once("\n[tick_storage]")
+        .map(|(_, rest)| rest.split("\n[").next().unwrap_or(""))
+        .expect("production.toml must carry a [tick_storage] section");
+    assert!(
+        section
+            .lines()
+            .any(|l| l.trim() == "own_ilp_encoder = true"),
+        "{section}"
     );
 }

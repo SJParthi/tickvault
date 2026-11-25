@@ -1,24 +1,25 @@
 # =============================================================================
 # tickvault — Docker Compose
 # =============================================================================
-# Same file on Mac dev and AWS prod (t4g.medium ARM Graviton2, 2 vCPUs / 4 GiB,
-# operator-lock 2026-07-15 Quote 8 in daily-universe-scope-expansion-2026-05-27.md §7).
+# Same file on Mac dev and AWS prod. Prod host: r8g.large (ARM Graviton4,
+# 2 vCPUs / 16 GiB), multi-AZ, per operator Quotes 32/33 (2026-10-21; was
+# r8g.xlarge 4 vCPU / 32 GiB under Quote 13) in daily-universe-scope-expansion-2026-05-27.md §7.
 #
-# Post-CloudWatch-only migration (#O1/#O2/#O3/#O4), Groww-only ~770-SID universe.
-#   Compose default QDB_MEM_LIMIT=12g — the r8g.xlarge 32 GiB host (operator
-#   Quote 13, 2026-08-08), per §7 Rule 2: QuestDB 8–16 GB + resident ticks
-#   2.3–7.2 GB + app 2–4 GB + OS/FS-cache 2–4 GB = ~14–31 GB of 32 GiB.
+# QuestDB memory (rewritten 2026-10-12, deep audit QDB-11):
+#   Compose default QDB_MEM_LIMIT=6g (12g until 2026-10-21, on the 32 GiB
+#   box). On the box, EVERY deploy derives the
+#   value (deploy-aws.yml, the questdb-mem step): 40% of the host MemTotal,
+#   clamped to 1..12g, written into the on-box deploy/docker/.env, and
+#   tv-questdb is recreated when it changed. So the 32 GiB box runs 12g and
+#   a smaller host gets a smaller cap with no manual step. The audit measured
+#   a QuestDB working set of about 4.17 GiB, so disk throughput, not memory,
+#   is the bound.
 #   History: 4g on r8g.large (2026-07-01 → 2026-07-15), then 1g on the
-#   t4g.medium downsize (2026-07-15 → 2026-08-10).
+#   t4g.medium downsize (2026-07-15 → 2026-08-10, Quote 8), then 12g.
 #
-#   ⚠ THE REPO CHANGE ALONE DOES NOT RETUNE THE BOX. The on-box
-#   deploy/docker/.env OVERRIDES this default, and it was written to 1g by
-#   the downsize workflow's SSM step. Until
-#   `scripts/aws-upgrade-instance.sh --qdb-mem 12g --apply-ssm` runs against
-#   the live instance, prod QuestDB stays at 1g regardless of this file.
-#   Note also that `.github/workflows/downsize-instance.yml` still hard-
-#   asserts 1073741824 and will FAIL against a 12g box — that workflow is a
-#   t4g.medium-era tool and must not be dispatched at the current lock.
+#   ⚠ `.github/workflows/downsize-instance.yml` still hard-asserts
+#   1073741824 and will FAIL against a 12g box. It is a t4g.medium-era tool
+#   and must not be dispatched at the current lock.
 #
 # REMOVED (CloudWatch-only migration):
 #   - Grafana       -> CloudWatch Dashboards (#O1)
@@ -124,7 +125,9 @@ services:
     # --qdb-mem 12g --apply-ssm` rewrites it.
     # QuestDB mmaps data files — actual RSS is much lower than limit.
     # Partition manager keeps hot data bounded to ~90 days.
-    mem_limit: ${QDB_MEM_LIMIT:-12g}
+    # 2026-10-21 (Quotes 32/33): default 6g, the deploy formula (4/10) on the
+    # 16 GiB r8g.large. The 12g notes above describe the 32 GiB box.
+    mem_limit: ${QDB_MEM_LIMIT:-6g}
     mem_reservation: 2g
     # HISTORY: this was `cpus: 3.0` with the note "3.0 of the box's 4 vCPU …
     # the remaining core is left for the tickvault app + OS". That reading was
@@ -182,7 +185,7 @@ services:
     # silently-unpartitioned prod box is the failure this whole change exists
     # to remove, and a loud docker error naming the exact fix is strictly
     # better than a quiet box that lost the isolation. The APP half has no such
-    # hazard — apply-host-tuning.sh removes its confinement automatically below
+    # hazard — `tickvault host-tuning apply` removes its confinement automatically below
     # 3 cores, because systemd cannot name the fix for you.
     cpuset: "${TV_QDB_CPUSET:-2,3}"
     # Kept alongside the cpuset deliberately. The cpuset is the hard placement
@@ -218,7 +221,7 @@ services:
       # dynamic ingress) — never public, even when bound 0.0.0.0. Compose v2
       # loads .env from the compose file's project dir for EVERY caller
       # (deploy-aws.yml, user-data boot, infra.rs --force-recreate,
-      # ensure-questdb.sh), so the prod bind persists across all restarts.
+      # `tickvault ensure-questdb`), so the prod bind persists across all restarts.
       - "${TV_QDB_HTTP_BIND:-127.0.0.1}:9000:9000" # HTTP API + Web Console (dev default: localhost only)
       - "8812:8812"            # PostgreSQL wire protocol
       - "9009:9009"            # InfluxDB Line Protocol (high-speed ingestion)
@@ -229,6 +232,62 @@ services:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_METRICS_ENABLED: "TRUE"
+      # --- /exp connection limit (2026-11-03) ---
+      # Measured live 2026-11-03 19:40 IST: QuestDB 9.3.5 ran with
+      # http_export_connections connectionLimit=1, and the partition
+      # archiver's /exp export (one market_depth hour at a time) held that
+      # one slot all evening, so every operator-portal /exp read (Data tab
+      # query box and table list, Overview row counts) got HTTP 429.
+      # 4 = the archiver's one sequential export plus portal reads. Each
+      # portal read is capped at 1000 rows and a 5 s curl, so the extra
+      # slots hold little memory. /exec (the Stocks page, /api/*) is a
+      # separate pool and is unaffected.
+      # ⚠ CHANGED 2026-11-06 (PR DP review M6): 4 → 2. With 4 export slots
+      # and 2 HTTP workers, two /exp streams could hold both workers and
+      # starve /write and /exec again. The export limit is now 2 (the
+      # archiver's one export plus one portal read) and the HTTP pool is
+      # export limit + 1 (below), so one worker is always free for writes.
+      # The guard pins workers > export limit.
+      # ROLLBACK: set back to "4" together with QDB_HTTP_WORKER_COUNT 5.
+      QDB_HTTP_EXPORT_CONNECTION_LIMIT: "2"
+      # --- HTTP worker pool of its own (2026-11-06, PR DP-1) ---
+      # Measured live 2026-11-06 08:31-09:13 IST (SHOW PARAMETERS):
+      # http.worker.count=0 and shared.network.worker.count=1, so every HTTP
+      # request rode the ONE shared network thread. The disk-pressure
+      # archiver's /exp export of one market_depth hour (95-115M rows) held
+      # that thread 4-5 minutes at a time, and every ILP /write (ticks,
+      # depth, candles: all ILP over HTTP on :9000) and every /exec waited
+      # behind it: 14 BOOT-01, 30 reconnects, 2,935,971 tick rows and
+      # 2,331,360 depth levels rescued to spill.
+      # 3 = the export connection limit (2) plus one thread an export can
+      # never take, so /write and /exec always have a worker (PR DP review
+      # M6; was 2, which two concurrent exports could fill).
+      # HTTP threads mostly wait on the socket and the disk, so they are not
+      # held to the cpuset width the way the WAL-apply and shared pools are
+      # (cpu_partition_guard pins those two only). The cpuset and the quota
+      # are unchanged.
+      # ROLLBACK: TV_QDB_HTTP_WORKERS=0 in deploy/docker/.env (0 = HTTP back
+      # on the shared network pool, the pre-2026-11-06 behaviour).
+      QDB_HTTP_WORKER_COUNT: "${TV_QDB_HTTP_WORKERS:-3}"
+      # The shared NETWORK pool (PG wire, ILP over TCP) sized on its own key,
+      # so `tickvault host-tuning`'s core isolation (TV_QDB_SHARED_WORKERS=1)
+      # no longer forces it to one thread as a side effect.
+      # ROLLBACK: delete this line (QuestDB then sizes it from the shared
+      # worker count, as before).
+      QDB_SHARED_NETWORK_WORKER_COUNT: "${TV_QDB_NETWORK_WORKERS:-2}"
+      # --- Commit mode (2026-10-12, deep audit QDB-7) ---
+      # cairo.commit.mode is LEFT at QuestDB's default, nosync, ON PURPOSE: an
+      # ILP 2xx means the rows reached the page cache, not the disk. sync was
+      # MEASURED on 2026-10-02 and rejected (a 1,000-row tick flush went from
+      # p50 3.3 ms to 21-26 ms, a 10,000-row depth flush from 14 ms to
+      # 37-42 ms). Durability across a host crash comes from the app instead:
+      # the persisted applied watermark trails acks by
+      # WATERMARK_DURABILITY_LAG_SECS (60 s, wal_applied_watermark.rs), so the
+      # WAL replays anything the kernel had not yet written back. The lag and
+      # row-cap settings below shape WAL apply only, not ack durability. Not
+      # pinned here as an env var: adding one would recreate tv-questdb on the
+      # next deploy for no behaviour change.
+      #
       # --- WAL / writer tuning ---
       #
       # Every value below was VERIFIED against the running container on
@@ -255,8 +314,93 @@ services:
       #     would let one table hold the WAL apply job while the other ~25
       #     starved.
       QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
-      # O3 max lag: 60s. Tighter out-of-order merge window.
-      QDB_CAIRO_O3_MAX_LAG: "60000000"
+      # O3 max lag: 600s — QuestDB's own documented default.
+      #
+      # RAISED 2026-09-11 from 60s (see Item 42 of
+      # .claude/plans/active-plan-feed-hardening.md for the full measurement).
+      # The old value carried the comment "Tighter out-of-order merge window"
+      # and no measurement at all. Measured live, mid-session, 15:27 IST:
+      #
+      #   tv_dhan_feed_depth_total{outcome="rows"}   773,624,120
+      #   tv_depth_rows_spilled_total{feed="dhan"}   228,215,136  (29.5%)
+      #   tv_depth_rows_dropped_total{feed="dhan"}   228,215,136  (identical
+      #                                              => zero loss, all rescued)
+      #   tv_tick_spill_replayed_bytes_total          47,053,504,733 (47 GB)
+      #   tv_questdb_wal_apply_lag_max                55,060
+      #
+      # Nearly a THIRD of every depth row this session is written twice: once
+      # into a batch the offload writer's hand-off queue could not accept, and
+      # again from data/spill/depth/ at least REPLAY_INTERVAL_SECS = 300 later
+      # — carrying its ORIGINAL timestamp, because
+      # tick_spill_replay::retain_lines_in_open_window copies each line
+      # byte-for-byte and never re-stamps it.
+      #
+      # ⚠ CORRECTED 2026-09-11, hours after this comment was first written: the
+      # sentence above said the rescue came from "a flush that hit its 5,000 ms
+      # client request_timeout". The counters that separate the two causes were
+      # then read on the box and they REFUTE it:
+      #
+      #   tv_depth_flush_retries_skipped_total         13   <- genuine timeouts
+      #   tv_depth_flush_queue_full_total          68,838   <- the real cause
+      #   tv_depth_flush_width_capped_total        22,488   <- the rescues
+      #   tv_depth_flush_offloaded_total          107,778
+      #
+      # It is QUEUE SATURATION (DEPTH_FLUSH_QUEUE_DEPTH = 4), not timeouts.
+      # That matters beyond bookkeeping: the follow-up this comment originally
+      # named -- raising the ILP request_timeout -- would have changed NOTHING,
+      # because the timeout is not what fires. Recorded rather than silently
+      # swapped, per the house rule that a wrong theory which dies quietly is
+      # the expensive kind.
+      #
+      # At 60s every one of those replayed rows was 5x to 400x OUTSIDE the
+      # merge window, so QuestDB could not absorb it in memory and had to
+      # rewrite the partition — which is the 78 MB/s of READS observed on a
+      # write-only workload, and the 93.2% device utilisation, which makes the
+      # NEXT flush more likely to time out. A spiral, and the tight window was
+      # feeding it.
+      #
+      # 600s covers the 300s replay cadence plus round duration with margin.
+      #
+      # ⚠⚠ THIS CHANGE IS INERT ON ITS OWN, AND THE SENTENCE THAT USED TO SIT
+      # HERE IS WHY. It read: "Memory does not grow with the window:
+      # QDB_CAIRO_MAX_UNCOMMITTED_ROWS above caps the lag buffer in ROWS."
+      # That is TRUE, and it is exactly the reason the window is never reached
+      # — a LIMITATION written down as a REASSURANCE, in the same commit that
+      # shipped the change it undermines.
+      #
+      # QuestDB commits on whichever limit binds FIRST. The row cap above is
+      # 2,000,000. For a 600s window to be reached, the table's ingest rate
+      # must stay under 2,000,000 / 600 = 3,333 rows/s. MEASURED this session:
+      # 793,936,720 depth rows over ~26,280s = ~30,200 rows/s average, so the
+      # row cap fires at roughly 66 SECONDS — about 9x sooner than the window.
+      # The 600s setting is therefore correct in DIRECTION and currently
+      # cannot change a single number.
+      #
+      # The missing half is a HIGHER ROW CAP, and it is deliberately NOT
+      # shipped here: this key is SERVER-WIDE across all 26 tables, so raising
+      # it 10x buys ~1.4 GB of QuestDB working set for market_depth alone
+      # (20M rows x 72 B) plus whatever the rest take, against a 12 GiB limit
+      # measured at 4.17 GiB. The surgical form is a PER-TABLE
+      # `ALTER TABLE market_depth SET PARAM maxUncommittedRows = ...` in the
+      # boot DDL — a mechanism this tree does not have yet (grep: zero
+      # `SET PARAM` anywhere), so it is new code with its own guard, not a
+      # line edit, and it should land measured rather than at pace.
+      #
+      # NOT claimed: that this stops rows spilling. 29.5% still take that path.
+      # This treats the O3 COST, not the spill CAUSE — and until the row cap
+      # moves, it does not yet treat the O3 cost either.
+      #
+      # THE SCALE OF THE PROBLEM, measured 2026-09-11 across the full day:
+      # the volume wrote 5.02 TB to store roughly 80 GB of logical rows
+      # (~63x amplification) and sat at 520-525 MB/s against a 500 MB/s
+      # provisioned ceiling CONTINUOUSLY from 03:55 to 05:15 UTC. An earlier
+      # read of this same metric said "152 MB/s, 30% of provisioned, not the
+      # limit" — that read caught the post-saturation plateau, not the peak,
+      # and is withdrawn.
+      #
+      # REVERT: set back to "60000000" and restart the container. No schema
+      # change, no data migration, no code path altered.
+      QDB_CAIRO_O3_MAX_LAG: "600000000"
       # --- Crash Recovery & Stability ---
       # Writer append page size: 16MB (QuestDB's default).
       #
@@ -285,6 +429,44 @@ services:
       #
       # ROLLBACK: TV_QDB_WAL_WORKERS=3 in deploy/docker/.env (raise the cpuset
       # in the same edit, or this simply re-creates the throttling).
+      #
+      # ---------------------------------------------------------------
+      # 2026-09-03 — 6 WORKERS WAS TRIED LIVE AND DID NOT WORK. Do not retry
+      # it without a different hypothesis; the measurement is below.
+      # ---------------------------------------------------------------
+      # The hypothesis was thread starvation, and the evidence for it looked
+      # strong. Measured mid-session with 2 workers: all four threads
+      # (wal-apply_0/_1, shared-write_0/_1) sat in D state SIMULTANEOUSLY at
+      # 57.6% host iowait and 32.2% idle, using 1,638 IOPS of the 6,000
+      # PROVISIONED, with nr_throttled 6 of nr_periods 31709 = 0.019% — so the
+      # 2026-08-18 throttling argument above genuinely did not apply to this
+      # workload. market_depth was 126,909 transactions behind with
+      # suspended=false and unqueryable for the whole session.
+      #
+      # It was raised to 6 live and measured. RESULT: NO THROUGHPUT GAIN.
+      #
+      #   lag growth   8.1 txn/sec  ->  7.6 txn/sec   (noise)
+      #   device IOPS  1,638        ->  1,004         (went DOWN)
+      #   throttling   0.019%       ->  0.000%        (harmless, as predicted)
+      #   threads in D 4            ->  8             (all of them, again)
+      #
+      # Per-table, it only REDISTRIBUTED capacity rather than adding any:
+      #   candles_1s   15,927 -> 36,409   worse
+      #   candles_5s   11,382 ->  3,297   better
+      #   market_depth        still growing at the same rate
+      #
+      # WHAT THAT RULES OUT, which is the useful part: the limit is NOT worker
+      # count, NOT CPU, NOT CPU throttling, NOT provisioned IOPS (6,000, we use
+      # ~1,600), NOT provisioned throughput (500 MiB/s, we use 150-260 MB/s),
+      # NOT free memory (13 GiB free, 13 GiB page cache) and NOT disk space
+      # (181 GB free). Eight threads blocked on a device that is not saturated
+      # means the work is serialized somewhere those threads all share.
+      #
+      # The leading remaining explanation, UNVERIFIED: QuestDB applies a single
+      # table's WAL serially, so worker count sets how many TABLES apply at
+      # once, never how fast the one table that matters applies. If true, no
+      # thread-pool setting can fix market_depth and the only levers are fewer
+      # depth rows or lower per-op storage latency.
       QDB_WAL_APPLY_WORKER_COUNT: "${TV_QDB_WAL_WORKERS:-2}"
       # QuestDB's GENERAL worker pool, set EXPLICITLY for the same reason.
       #

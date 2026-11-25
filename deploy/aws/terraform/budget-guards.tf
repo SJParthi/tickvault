@@ -4,9 +4,11 @@
 # Two Lambdas that protect the operator's monthly budget:
 #
 # 1. tv-prod-daily-budget-digest (runs 17:30 IST Mon-Fri = 12:00 UTC)
-#    - Queries Cost Explorer for today's spend + month-to-date
+#    - Reads month-to-date spend from the free AWS Budgets API
+#      (budgets:DescribeBudget on aws_budgets_budget.tv_monthly; paid Cost
+#      Explorer until 2026-10-22, plan item 63, operator Quote 37)
 #    - Publishes Telegram-formatted message to SNS tv-prod-alerts
-#    - Operator sees daily message: "Today ₹X | MTD ₹Y / ₹2000 (Z%)"
+#    - Operator sees daily message: "This month ₹Y / stop-budget (Z%)"
 #
 # 2. tv-prod-hard-stop-guard (runs HOURLY, every day)
 #    - Force-stops the EC2 instance if running OUTSIDE the Mon-Fri
@@ -17,7 +19,7 @@
 #      rule, because the native AWS Budget stop-actions fire only ONCE
 #      per month-crossing — without this, the next morning's start cron
 #      restarts the box and it runs daily, unkilled, for the rest of
-#      the month. Cost Explorer errors fail-safe (page, never disable).
+#      the month. Spend-lookup errors fail-safe (page, never disable).
 #    - Source lives in crates/aws-lambdas/src/hard_stop_guard.rs (the
 #      Rust port, rust-only phase 2b-2 wave 2 — the former
 #      deploy/aws/lambda/hard-stop-guard/ handler dir was deleted in the
@@ -33,7 +35,7 @@
 # Rust — crates/aws-lambdas/src/budget_digest.rs (lib logic + unit tests) +
 # src/bin/daily_budget_digest.rs (thin bootstrap bin). Behavior parity:
 # same Cost Explorer queries (us-east-1, DAILY UnblendedCost, exclusive
-# end), same INR_PER_USD=85 / GST_MULT=1.18 / BUDGET_USD constants
+# end; REPLACED 2026-10-22 by one free budgets:DescribeBudget, plan item 63), same INR_PER_USD=85 / GST_MULT=1.18 / BUDGET_USD constants
 # (BUDGET_USD=25 since the 2026-07-19 sub-1K ruling step, was 55)
 # (KEEP IN SYNC with budget.tf limit_amount), same emoji thresholds, same
 # Telegram line format, same '[BUDGET] daily AWS cost' subject, same
@@ -69,9 +71,13 @@ resource "aws_iam_role_policy" "tv_daily_budget_digest" {
     Version = "2012-10-17"
     Statement = [
       {
+        # 2026-10-22 (plan item 63, operator Quote 37): month-to-date spend
+        # from the free AWS Budgets API on the ONE tickvault budget. Replaces
+        # ce:GetCostAndUsage + ce:GetCostForecast (paid per request).
+        Sid      = "ViewTheOneBudget"
         Effect   = "Allow"
-        Action   = ["ce:GetCostAndUsage", "ce:GetCostForecast"]
-        Resource = "*"
+        Action   = ["budgets:ViewBudget"]
+        Resource = aws_budgets_budget.tv_monthly.arn
       },
       {
         Effect   = "Allow"
@@ -100,6 +106,9 @@ resource "aws_lambda_function" "tv_daily_budget_digest" {
   environment {
     variables = {
       ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
+      # 2026-10-22 (plan item 63): the budget DescribeBudget reads.
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }
@@ -180,11 +189,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
       },
       {
         # Read-only MTD spend for the hourly cost ping AND the GAP 1
-        # in-window breach check. Fail-safe: a Cost Explorer error never
+        # in-window breach check. Fail-safe: a spend-lookup error never
         # stops the box or disables the start rule (page-only).
+        # 2026-10-22 (plan item 63, operator Quote 37): the free AWS Budgets
+        # DescribeBudget on the ONE tickvault budget, replacing paid
+        # ce:GetCostAndUsage. AWS refreshes that figure about every 8-12 h.
+        Sid      = "ViewTheOneBudget"
         Effect   = "Allow"
-        Action   = ["ce:GetCostAndUsage"]
-        Resource = "*"
+        Action   = ["budgets:ViewBudget"]
+        Resource = aws_budgets_budget.tv_monthly.arn
       },
       {
         # GAP 1 (post-breach morning restart): on MTD >= $55 the Lambda
@@ -194,6 +207,15 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Sid      = "DisableDailyStartRuleOnBudgetBreach"
         Effect   = "Allow"
         Action   = ["events:DisableRule"]
+        Resource = aws_cloudwatch_event_rule.daily_start.arn
+      },
+      {
+        # Audit PR30 (2026-09-27): when the budget-stop latch names an
+        # EARLIER billing month, the guard turns the same rule back on once,
+        # so the box starts normally in the new month. Same one-rule scope.
+        Sid      = "ReleaseDailyStartRuleNextMonth"
+        Effect   = "Allow"
+        Action   = ["events:EnableRule"]
         Resource = aws_cloudwatch_event_rule.daily_start.arn
       },
       {
@@ -213,6 +235,40 @@ resource "aws_iam_role_policy" "tv_hard_stop_guard" {
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/budget-guard/ping-state"
+      },
+      {
+        # 2026-09-08 (the two hourly guards over the same box disagreed): the
+        # out-of-window force-stop now honours the SAME keep-alive marker the
+        # start-watchdog curfew reads (/tickvault/<env>/keep-alive-until) —
+        # an operator's evening `keep-alive` was left alone by one Lambda and
+        # stopped by the other within the hour. READ-ONLY: this guard never
+        # writes the marker; the console owns it. Scoped to the single ARN.
+        Sid      = "ReadKeepAliveOverride"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/keep-alive-until"
+      },
+      {
+        # Operator Quote 31 (2026-10-21): the out-of-window stop honours the
+        # app's drain hold, as the start-watchdog's stops do. READ-ONLY, one
+        # ARN. The in-window budget breach stop never reads it.
+        Sid      = "ReadDrainHold"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault/${var.environment}/drain-hold"
+      },
+      {
+        # Audit PR30 (2026-09-27): the breach stop WRITES the budget-stop
+        # latch so the start watchdog, the autopilot and the terraform apply
+        # do not restart the box for the rest of the billing month (the
+        # breach path only writes it, it never reads SSM). The READ is the
+        # new-month release, which runs only while the box is stopped.
+        # Scoped to the single ARN, created lazily by
+        # PutParameter(Overwrite=true).
+        Sid      = "WriteBudgetStopLatch"
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/tickvault-guard/${var.environment}/budget-stop-month"
       },
       {
         Effect   = "Allow"
@@ -259,10 +315,38 @@ resource "aws_lambda_function" "tv_hard_stop_guard" {
       # fire at 90%/100%, so a $100 ceiling would put the 90% line at $90, BELOW
       # the new bill, and stop the trading box mid-session. $130 puts it at $117 —
       # $4.28 of room, thinner than the $7.28 this change was called in to fix.)
-      BUDGET_KILL_USD = "130"
+      # 2026-09-23 (operator Quote 23): $150 -> $225 for SEPTEMBER 2026 only.
+      # The Lambda clamps every other month to $150 in code
+      # (effective_budget_kill_usd), so October is protected even before the
+      # scheduled 1-Oct revert of this value lands.
+      # 2026-10-01 (audit PR30b): that revert. $225 -> $150, so the configured
+      # value and the code clamp agree again.
+      # 2026-10-13 (operator Quote 30): $150 -> $170 (≈₹15,000 a month).
+      # 2026-10-28 (operator Quote 45): $170 -> $185, October 2026 only; the
+      # code clamps November onward to $75.
+      # 2026-11-11 (operator Quotes 52 and 54): the code clamps November 2026
+      # to $90 and December onward to $62; this configured value is unchanged.
+      BUDGET_KILL_USD = "185"
       # 2026-07-09: change-only ping state (matches the IAM statement's
       # single-parameter scope above).
       PING_STATE_PARAM = "/tickvault/${var.environment}/budget-guard/ping-state"
+      # 2026-09-08: the keep-alive override the curfew already honours (same
+      # parameter as start-watchdog-lambda.tf KEEP_ALIVE_PARAM — one marker,
+      # two readers, so the guards cannot disagree).
+      KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"
+      # Audit PR30: the budget-stop latch the breach stop writes.
+      BUDGET_STOP_PARAM = "/tickvault-guard/${var.environment}/budget-stop-month"
+      # Operator Quote 31 (2026-10-21): the app's drain hold, read by the
+      # out-of-window stop only (same parameter as the start-watchdog's).
+      DRAIN_HOLD_PARAM = "/tickvault/${var.environment}/drain-hold"
+      # Plan item J8: the NSE Muhurat sessions (same value as the start
+      # watchdog's); a box inside a session window is in-window here.
+      MUHURAT_SESSIONS = local.muhurat_sessions_env
+      # 2026-10-22 (plan item 63, operator Quote 37): the budget whose free
+      # DescribeBudget gives the month-to-date spend. Missing = unknown spend
+      # (page, never stop).
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
     }
   }
 }
@@ -285,10 +369,15 @@ resource "aws_cloudwatch_log_group" "tv_hard_stop_guard" {
 # at 90%/100% spend regardless (but only ONCE per month-crossing — this Lambda
 # is what keeps the box down for the rest of the month).
 # 1 invocation/hour is well within the Lambda free tier (1M/mo).
+# Minute 50, not 0 (audit B2 review, 2026-11-13): the guard's stopped-box
+# budget hold must disable the daily-start rule BEFORE that rule fires at
+# 03:00 UTC (08:30 IST); two rules firing in the same minute have no order.
+# The 02:50 UTC run (08:20 IST) comes first. Residual window: a latch
+# written 02:50-03:00 UTC can still let that morning's start through.
 resource "aws_cloudwatch_event_rule" "tv_hard_stop_guard" {
   name                = "tv-prod-hard-stop-guard"
   description         = "Hourly out-of-window force-stop + in-window change-only budget ping — budget never-cross safety net"
-  schedule_expression = "cron(0 * * * ? *)"
+  schedule_expression = "cron(50 * * * ? *)"
 }
 
 resource "aws_cloudwatch_event_target" "tv_hard_stop_guard" {
@@ -303,4 +392,174 @@ resource "aws_lambda_permission" "tv_hard_stop_guard_eventbridge" {
   function_name = aws_lambda_function.tv_hard_stop_guard.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.tv_hard_stop_guard.arn
+}
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "hard_stop_guard_errors" {
+  alarm_name          = "tv-${var.environment}-hard-stop-guard-errors"
+  alarm_description   = "The HARD STOP GUARD itself FAILED. This is the hourly Lambda that force-stops the box when it is running outside its authorized window or over budget. Its silence cuts BOTH ways: a box left running bills unnoticed, and a guard that is spuriously stopping a healthy box is equally invisible. Note the standing caveat - the budget's own STOP_EC2_INSTANCES actions have been recorded in EXECUTION_FAILURE since 2026-07-31 and cannot be re-checked with the current IAM identity, so this guard may be the only stop path that actually works. Triage: read the Lambda log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_hard_stop_guard.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): a post-ALARM auto-OK only means the Errors
+  # datapoint aged out of the lookback, never that anything was fixed.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "daily_budget_digest_errors" {
+  alarm_name          = "tv-${var.environment}-daily-budget-digest-errors"
+  alarm_description   = "The DAILY BUDGET DIGEST itself FAILED. Its failure mode is a digest that simply stops arriving - which reads exactly like a quiet day, so nothing else reports it. Spend visibility is the first thing lost. Triage: read the Lambda log group."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_daily_budget_digest.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (round-14): a post-ALARM auto-OK only means the Errors
+  # datapoint aged out of the lookback, never that anything was fixed.
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 — "did the kill-switch RUN?" (the gap behind four rule-file rows)
+#
+# CORRECTION FIRST, because the record has been scarier than the code for a
+# month. budget.tf, daily-universe-scope-expansion §7 and two Quote sections
+# all carry a FLAGGED, UNRESOLVED note reading, in substance, "if both
+# STOP_EC2_INSTANCES budget actions are still in EXECUTION_FAILURE then the
+# kill switch does not fire AT ALL". That sentence names the AWS-NATIVE budget
+# action and then generalises to "the kill switch", which is wrong: this
+# account has TWO independent switches, and the second one is ours.
+#
+# `tv_hard_stop_guard` above reads month-to-date spend (AWS Budgets
+# DescribeBudget since 2026-10-22, plan item 63; Cost Explorer before) every
+# hour, and at `>= BUDGET_KILL_USD` it stops the instance, disables the morning
+# auto-start rule, and pages — see `hard_stop_guard.rs::classify` ("breach_stop"
+# / "cost_unknown" / "below_budget") and `execute_breach_stop`. Its IAM policy
+# carries `ec2:StopInstances` scoped by the `tv-<env>-app` Name tag,
+# `budgets:ViewBudget` (was `ce:GetCostAndUsage`) and `events:DisableRule`. It does not consult the native
+# budget action and does not care whether that action works. So the honest
+# statement is "the AWS-NATIVE action is unverifiable", never "the kill switch
+# may not fire" — and whether the native one works is now a nice-to-know rather
+# than the most serious open item on the account.
+#
+# THE GAP THAT IS REAL, and that nobody was looking at while everyone worried
+# about the native action: NOTHING checks that OUR switch still runs. Its
+# Errors alarm (added 2026-08-25 with the other twelve) is structurally blind to
+# a dropped schedule — zero invocations produce zero errors, so a silently
+# disabled EventBridge rule reads as a permanently healthy Lambda. That is the
+# 2026-07-02 repo-wide scheduler-drop class, which this repo has already been
+# bitten by twice, and it applies with more force here than anywhere else: a
+# kill-switch that stopped being invoked is indistinguishable from a kill-switch
+# that has nothing to do.
+#
+# 6-hour window, not the 24h the token-minter uses. That alarm watches a DAILY
+# mint where 24h is the natural unit; this Lambda fires HOURLY, so a 6h window
+# expects six invocations and still cannot false-page on a single miss, while
+# cutting detection from ~a day to ~a quarter of one. For the component whose
+# whole job is to stop a runaway bill, a day of blindness is the wrong trade.
+#
+# ok_actions = [] deliberately: recovery here means "a datapoint appeared
+# again", which is worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "tv_hard_stop_guard_not_invoked" {
+  alarm_name          = "tv-${var.environment}-hard-stop-guard-not-invoked"
+  alarm_description   = "The hourly budget kill-switch did NOT RUN in the last 6h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This is the guard that stops the box on a budget breach; while it is not running there is no spend ceiling in force at all, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 21600
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_hard_stop_guard.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
+}
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the digest RUN?" (found by the new guard)
+#
+# The tempting exemption - "the operator notices a missing daily Telegram" - is
+# refused deliberately. It is the same reasoning this repo has rejected twice
+# before: noticing an ABSENCE requires remembering to expect something, which
+# is precisely what people stop doing on the days it matters. The digest is
+# also the only routine surface on which a cost trend is visible at all; the
+# hourly kill-switch reads spend but only speaks at the threshold.
+#
+# 24h window: MON-FRI 17:30 IST cron, one invocation expected per weekday.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+#
+# 2026-11-07 (owner: "see today is saturday why the fuck server started dude
+# why?"): with evaluation_periods = 1 this paged EVERY weekend - the digest
+# cron is MON-FRI, so Saturday's datapoint is legitimately missing and
+# breaching turns that into an ALARM. It was missed when the three sibling
+# did-it-run alarms were gated on 2026-09-01. Their fix (actions disabled,
+# armed by the market-hours gate 09:20-15:35 IST) does NOT fit this one: the
+# digest runs at 17:30 IST, so at Monday 09:20 the last 24 hours hold no
+# invocation and the gate would page every Monday morning. Instead, the
+# market_hours_liveness_gate_not_invoked pattern: N consecutive missing days.
+# A weekend is at most 2 missing days (the cron ignores holidays, so a weekday
+# holiday is not one), and FOUR periods rather than three keeps a Monday
+# whose 17:30 invocation lands a minute late (Friday's is then just over 72 h
+# old) from paging. Cost: a dropped schedule pages after ~4 days, not 1.
+# Pinned by crates/common/tests/weekend_false_page_guard.rs.
+# ---------------------------------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "tv_daily_budget_digest_not_invoked" {
+  alarm_name          = "tv-${var.environment}-daily-budget-digest-not-invoked"
+  alarm_description   = "The daily spend digest did NOT RUN for ~4 days - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). The digest is the operator-facing view of AWS spend; while it is not running the bill is unobserved between the hourly kill-switch checks, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 4
+  datapoints_to_alarm = 4
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_daily_budget_digest.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = []
 }

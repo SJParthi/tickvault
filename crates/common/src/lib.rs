@@ -1,4 +1,5 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]
@@ -51,15 +52,21 @@ pub mod muhurat;
 // `open_price_source` DELETED as a pair — the retired `/marketfeed/quote`
 // open-price fallback (already a REMOVE class in
 // no-rest-except-live-feed-2026-06-27.md §3; zero refs outside the pair).
+pub mod operator_movers_wire;
 pub mod order_types;
-// Dead-code batch 2 (2026-07-18): `phase` DELETED — zero refs.
-pub mod portfolio_types;
 pub mod price_precision;
 pub mod sanitize;
 pub mod segment;
+pub mod session_window;
 pub mod source_scan;
 pub mod tick_types;
 pub mod trading_calendar;
 pub mod types;
 pub mod url_join;
 pub mod ws_event_types;
+
+pub mod operator_stock_movers_wire;
+// Plan PR MV (2026-11-06): the movers universe + pure per-filter selection,
+// shared with the operator Lambda through `#[path]`.
+pub mod mtf_receipt_json;
+pub mod operator_movers_universe;

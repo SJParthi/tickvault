@@ -61,14 +61,9 @@ fn ratchet_order_runtime_spawned_only_from_rest_stack() {
 
     // ZERO spawns anywhere else that could run alongside trading_pipeline's
     // OMS (main.rs incl. the fast crash-recovery arm AND the post-test-module
-    // trailing fns, the pipeline itself, the mark-source REST legs —
-    // groww_bridge.rs retired with the Groww live feed, 2026-07-15/#1581).
-    for file in [
-        "main.rs",
-        "trading_pipeline.rs",
-        "groww_spot_1m_boot.rs",
-        "groww_contract_1m_boot.rs",
-    ] {
+    // trailing fns, and the pipeline itself). The retired feed's REST legs
+    // left this scan set with their files on 2026-08-21.
+    for file in ["main.rs", "trading_pipeline.rs"] {
         let prod = prod_region(file);
         let spawns = prod.matches("spawn_order_runtime(").count();
         assert_eq!(
@@ -101,56 +96,6 @@ fn ratchet_order_runtime_spawned_only_from_rest_stack() {
          risk.evaluate_daily_loss_halt() at least twice (post-mark-batch + \
          housekeeping backstop); found {halt_calls} — the MTM halt would be \
          dead in the spawned task"
-    );
-}
-
-/// M2 (fix-round 2026-07-14; re-homed 2026-07-16 after the Groww live
-/// bridge retired with #1581): the Groww per-minute REST legs' OWN-FIRE
-/// persist-confirm taps are the ONLY thing feeding the runtime's marks —
-/// deleting a `mark_forward(` call (or a `staged_marks.push`) would
-/// silently kill paper fills + the mark-to-market halt in prod while every
-/// unit test (which hand-feeds `mark_tx`) stays green. Pin EXACTLY ONE tap
-/// per leg (1-tap-per-leg): one own-fire staging site + one post-flush-ACK
-/// forward site per file's production region — a second staging site would
-/// mean the backfill/sweep arms started producing marks (the stale-price
-/// class the C11 replay-window gate existed for on the old bridge).
-#[test]
-fn ratchet_groww_rest_leg_mark_taps_pinned() {
-    for file in ["groww_spot_1m_boot.rs", "groww_contract_1m_boot.rs"] {
-        let prod = prod_region(file);
-        let stages = prod.matches("staged_marks.push(").count();
-        assert_eq!(
-            stages, 1,
-            "{file} production region must stage marks at EXACTLY ONE site \
-             (the OWN-FIRE just-closed-minute close) — found {stages}; a \
-             second site means backfill/sweep/warm-up started producing \
-             marks (stale prices must never fill paper orders), zero means \
-             the runtime receives no marks from this leg"
-        );
-        let forwards = prod.matches("forwarder.mark_forward(").count();
-        assert_eq!(
-            forwards, 1,
-            "{file} production region must forward marks at EXACTLY ONE \
-             site (after the persist flush ACK) — found {forwards}"
-        );
-        // The forward site stays gated on the flush-ACK success arm: the
-        // staging vec is only drained where the fold-writer/commit handoff
-        // confirms persistence. Pin the None-gate shape so a refactor can't
-        // start forwarding unconditionally.
-        assert!(
-            prod.contains("if let Some(forwarder) = params.mark_forwarder.as_ref()"),
-            "{file} lost the Option-gate on the mark forward — the tap must \
-             be a no-op when [order_runtime] is disabled"
-        );
-    }
-    // The sweep/backfill arms must stay mark-free: the spot leg's
-    // post-session sweep fn exists in the scanned region (so the
-    // 1-site count above genuinely covers it).
-    let spot_prod = prod_region("groww_spot_1m_boot.rs");
-    assert!(
-        spot_prod.contains("async fn run_post_session_sweep"),
-        "groww_spot_1m_boot.rs scanned region lost run_post_session_sweep — \
-         the 1-tap pin no longer proves the sweep is mark-free"
     );
 }
 
@@ -249,18 +194,8 @@ mod tests {
         "main.rs scanned region lost `fn spawn_feed_scoreboard_tasks` — the \
          post-test-module production code is no longer covered (H1 regression)"
     );
-    // (groww_bridge.rs retired with the Groww live feed 2026-07-15/#1581;
-    // groww_spot_1m_boot.rs has the same H1 shape — mid-impl #[cfg(test)]
-    // attrs long before its late production sweep fn.)
-    let spot = src("groww_spot_1m_boot.rs");
-    let first_cfg_test = spot
-        .find("#[cfg(test)]")
-        .expect("groww_spot_1m_boot.rs has cfg(test) markers"); // APPROVED: test
-    let spot_prod = prod_region("groww_spot_1m_boot.rs");
-    assert!(
-        spot_prod[first_cfg_test..].contains("async fn run_post_session_sweep"),
-        "groww_spot_1m_boot.rs scanned region lost `run_post_session_sweep` \
-         AFTER its first #[cfg(test)] marker — the guard is back to scanning \
-         only the file prefix (H1 regression)"
-    );
+    // The second half of this self-test scanned the retired feed's spot leg,
+    // which had the same mid-impl #[cfg(test)] shape as main.rs. It went with
+    // the feed on 2026-08-21, so main.rs above is the only file left proving
+    // the scan reaches past a mid-file test module.
 }

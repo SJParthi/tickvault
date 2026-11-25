@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e23825ef96162877830143b9ed3ac6d283fb0c4cfa04025b7b37ebd604054e29 # shrinks to rows = [DepthCandidate { underlying: "RELIANCE", contract_security_id: 1, expiry_micros: 1900000000000000, strike: 24550.0, spot: 24500.0, leg: "PE", is_index_option: true }, DepthCandidate { underlying: "RELIANCE", contract_security_id: 1, expiry_micros: 1900000000000000, strike: 24550.0, spot: 24500.0, leg: "CE", is_index_option: true }, DepthCandidate { underlying: "RELIANCE", contract_security_id: 2, expiry_micros: 1900000000000000, strike: 24550.0, spot: 24500.0, leg: "PE", is_index_option: true }]
+cc 7138330859230727182208f92566a46306e1047517dbb2a9ac54110ef446bf93 # shrinks to rows = [DepthCandidate { underlying: "RELIANCE", contract_security_id: 23, expiry_micros: 1900000000000000, strike: 24600.0, spot: 24500.0, leg: "PE", is_index_option: true }, DepthCandidate { underlying: "RELIANCE", contract_security_id: 23, expiry_micros: 1900000000000000, strike: 24600.0, spot: 24500.0, leg: "CE", is_index_option: true }]

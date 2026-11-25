@@ -1,5 +1,5 @@
 //! Hand-rolled JSON-RPC 2.0 over newline-delimited stdio — the exact
-//! MCP 2024-11-05 subset server.py implements: `initialize`,
+//! MCP 2024-11-05 subset the retired reference implementation implements: `initialize`,
 //! `tools/list`, `tools/call`, `notifications/initialized` (silent),
 //! unknown method → -32601, parse error → -32700 with `id: null`.
 //!
@@ -19,7 +19,7 @@ use crate::tools;
 /// legacy `f"{value}"` rendering of a JSON value pulled from the request
 /// (`unknown tool: {name}` / `method not found: {method}`): `None`,
 /// `True`/`False`, bare strings, number repr.
-fn py_display(v: &Value) -> String {
+fn legacy_display(v: &Value) -> String {
     match v {
         Value::Null => "None".to_string(),
         Value::Bool(true) => "True".to_string(),
@@ -92,7 +92,7 @@ pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
                     // too, so only key ORDER differs (sorted vs
                     // insertion — the harness's documented
                     // normalization).
-                    let text = crate::pycompat::ensure_ascii(
+                    let text = crate::legacy_compat::ensure_ascii(
                         &serde_json::to_string_pretty(&result).unwrap_or_default(),
                     );
                     Some(envelope_result(
@@ -103,12 +103,12 @@ pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
                 Some(Err(msg)) => Some(envelope_error(
                     &id,
                     -32000,
-                    &format!("tool {} failed: {msg}", py_display(&name_val)),
+                    &format!("tool {} failed: {msg}", legacy_display(&name_val)),
                 )),
                 None => Some(envelope_error(
                     &id,
                     -32601,
-                    &format!("unknown tool: {}", py_display(&name_val)),
+                    &format!("unknown tool: {}", legacy_display(&name_val)),
                 )),
             }
         }
@@ -116,7 +116,7 @@ pub fn handle_request(ctx: &Ctx, req: &Value) -> Option<Value> {
         _ => Some(envelope_error(
             &id,
             -32601,
-            &format!("method not found: {}", py_display(&method_val)),
+            &format!("method not found: {}", legacy_display(&method_val)),
         )),
     }
 }
@@ -135,7 +135,7 @@ pub fn process_line(ctx: &Ctx, raw: &str) -> Option<Value> {
 }
 
 /// The stdio loop: newline-delimited requests in, newline-delimited
-/// responses out, flush after every response (server.py flushes per
+/// responses out, flush after every response (the retired reference implementation flushes per
 /// write).
 ///
 /// Lines are read as RAW BYTES (`read_until(b'\n')`) and converted with
@@ -177,7 +177,7 @@ fn run_loop<R: BufRead, W: Write>(ctx: &Ctx, mut input: R, mut out: W) {
             // then; this covers envelope-level non-ASCII (e.g. a
             // client-supplied non-ASCII tool name echoed into an error
             // message).
-            let s = crate::pycompat::ensure_ascii(&s);
+            let s = crate::legacy_compat::ensure_ascii(&s);
             // Deliberate deviation (ledger in lib.rs): a stdout write
             // failure (broken pipe) is swallowed and the loop runs to
             // stdin EOF + exit 0; the legacy runtime dies exit 1 with a

@@ -77,7 +77,7 @@ The operator's verbatim charter (shouted across multiple sessions):
 |---|---|---|
 | Never miss a single tick | BOUNDED ZERO LOSS inside chaos-test envelope: rescue ring (600 K) → spill file → DLQ NDJSON. Beyond envelope DLQ catches every payload as recoverable text. | SEBI audit demands honesty; "never" without envelope is a lie. |
 | WebSocket never disconnects | DETECT in <= 5 s via watchdog; RECONNECT with SubscribeRxGuard preserving subs; SLEEP-UNTIL-OPEN post-close (Wave-2-A/B). | TCP is not in our control; networks fail. |
-| Never slow / locked / hanged | Hot path DHAT-tested <= 4 blocks/8 KB across 10 K calls; Criterion p99 <= 100 ns enqueue; tick-gap > 30 s fires Telegram (coalesced 60 s). | OS scheduler can preempt; we detect, we don't prevent. |
+| Never slow / locked / hanged | Hot path DHAT-tested <= 4 blocks/8 KB across 10 K calls; Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) <= 100 ns enqueue; tick-gap > 30 s fires Telegram (coalesced 60 s). | OS scheduler can preempt; we detect, we don't prevent. |
 | QuestDB never fails | ABSORB via 3-tier resilience; `tv_questdb_disconnected_seconds > 30` fires CRITICAL. | Remote process; we cannot prevent its failures. |
 | O(1) latency | DHAT zero-alloc + Criterion <= 50 ns budget on hot-path lookups; bench-gate fails build on > 5 % regression. | Without ratchet, drift returns within 1 month. |
 | Uniqueness + dedup | Composite key `(security_id, exchange_segment)` per I-P1-11; DEDUP UPSERT KEYS on every storage table; `dedup_segment_meta_guard` scans every constant. | Without composite key the 2026-04-17 production bug recurs. |
@@ -136,7 +136,7 @@ For EACH new code path, ALL SEVEN observability layers must fire.
 
 Mechanical guards (already shipped):
 - `error_code_tag_guard.rs` — `error!` must carry `code` field
-- `resilience_sla_alert_guard.rs` — counters must have an alert rule
+- `resilience_sla_alert_guard.rs` — counters must have an alert rule **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.**
 - `dedup_segment_meta_guard.rs` — every DEDUP key includes segment
 
 ---
@@ -213,14 +213,14 @@ Honest implementation (mechanical, not aspirational):
 
 | 100% claim | Mechanical proof |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (68.3–99.4, target 100%), floors only move up; enforced post-merge by `scripts/coverage-gate.sh` |
+| Code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up; ~~enforced post-merge by `scripts/coverage-gate.sh`~~ **⚠ CORRECTED 2026-10-11:** enforced by `scripts/coverage-gate.sh` on every PR inside All Green, and again after merge |
 | Audit coverage | Every typed event writes to a `<event>_audit` table (Wave-2-D + Wave-4-E) |
 | Testing coverage | 22 test categories per `testing.md`; scoped per changed crate |
 | Code checks | banned-pattern-scanner + pub-fn-test-guard + pub-fn-wiring-guard + plan-verify + secret-scan + 8 pre-commit gates |
-| Performance | DHAT zero-alloc + Criterion p99 budgets + bench-gate <= 5% regression |
+| Performance | DHAT zero-alloc + Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) budgets + bench-gate <= 5% regression |
 | Monitoring | 7-layer telemetry (Section 4); `mcp__tickvault-logs__*` MCP tools |
 | Logging | tracing macros mandatory; ERROR routes to Telegram; logs hourly-rotated |
-| Alerting | Prometheus alerts in `alerts.yml`; `resilience_sla_alert_guard` ratchets |
+| Alerting | Prometheus alerts in `alerts.yml`; `resilience_sla_alert_guard` ratchets **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | Security | banned-pattern-scanner; secret-scan; `Secret<T>` enforced; security-reviewer agent |
 | Security hardening | Static IP enforcement; pre-commit secret scan; `unused_must_use` lint |
 | Bug fixing | Adversarial 3-agent review (Section 3) — proven 4-bug catch rate per 30-commit PR |
@@ -240,22 +240,25 @@ When the PR description quotes "100% guarantee", it MUST be phrased exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > <= 60s QuestDB outage absorbed by rescue->spill->DLQ;
-> the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (600,000 at TF_COUNT=24 — never restate this as a literal: the docs said 200,000, then 525,000 at TF_COUNT=21, and TF_COUNT is now 24. Read the constant, do not quote a number) (constant `SEAL_BUFFER_CAPACITY`,
+> the derived seal-ring capacity `AGGREGATOR_MAX_SLOTS × TF_COUNT` (never restate this as a number: the docs quoted 200,000, then 525,000, 600,000 and 225,000 as `TF_COUNT` moved, and each went stale. Read the constant) (constant `SEAL_BUFFER_CAPACITY`,
 > `crates/trading/src/candles/seal_ring.rs`, ratcheted by
 > `seal_ring.rs::test_seal_buffer_capacity_constant_is_locked_value`)
 > -> NDJSON spill -> DLQ; bench-gated
 > O(1) hot path; composite-key uniqueness;
-> chaos-tested 65h Fri 16:00 IST -> Mon 09:00 IST weekend sleep/wake
-> (`crates/core/tests/ws_sleep_resilience.rs`). Beyond the envelope,
+> calendar-tested 65h Fri 16:00 IST -> Mon 09:00 IST weekend sleep-until-open
+> schedule (`crates/core/tests/ws_sleep_resilience.rs` -- date arithmetic only:
+> no socket is held open across it; the box is stopped overnight and at
+> weekends). Beyond the envelope,
 > DLQ NDJSON catches every payload as recoverable text."
 
 Promising "WebSocket never disconnects" or "QuestDB never fails"
 without the envelope qualifier = REJECT IN REVIEW.
 
 Outstanding (Wave-6 backlog): >65h dormant sleep across long-weekend
-holidays (Fri -> Tue) is NOT yet pinned by a chaos test. The
-`secs_until_next_market_open` calendar handles arbitrary holiday gaps,
-but the chaos sweep only exercises the 65h weekend case. See
+holidays (Fri -> Tue) has a CALENDAR test only
+(`test_long_weekend_monday_holiday_sleep_wakes_on_tuesday`); no test holds a
+socket across any sleep, 65h or longer (corrected 2026-10-09: this paragraph
+and the template above called the calendar test a "chaos sweep"). See
 `.claude/plans/active-plan-wave-6-backlog.md` item W6-2 for the
 extension to a 92h Mon-holiday wake test.
 

@@ -45,6 +45,8 @@ arc-swap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Plan PR MV: the movers `select` identity property test (existing workspace pin).
+proptest = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "tickvault-storage", "thiserror", "tower"]

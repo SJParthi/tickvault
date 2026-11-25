@@ -6,7 +6,8 @@
 //!                            (a) the holiday-stop marker is NOT today and
 //!                            (b) the tv-app box is actually up; then reset
 //!                            each alarm to OK.
-//! mode="close" (15:35 IST) → disable them again.
+//! mode="close" (15:40 IST since 2026-10-26, audit PR L4; 15:35 before) →
+//! disable them again.
 //!
 //! Environment variables (unchanged): `ALARM_NAMES` (comma-separated),
 //! `EC2_INSTANCE_ID`, `HOLIDAY_STOP_PARAM`.
@@ -51,6 +52,33 @@ pub fn parse_alarm_names(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Event key naming gated alarms an `open` must leave disarmed.
+pub const SKIP_ALARMS_EVENT_KEY: &str = "skip_alarms";
+
+/// The alarms an `open` arms: `ALARM_NAMES` less every name the event lists
+/// under [`SKIP_ALARMS_EVENT_KEY`]. A subset only, never a widening: a name
+/// not in `ALARM_NAMES` is ignored, and a missing or malformed key skips
+/// nothing (the weekday 09:20 rule sends no key, so it arms the full list).
+///
+/// Why it exists (2026-10-30, owner: "go ahead and fix the muhurat risk
+/// dude"): the dated Muhurat open rule runs on a weekend date, and three gated
+/// alarms ask "did a MON-FRI Lambda run today?" (`Invocations < 1`, 86400 s,
+/// breaching). Armed on a Sunday they would page for a check that correctly
+/// did not run. The Muhurat rule lists those three here. Pure, O(names × skip).
+#[must_use]
+pub fn alarms_to_open(alarm_names: &[String], event: &Value) -> Vec<String> {
+    let skip: Vec<&str> = event
+        .get(SKIP_ALARMS_EVENT_KEY)
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    alarm_names
+        .iter()
+        .filter(|name| !skip.contains(&name.as_str()))
+        .cloned()
         .collect()
 }
 
@@ -129,6 +157,9 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     }
 
     // --- mode == open ---
+    // A dated Muhurat open leaves the weekday did-it-run alarms disarmed
+    // (`alarms_to_open`); the weekday rule sends no skip list.
+    let alarm_names = alarms_to_open(&alarm_names, &event);
     let ssm = crate::clients::ssm(&config);
     let today_ist = crate::time::today_ist_string(Utc::now());
     // FAIL-OPEN: any SSM error / missing param = not a holiday.
@@ -182,21 +213,131 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             );
         }
         OpenDecision::Enable => {
-            cw.enable_alarm_actions()
-                .set_alarm_names(Some(alarm_names.clone()))
-                .send()
-                .await?;
-            // Reset to OK on open so a stale ALARM from a prior window does
-            // not immediately re-fire on the first enabled evaluation.
+            // ORDER IS LOAD-BEARING -- corrected 2026-08-28. See
+            // `alarm_gate.rs` for the full reasoning; in short: AWS runs an
+            // alarm's actions on `SetAlarmState` whenever the new state
+            // differs from the old, so enabling BEFORE resetting paged the
+            // operator every trading morning at 09:20.
+            //
+            // Five of the gated alarms are `treat_missing_data = breaching`
+            // AND carry `ok_actions` -- dhan_live_lane_down,
+            // dhan_no_ticks_flowing, depth_steering_stalled,
+            // market_hours_liveness_missing, app_log_ingestion_silent. The box
+            // stops at 17:30, they enter ALARM overnight with actions
+            // disabled (correct, no page), and the old order then enabled
+            // actions and immediately transitioned them ALARM -> OK, firing
+            // five "recovered" messages for a condition that was the box being
+            // switched off on schedule. Roughly 110 pages a month, all noise,
+            // all at the same minute.
+            //
+            // Resetting while actions are still disabled costs nothing, keeps
+            // every alarm's genuine in-session recovery signal, and also shuts
+            // the mirror-image window in which a stale ALARM briefly had live
+            // actions.
+            // THE RESET MUST NOT BE ABLE TO BLOCK THE ENABLE -- 2026-08-28,
+            // same day, correcting the change directly above.
+            //
+            // The first version of this reordering used `?` inside the loop.
+            // That is a strictly WORSE failure mode than the bug it fixed: one
+            // failed `SetAlarmState` returns early, `enable_alarm_actions` never
+            // runs, and EVERY gated alarm stays action-disabled for the entire
+            // trading day. Trading five spurious morning pages for a chance of
+            // total alerting silence is not a trade worth making.
+            //
+            // So a failed reset is COUNTED and LOGGED and the loop continues.
+            // The worst case is now the OLD behaviour for that one alarm -- a
+            // stale ALARM transitioning to OK with actions live, i.e. one
+            // spurious recovery page -- which is exactly the noise this change
+            // set out to remove, and infinitely better than silence.
+            //
+            // `enable_alarm_actions` is therefore unconditional and is the ONLY
+            // call in this arm that may propagate: if the alarms cannot be
+            // armed at all, the invocation must fail loudly so the Lambda's
+            // Errors alarm fires.
+            // ARM EACH ALARM AS SOON AS IT IS RESET -- 2026-08-29, closing the
+            // last hole an adversarial review found in the two corrections
+            // above.
+            //
+            // Those corrections handled a failed `SetAlarmState`. Neither
+            // handled the INVOCATION dying: this Lambda has a 30s timeout, and
+            // under CloudWatch throttling the SDK retries each call with
+            // backoff. A timeout part-way through a reset-all-then-enable-all
+            // shape means `enable_alarm_actions` never runs and ALL of the
+            // gated alarms stay unarmed for the whole trading day -- the total
+            // silence the comment above correctly calls the worse trade, just
+            // reached through a door it was not watching.
+            //
+            // Pairing the two calls per alarm removes the trade rather than
+            // choosing a side of it. A death mid-loop now leaves every
+            // ALREADY-PROCESSED alarm armed and only the remainder unarmed,
+            // instead of losing all of them. The reset still happens while
+            // that alarm's actions are disabled, so the spurious-page property
+            // the reorder was made for is unchanged.
+            let mut reset_failures = 0usize;
+            let mut arm_failures = 0usize;
             for name in &alarm_names {
-                cw.set_alarm_state()
+                if let Err(err) = cw
+                    .set_alarm_state()
                     .alarm_name(name)
                     .state_value(aws_sdk_cloudwatch::types::StateValue::Ok)
                     .state_reason(MARKET_OPEN_STATE_REASON)
                     .send()
-                    .await?;
+                    .await
+                {
+                    reset_failures += 1;
+                    tracing::error!(
+                        code = "LAMBDA-AWS-02",
+                        alarm = %name,
+                        error = %err,
+                        "could not pre-reset this alarm to OK before arming. Arming \
+                         continues regardless -- the cost is at most one spurious \
+                         recovery page for this alarm, and the alternative is an \
+                         unarmed alarm for the whole session."
+                    );
+                }
+                if let Err(err) = cw.enable_alarm_actions().alarm_names(name).send().await {
+                    arm_failures += 1;
+                    tracing::error!(
+                        code = "LAMBDA-AWS-02",
+                        alarm = %name,
+                        error = %err,
+                        "could not arm this alarm -- the others are armed independently, \
+                         and if NONE of them arms the invocation fails below"
+                    );
+                }
             }
-            info!(alarms = ?alarm_names, "enabled actions");
+            // There is exactly ONE arming call in this file (the guard in
+            // `cloudwatch_agent_glob_guard.rs` counts them, so this comment
+            // deliberately does not spell the token), and it is the per-alarm
+            // one inside the loop above. A second bulk
+            // call would read as an unconditional arm to anyone auditing this
+            // arm -- the shape the holiday guard exists to forbid -- and it
+            // bought nothing the loop does not already do: the loop arms every
+            // alarm independently, so a mid-loop failure never costs the rest.
+            //
+            // What the bulk call DID carry was the loud-failure property, and
+            // that is kept here explicitly, at the SAME strength: the bulk `?`
+            // failed the invocation on any arming error, so ANY unarmed alarm
+            // fails it here too. Deliberately not "all of them failed" -- one
+            // unarmed alarm is one signal that pages nobody for the session,
+            // and returning Ok on that is the false-OK class this repo forbids.
+            //
+            // Reset failures are NOT fatal, and the asymmetry is the point: a
+            // failed pre-reset costs at most one spurious recovery page, while
+            // a failed arm costs the page itself.
+            if arm_failures > 0 {
+                return Err(Error::from(format!(
+                    "could not arm {arm_failures} of {} gated alarms -- each is a \
+                     liveness signal that would page nobody for the session",
+                    alarm_names.len()
+                )));
+            }
+            info!(
+                alarms = ?alarm_names,
+                reset_failures,
+                arm_failures,
+                "enabled actions"
+            );
         }
     }
     Ok(open_result(mode, &decision))
@@ -204,7 +345,127 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failed pre-reset must never prevent the alarms being ARMED.
+    ///
+    /// The reordering that removed the daily false-recovery flood was first
+    /// written with `?` inside the reset loop. That is a strictly worse failure
+    /// than the one it fixed: one failed `SetAlarmState` returns early,
+    /// `enable_alarm_actions` never runs, and every gated alarm stays
+    /// action-disabled for the whole trading day. Five spurious pages traded
+    /// for a chance of total silence is not a trade worth making.
+    ///
+    /// Source-order and shape assertion, because the failure is entirely about
+    /// which call can abort which -- there is no way to observe it from a unit
+    /// test without an AWS client.
+    #[test]
+    fn a_failed_alarm_reset_cannot_block_arming() {
+        // BOTH gates, and the scope is the point (2026-08-28).
+        //
+        // This test read only `market_hours_gate.rs` when it was written, and
+        // `alarm_gate.rs` carried the IDENTICAL `.await?` on its reset — so the
+        // fix this test pinned was half a fix, and the test was structurally
+        // unable to say so. A guard scoped to one of two identical call sites
+        // certifies the site it can see and quietly blesses the one it cannot.
+        for (label, source) in [
+            ("market_hours_gate", include_str!("market_hours_gate.rs")),
+            ("alarm_gate", include_str!("alarm_gate.rs")),
+        ] {
+            let enable = source
+                .find("enable_alarm_actions()")
+                .unwrap_or_else(|| panic!("{label}: the open path must arm the alarms"));
+            let reset = source[..enable]
+                .rfind("set_alarm_state()")
+                .unwrap_or_else(|| panic!("{label}: the open path must reset to OK first"));
+            // Everything between the reset call and the arm call. If a `?` sits
+            // in there, one transient SetAlarmState failure returns early and
+            // the arm never happens.
+            let body = &source[reset..enable];
+            assert!(
+                !body.contains(".await?"),
+                "{label}: the pre-arm reset propagates with `?`. One failed \
+                 SetAlarmState then returns early and enable_alarm_actions NEVER RUNS, \
+                 leaving the gated alarm(s) silent for the entire session it was being \
+                 armed for. A failed reset must be logged and arming must proceed"
+            );
+            assert!(
+                body.contains("tracing::error!") || body.contains("reset_failures"),
+                "{label}: a failed reset must be VISIBLE — silently swallowing it hides \
+                 that an alarm may fire one spurious recovery page, and hides that the \
+                 reset is failing at all"
+            );
+        }
+    }
+
+    /// The gates must RESET to OK before ENABLING actions, never after.
+    ///
+    /// AWS runs an alarm's actions on `SetAlarmState` whenever the new state
+    /// differs from the old one. Enabling first therefore turned the daily
+    /// window open into a page: the box stops at 17:30, the five gated alarms
+    /// that are `treat_missing_data = breaching` AND carry `ok_actions` enter
+    /// ALARM overnight (correctly silent, actions disabled), and the 09:20
+    /// reset then fired five "recovered" messages for a condition that was the
+    /// box being switched off on schedule -- roughly 110 pages a month, all
+    /// noise, all at the same minute.
+    ///
+    /// Pinned as a source-order assertion because there is no way to observe
+    /// AWS's action dispatch from a unit test: the bug is entirely in WHICH
+    /// call happens first, and that is exactly what this reads.
+    #[test]
+    fn the_gates_reset_to_ok_before_enabling_actions() {
+        for (label, source) in [
+            ("market_hours_gate", include_str!("market_hours_gate.rs")),
+            ("alarm_gate", include_str!("alarm_gate.rs")),
+        ] {
+            let enable = source
+                .find("enable_alarm_actions()")
+                .unwrap_or_else(|| panic!("{label}: the open path must enable actions"));
+            let reset = source
+                .find("set_alarm_state()")
+                .unwrap_or_else(|| panic!("{label}: the open path must reset to OK"));
+            assert!(
+                reset < enable,
+                "{label}: SetAlarmState(OK) must come BEFORE enable_alarm_actions. \
+                 Enabling first makes the daily window-open transition ALARM -> OK \
+                 with live actions, which pages the operator every trading morning \
+                 for alarms that were never broken -- and leaves a window in which a \
+                 stale ALARM has live actions too"
+            );
+        }
+    }
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn test_alarms_to_open_weekday_event_arms_the_full_list() {
+        let all = names(&["liveness", "no-ticks", "deploy-watchdog-not-invoked"]);
+        assert_eq!(alarms_to_open(&all, &json!({"mode": "open"})), all);
+        // A malformed skip value skips nothing.
+        assert_eq!(
+            alarms_to_open(&all, &json!({"mode": "open", "skip_alarms": "liveness"})),
+            all
+        );
+    }
+
+    #[test]
+    fn test_alarms_to_open_muhurat_event_leaves_the_skipped_alarms_disarmed() {
+        let all = names(&["liveness", "no-ticks", "deploy-watchdog-not-invoked"]);
+        let event = json!({"mode": "open", "skip_alarms": ["deploy-watchdog-not-invoked"]});
+        assert_eq!(
+            alarms_to_open(&all, &event),
+            names(&["liveness", "no-ticks"])
+        );
+    }
+
+    #[test]
+    fn test_alarms_to_open_never_widens_the_list() {
+        let all = names(&["liveness"]);
+        let event = json!({"mode": "open", "skip_alarms": ["some-other-alarm", 7]});
+        assert_eq!(alarms_to_open(&all, &event), all);
+    }
 
     #[test]
     fn test_parse_alarm_names_splits_trims_and_drops_empties() {

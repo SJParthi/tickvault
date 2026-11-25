@@ -11,12 +11,16 @@
 //! - QuestDB table row counts (`/api/stats`),
 //! - overall app health + subsystems (`/health`).
 //!
-//! It is a pure VIEW that client-side fetches the EXISTING JSON endpoints —
-//! `GET /health`, `GET /api/feeds`, `GET /api/feeds/health`, `GET /api/stats` —
-//! and renders them with ~5s auto-refresh. It adds NO new backend endpoint: the
-//! Groww/Dhan last-error reason, tick counts, candle counts and DB stats are all
-//! already first-class fields on those endpoints (so the page shows REAL values,
-//! never hardcoded/hallucinated numbers).
+//! It is a pure VIEW that client-side fetches the JSON endpoints —
+//! `GET /health`, `GET /api/feeds`, `GET /api/feeds/health`, `GET /api/stats`,
+//! and (owner 2026-10-30) the bearer-gated `GET /api/debug/speed-health` —
+//! and renders them with ~5s auto-refresh. The page shows REAL values, never
+//! hardcoded numbers. The speed-and-health panel is painted generically: the
+//! server decides each source's label, number and operational verdict; the page
+//! rejects legacy/expired snapshots, and strict session proof stays UNKNOWN.
+//! The server decides metric semantics
+//! (`handlers::speed_health`, where it is tested), so the page's script stays
+//! inside the browser-surface guard's size ceilings.
 //!
 //! The HTML shell carries no secrets, so it is a PUBLIC route; every data read it
 //! performs goes through the same `/api/*` endpoints as `/feeds`. The page keeps
@@ -24,10 +28,26 @@
 //! works with no token). It iterates whatever feed rows the API returns (no
 //! hardcoded 2-feed list), so a future 3rd feed appears with zero page edits.
 //!
+//! **⚠ CHANGED 2026-10-30 (owner: "yes add the fno stocks page to dashboard
+//! dude"):** the page gains an "F&O stocks — price movers" section (Gainers /
+//! Losers / All, search, sort by change %), fed by ONE new endpoint,
+//! `GET /api/fno-stocks` (bearer-gated, rate-limited, 2 s cache; see
+//! `fno_stocks.rs`). So "adds NO new backend endpoint" above is no longer true
+//! for that one section. The section shows a price as live only when the
+//! endpoint says `live`; every other status is shown as a plain reason.
+//!
 //! Mirrors the `feeds_page.rs` pattern: a `const DASHBOARD_HTML` returned via
 //! `Html(...)` with `X-Frame-Options: SAMEORIGIN` + a `frame-ancestors 'self'`
 //! CSP, and every fetched value rendered via `textContent` (never `innerHTML`)
 //! so the page is XSS-proof by construction.
+//!
+//! Browser controls: DOM writes use createElement/textContent; one failed read
+//! clears only its panel. Gated reads stop after a current-generation 401 until
+//! Save. Refreshes never overlap. F&O rows are live only when their source says
+//! live; feed enable switches are distinct from feed-health verdicts. Automatic
+//! polls pause while hidden, and returning to the tab clears old speed colours.
+//! The 15-second response lease is three UI poll periods, not a latency/sample-
+//! freshness policy. Its timer expires even while another endpoint's read hangs.
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Redirect};
@@ -86,11 +106,22 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   .warn { color: #b45309; }
   .err  { color: #b91c1c; }
   .ok   { color: #15803d; }
+  .fno-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .fno-bar button.on { background: #8885; font-weight: 700; }
+  .fno-bar input { flex: 1; min-width: 140px; padding: 7px 10px; font-size: 0.95rem;
+                   border: 1px solid #8884; border-radius: 8px; }
+  .fno-note { font-size: 0.85rem; color: #888; margin: 4px 0 8px; }
+  .fno-wrap { overflow-x: auto; }
+  .fno-wrap table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  .fno-wrap th, .fno-wrap td { padding: 6px 8px; border-bottom: 1px solid #8883;
+                               text-align: right; white-space: nowrap; }
+  .fno-wrap th:first-child, .fno-wrap td:first-child { text-align: left; }
+  .fno-wrap th { cursor: pointer; font-weight: 600; }
 </style>
 </head>
 <body>
   <h1>TickVault — Operator Dashboard</h1>
-  <p class="sub">Everything at a glance — feeds, live ticks, candles, database and
+  <p class="sub">Everything at a glance — feeds, live ticks, candles, database, speed and
      overall health. Updates automatically every few seconds.</p>
 
   <div class="token-row">
@@ -108,6 +139,32 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   <h2>Database</h2>
   <div id="stats" class="card"></div>
 
+  <h2>F&amp;O stocks — price movers</h2>
+  <div class="card">
+    <div class="fno-bar">
+      <button id="fno-gain" class="on">Gainers</button>
+      <button id="fno-lose">Losers</button>
+      <button id="fno-all">All</button>
+      <input id="fno-q" type="search" placeholder="Search a stock" autocomplete="off">
+    </div>
+    <div id="fno-note" class="fno-note"></div>
+    <div class="fno-wrap"><table>
+      <thead><tr><th>Name</th><th>LTP</th><th>Change</th><th id="fno-sort">Change % ▼</th>
+        <th>Value (Cr.) est.</th><th>Volume</th></tr></thead>
+      <tbody id="fno-body"></tbody>
+    </table></div>
+  </div>
+
+  <h2>Strict p99 below 1 microsecond</h2>
+  <p class="card" id="strict-proof">UNKNOWN — this endpoint has no dated, complete,
+     fresh strict-target proof. A first histogram bucket through 1,024 nanoseconds
+     cannot prove below 1,000. Since-startup readings are not Monday/session proof.</p>
+  <h2>Operational health and historical observations</h2>
+  <p class="sub">Speed colours use broad stall budgets, not the strict target above.
+     Each section states its own window. Grey means UNKNOWN. Response freshness
+     does not establish sample freshness or complete session coverage.</p>
+  <div id="speed"></div>
+
   <div id="status"></div>
 
   <div class="links">
@@ -116,13 +173,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
 <script>
-// Every value rendered below is built with createElement + textContent (never
-// innerHTML) so no fetched value can ever be interpreted as markup — XSS-proof by
-// construction even though some strings (feed reason) come from the server.
 const tokenEl   = document.getElementById("token");
 const overallEl = document.getElementById("overall");
 const feedsEl   = document.getElementById("feeds");
 const statsEl   = document.getElementById("stats");
+const speedEl   = document.getElementById("speed");
 const statusEl  = document.getElementById("status");
 
 tokenEl.value = sessionStorage.getItem("tv_api_token") || "";
@@ -142,19 +197,12 @@ function setStatus(msg, cls) {
   statusEl.className = cls || "";
 }
 
-// Emoji status, operator-readable. No library names, no file paths, no versions.
-function emojiFor(verdict) {
-  switch (verdict) {
-    case "ok":       return "✅"; // green check
-    case "degraded": return "⚠️"; // warning
-    case "down":     return "🆘"; // SOS
-    case "disabled": return "⭕"; // off circle
-    default:         return "❔"; // unknown
-  }
-}
+const VERDICT_EMOJI = { ok: "✅", degraded: "⚠️", down: "🆘", disabled: "⭕" };
+function emojiFor(verdict) { return VERDICT_EMOJI[verdict] || "❔"; }
+const LIGHT_EMOJI = { green: "🟢", amber: "🟠", red: "🔴" };
+const SPEED_RESPONSE_MAX_AGE_MS = 15000;
+let speedTimer;
 
-// Best-effort fetch helper: returns parsed JSON or null on any failure, so one
-// dead endpoint degrades a single panel to "—" instead of breaking the page.
 async function getJson(url) {
   try {
     const res = await fetch(url, { headers: authHeaders() });
@@ -166,22 +214,39 @@ async function getJson(url) {
   }
 }
 
-// SP6-style in-flight guard so the 5s auto-refresh + a manual Save can't overlap.
+let denied = false, gen = 0;
+async function getGated(url) {
+  if (denied) return null;
+  const g = gen;
+  try {
+    const res = await fetch(url, { headers: authHeaders() });
+    if (res.status === 401) { if (g === gen) { denied = true; setStatus("Unauthorized — enter your API token above.", "err"); } return null; }
+    return res.ok ? await res.json() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 let refreshing = false;
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
-    const [health, feeds, feedsHealth, stats] = await Promise.all([
+    const [health, feeds, feedsHealth, stats, fno, speed] = await Promise.all([
       getJson("/health"),
       getJson("/api/feeds"),
       getJson("/api/feeds/health"),
       getJson("/api/stats"),
+      getGated("/api/fno-stocks"),
+      getGated("/api/debug/speed-health"),
     ]);
     renderOverall(health);
     renderFeeds(feeds, feedsHealth);
     renderStats(stats);
-    setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
+    fnoData = fno;
+    renderFno();
+    renderSpeed(speed);
+    if (!denied) setStatus("Updated " + new Date().toLocaleTimeString(), "ok");
   } catch (e) {
     setStatus("Network error refreshing the dashboard.", "err");
   } finally {
@@ -189,40 +254,34 @@ async function refresh() {
   }
 }
 
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
 function appendKV(parent, label, value) {
-  const span = document.createElement("span");
-  const b = document.createElement("b");
-  b.textContent = value;
+  const span = el("span");
   span.appendChild(document.createTextNode(label + ": "));
-  span.appendChild(b);
+  span.appendChild(el("b", "", value));
   parent.appendChild(span);
+}
+
+function cardHead(parent, nameText, verdictText, verdictCls) {
+  const head = el("div", "head");
+  head.appendChild(el("div", "name", nameText));
+  head.appendChild(el("div", "verdict " + (verdictCls || ""), verdictText));
+  parent.appendChild(head);
 }
 
 function renderOverall(health) {
   overallEl.replaceChildren();
-  const head = document.createElement("div");
-  head.className = "head";
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = "Application";
-  const verdict = document.createElement("div");
-  verdict.className = "verdict";
-  if (!health) {
-    verdict.textContent = "❔ could not read health";
-    head.appendChild(name); head.appendChild(verdict);
-    overallEl.appendChild(head);
-    return;
-  }
+  if (!health) { cardHead(overallEl, "Application", "❔ could not read health"); return; }
   const healthy = health.status === "healthy";
-  verdict.textContent = (healthy ? "✅ " : "⚠️ ") + health.status;
-  verdict.className = "verdict " + (healthy ? "ok" : "warn");
-  head.appendChild(name); head.appendChild(verdict);
-  overallEl.appendChild(head);
-
-  // Subsystems — one short labelled chip per subsystem, real status text.
+  cardHead(overallEl, "Application", (healthy ? "✅ " : "⚠️ ") + health.status, healthy ? "ok" : "warn");
   const sub = health.subsystems || {};
-  const row = document.createElement("div");
-  row.className = "subsys metrics";
+  const row = el("div", "subsys metrics");
   for (const key of ["websocket", "order_update", "questdb", "token", "pipeline", "tick_persistence"]) {
     const s = sub[key];
     if (!s) continue;
@@ -234,48 +293,23 @@ function renderOverall(health) {
 function renderFeeds(feeds, feedsHealth) {
   feedsEl.replaceChildren();
   feeds = feeds || {};
-  feedsHealth = feedsHealth || {};
-  const rows = (feedsHealth.feeds || []);
+  const rows = ((feedsHealth || {}).feeds || []);
   if (rows.length === 0) {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.textContent = "— could not read feed health.";
-    feedsEl.appendChild(card);
+    feedsEl.appendChild(el("div", "card", "— could not read feed health."));
     return;
   }
   for (const hv of rows) {
     const key = hv.feed;
-    const card = document.createElement("div");
-    card.className = "card";
-
-    const head = document.createElement("div");
-    head.className = "head";
-    const name = document.createElement("div");
-    name.className = "name";
-    // ON/OFF from /api/feeds (enabled flag), health verdict from /api/feeds/health.
+    const card = el("div", "card");
     const enabled = !!feeds[key + "_enabled"];
-    name.textContent = key + " — " + (enabled ? "ON" : "OFF");
-    const verdict = document.createElement("div");
-    verdict.className = "verdict";
-    verdict.textContent = emojiFor(hv.verdict) + " " + (hv.verdict || "unknown").toUpperCase();
-    head.appendChild(name); head.appendChild(verdict);
-    card.appendChild(head);
-
-    // Plain-English last-error / status reason — prominent for the bad cases
-    // (esp. Groww connected-but-0-ticks or an auth/entitlement rejection).
+    cardHead(card, key + " — " + (enabled ? "ON" : "OFF"),
+      emojiFor(hv.verdict) + " " + (hv.verdict || "unknown").toUpperCase());
     if (hv.reason) {
-      const reason = document.createElement("div");
       const bad = (hv.verdict === "down") || hv.auth_rejected;
       const warn = (hv.verdict === "degraded");
-      reason.className = "reason" + (bad ? " bad" : (warn ? " warn" : ""));
-      reason.textContent = hv.reason;
-      card.appendChild(reason);
+      card.appendChild(el("div", "reason" + (bad ? " bad" : (warn ? " warn" : "")), hv.reason));
     }
-
-    // Live tick counts, candles, last tick time, subscribe/decode proof — real
-    // registry-backed numbers (never hardcoded).
-    const m = document.createElement("div");
-    m.className = "metrics";
+    const m = el("div", "metrics");
     appendKV(m, "connected", hv.connected ? "yes" : "no");
     appendKV(m, "ticks", String(hv.ticks_total || 0));
     if (hv.last_tick_age_secs === null || hv.last_tick_age_secs === undefined) {
@@ -289,65 +323,126 @@ function renderFeeds(feeds, feedsHealth) {
     if ((hv.decoded_dropped || 0) > 0) appendKV(m, "unmatched", String(hv.decoded_dropped));
     if ((hv.drops_total || 0) > 0) appendKV(m, "dropped", String(hv.drops_total));
     card.appendChild(m);
-
     feedsEl.appendChild(card);
   }
 }
 
+function tile(label, value, sub) {
+  const cell = el("div", "stat");
+  cell.appendChild(el("div", "num", value));
+  cell.appendChild(el("div", "lbl", label));
+  if (sub) cell.appendChild(el("div", "lbl", sub));
+  return cell;
+}
+
 function renderStats(stats) {
   statsEl.replaceChildren();
-  if (!stats) {
-    statsEl.textContent = "— could not read database stats.";
-    return;
-  }
-  const head = document.createElement("div");
-  head.className = "head";
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = "QuestDB";
-  const verdict = document.createElement("div");
-  verdict.className = "verdict " + (stats.questdb_reachable ? "ok" : "warn");
-  verdict.textContent = stats.questdb_reachable ? "✅ reachable" : "⚠️ unreachable";
-  head.appendChild(name); head.appendChild(verdict);
-  statsEl.appendChild(head);
-
-  const grid = document.createElement("div");
-  grid.className = "grid";
+  if (!stats) { statsEl.textContent = "— could not read database stats."; return; }
+  cardHead(statsEl, "QuestDB", stats.questdb_reachable ? "✅ reachable" : "⚠️ unreachable",
+    stats.questdb_reachable ? "ok" : "warn");
+  const grid = el("div", "grid");
   grid.style.marginTop = "10px";
-  // ticks / underlyings / derivatives (contracts) / indices tiles RETIRED
-  // 2026-07-19 (BATCH-5): the `ticks` writer was deleted 2026-07-17 and the
-  // instrument-master tables (fno_underlyings / derivative_contracts /
-  // subscribed_indices) are in the boot-time RETIRED_QUESTDB_TABLES DROP list,
-  // so all four rendered a permanently-0 placeholder (false-OK). Only the live
-  // `tables` (SHOW TABLES) count remains. Live per-feed tick/candle counts are
-  // still shown in the per-feed section above (hv.ticks_total / hv.candles_total).
-  const cells = [
-    ["tables", stats.tables],
-  ];
-  for (const [lbl, val] of cells) {
-    const cell = document.createElement("div");
-    cell.className = "stat";
-    const num = document.createElement("div");
-    num.className = "num";
-    num.textContent = String(val === null || val === undefined ? 0 : val);
-    const l = document.createElement("div");
-    l.className = "lbl";
-    l.textContent = lbl;
-    cell.appendChild(num); cell.appendChild(l);
-    grid.appendChild(cell);
-  }
+  grid.appendChild(tile("tables", String(stats.tables === null || stats.tables === undefined ? 0 : stats.tables)));
   statsEl.appendChild(grid);
 }
 
+let fnoData = null, fnoMode = "gain", fnoDesc = true;
+const fnoNote = document.getElementById("fno-note");
+const fnoBody = document.getElementById("fno-body");
+const fnoNum = (v, d) => (v === null || v === undefined) ? "—"
+  : Number(v).toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
+const FNO_STATUS = {
+  live: "🟢 Live",
+  stale: "⚠️ Not live — the newest price is old; the feed may be stalled",
+  closed: "⭕ Market closed — prices show only during the trading session",
+  no_fno_list: "❔ Today's F&O stock list is not ready yet",
+  no_data: "❔ No F&O stock price captured in the last few minutes",
+  unreachable: "🆘 The database did not answer — no prices shown",
+  query_failed: "🆘 The database refused the query — no prices shown",
+};
+function renderFno() {
+  fnoBody.replaceChildren();
+  const d = fnoData;
+  if (!d) { fnoNote.textContent = "— could not read F&O stocks."; fnoNote.className = "fno-note err"; return; }
+  let note = FNO_STATUS[d.status] || ("❔ " + d.status);
+  if (d.as_of_ist) note += " · as of " + d.as_of_ist + " IST";
+  if (d.fno_stocks_total) note += " · " + d.stocks_priced + " of " + d.fno_stocks_total + " F&O stocks priced";
+  fnoNote.textContent = note + ". " + d.value_basis + ".";
+  fnoNote.className = "fno-note " + (d.status === "live" ? "ok" : "warn");
+  const q = document.getElementById("fno-q").value.trim().toUpperCase();
+  let rows = (d.stocks || []).filter((s) => !q || s.name.toUpperCase().includes(q));
+  if (fnoMode !== "all") rows = rows.filter((s) => s.change_pct !== null && (fnoMode === "gain" ? s.change_pct > 0 : s.change_pct < 0));
+  const sign = (fnoMode === "lose" ? !fnoDesc : fnoDesc) ? -1 : 1;
+  rows.sort((a, b) => sign * ((a.change_pct ?? -1e9) - (b.change_pct ?? -1e9)));
+  for (const s of rows) {
+    const tr = document.createElement("tr");
+    const cls = s.change > 0 ? "ok" : (s.change < 0 ? "err" : "");
+    const cells = [[s.name, ""], [fnoNum(s.ltp, 2), ""], [fnoNum(s.change, 2), cls],
+      [s.change_pct === null ? "—" : fnoNum(s.change_pct, 2) + "%", cls],
+      [fnoNum(s.value_cr, 2), ""], [fnoNum(s.volume, 0), ""]];
+    for (const [text, c] of cells) {
+      const td = document.createElement("td");
+      td.textContent = text;
+      if (c) td.className = c;
+      tr.appendChild(td);
+    }
+    fnoBody.appendChild(tr);
+  }
+  if (rows.length === 0 && d.stocks && d.stocks.length) {
+    const tr = document.createElement("tr"), td = document.createElement("td");
+    td.colSpan = 6; td.textContent = "No stock matches."; tr.appendChild(td); fnoBody.appendChild(tr);
+  }
+}
+for (const [id, mode] of [["fno-gain", "gain"], ["fno-lose", "lose"], ["fno-all", "all"]]) {
+  document.getElementById(id).addEventListener("click", () => {
+    fnoMode = mode;
+    for (const b of ["fno-gain", "fno-lose", "fno-all"]) document.getElementById(b).className = b === id ? "on" : "";
+    renderFno();
+  });
+}
+document.getElementById("fno-q").addEventListener("input", renderFno);
+document.getElementById("fno-sort").addEventListener("click", (e) => {
+  fnoDesc = !fnoDesc;
+  e.target.textContent = "Change % " + (fnoDesc ? "▼" : "▲");
+  renderFno();
+});
+
+function renderSpeed(speed) {
+  clearTimeout(speedTimer);
+  speedEl.replaceChildren();
+  const age = speed ? Date.now() - speed.captured_at_unix_ms : NaN;
+  if (!speed || speed.evidence_version !== 1 || !Number.isSafeInteger(speed.captured_at_unix_ms)
+      || age < 0 || age >= SPEED_RESPONSE_MAX_AGE_MS || !Array.isArray(speed.sections)
+      || !speed.sections.every(s => s && Array.isArray(s.tiles) && s.tiles.every(t => t && typeof t.value === "string"))) {
+    speedEl.appendChild(el("div", "card", denied || !tokenEl.value.trim()
+      ? "UNKNOWN — enter the API token above and press Save."
+      : "UNKNOWN — snapshot missing, legacy, or expired; no current colours."));
+    return;
+  }
+  speedTimer = setTimeout(() => renderSpeed(null), SPEED_RESPONSE_MAX_AGE_MS - age);
+  for (const s of speed.sections) {
+    const card = el("div", "card");
+    card.appendChild(el("div", "name", s.title));
+    if (s.note) card.appendChild(el("div", "reason", s.note));
+    const grid = el("div", "grid");
+    grid.style.marginTop = "10px";
+    for (const t of (s.tiles || [])) {
+      grid.appendChild(tile(t.label, (LIGHT_EMOJI[t.status] || "⚪") + " " + t.value, t.detail));
+    }
+    card.appendChild(grid);
+    speedEl.appendChild(card);
+  }
+}
+
 document.getElementById("save").addEventListener("click", () => {
+  denied = false;
+  gen++;
   sessionStorage.setItem("tv_api_token", tokenEl.value.trim());
   refresh();
 });
 
 refresh();
-// Auto-refresh every 5s so the operator watches everything live. Skip polling when
-// the tab is hidden (no needless load on a backgrounded tab); a manual Save still
-// refreshes immediately.
+document.addEventListener("visibilitychange", () => { renderSpeed(null); if (!document.hidden) refresh(); });
 setInterval(() => { if (!document.hidden) refresh(); }, 5000);
 </script>
 </body>
@@ -417,9 +512,18 @@ mod tests {
     #[test]
     fn test_dashboard_page_fetches_all_required_endpoints() {
         // Guards against the page drifting from the API contract: it must compose
-        // ALL the existing endpoints it depends on. Re-uses existing endpoints —
-        // there is deliberately NO new /api/dashboard endpoint.
-        for endpoint in ["/health", "/api/feeds", "/api/feeds/health", "/api/stats"] {
+        // ALL the endpoints it depends on. Re-uses existing endpoints — there is
+        // deliberately NO /api/dashboard aggregate; /api/fno-stocks (2026-10-30)
+        // feeds only the F&O stocks section.
+        // /api/debug/speed-health (2026-10-30) feeds only the speed panel.
+        for endpoint in [
+            "/health",
+            "/api/feeds",
+            "/api/feeds/health",
+            "/api/stats",
+            "/api/fno-stocks",
+            "/api/debug/speed-health",
+        ] {
             assert!(
                 DASHBOARD_HTML.contains(endpoint),
                 "dashboard must fetch {endpoint}"
@@ -493,6 +597,61 @@ mod tests {
     }
 
     #[test]
+    fn test_dashboard_page_paints_the_speed_panel_from_server_verdicts() {
+        // Owner 2026-10-30: the speed and health numbers appear on this page.
+        // Rust supplies operational verdicts. The page withdraws expired or
+        // legacy responses; it never infers strict proof from their colours.
+        for marker in [
+            "Operational health and historical observations",
+            "Strict p99 below 1 microsecond",
+            "id=\"speed\"",
+            "renderSpeed(speed)",
+            "speed.sections",
+            "t.status",
+            "t.detail",
+            "green: \"🟢\"",
+            "amber: \"🟠\"",
+            "red: \"🔴\"",
+            "\"⚪\"",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "speed panel marker missing: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_never_polls_speed_without_a_token_or_after_a_refusal() {
+        // Every 401 on a bearer-gated route counts toward the brute-force
+        // page (Sum >= 25 per 5 min). A tab with no token, or a stale one,
+        // must not poll any of them every 5 s: the first 401 stops every
+        // gated read until Save (with auth off the read answers 200, so an
+        // empty token box is not a reason to skip it). A 401 for a request
+        // sent before the last Save does not lock the new token out. Both
+        // gated routes the page reads go through the one guarded helper.
+        for marker in [
+            "  if (denied) return null;\n  const g = gen;",
+            "if (res.status === 401) { if (g === gen) { denied = true; setStatus(\"Unauthorized — enter your API token above.\", \"err\"); } return null; }",
+            "  denied = false;\n  gen++;\n  sessionStorage.setItem",
+            "if (!denied) setStatus(\"Updated \"",
+            "getGated(\"/api/fno-stocks\"),",
+            "getGated(\"/api/debug/speed-health\"),",
+        ] {
+            assert!(DASHBOARD_HTML.contains(marker), "missing: {marker}");
+        }
+        // Only two fetch sites exist (the open getJson and the guarded
+        // getGated), and neither gated route goes through the open one.
+        assert_eq!(DASHBOARD_HTML.matches("fetch(").count(), 2);
+        for gated in ["/api/fno-stocks", "/api/debug/speed-health"] {
+            assert!(
+                !DASHBOARD_HTML.contains(&format!("getJson(\"{gated}\")")),
+                "{gated} must be fetched only through the token-guarded helper"
+            );
+        }
+    }
+
+    #[test]
     fn test_dashboard_page_auto_refreshes() {
         // Operator: watch everything live.
         assert!(
@@ -509,6 +668,55 @@ mod tests {
                 && DASHBOARD_HTML.contains("if (refreshing) return"),
             "refresh() has an in-flight guard"
         );
+    }
+
+    #[test]
+    fn test_dashboard_page_has_the_fno_stocks_movers_section() {
+        // Owner 2026-10-30: the F&O stocks price-movers view on the dashboard.
+        for marker in [
+            "F&amp;O stocks — price movers",
+            "/api/fno-stocks",
+            "Gainers",
+            "Losers",
+            "Search a stock",
+            "Change %",
+            "Value (Cr.) est.",
+            "Volume",
+            "as of ",
+            " IST",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(marker),
+                "dashboard must contain the F&O stocks marker '{marker}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_fno_section_shows_live_only_for_live_status() {
+        // Never show stale data as live: only status "live" gets the live
+        // label, every other status the endpoint can send has its own reason.
+        assert!(DASHBOARD_HTML.contains(r#"d.status === "live" ? "ok" : "warn""#));
+        for status in [
+            "live:",
+            "stale:",
+            "closed:",
+            "no_fno_list:",
+            "no_data:",
+            "unreachable:",
+            "query_failed:",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(status),
+                "the page must explain status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dashboard_page_fno_table_scrolls_inside_its_box_on_a_phone() {
+        assert!(DASHBOARD_HTML.contains(".fno-wrap { overflow-x: auto; }"));
+        assert!(DASHBOARD_HTML.contains("width=device-width"));
     }
 
     #[tokio::test]

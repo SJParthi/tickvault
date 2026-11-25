@@ -14,6 +14,12 @@
 //! crate, using only the public surface of `WsFrameSpill`, so any
 //! subtle refactor that breaks the public contract is caught here.
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit TEST-1).** "SIGKILL-equivalent drop"
+//! above is a clean `Drop` of the spill, which joins the writer and flushes;
+//! no process is killed, so no torn tail is ever tested. `run_read_loop` and
+//! `make_ws_pair` no longer exist in `connection.rs`. The real process kill of
+//! the WAL is `crates/storage/tests/chaos_wal_real_sigkill.rs`.
+//!
 //! Scenarios:
 //!   1. 200 binary frames sent by the mock server land in the WAL
 //!      exactly once in FIFO order with exact payload preservation

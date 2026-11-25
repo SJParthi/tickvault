@@ -11,8 +11,9 @@
 //! - [`tickvault_storage::shadow_persistence::ensure_shadow_candle_tables`]
 //!   — `CREATE TABLE IF NOT EXISTS candles_<tf>` + `DEDUP ENABLE UPSERT
 //!   KEYS` for all 21 Engine-B candle tables.
-//! - [`tickvault_storage::console_views::ensure_named_views`] — the
-//!   read-only analyst console views.
+//! - [`tickvault_storage::console_views::drop_retired_views`] — removes
+//!   every console view this repository ever created (2026-09-22: the app
+//!   creates NO view; `candles_10m` is a real table).
 //!
 //! Meanwhile the REST-era bar-fold (`rest_candle_fold`) KEPT writing the
 //! `candles_*` tables through the shared seal-writer chain. On a FRESH
@@ -23,8 +24,8 @@
 //! boot path ran the ensure DDL anymore.
 //!
 //! This module re-homes the old main.rs wiring (pre-#1522 order:
-//! readiness → `drop_legacy_candle_objects` → `ensure_shadow_candle_tables`
-//! → `ensure_named_views`) behind a bounded QUIET readiness probe (the
+//! readiness → `drop_retired_views` → `drop_legacy_candle_objects` →
+//! `ensure_shadow_candle_tables`) behind a bounded QUIET readiness probe (the
 //! `index_constituency_boot` ts-pin precedent — 12 × 5s via
 //! `shared_probe_client`, never the paging BOOT-01/02 `wait_for_questdb_ready`).
 //!
@@ -44,10 +45,21 @@ use tracing::{error, info, warn};
 /// Quiet-probe attempts before giving up on QuestDB readiness (× backoff
 /// = 60s worst case — the ts-pin migration precedent).
 pub const CANDLE_DDL_READINESS_ATTEMPTS: u32 = 12;
+
+/// Attempts at the candle-table ensure before the boot gives up.
+///
+/// Six attempts five seconds apart is thirty seconds — deliberately the SAME
+/// bound as [`LIVE_TABLE_DDL_ATTEMPTS`], because it answers the same question
+/// about the same database. Not unbounded: a QuestDB that will not accept a
+/// `CREATE TABLE` in half a minute is the boot-probe escalation codes' problem,
+/// and holding the boot behind it would turn a schema gap into a dark session.
+pub const CANDLE_ENSURE_ATTEMPTS: u32 = 6;
+/// Seconds between candle-ensure attempts.
+pub const CANDLE_ENSURE_BACKOFF_SECS: u64 = 5;
 /// Seconds between readiness probe attempts.
 pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 
-/// Run the retired-object sweep + candle-table ensure DDL + named views,
+/// Run the retired-view drop + retired-object sweep + candle-table ensure DDL,
 /// gated on a bounded quiet readiness probe.
 ///
 /// Degrade-safe, never blocks boot indefinitely:
@@ -56,8 +68,9 @@ pub const CANDLE_DDL_READINESS_BACKOFF_SECS: u64 = 5;
 /// - probe exhausted (QuestDB down) → SKIP the DDL loudly and return —
 ///   the first ILP write may then auto-create `candles_*` WITHOUT DEDUP
 ///   UPSERT KEYS (duplicate-row window until a later boot's ensure
-///   succeeds); the drop-sweep marker is not written, so the sweep also
-///   retries next boot.
+///   succeeds); the drop sweeps write their markers only when QuestDB
+///   answered every DROP, so a sweep that could not reach it re-runs in
+///   the background retry or at the next boot (audit PR53).
 // TEST-EXEMPT: network I/O orchestration — the call order + boot wiring are pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs; the probe-bound constants are unit-tested below; the underlying DDL fns carry their own unit tests in tickvault-storage.
 pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     let probe_url = format!(
@@ -98,31 +111,778 @@ pub async fn run_candle_ddl_at_boot(questdb: &QuestDbConfig) {
     }
     if !ready {
         error!(
+            code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+            source = "candle_ddl_skipped",
             attempts = CANDLE_DDL_READINESS_ATTEMPTS,
             backoff_secs = CANDLE_DDL_READINESS_BACKOFF_SECS,
             "candle DDL boot: QuestDB not ready within the quiet probe bound — \
-             candle DDL SKIPPED this boot. Consequence: if the candle tables do \
-             not exist yet, the first ILP write may auto-create them WITHOUT \
-             DEDUP UPSERT KEYS (duplicate-row window until a later boot's ensure \
-             succeeds). The retired-object sweep marker is not written, so the \
-             sweep also retries next boot."
+             candle DDL SKIPPED this boot. Consequence: the candle writer refuses \
+             to send until the tables are confirmed keyed, so sealed candles go to \
+             the disk spill meanwhile; the ensure re-runs in the background; the \
+             spill replays after the live flushes are clean again, or at the next boot. The drop sweeps write \
+             their markers only when QuestDB answered every DROP, so they re-run too."
         );
+        // Audit PR31a: the candle writer refuses to send until these tables are
+        // keyed, so re-run the skipped steps in the background rather than
+        // wait a day.
+        drop(spawn_ensure_until_keyed(
+            questdb.clone(),
+            DdlTables::CandlesWithSkippedSweep,
+        ));
         return;
     }
 
+    // 2026-09-22 — the ONE-SHOT fresh-start reset (`2026-09-19-fresh-start`,
+    // scope lock "THIS TIME ALONE"). FIRST, before every other DDL: it drops
+    // the allowlisted tables and views, and everything below recreates them
+    // on the new schema in this same boot. `build_shared_infra` awaits this
+    // fn before the feed stack spawns, so no writer is live during the drops.
+    // After the id is logged this is one count query per boot, forever.
+    tickvault_storage::fresh_start_reset::run_fresh_start_reset_at_boot(questdb).await;
+
+    // 2026-09-22 (SECOND) — NO VIEWS ANYWHERE. Drop every retired console view
+    // BEFORE any table DDL: a surviving `candles_10m` VIEW occupies the name the
+    // `candles_10m` TABLE needs, and the CREATE below would be refused on it.
+    tickvault_storage::console_views::drop_retired_views(questdb).await;
+
     // Order is load-bearing (the pre-#1522 main.rs contract): the drop
     // sweep must free any legacy matview squatting a `candles_<tf>` name
-    // BEFORE the CREATE TABLE loop, and the named views validate their
-    // column references against the ensured tables.
+    // BEFORE the CREATE TABLE loop.
     tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
-    tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await;
-    tickvault_storage::console_views::ensure_named_views(questdb).await;
-    info!("candle DDL boot complete — retired-object sweep + candle ensure + named views done");
+
+    // 2026-09-18 operator directive — the fifteen non-emitting candle tables are
+    // dropped BEFORE the ensure, which is itself filtered to the emitted nine. The
+    // two halves are one change: dropping without filtering the CREATE loop would be
+    // undone in this same boot, and filtering without dropping would leave the
+    // retired tables resident forever.
+    tickvault_storage::shadow_persistence::drop_retired_candle_tables(questdb).await;
+
+    // RETRY the candle ensure, 2026-09-09.
+    //
+    // Until today this awaited the ensure ONCE and discarded the verdict —
+    // the same shape `run_live_table_ddl_at_boot` was given a six-attempt loop
+    // for on 2026-09-08, and this path is the one where a refusal costs most.
+    // A candle table missing when the ensure is refused (a fresh deployment,
+    // or a table removed by hand) does not exist until the seal writer's first
+    // ILP row auto-creates it with NO dedup key, and every replayed or
+    // re-flushed bar then duplicates into it for the life of the table,
+    // silently. (Until 2026-09-28, audit PR53, `drop_legacy_candle_objects`
+    // above also DROPPED `candles_1s` on any boot whose sweep version moved;
+    // no sweep drops a kept table any more.)
+    //
+    // The readiness probe above cannot prevent this — it answers `SELECT 1`,
+    // which a QuestDB still replaying its own WAL answers happily and then
+    // refuses the DDL.
+    //
+    // Re-running an accepted table is free: every statement is `IF NOT EXISTS`
+    // or an idempotent `DEDUP ENABLE`.
+    let mut keyed = false;
+    for attempt in 1..=CANDLE_ENSURE_ATTEMPTS {
+        if tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await {
+            keyed = true;
+            if attempt > 1 {
+                info!(attempt, "candle DDL boot: candle tables keyed on retry");
+            }
+            break;
+        }
+        if attempt < CANDLE_ENSURE_ATTEMPTS {
+            warn!(
+                attempt,
+                next_in_secs = CANDLE_ENSURE_BACKOFF_SECS,
+                "candle DDL boot: a candle table's DEDUP-bearing statement was \
+                 refused — retrying rather than running the session on whatever \
+                 the first ILP row auto-creates"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(CANDLE_ENSURE_BACKOFF_SECS)).await;
+        }
+    }
+    if !keyed {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+            attempts = CANDLE_ENSURE_ATTEMPTS,
+            "candle DDL boot: candle tables NOT confirmed keyed after every \
+             attempt. Consequence: the candle writer refuses to send until they \
+             are, so sealed candles go to the disk spill meanwhile. The ensure \
+             keeps re-running in the background; the spill replays after the live \
+             flushes are clean again, or at the next boot."
+        );
+        // Audit PR31a: the candle writer refuses to send until these tables are
+        // keyed, so keep re-running the ensure for this session.
+        drop(spawn_ensure_until_keyed(
+            questdb.clone(),
+            DdlTables::Candles,
+        ));
+    }
+
+    info!(
+        keyed,
+        "candle DDL boot complete — retired views dropped + retired-object sweep + candle ensure attempted"
+    );
 }
 
+/// Attempts at the `ticks` + `market_depth` DDL before the boot gives up.
+///
+/// Six attempts five seconds apart is thirty seconds — the same order as the
+/// candle probe's bound, and deliberately NOT unbounded: a QuestDB that will
+/// not accept a `CREATE TABLE` in half a minute is the boot-probe escalation
+/// codes' problem, and holding the lane behind it would turn a schema gap into
+/// a dark session.
+pub const LIVE_TABLE_DDL_ATTEMPTS: u32 = 6;
+/// Seconds between `ticks` / `market_depth` DDL attempts.
+pub const LIVE_TABLE_DDL_BACKOFF_SECS: u64 = 5;
+
+/// Ensure the LIVE-writer tables — `ticks`, `market_depth` and
+/// `feed_aux_packets` (the four `top_volume_<tf>` tables were dropped from this
+/// list on 2026-10-22, plan item 62) — with their DEDUP keys, retrying a refusal instead of running the session on
+/// whatever ILP auto-creates.
+///
+/// # Why a retry, when the candle DDL above gets one probe and one shot
+///
+/// Before 2026-09-08 `main.rs` awaited each ensure ONCE and discarded the
+/// verdict. The readiness probe in [`run_candle_ddl_at_boot`] answers
+/// `SELECT 1`, which a QuestDB still replaying its own WAL, or holding a
+/// table in a suspended state, answers happily — and then refuses the DDL.
+/// Every refusal was logged and counted, and the boot continued: the first
+/// ILP row auto-created `ticks` without `capture_seq` and `feed` in its key
+/// (a replay then DUPLICATES instead of collapsing) and `market_depth` without
+/// `depth_kind` (the two depth pools then OVERWRITE each other's levels).
+/// Both are silent — rows land, counts look right — and both last the
+/// session, because nothing re-ran the DDL.
+///
+/// The ensure fns now return whether every statement was accepted, and this
+/// loop re-runs ALL of them until they are or the bound is spent. Re-running an
+/// already-accepted table is free: every statement is `IF NOT EXISTS` or an
+/// idempotent `DEDUP ENABLE`.
+///
+/// Returns `true` when every live table was ensured on some attempt. On
+/// exhaustion it returns `false` after a coded `error!` naming the
+/// consequence — never a panic, and never a silent continue.
+// TEST-EXEMPT: network I/O orchestration — the retry bound is unit-tested below, the give-up path is exercised against an unreachable port, and the boot call site is pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
+pub async fn run_live_table_ddl_at_boot(questdb: &QuestDbConfig) -> bool {
+    // B1 (2026-11-13): from here on the live tick and depth writers post only
+    // into tables an ensure below (or its background re-run) has keyed. Armed
+    // BEFORE the first ensure so no live row can reach a table ILP would
+    // create without its key; a refusal keeps the rows in the spill / WAL.
+    tickvault_storage::ilp_table_gate::arm_live_write_gate();
+    live_table_ddl_loop(questdb).await
+}
+
+/// The bounded ensure loop behind [`run_live_table_ddl_at_boot`], without the
+/// gate arming, so its own test cannot arm the process-wide gate for the
+/// other tests in this binary.
+async fn live_table_ddl_loop(questdb: &QuestDbConfig) -> bool {
+    for attempt in 1..=LIVE_TABLE_DDL_ATTEMPTS {
+        let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
+        let depth_ok =
+            tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+        // The four `top_volume_<tf>` tables are no longer ensured (2026-10-22,
+        // plan item 62, operator Quote 34): nothing writes them, and creating
+        // them would undo the Quote 34 removal on a fresh volume.
+        // 2026-10-02 (item 45h): `feed_aux_packets` rides the tick writer's
+        // buffer, so it must carry its 6-key DEDUP before the first frame too.
+        let feed_aux_ok =
+            tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
+        // 2026-09-22 (SECOND): no view re-ensure here any more. The app
+        // creates NO view; the retired ones are dropped once, before any table
+        // DDL, by `run_candle_ddl_at_boot`.
+        if ticks_ok && depth_ok && feed_aux_ok {
+            info!(
+                attempt,
+                "live-table DDL boot complete — ticks (5-key DEDUP) + market_depth \
+                 (depth_kind DEDUP) + \
+                 feed_aux_packets (6-key DEDUP) ensured."
+            );
+            return true;
+        }
+        if attempt < LIVE_TABLE_DDL_ATTEMPTS {
+            warn!(
+                attempt,
+                attempts = LIVE_TABLE_DDL_ATTEMPTS,
+                ticks_ok,
+                depth_ok,
+                feed_aux_ok,
+                backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
+                "live-table DDL refused — retrying so the session does not run on an \
+                 ILP-auto-created table with the DEDUP key missing"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(LIVE_TABLE_DDL_BACKOFF_SECS)).await;
+        }
+    }
+    error!(
+        code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop.code_str(),
+        attempts = LIVE_TABLE_DDL_ATTEMPTS,
+        backoff_secs = LIVE_TABLE_DDL_BACKOFF_SECS,
+        "live-table DDL boot EXHAUSTED — ticks, market_depth and/or feed_aux_packets could not be \
+         ensured. Consequence: the live writers do NOT post into an un-keyed table (QuestDB \
+         would create it in a shape that can never take the DEDUP key); their batches go to \
+         the spill files or stay in the frame log until the ensure, which keeps re-running \
+         in the background (the boot spawns it), keys the table. \
+         Check QuestDB's WAL state (`wal_tables()`) before the next session."
+    );
+    false
+}
+
+/// First delay of the background re-run of a table ensure the boot gave up on.
+///
+/// Audit PR31a (2026-09-27). Before this, a boot whose ensure was refused
+/// left the tables un-keyed for the whole session: nothing ran the DDL again
+/// until the next boot. The candle writer (and the `top_volume_<tf>` writer, removed 2026-10-22) REFUSE to
+/// send until their tables are keyed, so without a re-run a transient refusal
+/// at 09:00 would send every candle to the disk spill until the next morning.
+pub const DDL_BACKGROUND_RETRY_FIRST_SECS: u64 = 30;
+/// Ceiling on the background re-run's doubling delay. Every failed ensure
+/// writes its own coded errors, so a fixed 30 s would log them ~2,900 times a
+/// day against a database that keeps refusing; doubling to ten minutes keeps a
+/// long outage to a few dozen episodes while a short one still clears fast.
+pub const DDL_BACKGROUND_RETRY_MAX_SECS: u64 = 600;
+
+/// Ceiling on the live-table re-run's delay while the live writers' gate is
+/// still holding their batches (B1 review, 2026-11-13).
+///
+/// Every live tick and depth batch goes to the spill (or stays in the frame
+/// log) until the `Live` re-run keys `ticks`, `tick_quotes`,
+/// `feed_aux_packets` and `market_depth`. A boot whose bounded ensure gave up
+/// against a QuestDB that answered slowly then recovered would otherwise
+/// wait for the doubling delay (up to ten minutes) with the whole feed
+/// spilled. Once the gate is open the re-run returns to the doubling delay,
+/// so a database that keeps refusing only a column self-heal is not retried
+/// (and logged) every 30 s all day.
+pub const DDL_LIVE_UNKEYED_RETRY_MAX_SECS: u64 = 30;
+
+/// The delay before the next background re-run attempt: the doubling `delay`,
+/// capped at [`DDL_LIVE_UNKEYED_RETRY_MAX_SECS`] for the `Live` tables while
+/// the live writers' gate is still shut (`live_gate_open` false). Pure.
+#[must_use]
+pub fn background_retry_delay(
+    tables: DdlTables,
+    delay: std::time::Duration,
+    live_gate_open: bool,
+) -> std::time::Duration {
+    if tables == DdlTables::Live && !live_gate_open {
+        delay.min(std::time::Duration::from_secs(
+            DDL_LIVE_UNKEYED_RETRY_MAX_SECS,
+        ))
+    } else {
+        delay
+    }
+}
+
+/// Whether the live writers' gate is open for every live table (one Acquire
+/// load per table set). True in a process that never armed it.
+///
+/// B1 review 2: a table found un-keyable (QuestDB created it itself, see
+/// `ilp_table_gate::diagnose_refused_key`) counts as open here: no re-run can
+/// key it, so retrying every 30 s would only repeat the same refused
+/// statements and their error lines all session. The doubling delay applies.
+fn live_gate_open() -> bool {
+    use tickvault_storage::ilp_table_gate::{GatedTable, live_tables_writable, table_unkeyable};
+    live_rerun_settled(
+        [
+            GatedTable::Ticks,
+            GatedTable::TickQuotes,
+            GatedTable::FeedAuxPackets,
+            GatedTable::MarketDepth,
+        ]
+        .map(|t| (live_tables_writable(&[t]), table_unkeyable(t))),
+    )
+}
+
+/// Pure: `(keyed, unkeyable)` per live table; the re-run has nothing to
+/// hurry for once each table is keyed or known un-keyable. O(tables).
+#[must_use]
+fn live_rerun_settled(tables: [(bool, bool); 4]) -> bool {
+    tables.iter().all(|(keyed, unkeyable)| *keyed || *unkeyable)
+}
+
+/// Which ensure a background re-run repeats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DdlTables {
+    /// Every emitted `candles_<tf>` table ([`run_candle_ddl_at_boot`]'s ensure).
+    Candles,
+    /// The same, for a boot that SKIPPED the candle DDL because QuestDB never
+    /// answered its readiness probe: each attempt first runs the three drop
+    /// steps that boot skipped (retired views, the legacy-object sweep, the
+    /// retired candle tables), because a legacy object squatting a
+    /// `candles_<tf>` name would otherwise refuse the CREATE all session.
+    /// Safe with the lane live: the candle writer sends nothing until the
+    /// tables are keyed. The one-shot fresh-start reset is NOT re-run here —
+    /// it drops live-writer tables and belongs to the boot only.
+    CandlesWithSkippedSweep,
+    /// `ticks`, `market_depth` and `feed_aux_packets`
+    /// ([`run_live_table_ddl_at_boot`]'s ensures).
+    Live,
+    /// `market_depth_book` (2026-11-07). The Dhan lane runs its ensure once,
+    /// with `[depth_storage] array_rows` on, and starts this re-run when it is
+    /// refused (QuestDB still replaying its WAL, or the wrong-timestamp table
+    /// outside the self-heal window). A success sets the spill replay's ensure
+    /// flag (`ilp_table_gate`), so held book records drain; the book WRITER
+    /// stays armed only from the boot's outcome. Each attempt runs the whole
+    /// ensure, the empty-table self-heal included.
+    MarketDepthBook,
+    /// The order-side and socket audit tables: `order_audit`, `pnl_audit`,
+    /// `order_update_events`, `position_update_events`, `order_leg_pnl` and
+    /// `ws_event_audit`.
+    ///
+    /// Audit J3 (2026-10-26). Each consumer ensured its tables ONCE at start
+    /// and never again, so a DDL QuestDB refused at boot (still replaying its
+    /// WAL, say) left the session writing into tables ILP auto-created with no
+    /// DEDUP key. A consumer whose ensure is refused now starts this re-run
+    /// ([`spawn_audit_ensure_until_keyed_once`]); the spill drains for the
+    /// three spilled tables also refuse to replay until their table is keyed.
+    /// **Honest limit:** a live row written in the gap before the re-run lands
+    /// can still auto-create its table without the key (the gap is small in
+    /// practice: these consumers start at boot and order-side rows arrive
+    /// later, but it is not closed). Whether the re-run's `DEDUP ENABLE` then
+    /// keys such a table depends on the schema ILP gave it, which is Unknown
+    /// here (no QuestDB was reachable to check); until it does, the re-run
+    /// keeps retrying on the doubling delay and each refusal logs its coded
+    /// error. The first re-run is 30 s after the refusal.
+    AuditTables,
+}
+
+async fn ensure_tables_once(questdb: &QuestDbConfig, tables: DdlTables) -> bool {
+    match tables {
+        DdlTables::Candles => {
+            tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await
+        }
+        DdlTables::CandlesWithSkippedSweep => {
+            tickvault_storage::console_views::drop_retired_views(questdb).await;
+            tickvault_storage::shadow_persistence::drop_legacy_candle_objects(questdb).await;
+            tickvault_storage::shadow_persistence::drop_retired_candle_tables(questdb).await;
+            tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(questdb).await
+        }
+        DdlTables::Live => {
+            let ticks_ok = tickvault_storage::tick_persistence::ensure_ticks_table(questdb).await;
+            let depth_ok =
+                tickvault_storage::depth_persistence::ensure_market_depth_table(questdb).await;
+            let feed_aux_ok =
+                tickvault_storage::feed_aux_persistence::ensure_feed_aux_table(questdb).await;
+            ticks_ok && depth_ok && feed_aux_ok
+        }
+        DdlTables::MarketDepthBook => {
+            tickvault_storage::depth_persistence::ensure_market_depth_book_table(questdb)
+                .await
+                .is_ensured()
+        }
+        DdlTables::AuditTables => {
+            use tickvault_storage::{
+                order_audit_persistence, order_leg_pnl_persistence,
+                order_update_events_persistence, pnl_audit_persistence,
+                position_update_events_persistence, ws_event_audit_persistence,
+            };
+            // Every ensure runs on every attempt (no short-circuit), so one
+            // refused table never stops the others from being keyed.
+            let results = [
+                order_audit_persistence::ensure_order_audit_table(questdb).await,
+                pnl_audit_persistence::ensure_pnl_audit_table(questdb).await,
+                order_update_events_persistence::ensure_order_update_events_table(questdb).await,
+                position_update_events_persistence::ensure_position_update_events_table(questdb)
+                    .await,
+                order_leg_pnl_persistence::ensure_order_leg_pnl_table(questdb).await,
+                ws_event_audit_persistence::ensure_ws_event_audit_table(questdb).await,
+            ];
+            results.iter().all(|keyed| *keyed)
+        }
+    }
+}
+
+/// Set once the [`DdlTables::AuditTables`] re-run has been started in this
+/// process, so several consumers refused at the same boot start ONE re-run.
+static AUDIT_ENSURE_RETRY_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the [`DdlTables::AuditTables`] background re-run unless one already
+/// runs in this process. Returns `true` when this call started it.
+///
+/// Called by an audit consumer whose own ensure returned `false` (audit J3,
+/// 2026-10-26). O(1): one atomic swap, then at most one spawn per process.
+pub fn spawn_audit_ensure_until_keyed_once(questdb: &QuestDbConfig) -> bool {
+    if AUDIT_ENSURE_RETRY_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return false;
+    }
+    error!(
+        code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        source = "audit_ddl_not_keyed",
+        first_retry_in_secs = DDL_BACKGROUND_RETRY_FIRST_SECS,
+        "audit table DDL refused at consumer start — QuestDB did not confirm the DEDUP key, so a \
+         row written now may auto-create its table without it. Re-running the audit-table DDL in \
+         the background until every table is keyed; the spilled audit tables replay only after."
+    );
+    drop(spawn_ensure_until_keyed(
+        questdb.clone(),
+        DdlTables::AuditTables,
+    ));
+    true
+}
+
+/// Re-runs the ensure for `tables` until every statement is accepted, waiting
+/// `first_delay` after the first refusal and doubling up to `max_delay`.
+/// Returns the number of attempts it took.
+///
+/// Never gives up: the tables it ensures are ones whose writers refuse to send
+/// until they are keyed, so giving up would park those writes for the session.
+/// Every statement is `IF NOT EXISTS` or an idempotent `DEDUP ENABLE`, so a
+/// re-run against a table the boot already created is free. A `DEDUP ENABLE`
+/// re-run repairs a refused key on a table our CREATE made; it can NOT repair
+/// a table ILP auto-created (designated timestamp `timestamp`, no `ts`), which
+/// is why every writer it serves refuses to post until the ensure succeeds
+/// (B1, 2026-11-13: the live tick and depth writers joined that rule).
+pub async fn ensure_until_keyed(
+    questdb: &QuestDbConfig,
+    tables: DdlTables,
+    first_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> u32 {
+    let mut attempt: u32 = 0;
+    let mut delay = first_delay;
+    loop {
+        attempt = attempt.saturating_add(1);
+        if ensure_tables_once(questdb, tables).await {
+            info!(
+                ?tables,
+                attempt, "DDL background retry: tables confirmed keyed — writes to them resume"
+            );
+            return attempt;
+        }
+        tokio::time::sleep(background_retry_delay(tables, delay, live_gate_open())).await;
+        delay = delay.saturating_mul(2).min(max_delay);
+    }
+}
+
+/// Spawns [`ensure_until_keyed`] for `tables` on the production delays. Called
+/// when the boot's bounded ensure gives up, so the session keys its tables as
+/// soon as QuestDB accepts the DDL instead of on the next boot.
+pub fn spawn_ensure_until_keyed(
+    questdb: QuestDbConfig,
+    tables: DdlTables,
+) -> tokio::task::JoinHandle<u32> {
+    warn!(
+        ?tables,
+        first_retry_in_secs = DDL_BACKGROUND_RETRY_FIRST_SECS,
+        "DDL background retry started — the boot could not confirm these tables keyed"
+    );
+    tokio::spawn(async move {
+        ensure_until_keyed(
+            &questdb,
+            tables,
+            std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_FIRST_SECS),
+            std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS),
+        )
+        .await
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The retry bound stays inside the same half-minute class as the
+    /// candle probe: attempts × backoff must never grow into a boot stall.
+    #[test]
+    fn live_table_ddl_retry_bound_is_thirty_seconds() {
+        assert_eq!(
+            u64::from(LIVE_TABLE_DDL_ATTEMPTS) * LIVE_TABLE_DDL_BACKOFF_SECS,
+            30
+        );
+        assert!(LIVE_TABLE_DDL_ATTEMPTS >= 2, "one attempt is not a retry");
+    }
+
+    /// The candle ensure gets the SAME retry bound as the live-table ensure,
+    /// because it answers the same question about the same database — and
+    /// because a single refused attempt leaves the seal writer to auto-create
+    /// any missing candle table with no dedup key for the life of the table.
+    ///
+    /// Asserted as an EQUALITY against its sibling rather than as its own
+    /// literal: two bounds for one database is two things to keep true, and a
+    /// literal here would let them drift apart silently.
+    #[test]
+    fn candle_ensure_retry_bound_matches_the_live_table_one() {
+        assert_eq!(CANDLE_ENSURE_ATTEMPTS, LIVE_TABLE_DDL_ATTEMPTS);
+        assert_eq!(CANDLE_ENSURE_BACKOFF_SECS, LIVE_TABLE_DDL_BACKOFF_SECS);
+        assert!(CANDLE_ENSURE_ATTEMPTS >= 2, "one attempt is not a retry");
+    }
+
+    /// The candle boot must RETRY the ensure and must not treat a refusal as
+    /// success.
+    ///
+    /// A source pin rather than a behavioural one, because the ensure needs a
+    /// live QuestDB. It asserts the three things that make the retry real: the
+    /// loop exists over the bound, the verdict is consulted, and the exhausted
+    /// path is a coded `error!` rather than a silent continue.
+    #[test]
+    fn the_candle_boot_retries_the_ensure_and_reports_exhaustion() {
+        let src = include_str!("candle_ddl_boot.rs");
+        let body = src
+            // Split so the literal is not itself a declaration: the pub-fn
+            // test guard scans source line by line, and a bare
+            // `pub async fn <name>` inside a string reads to it as a NEW
+            // untested function. Assembling it keeps the assertion identical
+            // and stops a test about the scanner tripping the scanner.
+            .split(concat!("pub async ", "fn run_candle_ddl_at_boot"))
+            .nth(1)
+            .expect("the candle boot fn must exist");
+        let body = body
+            .split("\n/// Attempts at the `ticks`")
+            .next()
+            .expect("the candle boot fn must end before the live-table section");
+        assert!(
+            body.contains("for attempt in 1..=CANDLE_ENSURE_ATTEMPTS"),
+            "the ensure must be retried over the bound, not awaited once"
+        );
+        assert!(
+            body.contains("ensure_shadow_candle_tables(questdb).await {"),
+            "the ensure's verdict must be CONSULTED — awaiting and discarding \
+             it is what let a refused CREATE run the whole session"
+        );
+        assert!(
+            body.contains("if !keyed {"),
+            "exhaustion must have its own arm"
+        );
+        assert!(
+            body.contains("HotPath02WriterQueueDrop"),
+            "exhaustion must be CODED, so a metric filter can read it — the \
+             same code the live-table exhaustion arm uses for the same \
+             consequence"
+        );
+    }
+
+    /// Against a port nothing listens on, every attempt fails, the loop
+    /// spends its bound, and the verdict is `false` — never a hang and
+    /// never a panic. Paused tokio time makes the five-second backoffs free.
+    #[tokio::test(start_paused = true)]
+    async fn run_live_table_ddl_at_boot_gives_up_after_the_bound_and_reports_false() {
+        let questdb = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!live_table_ddl_loop(&questdb).await);
+    }
+
+    // B1 (2026-11-13): that the boot's live-table DDL step arms the live
+    // writers' gate BEFORE its first ensure is a behaviour test in its own
+    // binary (`crates/app/tests/live_write_gate_boot.rs`), because arming is
+    // process-wide and would close the gate for every other test here.
+
+    /// Regression, B1 review (2026-11-13): while the live gate is shut the
+    /// `Live` re-run retries every 30 s at most, instead of doubling to ten
+    /// minutes with the whole feed in the spill; once open, and for every
+    /// other table set, the doubling delay is untouched.
+    #[test]
+    fn test_background_retry_delay_regression_live_rerun_retries_fast_only_while_the_gate_is_shut()
+    {
+        let ten_min = std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS);
+        let cap = std::time::Duration::from_secs(DDL_LIVE_UNKEYED_RETRY_MAX_SECS);
+        assert_eq!(background_retry_delay(DdlTables::Live, ten_min, false), cap);
+        assert_eq!(
+            background_retry_delay(DdlTables::Live, ten_min, true),
+            ten_min
+        );
+        assert_eq!(
+            background_retry_delay(DdlTables::Candles, ten_min, false),
+            ten_min
+        );
+        let short = std::time::Duration::from_secs(5);
+        assert_eq!(background_retry_delay(DdlTables::Live, short, false), short);
+        assert!(DDL_LIVE_UNKEYED_RETRY_MAX_SECS <= DDL_BACKGROUND_RETRY_FIRST_SECS);
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): a table QuestDB created itself can
+    /// never be keyed by a re-run, so it must not keep the Live re-run on its
+    /// 30 s cadence (one refused statement and its error line every 30 s, all
+    /// day). A table merely not keyed yet still does.
+    #[test]
+    fn test_live_rerun_settled_treats_an_unkeyable_table_as_settled() {
+        let keyed = (true, false);
+        let pending = (false, false);
+        let unkeyable = (false, true);
+        assert!(live_rerun_settled([keyed; 4]));
+        assert!(!live_rerun_settled([keyed, keyed, pending, keyed]));
+        assert!(live_rerun_settled([keyed, keyed, unkeyable, keyed]));
+        assert!(!live_rerun_settled([unkeyable, pending, keyed, keyed]));
+    }
+
+    fn unreachable_questdb() -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    /// A loopback QuestDB stand-in that accepts every statement.
+    async fn spawn_accept_everything_http() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                            .await;
+                    });
+                }
+            }
+        });
+        port
+    }
+
+    /// Audit PR31a: the background re-run never gives up on a database that
+    /// keeps refusing — an hour of paused time spans several doubled delays
+    /// and the future is still pending.
+    #[tokio::test(start_paused = true)]
+    async fn ensure_until_keyed_keeps_retrying_a_database_that_refuses() {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(3_600),
+            ensure_until_keyed(
+                &unreachable_questdb(),
+                DdlTables::Candles,
+                std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_FIRST_SECS),
+                std::time::Duration::from_secs(DDL_BACKGROUND_RETRY_MAX_SECS),
+            ),
+        )
+        .await;
+        assert!(outcome.is_err(), "it must still be retrying after an hour");
+    }
+
+    /// Against a database that accepts every statement the re-run returns
+    /// after its first attempt, for both table sets.
+    #[tokio::test]
+    async fn ensure_until_keyed_returns_once_every_statement_is_accepted() {
+        let port = spawn_accept_everything_http().await;
+        let questdb = QuestDbConfig {
+            http_port: port,
+            ..unreachable_questdb()
+        };
+        let quick = std::time::Duration::from_millis(1);
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::Candles, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::Live, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::CandlesWithSkippedSweep, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::AuditTables, quick, quick).await,
+            1
+        );
+        assert_eq!(
+            ensure_until_keyed(&questdb, DdlTables::MarketDepthBook, quick, quick).await,
+            1
+        );
+    }
+
+    /// 2026-11-07: the Dhan lane starts the book re-run when its one boot
+    /// ensure is refused. A source pin, because the refusal needs a QuestDB
+    /// that refuses at the one moment the lane starts. Bite: delete the spawn
+    /// and this fails.
+    #[test]
+    fn the_lane_starts_the_book_re_run_on_a_refused_ensure() {
+        let src = include_str!("dhan_feed_stack.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        let compact: String = prod.split_whitespace().collect();
+        assert!(
+            compact.contains(
+                "ifbook_outcome.is_some_and(|o|!o.is_ensured()){drop(crate::candle_ddl_boot::\
+                 spawn_ensure_until_keyed(params.questdb.clone(),crate::candle_ddl_boot::\
+                 DdlTables::MarketDepthBook,));}"
+            ),
+            "the lane must re-run a refused market_depth_book ensure in the background"
+        );
+    }
+
+    /// 2026-11-07: a refused book ensure must not read as keyed, so its
+    /// re-run keeps going (and the replay keeps its book records held).
+    #[tokio::test]
+    async fn market_depth_book_ensure_reads_not_keyed_when_unreachable() {
+        assert!(!ensure_tables_once(&unreachable_questdb(), DdlTables::MarketDepthBook).await);
+    }
+
+    /// Audit J3 (2026-10-26): a refused audit ensure must not read as keyed,
+    /// so the re-run keeps going against a database that refuses.
+    #[tokio::test]
+    async fn audit_tables_ensure_reads_not_keyed_when_unreachable() {
+        assert!(!ensure_tables_once(&unreachable_questdb(), DdlTables::AuditTables).await);
+    }
+
+    /// Several consumers refused at one boot start ONE re-run: every call
+    /// after the first returns `false` and spawns nothing.
+    #[tokio::test]
+    async fn test_spawn_audit_ensure_until_keyed_once_starts_once_per_process() {
+        let questdb = unreachable_questdb();
+        let _ = spawn_audit_ensure_until_keyed_once(&questdb);
+        assert!(!spawn_audit_ensure_until_keyed_once(&questdb));
+        assert!(!spawn_audit_ensure_until_keyed_once(&questdb));
+    }
+
+    /// Every audit consumer starts the re-run when its own ensure is refused.
+    /// A source pin, because the refusal needs a QuestDB that refuses at the
+    /// one moment the consumer starts.
+    #[test]
+    fn every_audit_consumer_starts_the_re_run_on_a_refused_ensure() {
+        for (file, src) in [
+            (
+                "order_observability.rs",
+                include_str!("order_observability.rs"),
+            ),
+            (
+                "dhan_order_push_observability.rs",
+                include_str!("dhan_order_push_observability.rs"),
+            ),
+            (
+                "order_leg_pnl_boot.rs",
+                include_str!("order_leg_pnl_boot.rs"),
+            ),
+            (
+                "order_update_events_boot.rs",
+                include_str!("order_update_events_boot.rs"),
+            ),
+            ("ws_audit_consumer.rs", include_str!("ws_audit_consumer.rs")),
+        ] {
+            let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+            assert!(
+                prod.contains("candle_ddl_boot::spawn_audit_ensure_until_keyed_once("),
+                "{file} must start the audit DDL re-run when its ensure is refused"
+            );
+        }
+    }
+
+    /// The spawned form runs the same loop to completion on its own task.
+    #[tokio::test]
+    async fn spawn_ensure_until_keyed_finishes_once_the_tables_are_keyed() {
+        let port = spawn_accept_everything_http().await;
+        let questdb = QuestDbConfig {
+            http_port: port,
+            ..unreachable_questdb()
+        };
+        let attempts = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            spawn_ensure_until_keyed(questdb, DdlTables::Candles),
+        )
+        .await
+        .expect("an accepting database keys the tables at once")
+        .expect("the task must not panic");
+        assert_eq!(attempts, 1);
+    }
+
+    /// The doubling delay starts at half a minute and stops at ten.
+    #[test]
+    fn ddl_background_retry_delays_are_pinned() {
+        assert_eq!(DDL_BACKGROUND_RETRY_FIRST_SECS, 30);
+        assert_eq!(DDL_BACKGROUND_RETRY_MAX_SECS, 600);
+    }
 
     /// The inline await in `build_shared_infra` is bounded by the quiet
     /// probe: attempts × backoff must stay ≤ 60s so a down QuestDB can

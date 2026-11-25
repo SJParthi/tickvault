@@ -2,8 +2,10 @@
 //!
 //! # Why this file exists separately from the visibility guard
 //!
-//! `dashboard_live_lane_visibility_guard` proves every published lane metric is
-//! *shown*. Showing is not telling. A dashboard is a pull surface: it reports
+//! `dashboard_live_lane_visibility_guard` proves every published metric is
+//! *shown* (its scope widened from lane-only to ALL selected names on
+//! 2026-08-26; the FILE keeps its lane name so this cross-reference and its
+//! git history stay intact). Showing is not telling. A dashboard is a pull surface: it reports
 //! only to someone who has already decided to look, which by definition is not
 //! the person asleep at 02:00 when the durable floor stops holding.
 //!
@@ -46,7 +48,7 @@ fn read(rel: &str) -> String {
 
 const LANE_ALARMS: &str = "deploy/aws/terraform/live-lane-alarms.tf";
 const ERRCODE_ALARMS: &str = "deploy/aws/terraform/error-code-alarms.tf";
-const NOISE_LOCK: &str = ".claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md";
+const NOISE_LOCK: &str = "docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md";
 
 /// Signals that are BOTH permanent and evidence-free, so a dashboard alone is
 /// not enough. Each entry names why it cannot wait for someone to look.
@@ -134,9 +136,26 @@ fn the_permanent_losses_never_send_a_false_recovery() {
         let Some(pos) = tf.find(&format!("\"{metric}\"")) else {
             panic!("{metric} is not alarmed — the previous test should have caught this");
         };
-        // Look at the remainder of that resource block for its ok_actions.
-        let block_end = tf[pos..].find("\n}\n").map_or(tf.len(), |o| pos + o);
-        let block = &tf[pos..block_end];
+        // Scan the WHOLE resource block, not the remainder after the metric
+        // name (2026-08-28). The old form anchored at the first mention of the
+        // metric and read forward to the next `\n}\n`, which is correct for a
+        // plain alarm — `ok_actions` follows the metric there — and WRONG for a
+        // metric-math alarm, where the metric name lives inside a
+        // `metric_query` block placed AFTER `ok_actions`. When `ticks_dropped`
+        // became metric math on `dropped - spilled` this test failed on an
+        // alarm that did set `ok_actions = []`, and the nested `}` of the
+        // metric_query would have truncated the window anyway.
+        //
+        // The invariant is unchanged and is the point: a permanent-loss alarm
+        // must never send a recovery page. Only the way the block is located
+        // moved, so the guard reads metric-math and plain alarms alike.
+        let block_start = tf[..pos]
+            .rfind("\nresource \"aws_cloudwatch_metric_alarm\"")
+            .unwrap_or_else(|| panic!("{metric} is mentioned outside any alarm resource"));
+        let block_end = tf[block_start + 1..]
+            .find("\nresource ")
+            .map_or(tf.len(), |o| block_start + 1 + o);
+        let block = &tf[block_start..block_end];
         assert!(
             block.contains("ok_actions = []"),
             "the alarm on {metric} does not set `ok_actions = []`. A recovery \
@@ -162,6 +181,32 @@ fn the_connected_but_silent_page_exists() {
     assert!(
         tf.contains("RISK-GAP-03") && tf.contains("$.level = \\\"ERROR\\\""),
         "the risk-gap-03 filter must match the coded ERROR line"
+    );
+}
+
+#[test]
+fn the_hot_path_stall_page_exists_without_a_false_recovery() {
+    // 2026-10-02, noise-lock §2.8: a stalled runtime or frame drain pauses
+    // the socket reads with no loss counter moving, so the stall line is the
+    // only evidence. Its page must exist, must not send an OK (a stall that
+    // ended is not a repair), and must have its dated authority on record.
+    let tf = read(ERRCODE_ALARMS);
+    let Some(start) = tf.find("\"hot-path-stall-01\" = {") else {
+        panic!("HOT-PATH-STALL-01 has no error_code_alerts entry in {ERRCODE_ALARMS}");
+    };
+    let block = &tf[start..start + tf[start..].find("\n    }").unwrap_or(0)];
+    assert!(
+        block.contains("$.code = \\\"HOT-PATH-STALL-01\\\" && $.level = \\\"ERROR\\\""),
+        "the hot-path-stall-01 filter must match the coded ERROR line"
+    );
+    assert!(
+        block.contains("ok_recovery = false"),
+        "the hot-path-stall-01 alarm must not send a recovery page"
+    );
+    let lock = read(NOISE_LOCK);
+    assert!(
+        lock.contains("§2.8") && lock.contains("HOT-PATH-STALL-01"),
+        "{NOISE_LOCK} must carry the dated §2.8 row naming HOT-PATH-STALL-01"
     );
 }
 

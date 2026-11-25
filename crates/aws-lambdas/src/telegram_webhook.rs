@@ -78,122 +78,452 @@ pub const TELEGRAM_TIMEOUT_SECONDS: u64 = 8;
 /// 🆘 is unacceptable; a duplicate ✅ after a cold start is accepted.
 pub const OK_REPEAT_SUPPRESS_SECS: f64 = 300.0;
 
+/// Window within which a REPEAT ALARM for the SAME alarm, in the SAME state,
+/// is rendered as a one-line "still down" page instead of the full two-line
+/// house line.
+///
+/// # This is COALESCING, never suppression
+///
+/// The never-drop law above is correct and is unchanged: an ALARM record is
+/// ALWAYS delivered. A recorded incident produced 25 pages from one flapping
+/// alarm in a single session, and the fix for that is NOT to start dropping
+/// 🆘 — a dropped page is unrecoverable, a verbose page is merely annoying.
+/// What this does is make the 2nd and later pages of one ongoing episode
+/// SHORT and self-labelling ("3rd page in 10 min"), so a burst reads as one
+/// event rather than as three unrelated emergencies.
+///
+/// # The key is the exact alarm name AND state — never anything coarser
+///
+/// Coalescing is keyed on the alarm NAME (the cache key) plus its cached
+/// STATE. It must never be widened to a category, a prefix, a severity or a
+/// time bucket. A second, DIFFERENT alarm firing while a noisy first one is
+/// active has to arrive as its own full page: several alarms in this account
+/// are the only signal for their condition anywhere — the unrecovered-frames
+/// alarm says so in its own description — so swallowing one inside another's
+/// streak would lose the only notification that condition will ever produce.
+/// `alarm_coalescing_is_never_widened_across_different_alarms` pins this.
+///
+/// 600 s = ten minutes, chosen to match the longest evaluation cadence in the
+/// alarm set (5-minute periods x 2 evaluation periods), so one ongoing
+/// condition re-notifying on its natural schedule reads as one episode.
+pub const ALARM_REPEAT_COALESCE_SECS: f64 = 600.0;
+
+/// Per-alarm memory carried across a warm Lambda container: the last state
+/// delivered for that alarm name, the epoch seconds it was delivered at, and
+/// how many consecutive ALARM pages the current episode has produced.
+///
+/// # Honest limit: this is WARM-CONTAINER ONLY
+///
+/// AWS keeps a Lambda container warm for roughly fifteen minutes of idle time
+/// and may recycle it at any moment, and concurrent invocations get separate
+/// containers with separate copies of this map. So the streak count is a
+/// best-effort convenience, not a guarantee: after a cold start, or on a
+/// second concurrent container, an ongoing episode's next page renders as a
+/// FULL first page again. That direction is deliberate — losing the "3rd page"
+/// label costs nothing, whereas persisting this state anywhere would put a
+/// storage dependency between an emergency and the operator's phone.
+pub type AlertCache = std::collections::HashMap<String, (String, f64, u32)>;
+
 pub const GENERIC_SAFE_LINE: &str = "🔔 Alert received — details are in the server log";
 
 /// Known alarm → auto-driver plain English (charter §D: no library names,
 /// no file paths, no jargon). Keys are alarm names AFTER the tv-<env>-
 /// prefix strip. Unknown names fall back to a humanized form — never a
-/// lookup panic, never raw JSON. Legacy parity: `ALARM_PHRASES` dict,
-/// byte-identical phrases (incl. the 🔷 DHAN / 🖥️ HOST broker tags per the
-/// operator directive 2026-07-14).
+/// lookup panic, never raw JSON.
 ///
-/// O(n) scan over 29 entries per lookup — cold path (a handful of alarm
-/// renders per SNS batch), deliberately not a hash map so the table stays
-/// a reviewable literal.
-pub const ALARM_PHRASES: [(&str, &str); 29] = [
-    // 2026-07-18 (stage-4 dead-producer sweep): the dlq-ticks /
-    // late-tick-after-boundary / spill-dropped / ticks-dropped alarm slugs
-    // were retired with their deleted tick-chain alarms; mappings removed.
+/// # Why this table must be COMPLETE, and is now guarded
+///
+/// It carried 29 entries, of which 8 named alarms that no longer exist and 21
+/// matched a live one — so 83 of the 102 live alarms rendered as a humanized
+/// slug ("Errcode ws gap 03 xverify vacuous"), which is the alarm name with
+/// the hyphens taken out, not plain English. The errcode family is the entire
+/// coded-error route to the operator's phone and had NO entries at all.
+///
+/// The alternative considered and REJECTED was delivering each alarm's
+/// terraform `AlarmDescription` into the message. It is forensic free text a
+/// future engineer could paste anything into, and the house contract — stated
+/// at the `NewStateReason` redactor below — is that free-text forensic fields
+/// never reach Telegram. Writing the phrases by hand keeps every word that
+/// reaches the phone reviewed in this file.
+///
+/// Staleness is what made this table useless, so it is now MECHANICALLY
+/// pinned in both directions by
+/// `crates/aws-lambdas/tests/alarm_phrase_coverage_guard.rs`: every live alarm
+/// must have an entry, and every entry must name a live alarm.
+///
+/// O(n) scan per lookup — cold path (a handful of alarm renders per SNS
+/// batch), deliberately not a hash map so the table stays a reviewable literal.
+pub const ALARM_PHRASES: [(&str, &str); 87] = [
+    // ---- capacity + candle building ----
     (
-        "aggregator-no-seals",
-        "Candle building has stopped during market hours",
+        "aggregator-slots-exhausted",
+        "🔷 DHAN: ran out of candle slots — some instruments are no longer getting candles",
+    ),
+    (
+        "seal-writer-dropped",
+        "Finished candles were thrown away instead of being saved",
+    ),
+    // ---- app + host health ----
+    (
+        "app-log-ingestion-silent",
+        "🖥️ HOST: the app has stopped writing any log lines",
+    ),
+    (
+        "errcode-stream-silent",
+        "The error feed the alarms read has stopped arriving — the app is still reporting errors, so the other alarms are now blind until this is fixed",
     ),
     (
         "binary-sha-stale",
         "The running app is more than a day behind the latest approved code",
     ),
     (
+        "deploy-provenance-blind",
+        "the check that tells you the box is running the latest code cannot run — it is not saying the code is fine, it is saying it does not know",
+    ),
+    (
         "boot-heartbeat-missing",
         "The app did not start on time this morning",
-    ),
-    (
-        "budget-killswitch-errors",
-        "The cost kill-switch helper is failing",
-    ),
-    ("clock-skew-high", "The server clock has drifted too far"),
-    (
-        "cpu-high-5min",
-        "Server CPU has been very high for 5 minutes",
-    ),
-    ("disk-used-high", "Server disk is almost full"),
-    ("disk-watcher-respawn", "The disk monitor keeps restarting"),
-    (
-        "ebs-write-latency-high",
-        "Disk writes have become very slow",
-    ),
-    (
-        "eventbridge-dlq-depth",
-        "Scheduled cloud tasks are failing and piling up",
-    ),
-    (
-        "instance-status-failed",
-        "The cloud server is failing its health checks",
-    ),
-    (
-        "logs-ingestion-runaway",
-        "Log volume is growing abnormally fast",
-    ),
-    (
-        "market-hours-liveness-missing",
-        "🖥️ HOST: the app has gone silent during market hours",
-    ),
-    ("mem-used-high", "Server memory is almost full"),
-    (
-        "network-out-runaway",
-        "Outbound network traffic is abnormally high",
-    ),
-    (
-        "operator-control-errors",
-        "The operator control page is failing",
-    ),
-    (
-        "order-update-ws-inactive",
-        "Order confirmations feed has gone quiet",
-    ),
-    ("orders-rejected", "Orders are being rejected"),
-    (
-        "questdb-console-front-errors",
-        "The database console page is failing",
-    ),
-    (
-        "questdb-disconnected",
-        "The database has been unreachable for too long",
-    ),
-    (
-        "realtime-guarantee-critical",
-        "Overall system health has dropped to critical",
     ),
     (
         "system-status-failed",
         "The cloud hardware is failing its health checks",
     ),
     (
+        "market-hours-liveness-missing",
+        "🖥️ HOST: the app has gone silent during market hours",
+    ),
+    // ---- disk ----
+    ("disk-used-high", "Server disk is almost full"),
+    (
+        "spill-dir-free-low",
+        "Disk space is nearly gone — rescued prices will stop fitting soon",
+    ),
+    // ---- database ----
+    (
+        "questdb-disconnected",
+        "The database has been unreachable for too long",
+    ),
+    (
+        "questdb-wal-suspended",
+        "A database table has stopped storing rows while still accepting them",
+    ),
+    (
+        "wal-suspension-probe-blind",
+        "The check that watches for stuck database tables cannot see anything — a stuck table would not page right now",
+    ),
+    // ---- market data capture + loss ----
+    (
+        "market-data-persistence-loss",
+        "Market prices were LOST — dropped without being rescued to disk",
+    ),
+    (
+        "durable-floor-breach",
+        "Incoming prices were lost before they could be safely stored",
+    ),
+    (
+        "ticks-dropped",
+        "Live prices were dropped before they could be saved",
+    ),
+    ("ticks-lost-spill", "Rescued prices were lost for good"),
+    (
+        "tick-spill-quarantined",
+        "A rescue file of prices was set aside because the database refused it — those prices are not in the database until someone re-sends them",
+    ),
+    (
+        "wal-frames-not-recovered",
+        "Saved market data could not be recovered at start-up — that data is gone",
+    ),
+    (
+        "tick-rescue-abandoned",
+        "Prices marked as rescued may never have reached the disk file — treat this session's price count as unproven",
+    ),
+    (
+        "wal-spill-shutdown-incomplete",
+        "The app was cut off while still writing captured market data — those frames were never saved and cannot be recovered",
+    ),
+    (
+        "wal-replay-unknown-magic",
+        "A saved market data file is in a format this app cannot read — that data is gone",
+    ),
+    (
+        "offload-writer-shutdown-incomplete",
+        "The app shut down before it finished saving everything it was holding",
+    ),
+    (
+        "cold-backup-failing",
+        "Copies of captured market data are not reaching cloud storage — the files are kept on the server, but the disk will fill",
+    ),
+    (
+        "log-lines-dropped",
+        "Log lines were dropped because the log writer fell behind — part of the record is missing",
+    ),
+    // ---- loss groups (noise lock §2.10, 2026-10-05) ----
+    (
+        "market-data-refused",
+        "🔷 DHAN: some received market data could not be saved and was set aside or refused — part of the record is missing",
+    ),
+    (
+        "subscription-coverage-lost",
+        "🔷 DHAN: some planned price or depth connections did not start or did not take their contracts — those contracts are getting no data",
+    ),
+    (
+        "audit-rows-lost",
+        "Some audit history rows could not be saved — there is a gap in the record",
+    ),
+    (
+        "durability-sync-failing",
+        "The server could not confirm saved data to disk — a power cut now could lose the newest data",
+    ),
+    (
+        "order-path-dropped",
+        "🔷 DHAN: an order update, fill or price meant for the order system was dropped or refused — check the order book",
+    ),
+    (
+        "safety-bound-or-monitor-blind",
+        "A size limit was reached or a health check could not read the server — something may be going unwatched",
+    ),
+    // ---- Dhan live feed ----
+    (
+        "dhan-live-lane-down",
+        "🔷 DHAN: the live market data feed is not running",
+    ),
+    (
+        "dhan-no-ticks-flowing",
+        "🔷 DHAN: connected, but no live prices are arriving",
+    ),
+    (
+        "dhan-socket-parked",
+        "🔷 DHAN: a market data connection has given up and will not try again",
+    ),
+    (
+        "dhan-wal-dropped",
+        "🔷 DHAN: live prices arrived but were never safely stored — that data is gone",
+    ),
+    (
+        "dhan-contract-universe-failed",
+        "🔷 DHAN: could not work out today's contract list — most instruments are unsubscribed",
+    ),
+    (
+        "ws-no-alive-connections",
+        "🔷 DHAN: no live market data connections are up",
+    ),
+    (
+        "live-universe-fallback",
+        "🔷 DHAN: the live feed is not using today's full instrument list — some instruments are not being watched",
+    ),
+    (
+        "ws-ring-full",
+        "🔷 DHAN: the incoming price buffer is full — new prices are being refused",
+    ),
+    (
+        "ws-ring-bytes-full",
+        "🔷 DHAN: the incoming price buffer has hit its size limit — new prices are being refused",
+    ),
+    (
+        "token-remaining-low",
+        "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed",
+    ),
+    // ---- orders + risk ----
+    ("order-audit-chain-loss", "Order history rows were lost"),
+    (
+        "order-update-dropped",
+        "🔷 DHAN: an order update from the broker reached nothing in the app — that update is missing",
+    ),
+    // ---- helper Lambdas: is it erroring? ----
+    (
+        "budget-killswitch-errors",
+        "The cost kill-switch helper is failing",
+    ),
+    (
+        "hard-stop-guard-errors",
+        "The cost stop-switch helper is failing",
+    ),
+    (
+        "daily-budget-digest-errors",
+        "The daily cost summary helper is failing",
+    ),
+    (
+        "market-hours-gate-errors",
+        "The market-hours alarm switch is failing",
+    ),
+    (
+        "market-hours-gate-not-invoked",
+        "The market-hours alarm switch did not run — its schedule was dropped",
+    ),
+    (
+        "start-watchdog-errors",
+        "The morning start helper is failing",
+    ),
+    (
+        "start-watchdog-not-invoked",
+        "The morning start helper did not run — its schedule was dropped",
+    ),
+    (
+        "instance-status-failed",
+        "The cloud server is failing its health checks",
+    ),
+    (
+        "errcode-aggregator-stall-01",
+        "The live price feed paused for over a second while a slow disk saved a candle — check the disk",
+    ),
+    (
+        "errcode-boot-03",
+        "The server clock has drifted too far for the app to start",
+    ),
+    (
+        "errcode-oms-gap-06",
+        "The paper order runtime stopped and had to be restarted",
+    ),
+    (
+        "api-auth-failed",
+        "Someone is repeatedly failing the password check on the operator web pages",
+    ),
+    (
+        "orders-placed-storm",
+        "Far more orders are being placed than expected",
+    ),
+    (
+        "daily-loss-breach",
+        "Today's trading loss has crossed the limit you set",
+    ),
+    (
+        "boot-heartbeat-gate-errors",
+        "The morning start-up alarm switch is failing",
+    ),
+    (
+        "dhan-token-minter-errors",
+        "🔷 DHAN: the daily access-key helper is failing",
+    ),
+    (
+        "dhan-depth-token-minter-errors",
+        "🔷 DHAN: the second (depth-only) account's daily access-key helper is failing — only its extra depth sockets are affected",
+    ),
+    (
         "telegram-webhook-errors",
         "The Telegram alert relay itself is failing",
     ),
     (
-        "tick-gap-instruments-silent",
-        "🔷 DHAN: some instruments have stopped sending prices",
+        "telegram-drops",
+        "Some alerts could not be delivered to this chat",
+    ),
+    // ---- helper Lambdas: did it run at all? ----
+    (
+        "hard-stop-guard-not-invoked",
+        "The cost stop-switch did not run — its schedule was dropped",
     ),
     (
-        "token-remaining-low",
-        "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop",
+        "daily-budget-digest-not-invoked",
+        "The daily cost summary did not run — its schedule was dropped",
     ),
     (
-        "ws-failed-connections",
-        "🔷 DHAN: the live market data connection keeps failing",
+        "boot-heartbeat-gate-not-invoked",
+        "The morning start-up alarm switch did not run — its schedule was dropped",
     ),
     (
-        "ws-frame-dropped-no-wal",
-        "Live market data arrived but could not be saved",
+        "aws-waste-check-not-invoked",
+        "The daily AWS waste check did not run — its schedule was dropped",
     ),
     (
-        "ws-pool-all-dead",
-        "🔷 DHAN: ALL live market data connections are down",
+        "dhan-token-minter-not-invoked",
+        "🔷 DHAN: the daily access-key helper did not run — its schedule was dropped",
     ),
     (
-        "ws-reconnect-gap-high",
-        "🔷 DHAN: the live market data feed is taking too long to reconnect",
+        "dhan-depth-token-minter-not-invoked",
+        "🔷 DHAN: the second (depth-only) account's daily access-key helper did not run — its schedule was dropped",
+    ),
+    // ---- coded errors (the error!-to-phone route) ----
+    (
+        "errcode-dh-901",
+        "🔷 DHAN: the broker sign-in check is failing — usually THEIR server, not our key. Read the status first: 401/403 means the key, 5xx means Dhan is down. Do not replace the key on a 5xx",
+    ),
+    (
+        "errcode-auth-gap-04",
+        "🔷 DHAN: the login code no longer matches — sign-in stays dead until it is fixed by hand",
+    ),
+    (
+        "errcode-auth-gap-05-remint-failed",
+        "🔷 DHAN: could not get a fresh access key after repeated tries",
+    ),
+    (
+        "errcode-boot-02",
+        "The app could not reach its database at start-up, so it did not start",
+    ),
+    // ---- Four REST-leg phrases RETIRED 2026-09-17 ----
+    //
+    // `errcode-chain-01`, `errcode-chain-02-escalation`,
+    // `errcode-chain-04-warmup` and `errcode-spot1m-01-escalation` translated
+    // the per-minute Dhan spot + option-chain pull alarms. Those legs, their
+    // error codes and their terraform metric filters were all removed by the
+    // operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10), so each phrase named
+    // an alarm that can never fire again.
+    //
+    // Deleted rather than kept "just in case", because this table's own guard
+    // says why: a stale entry makes the table look better covered than it is,
+    // and other tests can keep asserting against it forever while none of it
+    // is true of the running system.
+    (
+        "errcode-aggregator-drop-01",
+        "Finished candles were dropped, or prices were refused by the candle builder",
+    ),
+    (
+        "errcode-hot-path-stall-01",
+        "🔷 DHAN: the live market data path stalled for 2 seconds or more — some prices may have been skipped; check the server",
+    ),
+    (
+        "errcode-dhan-feed-time-01",
+        "🔷 DHAN: live prices carry the wrong time even after our fix, Dhan switched its time format back, or no candle formed for 10 minutes — today is held for repair; raw data is kept",
+    ),
+    (
+        "errcode-clock-skew-01",
+        "The server clock has been more than 1 millisecond off for 5 minutes in a row — signal and order times may be wrong; check the time sync",
+    ),
+    (
+        "errcode-hot-path-02",
+        "The database is behind, so prices are being held on disk and replayed — nothing is lost",
+    ),
+    (
+        "errcode-proc-01",
+        "The app was killed by the server for using too much memory",
+    ),
+    (
+        "errcode-risk-gap-03",
+        "🔷 DHAN: some instruments have gone quiet or never sent a price today",
+    ),
+    (
+        "errcode-storage-gap-05",
+        "Disk is above its high-water mark and nothing is left that may be archived away",
+    ),
+    (
+        "errcode-ws-spill-01",
+        "The safety capture for incoming market data hit a limit — a writer restarted, or replay stood down to protect memory. The server log line names which; on its own this does NOT mean anything was lost",
+    ),
+    (
+        "errcode-ws-spill-02",
+        "Incoming market data hit a capture limit — EITHER a frame was genuinely dropped, OR replay deferred segments to the next start, which loses nothing. The server log line names which — check it before assuming loss",
+    ),
+    (
+        "errcode-ws-gap-03-universe-collapse",
+        "🔷 DHAN: fell back to just four indices — almost the whole instrument list is missing",
+    ),
+    // ---- Three cross-verification phrases RESTORED 2026-09-24 ----
+    //
+    // Retired 2026-09-17 with the 15:41 comparator; restored with it on the
+    // operator's instruction (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.15, noise lock §2.5). The check compares our 1-minute candles
+    // against Dhan's own 1-minute record, and the S3 daily archive waits for
+    // it, so the vacuous and failed phrases also say the archive is held.
+    (
+        "errcode-ws-gap-03-xverify-diverged",
+        "🔷 DHAN: our recorded prices disagree badly with the broker's own record",
+    ),
+    (
+        "errcode-ws-gap-03-xverify-failed",
+        "🔷 DHAN: the end-of-day price cross-check could not run — today's backup to S3 is on hold",
+    ),
+    (
+        "errcode-ws-gap-03-xverify-vacuous",
+        "🔷 DHAN: the end-of-day price cross-check compared nothing at all — today's backup to S3 is on hold",
     ),
 ];
 
@@ -204,7 +534,7 @@ static CACHED_TOKEN: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::cons
 static CACHED_CHAT_ID: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// Warm-container OK-suppression cache — legacy parity: `_LAST_SENT`.
-static LAST_SENT: Mutex<Option<HashMap<String, (String, f64)>>> = Mutex::new(None);
+static LAST_SENT: Mutex<Option<AlertCache>> = Mutex::new(None);
 
 /// The fixed IST offset (+05:30). `east_opt` is statically in range; the
 /// fallback arm is unreachable (kept to avoid `unwrap` per crate lints).
@@ -225,12 +555,94 @@ fn value_str_or(value: Option<&Value>, default: &str) -> String {
     }
 }
 
+/// Alarms whose CONDITION is a self-healing degrade, not an emergency.
+///
+/// Every one of these fires while the system is doing exactly what it was
+/// built to do: a flush could not reach the database, so the rows went to the
+/// spill file and will be replayed. Their own message bodies say so — "nothing
+/// is lost, they are replayed", "check it before assuming loss".
+///
+/// WHY THIS LIST EXISTS (2026-09-08, from a real operator complaint with a
+/// screenshot). Between 08:32 and 09:21 IST the operator's phone took FOURTEEN
+/// alerts. Nine of them contained the words "nothing is lost" in their own
+/// body, three were the SAME message re-sent at 08:34, 09:04 and 09:21 — and
+/// every single one rendered as a red 🆘, because the line below returned 🆘
+/// for `state == "ALARM"` unconditionally. The declared `Severity` in
+/// `error_code.rs` never reached the phone at all: `HOT-PATH-02` is declared
+/// **Low** and arrived looking identical to a Critical.
+///
+/// The measured truth for that session: dropped == spilled on both the tick
+/// and the depth path (every rescued row re-ingestable), WAL-dropped zero,
+/// sockets parked zero. Nothing was lost. The ONE alert that mattered — the
+/// contract universe failing at 09:13 — sat eleventh of fourteen, wearing the
+/// same emoji as the nine that said nothing was wrong.
+///
+/// FAIL-LOUD BY DEFAULT: an alarm not named here keeps 🆘. This list downgrades
+/// only conditions whose own text says nothing is lost, and adding to it is a
+/// deliberate act with a reason attached — never a way to quieten something
+/// inconvenient.
+//
+// ⚠ 2026-11-11 (operator Quote 53, docs/audits/2026-11-alarm-review.md): BOTH
+// alarms named below were REMOVED from terraform, so in production this list
+// matches nothing today and every page renders 🆘 (fail-loud, the default).
+// The two entries are kept so the downgrade mechanism and its tests stay
+// exercised; an alarm restored under a fresh dated quote gets its downgrade
+// back without a code change. Kept stale on purpose and stated here, rather
+// than read as live coverage.
+const DEGRADE_NOT_EMERGENCY: &[&str] = &[
+    // The tick spill tier engaging. `dropped == spilled` is the proof the
+    // rescue worked, and this alarm fires on exactly that path.
+    "ticks-spilling",
+    // Ticks the per-minute candle summary skipped. The ROWS ARE WRITTEN; only
+    // the candle is missed, and the emit site says so in capitals.
+    "aggregator-refusal-rate-high",
+    // ⚠ TWO ENTRIES REMOVED 2026-09-08, hours after this list was written, by
+    // an observability audit that read each alarm's EMIT SITES rather than
+    // its phrase:
+    //
+    // - `errcode-ws-spill-02` is declared `Severity::Critical`, its terraform
+    //   entry says "discrete PERMANENT data loss", and its three emit sites in
+    //   `ws_frame_spill.rs` all read "frame dropped (durable floor lost)". The
+    //   ring-took-it degrade path emits WS-GAP-03, not this code, so this code
+    //   has NO nothing-lost arm. Downgrading it hid the one alarm that means
+    //   bytes are gone.
+    // - `errcode-hot-path-02` is declared Low, but its alarm covers the
+    //   `dropped` + `spill_error` arm ("permanently gone") and the DEPTH
+    //   `dropped` arm, which has no spill tier at all. Mixed is not "nothing
+    //   lost", and a mixed alarm downgraded is a permanent loss wearing a
+    //   warning.
+    //
+    // The list is ONLY for alarms whose EVERY arm is a rescue. The flood the
+    // operator screenshotted was four `ticks-spilling` repeats, which are
+    // still covered; the two removed here fired zero times that morning.
+];
+
+/// True when this alarm's condition is a self-healing degrade.
+///
+/// Matched on the alarm NAME fragment, which is stable across environments
+/// (`tv-prod-…` / `tv-dev-…` share the fragment), rather than on the message
+/// body, which is prose and would drift.
+#[must_use]
+pub fn is_degrade_not_emergency(subject: &str) -> bool {
+    let lower = subject.to_lowercase();
+    DEGRADE_NOT_EMERGENCY
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
+
 /// Map alarm severity / subject to a leading emoji per charter §D rule
 /// 5+10. Legacy parity: `_severity_emoji` (the legacy `"deploy ok" in`
 /// clause is a subset of the `"ok" in` clause — one contains-check here).
 pub fn severity_emoji(subject: &str, alarm_state: Option<&str>) -> &'static str {
     let subject_lower = subject.to_lowercase();
     let state = alarm_state.unwrap_or("").to_uppercase();
+    // Checked BEFORE the ALARM arm, and only for the ALARM state: a degrade
+    // returning to OK is still a ✅, and an alarm that is not in the list is
+    // still an emergency. The order is the whole safety property — moving this
+    // below the 🆘 return makes it unreachable and silently restores the flood.
+    if state == "ALARM" && is_degrade_not_emergency(subject) {
+        return "⚠️";
+    }
     if subject_lower.contains("fail") || subject_lower.contains("critical") || state == "ALARM" {
         return "🆘";
     }
@@ -342,7 +754,7 @@ pub fn house_line(alarm: &Value) -> String {
     let emoji = if state.is_empty() {
         "🔔"
     } else {
-        severity_emoji("", Some(&state))
+        severity_emoji(&name, Some(&state))
     };
     format!("{emoji} {phrase}\n{ist_time} IST")
 }
@@ -486,15 +898,67 @@ pub fn format_plain_sns(subject: Option<&Value>, message: &Value) -> String {
 /// ONLY ever called for OK-state records — ALARM records are never
 /// routed through this cache (never-drop law). Legacy parity:
 /// `_should_suppress_ok`.
-pub fn should_suppress_ok(
-    name: &str,
-    now_epoch: f64,
-    cache: &HashMap<String, (String, f64)>,
-) -> bool {
-    let Some((last_state, last_epoch)) = cache.get(name) else {
+pub fn should_suppress_ok(name: &str, now_epoch: f64, cache: &AlertCache) -> bool {
+    let Some((last_state, last_epoch, _)) = cache.get(name) else {
         return false;
     };
     last_state == "OK" && (now_epoch - last_epoch) < OK_REPEAT_SUPPRESS_SECS
+}
+
+/// How many consecutive ALARM pages the current episode has produced for
+/// `name`, counting the one about to be sent. `1` means "first page of a new
+/// episode" — render it in full.
+///
+/// The match arm is the whole safety property of this feature, so read it
+/// literally: the cache is keyed by the EXACT alarm name, and the arm fires
+/// only when THAT key's cached state is also `ALARM` and the previous page for
+/// THAT key landed inside the window. A different alarm has a different key and
+/// therefore always returns 1 — it can never be folded into a neighbour's
+/// streak, which matters because several alarms in this account are the ONLY
+/// signal their condition will ever produce.
+///
+/// Never returns 0 and never suppresses: the caller sends on every value.
+pub fn alarm_repeat_streak(name: &str, now_epoch: f64, cache: &AlertCache) -> u32 {
+    match cache.get(name) {
+        Some((last_state, last_epoch, streak))
+            if last_state == "ALARM" && (now_epoch - last_epoch) < ALARM_REPEAT_COALESCE_SECS =>
+        {
+            streak.saturating_add(1)
+        }
+        _ => 1,
+    }
+}
+
+/// English ordinal for a page number — "2nd", "3rd", "4th", "11th", "21st".
+/// Plain English is a Telegram commandment; "page #4" reads like a machine.
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// The SHORT render for a repeat ALARM inside the coalescing window.
+///
+/// One line, emoji first (commandment 5), the same plain-English phrase the
+/// full page used, and an explicit count so the operator can see at a glance
+/// that this is an ongoing episode rather than a new emergency. The alarm is
+/// still DELIVERED — only its length changes.
+pub fn repeat_alarm_line(alarm: &Value, streak: u32) -> String {
+    let name = value_str_or(alarm.get("AlarmName"), "unknown-alarm");
+    let state = value_str_or(alarm.get("NewStateValue"), "ALARM").to_uppercase();
+    let phrase = alarm_phrase(&name);
+    let ist_time = ist_12h(&value_str_or(alarm.get("StateChangeTime"), ""));
+    let emoji = severity_emoji(&name, Some(&state));
+    let window_mins = (ALARM_REPEAT_COALESCE_SECS / 60.0).round() as u64;
+    format!(
+        "{emoji} Still down: {phrase} ({} page in {window_mins} min) — {ist_time} IST",
+        ordinal(streak)
+    )
 }
 
 /// Fold one SNS batch into the final list of Telegram texts.
@@ -512,11 +976,7 @@ pub fn should_suppress_ok(
 ///   same alarm is suppressed (warm cache); ALARM is never consulted.
 /// - A malformed record folds to a safe generic line — never a crash,
 ///   never raw JSON.
-pub fn fold_records(
-    records: &[Value],
-    now_epoch: f64,
-    cache: &mut HashMap<String, (String, f64)>,
-) -> Vec<String> {
+pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -> Vec<String> {
     let now = now_epoch;
     let mut plain_texts: Vec<String> = Vec::new();
     // Per alarm name (first-appearance order): the LAST record wins,
@@ -587,7 +1047,7 @@ pub fn fold_records(
         if final_state == "OK" && saw_alarm.get(name).copied().unwrap_or(false) {
             // ALARM→OK inside one batch: ONLY the recovered line.
             out.push(house_line(alarm));
-            cache.insert(name.clone(), ("OK".to_string(), now));
+            cache.insert(name.clone(), ("OK".to_string(), now, 0));
             continue;
         }
 
@@ -600,14 +1060,31 @@ pub fn fold_records(
             lone_ok_phrases.push(alarm_phrase(name));
             let when = value_str_or(alarm.get("StateChangeTime"), "");
             lone_ok_ist = Some(ist_12h(&when));
-            cache.insert(name.clone(), ("OK".to_string(), now));
+            cache.insert(name.clone(), ("OK".to_string(), now, 0));
             continue;
         }
 
         // ALARM / INSUFFICIENT_DATA final state — individual house line,
         // NEVER suppressed, NEVER folded away by an earlier OK.
-        out.push(house_line(alarm));
-        cache.insert(name.clone(), (final_state, now));
+        //
+        // COALESCING (2026-09-01): a repeat ALARM for the SAME name in the
+        // SAME state, inside ALARM_REPEAT_COALESCE_SECS, is still SENT but
+        // rendered as one short "still down" line carrying its page number.
+        // The streak is scoped to ALARM only — an INSUFFICIENT_DATA render is
+        // a different state and always starts a fresh, full page, so a
+        // flapping-to-unknown alarm can never quietly ride an ALARM streak.
+        let streak = if final_state == "ALARM" {
+            alarm_repeat_streak(name, now, cache)
+        } else {
+            1
+        };
+        if streak > 1 {
+            info!("alarm-repeat-coalesced name={name} page={streak}");
+            out.push(repeat_alarm_line(alarm, streak));
+        } else {
+            out.push(house_line(alarm));
+        }
+        cache.insert(name.clone(), (final_state, now, streak));
     }
 
     if !lone_ok_phrases.is_empty() {
@@ -713,14 +1190,14 @@ where
                 if status >= 400 {
                     let head: String = body.chars().take(200).collect();
                     failures.push(format!("http {status}: {head}"));
-                    error!(status, body = %head, "Telegram POST returned an error status");
+                    error!(code = "LAMBDA-NOTIFY-01", status, body = %head, "Telegram POST returned an error status");
                 } else {
                     sent += 1;
                 }
             }
             Err(err) => {
                 failures.push(err.clone());
-                error!(error = %err, "Failed to relay one message to Telegram");
+                error!(code = "LAMBDA-NOTIFY-01", error = %err, "Failed to relay one message to Telegram");
             }
         }
         // Cheap rate-limit cushion. Telegram allows ~30 msg/sec per bot;
@@ -731,13 +1208,34 @@ where
     json!({"sent": sent, "failures": failures, "records": records_len})
 }
 
+/// True when the batch had messages to send and NOT ONE reached Telegram.
+///
+/// Operator sweep row 24 (2026-09-08): `handle` returned `Ok` on this shape,
+/// so a dead bot token, a revoked chat, or a Telegram outage produced ZERO
+/// Lambda errors — the `*-errors` alarm on this function stayed green while
+/// every page in the account was being dropped on the floor. A partial
+/// failure stays `Ok` (SNS would otherwise redeliver the whole batch and
+/// re-page the ones that landed); a TOTAL failure is the one shape where a
+/// redelivery costs nothing and an error is the only signal that survives,
+/// because the alarm's own Telegram leg is the thing that is broken and its
+/// email fan-out is not.
+#[must_use]
+pub fn nothing_was_delivered(result: &Value) -> bool {
+    let sent = result.get("sent").and_then(Value::as_u64).unwrap_or(0);
+    let failures = result
+        .get("failures")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    sent == 0 && failures > 0
+}
+
 /// Fold + send composed — the testable end-to-end delivery seam the
 /// LambdaHandlerDelivery tests drive (the legacy runtime patched `lambda_handler`'s
 /// collaborators; the Rust seam injects the cache + transport instead).
 pub async fn deliver<F, Fut>(
     records: &[Value],
     now_epoch: f64,
-    cache: &mut HashMap<String, (String, f64)>,
+    cache: &mut AlertCache,
     post: F,
 ) -> Value
 where
@@ -801,7 +1299,10 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     let (token, chat_id) = match get_credentials().await {
         Ok(pair) => pair,
         Err(err) => {
-            error!("Failed to fetch Telegram credentials from SSM");
+            error!(
+                code = "LAMBDA-NOTIFY-01",
+                "Failed to fetch Telegram credentials from SSM"
+            );
             return Err(err);
         }
     };
@@ -840,11 +1341,206 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     })
     .await;
 
+    if nothing_was_delivered(&result) {
+        error!(
+            code = "LAMBDA-NOTIFY-01",
+            records = records.len(),
+            "not one message of this batch reached Telegram — failing the invocation so the \
+             function's Errors alarm can say so through its email leg"
+        );
+        return Err(Error::from(format!(
+            "telegram delivery failed for every message in the batch: {}",
+            result["failures"]
+        )));
+    }
+
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{is_degrade_not_emergency, severity_emoji};
+
+    /// The exact alerts from the operator's 2026-09-08 screenshot.
+    ///
+    /// Nine of fourteen carried "nothing is lost" in their own body and every
+    /// one rendered 🆘. These TWO are the repeat offenders whose bodies are
+    /// honest about it; each must now render ⚠️ so the ones that mean
+    /// something can be seen. (hot-path-02 and ws-spill-02 were on this list
+    /// for one evening and were removed: ws-spill-02 is Critical permanent
+    /// loss, and hot-path-02 has a loss arm — a name-level downgrade would
+    /// have quietened both.)
+    #[test]
+    fn a_degrade_that_says_nothing_is_lost_is_not_an_emergency() {
+        for alarm in [
+            "tv-prod-ticks-spilling",
+            "tv-prod-aggregator-refusal-rate-high",
+        ] {
+            assert_eq!(
+                severity_emoji(alarm, Some("ALARM")),
+                "⚠️",
+                "{alarm} says nothing is lost — it must not wear the emergency emoji"
+            );
+        }
+    }
+
+    /// FAIL LOUD BY DEFAULT. Anything not explicitly named stays 🆘.
+    ///
+    /// This is the half that keeps the list honest: it must be impossible to
+    /// quieten an alarm by forgetting to think about it.
+    #[test]
+    fn an_alarm_not_on_the_degrade_list_keeps_the_emergency_emoji() {
+        for alarm in [
+            // Removed from the degrade list 2026-09-08: ws-spill-02 is a
+            // Critical PERMANENT loss and hot-path-02 carries a loss arm.
+            "tv-prod-errcode-ws-spill-02",
+            "tv-prod-errcode-hot-path-02",
+            // The ONE that mattered on 2026-09-08, buried eleventh of fourteen.
+            "tv-prod-dhan-contract-universe-failed",
+            "tv-prod-dhan-live-lane-down",
+            "tv-prod-wal-frames-not-recovered",
+            "tv-prod-questdb-wal-suspended",
+            "tv-prod-some-alarm-nobody-has-classified-yet",
+        ] {
+            assert_eq!(
+                severity_emoji(alarm, Some("ALARM")),
+                "🆘",
+                "{alarm} is not a known degrade and must stay loud"
+            );
+        }
+    }
+
+    /// A degrade RECOVERING is still a recovery, and a degrade that is not in
+    /// the ALARM state is not being downgraded by accident.
+    #[test]
+    fn the_degrade_downgrade_applies_only_to_the_alarm_state() {
+        assert_eq!(severity_emoji("tv-prod-ticks-spilling", Some("OK")), "✅");
+        assert_eq!(
+            severity_emoji("tv-prod-ticks-spilling", Some("INSUFFICIENT_DATA")),
+            "⚠️"
+        );
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT THE 2026-09-08 DEAD-ON-ARRIVAL BUG.
+    ///
+    /// The three tests above all call `severity_emoji(alarm_name, ...)`
+    /// directly — and PRODUCTION NEVER CALLS IT THAT WAY. Both CloudWatch
+    /// renderers read the alarm name into a local and then passed `""`:
+    ///
+    /// ```text
+    /// let name = value_str_or(alarm.get("AlarmName"), "unknown-alarm");
+    /// let emoji = severity_emoji("", Some(&state));   // <- the name dropped
+    /// ```
+    ///
+    /// So `is_degrade_not_emergency("")` was false for every fragment, every
+    /// degrade still rendered red, and all 59 tests passed. The classifier was
+    /// correct and unreachable.
+    ///
+    /// That is the same shape as a reader querying a different store than the
+    /// writer fills: every behavioural test of the piece passes, and the
+    /// system does not do the thing. The only test that catches it is one that
+    /// goes through the door production goes through — so these assert on the
+    /// RENDERED LINE, never on the classifier.
+    #[test]
+    fn the_rendered_house_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:04:00.000+0000",
+        }));
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "the rendered line for a degrade must open with the warning emoji, got: {degrade}"
+        );
+
+        // The one that MATTERED on 2026-09-08, buried eleventh of fourteen.
+        let real = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-dhan-contract-universe-failed",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-09-08T03:43:00.000+0000",
+        }));
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a real failure must stay loud in the RENDERED line, got: {real}"
+        );
+
+        // A degrade recovering is still a recovery.
+        let recovered = house_line(&serde_json::json!({
+            "AlarmName": "tv-prod-ticks-spilling",
+            "NewStateValue": "OK",
+            "StateChangeTime": "2026-09-08T04:00:00.000+0000",
+        }));
+        assert!(
+            recovered.starts_with('\u{2705}'),
+            "recovery must render as a recovery, got: {recovered}"
+        );
+    }
+
+    /// The repeat renderer is a SECOND door into the same classifier, and it
+    /// carried the identical `severity_emoji("", ...)` defect. Three of the
+    /// fourteen alerts on 2026-09-08 were repeats, so this is not a
+    /// hypothetical second path — it is a third of the flood.
+    #[test]
+    fn the_rendered_repeat_line_downgrades_a_degrade_and_only_a_degrade() {
+        let degrade = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-ticks-spilling",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            degrade.starts_with('\u{26a0}'),
+            "a repeated degrade must not re-page as an emergency, got: {degrade}"
+        );
+
+        let real = repeat_alarm_line(
+            &serde_json::json!({
+                "AlarmName": "tv-prod-dhan-live-lane-down",
+                "NewStateValue": "ALARM",
+                "StateChangeTime": "2026-09-08T03:34:00.000+0000",
+            }),
+            3,
+        );
+        assert!(
+            real.starts_with('\u{1f198}'),
+            "a repeated real failure must stay loud, got: {real}"
+        );
+    }
+
+    /// Source-level pin on the wiring itself, because the two tests above are
+    /// behavioural and a future refactor could reintroduce the empty-subject
+    /// call in a THIRD renderer that has no rendered-line test yet.
+    ///
+    /// The rule is narrow and mechanical: no production call site may pass an
+    /// empty string literal as the subject while passing a real state. That is
+    /// the exact shape that made the classifier unreachable.
+    #[test]
+    fn no_renderer_passes_an_empty_subject_with_a_real_state() {
+        let src = include_str!("telegram_webhook.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            !production.contains("severity_emoji(\"\", Some("),
+            "a production renderer passes an empty subject to severity_emoji \
+             while passing a real alarm state.\n\
+             That drops the alarm NAME, so every degrade classification is \
+             dead code and the operator gets the 2026-09-08 flood back: nine \
+             notices whose own bodies say nothing is lost, all rendered red."
+        );
+    }
+    /// The classifier matches on the name FRAGMENT, so it works in every
+    /// environment without a per-environment list.
+    #[test]
+    fn is_degrade_not_emergency_matches_across_environments() {
+        assert!(is_degrade_not_emergency("tv-prod-ticks-spilling"));
+        assert!(is_degrade_not_emergency("tv-dev-ticks-spilling"));
+        assert!(is_degrade_not_emergency("TV-PROD-TICKS-SPILLING"));
+        assert!(!is_degrade_not_emergency("tv-prod-dhan-live-lane-down"));
+    }
+
     use super::*;
 
     fn ist_12h_re() -> regex_lite::Re {
@@ -931,7 +1627,7 @@ mod tests {
     #[test]
     fn test_house_line_no_raw_threshold_json() {
         let a = json!({
-            "AlarmName": "tv-prod-order-update-ws-inactive",
+            "AlarmName": "tv-prod-questdb-wal-suspended",
             "NewStateValue": "ALARM",
             "NewStateReason": "Threshold Crossed: 1 out of the last 1 datapoints \
                  [0.0 (07/07/26 04:26:00)] was less than or equal to the \
@@ -944,27 +1640,27 @@ mod tests {
         assert!(!out.contains("datapoint"));
         assert!(!out.contains('{'));
         assert!(out.starts_with("🆘 "));
-        assert!(out.contains("Order confirmations feed has gone quiet"));
+        assert!(out.contains("stopped storing rows while still accepting them"));
         assert!(ist_12h_re().is_match(&out));
     }
 
     #[test]
     fn test_alarm_state_two_lines_emoji_first() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-cpu-high-5min",
+            "AlarmName": "tv-prod-disk-used-high",
             "NewStateValue": "ALARM",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
         let lines: Vec<&str> = out.split('\n').collect();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "🆘 Server CPU has been very high for 5 minutes");
+        assert_eq!(lines[0], "🆘 Server disk is almost full");
         assert_eq!(lines[1], "10:01 AM IST");
     }
 
     #[test]
     fn test_ok_state_single_recovered_line() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-cpu-high-5min",
+            "AlarmName": "tv-prod-disk-used-high",
             "NewStateValue": "OK",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
@@ -996,7 +1692,7 @@ mod tests {
     #[test]
     fn test_insufficient_data_is_warning_emoji() {
         let out = house_line(&json!({
-            "AlarmName": "tv-prod-mem-used-high",
+            "AlarmName": "tv-prod-spill-dir-free-low",
             "NewStateValue": "INSUFFICIENT_DATA",
             "StateChangeTime": "2026-07-07T04:31:12.345+0000",
         }));
@@ -1058,10 +1754,41 @@ mod tests {
     }
 
     #[test]
+    fn rearmed_alarm_pages_are_each_delivered_without_an_ok_between() {
+        // The seven observed 2026-11-02 OK->ALARM transitions (they were on
+        // the feed-delay alarm, removed 2026-11-11 by operator Quote 53; the
+        // socket-parked page has OK actions disabled the same way). The Lambda
+        // sees no intervening OK, and every re-armed incident must still reach
+        // the rendered output.
+        let mut cache = AlertCache::new();
+        let name = "tv-prod-dhan-socket-parked";
+        for (now, when) in [
+            (0.0, "2026-11-02T03:57:15.297+0000"),
+            (6_060.0, "2026-11-02T05:38:15.297+0000"),
+            (7_800.0, "2026-11-02T06:07:15.298+0000"),
+            (8_640.0, "2026-11-02T06:21:15.297+0000"),
+            (10_800.0, "2026-11-02T06:57:15.297+0000"),
+            (12_720.0, "2026-11-02T07:29:15.297+0000"),
+            (13_980.0, "2026-11-02T07:50:15.297+0000"),
+            // A repeated delivery also stays visible through the short
+            // renderer; wording correction must not suppress an incident.
+            (14_040.0, "2026-11-02T07:50:15.297+0000"),
+        ] {
+            let texts = fold_records(&[alarm_record(name, "ALARM", when)], now, &mut cache);
+            assert_eq!(texts.len(), 1, "an ALARM must still be delivered at {when}");
+            let text = &texts[0];
+            assert!(
+                text.contains("DHAN") && text.contains("given up"),
+                "the kept phrase must reach every re-armed page: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn test_env_prefix_is_stripped_for_any_environment() {
         assert_eq!(
-            alarm_phrase("tv-staging-cpu-high-5min"),
-            alarm_phrase("tv-prod-cpu-high-5min")
+            alarm_phrase("tv-staging-disk-used-high"),
+            alarm_phrase("tv-prod-disk-used-high")
         );
     }
 
@@ -1076,14 +1803,14 @@ mod tests {
     fn test_ok_flip_single_line_recovered() {
         let mut cache = HashMap::new();
         let texts = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(texts.len(), 1);
         assert!(!texts[0].contains('\n'));
         assert!(texts[0].starts_with("✅ Recovered: "));
-        assert!(texts[0].contains("Server CPU has been very high for 5 minutes"));
+        assert!(texts[0].contains("Server disk is almost full"));
         assert!(ist_12h_re().is_match(&texts[0]));
     }
 
@@ -1092,8 +1819,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
-                alarm("tv-prod-cpu-high-5min", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
+                alarm("tv-prod-disk-used-high", "OK"),
             ],
             1_000_000.0,
             &mut cache,
@@ -1109,8 +1836,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "OK"),
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
             ],
             1_000_000.0,
             &mut cache,
@@ -1124,16 +1851,16 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "OK"),
-                alarm("tv-prod-mem-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "OK"),
+                alarm("tv-prod-spill-dir-free-low", "OK"),
             ],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(texts.len(), 1);
         assert!(texts[0].starts_with("✅ Recovered: "));
-        assert!(texts[0].contains("Server CPU has been very high for 5 minutes"));
-        assert!(texts[0].contains("Server memory is almost full"));
+        assert!(texts[0].contains("Server disk is almost full"));
+        assert!(texts[0].contains("Disk space is nearly gone"));
     }
 
     #[test]
@@ -1141,7 +1868,7 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
                 alarm("tv-prod-questdb-disconnected", "ALARM"),
             ],
             1_000_000.0,
@@ -1157,17 +1884,17 @@ mod tests {
     fn test_alarm_never_suppressed_by_warm_cache() {
         let mut cache = HashMap::from([
             (
-                "tv-prod-cpu-high-5min".to_string(),
-                ("ALARM".to_string(), 999_999.0),
+                "tv-prod-disk-used-high".to_string(),
+                ("ALARM".to_string(), 999_999.0, 1),
             ),
             (
                 "tv-prod-questdb-disconnected".to_string(),
-                ("OK".to_string(), 999_999.0),
+                ("OK".to_string(), 999_999.0, 0),
             ),
         ]);
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
                 alarm("tv-prod-questdb-disconnected", "ALARM"),
             ],
             1_000_000.0,
@@ -1183,20 +1910,20 @@ mod tests {
     fn test_repeat_ok_within_window_is_suppressed() {
         let mut cache = HashMap::new();
         let first = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0,
             &mut cache,
         );
         assert_eq!(first.len(), 1);
         let repeat = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0 + 30.0,
             &mut cache,
         );
         assert!(repeat.is_empty());
         // Past the window the OK flows again.
         let later = fold_records(
-            &[alarm("tv-prod-cpu-high-5min", "OK")],
+            &[alarm("tv-prod-disk-used-high", "OK")],
             1_000_000.0 + OK_REPEAT_SUPPRESS_SECS + 1.0,
             &mut cache,
         );
@@ -1227,8 +1954,8 @@ mod tests {
         let mut cache = HashMap::new();
         let texts = fold_records(
             &[
-                alarm("tv-prod-cpu-high-5min", "ALARM"),
-                alarm("tv-prod-mem-used-high", "OK"),
+                alarm("tv-prod-disk-used-high", "ALARM"),
+                alarm("tv-prod-spill-dir-free-low", "OK"),
                 json!({"Sns": {"Subject": "DLT deploy OK", "Message": "commit=abc ref=main"}}),
             ],
             1_000_000.0,
@@ -1425,14 +2152,36 @@ mod tests {
         (result, texts)
     }
 
+    #[test]
+    fn nothing_was_delivered_is_true_only_for_a_total_failure() {
+        use super::nothing_was_delivered;
+        use serde_json::json;
+        assert!(nothing_was_delivered(
+            &json!({"sent": 0, "failures": ["http 401: x"], "records": 1})
+        ));
+        assert!(
+            !nothing_was_delivered(&json!({"sent": 1, "failures": ["http 429: y"], "records": 2})),
+            "a partial failure stays Ok — SNS would redeliver and re-page the ones that landed"
+        );
+        assert!(!nothing_was_delivered(
+            &json!({"sent": 2, "failures": [], "records": 2})
+        ));
+        assert!(
+            !nothing_was_delivered(&json!({"sent": 0, "failures": [], "records": 0})),
+            "an empty batch delivered nothing and failed nothing — not an error"
+        );
+        assert!(!nothing_was_delivered(&json!({"sent": 0, "skipped": 1})));
+    }
+
     #[tokio::test]
     async fn test_alarm_record_reaches_telegram_post_through_lambda_handler() {
-        let (result, posted) = invoke(vec![alarm("tv-prod-ws-pool-all-dead", "ALARM")]).await;
+        let (result, posted) =
+            invoke(vec![alarm("tv-prod-ws-no-alive-connections", "ALARM")]).await;
         assert_eq!(result["sent"], json!(1));
         assert_eq!(result["failures"], json!([]));
         assert_eq!(posted.len(), 1);
         assert!(posted[0].starts_with("🆘"));
-        assert!(posted[0].contains("ALL live market data connections are down"));
+        assert!(posted[0].contains("no live market data connections are up"));
     }
 
     #[tokio::test]
@@ -1441,9 +2190,9 @@ mod tests {
         // one edge-dated StateChangeTime crashed the ENTIRE invocation
         // before any send — the genuine 🆘 in the same batch was dropped.
         let (result, posted) = invoke(vec![
-            alarm("tv-prod-ws-pool-all-dead", "ALARM"),
+            alarm("tv-prod-ws-no-alive-connections", "ALARM"),
             alarm_record(
-                "tv-prod-cpu-high-5min",
+                "tv-prod-disk-used-high",
                 "ALARM",
                 "9999-12-31T23:59:59+00:00",
             ),
@@ -1453,14 +2202,14 @@ mod tests {
         assert_eq!(result["sent"], json!(2));
         let genuine: Vec<&String> = posted
             .iter()
-            .filter(|t| t.contains("ALL live market data connections are down"))
+            .filter(|t| t.contains("no live market data connections are up"))
             .collect();
         assert_eq!(genuine.len(), 1);
         assert!(genuine[0].starts_with("🆘"));
         // The edge-dated alarm still pages (degraded timestamp, not dropped).
         let poisoned: Vec<&String> = posted
             .iter()
-            .filter(|t| t.contains("Server CPU has been very high for 5 minutes"))
+            .filter(|t| t.contains("Server disk is almost full"))
             .collect();
         assert_eq!(poisoned.len(), 1);
         assert!(poisoned[0].starts_with("🆘"));
@@ -1522,6 +2271,48 @@ mod tests {
     }
 
     #[test]
+    fn the_spill_phrases_never_assert_a_drop_they_cannot_know_happened() {
+        // MEASURED 2026-09-03, 08:32 IST: the operator was paged
+        // "An incoming market data frame was dropped before it could be safely
+        // stored" and "The safety file for incoming market data could not be
+        // written". Neither had happened. The real events were a replay
+        // DEFERRAL (deferred_segments 91, consumed_segments 5, on the byte
+        // budget) and the catch-up drain standing DOWN for memory at 9.1 GB
+        // against a 15 GiB ceiling -- both safety mechanisms working. Every
+        // row was accounted for: dropped == spilled exactly, 405,422 ticks
+        // and 22,538,490 depth rows.
+        //
+        // These two codes are emitted by MANY sites with different meanings --
+        // a genuinely dropped frame (channel full / writer dead), a writer
+        // respawn, a replay deferral, a memory stand-down. The phrase is keyed
+        // on the ALARM name, so it cannot see which one fired. It must
+        // therefore state what is true of ALL of them and never assert loss.
+        //
+        // Alarming in the wrong direction is not the safe direction: an
+        // operator taught that "dropped" sometimes means "deferred" stops
+        // believing the word on the day it is real.
+        for key in ["errcode-ws-spill-01", "errcode-ws-spill-02"] {
+            let phrase = alarm_phrase(key);
+            assert!(
+                phrase.contains("log line names which"),
+                "{key}: the phrase must point at the payload that says which \
+                 emitter fired, since the alarm name alone cannot -- got {phrase:?}"
+            );
+        }
+        assert!(
+            alarm_phrase("errcode-ws-spill-01").contains("does NOT mean anything was lost"),
+            "ws-spill-01 covers writer respawn and memory stand-down as well as \
+             loss; it must not read as a loss report"
+        );
+        let two = alarm_phrase("errcode-ws-spill-02");
+        assert!(
+            two.contains("EITHER") && two.contains("loses nothing"),
+            "ws-spill-02 must name BOTH outcomes -- a real drop and a deferral \
+             -- so it cannot collapse back into an unconditional drop claim"
+        );
+    }
+
+    #[test]
     fn test_broker_scoped_alarm_phrases_carry_dhan_tag() {
         // Operator directive 2026-07-14: broker-specific alarm phrases lead
         // with the broker tag; the OK flip reuses the phrase so recoveries
@@ -1529,13 +2320,19 @@ mod tests {
         // token-remaining-low wording is coordinator-ruled EXACT (2026-07-14).
         assert_eq!(
             alarm_phrase("token-remaining-low"),
-            "🔷 DHAN: access token expires soon — spot-1m + option-chain pulls will stop"
+            "🔷 DHAN: access token expires soon — the live price feed stops if it is not renewed"
         );
+        // The four keys below are LIVE alarms as of 2026-09-01. The previous
+        // four (ws-pool-all-dead, ws-failed-connections, ws-reconnect-gap-high,
+        // tick-gap-instruments-silent) named alarms that had been deleted from
+        // terraform, so this ratchet was asserting a tag on phrases no running
+        // alarm could ever reach — a passing test proving nothing about the
+        // system. `alarm_phrase_coverage_guard` now stops that recurring.
         for key in [
-            "ws-pool-all-dead",
-            "ws-failed-connections",
-            "ws-reconnect-gap-high",
-            "tick-gap-instruments-silent",
+            "ws-no-alive-connections",
+            "dhan-live-lane-down",
+            "dhan-no-ticks-flowing",
+            "errcode-risk-gap-03",
         ] {
             let phrase = alarm_phrase(key);
             assert!(
@@ -1566,6 +2363,263 @@ mod tests {
         assert!(out.contains("🔷 DHAN:"));
     }
 
+    // ---- ALARM repeat coalescing (2026-09-01) ----
+
+    #[test]
+    fn test_repeat_alarm_is_coalesced_but_still_sent() {
+        // The never-drop law is intact: every ALARM is delivered. Only the
+        // 2nd and later pages of ONE ongoing episode get the short render.
+        let mut cache = HashMap::new();
+        let first = fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0,
+            &mut cache,
+        );
+        assert_eq!(first.len(), 1);
+        assert!(
+            first[0].starts_with("🆘 Server disk"),
+            "got: {:?}",
+            first[0]
+        );
+        assert!(!first[0].contains("Still down"));
+
+        let second = fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0 + 60.0,
+            &mut cache,
+        );
+        assert_eq!(second.len(), 1, "a repeat ALARM must still be SENT");
+        assert!(
+            second[0].starts_with("🆘 Still down: "),
+            "got: {:?}",
+            second[0]
+        );
+        assert!(second[0].contains("2nd page in 10 min"));
+        assert!(!second[0].contains('\n'), "the repeat render is ONE line");
+
+        let third = fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0 + 120.0,
+            &mut cache,
+        );
+        assert!(
+            third[0].contains("3rd page in 10 min"),
+            "got: {:?}",
+            third[0]
+        );
+    }
+
+    #[test]
+    fn alarm_coalescing_is_never_widened_across_different_alarms() {
+        // THE safety property. Several alarms in this account are the ONLY
+        // signal their condition will ever produce — wal-frames-not-recovered
+        // says so in its own description — so a second, DIFFERENT alarm firing
+        // while a noisy first one is active must arrive as its own FULL page.
+        // If the coalescing key is ever widened past (alarm name, state), this
+        // test is what fails.
+        let mut cache = HashMap::new();
+        for tick in 0..4 {
+            let out = fold_records(
+                &[alarm("tv-prod-disk-used-high", "ALARM")],
+                1_000_000.0 + f64::from(tick) * 30.0,
+                &mut cache,
+            );
+            assert_eq!(out.len(), 1);
+        }
+
+        // A different alarm, deep inside the first one's active streak.
+        let other = fold_records(
+            &[alarm("tv-prod-wal-frames-not-recovered", "ALARM")],
+            1_000_000.0 + 121.0,
+            &mut cache,
+        );
+        assert_eq!(other.len(), 1, "a different alarm must never be swallowed");
+        assert!(
+            !other[0].contains("Still down"),
+            "a DIFFERENT alarm must render as a full FIRST page, never as a repeat of \
+             its neighbour's episode: {:?}",
+            other[0]
+        );
+        assert!(
+            other[0].contains("could not be recovered at start-up"),
+            "the second alarm must carry its OWN phrase: {:?}",
+            other[0]
+        );
+        assert!(other[0].contains('\n'), "a full page is two lines");
+    }
+
+    #[test]
+    fn test_alarm_outside_the_coalesce_window_starts_a_fresh_full_page() {
+        let mut cache = HashMap::new();
+        fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0,
+            &mut cache,
+        );
+        let later = fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0 + ALARM_REPEAT_COALESCE_SECS + 1.0,
+            &mut cache,
+        );
+        assert!(
+            !later[0].contains("Still down"),
+            "past the window a new episode renders in full: {:?}",
+            later[0]
+        );
+    }
+
+    #[test]
+    fn test_recovery_resets_the_streak() {
+        // An OK ends the episode, so the NEXT ALARM is a first page again —
+        // otherwise a flapping alarm would render "7th page" for what the
+        // operator experiences as a new failure.
+        let mut cache = HashMap::new();
+        fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0,
+            &mut cache,
+        );
+        fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0 + 30.0,
+            &mut cache,
+        );
+        fold_records(
+            &[alarm("tv-prod-disk-used-high", "OK")],
+            1_000_000.0 + 60.0,
+            &mut cache,
+        );
+        let re_alarm = fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0 + 90.0,
+            &mut cache,
+        );
+        assert!(
+            !re_alarm[0].contains("Still down"),
+            "an ALARM after a recovery is a NEW episode: {:?}",
+            re_alarm[0]
+        );
+    }
+
+    #[test]
+    fn test_insufficient_data_never_rides_an_alarm_streak() {
+        // The streak is keyed on (name, state). A flip to INSUFFICIENT_DATA is
+        // a different state and must render in full, or an alarm that goes
+        // unknown mid-episode would be labelled as more of the same.
+        let mut cache = HashMap::new();
+        fold_records(
+            &[alarm("tv-prod-disk-used-high", "ALARM")],
+            1_000_000.0,
+            &mut cache,
+        );
+        let unknown = fold_records(
+            &[alarm("tv-prod-disk-used-high", "INSUFFICIENT_DATA")],
+            1_000_000.0 + 30.0,
+            &mut cache,
+        );
+        assert!(unknown[0].starts_with("⚠️"), "got: {:?}", unknown[0]);
+        assert!(!unknown[0].contains("Still down"));
+    }
+
+    /// `alarm_repeat_streak` is the counter behind the "3rd page in 10 min"
+    /// line, so its two boundaries ARE the contract: a repeat of the same
+    /// ALARM inside the window increments, and everything else restarts at 1.
+    ///
+    /// Tested directly rather than only through `fold_records`, because a
+    /// fold-level test passes just as happily when the streak is stuck at 1 —
+    /// every page still goes out, so nothing looks broken, and the operator
+    /// silently loses the "this is one ongoing episode" signal that the
+    /// coalescing exists to give.
+    #[test]
+    fn test_alarm_repeat_streak_increments_only_inside_the_window() {
+        let mut cache: AlertCache = HashMap::new();
+        let t0 = 1_000_000.0;
+
+        // Never seen before: this is the first page, not a repeat.
+        assert_eq!(alarm_repeat_streak("a", t0, &cache), 1);
+
+        cache.insert("a".to_string(), ("ALARM".to_string(), t0, 1));
+        assert_eq!(
+            alarm_repeat_streak("a", t0 + 1.0, &cache),
+            2,
+            "a repeat inside the window is the second page"
+        );
+
+        // The window is EXCLUSIVE at its edge, so a page landing exactly one
+        // window later opens a fresh episode rather than extending the old
+        // one. Pinned because an off-by-one here would let a slow flap
+        // accumulate one unbroken streak all session.
+        assert_eq!(
+            alarm_repeat_streak("a", t0 + ALARM_REPEAT_COALESCE_SECS, &cache),
+            1
+        );
+
+        // A cached OK is not a streak however recent it is — otherwise a
+        // recovery followed by a genuine new failure would arrive as a terse
+        // "still down" line instead of a full page.
+        cache.insert("b".to_string(), ("OK".to_string(), t0, 7));
+        assert_eq!(alarm_repeat_streak("b", t0 + 1.0, &cache), 1);
+    }
+
+    /// The short render must still be a real page: one line, plain English,
+    /// emoji first, IST — the Telegram commandments do not relax because the
+    /// message is a repeat.
+    #[test]
+    fn test_repeat_alarm_line_is_one_line_and_names_the_page_number() {
+        let inner = json!({
+            "AlarmName": "tv-prod-disk-used-high",
+            "NewStateValue": "ALARM",
+            "StateChangeTime": "2026-07-07T04:31:12.345+0000",
+        });
+        let line = repeat_alarm_line(&inner, 3);
+
+        // One line. A "short" render that wraps to several lines is not
+        // shorter than the full page and buys nothing.
+        assert_eq!(line.lines().count(), 1, "got: {line:?}");
+
+        // Plain English ordinal (commandment 1) — never "page #3".
+        assert!(line.contains("3rd page"), "got: {line:?}");
+        assert!(!line.contains('#'), "got: {line:?}");
+
+        // Emoji first (commandment 5).
+        assert!(line.starts_with('🆘'), "got: {line:?}");
+
+        // The window is stated, so the operator can judge the RATE and not
+        // just the count.
+        assert!(line.contains("10 min"), "got: {line:?}");
+
+        // IST (commandment 9), never a raw vendor UTC stamp — and it must be
+        // the ALARM'S OWN time (04:31 UTC = 10:01 AM IST), never "now".
+        // `ist_12h` falls back to the current time on an unparseable input,
+        // so a weaker assertion here passes while every repeat page silently
+        // claims to have just happened.
+        assert!(line.contains("10:01 AM IST"), "got: {line:?}");
+        assert!(!line.contains("+0000"), "got: {line:?}");
+
+        // It carries the same plain-English phrase the full page used, so the
+        // repeat is recognisable as the SAME incident.
+        assert!(line.contains("disk"), "got: {line:?}");
+    }
+
+    #[test]
+    fn test_ordinal_suffixes_read_as_english() {
+        for (n, want) in [
+            (1u32, "1st"),
+            (2, "2nd"),
+            (3, "3rd"),
+            (4, "4th"),
+            (11, "11th"),
+            (12, "12th"),
+            (13, "13th"),
+            (21, "21st"),
+            (22, "22nd"),
+            (23, "23rd"),
+            (101, "101st"),
+            (111, "111th"),
+        ] {
+            assert_eq!(ordinal(n), want, "ordinal({n})");
+        }
+    }
     // ---- Rust-side additions beyond the legacy suite ----
 
     #[test]

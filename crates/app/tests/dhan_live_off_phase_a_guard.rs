@@ -137,20 +137,19 @@ fn test_configs_lock_dhan_live_ws_on() {
              updated in the same PR."
         );
     }
-    // 2026-07-15: the Groww LIVE feed is retired too — prod is REST-only.
-    // (Supersedes the 2026-07-13 "Groww stays THE live feed" pin.)
+    // 2026-07-15 retired the second live feed; 2026-08-21 REMOVED it (dated
+    // authorization in websocket-connection-scope-lock.md, "2026-08-21 (THIRD
+    // quote of the day)"). The pin here used to assert its enable key was
+    // present-and-false. `FeedsConfig` now has no field to bind that key to,
+    // and there is no `deny_unknown_fields`, so serde would silently ignore a
+    // line that still reads like a live switch. Pin ABSENCE instead, in either
+    // direction — strictly stronger than the pair it replaces.
     let prod = strip_line_comments(&read("config/production.toml"));
     assert!(
-        prod.contains("groww_enabled = false"),
-        "config/production.toml must carry `groww_enabled = false` — the \
-         Groww live feed is retired (operator directive 2026-07-15; the \
-         REST-only boot emits tv_boot_completed directly)"
-    );
-    assert!(
-        !prod.contains("groww_enabled = true"),
-        "config/production.toml must NOT carry `groww_enabled = true` — \
-         re-enabling the retired Groww live lane requires a fresh dated \
-         operator quote + updating this guard in the same PR"
+        !prod.contains("groww_enabled"),
+        "config/production.toml must not carry an enable key for the removed \
+         feed — it binds to no FeedsConfig field, so serde ignores it while \
+         the line still reads as a switch that controls something"
     );
 }
 
@@ -212,30 +211,24 @@ fn test_main_spawns_rest_stack_in_dhan_off_branch() {
 #[test]
 fn test_overlay_and_gate_and_suppression_warn_exist() {
     let persist_src = strip_line_comments(&read("crates/api/src/feed_state_persist.rs"));
+    // 2026-09-08: the AND-gate (`config && persisted`) became config-only —
+    // a persisted dhan-off used to darken a config-ON boot after one stray
+    // authenticated POST. The property this pin protects is unchanged and
+    // stronger: a stale persisted TRUE can never widen a config-off lane,
+    // because the persisted value is not consulted at all.
     assert!(
-        persist_src.contains("dhan_enabled: config.dhan_enabled && p.dhan_enabled"),
-        "feed_state_persist.rs lost the Dhan overlay AND-gate — a stale \
-         data/feed-state.json with dhan_enabled=true could resurrect the \
-         retired live WS lane (operator directive 2026-07-13)"
+        persist_src.contains("dhan_enabled: config.dhan_enabled,"),
+        "feed_state_persist.rs lost the config-authoritative Dhan overlay — a stale \
+         data/feed-state.json must never resurrect a config-off lane (operator directive \
+         2026-07-13) nor darken a config-on one (2026-09-08)"
+    );
+    assert!(
+        !persist_src.contains("&& p.dhan_enabled") && !persist_src.contains("&& _p.dhan_enabled"),
+        "the persisted Dhan flag must not be consulted by the overlay in either direction"
     );
     assert!(
         persist_src.contains("pub fn dhan_overlay_suppressed("),
         "feed_state_persist.rs lost the dhan_overlay_suppressed predicate — \
-         the boot-site suppression warn depends on it"
-    );
-    // 2026-07-15 (Groww live-feed retirement): the Groww overlay is
-    // narrow-only too — a stale persisted groww_enabled=true (written while
-    // Groww WAS the live feed) must never resurrect the retired feed over
-    // the production.toml flip.
-    assert!(
-        persist_src.contains("groww_enabled: config.groww_enabled && p.groww_enabled"),
-        "feed_state_persist.rs lost the Groww overlay AND-gate — a stale \
-         data/feed-state.json with groww_enabled=true could resurrect the \
-         retired Groww live feed (operator directive 2026-07-15)"
-    );
-    assert!(
-        persist_src.contains("pub fn groww_overlay_suppressed("),
-        "feed_state_persist.rs lost the groww_overlay_suppressed predicate — \
          the boot-site suppression warn depends on it"
     );
 
@@ -244,11 +237,6 @@ fn test_overlay_and_gate_and_suppression_warn_exist() {
         main_src.contains("dhan_overlay_suppressed("),
         "main.rs must consult dhan_overlay_suppressed at the overlay \
          application site (the one-shot boot warn)"
-    );
-    assert!(
-        main_src.contains("groww_overlay_suppressed("),
-        "main.rs must consult groww_overlay_suppressed at the overlay \
-         application site (the 2026-07-15 one-shot boot warn)"
     );
     assert!(
         main_src.contains("overlay SUPPRESSED"),
@@ -285,16 +273,27 @@ fn test_rest_stack_module_is_not_a_stub() {
         // Renewal + mid-session watchdog.
         "spawn_renewal_task()",
         "spawn_mid_session_profile_watchdog(",
-        // The retained REST subsystems (the REST canary was deleted
-        // 2026-07-14 per the operator Dhan noise lock — the legs
-        // self-detect REST death via their own escalation edges).
-        "spawn_supervised_spot_1m_rest(",
-        "spawn_supervised_option_chain_1m(",
-        "run_option_chain_1m_probe(",
-        // Their existing config gates are respected.
-        "config.spot_1m_rest.enabled",
-        "config.option_chain_1m.enabled",
-        "config.option_chain_1m.probe_and_report",
+        // ---- The six REST-LEG needles are RETIRED 2026-09-17 ----
+        //
+        // `spawn_supervised_spot_1m_rest(`, `spawn_supervised_option_chain_1m(`,
+        // `run_option_chain_1m_probe(` and the three config gates
+        // (`config.spot_1m_rest.enabled`, `config.option_chain_1m.enabled`,
+        // `config.option_chain_1m.probe_and_report`) all named the per-minute
+        // market-data legs, which the operator's SOCKETS-ONLY narrowing removed
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+        //
+        // The needles BELOW are unchanged, and this test is arguably MORE
+        // load-bearing after the narrowing than before it. §12.1 measured why
+        // the AUTH half could not go with the market-data half: the socket URL
+        // embeds the JWT (`connection.rs`'s `build_feed_url`), and
+        // `current_feed_token`'s own docblock says "there is no second
+        // credential path". So this stack's remaining job is to produce the one
+        // credential all sixteen sockets dial with — lock, mint, renew, watch,
+        // and publish a 0/1 up-gauge that reads 0 during bring-up.
+        //
+        // A skeleton HERE now means a dark lane, not a missing REST leg, which
+        // is why the list was narrowed rather than the test retired. The
+        // lock-before-mint ordering assertion below is untouched.
         // Observability: the 0/1 up-gauge (Rule 11 — bring-up reads 0).
         "tv_dhan_rest_stack_up",
     ] {
@@ -317,5 +316,80 @@ fn test_rest_stack_module_is_not_a_stub() {
         "lock-before-mint violated: try_acquire_instance_lock @{lock_pos} \
          must precede TokenManager::initialize @{mint_pos} \
          (dual-instance-lock-2026-07-04.md §2)"
+    );
+}
+
+/// 2026-09-08: the live tick lane dials ONLY while the dual-instance lock is
+/// held, and the flag it reads is the ONE the REST stack writes.
+///
+/// Before this the flag was created inside the REST stack's task, and the
+/// lane's only protection was ordering: it waited for the token manager,
+/// which the stack registers after acquiring the lock. A lock lost after
+/// acquisition — a heartbeat that could not renew, a peer seizing the
+/// parameter — left the lane dialing on a second box's token with nothing
+/// checking. Three pins: the boot creates the flag once and hands it to both
+/// stacks; the REST stack CLONES the shared flag rather than minting its own;
+/// the lane refuses to dial on `false` with the RESILIENCE-01 code.
+#[test]
+fn test_live_lane_refuses_to_dial_without_the_shared_instance_lock() {
+    let main_src = strip_line_comments(&read("crates/app/src/main.rs"));
+    assert!(
+        main_src.contains("let dhan_instance_lock_held ="),
+        "main.rs must create the shared dual-instance lock flag once"
+    );
+    assert_eq!(
+        main_src
+            .matches("instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held)")
+            .count(),
+        2,
+        "the ONE flag must be handed to BOTH Dhan stacks (REST + live lane)"
+    );
+    let rest_src = strip_line_comments(&read("crates/app/src/dhan_rest_stack.rs"));
+    assert!(
+        rest_src.contains("let instance_lock_held = Arc::clone(&params.instance_lock_held);"),
+        "the REST stack must share the boot's flag, never mint a private one"
+    );
+    assert!(
+        !rest_src.contains("let instance_lock_held = Arc::new(AtomicBool::new(false));"),
+        "a privately-minted flag would leave the live lane reading a flag nobody writes"
+    );
+    let feed_src = strip_line_comments(&read("crates/app/src/dhan_feed_stack.rs"));
+    let prod = feed_src.split("#[cfg(test)]").next().unwrap_or(&feed_src);
+    // ⚠ CHANGED 2026-10-26 (audit L3): the lock refusal no longer RETURNS for
+    // the rest of the process; the lane waits in `wait_for_dial_preconditions`
+    // (capped backoff, one RESILIENCE-01 line per episode) and dials only once
+    // the flag reads held. The staged WAL frames are no longer reported as
+    // refused there: they are folded when the lane dials, or deferred on
+    // shutdown.
+    let wait_fn = prod
+        .split_once("async fn wait_for_dial_preconditions(")
+        .expect("the precondition wait must exist") // APPROVED: test
+        .1;
+    let wait_fn = wait_fn
+        .split_once("\n}\n")
+        .map_or(wait_fn, |(body, _)| body);
+    assert!(
+        wait_fn.contains("instance_lock_held.load(Ordering::Acquire)"),
+        "the precondition wait must check the lock flag before the lane dials"
+    );
+    assert!(
+        wait_fn.contains("Some(id) if lock_held =>"),
+        "the client id is returned only while the lock is held"
+    );
+    assert!(
+        wait_fn.contains("code = ErrorCode::Resilience01DualInstanceDetected.code_str(),")
+            && wait_fn.contains("source = \"live_lane_dial_refused\","),
+        "the refusal must carry RESILIENCE-01 with its own source label"
+    );
+    // The wait must sit BEFORE the fold/dial.
+    let gate = prod
+        .find("wait_for_dial_preconditions(&params.instance_lock_held")
+        .expect("the lane must call the precondition wait"); // APPROVED: test
+    let fold = prod
+        .find("let capacity = distinct_fold_slots(")
+        .expect("fold present"); // APPROVED: test
+    assert!(
+        gate < fold,
+        "the lock wait must precede the fold ({fold}); wait at {gate}"
     );
 }

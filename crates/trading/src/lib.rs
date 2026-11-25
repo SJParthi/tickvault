@@ -1,4 +1,5 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]
@@ -29,6 +30,7 @@
 //! # Pipeline Position
 //! ParsedTick → **IndicatorEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
+pub mod brutex_host;
 pub mod candles;
 // PR #3 (2026-05-19): `greeks` module DELETED. Under the 4-IDX_I-only
 // LOCKED_UNIVERSE there are no live option contracts on the WebSocket
@@ -40,6 +42,7 @@ pub mod oms;
 pub mod orphan_position_watchdog;
 pub mod risk;
 pub mod strategy;
+pub(crate) mod sync;
 
 #[cfg(test)]
 mod tests {

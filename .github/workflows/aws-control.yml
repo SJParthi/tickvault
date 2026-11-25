@@ -94,7 +94,7 @@ jobs:
     if: needs.preflight.outputs.ready == 'true'
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -144,7 +144,17 @@ jobs:
           echo "id=$IID" >> "$GITHUB_OUTPUT"
           echo "Instance: $IID"
 
-      - name: Market-hours guard (IST 09:15-15:30 Mon-Fri)
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Market-hours guard (IST 09:00-15:40 Mon-Fri)
         id: guard
         # 2026-08-10 (security review): both inputs come in through `env:`,
         # never spliced into the script text. `force` is a free-form string,
@@ -161,17 +171,17 @@ jobs:
           set -euo pipefail
           action="$ACTION_INPUT"
           force="$FORCE_INPUT"
-          # Only stop/reboot/restart-app interrupt a live session.
+          # These actions interrupt capture or its persistence during a live session.
           case "$action" in
-            stop|reboot|restart-app|stop-app|rotate-ip) sensitive=1 ;;
+            stop|reboot|restart-app|stop-app|rotate-ip|restart-questdb) sensitive=1 ;;
             *) sensitive=0 ;;
           esac
           if [ "$sensitive" = "1" ] && [ "$force" != "yes" ]; then
-            # IST = UTC+5:30. Market window UTC 03:45-10:00, Mon-Fri.
-            mins=$(( ( $(date -u +%H) * 60 + $(date -u +%M) ) ))
-            dow=$(date -u +%u)  # 1=Mon..7=Sun
-            if [ "$dow" -le 5 ] && [ "$mins" -ge 225 ] && [ "$mins" -le 600 ]; then
-              echo "::error::'$action' blocked during market hours (09:15-15:30 IST Mon-Fri). Re-run with force=yes if truly needed."
+            # IST = UTC+5:30. Capture window UTC 03:30-10:10 (09:00-15:40 IST), Mon-Fri.
+            mins=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+            dow=$(date -u +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes  # 1=Mon..7=Sun
+            if [ "$MUHURAT" = "yes" ] || { [ "$dow" -le 5 ] && [ "$mins" -ge 210 ] && [ "$mins" -le 610 ]; }; then
+              echo "::error::'$action' blocked during the capture window (09:00-15:40 IST Mon-Fri, or all of a Muhurat date). Re-run with force=yes if truly needed."
               exit 1
             fi
           fi
@@ -208,15 +218,15 @@ jobs:
             --comment "tickvault full status" \
             --parameters 'commands=[
               "echo ===APP===",
-              "systemctl is-active tickvault 2>/dev/null || echo inactive",
+              "systemctl is-active tickvault||true",
               "echo ===DOCKER===",
               "docker ps --format \"{{.Names}} {{.Status}}\" 2>/dev/null || echo none",
               "echo ===ROWS===",
-              "for t in ticks candles_1m option_chain_minute_snapshot instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
+              "for t in ticks candles_1m market_depth instrument_lifecycle; do c=$(curl -s \"http://localhost:9000/exec?query=select%20count(*)%20from%20$t\" 2>/dev/null | grep -oE \"\\[\\[[0-9]+\" | grep -oE \"[0-9]+\" | head -1); echo \"$t=${c:-NA}\"; done",
               "echo ===FEED_SPLIT===",
               "fs=$(curl -s \"http://localhost:9000/exec?query=select%20feed%2C%20count(*)%20from%20ticks%20group%20by%20feed\" 2>/dev/null | grep -oE \"\\[\\\"[^\\\"]+\\\",[0-9]+\\]\" | sed -E \"s/\\[\\\"([^\\\"]+)\\\",([0-9]+)\\]/\\1=\\2/\"); if [ -n \"$fs\" ]; then echo \"$fs\"; else echo no-feed-rows; fi",
               "echo ===LOGS===",
-              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null | tail -12 || echo no-logs",
+              "journalctl -u tickvault -n 12 --no-pager 2>/dev/null || echo no-logs",
               "echo ===ERRORS===",
               "tail -3 /opt/tickvault/data/logs/errors.summary.md 2>/dev/null || echo no-summary"
             ]' \
@@ -293,7 +303,7 @@ jobs:
             echo "**Partial** — see the sections above; re-run status after a minute." >> "$S"
           fi
           echo "" >> "$S"
-          echo "_Dashboards: CloudWatch → Dashboards → tv-prod-operator · Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
+          echo "_Logs: CloudWatch → Log groups → /tickvault/prod/app_" >> "$S"
 
           # Also echo to the run log for quick glance.
           echo "$OUT"
@@ -355,7 +365,7 @@ jobs:
           IID=${{ steps.iid.outputs.id }}
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --parameters 'commands=["systemctl reset-failed tickvault;systemctl restart tickvault;sleep 5;systemctl is-active -q tickvault&&echo RESTARTED-OK||(echo FAIL;exit 1)"]' \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
@@ -385,7 +395,7 @@ jobs:
           IID=${{ steps.iid.outputs.id }}
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["cd /opt/tickvault/repo/deploy/docker && docker compose restart questdb && docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest"]' \
+            --parameters 'commands=["cd /opt/tickvault/repo/deploy/docker && docker compose restart tv-questdb && docker ps --format \"{{.Names}} {{.Status}}\" | grep -i quest"]' \
             --query Command.CommandId --output text)
           aws ssm wait command-executed --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" || true
           aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" \
@@ -440,7 +450,7 @@ jobs:
           # Restart the app so it dials the feed out from the new IP.
           CMD=$(aws ssm send-command --region "$AWS_REGION" --instance-ids "$IID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["systemctl restart tickvault","sleep 5","systemctl is-active --quiet tickvault && echo RESTARTED-OK || (echo FAIL; exit 1)"]' \
+            --parameters 'commands=["systemctl reset-failed tickvault;systemctl restart tickvault;sleep 5;systemctl is-active -q tickvault&&echo RESTARTED-OK||(echo FAIL;exit 1)"]' \
             --query Command.CommandId --output text)
           for i in $(seq 1 20); do
             ST=$(aws ssm get-command-invocation --region "$AWS_REGION" --command-id "$CMD" --instance-id "$IID" --query Status --output text 2>/dev/null || echo Pending)

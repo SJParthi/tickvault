@@ -33,5 +33,6 @@
 // RAM spot bars).
 pub mod day_ohlc_tracker;
 pub mod spot_bar_store;
+pub mod tick_ram_arena;
 
 pub use day_ohlc_tracker::{DayOhlc, DayOhlcTracker};

@@ -54,8 +54,16 @@ fn retired_tables_from_source() -> Vec<String> {
         names.push(after[..close].to_string());
         rest = &after[close + 1..];
     }
+    // Floor lowered 18 -> 17 on 2026-09-05: `market_depth` was removed from
+    // RETIRED_QUESTDB_TABLES because it REGAINED a live writer
+    // (crates/storage/src/depth_persistence.rs, the 2026-08-15 full-depth
+    // capture authorization). Leaving it on the drop list meant a boot with a
+    // stale sweep marker would DROP the largest table in the process. The
+    // floor is an anti-vacuity check on the PARSER, not a claim about the
+    // list length -- it moves only with a recorded reason, never to make a
+    // red build green.
     assert!(
-        names.len() >= 18,
+        names.len() >= 17,
         "RETIRED_QUESTDB_TABLES parse looks vacuous ({} names) — the \
          scanner must track the real drop list",
         names.len()

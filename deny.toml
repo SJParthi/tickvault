@@ -22,6 +22,8 @@ all-features = true
 # are outside our control and should not block CI.
 [advisories]
 unmaintained = "workspace"
+# Include transitive unsound advisories, not only workspace direct deps.
+unsound = "all"
 # Temporary advisory ignores — waiting on stable upstream fixes.
 # Review at every dependency-bump pass; remove once the fix ships in a
 # non-alpha release and we bump the relevant workspace dep.
@@ -49,7 +51,18 @@ unmaintained = "workspace"
 # via reqwest's disabled `http3` feature) and its ignore was likewise
 # removed from .cargo/audit.toml after the quinn-proto 0.11.15 lock bump.
 # Both advisories are now resolved in the lockfile, so no ignore is needed.
-ignore = []
+# 2026-11-17: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz),
+# published that day, mark both crates UNMAINTAINED: no vulnerability, and
+# "No safe upgrade is available". chrono is also a dependency of questdb-rs,
+# so it cannot leave the tree today. Owner card 2026-11-17, "Allow now,
+# replace later (Recommended)": ignored here with this note; chrono-tz is to
+# be replaced next (IST is a fixed +05:30 offset), and the chrono migration
+# is its own project. Remove each entry in the PR that removes its crate.
+# 2026-11-18: chrono-tz removed (its one use, a test, now uses the fixed
+# +05:30 offset), so its RUSTSEC-2026-0555 entry is removed with it.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fix exists; questdb-rs depends on it; owner card 2026-11-17 Allow now, replace later" },
+]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]
@@ -102,6 +115,13 @@ skip = [
     { crate = "rustls-webpki", reason = "follows rustls version split" },
     { crate = "tokio-rustls", reason = "follows rustls version split" },
     { crate = "socket2", reason = "AWS SDK + tokio version split" },
+    # 2026-09-09: the API server pins tower-http 0.7.1 directly (it uses only
+    # CorsLayer), while reqwest 0.13.4 still pulls 0.6.x transitively. Both
+    # versions therefore compile. Accepted deliberately rather than pinning
+    # back: the split disappears when reqwest moves to 0.7, and until then the
+    # cost is one small duplicated crate in the graph, not a behaviour risk --
+    # nothing in this workspace passes a tower-http type across the boundary.
+    { crate = "tower-http", reason = "reqwest 0.13.4 uses 0.6.x, the API server pins 0.7.x" },
     # --- Proc-macro ecosystem duplicates ---
     { crate = "syn", reason = "proc-macro crates straddle syn 1.x and 2.x" },
     # --- Other transitive duplicates ---
@@ -158,6 +178,15 @@ skip = [
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
     # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
     { crate = "winnow", reason = "toml_edit + figment parser version split" },
+    # 2026-09-16: reqwest 0.13.5 moved to base64 0.23.x. MEASURED against the
+    # lockfile, the 0.22.1 line is still held by eight crates including our
+    # OWN `tickvault-aws-lambdas`, plus axum, hyper-util, lambda_runtime,
+    # metrics-exporter-prometheus, tonic, ureq and ureq-proto. Both versions
+    # therefore compile. Accepted deliberately rather than pinning reqwest
+    # back, which would forfeit the rustls 0.23.44 bump in the same group:
+    # base64 carries no advisory on either line, and nothing in this
+    # workspace passes a base64 type across the boundary.
+    { crate = "base64", reason = "reqwest 0.13.5 uses 0.23.x, axum/lambda/tonic/our own aws-lambdas use 0.22.x" },
     # 2026-06-10: the reqwest duplicate-version skip (opentelemetry-http 0.31
     # pulled reqwest 0.12) was removed — the otel 0.32 quartet bump leaves a
     # single reqwest 0.13.x in the tree.

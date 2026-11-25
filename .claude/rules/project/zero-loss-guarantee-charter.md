@@ -28,6 +28,13 @@ This is a **checklist contract**, not an aspiration. The mechanical reality:
 | Every commit | banned-pattern + secret + pub-fn + fmt + the 12 pre-push gates | git hooks (see `operator-charter-forever.md` enforcement chain) |
 | GitHub (CI) | full 22-test battery + Build & Verify + Security & Audit + Commit Lint + Secret Scan | `.github/workflows/*.yml` |
 
+> **⚠ CORRECTED 2026-11-15 (audit repo-3) — the first row is not what
+> runs.** The two SessionStart hooks in `.claude/settings.json` are
+> `session-sanity.sh` and `session-auto-health.sh`; they run shell scripts
+> (`scripts/doctor.sh` among them), not `run_doctor` or `summary_snapshot`.
+> A command hook cannot call an MCP tool, so the session must call those two
+> itself. The row is kept as history.
+
 **Rule:** no box may be silently skipped. A box that genuinely does not apply
 is written `N/A — <one-line reason>`. A box with no evidence and no N/A reason
 **blocks the PR in review.**
@@ -45,9 +52,9 @@ hallucination and is REJECTED in review.
 
 | Operator "absolute" | Honest, enforced envelope | Evidence required |
 |---|---|---|
-| Zero tick loss | Bounded zero loss inside the chaos envelope: ring → spill NDJSON → DLQ; beyond it, DLQ catches every payload as recoverable text | `seal_ring.rs` (SEAL_BUFFER_CAPACITY ratchet) + seal-chain chaos tests *(zero_tick_loss_alert_guard.rs retired 2026-07-18 with the dead tick chain)* |
-| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close; SEBI 24h JWT forces ≥1 reconnect/day by law | pool watchdog + `ws_sleep_resilience` tests |
-| Never slow / hanged | Hot path: DHAT ≤ budget alloc, Criterion p99 ≤ budget; tick-gap >30s → Telegram | DHAT tests + Criterion + bench-gate |
+| Zero tick loss | Bounded zero loss inside the chaos envelope: ~~ring → spill NDJSON → DLQ; beyond it, DLQ catches every payload as recoverable text~~ **⚠ CORRECTED 2026-10-11:** ticks: WAL → ring → QuestDB, with the rescue spill and the inline fallback; the tick tier has no DLQ (only candles do: seal ring → spill → DLQ). Every tick loss we can see is counted and paged; a power cut (up to ~1 s plus the syncer time) and records still queued for the WAL at a kill are not counted | `seal_ring.rs` (SEAL_BUFFER_CAPACITY ratchet) + seal-chain chaos tests *(zero_tick_loss_alert_guard.rs retired 2026-07-18 with the dead tick chain)* |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close; SEBI 24h JWT forces ≥1 reconnect/day by law | pool watchdog + `ws_sleep_resilience` tests (calendar arithmetic only; no socket is held across a sleep) |
+| Never slow / hanged | Hot path: DHAT ≤ budget alloc, Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤ budget; tick-gap >30s → Telegram | DHAT tests + Criterion + bench-gate |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal; alert if disconnected >30s | chaos_questdb tests |
 | Strict O(1) everywhere | **O(1) per-tick + per-lookup (proven)**; inherently-O(N) build steps are flagged honestly, never faked as O(1) | DHAT + Criterion + explicit N flag |
 | 100% (every dimension) | 100% **inside the tested envelope with ratcheted regression coverage** | the §2 matrix evidence |
@@ -65,19 +72,19 @@ allowed where genuinely inapplicable.
 
 | Dimension | Proof artefact (real, no hallucination) |
 |---|---|
-| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (68.3–99.4, target 100%), floors only move up), `scripts/coverage-gate.sh` post-merge |
+| Code coverage | `quality/crate-coverage-thresholds.toml` (ratcheted per-crate floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%), floors only move up), `scripts/coverage-gate.sh` ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green, and again after merge |
 | Audit coverage | `<event>_audit` QuestDB table with DEDUP UPSERT KEYS |
 | Testing coverage | the 22 test categories in `testing.md`, scoped to changed crate(s) |
 | Security coverage | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent |
 | Monitoring coverage | Prom counter + gauge + tracing span (7-layer telemetry) |
 | Logging coverage | `error!`/`warn!`/`info!` with `code = ErrorCode::X.code_str()`; hourly `errors.jsonl` |
-| Alerting coverage | Prom/CloudWatch alert rule + `resilience_sla_alert_guard.rs` ratchet |
+| Alerting coverage | Prom/CloudWatch alert rule + `resilience_sla_alert_guard.rs` ratchet **⚠ CORRECTED 2026-10-12 (deep audit TRU-8): `resilience_sla_alert_guard.rs` does not exist in the tree; NOT ENFORCED.** |
 | Scenario coverage | chaos test for any new failure mode |
 | Edge-case coverage | property tests (proptest) + boundary tests on financial fns |
 | Runtime validation | `make doctor` 7-section + market-open self-test + SLO score @10s |
 | Failure detection | typed `ErrorCode` + runbook + triage YAML rule |
 | Bug detection | adversarial 3-agent review (hot-path + security + hostile) |
-| Performance validation | DHAT zero-alloc + Criterion p99 + bench-gate ≤5% regression |
+| Performance validation | DHAT zero-alloc + Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) + bench-gate ≤5% regression |
 | Recovery validation | chaos rescue→spill→DLQ + reconnect/sleep-wake tests |
 | API validation | request/response schema tests against the Dhan ref rules |
 | DB validation | DEDUP-key meta-guard + schema self-heal (`ALTER ADD COLUMN IF NOT EXISTS`) |

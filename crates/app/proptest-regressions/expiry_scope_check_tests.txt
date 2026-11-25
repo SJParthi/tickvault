@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7f53d1070e91795232f0019937d96c0e81bc75a632c3ceddcf91a2ec6fcc559b # shrinks to rows = [ContractRow { i: 18, x: "NSE", c: "OPTSTK", e: 20261028, s: 11000, l: "CE", u: "NIFTY", z: 75 }, ContractRow { i: 19, x: "NSE", c: "OPTSTK", e: 20261028, s: 11000, l: "PE", u: "NIFTY", z: 75 }, ContractRow { i: 15, x: "NSE", c: "OPTIDX", e: 20261028, s: 11000, l: "CE", u: "NIFTY", z: 75 }, ContractRow { i: 16, x: "NSE", c: "OPTIDX", e: 20261028, s: 11000, l: "PE", u: "NIFTY", z: 75 }, ContractRow { i: 17, x: "NSE", c: "OPTIDX", e: 20261028, s: 12000, l: "CE", u: "NIFTY", z: 75 }, ContractRow { i: 18, x: "NSE", c: "OPTIDX", e: 20261028, s: 12000, l: "PE", u: "NIFTY", z: 75 }]
+cc 5387a071d8e2486d88f8fdb235d6e1d574c921cfd5d97c9a89b024556f0d0689 # shrinks to (rows, shuffled) = ([CandleContractRow { security_id: 999, segment: "NSE_FNO", contract: Some("X-23Nov2026-100-CE") }, CandleContractRow { security_id: 999, segment: "NSE_FNO", contract: Some("X-29Dec2026-100-CE") }], [CandleContractRow { security_id: 999, segment: "NSE_FNO", contract: Some("X-29Dec2026-100-CE") }, CandleContractRow { security_id: 999, segment: "NSE_FNO", contract: Some("X-23Nov2026-100-CE") }])

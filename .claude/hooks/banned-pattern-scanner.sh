@@ -25,24 +25,66 @@ REPORT=""
 extract_prod_code() {
   local file="$1"
   awk '
-    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; buf="" }
+    BEGIN { skip=0; depth=0; exempt=0; skip_next=0; seen_item=0; buf="" }
     # Skip #[cfg(test)] and #[test] blocks (brace-depth tracking)
     # Only trigger when NOT already inside a skip block to prevent
     # nested #[test] attributes from resetting the outer module depth.
-    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; next }
-    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; next }
+    skip==0 && /^[[:space:]]*#\[cfg\(test\)\]/ { skip=1; depth=0; seen_item=0; next }
+    skip==0 && /^[[:space:]]*#\[test\]/ { skip=1; depth=0; seen_item=0; next }
     # Inside a skip block that has entered braces — track depth
     skip==1 && depth > 0 {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
       next
     }
     # Inside a skip block, first line with opening brace — start depth tracking
     skip==1 && /\{/ {
       depth += gsub(/\{/, "{")
       depth -= gsub(/\}/, "}")
-      if (depth <= 0) { skip=0; depth=0 }
+      if (depth <= 0) { skip=0; depth=0; seen_item=0 }
+      next
+    }
+    # A BRACE-LESS `#[cfg(test)]` item ends at its own semicolon.
+    #
+    # Without this arm the catch-all below keeps skipping until the next line
+    # containing `{` -- which, after `#[cfg(test)] const X = ...;` or
+    # `#[cfg(test)] mod tests;`, is the opening brace of the NEXT and
+    # PRODUCTION item. That item was swallowed whole and never scanned.
+    #
+    # Measured 2026-09-16 on the live tree: `crates/trading/src/strategy/mod.rs`
+    # lost `pub mod evaluator;`, `pub mod hot_reload;` and `pub mod types;`, and
+    # a minimal fixture proved an entire production `fn` carrying `.unwrap()`
+    # disappeared from the scan. 12 brace-less sites exist workspace-wide.
+    #
+    # Placed AFTER the two brace arms deliberately: `#[cfg(test)] use super::{a};`
+    # carries a brace AND a semicolon, and the brace arm already balances it to
+    # depth 0. `depth==0` keeps this out of the way of a real `mod tests {` body,
+    # whose inner `let x = 1;` lines must stay skipped.
+    #
+    # ITEM-SCOPED: `seen_item` marks the FIRST code line of the item, and ONLY that
+    # line may end the skip. Three shapes broke the naive "any line ending in
+    # `;`" form (adversarial review of the first patch, 2026-09-16 -- all three
+    # reproduced end-to-end before and after):
+    #   (a) MISSED: `const X: u8 = 1; // note` -- the bare `$` anchor rejected a
+    #       trailing comment, so the headline bug survived a one-comment diff;
+    #   (b) FALSE POSITIVE: a doc comment between the attribute and the item
+    #       (`/// ... let n = parse(s)?;`) ended the skip early, flagging a
+    #       TEST-ONLY body as production;
+    #   (c) FALSE POSITIVE: a raw-string fixture (`r#" SELECT 1; "#;`) ended it
+    #       on the semicolon INSIDE the fixture and scanned the fixture as production.
+    #
+    # A false positive is the worse half -- it blocks a legitimate commit, which
+    # is how a guard gets disabled. Comments, blank lines and stacked attributes
+    # therefore never terminate. HONEST RESIDUAL: a MULTI-LINE brace-less item
+    # (case c) stays over-skipped -- the pre-patch behaviour, a miss rather than
+    # a false alarm. Stated, not hidden.
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*$/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*(\/\/|\/\*|\*)/ { next }
+    skip==1 && depth==0 && seen_item==0 && /^[[:space:]]*#\[/ { next }
+    skip==1 && depth==0 && seen_item==0 {
+      seen_item=1
+      if ($0 ~ /;[[:space:]]*(\/\/.*)?$/) { skip=0; depth=0; seen_item=0 }
       next
     }
     # Inside a skip block, no braces yet (attribute lines like #[allow()])
@@ -89,9 +131,14 @@ scan_prod_code() {
     # (proof examples + operator CLIs like tv_doctor whose OUTPUT is stdout).
     # This mirrors the compile-time policy: the print/unwrap deny lints are
     # scoped to each crate's prod lib.rs, not to examples/bins.
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/)'; then
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/) ]]; then
       continue
     fi
+
+    # These token patterns cannot arise from the added line-number prefix.
+    # A raw no-match cannot produce a hit after test/comment exclusion.
+    # Keep the same BRE pattern; avoid extraction and filter forks on no-match.
+    grep -q -- "$pattern" "$full_path" || continue
 
     # Extract prod code (strips #[cfg(test)] blocks), then scan
     local matches
@@ -135,19 +182,64 @@ scan_prod_code() {
 #   crates/storage/src/ws_frame_spill.rs    — per-frame WAL append
 # (crates/app/src/groww_bridge.rs — the per-tick Groww NDJSON consume path — was
 #  DELETED 2026-07-15 with the Groww live feed; its alternative is removed below.)
-# (crates/storage/src/tick_persistence.rs + tick_row_builder.rs — the per-tick
-#  ILP append/row-build chain — were DELETED 2026-07-17 in the stage-2 dead-WS
-#  sweep (PR #1631); their alternatives are removed below per the zero-match
-#  guard in hot-path-scanner-selftest.sh.)
+#   crates/storage/src/tick_persistence.rs   — per-tick ILP append + flush
+#   crates/storage/src/depth_persistence.rs  — per-depth-row ILP append + flush
+#
+# 2026-09-05 — the two persistence writers were ADDED on this date, and the
+# lines they replace used to read "tick_persistence.rs + tick_row_builder.rs
+# were DELETED 2026-07-17 ... their alternatives are removed". That was true
+# when written and stopped being true on 2026-08-26, when both files came back
+# with the Dhan live-WS revival and the full-depth capture authorization. So a
+# stale comment stood where a reader would go looking for exactly this, and the
+# zero-allocation bans had never applied to the two per-row writers — one of
+# which carries a measured 1,530,651,649 rows per session.
+# Triaged before widening: 21 pre-existing hits, ALL boot DDL, ILP-conf,
+# once-per-process wiring, or a rescue arm reached only after a flush has
+# already failed. Zero were on a per-row path (`TickRow::from_parsed_tick` and
+# `DepthWriter::append_row_inner` are hit-free). Each now carries its own
+# `// APPROVED:` line with the reason.
+#
+# ⚠ STILL OUT OF SCOPE: crates/app/src/dhan_feed_stack.rs, which contains the
+#  frame drain itself. Its drain span was verified hit-free the same day, and
+#  all ~42 of its hits are boot, socket-dial, depth-attach or shutdown — but
+#  the file is ~11,600 lines and roughly 80% of it is NOT hot, so a FILE-level
+#  include is the wrong instrument: it would demand ~42 exemptions on code that
+#  was never on the tick path, and an allowlist that size teaches the next
+#  reader to add a forty-third. Covering it properly needs region scoping
+#  (the `// O(1) EXEMPT: begin/end` block shape this repo already uses,
+#  inverted to mark the HOT region) plus a test pinning that the marked region
+#  still contains the drain. That is its own change, not a regex edit.
 # Cold path within core (auth/, instrument/, notification/, historical/) is NOT hot path.
 # Cold path within trading (oms/) — order placement is network-I/O-bound, not
 # per-tick latency-critical (pre-existing documented exclusion, kept).
 # NOTE: keep this regex a flat '|'-separated list of alternatives with NO
 # nested groups — hot-path-scanner-selftest.sh splits it on '|' to verify
 # every alternative matches at least one real file.
-HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$'
+HOT_PATH_INCLUDE_REGEX='^crates/core/src/parser/|^crates/core/src/pipeline/|^crates/core/src/websocket/|^crates/trading/|^crates/storage/src/ws_frame_spill\.rs$|^crates/storage/src/tick_persistence\.rs$|^crates/storage/src/depth_persistence\.rs$'
 HOT_PATH_EXCLUDE_REGEX='^crates/trading/src/oms/'
 
+# 2026-09-05: scan_hot_path no longer delegates to scan_prod_code. Two
+# reasons, both found by dry-running the widened include set:
+#
+#  1. COMMENT LINES. scan_prod_code drops `///` and `//!` but keeps plain
+#     `//`. crates/app/src/dhan_feed_stack.rs:1606 is a `//` comment whose
+#     text explains why `?err` is used INSTEAD of `format!` — the scanner
+#     flagged the prose that records the rule. Exempting it would invite
+#     someone to delete the explanation to silence the guard.
+#  2. MULTI-LINE MACROS. The same-line `// APPROVED:` escape does not
+#     survive `cargo fmt` on a macro opener: rustfmt hoists a trailing
+#     comment after `format!(` onto the next line, INSIDE the macro, where
+#     a same-line grep can never see it. Every marker on a wrapped
+#     `format!(` would silently stop working at the next fmt run.
+#
+# So this scan strips comment lines and looks BACK up to 5 lines for the
+# marker — the same shape scan_hot_path_sync_fs has used since Wave 1.
+# The look-back is scoped to the HOT-PATH bans only; the universal bans
+# (unwrap/expect/println) keep their stricter same-line escape.
+#
+# grep is deliberately BASIC, not -E: the patterns below are written as
+# `\.clone()` / `Vec::new()`, where `()` is a literal pair. Under -E it
+# would be an empty group that matches every line.
 scan_hot_path() {
   local pattern="$1"
   local description="$2"
@@ -159,7 +251,67 @@ scan_hot_path() {
     return
   fi
 
-  scan_prod_code "$pattern" "$description" "$hot_path_files"
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    local full_path="$PROJECT_DIR/$file"
+    [ ! -f "$full_path" ] && continue
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/|/examples/|/src/bin/) ]]; then
+      continue
+    fi
+
+    grep -q -- "$pattern" "$full_path" || continue
+    local prod_code
+    prod_code=$(extract_prod_code "$full_path")
+    [ -z "$prod_code" ] && continue
+
+    # `<line_num>: <code>` — drop entries whose code is a comment.
+    local code_only
+    code_only=$(echo "$prod_code" | grep -vE '^[0-9]+:[[:space:]]*(///|//!|//)' || true)
+
+    local hits
+    hits=$(echo "$code_only" | grep "$pattern" || true)
+    [ -z "$hits" ] && continue
+
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      local hit_line_num
+      hit_line_num=$(echo "$hit" | cut -d: -f1)
+      [ -z "$hit_line_num" ] && continue
+
+      local exempt=0
+      local hit_text
+      hit_text=$(sed -n "${hit_line_num}p" "$full_path" 2>/dev/null)
+      # SAME LINE ONLY for the incidental markers. `// TODO` and
+      # `// SAFETY:` must never exempt from a distance: a TODO five lines
+      # above an unrelated `.clone()` would silently waive it, which is a
+      # LOOSENING of the pre-2026-09-05 behaviour rather than a fix.
+      if echo "$hit_text" | grep -qE '// (SAFETY:|TODO|test)|// O\(1\) EXEMPT:'; then
+        exempt=1
+      fi
+      # DELIBERATE markers may sit ONE line above: a wrapped macro
+      # (rustfmt hoists a trailing comment off a `format!(` opener) or a
+      # marker on the enclosing fn.
+      local j
+      # Window is 0..1 deliberately, NOT the 5 that scan_hot_path_sync_fs uses:
+      # the marker is always ON the hit line or DIRECTLY above it, and a wider
+      # window lets an `// APPROVED:` written for one line silently waive an
+      # unrelated allocation added under it later.
+      for j in 0 1; do
+        [ "$exempt" = "1" ] && break
+        local back_line_num=$((hit_line_num - j))
+        [ "$back_line_num" -lt 1 ] && break
+        local back_text
+        back_text=$(sed -n "${back_line_num}p" "$full_path" 2>/dev/null)
+        if echo "$back_text" | grep -qE '// APPROVED:|HOT-PATH-EXEMPT:'; then
+          exempt=1
+        fi
+      done
+      [ "$exempt" = "1" ] && continue
+
+      VIOLATIONS=$((VIOLATIONS + 1))
+      REPORT="${REPORT}\n  [BANNED] ${description} in ${file}:\n    ${hit}"
+    done <<< "$hits"
+  done <<< "$hot_path_files"
 }
 
 echo "=== Banned Pattern Scanner ===" >&2
@@ -341,13 +493,13 @@ scan_prod_code 'DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.*twohundreddepth' \
 # security_id ALONE silently drops one of the two — leading to missing
 # WebSocket subscriptions, wrong tick enrichment, and silent data loss.
 #
-# Every HashSet<u32> / HashSet<SecurityId> / HashMap<u32, _> / HashMap<SecurityId, _>
+# Every HashSet<u32|u64|SecurityId> / HashMap<u32|u64|SecurityId, _> (u64 = SecurityId)
 # in instrument-handling paths must either:
 #  (a) use the composite key (u32, ExchangeSegment) / (SecurityId, ExchangeSegment), OR
 #  (b) carry a `// APPROVED: single-segment context — <reason>` comment
 #      proving every value belongs to one known segment.
 #
-# Scope: paths where cross-segment instruments can appear.
+# Scope: paths where cross-segment instruments can appear (app + storage since 2026-11-15).
 scan_instrument_paths() {
   local pattern="$1"
   local description="$2"
@@ -355,7 +507,7 @@ scan_instrument_paths() {
   local instrument_files
 
   instrument_files=$(echo "$files" | grep -E \
-    '^crates/(common|core|trading)/src/(instrument|pipeline|websocket|greeks)/|^crates/common/src/instrument_registry\.rs$' \
+    '^crates/(common|core|trading)/src/(instrument|pipeline|websocket|greeks)/|^crates/common/src/instrument_registry\.rs$|^crates/(app|storage)/src/' \
     || true)
   if [ -z "$instrument_files" ]; then
     return
@@ -364,16 +516,16 @@ scan_instrument_paths() {
   scan_prod_code "$pattern" "$description" "$instrument_files"
 }
 
-# Ban single-key collections on u32 / SecurityId — the exact bug class from
+# Ban single-key collections on u32 / u64 / SecurityId — the exact bug class from
 # Parthiban's 2026-04-17 live finding (NIFTY IDX_I id=13 dropped).
-scan_instrument_paths 'HashSet<u32>' \
-  'I-P1-11: HashSet<u32> — use HashSet<(u32, ExchangeSegment)> or add // APPROVED: comment' \
+scan_instrument_paths 'HashSet<u[36][24]>' \
+  'I-P1-11: HashSet<u32/u64> — use HashSet<(id, ExchangeSegment)> or add // APPROVED: comment' \
   "$STAGED_FILES"
 scan_instrument_paths 'HashSet<SecurityId>' \
   'I-P1-11: HashSet<SecurityId> — use HashSet<(SecurityId, ExchangeSegment)> or add // APPROVED: comment' \
   "$STAGED_FILES"
-scan_instrument_paths 'HashMap<u32,' \
-  'I-P1-11: HashMap<u32, _> — use HashMap<(u32, ExchangeSegment), _> or add // APPROVED: comment' \
+scan_instrument_paths 'HashMap<u[36][24],' \
+  'I-P1-11: HashMap<u32/u64, _> — use HashMap<(id, ExchangeSegment), _> or add // APPROVED: comment' \
   "$STAGED_FILES"
 scan_instrument_paths 'HashMap<SecurityId,' \
   'I-P1-11: HashMap<SecurityId, _> — use HashMap<(SecurityId, ExchangeSegment), _> or add // APPROVED: comment' \
@@ -488,9 +640,10 @@ scan_hot_path_sync_fs() {
     [ -z "$file" ] && continue
     local full_path="$PROJECT_DIR/$file"
     [ ! -f "$full_path" ] && continue
-    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+    if [[ "$file" =~ (_test\.rs|/tests/|/test_|_tests\.rs|/benches/) ]]; then
       continue
     fi
+    grep -qE -- "$pattern" "$full_path" || continue
     # Production-only: strip #[cfg(test)] blocks via the same awk used
     # in the universal scanner.
     local prod_code

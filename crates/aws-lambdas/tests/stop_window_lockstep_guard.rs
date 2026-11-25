@@ -1,8 +1,9 @@
 //! Build-failing ratchet pinning the **evening stop-window lockstep**.
 //!
-//! The operator's 9-hour trading window is 08:30–17:30 IST (operator Quote 14,
-//! 2026-08-08 — the stop moved 16:30 → 17:30; the START is unchanged). Four
-//! places encode the evening edge, and **three of them will actively fight the
+//! The operator's trading window is 08:30–16:30 IST (operator Quote 37,
+//! 2026-10-21, plan item 64 — the stop moved back 17:30 → 16:30; it was
+//! 08:30–17:30 from operator Quote 14, 2026-08-08; the START is unchanged). FIVE
+//! places encode the evening edge, and **four of them will actively fight the
 //! schedule if they disagree** — this is not a cosmetic consistency test:
 //!
 //! | Site | If it stays at the old time |
@@ -11,6 +12,7 @@
 //! | `hard_stop_guard::in_up_window` | runs HOURLY and **force-stops** any box outside its window → kills the box at 17:00, pages, and silently cancels the extra hour |
 //! | `start_watchdog::OPERATING_CLOSE_IST_MINUTES` | the curfew guard **stops** the box 30 min early |
 //! | `start_watchdog::STOP_TRIGGER_UTC_HOUR` + its cron | stop-verify fires 45 min BEFORE the stop → a false "auto-stop FAILED" page every trading day |
+//! | `.github/workflows/deploy-aws.yml` (2 branches) | a deploy that self-started the box **stops it again inside the window**, and a box down during a paid hour is reported as "intentionally stopped" |
 //!
 //! So a partial edit does not merely look inconsistent — it produces either a
 //! prematurely-killed box or a guaranteed daily false page. A comment cannot
@@ -30,10 +32,11 @@ use tickvault_aws_lambdas::start_watchdog::{
 
 use chrono::{TimeZone, Utc};
 
-/// The single source of truth for this test: 17:30 IST = 12:00 UTC.
-const STOP_IST_HOUR: u32 = 17;
+/// The single source of truth for this test: 16:30 IST = 11:00 UTC
+/// (2026-10-22, plan item 64; 17:30 IST = 12:00 UTC before).
+const STOP_IST_HOUR: u32 = 16;
 const STOP_IST_MINUTE: u32 = 30;
-const STOP_UTC_HOUR: u32 = 12;
+const STOP_UTC_HOUR: u32 = 11;
 const STOP_UTC_MINUTE: u32 = 0;
 
 fn repo_root() -> PathBuf {
@@ -58,7 +61,7 @@ fn stop_time_utc_and_ist_agree() {
     assert_eq!(
         ist_minutes,
         utc_minutes + 5 * 60 + 30,
-        "17:30 IST must equal 12:00 UTC (+05:30) — this test's own anchors drifted"
+        "16:30 IST must equal 11:00 UTC (+05:30) — this test's own anchors drifted"
     );
 }
 
@@ -78,8 +81,9 @@ fn start_watchdog_stop_trigger_matches_the_cron() {
         "main.tf must schedule daily_stop at `{expected}` (= {STOP_IST_HOUR}:{STOP_IST_MINUTE} IST)"
     );
     assert!(
-        !tf.contains("cron(0 11 ? * MON-FRI *)"),
-        "main.tf still carries the OLD 16:30 IST daily_stop cron — the box would stop an hour early"
+        !tf.contains("cron(0 12 ? * MON-FRI *)"),
+        "main.tf still carries the OLD 17:30 IST daily_stop cron (2026-08-08 to 2026-10-22) — \
+         the box would stop an hour late and the hard-stop guard would force-stop it at 17:05"
     );
 }
 
@@ -164,21 +168,21 @@ fn hard_stop_up_window_covers_the_whole_scheduled_day() {
         in_up_window(at(3, 0)),
         "08:30 IST (the scheduled start) must be inside the up-window"
     );
-    // 11:59 UTC = 17:29 IST — one minute before the stop must be inside.
+    // 10:59 UTC = 16:29 IST — one minute before the stop must be inside.
     assert!(
-        in_up_window(at(11, 59)),
-        "17:29 IST must be inside the up-window — otherwise the hourly guard \
+        in_up_window(at(10, 59)),
+        "16:29 IST must be inside the up-window — otherwise the hourly guard \
          force-stops the box before its scheduled stop"
     );
-    // 12:00 UTC = 17:30 IST — the stop minute itself is inclusive.
+    // 11:00 UTC = 16:30 IST — the stop minute itself is inclusive.
     assert!(
-        in_up_window(at(12, 0)),
-        "17:30 IST (the scheduled stop minute) must be inside the up-window"
+        in_up_window(at(11, 0)),
+        "16:30 IST (the scheduled stop minute) must be inside the up-window"
     );
-    // 12:01 UTC = 17:31 IST — past the stop, the guard SHOULD act.
+    // 11:01 UTC = 16:31 IST — past the stop, the guard SHOULD act.
     assert!(
-        !in_up_window(at(12, 1)),
-        "17:31 IST must be OUTSIDE the up-window — the guard is the backstop for \
+        !in_up_window(at(11, 1)),
+        "16:31 IST must be OUTSIDE the up-window — the guard is the backstop for \
          a failed stop, so it must not stay permissive all evening"
     );
     // Weekends are always out, regardless of clock.
@@ -266,12 +270,104 @@ fn operator_facing_stop_times_are_in_lockstep() {
          hour — commandment 9 requires a precise IST 12-hour time."
     );
 
-    // Inverted pin: the retired 4:30 PM text must never come back. Every
+    // Inverted pin: the retired 5:30 PM text must never come back. Every
     // occurrence would be operator-facing, so one is already too many.
+    // (2026-10-22, plan item 64: this pinned the retired 4:30 PM until the
+    // operator moved the stop back to 4:30 PM IST under Quote 37.)
     assert!(
-        !body.contains("4:30 PM"),
-        "the retired 4:30 PM IST stop time must not reappear in any \
-         operator-facing body (operator widened the window to 5:30 PM IST on \
-         2026-08-08, Quote 14)."
+        !body.contains("5:30 PM"),
+        "the retired 5:30 PM IST stop time must not reappear in any \
+         operator-facing body (operator moved the stop back to 4:30 PM IST on \
+         2026-10-21, Quote 37)."
     );
+
+    // EIGHTH site (added 2026-09-23, dhan-rest-only-noise-lock §2.3x): the
+    // app's own shutdown Telegram (`NotificationEvent::ShutdownInitiated`)
+    // told the operator "daily 4:30 PM IST window" for 46 days after the stop
+    // moved to 17:30 — and the ExternalStop body said a stop OUTSIDE "the
+    // 4:30 PM IST window" was unexpected, so every ordinary 5:30 PM stop read
+    // as a contradiction on the phone. Same silent-wrong-answer class, a
+    // different crate this guard never opened.
+    let events = read(&root.join("crates/core/src/notification/events.rs"));
+    assert!(
+        events.contains(&current),
+        "notification/events.rs shutdown bodies must name the CURRENT stop time \
+         as `{current}`"
+    );
+    assert!(
+        !events.contains("5:30 PM"),
+        "the retired 5:30 PM IST stop time must not reappear in \
+         notification/events.rs — it is rendered straight onto the operator's phone"
+    );
+}
+
+/// The FIFTH site: `.github/workflows/deploy-aws.yml`.
+///
+/// Added 2026-08-27. The four sites this file was written for all live under
+/// `deploy/aws/terraform/**` or `crates/aws-lambdas/src/**`, and every path this
+/// guard reads is one of those two. The deploy workflow encodes the SAME evening
+/// edge in two live `sh` branches and was never scanned, so it kept the old
+/// 16:30 for nineteen days after operator Quote 14 moved the window.
+///
+/// Both branches decide something real:
+///
+/// | Branch | With the old 16:30 |
+/// |---|---|
+/// | `UP_WINDOW` (stopped-box decision) | a box that is down during a PAID hour is classified "intentionally stopped": the deploy skips GREEN and SILENT — a false-OK |
+/// | the auto-stop guard | a dispatch-deploy that self-started the box **stops it again at e.g. 17:00**, inside the window, under a comment reading "NEVER stop during the trading window" |
+///
+/// The expected boundary is DERIVED from this file's own `STOP_IST_*` constants,
+/// so moving the window moves this assertion with it and cannot drift again.
+#[test]
+fn deploy_workflow_encodes_the_same_evening_edge() {
+    let wf = read(&repo_root().join(".github/workflows/deploy-aws.yml"));
+    let expected = STOP_IST_HOUR * 100 + STOP_IST_MINUTE;
+
+    // Only LIVE shell lines count. A comment carrying an old figure is stale
+    // prose, not a decision, and this guard exists for decisions.
+    let live: Vec<(usize, &str)> = wf
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .filter(|(_, l)| !l.trim_start().starts_with('#'))
+        // Select ONLY the up-window branches. The file also carries the
+        // market-hours BLACKOUT guard (`-ge 900 ... -lt 1545`), which is a
+        // different window and must NOT be dragged to the stop edge — an
+        // earlier draft of this filter caught it and would have failed on a
+        // correct line. The up-window's START (08:30) is what distinguishes
+        // them, and Quote 14 left that start unchanged.
+        .filter(|(_, l)| l.contains("$HHMM") && l.contains("-ge 830"))
+        .collect();
+
+    assert!(
+        live.len() >= 2,
+        "expected at least the two window branches in deploy-aws.yml (UP_WINDOW and the \
+         auto-stop guard); found {} — if a branch was removed, remove it here too rather \
+         than weakening the count",
+        live.len()
+    );
+
+    for (lineno, line) in &live {
+        assert!(
+            line.contains(&format!("-le {expected}")),
+            "deploy-aws.yml:{lineno} compares against the wrong evening edge — the window \
+             closes at {STOP_IST_HOUR}:{STOP_IST_MINUTE:02} IST, so this must read \
+             `-le {expected}`. Line: {}",
+            line.trim()
+        );
+    }
+
+    // Belt and braces: no live line anywhere may carry the retired figure.
+    for (i, line) in wf.lines().enumerate() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        assert!(
+            !line.contains("1730"),
+            "deploy-aws.yml:{} still carries the retired 17:30 IST edge on a LIVE line. \
+             Operator Quote 37 (2026-10-21) moved the window back to 16:30. Line: {}",
+            i + 1,
+            line.trim()
+        );
+    }
 }

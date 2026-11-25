@@ -225,7 +225,7 @@ Operator-charter §A demands "common runtime dynamic scalable." Mechanical proof
 | Scalable | Bounded mpsc + ring + DLQ; aggregator O(1) per (SID, TF); papaya concurrent map for lock-free reads; arc-swap for atomic config swap; per-table DEDUP UPSERT KEYS handle any volume |
 | Automated | SessionStart hooks auto-load doctor + summary + alerts; MCP server auto-exposes logs; CloudWatch auto-routes; SNS auto-fans-out to 4 channels; EventBridge auto-starts/stops |
 | Real-time | Per-tick 250 ns aggregator; CloudWatch metric scrape every 60s; CloudWatch alarm evaluation every 60s; SNS delivery sub-second |
-| O(1) latency | Bench-gated p99 ≤100 ns per indicator update; DHAT zero-alloc hot path; `quality/benchmark-budgets.toml` 5% regression gate |
+| O(1) latency | Bench-gated p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤100 ns per indicator update; DHAT zero-alloc hot path; `quality/benchmark-budgets.toml` 5% regression gate |
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11; DEDUP UPSERT KEYS on every storage table; `dedup_segment_meta_guard.rs` ratchet |
 | Common-runtime invariant | `crates/storage/tests/operator_health_dashboard_guard.rs` and similar ratchets enforce Mac=AWS parity |
 

@@ -110,7 +110,7 @@ SHIFTED toward 24; both readings are recorded and NEITHER is asserted as wire tr
 **UNVERIFIED-LIVE both ways, zero runtime impact** (depth WebSockets are FORBIDDEN FOREVER
 per `websocket-connection-scope-lock.md`; any currently-banned future depth work MUST
 live-probe before trusting either value). Code follow-up (comment-only, separate PR): the
-`constants.rs:395` "There is NO code 24" claim is now cross-surface-contested.
+`constants.rs:395` "There is NO code 24" claim is now cross-surface-contested. *(⚠ SETTLED LIVE 2026-09-10 — 25 ignored, 24 ships; see the end-of-file note.)*
 
 ### (c) Smaller classic-surface deltas (2026-07-14, Verified-live)
 
@@ -216,9 +216,9 @@ impl ExchangeSegment {
 | `21` | Subscribe — Full Packet        |
 | `22` | Unsubscribe — Full Packet      |
 | `23` | Subscribe — Full Market Depth  |
-| `25` | Unsubscribe — Full Market Depth|
+| `24` | Unsubscribe — Full Market Depth (classic surface; **LIVE-VERIFIED 2026-09-10: 25 is IGNORED** — see the end-of-file note) |
 
-> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe, but the correct code per this annexure is `25`. Our code uses `25`.
+> **SDK Note**: Python SDK `marketfeed.py` defines `Depth = 19` as a v1-only depth subscribe code (standalone market depth packet). This is deprecated in v2 and NOT listed above. The SDK rejects it for v2 subscriptions. Also note: the SDK's generic unsubscribe logic (`subscribe_code + 1`) produces code `24` for depth unsubscribe. **Until 2026-09-10 this note said the correct code was `25` and that our code used `25`; the live wire ignored every code-25 unsubscribe on 2026-09-10, and our code now sends `24`** (end-of-file note).
 
 ---
 
@@ -396,6 +396,8 @@ let utc_epoch = ltt as i64 - 19800;
 
 > Dhan v1 Historical Data used custom epoch from Jan 1, 1980 IST — v2 uses standard UNIX epoch for REST, IST epoch for WebSocket.
 
+> **⚠ CHANGED BY DHAN 2026-11-20 (Verified, Dhan support ticket #6684672, 21 Nov 2026):** the Live Market Feed LTT changed from IST-based to UTC-based epoch effective 20 Nov 2026, before the market opened, "part of an API restructuring exercise ... to standardise the timestamp format across all API endpoints", and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". From a frame receipt of 2026-11-20 00:00 IST, WebSocket LTT is standard UNIX epoch like §12a (IST = raw + 19,800 s); earlier receipts are IST epoch as written in this section, which is kept as the original documentation. tickvault rule: `websocket-connection-scope-lock.md` §"2026-11-21".
+
 ---
 
 ## 13. Conditional Trigger Enums
@@ -440,3 +442,27 @@ Others: `RSI_14`, `ATR_14`, `STOCHASTIC`, `STOCHRSI_14`, `MACD_26`, `MACD_12`, `
 | `CANCELLED` | Alert cancelled       |
 
 > **Note**: Conditional trigger order sub-objects use `discQuantity` (abbreviated), while regular orders use `disclosedQuantity`. Use the exact field name for each endpoint.
+
+---
+
+## 2026-09-10 — LIVE VERDICT: Unsubscribe Full Market Depth is **24**; code 25 is IGNORED by Dhan
+
+> **⚠ SUPERSEDED (recorded 2026-10-06).** The code went back to **25** after the next day's session measured the same ghost shape on code 24 (`websocket-connection-scope-lock.md`, 2026-09-11 measurements and §"2026-09-12 — THE TWO-ARMED UNSUBSCRIBE PROBE: code 25 CONFIRMED"). Dhan's 2026-09-30 reply states RequestCode 25 unsubscribes one instrument (`docs/dhan-support/2026-09-13-depth-unsubscribe-ignored.md`). The code sends 25 (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`). This section is kept as the 2026-09-10 record.
+
+§(b) above recorded the 24-vs-25 split as "UNVERIFIED-LIVE both ways" and said
+any future depth work "MUST live-probe before trusting either value". The probe
+ran on 2026-09-10, the first session with the ghost-instrument family seeded, and
+with `25` on every unsubscribe frame:
+
+| Reading, 09:16–09:46 IST | Value |
+|---|---:|
+| `unsubscribe_ignored` events (a dropped contract still streaming past the 90 s grace) | **20** |
+| ghost redials armed | **10** |
+| distinct instruments streaming depth-200 on the 5 single-instrument sockets | **8** |
+
+Dhan honoured none of them. `24` — the classic-surface value and the SDK's own
+`subscribe_code + 1` — ships from 2026-09-10 (`FEED_UNSUBSCRIBE_TWENTY_DEPTH`).
+**24 is itself unverified until a session reads `ghost = 0` with
+`unsubscribed_grace > 0`**; the same detector is the verdict instrument. Dated
+record and REJECT list: `.claude/rules/project/websocket-connection-scope-lock.md`
+"2026-09-10 — THE DEPTH UNSUBSCRIBE REQUESTCODE IS SETTLED LIVE".

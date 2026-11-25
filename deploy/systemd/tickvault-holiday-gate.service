@@ -1,10 +1,11 @@
 # =============================================================================
 # tickvault-holiday-gate — boot-time NSE-holiday self-stop gate
 # =============================================================================
-# Runs ONCE per boot, ORDERED BEFORE tickvault.service. Asks the app binary
-# `--check-trading-day` (single source of truth: config/base.toml NSE holiday
-# list) and self-stops the instance on a non-trading day so the EventBridge
-# Mon-Fri start cron never bills a full no-op day on an NSE weekday holiday.
+# Runs ONCE per boot, ORDERED BEFORE tickvault.service. The app binary
+# (`tickvault-host holiday-gate`) checks the trading day in-process (single
+# source of truth: config/base.toml NSE holiday list) and self-stops the
+# instance on a non-trading day so the EventBridge Mon-Fri start cron never
+# bills a full no-op day on an NSE weekday holiday.
 #
 # FAIL-OPEN: stops ONLY on a definitive holiday verdict; every uncertainty
 # (missing binary, config error, IMDS failure) lets the app start. A separate
@@ -33,10 +34,21 @@ RemainAfterExit=yes
 User=ec2-user
 Group=ec2-user
 WorkingDirectory=/opt/tickvault
-ExecStart=/opt/tickvault/repo/deploy/aws/holiday-gate.sh
+# The gate was a shell script until 2026-10-01 (audit D6c); it is now a
+# subcommand of the app binary, run from its root-owned copy `bin/tickvault-host`
+# (see tickvault-host-tuning.service for why never `bin/tickvault`: the deploy
+# rollback restores that one, and a binary from before the port would ignore the
+# subcommand and boot the whole trading app here). The leading `-` keeps the
+# fail-open default: a missing copy (a new instance before its first deploy)
+# lets the app start, exactly as the script did when the binary was absent.
+ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate
 # A holiday verdict returns exit 1 (instance stop issued); that is an expected,
 # non-error outcome for this gate, so do not let it fail the boot transaction.
 SuccessExitStatus=0 1
+# A oneshot has no start timeout by default and tickvault.service is ordered
+# after this unit, so a hung AWS call would keep the app down. Every call inside
+# has its own 5 s (metadata) or 30 s (AWS) limit; this is the outer bound.
+TimeoutStartSec=300
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tickvault-holiday-gate

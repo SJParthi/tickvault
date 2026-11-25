@@ -92,7 +92,9 @@ fn autopilot_still_self_heals_enabled_but_inactive_unit() {
 
 /// Section D (BP-09, 2026-07-01) — the self-heal restart MUST `reset-failed`
 /// BEFORE it starts the unit. `deploy/systemd/tickvault.service` sets
-/// StartLimitBurst=8 / StartLimitIntervalSec=600, so after > 8 restarts in 10
+/// StartLimitBurst=5 / StartLimitIntervalSec=3600 (widened 2026-09-03 — the
+/// old 8-in-10-minutes pair could not see a cycle slower than 75s, and the
+/// loop that happened ran on ~9-minute cycles), so after > 5 restarts in 60
 /// min systemd flips the unit to `failed` and a bare `systemctl restart`/`start`
 /// returns "Start request repeated too quickly" and is a NO-OP until the
 /// start-limit counter is cleared with `systemctl reset-failed`. Without this,
@@ -105,7 +107,7 @@ fn autopilot_resets_failed_before_start_to_recover_crash_loop() {
     assert!(
         body.contains("reset-failed tickvault"),
         "aws-autopilot.sh must `systemctl reset-failed tickvault` before starting \
-         the unit, or a StartLimit-`failed` crash-loop (StartLimitBurst=8 in \
+         the unit, or a StartLimit-`failed` crash-loop (StartLimitBurst in \
          tickvault.service) cannot be recovered — a bare restart/start on a \
          `failed` unit is a no-op (BP-09)"
     );

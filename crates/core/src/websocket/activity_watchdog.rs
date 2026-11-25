@@ -28,8 +28,13 @@
 //!   the task on disconnect and respawns before the next `run_read_loop`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+// `crate::sync` (audit H3): the std `AtomicU64` in a normal build, loom's
+// under the crate's `loom` feature, so `tests/loom_activity_watchdog.rs`
+// drives the real `note_activity` / `ProgressProbe` through every interleaving.
+use crate::sync::AtomicU64;
 
 use tickvault_common::market_hours::is_within_trading_session_ist;
 use tokio::sync::Notify;
@@ -127,10 +132,9 @@ pub const WATCHDOG_THRESHOLD_VIX_SECS: u64 = 30;
 /// - `1800s` (2026-04-21) still fired every 30 min on idle accounts →
 ///   Telegram shows 4+ reconnects every trading morning with zero orders
 ///   (observed 2026-04-23 09:10 / 09:40 / 10:10 / 10:40).
-/// - `14400s` (2026-04-22) = 4 hours. Longer than any realistic in-market
-///   idle window (market hours are 6.5h total 09:15-15:30, but order
-///   update only goes silent when NO orders flow — still capped by
-///   truly-dead-socket detection via the read loop's `Err(..)` branch).
+/// - `14400s` (2026-04-22) = 4 hours. A quiet account can exceed this
+///   interval while its socket remains healthy. The order reader now probes
+///   with a bounded Ping/Pong exchange before reconnecting for idle expiry.
 pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 
 /// Watchdog threshold for depth WebSocket connections in DEFERRED mode
@@ -156,6 +160,60 @@ pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 /// instruments for depth-20).
 pub const WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS: u64 = 14400;
 
+/// Records one inbound frame on a connection's activity counter.
+///
+/// The read loop's only write to the counter, once per `Some(Ok(_))` frame:
+/// one relaxed `fetch_add`, O(1), no allocation. Relaxed is enough because
+/// the watchdog asks only "did the counter move", never what else the reader
+/// wrote; coherence on one atomic already forbids it from seeing the counter
+/// go backwards. Driven under loom by `tests/loom_activity_watchdog.rs`.
+#[inline]
+pub fn note_activity(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The watchdog's per-poll progress decision, kept apart from its timer so
+/// the loom lane can drive the exact code [`ActivityWatchdog::run`] runs.
+///
+/// Holds the last counter value the watchdog saw. [`Self::advanced`] reads the
+/// counter once and catches up to it in one step, however many frames
+/// arrived since the last poll, so a later poll never reports progress for
+/// frames an earlier poll already counted. Copy, two words, O(1), no
+/// allocation. Hidden from docs: public only for the loom test.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProgressProbe {
+    last_seen: u64,
+}
+
+impl ProgressProbe {
+    /// A probe that has seen the counter's current value.
+    #[must_use]
+    pub fn start(counter: &AtomicU64) -> Self {
+        Self {
+            last_seen: counter.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `true` when the counter moved since the previous poll (or since
+    /// [`Self::start`]), in which case the probe now holds the new value.
+    #[must_use]
+    pub fn advanced(&mut self, counter: &AtomicU64) -> bool {
+        let current = counter.load(Ordering::Relaxed);
+        if current == self.last_seen {
+            return false;
+        }
+        self.last_seen = current;
+        true
+    }
+
+    /// The last counter value this probe saw.
+    #[must_use]
+    pub const fn last_seen(&self) -> u64 {
+        self.last_seen
+    }
+}
+
 /// Per-connection activity watchdog.
 ///
 /// Construct with [`ActivityWatchdog::new`], share the [`Arc<AtomicU64>`]
@@ -177,6 +235,8 @@ pub struct ActivityWatchdog {
     /// When the watchdog fires, it calls `notify_one`; the read loop then
     /// returns `Err(WatchdogFired)`.
     notify: Arc<Notify>,
+    /// The owner will probe liveness before classifying an idle socket as failed.
+    probe_before_reconnect: bool,
 }
 
 impl ActivityWatchdog {
@@ -194,7 +254,15 @@ impl ActivityWatchdog {
             counter,
             threshold,
             notify,
+            probe_before_reconnect: false,
         }
+    }
+
+    /// Notify the owner to perform a bounded liveness probe before emitting
+    /// a reconnect failure. Other watchdog users retain immediate diagnosis.
+    pub(crate) const fn with_liveness_probe(mut self) -> Self {
+        self.probe_before_reconnect = true;
+        self
     }
 
     /// Runs the watchdog loop until either the counter goes stale for
@@ -204,7 +272,7 @@ impl ActivityWatchdog {
     // TEST-EXEMPT: covered by watchdog_does_not_fire_when_counter_advances, watchdog_fires_on_sustained_silence_past_threshold, watchdog_resets_on_late_activity — hook name-matcher doesn't pick up behaviour-named tests
     pub async fn run(self) {
         let poll = Duration::from_secs(WATCHDOG_POLL_INTERVAL_SECS);
-        let mut last_counter = self.counter.load(Ordering::Relaxed);
+        let mut probe = ProgressProbe::start(&self.counter);
         let mut last_advance = Instant::now();
         let mut ticker = tokio::time::interval(poll);
         // Skip missed ticks so long stalls (e.g. during a stop-the-world
@@ -217,9 +285,7 @@ impl ActivityWatchdog {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            let current = self.counter.load(Ordering::Relaxed);
-            if current != last_counter {
-                last_counter = current;
+            if probe.advanced(&self.counter) {
                 last_advance = Instant::now();
                 continue;
             }
@@ -242,7 +308,13 @@ impl ActivityWatchdog {
                 // (weekday + market-hours) so Saturday/Sunday boots no
                 // longer false-page on Dhan-server idle TCP resets.
                 if is_within_trading_session_ist() {
+                    if self.probe_before_reconnect {
+                        self.notify.notify_one();
+                        return;
+                    }
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                        source = "activity_watchdog_fired",
                         label = %self.label,
                         threshold_secs = self.threshold.as_secs(),
                         silent_secs = silent_for.as_secs(),
@@ -311,10 +383,21 @@ impl ActivityWatchdog {
 /// the caller exactly as before. Panics in the watchdog no longer leave
 /// the read loop stuck.
 ///
+/// **CORRECTED 2026-10-12 (deep audit CR-4):** the two paragraphs above hold
+/// only in dev and test builds. The release profile sets `panic = "abort"`
+/// (root `Cargo.toml`), so a watchdog panic in release ends the whole process:
+/// `catch_unwind` never returns and the notify-on-panic arm never runs. What
+/// recovers release is the panic hook in `main.rs` (one synchronous log line
+/// and a bounded drain) followed by the systemd restart and the WAL replay.
+/// The same correction was made for the frame-log writer (Z11b,
+/// `ws_frame_spill.rs`).
+///
 /// # Testing
 /// Covered by `test_spawn_with_panic_notify_fires_notify_on_panic` —
 /// spawns a future that panics immediately, awaits `notify.notified()`
 /// with a 500ms timeout, and asserts the notify fires.
+/// That test proves the unwinding build only; it cannot run under
+/// `panic = "abort"`.
 /// Builds a heartbeat gauge handle for a single WebSocket connection.
 ///
 /// # Why this helper exists (ZL-P0-1)
@@ -362,6 +445,8 @@ pub fn spawn_with_panic_notify(watchdog: ActivityWatchdog) -> tokio::task::JoinH
     let label = watchdog.label.clone();
     tokio::spawn(async move {
         use futures_util::FutureExt as _;
+        // Reachable only under unwinding (dev/test). Release aborts on panic
+        // (`panic = "abort"`), so there the process ends instead (CR-4).
         let result = std::panic::AssertUnwindSafe(watchdog.run())
             .catch_unwind()
             .await;
@@ -374,6 +459,8 @@ pub fn spawn_with_panic_notify(watchdog: ActivityWatchdog) -> tokio::task::JoinH
                 .or_else(|| panic_payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic payload>");
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "activity_watchdog_panicked",
                 label = %label,
                 panic = %panic_msg,
                 "CRITICAL: WS activity watchdog task PANICKED — firing \
@@ -412,6 +499,48 @@ mod tests {
         );
         let handle = tokio::spawn(watchdog.run());
         (handle, counter, notify)
+    }
+
+    #[test]
+    fn test_note_activity_bumps_the_counter_by_exactly_one() {
+        let counter = AtomicU64::new(41);
+        note_activity(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 42);
+    }
+
+    #[test]
+    fn test_progress_probe_start_holds_the_current_value() {
+        let counter = AtomicU64::new(7);
+        let probe = ProgressProbe::start(&counter);
+        assert_eq!(probe.last_seen(), 7);
+    }
+
+    /// Several frames between two polls count as ONE advance, and the next
+    /// poll with no new frame reports none: the probe catches up in one step.
+    #[test]
+    fn test_progress_probe_advanced_catches_up_in_one_step() {
+        let counter = AtomicU64::new(0);
+        let mut probe = ProgressProbe::start(&counter);
+        assert!(!probe.advanced(&counter), "no frame, no progress");
+        note_activity(&counter);
+        note_activity(&counter);
+        note_activity(&counter);
+        assert!(probe.advanced(&counter));
+        assert_eq!(probe.last_seen(), 3);
+        assert!(
+            !probe.advanced(&counter),
+            "frames already counted must not read as progress again"
+        );
+    }
+
+    /// The counter wraps at `u64::MAX`; a wrapped value is still a change.
+    #[test]
+    fn test_progress_probe_last_seen_follows_a_wrapping_counter() {
+        let counter = AtomicU64::new(u64::MAX);
+        let mut probe = ProgressProbe::start(&counter);
+        note_activity(&counter);
+        assert!(probe.advanced(&counter));
+        assert_eq!(probe.last_seen(), 0);
     }
 
     #[tokio::test(start_paused = true)]

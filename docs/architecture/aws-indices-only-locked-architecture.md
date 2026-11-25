@@ -1,5 +1,7 @@
 # AWS Indices-Only Architecture — LOCKED 2026-05-18
 
+> **⚠ §5 RE-SUPERSEDED → r8g.large + MULTI-AZ 2026-10-21 (operator Quotes 32/33 in [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md) §0/§7):** instance DOWNSIZED r8g.xlarge → **r8g.large** (Graviton4, 2 vCPU / 16 GiB) on the 2026-10-22 rebuild, which also replaces the 600 GB root with a fresh **150 GB** gp3 volume (3,000 IOPS, 125 MiB/s); the multi-AZ shape is kept. Memory is retuned for 16 GiB by `tickvault host-tuning` (QuestDB 4/10 of RAM, the app's `MemoryHigh` lowered by a drop-in, QuestDB's cpuset narrowed to the two cores). About $70–75 a month is the owner's estimate, not a cap. The current effective instance lock lives in that file's §7.
+
 > **⚠ §5 SUPERSEDED 2026-05-27 by [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md):** instance upgraded t4g.medium → t4g.large (8 GiB), bill ~₹1,022/mo → ~₹1,514/mo, cron 08:00 → 08:30 IST, universe 4 IDX_I → ~250 daily-fetched SIDs (all NSE indices + 1 BSE SENSEX + unique F&O underlyings, all Quote mode). Other sections retain 2026-05-18 lock.
 >
 > **⚠ §5 FURTHER SUPERSEDED → r8g.large 16 GiB 2026-06-30 (operator Quote 7 in [`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`](../../.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md) §7):** instance upgraded m8g.large → **r8g.large** (Graviton4, 2 vCPU / **16 GiB**, memory-optimized — DOUBLED RAM), bill → ~₹2,919/mo incl GST (270 hrs, 30 GB EBS, +EIP kept; r8g.large @ $0.08258/hr). Host memory budget recomputed for 16 GiB (~8.2 GB used, ~7.8 GB headroom at the current ~250–1000-SID universe). EIP kept because a stop/modify/start instance-type flip leaves no ephemeral public IP. The current effective instance lock lives in that file's §7; the t4g.medium spec table below is 2026-05-18 historical audit only.
@@ -399,7 +401,7 @@ The operator demanded these are NEVER compromised. Checking at 4-SID scope:
 > - Zero data loss bounded by the 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ _(2026-07-18: the 100K tick rescue ring was deleted with the dead tick writer, stage-4 sweep — the seal chain is the live absorption tier)_.
 > - WebSocket detect-and-reconnect ≤5s; sleep-until-open post-close; SubscribeRxGuard preserves subscriptions across reconnects.
 > - QuestDB outage absorbed up to ring capacity; CloudWatch alarm fires within 30s of disconnect; operator paged via SMS+Telegram+Email simultaneously.
-> - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99.
+> - Hot path O(1) per yata indicator update; bench-gated ≤100ns p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured).
 > - Composite (security_id, exchange_segment) uniqueness preserved (degenerate at 4 IDX_I SIDs but invariant holds).
 > - CloudWatch detection latency ≤60s for all 12 worst-case scenarios in `aws-daily-lifecycle.md` §3.
 > - AWS ap-south-1 99.99% regional SLA = ~4.3 minutes/month expected downtime envelope.
@@ -796,7 +798,7 @@ Per operator-charter §F honest envelope:
 When the BRUTEX work lands, add these tests:
 
 1. `crates/trading/tests/strategy_load_ratchet.rs` — measures total RAM with 20 mock strategies; fails build if > 5 MB
-2. `crates/trading/benches/strategy_eval_p99.rs` — Criterion bench; per-eval p99 ≤ 100 µs; fails build at >5% regression
+2. `crates/trading/benches/strategy_eval_p99.rs` — Criterion bench; per-eval p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤ 100 µs; fails build at >5% regression
 3. `crates/storage/tests/cpu_credit_budget_alarm_guard.rs` — pins the `tv-cpu-credit-low` CloudWatch alarm name + threshold (=50)
 
 ---

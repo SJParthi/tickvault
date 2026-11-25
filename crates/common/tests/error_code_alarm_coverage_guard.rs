@@ -99,10 +99,9 @@ fn strip_hcl_comments(src: &str) -> String {
                 escaped = true;
             } else if c == b'"' {
                 in_str = !in_str;
-            } else if !in_str && c == b'#' {
-                cut = i;
-                break;
-            } else if !in_str && c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            } else if !in_str
+                && (c == b'#' || (c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/'))
+            {
                 cut = i;
                 break;
             }
@@ -123,15 +122,43 @@ fn strip_hcl_comments(src: &str) -> String {
 /// recognised, so a structural parser tuned to today's two would be the fragile
 /// choice here.
 fn alarmed_codes() -> BTreeSet<&'static str> {
-    let tf = strip_hcl_comments(&read(ALARM_TF));
+    alarmed_codes_in(&read(ALARM_TF))
+}
+
+/// The pure half of `alarmed_codes`, split out 2026-09-16 so the
+/// desc-vs-pattern distinction can be bite-tested directly instead of
+/// depending on a live example happening to exist in the terraform. See
+/// `only_a_filter_pattern_counts_as_alarmed_never_a_mention_in_prose`.
+fn alarmed_codes_in(tf_raw: &str) -> BTreeSet<&'static str> {
+    let tf = strip_hcl_comments(tf_raw);
+    // ONLY a filter `pattern` alarms a code. Scanning the whole file counted a
+    // code merely NAMED in another alarm's free-text `desc` as covered.
+    //
+    // That is not hypothetical. `DH-902` (Critical, live emit site at
+    // `oms/engine.rs::engage_halt`, and NOT on the exempt list below) read as
+    // alarmed for months on the strength of one substring inside CHAIN-01's
+    // description: "DH-902/806 class". The old delimiter check accepted it
+    // because the next byte is `/` — neither alphanumeric nor `-`.
+    //
+    // The failure direction is the one this guard exists to prevent: it
+    // reported coverage that does not exist, so the code was neither alarmed
+    // NOR forced onto the exempt list where a human would have had to write
+    // down why. Narrowing the haystack to `pattern` lines is what makes the
+    // guard's own claim true.
+    let haystack: String = tf
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("pattern"))
+        .collect::<Vec<_>>()
+        .join("\n");
     ErrorCode::all()
         .iter()
         .map(|c| c.code_str())
         .filter(|code| {
             // Require the code to be delimited, so `CHAIN-01` does not match
             // inside a hypothetical `CHAIN-011`.
-            tf.match_indices(*code).any(|(idx, _)| {
-                let after = tf.as_bytes().get(idx + code.len()).copied();
+            haystack.match_indices(*code).any(|(idx, _)| {
+                let after = haystack.as_bytes().get(idx + code.len()).copied();
                 !matches!(after, Some(b) if b.is_ascii_alphanumeric() || b == b'-')
             })
         })
@@ -196,6 +223,36 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     // real merge: had the entries survived, a later removal of those four
     // alarms would have passed silently — the exact failure mode the test was
     // written to prevent, arrived at by accident rather than intent.
+    //
+    // ADDED 2026-09-03 — and this is an addition to a shrink-only list, so it
+    // needs its reason stated rather than assumed.
+    //
+    // DH-902 is NOT a new code and its coverage did not change. It has been
+    // uncovered since the seed and was MISCOUNTED as alarmed, because
+    // `alarmed_codes()` scanned the whole terraform file and the string
+    // "DH-902/806 class" appears inside CHAIN-01's free-text `desc`. Narrowing
+    // that matcher to `pattern` lines (same commit) is what surfaced it. So
+    // this entry corrects the 2026-08-10 seed; it does not widen the exemption.
+    //
+    // Why log-sink-only is the RIGHT answer here, not a shrug: DH-902's OMS
+    // emit site is `engine.rs::halt_with_alert`, which fires
+    // `OmsAlert::OmsHalted` — and `order_runtime.rs`'s sink matches that
+    // variant and deliberately routes NOTHING, with the contract named in its
+    // own comment (`order-readiness-error-codes.md` §3 + the Dhan noise lock
+    // §2: no Telegram family row exists for the cluster-F alerts, and adding
+    // one would be an unauthorized new Dhan page class). Its cluster-F siblings
+    // DH-903, DH-904, DATA-805 and ORDER-READY-01 are all already on this list
+    // for exactly that reason — DH-902 is the one the substring bug hid.
+    //
+    // Also already covered where it is reachable today: the option-chain leg's
+    // DH-902 entitlement class pages via the CHAIN-01 alarm, whose description
+    // is the very string that caused the false positive.
+    //
+    // What would change this: authorizing live order fire. The OMS is
+    // paper-only (`dry_run: true` hardcoded, sole setter `#[cfg(test)]`), so a
+    // halt today stops a simulated order path. A live-fire enable needs its own
+    // dated quote in the noise lock, and that same quote should give this code
+    // a real alarm.
     "AGGREGATOR-LAG-01",
     "AGGREGATOR-LATE-01",
     "AUTH-GAP-01",
@@ -204,16 +261,14 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "BAR-MISMATCH-02",
     "BAR-MISMATCH-03",
     "BOOT-01",
-    "BRUTEX-XVERIFY-01",
-    "BRUTEX-XVERIFY-02",
-    "CADENCE-01",
-    "CADENCE-02",
-    "CHAIN-03",
+    // CADENCE-01/02/03/05 RETIRED 2026-09-16 with crates/core/src/cadence/.
+    // CHAIN-01..04 RETIRED 2026-09-16 with the per-minute option-chain REST leg.
     "DATA-805",
     "DATA-807",
     "DATA-808",
     "DATA-809",
     "DATA-810",
+    "DH-902",
     "DH-903",
     "DH-904",
     "DH-905",
@@ -225,32 +280,6 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "FOLD-01",
     "FUTIDX-01",
     "FUTIDX-02",
-    "GROWW-MARG-01",
-    "GROWW-MARG-02",
-    "GROWW-MARG-03",
-    "GROWW-MARG-04",
-    "GROWW-OCO-01",
-    "GROWW-OCO-02",
-    "GROWW-OCO-03",
-    "GROWW-OCO-05",
-    "GROWW-ORD-01",
-    "GROWW-ORD-02",
-    "GROWW-ORD-03",
-    "GROWW-ORD-04",
-    "GROWW-ORD-06",
-    "GROWW-ORD-09",
-    "GROWW-ORD-10",
-    "GROWW-PORT-01",
-    "GROWW-PORT-02",
-    "GROWW-PORT-03",
-    "GROWW-PORT-04",
-    "GROWW-PUSH-01",
-    "GROWW-PUSH-02",
-    "GROWW-PUSH-04",
-    "GROWW-SCALE-01",
-    "GROWW-SCALE-02",
-    "GROWW-SCALE-03",
-    "GROWW-SCALE-05",
     "HTTP-CLIENT-01",
     "I-P0-03",
     "INDEX-OHLC-02",
@@ -260,27 +289,87 @@ const LOG_SINK_ONLY_EXEMPT: &[&str] = &[
     "OMS-GAP-04",
     "OMS-GAP-05",
     "ORDER-EVT-01",
+    // ORDER-EVT-02 is log-sink-only because the Dhan noise lock says so, not
+    // because a hollow decode is unimportant — it means order data is being
+    // silently discarded, which on its face is exactly what should wake
+    // someone. `dhan-rest-only-noise-lock-2026-07-14.md` §1 fixes the Dhan
+    // Telegram family at four items and §3 makes any new Dhan-scoped page a
+    // REJECT without a fresh dated operator quote, so an alarm here is not
+    // this change's to make. Its sibling ORDER-EVT-01 sits in this list for
+    // the same reason. The operator surface is the coded log line, whose
+    // `excerpt` field carries the raw frame — that excerpt, not the page, is
+    // what makes the next occurrence fixable.
+    "ORDER-EVT-02",
     "ORDER-PNL-01",
     "ORDER-READY-01",
     "ORPHAN-POSITION-01",
     "PREVCLOSE-03",
+    // DHAN-LIVE-XVERIFY-01 RESTORED 2026-09-24 (no-rest-except-live-feed-
+    // 2026-06-27.md §12.15) as LOG-SINK-ONLY, exactly as it was before its
+    // 2026-09-16 retirement. The verdicts that page are the three
+    // ws-gap-03-xverify-{vacuous,failed,diverged} filters (noise lock §2.5);
+    // this code marks a degraded RUN (client build, query or flush failure),
+    // whose day then stays unverified and holds its S3 archive — the hold is
+    // what the operator sees, so a second page for the same run is not added.
+    "DHAN-LIVE-XVERIFY-01",
     "RAMSTORE-01",
     "RESILIENCE-01",
     "RESILIENCE-03",
     "RESOURCE-01",
-    "RESOURCE-02",
+    // RESOURCE-02 LEFT this list 2026-09-02 (second-sweep finding 5): it is
+    // now a `"resource-02"` entry in error-code-alarms.tf, paired with the
+    // MemoryHigh=15G ceiling the systemd unit gained the same day — the page
+    // could not reach its 80% line while the unit set no memory directive
+    // (the resolver fell back to MemTotal). Dated row: noise-lock §2.3p.
     "RESOURCE-03",
     "RISK-GAP-01",
     "RISK-GAP-02",
     "SELFTEST-02",
-    "SPOT-XVERIFY-01",
-    "SPOT-XVERIFY-02",
     "SPOT1M-02",
+    // TICK-SPILL-01 is log-sink-only, and unlike most entries here that is
+    // a comfortable call rather than a constrained one. By the time it fires
+    // the file is already quarantined and the backlog is already draining —
+    // the condition it reports is one the system has just handled, not one
+    // waiting on a human. What needs a human is the salvage, which is not
+    // urgent: the rows are on disk and the dedup key makes the re-post
+    // repeatable whenever the operator gets to it. The urgent half of this
+    // story — the flush that failed in the first place — already pages via
+    // HOT-PATH-02 and the dhan_ticks_dropped alarm.
+    "TICK-SPILL-01",
+    // ADDED 2026-10-26 (plan item K4), an addition to a shrink-only list, so
+    // the reason: TICK-CONSERVE-01 is the daily ticks conservation verdict,
+    // written once a day after 15:40 IST into `tick_conservation_audit`. The
+    // task brief and `dhan-rest-only-noise-lock-2026-07-14.md` §3 make it log
+    // only: a new Dhan-scoped page needs a dated quote in that file first.
+    // The losses it can expose already page on their own counters
+    // (`dhan_ticks_dropped`, HOT-PATH-02, WS-SPILL-01/-02).
+    "TICK-CONSERVE-01",
+    // ADDED 2026-10-28 (owner: "go ahead and add the daily expiry check"), an
+    // addition to a shrink-only list, so the reason: EXPIRY-SCOPE-01 is a scope
+    // verdict (the attach refused an off-expiry contract, or the daily check
+    // found one stored). The task brief and the Dhan noise lock §3 make it log
+    // only; a page needs a dated quote there first. The refusal itself already
+    // keeps the wrong contract off the wire.
+    "EXPIRY-SCOPE-01",
+    // ADDED 2026-11-12 (plan item LF-7), an addition to a shrink-only list, so
+    // the reason: LIVE-FILL-02 is the daily paper fill calibration verdict (a
+    // paper fill outside the worst case re-priced from the stored 1 s candles).
+    // PAPER ONLY, written once a day after 15:40 IST; the noise lock §2.22 and
+    // its 2026-11-12 note allow no new page without a dated row first. The
+    // order lines are in the day's report files and the cold-bucket copy.
+    "LIVE-FILL-02",
     "TF-VERIFY-01",
     "TF-VERIFY-02",
     "TICK-FLUSH-01",
-    "VOLUME-MONO-01",
+    // VOLUME-MONO-01 left this list on 2026-10-22: its variant is retired
+    // with the volume leaderboard (plan item 62).
     "WS-GAP-10",
+    // 2026-11-11, operator Quote 53 alarm review (docs/audits/2026-11-alarm-review.md):
+    // these three lost their CloudWatch filter and alarm, each with a review
+    // row naming what still covers it. Their coded log lines are unchanged.
+    "DH-906",
+    "RESOURCE-02",
+    "WAL-SUSPEND-01",
     // WS-SPILL-01 left this list on 2026-08-12 — it is now ALARMED
     // (`deploy/aws/terraform/error-code-alarms.tf`, entry "ws-spill-01").
     // Its sibling WS-SPILL-02 had been alarmed since 2026-08-11 while the
@@ -397,10 +486,42 @@ so in a dated rule-file note and lower this floor deliberately. Found: {alarmed:
         alarmed.len()
     );
 
+    // 2026-08-21: floor lowered 100 -> 81 -> 74 DELIBERATELY. The entire
+    // Groww feed was ordered removed (websocket-connection-scope-lock.md,
+    // "2026-08-21 (THIRD quote of the day)"). First the 28 order-side
+    // variants whose only emit sites lived in crates/trading/src/oms/groww/**
+    // were RETIRED — 21 of them High/Critical (100 -> 81). Then the two
+    // Groww-scoped cross-broker comparators went, taking BRUTEX-XVERIFY-01/02
+    // and SPOT-XVERIFY-01/02 with them, while the SURVIVING live-vs-REST
+    // comparator gained DHAN-LIVE-XVERIFY-01 (81 -> 74, net -7 across the
+    // whole sweep).
+    //
+    // This is a real drop in what CAN page, recorded rather than absorbed: no
+    // surviving code was re-graded downward, and every retired variant ceased
+    // to exist along with the machinery it described.
+    // 2026-09-16: floor lowered 74 -> 68 DELIBERATELY, on the same reasoning
+    // and by the same mechanism as the 2026-08-21 drop above. The operator
+    // ordered the per-minute market-data REST legs and the 15:41 accuracy
+    // check removed ("Bro just remove per minute price falls and 3.41 pm
+    // accuracy check alone dude okay"), so ten ErrorCode variants lost every
+    // emit site they had and were RETIRED: SPOT1M-01, CHAIN-01..04,
+    // CADENCE-01/02/03/05 and DHAN-LIVE-XVERIFY-01. EIGHT of the ten were
+    // High; CADENCE-03 and CADENCE-05 were Medium and do not move this count.
+    //
+    // MEASURED, not inferred: the live count before the change was 76, i.e.
+    // the 74 floor already carried two of slack, and 76 - 8 = 68. No
+    // surviving code was re-graded downward, and every retired variant ceased
+    // to exist along with the machinery it described.
+    //
+    // SPOT1M-02 SURVIVES and is deliberately not in that list: its remaining
+    // emitter is the per-contract 1m writer, which the directive did not
+    // touch. It is also the one that nearly went by mistake — its four emit
+    // sites write the literal code string, never the variant, so a grep for
+    // the variant name reads identically to a genuinely dead code.
     let hc = high_or_critical();
     assert!(
-        hc.len() >= 100,
-        "only {} High/Critical variants seen; 102 existed on 2026-08-10. Either \
+        hc.len() >= 68,
+        "only {} High/Critical variants seen; 68 existed on 2026-09-16. Either \
 ErrorCode::all() has shrunk or severity() was re-graded downward — both change \
 what pages an operator and neither should happen silently",
         hc.len()
@@ -428,5 +549,88 @@ fn comment_stripper_does_not_cut_inside_a_pattern_string() {
     assert!(
         out.contains("DH-901"),
         "stripper destroyed the code token: {out}"
+    );
+}
+
+#[test]
+fn only_a_filter_pattern_counts_as_alarmed_never_a_mention_in_prose() {
+    // The bug this pins, found 2026-09-03: `alarmed_codes()` scanned the WHOLE
+    // comment-stripped file, so a code merely NAMED in another alarm's
+    // free-text `desc` counted as covered. DH-902 (Critical, live emit site,
+    // absent from LOG_SINK_ONLY_EXEMPT) read as alarmed for months on the
+    // strength of "DH-902/806 class" inside CHAIN-01's description.
+    //
+    // Bite-tested in BOTH directions against the REAL terraform, because a
+    // fixture would only prove the matcher parses a string I wrote. The
+    // negative half is the one that regresses silently.
+    let alarmed = alarmed_codes();
+
+    // Positive: DH-901 has a genuine `pattern` and must still count. Without
+    // this, "match nothing" would pass the negative half trivially.
+    assert!(
+        alarmed.contains("DH-901"),
+        "DH-901 has a real filter pattern in {ALARM_TF} but was not counted as \
+         alarmed — the matcher is now too narrow and every code reads as \
+         uncovered, which is a false ALARM storm rather than a false OK"
+    );
+
+    // Negative half. Until 2026-09-16 this asserted against a LIVE example:
+    // DH-902 appeared in the file only inside CHAIN-01's description, so the
+    // real terraform proved the distinction by itself. That example is GONE —
+    // CHAIN-01 was retired with the per-minute option-chain REST leg under the
+    // operator's sockets-only directive, and its `desc` was the last prose-only
+    // mention of any code in the file. MEASURED the same day: zero of the 127
+    // ErrorCode strings now appear in the comment-stripped terraform without
+    // also appearing on a `pattern` line.
+    //
+    // So the test's own instruction — "re-point this at whatever code is now
+    // named in prose without its own pattern" — has nothing left to point at.
+    // Deleting it (the other option the old message named, and forbade) would
+    // drop the substring bug entirely.
+    //
+    // It is therefore re-pointed at the REAL file PLUS one planted line. The
+    // original comment argued a fixture "would only prove the matcher parses a
+    // string I wrote" — true of a fixture that replaces the corpus, and not of
+    // one that EXTENDS it: the haystack below is the live terraform verbatim,
+    // and the single added line is exactly the shape that caused the bug. This
+    // is strictly stronger than what it replaces, because it no longer depends
+    // on an incidental live instance surviving the next cleanup.
+    //
+    // SPOT1M-02 is the planted subject because it is a REAL ErrorCode with no
+    // pattern of its own, so `ErrorCode::all()` cannot filter it out and a
+    // false positive here is a genuine one.
+    const PLANTED: &str = "SPOT1M-02";
+    assert!(
+        !alarmed.contains(PLANTED),
+        "precondition gone: {PLANTED} now HAS its own filter pattern in \
+         {ALARM_TF}. Remove it from LOG_SINK_ONLY_EXEMPT and re-point this \
+         test at another real code that has none — do not delete the test"
+    );
+
+    let raw = read(ALARM_TF);
+    let with_desc_mention = format!(
+        "{raw}\n# planted\nresource \"x\" \"y\" {{\n  desc = \"see the {PLANTED} class\"\n}}\n"
+    );
+    assert!(
+        !alarmed_codes_in(&with_desc_mention).contains(PLANTED),
+        "REGRESSION: {PLANTED} was named only inside a `desc`, never in a \
+         filter `pattern`, yet alarmed_codes_in() counted it as covered. That \
+         is the exact substring bug this test exists to prevent: the guard \
+         would report paging coverage that does not exist, and the code would \
+         be neither alarmed NOR forced onto the exemption list where a human \
+         has to write down why"
+    );
+
+    // And the same planted code ON a pattern line MUST count — without this,
+    // a matcher that returns nothing would pass the negative half trivially,
+    // which is the vacuity this file has had to correct elsewhere.
+    let with_pattern = format!(
+        "{raw}\n# planted\nresource \"x\" \"y\" {{\n  pattern = \"{{ $.code = \\\"{PLANTED}\\\" }}\"\n}}\n"
+    );
+    assert!(
+        alarmed_codes_in(&with_pattern).contains(PLANTED),
+        "the matcher failed to count {PLANTED} even when planted on a real \
+         `pattern` line — it is now too narrow, and every code would read as \
+         uncovered (a false ALARM storm rather than a false OK)"
     );
 }

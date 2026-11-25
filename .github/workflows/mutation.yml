@@ -54,25 +54,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 2026-10-06 (audit H2, second half): the weekly sweep could never finish.
+  # The header above measures a full sweep as ~18-hour-class, and the job was
+  # capped at 60 minutes, so even after the unmutated-baseline fix
+  # (`--in-place`, 2026-10-04) every weekly run would be killed at the cap.
+  # The scheduled / dispatched sweep is now split into MUTATION_SHARDS
+  # parallel jobs (`cargo mutants --shard k/n`), each up to 350 minutes
+  # (GitHub's job ceiling is 360). The repository is public, so standard
+  # runner minutes are free. A push run mutates only the lines the push
+  # changed (`--in-diff`), which is what fits in 60 minutes; it was the
+  # whole crate before, and the push history records it cancelled at the cap.
   mutants:
-    name: "Mutation Testing (critical crates)"
+    name: "Mutation Testing (critical crates, shard ${{ matrix.shard }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: ${{ github.event_name == 'push' && 60 || 350 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ github.event_name == 'push' && fromJSON('[0]') || fromJSON('[0, 1, 2, 3, 4, 5, 6, 7]') }}
+    env:
+      MUTATION_SHARDS: ${{ github.event_name == 'push' && 1 || 8 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95.0"
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-mutants
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # cargo-mutants
         with:
           tool: cargo-mutants
 
@@ -86,10 +102,13 @@ jobs:
             before="${{ github.event.before }}"
             if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
               # Force-push / new branch: fall back to the last commit.
-              CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git ls-files)
-            else
-              CHANGED=$(git diff --name-only "$before" HEAD)
+              before="HEAD~1"
             fi
+            CHANGED=$(git diff --name-only "$before" HEAD)
+            # Only the changed lines are mutated on a push (see the job
+            # comment); the diff is limited to the three critical crates.
+            git diff "$before" HEAD -- crates/core crates/trading crates/common > mutants.diff
+            echo "in_diff=--in-diff mutants.diff" >> "$GITHUB_OUTPUT"
           else
             # schedule / workflow_dispatch: no diff range — full weekly
             # sweep over ALL critical crates.
@@ -124,9 +143,21 @@ jobs:
         # binary; `--test-threads` is a libtest (test binary) flag, so the
         # correct shape preserving the original intent (bound test
         # parallelism to 2 threads) is `-- -- --test-threads=2`.
+        #
+        # `--in-place` (2026-10-04): by default cargo-mutants copies the tree
+        # into a scratch directory WITHOUT `.git`, so every guard test that
+        # calls `git ls-files` (browser_surface_and_toolchain_guard and five
+        # more) failed the UNMUTATED baseline and no mutant was ever tested
+        # (runs 35579483816, 36404195621: "cargo test failed in an unmutated
+        # tree"). Mutating the CI checkout in place keeps `.git`; the checkout
+        # is disposable and the run is serial (no `-j`), which `--in-place`
+        # requires.
         run: |
           set -euo pipefail
           cargo mutants ${{ steps.changed.outputs.packages }} \
+            ${{ steps.changed.outputs.in_diff }} \
+            --shard "${{ matrix.shard }}/${MUTATION_SHARDS}" \
+            --in-place \
             --timeout=120 \
             --no-shuffle \
             -- -- --test-threads=2 \
@@ -209,8 +240,8 @@ jobs:
 
       - name: Upload mutation results
         if: always() && steps.changed.outputs.skip == 'false'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mutation-results
+          name: mutation-results-shard-${{ matrix.shard }}
           path: mutation-results.txt
           retention-days: 30

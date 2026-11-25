@@ -20,6 +20,7 @@
 //!      `BLESS_BOUNDARY=1 cargo test -p tickvault-storage \
 //!        --test operator_boundary_indicator_strategy_guard -- --nocapture`
 //!      and paste the printed manifest over `BOUNDARY_FILES`.
+//!
 //! Never re-bless without step 1 — the whole point is that touching this area is
 //! a deliberate, recorded operator decision.
 //!

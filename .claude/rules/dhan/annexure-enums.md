@@ -48,8 +48,8 @@ paths:
      `docs/dhan-ref/08-annexure-enums.md` "2026-07-14 Upstream Update".
 
 3. **FeedRequestCode — exact numeric codes.**
-   - `11`=Connect, `12`=Disconnect, `15`=SubscribeTicker, `16`=UnsubscribeTicker, `17`=SubscribeQuote, `18`=UnsubscribeQuote, `21`=SubscribeFull, `22`=UnsubscribeFull, `23`=SubscribeFullDepth, `25`=UnsubscribeFullDepth
-   - **UnsubscribeFullDepth is 25, NOT 24.**
+   - `11`=Connect, `12`=Disconnect, `15`=SubscribeTicker, `16`=UnsubscribeTicker, `17`=SubscribeQuote, `18`=UnsubscribeQuote, `21`=SubscribeFull, `22`=UnsubscribeFull, `23`=SubscribeFullDepth, `25`=UnsubscribeFullDepth (the vendor table skips 24 entirely)
+   - **UnsubscribeFullDepth is 25 — the value the vendor publishes.** 2026-09-11, from the operator’s fresh full pull of the Dhan v2 docs: the Feed Request Code table goes `23 Subscribe` then `25 Unsubscribe`, **skipping 24**, and the literal 24 appears as a request code NOWHERE in all 10,263 lines. Depth is the ONE family that breaks the `subscribe_code + 1` rule — do not "correct" it. **Both codes are proven IGNORED on the wire** (25 on 2026-09-10, 24 on 2026-09-11, byte-identical signature: 80 `unsubscribe_ignored` lines, 40/40 across endpoints, all ten sockets). The code is not the variable; the next step is a vendor ticket, never a third guess.
    - **2026-07-14 note (cross-surface split — UNVERIFIED-LIVE both ways):** the "25, NOT 24"
      line above is no longer assertable as doc fact. The classic annexure says **24**
      (verbatim-stable 2026-06-02 → 2026-07-14); the portal export says **25** (stable since
@@ -129,6 +129,7 @@ paths:
 13. **Timestamps — two conventions depending on data source.**
     - **Historical REST API** (`/v2/charts/historical`, `/v2/charts/intraday`): standard UNIX epoch (seconds since 1970-01-01 00:00 UTC). Add +5:30 (19800 seconds) for IST display.
     - **WebSocket Live Market Feed** (LTT fields in binary packets): IST epoch seconds. Do NOT add +5:30 — the raw value already represents IST wall-clock time. To convert to UTC, subtract 19800 seconds.
+    - ⚠ 2026-11-20: Dhan changed WebSocket LTT to UTC epoch, permanently, effective 20 Nov 2026 (ticket #6684672). From a frame receipt of 2026-11-20 00:00 IST, LTT is standard UNIX epoch like REST (IST = raw + 19,800 s, added once in the core dispatcher by WAL receipt; scope lock §"2026-11-21"). The IST-epoch line above holds for earlier receipts only.
     - NOT milliseconds, NOT microseconds, NOT custom epoch.
 
 14. **Error response structure — exactly 3 string fields.**
@@ -143,7 +144,7 @@ paths:
 - Wrong retry strategy → API block (805) or token loop (901)
 - Hallucinated codes → enum variants that don't exist in Dhan API
 - Wrong rate limits → DH-904 flood → account suspension
-- Stale mappings → code says 24, Dhan says 25 → subscription failures
+- Stale mappings → shipping an UNDOCUMENTED code (the 2026-09-10→11 incident: 24 appears in no Dhan surface, and both 24 and 25 were ignored identically — ghost instruments on all ten depth sockets, two sessions running)
 - Timestamp confusion → dates off by 1000x
 
 ## Trigger

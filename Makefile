@@ -5,7 +5,7 @@
 # Run `make help` to see all available targets.
 # =============================================================================
 
-.PHONY: help run run-supervised stop build test check fmt clippy clean \
+.PHONY: help run run-supervised stop build test check fmt clippy clippy-ci clean \
         scale-test scale-probe scale-smoke scale-max scale-max-smoke scale-100-probe scale-test-clean \
         local-start local-stop local-status local-autopilot-install local-autopilot-uninstall local-autopilot-test \
         docker-up docker-down docker-restart docker-status docker-logs questdb-init \
@@ -16,7 +16,7 @@
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
         lambda-test \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
-        cross-verify-show cross-verify-now prev-day-show \
+        wave-guarantee-check \
 
 # ---- Configuration ----
 APP_NAME       := tickvault
@@ -213,6 +213,9 @@ fmt: ## Format code
 clippy: ## Lint with clippy (zero warnings)
 	@cargo clippy --workspace --all-targets -- -D warnings -W clippy::perf
 	@echo "  ✅ Clippy clean"
+
+clippy-ci: ## Lint at EXACT CI scope (works when the cargo-clippy shim is missing)
+	@bash scripts/clippy-local.sh
 
 clean: ## Clean build artifacts
 	@cargo clean
@@ -521,7 +524,10 @@ doctor: ## Total-system health check (one command — every section explicit pas
 	@bash scripts/doctor.sh
 
 guarantees: ## Rust-only + O(1) + automation report, every number measured now
-	@cargo run -q -p tickvault-app --bin tv_guarantees
+	@cargo run -q -p tickvault-app --bin tv-guarantees
+
+guarantees-html: ## the same measurements as a self-contained page (see also: make guarantees)
+	@cargo run -q -p tickvault-app --bin tv-guarantees -- --html
 
 mcp-doctor: ## Probe every endpoint the tickvault-logs MCP server reads (4 checks)
 	@bash scripts/mcp-doctor.sh
@@ -593,19 +599,5 @@ dispatch-check: ## Common preset — ask Claude to run the full health check
 dispatch-audit: ## Common preset — ask Claude to run the 100% audit
 	@$(MAKE) dispatch MSG="run scripts/100pct-audit.sh and post PASS/GAP counts + any GAPs as the step summary"
 
-verify-option-chain-minute-snapshot: ## 7-query verification of the option-chain minute-snapshot pipeline (PR #5 of 5)
-	@bash scripts/verify-option-chain-minute-snapshot.sh
-
-# ---- Post-market 1-minute cross-verification (operator visibility) ----
-cross-verify-show: ## Show the latest post-market cross-verify CSV (where a human looks)
-	@bash scripts/cross-verify-show.sh
-
-cross-verify-now: ## Run the post-market cross-verify NOW (on-demand, needs live auth + QuestDB)
-	@echo "  Running post-market 1-minute cross-verify on-demand (TICKVAULT_CROSS_VERIFY_NOW=1)."
-	@echo "  Requires a booted app: Dhan auth + QuestDB + today's candles_1m."
-	@echo "  On a dev box without live credentials this will stop at auth — that is expected."
-	@TICKVAULT_CROSS_VERIFY_NOW=1 $(MAKE) run
-
-# ---- Pre-market prev-day OHLCV fetch coverage (operator visibility) ----
-prev-day-show: ## Show the latest pre-market prev-day fetch coverage report
-	@bash scripts/prev-day-show.sh
+wave-guarantee-check: ## 15-row + 7-row guarantee matrix check over every active plan (per-wave-guarantee-matrix.md)
+	@bash .claude/hooks/per-item-guarantee-check.sh

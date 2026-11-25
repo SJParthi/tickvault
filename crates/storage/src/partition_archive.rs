@@ -27,6 +27,18 @@
 //!    skipped table-wide with one `warn!` — a suspended table's export and
 //!    recount see only APPLIED rows, so ACKed-but-unapplied rows would be
 //!    destroyed on `RESUME WAL` if we dropped its partitions.
+//!    **Per-partition WAL-APPLIED gate (2026-10-02):** a table that is not
+//!    suspended but merely BEHIND (`writerTxn < sequencerTxn`) has the same
+//!    blind spot — its acknowledged-but-unapplied rows are invisible to the
+//!    export and to both recounts, so the counts agree and the drop would
+//!    proceed. Immediately before each export AND again immediately before
+//!    each drop, a fresh `wal_tables()` probe must show the table not
+//!    suspended with `writerTxn == sequencerTxn`; otherwise (including an
+//!    unreadable probe or a table absent from it) the partition is kept,
+//!    the table is skipped for the rest of the run, and
+//!    `tv_partition_archive_skipped_total{reason="wal_not_applied"}` counts
+//!    it. The pre-drop re-read then compares `count()` AND `max(ts)` with
+//!    the values taken after the export.
 //! 2. **Export** — QuestDB HTTP `/exp` CSV of `SELECT * FROM <t> WHERE
 //!    ts >= '<start>' AND ts < '<end>'` (explicit ISO range predicates —
 //!    never integer literals against TIMESTAMP columns, never
@@ -80,13 +92,10 @@
 //! # Hot path
 //! ZERO involvement — this is the once-daily post-market cold task.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
@@ -98,10 +107,39 @@ use tickvault_common::sanitize::capture_rest_error_body;
 
 use crate::partition_manager::{
     DAY_PARTITIONED_TABLES, HOUR_PARTITIONED_TABLES, RETENTION_EXEMPT_TABLES,
-    build_detach_list_sql, is_valid_partition_name, parse_partition_rows,
+    build_closed_hour_list_sql, build_detach_list_sql, build_ist_day_list_sql,
+    build_partition_size_sql, is_valid_partition_name, parse_partition_rows, parse_partition_sizes,
     select_partitions_to_detach,
 };
-use crate::wal_suspension_watcher::parse_wal_tables_response;
+use crate::s3_cold::{
+    S3Cold, S3ObjectMeta, Sha256Writer, base64_encode, hex_encode, resolve_archive_bucket,
+    runtime_environment,
+};
+use crate::wal_suspension_watcher::WalTableRow;
+
+// PR AA step 2 (owner Quote 51): the WAL snapshot gate for hour-path tables.
+mod snapshot_gate;
+// PR AA step 3 (owner Quote 51): which tables take the hour path in a pass.
+mod hour_path;
+// PR AA review finding 11: bytes of hour-path partitions dropped per IST day.
+mod drop_tally;
+// Owner Quote 60 (2026-11-14): the daily Brutex export to the canonical keys.
+pub mod daily_export;
+// 2026-11-15: the ordered export in time slices, header written once.
+mod sliced_export;
+// Daily-universe Quote 63 (2026-11-20): held days out of every pass.
+mod held_day_filter;
+// Daily-universe Quote 63: the 20 Nov repair's verified quarantine copy and drop.
+pub mod quarantine_copy;
+
+use hour_path::{
+    HOUR_PATH_TABLES, TICK_SPILL_TABLES, hot_hour_floor, hour_window_for,
+    may_force_with_spill_pending, uses_snapshot_gate,
+};
+use snapshot_gate::{
+    ArchiveIo, CopiedPartition, HourFrameSpan, InFlightReader, InFlightVerdict, SnapshotGate,
+    archive_with_snapshot_gate, recheck_and_drop, snapshot_gate_table,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -125,23 +163,254 @@ pub const ARCHIVE_S3_PREFIX: &str = "questdb-partitions";
 /// at the start of every run.
 pub const ARCHIVE_TEMP_DIR: &str = "data/tmp/partition-archive";
 
+/// Process-global mutual exclusion for archive passes.
+///
+/// See the acquisition site in
+/// [`PartitionArchiver::archive_and_drop_old_partitions`] for why this exists
+/// and why it is a `try_lock` rather than a `lock`. Declared `const_new` so it
+/// costs nothing until first contention and needs no lazy initialiser.
+static ARCHIVE_PASS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// The after-close deferred-depth pass and the depth archive (DA-13d,
+// 2026-10-13; reworked by PR AA step 2, 2026-11-07).
+//
+// The pass rewrites shed depth rows at their ORIGINAL receipt time, so it
+// writes into `market_depth` / `market_depth_book` partitions this archiver
+// can select. Until PR AA it held a process-wide gate (`DEPTH_REWRITE_GATE`)
+// from its first write until its marks were cleared, which on a long night
+// kept every depth partition on the box for hours. It now takes the shared
+// side of the archive quiesce lock per bucket (`archive_quiesce`; ⚠ CHANGED
+// 2026-11-09, PR AA-G finding 17: per committing FLUSH, plus the book
+// writer's in-append pin-cut commit, never a whole bucket), and the
+// snapshot gate holds any hour whose frames still carry an after-close mark
+// (`snapshot_gate::InFlightVerdict::DeferredDepth`), so an hour is never
+// copied while rows of it are still to be written back, and the pass never
+// writes while a depth partition is between its recount and its drop.
+
+/// Whether `table` is one of the depth tables (`market_depth`,
+/// `market_depth_book`). Pure, O(1).
+fn is_depth_table(table: &str) -> bool {
+    DEPTH_TABLES.contains(&table)
+}
+
+/// Counts one depth partition held because the after-close pass still has
+/// rows of its hour to write back.
+fn note_depth_partition_held(summary: &mut ArchiveRunSummary) {
+    summary.held_deferred_depth = summary.held_deferred_depth.saturating_add(1);
+    count_depth_partitions_held(1);
+}
+
+/// Adds `n` to `tv_partition_archive_skipped_total{reason="deferred_depth_pass"}`
+/// (DA-13d). The ONE place the series' labels are written, so the boot seed
+/// (`n = 0`, from `main.rs`) and every hold land on the same series. Local
+/// `/metrics` only. O(1).
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 2): `cause` is `marks_waiting` (the hour
+/// still has after-close marks), not `rewrite_in_flight`: the all-night gate
+/// it named is gone.
+// TEST-EXEMPT: the series is asserted with a real Prometheus recorder by app's daily_archive_boot::test_regression_da13d_depth_hold_counter_seeds_at_zero (storage has no exporter dev-dependency); the hold path that adds 1 is driven by the snapshot-gate tests
+pub fn count_depth_partitions_held(n: u64) {
+    metrics::counter!(
+        "tv_partition_archive_skipped_total",
+        "reason" => "deferred_depth_pass",
+        "cause" => "marks_waiting",
+        "stage" => "pre_export"
+    )
+    .increment(n);
+}
+
+/// Whether the after-close depth pass still has rows to write back anywhere
+/// (any after-close mark is set). The disk-pressure leg reads it to hold a
+/// pass that last stood aside only for depth hours, while the pass runs.
+/// One snapshot of the mark table, O(`DEFERRED_BUCKETS`), cold.
+#[must_use]
+pub fn deferred_depth_marks_waiting() -> bool {
+    !crate::wal_deferred_depth::deferred_depth()
+        .snapshot()
+        .is_empty()
+}
+
+/// Partitions dropped after a verified copy, and when the latest was (PR
+/// AA-G, finding 10). Raised only on a DROP QuestDB accepted, never on a
+/// failed drop, a verify, an upload or a reused copy: those can repeat every
+/// pass with nothing freed. One per process ([`ARCHIVE_DROPS`]); a test
+/// archiver gets its own, so parallel tests never read each other's drops
+/// (2026-11-11 review: the stub test's assertions read the process statics
+/// and could pass on another test's drop).
+pub(crate) struct ArchiveDropLedger {
+    total: std::sync::atomic::AtomicU64,
+    /// Unix seconds of the latest drop; 0 before the first.
+    last_unix: std::sync::atomic::AtomicI64,
+}
+
+impl ArchiveDropLedger {
+    pub(crate) const fn new() -> Self {
+        Self {
+            total: std::sync::atomic::AtomicU64::new(0),
+            last_unix: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// Records one accepted DROP at `now_unix`. Two relaxed atomics, O(1).
+    /// ⚠ CHANGED 2026-11-11 (PR AA-G review): the instant is STORED, not
+    /// `fetch_max`ed: after a wall-clock step back, a max kept a future
+    /// instant and swallowed every later drop until the clock passed it
+    /// (freshness switched off for up to the step). Now the next drop
+    /// replaces it; a future instant still held is clamped to the clock by
+    /// the reader (`archive_backlog::backlog_holds`).
+    fn note(&self, now_unix: i64) {
+        self.total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_unix
+            .store(now_unix, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn total(&self) -> u64 {
+        self.total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn last_unix(&self) -> Option<i64> {
+        let at = self.last_unix.load(std::sync::atomic::Ordering::Relaxed);
+        (at > 0).then_some(at)
+    }
+}
+
+/// The process's drop ledger, read by the drain hold.
+static ARCHIVE_DROPS: ArchiveDropLedger = ArchiveDropLedger::new();
+
+/// Partitions dropped (after a verified copy) by either archive leg of this
+/// process. The drain hold counts a rise as progress while the archive
+/// backlog holds the box, so a long pass that is still freeing disk is never
+/// judged stalled (PR AA-G, finding 10). One relaxed load, O(1).
+#[must_use]
+pub fn archive_drops_total() -> u64 {
+    ARCHIVE_DROPS.total()
+}
+
+/// When this process last dropped a partition after a verified copy (Unix
+/// seconds), `None` before its first. Can be ahead of the clock after a
+/// wall-clock step back; the reader clamps it. One relaxed load, O(1).
+#[must_use]
+pub fn last_archive_drop_unix() -> Option<i64> {
+    ARCHIVE_DROPS.last_unix()
+}
+
+/// Free-space level below which an archive pass is reported as WEDGED.
+///
+/// # The trap this names (2026-09-01)
+///
+/// The archiver exports each partition to a gzip TEMPORARY FILE on the volume
+/// it is trying to free, then uploads it, then drops the partition. There is
+/// no free-space check anywhere on that path — so as the volume approaches
+/// full, the export starts failing, every partition is kept, and the pass
+/// reports a pile of per-partition failures while freeing nothing. That is a
+/// deadlock: the disk fills, writes fail, data spills to disk, the reclaim
+/// cannot write its scratch file, the disk stays full. Observed as the
+/// 93%-full session on 2026-09-01.
+///
+/// # Why this is a WARNING and emphatically NOT a refusal
+///
+/// The obvious shape — refuse to start below a floor — is the wrong one, and
+/// it took writing it to see why: refusing to run the only thing that frees
+/// space guarantees the space is never freed. It converts a pass that might
+/// still archive a few small partitions into one that provably archives none,
+/// which is strictly worse at exactly the moment it matters most.
+///
+/// So the pass ALWAYS proceeds. What this constant buys is that the condition
+/// stops being invisible: below it, the run emits one coded error naming the
+/// deadlock and increments a counter, so "the archiver is wedged by the very
+/// condition it exists to fix" becomes a thing an operator is told rather
+/// than something inferred from a pile of unexplained failures.
+///
+/// 2 GiB is sized against one gzipped partition — the largest observed is an
+/// hour of `market_depth` — so crossing it means the next export is genuinely
+/// at risk, not merely that the disk is busy.
+pub const ARCHIVE_MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Whether an archive pass has room to write its scratch file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveSpaceVerdict {
+    /// At or above [`ARCHIVE_MIN_FREE_BYTES`] — exports should succeed.
+    Ample,
+    /// Below the floor. The pass still runs (see the constant's doc); this is
+    /// the operator signal that it is likely to fail for lack of scratch.
+    Wedged,
+    /// Free space could not be read. Distinct from `Wedged` on purpose: an
+    /// unreadable volume is not evidence of a full one, and reporting it as
+    /// full would be a fabricated finding.
+    Unknown,
+}
+
+/// Classifies free space against the scratch floor. Pure, O(1).
+#[must_use]
+pub const fn archive_space_verdict(free_bytes: Option<u64>, floor: u64) -> ArchiveSpaceVerdict {
+    match free_bytes {
+        None => ArchiveSpaceVerdict::Unknown,
+        Some(free) if free >= floor => ArchiveSpaceVerdict::Ample,
+        Some(_) => ArchiveSpaceVerdict::Wedged,
+    }
+}
+
 /// HTTP timeout for DDL / count / drop statements (mirrors the detach path).
 const ARCHIVE_DDL_TIMEOUT_SECS: u64 = 30;
+
+/// HTTP timeout for the drop tally's size listing just before a drop's
+/// last-moment recount (review of PR AA finding 11, 2026-11-09). On a
+/// snapshot-gate table it runs under the exclusive quiesce lock, so it is
+/// kept well under [`ARCHIVE_DDL_TIMEOUT_SECS`]; a listing that does not
+/// answer in time records the pass-start size instead (a sizing estimate,
+/// never a drop decision).
+const PRE_DROP_SIZE_LISTING_TIMEOUT_SECS: u64 = 5;
+
+/// Why [`PartitionArchiver::session_bytes_on`] gave no reading (review of PR
+/// AA finding 11, 2026-11-09).
+#[derive(Debug)]
+pub enum SessionBytesError {
+    /// A size listing failed; a later reading may succeed.
+    Unread(anyhow::Error),
+    /// The drop tally cannot complete the day in this process (a dropped
+    /// partition of unknown size is gone, or the day overflowed the tally).
+    /// Reading again never succeeds; the caller leaves the day out.
+    Refused(&'static str),
+}
+
+impl SessionBytesError {
+    /// Whether reading the same day again in this process can succeed.
+    /// Pure, O(1).
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        matches!(self, Self::Unread(_))
+    }
+}
+
+impl std::fmt::Display for SessionBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unread(err) => write!(f, "session size listing failed: {err:#}"),
+            Self::Refused(reason) => write!(f, "session size refused: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionBytesError {}
 
 /// HTTP timeout for a single partition `/exp` CSV export. Generous — an
 /// hourly `ticks` partition can be hundreds of MB of CSV; the stream is
 /// consumed incrementally so memory stays bounded either way.
 const ARCHIVE_EXPORT_TIMEOUT_SECS: u64 = 600;
 
+/// Idle `/exp` connections the archiver's export client keeps open: none.
+/// QuestDB counts an idle keep-alive connection against its export limit
+/// (`http_export_connections`, 2) until it closes, so a kept one blocked the
+/// next export (17 Nov 2026: three Brutex attempts refused with
+/// `numOfConnections=3`). Each request opens and closes its own connection.
+pub(crate) const EXPORT_CLIENT_MAX_IDLE_PER_HOST: usize = 0;
+
 /// Cap on any `/exec` response body read into memory (SEC-LOW2, review
 /// round 1). The largest legitimate body is a `table_partitions()` listing
 /// (a few hundred KB on the first catch-up sweep); 4 MiB bounds a hostile /
 /// misrouted response without ever truncating a real one.
 const ARCHIVE_MAX_EXEC_BODY_BYTES: u64 = 4 * 1024 * 1024;
-
-/// The WAL-suspension probe (F3) — same query the WAL-SUSPEND-01 watcher
-/// issues; parsed by the SAME `parse_wal_tables_response`.
-const WAL_TABLES_PROBE_SQL: &str = "select * from wal_tables()";
 
 /// Forensic audit table — one row per archive attempt outcome.
 pub const PARTITION_ARCHIVE_AUDIT_TABLE: &str = "partition_archive_audit";
@@ -194,8 +463,14 @@ pub enum RetentionClass {
 ///
 /// Checked BEFORE the market-data test in [`retention_class`], because
 /// `market_depth` is also HOUR-partitioned and would otherwise be swept on
-/// the 35-day market-data window by virtue of that membership alone.
-const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
+/// the 15-day market-data window by virtue of that membership alone.
+///
+/// `market_depth_book` (2026-10-09, plan item 49e step 3) holds the same depth
+/// as array rows, so it takes the same window.
+const DEPTH_TABLES: [&str; 2] = [
+    crate::depth_persistence::MARKET_DEPTH_TABLE,
+    crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE,
+];
 
 /// True when `table` belongs to the [`RetentionClass::Intraday`] window —
 /// `ticks` plus every SUB-MINUTE candle table.
@@ -212,7 +487,14 @@ const DEPTH_TABLES: [&str; 1] = [crate::depth_persistence::MARKET_DEPTH_TABLE];
 /// a minute-or-longer one cannot join by accident. That is worth the O(24)
 /// scan, which runs on the cold retention sweep and never on a tick.
 fn is_intraday_table(table: &str) -> bool {
-    if table == TICKS_TABLE {
+    // 2026-10-22 (plan item 62): the two retired sub-minute tables keep the
+    // intraday window they were archived on while they were written.
+    // 2026-10-27 (plan item M5): `tick_quotes` holds rows `ticks` held before
+    // the split, so it keeps the same window.
+    if table == TICKS_TABLE
+        || table == crate::tick_quotes_persistence::TICK_QUOTES_TABLE
+        || crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table)
+    {
         return true;
     }
     (0..tickvault_trading::candles::TF_COUNT).any(|ordinal| {
@@ -232,6 +514,22 @@ const TICKS_TABLE: &str = "ticks";
 /// One minute, in seconds — the boundary between "intraday, current-day only"
 /// and "history the indicator and strategy paths read".
 const SECONDS_PER_MINUTE: u32 = 60;
+/// The per-minute option-chain capture table.
+///
+/// **RE-HOMED 2026-09-16.** This was
+/// `crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE` until the
+/// per-minute chain WRITER was deleted with the per-minute price pulls. The
+/// **TABLE and every row in it are RETAINED** — only the writer is gone — so
+/// its retention entry must survive, and the name needs a home that survives
+/// with it.
+///
+/// Named rather than inlined for exactly the reason `TICKS_TABLE` above gives:
+/// a rename must be a compile error here, not a silent reclassification into
+/// the wrong retention window. The literal is the same one
+/// `DAY_PARTITIONED_TABLES` in `partition_manager.rs` carries, and
+/// `partition_retention_coverage_guard` fails the build if the two disagree.
+const REST_OPTION_CHAIN_1M_TABLE: &str = "rest_option_chain_1m";
+
 /// The two per-minute option-chain capture tables (operator directive
 /// 2026-07-16: *"for only spots we will have minimum one month data …
 /// but option only for the current day"* — the chain tables are the
@@ -240,6 +538,11 @@ const SECONDS_PER_MINUTE: u32 = 60;
 /// class. 35 days is the smallest clean change (one existing knob covers
 /// ticks + candles + chain); tightening chain further toward current-day is
 /// a follow-up knob if disk pressure demands it.
+///
+/// *(2026-09-08 note: the 35-day figures in this and the two paragraphs
+/// around it are the 2026-07-16 history. The window is `market_data_hot_days`,
+/// whose default has been **15** since the 2026-09-06 disk decision, and the
+/// text elsewhere in this file that described the LIVE window now says 15.)*
 ///
 /// **First-sweep burst (dated honest note, 2026-07-16 round-2 MEDIUM):**
 /// the 90 → 35 day move makes every chain partition aged 36..90 days
@@ -257,7 +560,7 @@ const SECONDS_PER_MINUTE: u32 = 60;
 /// a bad first sweep is "nothing freed yet", never data loss. Subsequent
 /// sweeps return to the ~1-partition/day steady state.
 const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
-    crate::option_chain_1m_persistence::OPTION_CHAIN_1M_TABLE,
+    REST_OPTION_CHAIN_1M_TABLE,
     crate::option_contract_1m_rest_persistence::OPTION_CONTRACT_1M_REST_TABLE,
 ];
 
@@ -267,7 +570,7 @@ const CHAIN_MARKET_DATA_TABLES: [&str; 2] = [
 /// tables (2026-07-16); everything else is Standard.
 pub(crate) fn retention_class(table: &str) -> RetentionClass {
     // Depth FIRST. `market_depth` is also HOUR-partitioned, so testing the
-    // market-data list before this would classify it on the 35-day window by
+    // market-data list before this would classify it on the 15-day window by
     // virtue of that membership alone — 735 GB on a 100 GB root, and the
     // sweep would never fire before the disk filled.
     if DEPTH_TABLES.contains(&table) {
@@ -276,7 +579,7 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
         // BEFORE the market-data test, for exactly the reason Depth is before
         // both: `ticks` is HOUR_PARTITIONED and the second-level candles are
         // in `candle_table_names()`, so either would otherwise be classified
-        // on the 35-day window by virtue of that membership alone.
+        // on the 15-day window by virtue of that membership alone.
         RetentionClass::Intraday
     } else if HOUR_PARTITIONED_TABLES.contains(&table)
         || crate::shadow_persistence::candle_table_names().contains(&table)
@@ -285,6 +588,20 @@ pub(crate) fn retention_class(table: &str) -> RetentionClass {
         RetentionClass::MarketData
     } else {
         RetentionClass::Standard
+    }
+}
+
+/// The day-granular ARCHIVE list query for `table` (audit 2026-11-15,
+/// live-4). The IST-stamped market-data classes (`Intraday`, `Depth`) compare
+/// against `now()` shifted into IST ([`build_ist_day_list_sql`]); every other
+/// class keeps the UTC form ([`build_detach_list_sql`]). Only the archive
+/// worklist calls this; the retention detach is unchanged. Pure, O(1).
+fn archive_day_list_sql(table: &str, hot_days: u32) -> String {
+    match retention_class(table) {
+        RetentionClass::Intraday | RetentionClass::Depth => build_ist_day_list_sql(table, hot_days),
+        RetentionClass::MarketData | RetentionClass::Standard => {
+            build_detach_list_sql(table, hot_days)
+        }
     }
 }
 
@@ -315,6 +632,18 @@ pub(crate) fn effective_hot_days(configured_days: u32, floor: u32) -> u32 {
 /// - Today's partition has `minTimestamp >= today 00:00`, which is ALWAYS
 ///   later than `now() - 24h`. It can never be selected — safe by
 ///   construction, not by scheduling luck.
+///
+/// ⚠ CORRECTED 2026-11-15 (audit live-4): the first bullet was false for the
+/// IST-stamped tables. Their `minTimestamp` is IST stored as Z while `now()`
+/// is UTC, so the UTC cutoff sat 5.5 hours behind: on D+1 the hours from
+/// 11:00 IST of D became eligible only at about 16:30 IST, the box stop, and
+/// the daily leg latched at 16:21 without them. The archive worklist now uses
+/// `build_ist_day_list_sql` for `Intraday` and `Depth` (`archive_day_list_sql`),
+/// so each hour of D is eligible 24 hours after its first row: every
+/// session hour of D (09:00 to the 15:00 hour) by 16:00 IST of D+1, before
+/// the daily leg latches. Today's partitions still never are
+/// (`minTimestamp >= today 00:00 IST > now_ist - 24h`). The retention detach
+/// keeps the UTC form.
 ///
 /// So the general floor of 2 was not protecting anything here; it was simply
 /// retaining a second day of the two heaviest tables on the box.
@@ -349,6 +678,71 @@ pub(crate) fn hot_window_days(table: &str, cfg: &PartitionRetentionConfig) -> u3
 }
 
 // ---------------------------------------------------------------------------
+// Hour-granular eligibility — the mid-session reclaim
+// ---------------------------------------------------------------------------
+
+/// Tables whose designated `ts` is the ARRIVAL instant, not an exchange stamp.
+///
+/// This list is the whole safety argument for hour-granular archival, so it is
+/// a deliberate allowlist rather than "every HOUR-partitioned table".
+///
+/// `market_depth.ts` is stamped when the frame reached US
+/// (`depth_persistence.rs`, the "`ts` is ARRIVAL time" section) — the 12-byte
+/// depth header carries no timestamp at all, so there is nothing else it could
+/// be. Arrival is monotone, therefore an hour partition stops receiving writes
+/// the moment the wall clock leaves that hour, and a closed hour is genuinely
+/// closed.
+///
+/// **`ticks` is deliberately ABSENT and must stay absent.** Its `ts` is the
+/// exchange LAST-TRADE time (`tick_persistence::row_timestamp_ist_nanos`), so
+/// a quote packet for an illiquid option that last traded at 09:20 is written
+/// at 14:30 INTO the 09:20 partition — measured at ~10% of a session's ticks
+/// arriving more than an hour behind. Archiving `ticks` by the hour would
+/// therefore race live writes into a partition being detached. Day-granular
+/// eligibility is what makes that safe today, and it stays.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3, owner Quote 51): this list is now the
+/// tables on the hour path in EVERY pass. Three more arrival-stamped tables
+/// (`market_depth_book`, `tick_quotes`, `feed_aux_packets`) take the hour path
+/// only while a pass carries disk pressure, and `ticks` only behind its own
+/// switch (`ticks_hour_path_enabled`, off); see `hour_path::hour_window_for`.
+pub(crate) const ARRIVAL_STAMPED_HOUR_TABLES: &[&str] = &["market_depth"];
+
+/// Floor on the hour-granular hot window. Never smaller, whatever config says.
+///
+/// Four hours, not one, and the margin is for WAL REPLAY rather than for the
+/// live path. A replayed frame carries its ORIGINAL receipt (the TVW3 record
+/// field), which is the entire point of that format — so a mid-session restart
+/// re-writes frames into partitions that are already closed. Live arrival is
+/// monotone; replay is not, and replay is the one writer that can move
+/// backwards.
+///
+/// Four hours bounds a restart that replays a backlog of up to four hours.
+/// Beyond that the replay would land in a detached partition — which QuestDB
+/// rejects rather than silently drops, so the failure is loud, but it is still
+/// a failure and the floor exists to keep it out of reach.
+pub(crate) const MIN_HOT_HOURS: u32 = 4;
+
+/// The effective hour-granular hot window for `table`, or `None` when the
+/// table is not eligible for hour-granular archival at all.
+///
+/// `None` is the answer for every table outside
+/// [`ARRIVAL_STAMPED_HOUR_TABLES`] — including `ticks` — and the caller MUST
+/// fall back to the day-granular path rather than inventing an hour window.
+#[must_use]
+pub(crate) fn hot_window_hours(table: &str, configured_hours: u32) -> Option<u32> {
+    if !ARRIVAL_STAMPED_HOUR_TABLES.contains(&table) {
+        return None;
+    }
+    // 0 is the OFF switch, not "archive everything". Treating it as a window
+    // would make the cutoff `now()`, which matches the partition being
+    // actively written — the exact hazard MIN_HOT_DAYS_MARKET_DATA's own
+    // comment warns about, one unit down. The floor is shared with the
+    // hour path's other tables (`hour_path::hot_hour_floor`).
+    hot_hour_floor(configured_hours)
+}
+
+// ---------------------------------------------------------------------------
 // Partition-range SQL builders (pure)
 // ---------------------------------------------------------------------------
 
@@ -363,6 +757,17 @@ const TS_LITERAL_FMT: &str = "%Y-%m-%dT%H:%M:%S%.6fZ";
 /// HOUR `YYYY-MM-DDTHH` → [hour, next hour). Returns `None` for anything
 /// malformed (fail-closed — the partition is skipped, never guessed at).
 pub(crate) fn partition_range_bounds(name: &str) -> Option<(String, String)> {
+    let (start, end) = partition_range_naive(name)?;
+    Some((
+        start.format(TS_LITERAL_FMT).to_string(),
+        end.format(TS_LITERAL_FMT).to_string(),
+    ))
+}
+
+/// The `[start, end)` of a partition named `name`, as naive date-times.
+/// `None` for anything malformed. Used by [`partition_range_bounds`] (the
+/// top_volume hold that also used it was removed 2026-10-22, plan item 62).
+fn partition_range_naive(name: &str) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
     use chrono::{NaiveDate, NaiveTime, TimeDelta};
 
     if !is_valid_partition_name(name) {
@@ -383,10 +788,7 @@ pub(crate) fn partition_range_bounds(name: &str) -> Option<(String, String)> {
         }
         _ => return None,
     };
-    Some((
-        start.format(TS_LITERAL_FMT).to_string(),
-        end.format(TS_LITERAL_FMT).to_string(),
-    ))
+    Some((start, end))
 }
 
 /// `/exp` export SQL — the partition's full rows via explicit range
@@ -398,9 +800,36 @@ pub(crate) fn build_export_sql(table: &str, start: &str, end: &str) -> String {
     format!("SELECT * FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
 }
 
+/// [`build_export_sql`] with an optional `ORDER BY` (owner Quote 60): the
+/// daily Brutex export orders the rows by the table's DEDUP key, and the
+/// archiver orders the same way whenever an object already sits at the
+/// canonical key and the clock is outside 08:30 to the session's ingest end
+/// (`daily_export::archiver_export_order`; the export switch plays no part),
+/// so an unchanged partition exports to the same bytes twice and the archive
+/// reuses the export's object. `None` is exactly [`build_export_sql`].
+/// Pure, O(1).
+// TEST-EXEMPT: covered by test_build_export_sql_orders_by_dedup_key_when_enabled
+pub(crate) fn build_export_sql_ordered(
+    table: &str,
+    start: &str,
+    end: &str,
+    order_by: Option<&str>,
+) -> String {
+    match order_by {
+        Some(key) => format!("{} ORDER BY {key}", build_export_sql(table, start, end)),
+        None => build_export_sql(table, start, end),
+    }
+}
+
 /// Post-export recount SQL over the identical range (verify leg (a)).
+///
+/// Reads `count()` AND `max(ts)` in ONE statement (2026-10-02), so the two
+/// numbers come from the same snapshot. The pre-drop re-read compares both
+/// against the values taken right after the export: a late row stamped past
+/// everything the export saw moves `max(ts)` even in the unlikely case that
+/// the count happens to come back equal.
 pub(crate) fn build_count_sql(table: &str, start: &str, end: &str) -> String {
-    format!("SELECT count() FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
+    format!("SELECT count(), max(ts) FROM {table} WHERE ts >= '{start}' AND ts < '{end}'")
 }
 
 /// The DESTRUCTIVE drop DDL. Only callable from
@@ -411,18 +840,89 @@ fn build_drop_sql(table: &str, partition: &str) -> String {
     format!("ALTER TABLE {table} DROP PARTITION LIST '{partition}'")
 }
 
-/// Parses QuestDB's `/exec` JSON for a single-cell `count()` result.
-/// Fail-closed: anything unexpected → `None` (→ verify fails → keep).
-pub(crate) fn parse_count_response(json: &str) -> Option<u64> {
+/// One `count(), max(ts)` reading of a partition's range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RangeTally {
+    /// `count()` over the range.
+    pub(crate) rows: u64,
+    /// `max(ts)` over the range as QuestDB renders it; `None` for an empty
+    /// range (QuestDB answers `null`).
+    pub(crate) max_ts: Option<String>,
+}
+
+/// Parses QuestDB's `/exec` JSON for the `count(), max(ts)` row.
+/// Fail-closed: anything unexpected → `None` (→ verify fails → keep). The
+/// `max(ts)` cell must be PRESENT (a string, or `null` for an empty range);
+/// a missing second cell or any other type is unexpected, not "no max".
+pub(crate) fn parse_count_response(json: &str) -> Option<RangeTally> {
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
-    let cell = parsed
-        .get("dataset")?
-        .as_array()?
-        .first()?
-        .as_array()?
-        .first()?;
-    let n = cell.as_i64()?;
-    u64::try_from(n).ok()
+    let row = parsed.get("dataset")?.as_array()?.first()?.as_array()?;
+    let rows = u64::try_from(row.first()?.as_i64()?).ok()?;
+    let max_ts = match row.get(1)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => return None,
+    };
+    Some(RangeTally { rows, max_ts })
+}
+
+/// Whether a table's WAL is provably fully applied, read from one
+/// `wal_tables()` probe (2026-10-02).
+///
+/// A table whose WAL is BEHIND (`writerTxn < sequencerTxn`) holds rows that
+/// QuestDB has acknowledged and not yet applied. Those rows are invisible to
+/// the export and to both recounts, so the counts still agree, the S3 copy
+/// is "verified", and the drop proceeds; when the rows are applied they land
+/// in a partition that is gone, or after the export that was meant to hold
+/// them. Only [`Self::Applied`] lets the archiver export or drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WalApplyVerdict {
+    /// Not suspended and `writerTxn == sequencerTxn`.
+    Applied,
+    /// WAL apply is suspended.
+    Suspended,
+    /// Committed transactions are still waiting to be applied.
+    Lagging { writer_txn: i64, sequencer_txn: i64 },
+    /// The table is not in `wal_tables()` at all — its state cannot be read.
+    NotReported,
+    /// The row lacks `writerTxn` or `sequencerTxn` (schema drift).
+    TxnUnreadable,
+}
+
+impl WalApplyVerdict {
+    /// Stable label for logs and the `cause` metric label.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Suspended => "suspended",
+            Self::Lagging { .. } => "lagging",
+            Self::NotReported => "not_reported",
+            Self::TxnUnreadable => "txn_unreadable",
+        }
+    }
+}
+
+/// Classifies `table`'s WAL state from one `wal_tables()` row set.
+/// Fail-closed: only an exact `writerTxn == sequencerTxn` on a
+/// non-suspended row is [`WalApplyVerdict::Applied`].
+pub(crate) fn wal_apply_verdict(rows: &[WalTableRow], table: &str) -> WalApplyVerdict {
+    // O(1) EXEMPT: begin — linear scan over one wal_tables() row per table
+    // (tens of rows), on the once-per-partition cold archive path.
+    let Some(row) = rows.iter().find(|r| r.name == table) else {
+        return WalApplyVerdict::NotReported;
+    };
+    // O(1) EXEMPT: end
+    if row.suspended {
+        return WalApplyVerdict::Suspended;
+    }
+    match (row.writer_txn, row.sequencer_txn) {
+        (Some(w), Some(s)) if w == s => WalApplyVerdict::Applied,
+        (Some(writer_txn), Some(sequencer_txn)) => WalApplyVerdict::Lagging {
+            writer_txn,
+            sequencer_txn,
+        },
+        _ => WalApplyVerdict::TxnUnreadable,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -598,144 +1098,6 @@ pub(crate) fn verify_archive(
 }
 
 // ---------------------------------------------------------------------------
-// Content identity (pure — review round 2)
-// ---------------------------------------------------------------------------
-
-/// Standard base64 (RFC 4648, with padding) — exactly what S3's
-/// `x-amz-checksum-sha256` header carries. Hand-rolled for a fixed 32-byte
-/// digest rather than adding a new supply-chain root; pinned by a
-/// known-vector unit test below.
-pub(crate) fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
-        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(triple >> 6) as usize & 0x3f] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[triple as usize & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Lowercase hex of a digest (audit-row provenance column).
-pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// `Write` adapter folding every byte into a SHA-256 digest on its way to
-/// the inner writer — the gzip stream is hashed AS IT IS WRITTEN, so the
-/// content-identity digest covers exactly the bytes on disk (and therefore
-/// exactly the bytes S3 receives) with no second file read.
-struct Sha256Writer<W: Write> {
-    inner: W,
-    hasher: sha2::Sha256,
-}
-
-impl<W: Write> Sha256Writer<W> {
-    fn new(inner: W) -> Self {
-        use sha2::Digest as _;
-        Self {
-            inner,
-            hasher: sha2::Sha256::new(),
-        }
-    }
-
-    /// Consumes the adapter: `(inner writer, 32-byte digest)`.
-    fn finish(self) -> (W, [u8; 32]) {
-        use sha2::Digest as _;
-        (self.inner, self.hasher.finalize().into())
-    }
-}
-
-impl<W: Write> Write for Sha256Writer<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use sha2::Digest as _;
-        let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bucket resolution (pure + thin env shim)
-// ---------------------------------------------------------------------------
-
-/// Resolves the archive bucket (review round 1, F1b — FAIL-CLOSED): an
-/// explicit non-empty config value ALWAYS wins; an empty config derives the
-/// house cold bucket `tv-<env>-cold` (terraform `tv-${environment}-cold`)
-/// ONLY when the environment was EXPLICITLY provided by an env var. No
-/// explicit environment → `None` → the caller SKIPS archival entirely for
-/// the run. There is deliberately NO `"prod"` default here: a dev box /
-/// worktree / CI shell without env vars must never write (or overwrite)
-/// objects in the prod cold bucket.
-pub(crate) fn resolve_archive_bucket(
-    configured: &str,
-    environment: Option<&str>,
-) -> Option<String> {
-    let trimmed = configured.trim();
-    if !trimmed.is_empty() {
-        return Some(trimmed.to_string());
-    }
-    environment.map(|env| format!("tv-{env}-cold"))
-}
-
-/// Environment-name resolution from raw env-var reads (pure — testable
-/// without process-global env mutation). Precedence: `TV_ENVIRONMENT` →
-/// `ENVIRONMENT`. `None` when neither is set (F1b fail-closed — the
-/// SSM-path `"prod"` fallback in `secret_manager::resolve_environment` is
-/// DELIBERATELY not mirrored here). A value with characters outside
-/// `[a-zA-Z0-9-]` also resolves `None` (bucket-name safety, fail-closed).
-pub(crate) fn resolve_environment_from(
-    tv_environment: Option<&str>,
-    environment: Option<&str>,
-) -> Option<String> {
-    let candidate = tv_environment
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| environment.map(str::trim).filter(|s| !s.is_empty()))?;
-    if candidate
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        Some(candidate.to_string())
-    } else {
-        None
-    }
-}
-
-/// Reads the explicitly-set runtime environment name (`TV_ENVIRONMENT` →
-/// `ENVIRONMENT`); `None` when neither env var is set — archival is then
-/// skipped for the run (F1b fail-closed).
-fn runtime_environment() -> Option<String> {
-    resolve_environment_from(
-        std::env::var("TV_ENVIRONMENT").ok().as_deref(),
-        std::env::var("ENVIRONMENT").ok().as_deref(),
-    )
-}
-
-// ---------------------------------------------------------------------------
 // Archive-outcome labels + audit persistence
 // ---------------------------------------------------------------------------
 
@@ -783,6 +1145,79 @@ impl ArchiveOutcome {
             Self::DropFailed => "drop_failed",
         }
     }
+}
+
+/// The canonical S3 key a partition's archive lives at.
+///
+/// One key per `(table, partition)`. Stable across runs, and the object at
+/// this key is **never overwritten and never deleted** by the archiver —
+/// it may be the only surviving copy of data that has since been dropped
+/// from the database.
+#[must_use]
+pub fn canonical_archive_key(table: &str, partition: &str) -> String {
+    format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.csv.gz")
+}
+
+/// The content-addressed key used when a partition no longer matches the
+/// archive already sitting at its canonical key.
+///
+/// # Why this exists
+///
+/// A partition is not immutable. `ticks` is `PARTITION BY HOUR` on the
+/// exchange last-trade time, and 10.0% of live ticks arrive with a timestamp
+/// more than an hour behind their receive time (measured 2026-08-24:
+/// 6,433,267 of 64,349,753). Those rows land in an hourly partition that has
+/// already been archived, so a later export can never reproduce the archived
+/// bytes — and under a pure never-overwrite policy the partition is pinned to
+/// disk forever. That is not hypothetical: on 2026-08-25 the live box held
+/// 1,000 `s3_conflict` audit rows, zero successful archives, and tick data
+/// going back to 2026-06-02 against a ONE-DAY hot window.
+///
+/// Embedding the FULL SHA-256 hex of the gzip makes the key:
+/// - **collision-free** — different content is a different key, so writing
+///   here can never destroy another export;
+/// - **idempotent** — re-exporting unchanged content yields the same key, so
+///   a retry reuses the object instead of uploading a duplicate;
+/// - **self-describing** — the key states exactly which bytes it holds.
+///
+/// The canonical object is left untouched, so BOTH copies survive.
+#[must_use]
+pub fn sidecar_archive_key(table: &str, partition: &str, gzip_sha256_hex: &str) -> String {
+    format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.sha-{gzip_sha256_hex}.csv.gz")
+}
+
+/// The boot-time self-heal for `partition_archive_audit` (2026-09-01).
+///
+/// One `ALTER TABLE … ADD COLUMN IF NOT EXISTS` per non-designated column,
+/// then the DEDUP key re-applied — the same shape every other audit table in
+/// this crate already uses. Idempotent: on a table that already has every
+/// column each statement is a no-op. Pure so the test can assert every column
+/// in the CREATE has a matching heal line.
+pub fn partition_archive_audit_self_heal_ddl() -> Vec<String> {
+    const COLUMNS: &[(&str, &str)] = &[
+        ("table_name", "SYMBOL"),
+        ("partition_name", "SYMBOL"),
+        ("outcome", "SYMBOL"),
+        ("feed", "SYMBOL"),
+        ("rows_archived", "LONG"),
+        ("csv_bytes", "LONG"),
+        ("gzip_bytes", "LONG"),
+        ("gzip_sha256", "STRING"),
+        ("s3_key", "STRING"),
+        ("detail", "STRING"),
+    ];
+    let mut out: Vec<String> = COLUMNS
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "ALTER TABLE {PARTITION_ARCHIVE_AUDIT_TABLE} ADD COLUMN IF NOT EXISTS {name} {ty};"
+            )
+        })
+        .collect();
+    out.push(format!(
+        "ALTER TABLE {PARTITION_ARCHIVE_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PARTITION_ARCHIVE_AUDIT});"
+    ));
+    out
 }
 
 /// The idempotent `CREATE TABLE` DDL for the archive-audit chain. Pure
@@ -936,8 +1371,9 @@ impl PartitionArchiveAuditWriter {
         let Some(sender) = self.sender.as_mut() else {
             anyhow::bail!("partition_archive_audit: no ILP sender (QuestDB unreachable)");
         };
-        sender
-            .flush(&mut self.buffer)
+        // Sweep S5: the ILP round trip runs off the shared tokio worker.
+        let buffer = &mut self.buffer;
+        crate::off_worker::off_worker(|| sender.flush(buffer))
             .context("partition_archive_audit ILP flush")?;
         self.pending = 0;
         Ok(())
@@ -978,6 +1414,40 @@ pub struct ArchiveRunSummary {
     pub dropped: u32,
     /// Failed attempts (kept partitions — retried next run).
     pub failed: u32,
+    /// Tables whose eligible-partition LIST query failed this run.
+    ///
+    /// A list failure means the table contributed NOTHING to the worklist —
+    /// it is skipped whole, exactly as if it had no eligible partitions. That
+    /// is indistinguishable from healthy in every other field here, and the
+    /// per-table log line for it is `debug!`, which production never emits.
+    /// Surfacing the count on the existing cycle-summary line makes a silently
+    /// unswept table visible without adding a metric (the EMF selector has no
+    /// byte budget left) or a per-run warning for tables that legitimately do
+    /// not exist yet.
+    pub tables_list_failed: u32,
+    /// Tables that do NOT EXIST in QuestDB this run — not failures.
+    ///
+    /// # Why this is separate from [`Self::tables_list_failed`] (2026-09-23)
+    ///
+    /// The swept set is every table this binary knows how to retain: the
+    /// live tables PLUS the retained-history names of legs that were removed
+    /// (the per-minute REST tables, the renamed `top_volume`, retired candle
+    /// frames). On a fresh volume, or after the one-shot fresh-start reset,
+    /// those tables simply are not there. Until today the list query's
+    /// `table does not exist` answer was counted as a LIST FAILURE, and the
+    /// daily scheduler treats any list failure as an incomplete pass.
+    ///
+    /// MEASURED on the prod box 2026-09-23: every pass reported
+    /// `tables_list_failed = 19` with `partitions_considered = 0`, all six
+    /// attempts returned `table_list_failed`, the day never latched, and
+    /// `STORAGE-GAP-04` fired every evening for at least four days — for
+    /// tables that had nothing to archive because they did not exist.
+    ///
+    /// An absent table has nothing to move to S3, so it cannot make the day
+    /// incomplete. A table that EXISTS and whose list query fails for any
+    /// other reason (timeout, 5xx, malformed body) is still a real
+    /// `tables_list_failed` and still keeps the day unlatched.
+    pub tables_absent: u32,
     /// Rows durably archived to S3 across dropped partitions.
     pub rows_archived: u64,
     /// Compressed bytes uploaded to S3.
@@ -985,9 +1455,380 @@ pub struct ArchiveRunSummary {
     /// Uncompressed CSV bytes exported — the disk-bytes-freed ESTIMATE
     /// basis (columnar on-disk size differs; CSV is the honest upper proxy).
     pub csv_bytes_exported: u64,
+    /// Whether the sweep ACTUALLY RAN, as opposed to returning early.
+    ///
+    /// # Why a summary needs this at all
+    ///
+    /// Every other field here is a count, and a pass that never started has
+    /// the same counts as a pass that ran and found nothing to do: all zeros.
+    /// Two early returns produce exactly that — the concurrency-guard skip and
+    /// the WAL-suspension fail-closed skip — and both are emphatically NOT
+    /// "the day's archival is done".
+    ///
+    /// Without this flag a caller cannot tell them apart, and both callers got
+    /// it wrong in different directions: the daily scheduler read a zero
+    /// summary as a COMPLETE day and wrote its durable latch, sealing a day on
+    /// which nothing had been archived; the disk-pressure leg read
+    /// `dropped == 0` as "ran and found nothing reclaimable", which is its
+    /// escalation condition, and would have raised a false `STORAGE-GAP-05`
+    /// Critical.
+    ///
+    /// `false` by `Default` is load-bearing: both early returns hand back
+    /// `ArchiveRunSummary::default()`, so they report honestly without either
+    /// site having to remember to set anything.
+    pub pass_ran: bool,
+    /// Tables skipped this run because they were WAL-SUSPENDED.
+    ///
+    /// Kept separate from [`Self::tables_list_failed`] because the two need
+    /// different operator actions — a list-query error is retried, a
+    /// suspension needs `ALTER TABLE … RESUME WAL` — and because a suspended
+    /// table otherwise leaves NO trace: it `continue`s before any other
+    /// counter is touched, so a run that skipped every table for suspension
+    /// is byte-identical to a run with nothing to do.
+    pub tables_wal_suspended: u32,
+    /// Tables whose remaining partitions were skipped this run because a
+    /// per-partition `wal_tables()` check (before the export, or again
+    /// before the drop) could not prove the table's WAL fully applied —
+    /// lagging, suspended mid-run, absent from the probe, or the probe
+    /// itself failed. Counted once per table per run (2026-10-02).
+    ///
+    /// Separate from [`Self::tables_wal_suspended`], which is the run-start
+    /// snapshot: this one is the per-partition gate, and its most common
+    /// cause is a table that is merely behind, which clears on its own.
+    /// The daily scheduler reads it as "incomplete, retry".
+    pub tables_wal_not_applied: u32,
+    /// True ONLY when this call returned without starting, because another
+    /// pass already held [`ARCHIVE_PASS_LOCK`].
+    ///
+    /// # Why this is separate from `pass_ran == false`
+    ///
+    /// Both early returns hand back a default summary, so until 2026-09-01
+    /// they were indistinguishable — and they mean opposite things. A
+    /// WAL-probe fail-closed means NOBODY is archiving and the caller should
+    /// retry. A lock skip means the OTHER driver is archiving right now and
+    /// the caller should stand aside without spending anything.
+    ///
+    /// Collapsing them cost a real defect (adversarial review, 2026-09-01):
+    /// the daily scheduler charged an attempt for every tick that landed
+    /// inside a long disk-pressure pass, so six overlaps exhausted the day's
+    /// budget, paged that the archive had not completed on a box where it was
+    /// completing, and then abandoned the daily sweep for that day.
+    pub contended: bool,
+    /// Partitions HELD this run because their trading day has not been
+    /// cross-verified yet (daily leg only; §12.15.2 of the REST lock).
+    ///
+    /// Not a failure and deliberately not read by the daily scheduler's
+    /// latch: a held partition is retried by the next day's pass, and the
+    /// hold itself is bounded by [`MAX_CROSSVERIFY_HOLD_DAYS`].
+    pub held_unverified: u32,
+    /// Partitions HELD this run because their IST day is held (daily-universe
+    /// Quote 63: `held_days` or a `.hold` file, until the repair writes its `.done`).
+    /// Not a failure and not work tonight: nothing is copied or dropped and
+    /// the drain-hold backlog does not count them.
+    pub held_day: u32,
+    /// Depth partitions HELD this run because the after-close deferred-depth
+    /// pass still has rows of their hour to write back (DA-13d; since PR AA
+    /// step 2, the hour's after-close marks, read by the snapshot gate). Not
+    /// a failure: the partition is exported by a later pass, once the
+    /// rewritten rows are in it. The daily scheduler reads it as
+    /// "incomplete, retry".
+    pub held_deferred_depth: u32,
+    /// Hour-path partitions HELD this run because the archive quiesce lock
+    /// could not be taken in time: a WAL replay, a spill replay or the
+    /// after-close depth pass was writing old hours (PR AA step 2). Not a
+    /// failure; the daily scheduler gives the attempt back.
+    pub held_quiesce_busy: u32,
+    /// Hour-path partitions HELD this run because rows of their hour may
+    /// still be on their way to QuestDB: unapplied frames, an unsettled
+    /// rescue batch, not yet acknowledged, no WAL bound, or a clock that
+    /// stepped back (PR AA step 2). Not a failure and not a stand-aside: a
+    /// later pass archives the hour once its frames are in.
+    pub held_in_flight: u32,
+    // `held_top_volume_spill` REMOVED 2026-10-22 (plan item 62): nothing can
+    // replay rows into a `top_volume_<tf>` hour any more.
+    /// Partitions HELD this run by the caller's [`ArchivePassLimits`] (PR
+    /// DP-2, 2026-11-06): a depth partition skipped inside the session, a
+    /// partition past the per-pass cap, or a partition left when the pass
+    /// reached its stop time. Not a failure: a later pass exports it.
+    pub held_by_gate: u32,
+    /// The pass stopped at a partition boundary because it reached
+    /// [`ArchivePassLimits::stop_at_unix_secs`] (PR DP-2).
+    pub stopped_at_deadline: bool,
+    /// The pass ran with the in-session partition cap
+    /// ([`ArchivePassLimits::max_partitions`] set) (PR DP review H1). A capped
+    /// pass that dropped nothing because a table's WAL was behind is standing
+    /// aside, not "nothing reclaimable". A pass limited only by a stop time
+    /// (off-session or pre-open) is NOT capped: its WAL-lagging partitions
+    /// still escalate and page, as before PR DP (combined review 2026-11-06).
+    pub pass_gated: bool,
+    /// Bytes on disk of the partitions this pass could have acted on and
+    /// left on the box (PR AA step 6, AA-5): every partition of the worklist
+    /// after the cross-verification hold, less the ones it dropped and the
+    /// ones it held because rows of their hour were still on their way to
+    /// QuestDB (in-flight and after-close depth holds), plus the hours of
+    /// each table listed by the hour that have ended but become old enough
+    /// only later tonight (PR AA review). `None` when the pass
+    /// was not asked to measure it ([`PartitionArchiver::with_backlog_measure`]),
+    /// did not run, or a size listing could not be read. The daily leg hands
+    /// it to the drain hold.
+    pub archive_backlog_bytes: Option<u64>,
+}
+
+/// Gauge: seconds the archiver's last WAL snapshot wait took (PR AA step 6,
+/// AA-6). Local `/metrics` only, registered at 0 by
+/// [`register_archive_snapshot_wait_gauge`]; no page, alarm or EMF name.
+pub const WAL_SNAPSHOT_WAIT_GAUGE: &str = "tv_partition_archive_wal_snapshot_wait_secs";
+
+/// Registers [`WAL_SNAPSHOT_WAIT_GAUGE`] at 0, so the series exists before
+/// the first wait. O(1).
+pub fn register_archive_snapshot_wait_gauge() {
+    metrics::gauge!(WAL_SNAPSHOT_WAIT_GAUGE).set(0.0);
+    // 2026-11-17: the archiver's `/exp` busy retries, local only.
+    metrics::counter!(sliced_export::EXPORT_BUSY_RETRIES_COUNTER).increment(0);
+}
+
+/// The bytes of `worklist` partitions listed in `rows` (one table's
+/// `(name, diskSize)` listing), added to `sizes`. A worklist partition the
+/// listing does not name adds nothing. Pure, O(worklist + rows).
+pub(crate) fn add_worklist_sizes(
+    worklist: &[(&'static str, String)],
+    table: &str,
+    rows: &[(String, u64)],
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+) {
+    let listed: std::collections::HashMap<&str, u64> = rows
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), *bytes))
+        .collect();
+    for (t, partition) in worklist {
+        if *t == table
+            && let Some(bytes) = listed.get(partition.as_str())
+        {
+            sizes.insert((*t, partition.clone()), *bytes);
+        }
+    }
+}
+
+/// Adds the bytes of `table`'s hour partitions (from its `(name, diskSize)`
+/// listing `rows`) that have ENDED by `now_ist` but are not yet old enough
+/// for an hour window of `hours` (PR AA review): an hour starting at S is
+/// listed once S is more than `hours + 1` hours before now
+/// (`build_closed_hour_list_sql`), so until then it is copy work a later pass
+/// tonight does. Without them the drain hold let the box stop at 16:30 with
+/// the afternoon's hours still waiting. The open hour, day partitions,
+/// partitions `counts` refuses (a cross-verification hold) and partitions
+/// already in `sizes` are skipped. Pure, O(rows).
+pub(crate) fn add_pending_hour_sizes(
+    table: &'static str,
+    hours: u32,
+    rows: &[(String, u64)],
+    now_ist: chrono::NaiveDateTime,
+    counts: impl Fn(&str) -> bool,
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+) {
+    let listed_from = now_ist - chrono::TimeDelta::hours(i64::from(hours) + 1);
+    for (name, bytes) in rows {
+        let Some((start, end)) = partition_range_naive(name) else {
+            continue;
+        };
+        let is_hour = end - start == chrono::TimeDelta::hours(1);
+        let ended = end <= now_ist;
+        let not_listed_yet = start >= listed_from;
+        if is_hour && ended && not_listed_yet && counts(name) {
+            sizes.entry((table, name.clone())).or_insert(*bytes);
+        }
+    }
+}
+
+/// Removes from `sizes` every depth-table hour no acknowledgement can clear
+/// before the next session opens (PR AA review finding 12,
+/// [`snapshot_gate::depth_hour_cannot_clear_tonight`]): such an hour reads
+/// `NotAcked` in every pass tonight, so counting it kept the drain hold up
+/// for work no pass could do (about an hour, until it was listed and a pass
+/// reached it, and again after any pass that did not reach it). Every other
+/// entry stays. Pure, O(sizes).
+pub(crate) fn retain_copyable_tonight(
+    sizes: &mut std::collections::HashMap<(&'static str, String), u64>,
+    now_ist: chrono::NaiveDateTime,
+    muhurat_active: bool,
+    muhurat_yesterday: Option<bool>,
+    clock_trusted: bool,
+) {
+    sizes.retain(|(table, partition), _| {
+        !snapshot_gate::depth_hour_cannot_clear_tonight(
+            table,
+            partition,
+            now_ist,
+            muhurat_active,
+            muhurat_yesterday,
+            clock_trusted,
+        )
+    });
+}
+
+/// The bytes of `sizes` not in `settled` (dropped, or held in flight).
+/// Saturating. Pure, O(sizes).
+#[must_use]
+pub(crate) fn backlog_bytes_left(
+    sizes: &std::collections::HashMap<(&'static str, String), u64>,
+    settled: &std::collections::HashSet<(&'static str, String)>,
+) -> u64 {
+    sizes
+        .iter()
+        .filter(|(key, _)| !settled.contains(*key))
+        .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+}
+
+/// Limits the CALLER puts on one archive pass (PR DP-2, 2026-11-06).
+///
+/// Measured 2026-11-06 08:31–09:13 IST: a disk-pressure pass at 95% used
+/// exported 41 partitions back to back, nine of them `market_depth` hours of
+/// 95–115M rows at 4–5 minutes each, through QuestDB's single HTTP thread.
+/// Every ILP `/write` waited behind each export; 2.9M tick rows went to the
+/// spill. The default (no limits) is the behaviour before this change and is
+/// what the daily leg passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArchivePassLimits {
+    /// Skip every depth table (`market_depth`, `market_depth_book`).
+    pub skip_depth: bool,
+    /// At most this many partitions EXPORTED this pass (tighter of this and
+    /// the configured per-run cap). The run loop counts exports (PR DP review
+    /// H1): a partition refused at its pre-export WAL gate or held for the
+    /// after-close depth pass takes no slot, and a table whose WAL the
+    /// run-start probe found behind is dropped from the worklist first.
+    pub max_partitions: Option<u32>,
+    /// Stop at the next partition boundary once the wall clock (Unix seconds)
+    /// reaches this instant. Checked before every partition, so a partition
+    /// already being exported finishes.
+    pub stop_at_unix_secs: Option<i64>,
+}
+
+/// Applies the [`ArchivePassLimits`] depth skip and cap to a worklist.
+/// Returns the kept worklist and how many partitions the limits held. Pure,
+/// O(worklist).
+#[must_use]
+pub fn apply_pass_limits(
+    worklist: Vec<(&'static str, String)>,
+    limits: ArchivePassLimits,
+) -> (Vec<(&'static str, String)>, u32) {
+    let before = worklist.len();
+    let mut kept: Vec<(&'static str, String)> = if limits.skip_depth {
+        worklist
+            .into_iter()
+            .filter(|(table, _)| !is_depth_table(table))
+            .collect() // O(1) EXEMPT: cold once-per-run worklist filter
+    } else {
+        worklist
+    };
+    if let Some(cap) = limits.max_partitions {
+        kept.truncate(cap as usize);
+    }
+    let held = u32::try_from(before.saturating_sub(kept.len())).unwrap_or(u32::MAX);
+    (kept, held)
+}
+
+/// Whether a pass with stop time `stop_at_unix_secs` must stop before its
+/// next partition, at wall time `now_unix_secs`. Pure, O(1).
+#[must_use]
+pub const fn pass_deadline_reached(stop_at_unix_secs: Option<i64>, now_unix_secs: i64) -> bool {
+    match stop_at_unix_secs {
+        Some(at) => now_unix_secs >= at,
+        None => false,
+    }
+}
+
+/// How one `process_one` call ended, as far as the run loop cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionStep {
+    /// Dropped, kept, or failed for a partition-local reason — the next
+    /// partition of the same table is still attempted.
+    Done,
+    /// The table's WAL could not be proven fully applied BEFORE the export:
+    /// nothing was exported, so it does not count against a caller's
+    /// partition cap (PR DP review H1). The partition is kept and the rest of
+    /// the table's partitions are skipped this run.
+    WalNotAppliedBeforeExport,
+    /// The table's WAL fell behind between the export and the drop: the
+    /// export ran (it counts against the cap), the partition is kept, and the
+    /// rest of the table's partitions are skipped this run.
+    WalNotAppliedBeforeDrop,
+    /// Snapshot gate (PR AA step 2): rows of this hour may still be on their
+    /// way to QuestDB, or the after-close depth pass still has rows of it to
+    /// write back. Nothing was exported; the next partition is still tried.
+    Held,
+    /// Snapshot gate (PR AA step 2): the quiesce lock could not be taken in
+    /// time. Nothing was exported; the run holds every further hour-path
+    /// partition without waiting again.
+    QuiesceBusy,
+}
+
+impl PartitionStep {
+    /// Whether this step exported a partition (counts against a caller's
+    /// [`ArchivePassLimits::max_partitions`]). O(1).
+    const fn exported(self) -> bool {
+        matches!(self, Self::Done | Self::WalNotAppliedBeforeDrop)
+    }
+
+    /// Whether the table's WAL could not be proven applied. O(1).
+    const fn wal_not_applied(self) -> bool {
+        matches!(
+            self,
+            Self::WalNotAppliedBeforeExport | Self::WalNotAppliedBeforeDrop
+        )
+    }
+}
+
+/// The tables in `rows` whose WAL is BEHIND (`writerTxn < sequencerTxn`, not
+/// suspended), from one `wal_tables()` probe. A gated pressure pass drops
+/// their partitions from its worklist BEFORE its one-partition cap, so the
+/// cap is never spent on a table still being written (PR DP review H1). Pure,
+/// O(rows).
+#[must_use]
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 2): a snapshot-gate table (the depth
+/// tables) is never listed. Its old hours are archived once QuestDB reaches
+/// a snapshot taken under the quiesce lock, so a WAL that is merely behind
+/// (the live writer committing) is not a reason to skip it.
+pub(crate) fn wal_lagging_tables(rows: &[WalTableRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| {
+            !snapshot_gate_table(&r.name)
+                && matches!(
+                    wal_apply_verdict(rows, &r.name),
+                    WalApplyVerdict::Lagging { .. }
+                )
+        })
+        .map(|r| r.name.clone())
+        .collect() // O(1) EXEMPT: cold once-per-run probe of a few dozen rows
+}
+
+/// Drops from `worklist` every partition of a table in `lagging`. Returns the
+/// kept worklist and the DISTINCT tables it removed. Pure,
+/// O(worklist × lagging).
+#[must_use]
+pub(crate) fn drop_wal_lagging(
+    worklist: Vec<(&'static str, String)>,
+    lagging: &[String],
+) -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+    let mut removed: Vec<&'static str> = Vec::new();
+    let mut kept = Vec::with_capacity(worklist.len());
+    // O(1) EXEMPT: begin — cold once-per-run worklist filter over a few
+    // dozen lagging table names.
+    for (table, partition) in worklist {
+        if lagging.iter().any(|l| l == table) {
+            if !removed.contains(&table) {
+                removed.push(table);
+            }
+        } else {
+            kept.push((table, partition));
+        }
+    }
+    // O(1) EXEMPT: end
+    (kept, removed)
 }
 
 /// Outcome of streaming one partition's `/exp` CSV through gzip to disk.
+#[derive(Debug)]
 struct ExportedCsv {
     rows: u64,
     csv_bytes: u64,
@@ -999,26 +1840,258 @@ struct ExportedCsv {
     path: PathBuf,
 }
 
-/// S3 `HeadObject` metadata relevant to the reuse/conflict decision.
-struct S3ObjectMeta {
-    /// ContentLength.
-    len: u64,
-    /// `x-amz-checksum-sha256` attribute (base64), when the object carries
-    /// one. Our uploads ALWAYS set it; a foreign/legacy object may not.
-    checksum_sha256_b64: Option<String>,
-}
-
 /// QuestDB partition archiver — see the module docs for the full contract.
 pub struct PartitionArchiver {
     exec_url: String,
     exp_url: String,
     ddl_client: Client,
     export_client: Client,
-    s3: aws_sdk_s3::Client,
-    bucket: String,
+    /// How long a `/exp` request refused with 429 (QuestDB's export
+    /// connection limit) waits and retries (2026-11-17). Production:
+    /// [`sliced_export::ExportBusyBackoff::PRODUCTION`]; tests shrink it.
+    export_busy_backoff: sliced_export::ExportBusyBackoff,
+    /// A recent spent busy budget of this archiver (2026-11-17).
+    busy_hold: sliced_export::ExportBusyHold,
+    cold: S3Cold,
     temp_dir: PathBuf,
     cfg: PartitionRetentionConfig,
     audit: PartitionArchiveAuditWriter,
+    /// Answers "has trading day D been cross-verified?" — `None` means the
+    /// pass is ungated (the disk-pressure leg). Set ONLY by the daily leg,
+    /// per `no-rest-except-live-feed-2026-06-27.md` §12.15.2.
+    verified_day_gate: Option<VerifiedDayGate>,
+    /// Limits the caller put on this pass (PR DP-2); default = none.
+    pass_limits: ArchivePassLimits,
+    /// The quiesce lock the snapshot gate holds (PR AA step 2). `None` is the
+    /// process lock ([`crate::archive_quiesce::hold_writers_for_archive`]);
+    /// tests set a private one so they never contend with the process lock.
+    quiesce: Option<&'static crate::archive_quiesce::ArchiveQuiesce>,
+    /// Reads the in-flight state of an hour (PR AA step 2): the process
+    /// reader in production, a scripted one in tests.
+    in_flight_reader: InFlightReader,
+    /// Replaces the snapshot gate's poll interval in tests (`None` in
+    /// production: [`snapshot_gate::SNAPSHOT_POLL`]).
+    pause_override: Option<Duration>,
+    /// Replaces the IST day the pass reads for the contract name repair's
+    /// day range in tests (`None` in production: the wall clock).
+    repair_today_override: Option<chrono::NaiveDate>,
+    /// Replaces the IST instant the drain-hold backlog measure reads in
+    /// tests (`None` in production: the wall clock, read once per measure).
+    backlog_now_override: Option<chrono::NaiveDateTime>,
+    /// Measure the bytes this pass leaves on the box (PR AA step 6); set by
+    /// [`Self::with_backlog_measure`] for the daily leg only.
+    measure_backlog: bool,
+    /// Tables listed by the hour in this pass WITHOUT being forced past a
+    /// pending spill file (PR AA review). The snapshot gate reads each one's
+    /// own spill folder again under the quiesce lock ([`Self::in_flight_now`]).
+    spill_recheck_tables: Vec<&'static str>,
+    /// Whether a table's own spill folder holds a file the replay has not
+    /// read: [`process_spill_pending`] in production, scripted in tests.
+    spill_pending_reader: SpillPendingReader,
+    /// Where drops of hour-path-table partitions are recorded per IST day
+    /// (PR AA review finding 11): the process tally in production.
+    dropped_tally: &'static drop_tally::HourPathDropTally,
+    /// Where accepted DROPs are counted for the drain hold (PR AA-G, finding
+    /// 10): [`ARCHIVE_DROPS`] in production, a private ledger in tests.
+    drop_ledger: &'static ArchiveDropLedger,
+    /// `diskSize` of each hour-path-table partition this pass may drop,
+    /// listed at the pass start before any quiesce lock (finding 11).
+    drop_sizes: std::collections::HashMap<(String, String), u64>,
+    /// Whether the arrival-to-sequence mapping the drain-hold backlog's
+    /// depth-hour exclusion relies on holds (PR AA review finding 12):
+    /// [`snapshot_gate::process_depth_ack_bound_trusted`] in production.
+    depth_ack_bound_trusted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether the clock is inside the trading-day window (08:30 to the
+    /// session's export opening; owner Quote 60): the archiver never sorts
+    /// there. [`daily_export::in_trading_day_window_now`] in production.
+    trading_window_now: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Days held out of every pass (daily-universe Quote 63):
+    /// `cfg.held_days` plus the `.hold` / `.done` state files.
+    held_days: crate::held_days::HeldDays,
+}
+
+/// How the archiver reads a table's spill folder (PR AA review).
+pub(crate) type SpillPendingReader = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Whether `table`'s own spill folder holds a file the spill replay could
+/// still read, listed off the runtime worker. Cold: at most twice per
+/// hour-path partition, under the quiesce lock.
+fn process_spill_pending(table: &str) -> bool {
+    crate::off_worker::off_worker(|| PartitionArchiver::spill_dirs_have_pending_data(table))
+}
+
+/// Predicate the daily archive leg injects: `true` when day D is verified
+/// (a measured cross-verification ran, or D was not a trading day).
+///
+/// A closure rather than a direct marker read because the marker helpers
+/// live in the app crate, which this crate cannot depend on. Cold path — at
+/// most one call per eligible partition per pass.
+pub type VerifiedDayGate = std::sync::Arc<dyn Fn(chrono::NaiveDate) -> bool + Send + Sync>;
+
+/// How many CALENDAR days a partition may be held waiting for its day's
+/// cross-verification before it is archived anyway, loudly.
+///
+/// The hold must never become the reason the disk fills: a verifier that is
+/// broken for a week would otherwise pin a week of partitions on EBS. Three
+/// days covers a Friday verify failure over a weekend plus the Monday retry.
+pub const MAX_CROSSVERIFY_HOLD_DAYS: i64 = 3;
+
+/// What the daily gate decides for one partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossverifyHold {
+    /// Day is verified (or there is no gate) — archive normally.
+    Proceed,
+    /// Day is not verified yet and is inside the hold window — keep it.
+    Hold,
+    /// Day is not verified and the hold window has run out — archive it
+    /// anyway and say so loudly.
+    OverrideAfterCeiling,
+    /// The partition name has no parseable date — archive normally; the
+    /// gate never blocks on something it cannot read.
+    Unparseable,
+}
+
+/// Pure decision for one partition. O(1), no allocation.
+///
+/// `partition` is a QuestDB partition name (`YYYY-MM-DD` or
+/// `YYYY-MM-DDTHH`); only the first ten characters are read.
+pub fn crossverify_hold_decision(
+    partition: &str,
+    today_ist: chrono::NaiveDate,
+    is_verified: impl Fn(chrono::NaiveDate) -> bool,
+) -> CrossverifyHold {
+    let Some(day_part) = partition.get(..10) else {
+        return CrossverifyHold::Unparseable;
+    };
+    let Ok(day) = chrono::NaiveDate::parse_from_str(day_part, "%Y-%m-%d") else {
+        return CrossverifyHold::Unparseable;
+    };
+    if is_verified(day) {
+        return CrossverifyHold::Proceed;
+    }
+    let age_days = today_ist.signed_duration_since(day).num_days();
+    if age_days > MAX_CROSSVERIFY_HOLD_DAYS {
+        CrossverifyHold::OverrideAfterCeiling
+    } else {
+        CrossverifyHold::Hold
+    }
+}
+
+/// Which partition-list window a table gets this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HourWindowDecision {
+    /// Hour-granular, no spill in flight. The ordinary hour path.
+    Hours(u32),
+    /// Hour-granular DESPITE a spill in flight, because the volume is under
+    /// a disk-pressure episode. Counted separately so forcing is never
+    /// invisible.
+    ForcedHours(u32),
+    /// Table is hour-capable but a spill replay may be in flight and we are
+    /// not under pressure. Fall back to the day window.
+    DeferredToDays,
+    /// Table is not on the arrival-stamped allowlist. Day window by class.
+    DaysByClass,
+}
+
+impl HourWindowDecision {
+    /// Whether the pass lists this table by the hour. O(1).
+    pub(crate) const fn is_hour_granular(self) -> bool {
+        matches!(self, Self::Hours(_) | Self::ForcedHours(_))
+    }
+}
+
+/// Pure window choice, so the rule is testable without HTTP or a recorder.
+///
+/// `hours` is `None` for every table `hour_path::hour_window_for` keeps off
+/// the hour path in this pass and for a configured `0`, which is what keeps
+/// the day path the default.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3): `may_force` says whether a pending
+/// spill file may be overridden under pressure
+/// (`hour_path::may_force_with_spill_pending`: `market_depth` only, behind
+/// `market_depth_force_with_spill_pending`). Without it a pending spill
+/// defers the table to its day window, pressure or not.
+#[must_use]
+pub(crate) fn hour_window_decision(
+    hours: Option<u32>,
+    spill_pending: bool,
+    under_disk_pressure: bool,
+    may_force: bool,
+) -> HourWindowDecision {
+    match hours {
+        None => HourWindowDecision::DaysByClass,
+        Some(h) if !spill_pending => HourWindowDecision::Hours(h),
+        Some(h) if under_disk_pressure && may_force => HourWindowDecision::ForcedHours(h),
+        Some(_) => HourWindowDecision::DeferredToDays,
+    }
+}
+
+/// The spill folders whose pending rows a replay could still post into a
+/// swept table.
+///
+/// ⚠ CHANGED 2026-10-22 (plan item 62, operator Quote 34): the top_volume
+/// branch is gone with the top_volume writer, spill and replay. Nothing posts
+/// rows into a `top_volume_<tf>` table any more, so its partitions are no
+/// longer held for a pending spill file (`held_top_volume_spill` is removed);
+/// they are archived like every other table, then detached.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3): each table sees only the folder its
+/// writer spills to. The depth writer spills both depth tables to the depth
+/// folder (text and framed files); the tick writer spills `ticks`,
+/// `tick_quotes` and `feed_aux_packets` to the tick folder. A pending tick
+/// file therefore no longer keeps `market_depth` off its hour path. Any other
+/// table keeps both folders (it never takes the hour path, so this is only
+/// the conservative answer).
+#[must_use]
+pub(crate) fn spill_dirs_for_table(table: &str) -> &'static [&'static str] {
+    const DEPTH: [&str; 1] = [crate::depth_persistence::DEPTH_SPILL_DIR];
+    const TICK: [&str; 1] = [crate::tick_persistence::TICK_SPILL_DIR];
+    const TICKS_AND_DEPTH: [&str; 2] = [
+        crate::depth_persistence::DEPTH_SPILL_DIR,
+        crate::tick_persistence::TICK_SPILL_DIR,
+    ];
+    if DEPTH_TABLES.contains(&table) {
+        &DEPTH
+    } else if TICK_SPILL_TABLES.contains(&table) {
+        &TICK
+    } else {
+        &TICKS_AND_DEPTH
+    }
+}
+
+/// What a partition-list query found for one table.
+///
+/// `TableAbsent` exists because "this table is not on the volume" and
+/// "we could not ask" are different facts, and until 2026-09-23 they were
+/// counted as the same one. MEASURED on the box that day: 19 of the 48
+/// swept tables did not exist (retired REST legs, retired candle frames,
+/// renamed tables), every one returned QuestDB's "table does not exist",
+/// every one was counted in `tables_list_failed`, and so the daily pass
+/// reported `table_list_failed` on 6 of 6 attempts every day and never
+/// latched — firing STORAGE-GAP-04 daily for a pass that had done
+/// everything it could. An absent table has nothing to archive; that is
+/// a completed answer, not a failed one.
+#[derive(Debug, PartialEq, Eq)]
+enum PartitionListing {
+    /// The table exists; these partitions are eligible (possibly none).
+    Eligible(Vec<String>),
+    /// QuestDB said the table does not exist. Nothing to move.
+    TableAbsent,
+}
+
+/// `true` only for QuestDB's own "table does not exist" error envelope.
+///
+/// Requires BOTH the JSON `"error"` key AND the phrase, so a 2xx result set
+/// whose data happens to contain the words can never be read as absence,
+/// and every OTHER error (timeout, parse error, WAL-suspended table)
+/// stays a failure that keeps the day unlatched. Case-insensitive on the
+/// phrase because the wording is QuestDB's, not ours. O(body), cold path.
+#[must_use]
+fn is_table_absent_response(body: &str) -> bool {
+    if !body.contains("\"error\"") {
+        return false;
+    }
+    body.to_ascii_lowercase().contains("table does not exist")
 }
 
 impl PartitionArchiver {
@@ -1054,24 +2127,48 @@ impl PartitionArchiver {
             .timeout(Duration::from_secs(ARCHIVE_DDL_TIMEOUT_SECS))
             .build()
             .context("failed to create DDL HTTP client for partition archiver")?;
+        // No idle keep-alive (2026-11-17): QuestDB counts an open /exp
+        // connection against `http_export_connections` (limit 2) until it
+        // closes. reqwest keeps an idle connection 90 s by default, so a
+        // finished export of one archiver (and the daily exporter's, kept
+        // across its attempts) still held a slot; every 17 Nov Brutex attempt
+        // was refused with numOfConnections=3. One fresh local TCP connect
+        // per /exp request costs microseconds.
         let export_client = Client::builder()
             .timeout(Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS))
+            .pool_max_idle_per_host(EXPORT_CLIENT_MAX_IDLE_PER_HOST)
             .build()
             .context("failed to create export HTTP client for partition archiver")?;
-        let aws_conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .load()
-            .await;
-        let s3 = aws_sdk_s3::Client::new(&aws_conf);
+        let cold = S3Cold::connect(bucket).await;
         Ok(Some(Self {
             exec_url: format!("http://{}:{}/exec", questdb.host, questdb.http_port),
             exp_url: format!("http://{}:{}/exp", questdb.host, questdb.http_port),
             ddl_client,
             export_client,
-            s3,
-            bucket,
+            export_busy_backoff: sliced_export::ExportBusyBackoff::PRODUCTION,
+            busy_hold: sliced_export::ExportBusyHold::default(),
+            cold,
             temp_dir: PathBuf::from(ARCHIVE_TEMP_DIR),
             cfg: cfg.clone(),
             audit: PartitionArchiveAuditWriter::new(questdb),
+            verified_day_gate: None,
+            pass_limits: ArchivePassLimits::default(),
+            quiesce: None,
+            in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
+            pause_override: None,
+            repair_today_override: None,
+            backlog_now_override: None,
+            measure_backlog: false,
+            spill_recheck_tables: Vec::new(),
+            spill_pending_reader: std::sync::Arc::new(process_spill_pending),
+            dropped_tally: drop_tally::process_drop_tally(),
+            drop_ledger: &ARCHIVE_DROPS,
+            drop_sizes: std::collections::HashMap::new(),
+            depth_ack_bound_trusted: std::sync::Arc::new(
+                snapshot_gate::process_depth_ack_bound_trusted,
+            ),
+            trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
+            held_days: crate::held_days::HeldDays::from_config(cfg),
         }))
     }
 
@@ -1089,6 +2186,7 @@ impl PartitionArchiver {
         cfg: PartitionRetentionConfig,
         audit: PartitionArchiveAuditWriter,
     ) -> Result<Self> {
+        let held_days = crate::held_days::HeldDays::from_config(&cfg);
         Ok(Self {
             exec_url,
             exp_url,
@@ -1101,15 +2199,438 @@ impl PartitionArchiver {
                 .context("test DDL client")?,
             export_client: Client::builder()
                 .timeout(Duration::from_secs(ARCHIVE_EXPORT_TIMEOUT_SECS))
+                .pool_max_idle_per_host(EXPORT_CLIENT_MAX_IDLE_PER_HOST)
                 .no_proxy()
                 .build()
                 .context("test export client")?,
-            s3,
-            bucket,
+            export_busy_backoff: sliced_export::ExportBusyBackoff::PRODUCTION,
+            busy_hold: sliced_export::ExportBusyHold::default(),
+            cold: S3Cold::from_client(s3, bucket),
             temp_dir,
             cfg,
             audit,
+            verified_day_gate: None,
+            pass_limits: ArchivePassLimits::default(),
+            quiesce: None,
+            in_flight_reader: std::sync::Arc::new(snapshot_gate::process_in_flight_verdict),
+            pause_override: None,
+            repair_today_override: None,
+            backlog_now_override: None,
+            measure_backlog: false,
+            spill_recheck_tables: Vec::new(),
+            spill_pending_reader: std::sync::Arc::new(process_spill_pending),
+            dropped_tally: drop_tally::process_drop_tally(),
+            drop_ledger: &ARCHIVE_DROPS,
+            drop_sizes: std::collections::HashMap::new(),
+            depth_ack_bound_trusted: std::sync::Arc::new(
+                snapshot_gate::process_depth_ack_bound_trusted,
+            ),
+            trading_window_now: std::sync::Arc::new(daily_export::in_trading_day_window_now),
+            held_days,
         })
+    }
+
+    /// Holds each partition whose trading day has not been cross-verified.
+    ///
+    /// The daily post-market leg calls this; the disk-pressure leg does NOT,
+    /// because losing the box to a full disk costs more than archiving an
+    /// unverified day (`no-rest-except-live-feed-2026-06-27.md` §12.15.2).
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the gate; the hold it drives is tested through crossverify_hold_decision
+    pub fn with_verified_day_gate(mut self, gate: VerifiedDayGate) -> Self {
+        self.verified_day_gate = Some(gate);
+        self
+    }
+
+    /// Puts the caller's [`ArchivePassLimits`] on this archiver's passes
+    /// (PR DP-2). The disk-pressure leg sets them inside the session; the
+    /// daily leg does not.
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the limits; what they do is tested through apply_pass_limits, pass_deadline_reached and the stub-server pass test test_stub_pass_limits_skip_depth_cap_and_deadline
+    pub fn with_pass_limits(mut self, limits: ArchivePassLimits) -> Self {
+        self.pass_limits = limits;
+        self
+    }
+
+    /// Asks this archiver's passes to measure the bytes they leave on the
+    /// box ([`ArchiveRunSummary::archive_backlog_bytes`], PR AA step 6). Only
+    /// the daily leg sets it, for the drain hold: it costs one size listing
+    /// per table that has a partition to archive, per pass.
+    #[must_use]
+    // TEST-EXEMPT: builder setter that stores the flag; what it measures is tested through add_worklist_sizes, backlog_bytes_left and the stub-server pass test test_stub_pass_measures_the_backlog_it_leaves
+    pub fn with_backlog_measure(mut self) -> Self {
+        self.measure_backlog = true;
+        self
+    }
+
+    /// Test seam for the snapshot gate (PR AA step 2): a private quiesce lock
+    /// and a scripted in-flight reader, so a stub test never contends with
+    /// the process lock or depends on this process's WAL state.
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only builder; covered by test_regression_da13d_depth_hour_with_after_close_marks_is_held_until_cleared
+    pub(crate) fn with_test_snapshot_gate(
+        mut self,
+        quiesce: &'static crate::archive_quiesce::ArchiveQuiesce,
+        in_flight_reader: InFlightReader,
+    ) -> Self {
+        self.quiesce = Some(quiesce);
+        self.in_flight_reader = in_flight_reader;
+        self.pause_override = Some(Duration::from_millis(10));
+        self
+    }
+
+    /// Test seam (PR AA review): a scripted spill-folder reader for the
+    /// re-check under the quiesce lock. The pass's own listing still reads
+    /// the real (empty) folder, so a stub test can make a spill file appear
+    /// after the listing.
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only builder; covered by test_regression_spill_file_written_after_the_listing_holds_the_hour
+    pub(crate) fn with_test_spill_reader(mut self, reader: SpillPendingReader) -> Self {
+        self.spill_pending_reader = reader;
+        self
+    }
+
+    /// Test seam: the IST day the pass uses to decide which day-path
+    /// partitions the contract name repair can reach.
+    #[cfg(test)]
+    fn with_test_repair_today(mut self, today_ist: chrono::NaiveDate) -> Self {
+        self.repair_today_override = Some(today_ist);
+        self
+    }
+
+    /// Applies the cross-verification hold to the worklist. Held partitions
+    /// are counted, never failed; an over-ceiling partition is logged loudly
+    /// and archived.
+    fn apply_crossverify_hold(
+        &self,
+        worklist: Vec<(&'static str, String)>,
+        summary: &mut ArchiveRunSummary,
+    ) -> Vec<(&'static str, String)> {
+        let Some(gate) = self.verified_day_gate.as_ref() else {
+            return worklist;
+        };
+        let today_ist = chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive();
+        let mut kept = Vec::with_capacity(worklist.len());
+        // One loud line per pass, not one per partition: an hour-partitioned
+        // table contributes up to 24 partitions per day, so a per-partition
+        // `error!` would flood the sink for a single unverified day.
+        let mut overridden: u32 = 0;
+        let mut first_overridden: Option<(&'static str, String)> = None;
+        for (table, partition) in worklist {
+            match crossverify_hold_decision(&partition, today_ist, |d| gate(d)) {
+                CrossverifyHold::Hold => {
+                    summary.held_unverified = summary.held_unverified.saturating_add(1);
+                }
+                CrossverifyHold::OverrideAfterCeiling => {
+                    overridden = overridden.saturating_add(1);
+                    if first_overridden.is_none() {
+                        first_overridden = Some((table, partition.clone()));
+                    }
+                    kept.push((table, partition));
+                }
+                CrossverifyHold::Proceed | CrossverifyHold::Unparseable => {
+                    kept.push((table, partition));
+                }
+            }
+        }
+        if let Some((table, partition)) = first_overridden {
+            metrics::counter!("tv_partition_archive_hold_overridden_total")
+                .increment(u64::from(overridden));
+            error!(
+                code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                overridden,
+                first_table = table,
+                first_partition = %partition,
+                hold_ceiling_days = MAX_CROSSVERIFY_HOLD_DAYS,
+                "partitions archived WITHOUT a cross-verification: their day was never \
+                 verified and the hold ceiling has passed — archiving now so the disk \
+                 cannot fill waiting on a check that is not finishing"
+            );
+        }
+        if summary.held_unverified > 0 {
+            info!(
+                held_unverified = summary.held_unverified,
+                "partition archive: partitions HELD until their day's 1-minute \
+                 cross-verification finishes (not a failure; retried next pass)"
+            );
+        }
+        kept
+    }
+
+    /// Bytes the five Quote 51 tables hold on disk for IST day `day` (PR AA
+    /// step 5): the sum of `diskSize` over every partition of
+    /// [`HOUR_PATH_TABLES`] whose name is that day. The daily leg reads it
+    /// once after 15:40 to size its free-space target.
+    ///
+    /// A table QuestDB reports as not existing counts 0 (nothing on disk).
+    /// Any other failure, a non-2xx answer or a body missing `diskSize` on
+    /// any row, is an error, so a partial sum is never recorded as a whole
+    /// session. Five list queries, O(partitions), cold path.
+    ///
+    /// PR AA review finding 11: partitions of the day that either archive leg
+    /// already dropped are added back from the process drop tally
+    /// ([`drop_tally`]), so a day the disk-pressure leg drained does not read
+    /// low. A dropped partition the listing still shows (DROP refused,
+    /// unanswered, or not applied yet) is counted once, from the listing; a
+    /// gone one of unknown size makes the reading an error. Limit: the tally
+    /// is RAM only, so drops before a restart that day are not counted.
+    ///
+    /// # Errors
+    /// [`SessionBytesError::Unread`]: a list query failed, answered non-2xx,
+    /// or could not be parsed (a later reading may succeed).
+    /// [`SessionBytesError::Refused`]: a partition of the day is gone from
+    /// the listing with no known size, or the day recorded more drops than
+    /// the tally keeps; neither clears in this process, so reading again
+    /// never succeeds.
+    pub async fn session_bytes_on(
+        &self,
+        day: chrono::NaiveDate,
+    ) -> std::result::Result<u64, SessionBytesError> {
+        let mut listings: Vec<(&str, Vec<(String, u64)>)> =
+            Vec::with_capacity(HOUR_PATH_TABLES.len());
+        for table in HOUR_PATH_TABLES {
+            let rows = self
+                .partition_sizes(table)
+                .await
+                .map_err(SessionBytesError::Unread)?;
+            listings.push((table, rows));
+        }
+        // Read AFTER every listing: a DROP is recorded before it is sent, so
+        // any partition a listing no longer shows is in this read
+        // ([`drop_tally::session_bytes_with_drops`]).
+        let drops = self.dropped_tally.read(day);
+        let views: Vec<(&str, &[(String, u64)])> = listings
+            .iter()
+            .map(|(table, rows)| (*table, rows.as_slice()))
+            .collect();
+        drop_tally::session_bytes_with_drops(&views, day, &drops)
+            .map_err(SessionBytesError::Refused)
+    }
+
+    /// Records `table`'s `partition` in the drop tally for its IST day, with
+    /// its size, when it is an hour-path-table partition (PR AA review
+    /// finding 11). Called by `recheck_and_drop` BEFORE the last-moment
+    /// recount, whatever the recount and the DROP then answer: a lost DROP
+    /// answer may hide a DROP that ran, and a partition still listed is
+    /// counted from the listing. Any other table: nothing. Cold.
+    async fn record_drop_in_tally(&self, table: &str, partition: &str) {
+        let Some(hour_table) = HOUR_PATH_TABLES.iter().copied().find(|t| *t == table) else {
+            return;
+        };
+        let Some(day) = drop_tally::partition_day(partition) else {
+            return;
+        };
+        let size = self.size_just_before_drop(hour_table, partition).await;
+        self.dropped_tally.record(day, hour_table, partition, size);
+    }
+
+    /// `diskSize` of `table`'s `partition` read just before its last-moment
+    /// recount (review of PR AA finding 11): for a snapshot-gate table under
+    /// the quiesce lock and after the WAL wait; on the exact
+    /// `writerTxn == sequencerTxn` gate after that gate, with no lock. Rows
+    /// applied since the pass-start listing are counted. Runs BEFORE the
+    /// recount (never between it and the DROP) and is bounded by
+    /// [`PRE_DROP_SIZE_LISTING_TIMEOUT_SECS`], so on a gated table it adds at
+    /// most that to the exclusive lock hold. Falls back to the pass-start
+    /// size when this listing fails or does not show the partition; `None`
+    /// when neither is known. One list query, O(partitions), cold, once per
+    /// hour-path drop attempt.
+    async fn size_just_before_drop(&self, table: &str, partition: &str) -> Option<u64> {
+        let fresh = match self
+            .partition_sizes_within(
+                table,
+                Some(Duration::from_secs(PRE_DROP_SIZE_LISTING_TIMEOUT_SECS)),
+            )
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|(name, _)| name == partition)
+                .map(|(_, bytes)| bytes),
+            Err(err) => {
+                info!(
+                    table,
+                    partition,
+                    error = %format!("{err:#}"),
+                    "partition archive: size listing just before the drop failed; the \
+                     pass-start size is recorded for it"
+                );
+                None
+            }
+        };
+        fresh.or_else(|| {
+            self.drop_sizes
+                .get(&(table.to_string(), partition.to_string()))
+                .copied()
+        })
+    }
+
+    /// `(name, diskSize)` of every partition of `table`; empty when QuestDB
+    /// reports the table absent. One list query, O(partitions), cold.
+    async fn partition_sizes(&self, table: &str) -> Result<Vec<(String, u64)>> {
+        self.partition_sizes_within(table, None).await
+    }
+
+    /// [`Self::partition_sizes`] with an optional per-request timeout shorter
+    /// than the client's ([`ARCHIVE_DDL_TIMEOUT_SECS`]).
+    async fn partition_sizes_within(
+        &self,
+        table: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<(String, u64)>> {
+        let sql = build_partition_size_sql(table);
+        let mut request = self
+            .ddl_client
+            .get(&self.exec_url)
+            .query(&[("query", &sql)]);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request
+            .send()
+            .await
+            .context("partition size query failed")?;
+        let status = response.status();
+        let body = read_body_capped(response)
+            .await
+            .context("failed to read partition size response")?;
+        if is_table_absent_response(&body) {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "partition size list for {table} returned {status}: {}",
+                capture_rest_error_body(&body)
+            );
+        }
+        parse_partition_sizes(&body)
+            .with_context(|| format!("partition size list for {table} had no readable diskSize"))
+    }
+
+    /// `diskSize` of each partition of `worklist` on an hour-path table (PR AA
+    /// review finding 11), taken from `measured` when the pass already listed
+    /// it, else from one size listing per such table. It is the FALLBACK for
+    /// [`Self::size_just_before_drop`], which lists again under the lock; a
+    /// partition neither listing sizes is recorded with no known size (the
+    /// day's session reading refuses only once it is gone). O(worklist ×
+    /// partitions), at most five queries, cold, before any quiesce lock.
+    async fn hour_path_drop_sizes(
+        &self,
+        worklist: &[(&'static str, String)],
+        measured: Option<&std::collections::HashMap<(&'static str, String), u64>>,
+    ) -> std::collections::HashMap<(String, String), u64> {
+        let mut sizes = std::collections::HashMap::new();
+        for table in HOUR_PATH_TABLES {
+            let wanted: Vec<&(&'static str, String)> =
+                worklist.iter().filter(|(t, _)| t == table).collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            if let Some(measured) = measured
+                && wanted.iter().all(|key| measured.contains_key(*key))
+            {
+                for key in wanted {
+                    if let Some(bytes) = measured.get(key) {
+                        sizes.insert((key.0.to_string(), key.1.clone()), *bytes);
+                    }
+                }
+                continue;
+            }
+            match self.partition_sizes(table).await {
+                Ok(rows) => {
+                    for (name, bytes) in rows {
+                        if wanted.iter().any(|(_, p)| *p == name) {
+                            sizes.insert((table.to_string(), name), bytes);
+                        }
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        table,
+                        error = %format!("{err:#}"),
+                        "partition archive: pass-start size listing failed; a drop in this \
+                         pass records the size listed just before it, or no known size \
+                         when that listing fails too"
+                    );
+                }
+            }
+        }
+        sizes
+    }
+
+    /// The bytes of each partition of `worklist` (PR AA step 6), one size
+    /// listing per distinct table, plus (PR AA review) the hours of every
+    /// table in `hour_windows` that have ended but are not old enough yet:
+    /// a later pass tonight copies and drops them, so they are copy work
+    /// too. An hour the cross-verification hold would keep is not counted.
+    /// `None` when any listing fails: a partial map would understate what is
+    /// left. O(tables × partitions), cold.
+    async fn worklist_sizes(
+        &self,
+        worklist: &[(&'static str, String)],
+        hour_windows: &[(&'static str, u32)],
+    ) -> Option<std::collections::HashMap<(&'static str, String), u64>> {
+        let mut tables: Vec<&'static str> = worklist
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(hour_windows.iter().map(|(t, _)| *t))
+            .collect();
+        tables.sort_unstable();
+        tables.dedup();
+        // One clock reading for the whole measure (review of finding 12: a
+        // test that read the clock again could straddle 09:00 or midnight).
+        let now_ist = self.backlog_now_override.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                .naive_local()
+        });
+        let today_ist = now_ist.date();
+        let held_by_crossverify = |partition: &str| {
+            self.verified_day_gate.as_ref().is_some_and(|gate| {
+                crossverify_hold_decision(partition, today_ist, |d| gate(d))
+                    == CrossverifyHold::Hold
+            })
+        };
+        let mut sizes = std::collections::HashMap::with_capacity(worklist.len());
+        for table in tables {
+            match self.partition_sizes(table).await {
+                Ok(rows) => {
+                    add_worklist_sizes(worklist, table, &rows, &mut sizes);
+                    if let Some((_, hours)) = hour_windows.iter().find(|(t, _)| *t == table) {
+                        add_pending_hour_sizes(
+                            table,
+                            *hours,
+                            &rows,
+                            now_ist,
+                            |p| !held_by_crossverify(p) && self.backlog_counts_held(table, p),
+                            &mut sizes,
+                        );
+                    }
+                }
+                Err(err) => {
+                    info!(
+                        table,
+                        error = %format!("{err:#}"),
+                        "partition archive: size listing failed, so this pass reports no \
+                         archive backlog (the drain hold does not count it this time)"
+                    );
+                    return None;
+                }
+            }
+        }
+        // PR AA review finding 12: a depth hour no ack can clear before the
+        // next session is not copy work tonight, reached by this pass or not.
+        let yesterday = today_ist - chrono::TimeDelta::days(1);
+        retain_copyable_tonight(
+            &mut sizes,
+            now_ist,
+            tickvault_common::muhurat::current(),
+            tickvault_common::market_hours::installed_calendar_says_muhurat(yesterday),
+            (self.depth_ack_bound_trusted)(),
+        );
+        Some(sizes)
     }
 
     /// Runs one archive→verify→drop cycle over every retention-swept table.
@@ -1119,28 +2640,161 @@ impl PartitionArchiver {
     // a unit-tested pure function and the first prod run is the live probe
     // (a failed probe is a loud no-op, never a drop).
     pub async fn archive_and_drop_old_partitions(&mut self) -> ArchiveRunSummary {
+        // MUTUAL EXCLUSION between archive passes, taken here rather than at
+        // the call sites so no caller can forget it and no FUTURE caller has
+        // to know it exists.
+        //
+        // Two independent drivers reach this function: the disk-pressure loop
+        // (`disk_pressure_boot.rs`, 60-second poll) and the daily post-close
+        // loop (`daily_archive_boot.rs`). Before 2026-09-01 the daily leg was
+        // a ONE-SHOT inline block in `main.rs`, so an overlap needed a
+        // pressure episode to land inside that single instant and was
+        // vanishingly unlikely. Making the daily leg a polling loop — the fix
+        // for it never running at all — turns that near-impossibility into a
+        // routine occurrence, because both legs are awake in the same window.
+        //
+        // Two concurrent passes over the SAME tables are not merely wasteful.
+        // They race on the drop: pass A verifies partition P in S3 and is
+        // about to drop it while pass B, holding its own pre-drop recount for
+        // P taken before A's drop, issues a second `DROP PARTITION`. QuestDB
+        // answers the loser with an error, which this code classifies as a
+        // FAILURE and retries next run — so the visible symptom is a
+        // permanently "failing" archive of a partition that was archived
+        // perfectly well, and the counter that pages on it
+        // (`tv_partition_archive_failed_total`) fires on a healthy system.
+        //
+        // `try_lock`, never `lock`: the other pass is already doing this work,
+        // so QUEUEING behind it would run a second redundant sweep the moment
+        // the first finished. Skipping is the correct answer and is reported
+        // rather than silent. O(1), no allocation, no await while contended.
+        let _pass_guard = match ARCHIVE_PASS_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                metrics::counter!("tv_partition_archive_pass_skipped_concurrent_total")
+                    .increment(1);
+                warn!(
+                    "partition archive pass SKIPPED — another pass is already in flight \
+                     (this is the disk-pressure leg and the daily leg overlapping, which \
+                     is expected; the in-flight pass does the work)"
+                );
+                return ArchiveRunSummary {
+                    contended: true,
+                    ..ArchiveRunSummary::default()
+                };
+            }
+        };
+        self.run_archive_pass().await
+    }
+
+    /// The pass body, WITHOUT the concurrency guard.
+    ///
+    /// Split out so the guard lives at exactly one boundary — the public
+    /// entry point every production caller uses — while the body stays
+    /// callable directly by the stub integration tests below.
+    ///
+    /// Those tests exercise export/verify/drop decisions and cargo runs them
+    /// in PARALLEL, so calling the guarded entry point would have them contend
+    /// on the process-global lock and all but one would take the skip arm and
+    /// assert against an empty summary. That is the guard working correctly
+    /// and the test asking the wrong question. The guard has its own test
+    /// instead (`the_pass_guard_refuses_a_second_concurrent_pass`).
+    async fn run_archive_pass(&mut self) -> ArchiveRunSummary {
         let mut summary = ArchiveRunSummary::default();
 
+        // PR AA step 2: the quiesce-busy series exists from the first pass, so
+        // the first hold is a visible change rather than a new series.
+        snapshot_gate::count_quiesce_busy_held(0);
+        held_day_filter::count_held_day(0);
         self.ensure_audit_table().await;
         self.clean_temp_dir();
+
+        // SCRATCH-SPACE VERDICT — reported, never used to refuse.
+        //
+        // See `ARCHIVE_MIN_FREE_BYTES` for why refusing would be the wrong
+        // shape. The pass proceeds regardless; this exists so the deadlock is
+        // NAMED at the moment it starts rather than inferred afterwards from
+        // a pile of per-partition export failures that all share one cause.
+        // Probe the temp dir, CREATING it first.
+        //
+        // `clean_temp_dir` above returns early when the directory is absent —
+        // it is created lazily by the first export — and `df` on a path that
+        // does not exist exits non-zero in both its GNU and BSD forms. So
+        // probing it directly returned `ProbeFailed` → `Unknown` → a `debug!`
+        // nobody sees, on every run before the first export ever happened.
+        // The wedge detector would have been inert in exactly the situation it
+        // exists for, since a full volume is also where `create_dir_all` is
+        // most likely to have failed.
+        let temp_dir = std::path::Path::new(ARCHIVE_TEMP_DIR);
+        // Sweep S5: the mkdir and the `statvfs` probe below run off the
+        // shared tokio worker; this pass can run mid-session under disk pressure.
+        let probe_path =
+            if crate::off_worker::off_worker(|| std::fs::create_dir_all(temp_dir)).is_ok() {
+                temp_dir
+            } else {
+                // Could not create it — fall back to the volume's own root, which
+                // answers the same question ("how much room is on this disk") and
+                // is what the disk-pressure loop already probes.
+                std::path::Path::new(".")
+            };
+        let free_bytes = match crate::off_worker::off_worker(|| {
+            crate::disk_health_watcher::probe_disk_free_bytes(probe_path)
+        }) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => {
+                Some(free_bytes)
+            }
+            crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,
+        };
+        match archive_space_verdict(free_bytes, ARCHIVE_MIN_FREE_BYTES) {
+            ArchiveSpaceVerdict::Ample => {}
+            ArchiveSpaceVerdict::Wedged => {
+                metrics::counter!("tv_partition_archive_wedged_total").increment(1);
+                error!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    free_bytes = free_bytes.unwrap_or(0),
+                    floor_bytes = ARCHIVE_MIN_FREE_BYTES,
+                    "partition archive starting with LESS scratch space than one \
+                     partition needs — the archiver writes a temporary export file to \
+                     the very volume it is freeing, so exports are likely to fail. The \
+                     pass proceeds anyway (refusing would guarantee nothing is freed), \
+                     but expect per-partition failures with a single root cause"
+                );
+            }
+            ArchiveSpaceVerdict::Unknown => {
+                // Deliberately quiet. An unreadable volume is not evidence of
+                // a full one, and logging it at error level would page on a
+                // `df` that is merely unavailable.
+                debug!("partition archive: free-space probe unavailable; proceeding");
+            }
+        }
 
         // F3 (review round 1): WAL-suspension gate FIRST. A suspended
         // table's export/recount see only APPLIED rows — its ACKed-but-
         // unapplied WAL backlog would be destroyed on `RESUME WAL` if we
         // dropped its partitions. Probe failure = cannot prove ANY table is
         // safe → skip the ENTIRE run (fail-closed; next daily run retries).
-        let suspended: Vec<String> = match self.fetch_wal_suspended_tables().await {
-            Ok(names) => names,
-            Err(err) => {
-                error!(
-                    ?err,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition archive: wal_tables() probe failed — SKIPPING the whole \
+        // PR DP review H1: the same probe names the tables whose WAL is
+        // behind, which a gated pass drops before its cap.
+        let (suspended, wal_lagging): (Vec<String>, Vec<String>) =
+            match self.fetch_wal_tables().await {
+                Ok(rows) => {
+                    let lagging = wal_lagging_tables(&rows);
+                    let suspended = rows
+                        .into_iter()
+                        .filter(|r| r.suspended)
+                        .map(|r| r.name)
+                        .collect(); // O(1) EXEMPT: cold-path once-per-run probe
+                    (suspended, lagging)
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition archive: wal_tables() probe failed — SKIPPING the whole \
                      run (cannot prove tables are not WAL-suspended; fail-closed)"
-                );
-                return summary;
-            }
-        };
+                    );
+                    return summary;
+                }
+            };
         for table in &suspended {
             warn!(
                 table,
@@ -1149,10 +2803,35 @@ impl PartitionArchiver {
             );
         }
 
+        // Past every fail-closed gate — the sweep is genuinely happening now.
+        // Set HERE and not at the top of the function: everything above this
+        // line is a reason the pass did NOT run, and a caller must be able to
+        // tell that apart from a pass that ran and found nothing.
+        summary.pass_ran = true;
+        // A run where tables are WAL-suspended reaches this point, proceeds,
+        // and archives nothing FOR THOSE TABLES — they `continue` before
+        // `tables_scanned` or `tables_list_failed` are touched, so they leave
+        // no trace in any other count and the run looks clean.
+        //
+        // Recorded in its OWN field rather than folded into
+        // `tables_list_failed`: a list-query error and a WAL suspension need
+        // different operator actions (retry vs `RESUME WAL`), and merging them
+        // would put the wrong remedy in front of whoever reads the summary.
+        summary.tables_wal_suspended = u32::try_from(suspended.len()).unwrap_or(u32::MAX);
+
         // Build the worklist: (table, partition) pairs older than each
         // table's class hot window, active partition excluded, hostile names
         // rejected — the SAME selection primitives the detach path uses.
         let mut worklist: Vec<(&'static str, String)> = Vec::new();
+        // PR AA step 3: the tables listed by the hour in this pass. Each of
+        // them goes through the WAL snapshot gate (`uses_snapshot_gate`) and
+        // is never dropped from a gated pass for a WAL that is merely behind.
+        let mut hour_path_tables: Vec<&'static str> = Vec::new();
+        // PR AA review: the hour window of each table listed by the hour, so
+        // the drain-hold backlog also counts hours that become old enough
+        // later tonight (`add_pending_hour_sizes`).
+        let mut hour_windows: Vec<(&'static str, u32)> = Vec::new();
+        self.spill_recheck_tables.clear();
         for table in swept_tables() {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
@@ -1162,32 +2841,328 @@ impl PartitionArchiver {
             }
             summary.tables_scanned = summary.tables_scanned.saturating_add(1);
             let hot_days = hot_window_days(table, &self.cfg);
-            match self.list_eligible_partitions(table, hot_days).await {
-                Ok(names) => {
+            let window = self.hour_window(table);
+            if window.is_hour_granular() {
+                hour_path_tables.push(table);
+            }
+            match window {
+                // Listed by the hour with its spill folder empty: the folder
+                // is read again under the quiesce lock (PR AA review).
+                HourWindowDecision::Hours(hours) => {
+                    self.spill_recheck_tables.push(table);
+                    hour_windows.push((table, hours));
+                }
+                // Deliberately forced past a pending spill file
+                // (`market_depth` under pressure): no re-check.
+                HourWindowDecision::ForcedHours(hours) => hour_windows.push((table, hours)),
+                HourWindowDecision::DeferredToDays | HourWindowDecision::DaysByClass => {}
+            }
+            match self.list_eligible_partitions(table, window, hot_days).await {
+                Ok(PartitionListing::Eligible(names)) => {
                     for name in names {
                         worklist.push((table, name));
                     }
                 }
+                Ok(PartitionListing::TableAbsent) => {
+                    // Nothing to archive: the table is not there. Counted on
+                    // its own so the summary shows it, never as a failure.
+                    summary.tables_absent = summary.tables_absent.saturating_add(1);
+                    // info!, not debug!: a live table that vanished would otherwise be
+                    // named nowhere at production level. Once per table per archive
+                    // cycle (bounded by the retention table list), and deliberately not
+                    // an error: after a fresh-start reset, retired tables are absent by design.
+                    info!(
+                        table,
+                        "partition list: table does not exist — nothing to archive"
+                    );
+                }
                 Err(err) => {
-                    debug!(
+                    // Counted so the cycle summary can report it: a list
+                    // failure silently removes the table from this run, and
+                    // this log line is invisible at production level.
+                    // A table that EXISTS but could not be listed. Since
+                    // 2026-09-23 absence is classified separately, so this
+                    // arm is now a real failure and is logged at warn —
+                    // it keeps the day unlatched and the operator must be
+                    // able to see which table did it.
+                    summary.tables_list_failed = summary.tables_list_failed.saturating_add(1);
+                    warn!(
                         ?err,
-                        table, "partition list failed (table may not exist yet)"
+                        table, "partition list query failed for an existing table"
                     );
                 }
             }
         }
 
-        // Oldest first (partition names sort chronologically) so an
-        // interrupted run makes monotonic progress; bounded per run so the
-        // first catch-up sweep converges over a few evenings.
-        worklist.sort_by(|a, b| a.1.cmp(&b.1));
-        if self.cfg.max_partitions_per_run > 0 {
-            worklist.truncate(self.cfg.max_partitions_per_run as usize);
-        }
+        // Oldest first WITHIN each table (so an interrupted run makes
+        // monotonic progress per table), then FAIR-SHARED across tables so a
+        // table with an older backlog cannot starve a newer one out of the
+        // per-run budget entirely. See `fair_share_worklist` for the measured
+        // incident this replaces.
+        // Quote 63 held days first: a held partition takes no slot and is not
+        // counted as backlog (`held_day_filter`).
+        let worklist = self.apply_held_days(worklist, &mut summary);
+        // Cross-verification hold BEFORE the per-run cap, so a held partition
+        // never consumes budget a verified one could have used.
+        let worklist = self.apply_crossverify_hold(worklist, &mut summary);
+        // PR AA step 6: the sizes of what this pass could act on, for the
+        // drain hold. Measured after the cross-verification hold (a held day
+        // is not work tonight) and before any cap, so a partition the pass
+        // does not reach still counts.
+        let backlog_sizes = if self.measure_backlog {
+            self.worklist_sizes(&worklist, &hour_windows).await
+        } else {
+            None
+        };
+        let mut settled: std::collections::HashSet<(&'static str, String)> =
+            std::collections::HashSet::new();
+        // PR DP-2: the caller's depth skip BEFORE the per-run cap, so a held
+        // depth partition never takes a slot another table could use.
+        let (worklist, held_depth) = apply_pass_limits(
+            worklist,
+            ArchivePassLimits {
+                max_partitions: None,
+                ..self.pass_limits
+            },
+        );
+        summary.pass_gated = self.pass_limits.max_partitions.is_some();
+        // PR DP review H1: a capped (in-session) pass drops every table whose
+        // WAL the run-start probe found behind BEFORE its cap. The oldest
+        // partition is usually a ticks / candles / tick_quotes day still
+        // being written; with the cap applied first, the pass spent its one
+        // slot on it, read WalNotApplied, and dropped nothing.
+        // PR AA step 3: a table on the hour path this pass goes through the
+        // snapshot gate, so a WAL that is merely behind does not take it out.
+        let wal_lagging: Vec<String> = wal_lagging
+            .into_iter()
+            .filter(|t| !hour_path_tables.contains(&t.as_str()))
+            .collect(); // O(1) EXEMPT: cold once-per-run filter of a few dozen names
+        let worklist = if self.pass_limits.max_partitions.is_some() {
+            let (kept, removed) = drop_wal_lagging(worklist, &wal_lagging);
+            for table in &removed {
+                metrics::counter!(
+                    "tv_partition_archive_skipped_total",
+                    "reason" => "wal_not_applied",
+                    "cause" => "lagging",
+                    "stage" => "pass_start"
+                )
+                .increment(1);
+                info!(
+                    table,
+                    "partition archive (gated pass): table WAL is behind at the run start — \
+                     its partitions are left for a later pass and take no slot of this one"
+                );
+            }
+            summary.tables_wal_not_applied = summary
+                .tables_wal_not_applied
+                .saturating_add(u32::try_from(removed.len()).unwrap_or(u32::MAX));
+            kept
+        } else {
+            worklist
+        };
+        // 2026-11-15 (Quote 60 open limit): inside 08:30 to the ingest end
+        // the archiver never sorts, so moving a partition whose ordered
+        // export object already sits at its canonical key writes a second,
+        // content-addressed copy. A pressure pass there classifies every
+        // candidate BEFORE the per-run cap (review fix, same day: classified
+        // after it, today's not-yet-exported hours, the newest of each table,
+        // were cut by the cap first), fills the cap with the not-yet-exported
+        // ones, and gives an exported one only a slot they left. The loop
+        // below then skips an exported candidate once a not-yet-exported one
+        // has been dropped in this pass.
+        let cap_per_run = self.cfg.max_partitions_per_run as usize;
+        let (worklist, already_exported) =
+            if self.cfg.under_disk_pressure && (self.trading_window_now)() {
+                let exported = self.canonical_exported(&worklist).await;
+                (
+                    fair_share_preferring_unexported(worklist, &exported, cap_per_run),
+                    exported,
+                )
+            } else {
+                (
+                    fair_share_worklist(worklist, cap_per_run),
+                    std::collections::HashSet::new(),
+                )
+            };
+        // Set once a candidate with nothing at its canonical key was dropped
+        // in this pass; from then on an exported candidate is left for a
+        // later pass (counted as held by the gate), so the pass never writes
+        // a second copy after it already freed space without one.
+        let mut fresh_dropped = false;
+        // PR AA review finding 11: the pass-start size of every hour-path
+        // partition this pass may drop (the fallback for the listing taken
+        // just before each drop's recount), read before any quiesce lock.
+        // Review of the fix (2026-11-09): read AFTER the depth skip, the
+        // WAL-lag removal and the per-run cap, so a table the pass cannot
+        // drop from is never listed for it.
+        self.drop_sizes = self
+            .hour_path_drop_sizes(&worklist, backlog_sizes.as_ref())
+            .await;
+        summary.held_by_gate = held_depth;
         summary.partitions_considered = worklist.len() as u32;
 
-        for (table, partition) in worklist {
-            self.process_one(table, &partition, &mut summary).await;
+        // Tables whose WAL could not be proven applied this run. A table
+        // that fails the per-partition gate once is skipped for the rest of
+        // the run: its WAL state is a property of the whole table, and
+        // probing it again per partition would only repeat the refusal.
+        let mut wal_blocked: Vec<&'static str> = Vec::new();
+        let planned = worklist.len();
+        // PR DP review H1: the caller's cap counts partitions actually
+        // EXPORTED. One refused at its pre-export WAL gate, or held for the
+        // after-close depth pass, takes no slot, so the next is tried.
+        let cap = self.pass_limits.max_partitions;
+        let mut exported: u32 = 0;
+        let mut attempted: u32 = 0;
+        // PR AA step 2: set once the quiesce lock was busy for a full wait.
+        let mut quiesce_busy = false;
+        // Recheck of PR AA finding 1 (narrowed): the repair rewrites only
+        // today and the days before it, so only those day-path partitions
+        // wait for it.
+        let repair_today = self.repair_today_override.unwrap_or_else(|| {
+            chrono::Utc::now()
+                .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+                .date_naive()
+        });
+        for (index, (table, partition)) in worklist.into_iter().enumerate() {
+            if let Some(cap) = cap
+                && exported >= cap
+            {
+                let left = u32::try_from(planned.saturating_sub(index)).unwrap_or(u32::MAX);
+                summary.held_by_gate = summary.held_by_gate.saturating_add(left);
+                break;
+            }
+            // PR DP-2: a pass started before the session gate stops at the
+            // next partition boundary once its stop time has come; the
+            // partition being exported when the time came has finished.
+            if pass_deadline_reached(
+                self.pass_limits.stop_at_unix_secs,
+                chrono::Utc::now().timestamp(),
+            ) {
+                let left = u32::try_from(planned.saturating_sub(index)).unwrap_or(u32::MAX);
+                summary.held_by_gate = summary.held_by_gate.saturating_add(left);
+                summary.stopped_at_deadline = true;
+                info!(
+                    partitions_left = left,
+                    "partition archive pass STOPPED at its stop time (the session gate is \
+                     near); the partitions left are archived by a later pass"
+                );
+                break;
+            }
+            // Quote 63: a `.hold` written while this pass runs stops the
+            // copy here, not only on the next pass (one small file read).
+            if self.held_since_pass_start(table, &partition, &mut summary) {
+                continue;
+            }
+            // O(1) EXEMPT: begin — at most one entry per swept table, cold
+            // once-per-run loop.
+            if wal_blocked.contains(&table) {
+                continue;
+            }
+            // O(1) EXEMPT: end
+            // 2026-11-15 review fix: an exported candidate is taken only
+            // while no not-yet-exported one has been dropped in this pass
+            // (one hash probe; the set is empty outside an in-session
+            // pressure pass).
+            let candidate_exported = !already_exported.is_empty()
+                && already_exported.contains(&(table, partition.clone()));
+            if skip_exported_candidate(candidate_exported, fresh_dropped) {
+                summary.held_by_gate = summary.held_by_gate.saturating_add(1);
+                continue;
+            }
+            // PR AA step 2: a depth partition goes through the snapshot gate,
+            // which holds every writer that can post into an old hour for the
+            // whole of its copy and drop, and holds an hour the after-close
+            // depth pass still has rows of (it replaces the DA-13d all-night
+            // gate). Once the quiesce lock was busy for a full wait this run,
+            // every further hour-path partition is held without waiting
+            // again: the writer that held it is still at work.
+            // PR AA step 3: and so does every table on the hour path this
+            // pass (`tick_quotes`, `feed_aux_packets` under pressure).
+            let before = (
+                summary.dropped,
+                summary.held_in_flight,
+                summary.held_deferred_depth,
+            );
+            let step = if uses_snapshot_gate(table, &hour_path_tables) {
+                if quiesce_busy {
+                    summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+                    snapshot_gate::count_quiesce_busy_held(1);
+                    continue;
+                }
+                let gate = SnapshotGate::from_config(&self.cfg);
+                archive_with_snapshot_gate(self, table, &partition, gate, &mut summary).await
+            } else if crate::contract_name_repair::repair_may_rewrite_partition(
+                table,
+                &partition,
+                repair_today,
+            ) {
+                // Recheck of PR AA finding 1: the after-close contract name
+                // repair rewrites partitions of its days in place (same
+                // count, same max(ts)), so the day path of such a partition
+                // holds the old-hour writers out across the copy and the drop
+                // too. A busy lock holds this and every further locked
+                // partition, as above; an older partition never waits.
+                if quiesce_busy {
+                    summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+                    snapshot_gate::count_quiesce_busy_held(1);
+                    continue;
+                }
+                self.archive_one_quiesced(table, &partition, &mut summary)
+                    .await
+            } else {
+                self.process_one(table, &partition, &mut summary).await
+            };
+            if !matches!(step, PartitionStep::Held | PartitionStep::QuiesceBusy) {
+                attempted = attempted.saturating_add(1);
+            }
+            if step == PartitionStep::QuiesceBusy {
+                quiesce_busy = true;
+            }
+            if step.exported() {
+                exported = exported.saturating_add(1);
+            }
+            if !candidate_exported && summary.dropped > before.0 {
+                fresh_dropped = true;
+            }
+            if step.wal_not_applied() {
+                wal_blocked.push(table);
+                summary.tables_wal_not_applied = summary.tables_wal_not_applied.saturating_add(1);
+            }
+            // PR AA step 6: dropped, or held while rows of its hour are still
+            // on their way: either way not copy work left for tonight.
+            if backlog_sizes.is_some()
+                && before
+                    != (
+                        summary.dropped,
+                        summary.held_in_flight,
+                        summary.held_deferred_depth,
+                    )
+            {
+                settled.insert((table, partition));
+            }
+        }
+        summary.archive_backlog_bytes = backlog_sizes
+            .as_ref()
+            .map(|sizes| backlog_bytes_left(sizes, &settled));
+        if cap.is_some() {
+            // A capped pass reports what it handed to the export steps.
+            summary.partitions_considered = attempted;
+        }
+        if summary.held_deferred_depth > 0 {
+            info!(
+                held_deferred_depth = summary.held_deferred_depth,
+                "partition archive: depth hours HELD while the after-close pass still has \
+                 order-book rows of them to write back (not a failure; a later pass \
+                 archives them with those rows in)"
+            );
+        }
+        if summary.held_quiesce_busy > 0 || summary.held_in_flight > 0 {
+            info!(
+                held_quiesce_busy = summary.held_quiesce_busy,
+                held_in_flight = summary.held_in_flight,
+                "partition archive: hour partitions HELD (an old-hour writer was busy, or rows \
+                 of the hour may still be on their way to QuestDB; not a failure)"
+            );
         }
 
         // Best-effort final audit flush (AUDIT-WS-01 class — never gates).
@@ -1202,79 +3177,56 @@ impl PartitionArchiver {
 
         info!(
             tables_scanned = summary.tables_scanned,
+            tables_list_failed = summary.tables_list_failed,
+            tables_absent = summary.tables_absent,
             partitions_considered = summary.partitions_considered,
             verified = summary.verified,
             dropped = summary.dropped,
             failed = summary.failed,
             rows_archived = summary.rows_archived,
+            held_unverified = summary.held_unverified,
+            held_day = summary.held_day,
+            held_by_gate = summary.held_by_gate,
+            stopped_at_deadline = summary.stopped_at_deadline,
+            tables_wal_not_applied = summary.tables_wal_not_applied,
+            archive_backlog_bytes = summary.archive_backlog_bytes,
             gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
             csv_bytes_exported = summary.csv_bytes_exported,
-            bucket = %self.bucket,
+            bucket = %self.cold.bucket(),
             "partition archive cycle complete (archive→verify→drop)"
         );
 
         summary
     }
 
-    /// One partition: export → upload → verify → audit-first → drop.
-    async fn process_one(
+    /// Step 2 of [`Self::process_one`], shared with the rebuild copy (plan
+    /// item 66): the never-overwrite placement of an exported gzip at the
+    /// partition's canonical key, or at its content-addressed sidecar key when
+    /// the canonical object holds different bytes. Returns the key the bytes
+    /// now live at and whether THIS call uploaded them; `None` after a
+    /// recorded failure (counter, audit row and coded error already written,
+    /// temp file removed). Moved here verbatim on 2026-10-21; behaviour
+    /// unchanged. (2026-10-29: the rebuild copy was deleted after its run;
+    /// `process_one` is now the only caller.)
+    async fn place_archive(
         &mut self,
-        table: &'static str,
+        table: &str,
         partition: &str,
+        exported: &ExportedCsv,
         summary: &mut ArchiveRunSummary,
-    ) {
-        let Some((start, end)) = partition_range_bounds(partition) else {
-            // Unreachable in practice (names pass the allowlist upstream);
-            // fail-closed anyway.
-            self.record_failure(
-                table,
-                partition,
-                ArchiveOutcome::ExportFailed,
-                "unparseable partition name",
-                summary,
-            );
-            return;
-        };
-        let s3_key = format!("{ARCHIVE_S3_PREFIX}/{table}/{partition}.csv.gz");
-        // Did THIS run put the object there, or did it reuse an existing one?
-        // The 4b mismatch arm below needs to tell those apart: deleting an
-        // object we did not write could destroy the only copy of already-
-        // dropped data, which is exactly what the never-overwrite policy
-        // exists to prevent.
+    ) -> Option<(String, bool)> {
+        let mut s3_key = canonical_archive_key(table, partition);
         let mut uploaded_this_run = false;
-
-        // 1. Export (stream + gzip + count) — one partition on disk at a time.
-        let exported = match self
-            .export_partition_csv(table, partition, &start, &end)
-            .await
-        {
-            Ok(e) => e,
-            Err(err) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::ExportFailed,
-                    &format!("{err:#}"),
-                    summary,
-                );
-                return;
-            }
-        };
-        summary.csv_bytes_exported = summary
-            .csv_bytes_exported
-            .saturating_add(exported.csv_bytes);
-
-        // 2. Never-overwrite upload (F1): HeadObject FIRST. Reuse requires
-        //    CONTENT IDENTITY (review round 2): equal length (fast
-        //    pre-filter) AND a stored SHA-256 checksum equal to the freshly
-        //    exported gzip's digest — a stale object from a failed prior run
-        //    plus a mutated partition (backfill into a >hot-window
-        //    partition) with a coincidental compressed length can no longer
-        //    slip through to a drop. Length or checksum mismatch, OR an
-        //    object with NO checksum attribute (foreign/legacy) → LOUD
-        //    conflict, keep the partition (the object may be the only copy
-        //    of already-dropped data). Absent → conditional PutObject with
-        //    `If-None-Match: "*"` + `checksum_sha256`.
+        // Reuse requires CONTENT IDENTITY (review round 2): equal length (fast
+        // pre-filter) AND a stored SHA-256 checksum equal to the freshly
+        // exported gzip's digest — a stale object from a failed prior run
+        // plus a mutated partition (backfill into a >hot-window partition)
+        // with a coincidental compressed length can no longer slip through
+        // to a drop. Length or checksum mismatch, OR an object with NO
+        // checksum attribute (foreign/legacy) → sidecar key, never an
+        // overwrite (the object may be the only copy of already-dropped
+        // data). Absent → conditional PutObject with `If-None-Match: "*"` +
+        // `checksum_sha256`.
         match self.head_object_meta(&s3_key).await {
             Some(meta)
                 if meta.len == exported.gzip_bytes
@@ -1292,6 +3244,41 @@ impl PartitionArchiver {
                 );
             }
             Some(meta) => {
+                // The object at the canonical key does NOT match what this
+                // partition holds now. Before 2026-08-25 that ended the
+                // attempt: keep the partition, page nobody, retry forever.
+                //
+                // That policy deadlocked retention completely. Measured on
+                // the live box 2026-08-25: `partition_archive_audit` held
+                // 1,000 rows, EVERY one `s3_conflict`, ZERO successes ever
+                // recorded; the oldest surviving tick partition was
+                // 2026-06-02 against a ONE-DAY hot window, and the volume
+                // was 86% full and projected to fill within three sessions.
+                //
+                // The cause is not a bug in the never-overwrite rule — that
+                // rule is right. It is that a partition can legitimately
+                // CHANGE after it was archived: `ticks` is PARTITION BY HOUR
+                // on the exchange last-trade time, and 10.0% of live ticks
+                // arrive with a timestamp more than an hour behind their
+                // receive time (6,433,267 of 64,349,753 on 2026-08-24). Those
+                // land in an already-archived hourly partition, so the next
+                // export can never reproduce the archived bytes again, and
+                // the partition is pinned to disk for the life of the box.
+                //
+                // Resolution: keep the never-overwrite guarantee EXACTLY as
+                // it is — the existing object is never touched, never
+                // deleted, never PUT over — and write the current content to
+                // a CONTENT-ADDRESSED sidecar key instead. The key embeds the
+                // full SHA-256 of the gzip, so it is:
+                //   * collision-free  — a different digest is a different key;
+                //   * idempotent      — a re-run of an unchanged partition
+                //                       computes the same key and reuses it
+                //                       rather than uploading twice;
+                //   * complete        — it holds the partition as it stands
+                //                       NOW, which is what the drop removes.
+                // Both copies survive. The drop below then verifies against
+                // whichever key this run actually used.
+                let sidecar_key = sidecar_archive_key(table, partition, &exported.gzip_sha256_hex);
                 let reason = if meta.len != exported.gzip_bytes {
                     format!(
                         "existing S3 object length {} != local gzip {}",
@@ -1308,18 +3295,87 @@ impl PartitionArchiver {
                         exported.gzip_sha256_b64
                     )
                 };
-                self.record_failure(
-                    table,
-                    partition,
-                    ArchiveOutcome::S3Conflict,
-                    &format!(
-                        "{reason} — NEVER overwritten (may be the only copy of \
-                         already-dropped data); operator must inspect the key"
-                    ),
-                    summary,
-                );
-                remove_temp_file(&exported.path);
-                return;
+                match self.head_object_meta(&sidecar_key).await {
+                    Some(side)
+                        if side.len == exported.gzip_bytes
+                            && side.checksum_sha256_b64.as_deref()
+                                == Some(exported.gzip_sha256_b64.as_str()) =>
+                    {
+                        // A previous run already archived exactly this
+                        // content under the sidecar key. Reuse it — this is
+                        // the idempotent path, not a second upload.
+                        metrics::counter!("tv_partition_archive_sidecar_reused_total").increment(1);
+                        info!(
+                            table,
+                            partition,
+                            s3_key = %sidecar_key,
+                            reason = %reason,
+                            "canonical archive key differs from the current partition \
+                             (late-arriving rows changed it); identical sidecar archive \
+                             already present — reusing it, canonical key untouched"
+                        );
+                        s3_key = sidecar_key;
+                    }
+                    Some(_) => {
+                        // The sidecar key exists with DIFFERENT content. Two
+                        // distinct gzips cannot share a full SHA-256, so this
+                        // is a foreign object squatting the key rather than
+                        // one of ours. Refuse exactly as before.
+                        self.record_failure(
+                            table,
+                            partition,
+                            ArchiveOutcome::S3Conflict,
+                            &format!(
+                                "{reason}; and the content-addressed sidecar key is \
+                                 occupied by an object with a DIFFERENT digest — \
+                                 neither key overwritten; operator must inspect both"
+                            ),
+                            summary,
+                        );
+                        remove_temp_file(&exported.path);
+                        return None;
+                    }
+                    None => {
+                        uploaded_this_run = true;
+                        if let Err(err) = self
+                            .upload_to_s3(&exported.path, &sidecar_key, &exported.gzip_sha256_b64)
+                            .await
+                        {
+                            self.record_failure(
+                                table,
+                                partition,
+                                ArchiveOutcome::UploadFailed,
+                                &format!("{err:#}"),
+                                summary,
+                            );
+                            remove_temp_file(&exported.path);
+                            return None;
+                        }
+                        summary.gzip_bytes_uploaded = summary
+                            .gzip_bytes_uploaded
+                            .saturating_add(exported.gzip_bytes);
+                        metrics::counter!("tv_partition_archived_total").increment(1);
+                        // Counted separately from a clean first archive: a
+                        // rising sidecar rate means partitions are being
+                        // re-dirtied after archival, which is the signal that
+                        // the hot window is shorter than the feed's real
+                        // out-of-order lateness.
+                        metrics::counter!("tv_partition_archive_sidecar_written_total")
+                            .increment(1);
+                        warn!(
+                            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                            table,
+                            partition,
+                            s3_key = %sidecar_key,
+                            reason = %reason,
+                            "canonical archive key differs from the current partition \
+                             (late-arriving rows changed it) — archived to a \
+                             content-addressed sidecar key; canonical object NEVER \
+                             overwritten, both copies retained"
+                        );
+                        s3_key = sidecar_key;
+                    }
+                }
             }
             None => {
                 uploaded_this_run = true;
@@ -1335,7 +3391,7 @@ impl PartitionArchiver {
                         summary,
                     );
                     remove_temp_file(&exported.path);
-                    return;
+                    return None;
                 }
                 summary.gzip_bytes_uploaded = summary
                     .gzip_bytes_uploaded
@@ -1343,50 +3399,118 @@ impl PartitionArchiver {
                 metrics::counter!("tv_partition_archived_total").increment(1);
             }
         }
+        Some((s3_key, uploaded_this_run))
+    }
 
-        // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
-        let recount = self.recount_rows(table, &start, &end).await;
-        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
-        let proof = match verify_archive(
-            table,
-            partition,
-            exported.rows,
-            exported.csv_bytes,
-            exported.gzip_bytes,
-            &exported.gzip_sha256_hex,
-            recount,
-            s3_len,
-        ) {
-            Ok(proof) => proof,
-            Err(failure) => {
-                self.record_failure(
-                    table,
-                    partition,
-                    failure.outcome(),
-                    &format!("{failure:?}"),
-                    summary,
-                );
-                remove_temp_file(&exported.path);
-                return;
-            }
+    /// [`Self::process_one`] with the archiver side of the archive quiesce
+    /// lock held from before the export to after the drop (recheck of PR AA
+    /// finding 1), for a table the after-close contract name repair can
+    /// rewrite on one of its days
+    /// ([`crate::contract_name_repair::repair_may_rewrite_partition`]). The
+    /// repair takes the writer side around its statement, so no repair
+    /// statement runs between this export and this drop. A lock that cannot
+    /// be taken within `archive_quiesce_wait_secs` keeps the partition
+    /// (`QuiesceBusy`, counted). Cold, once per such partition.
+    async fn archive_one_quiesced(
+        &mut self,
+        table: &'static str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> PartitionStep {
+        let wait = SnapshotGate::from_config(&self.cfg).quiesce_wait;
+        let Some(hold) = ArchiveIo::hold_old_hour_writers(self, wait).await else {
+            summary.held_quiesce_busy = summary.held_quiesce_busy.saturating_add(1);
+            snapshot_gate::count_quiesce_busy_held(1);
+            info!(
+                table,
+                partition,
+                waited_secs = wait.as_secs(),
+                "partition archive: an old-hour writer (a replay, or the contract name \
+                 repair) is writing — partition KEPT for a later pass (not a failure)"
+            );
+            return PartitionStep::QuiesceBusy;
         };
-        remove_temp_file(&exported.path);
-        summary.verified = summary.verified.saturating_add(1);
-        metrics::counter!("tv_partition_archive_verified_total").increment(1);
+        let step = self.process_one(table, partition, summary).await;
+        drop(hold);
+        step
+    }
 
-        // 4. Audit-GATED (F2): the `verified` row must be ACK-flushed
-        //    (ILP-over-HTTP) BEFORE the drop — a failed flush WITHHOLDS the
-        //    drop (the partition is kept; retried next run).
-        if let Err(err) = self.append_verified_audit_gated(table, partition, &proof, &s3_key) {
+    /// One partition through the EXACT WAL gate: export → upload → verify →
+    /// audit-first → drop. Every table except the snapshot-gate tables
+    /// (`snapshot_gate::snapshot_gate_table`) goes this way.
+    async fn process_one(
+        &mut self,
+        table: &'static str,
+        partition: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> PartitionStep {
+        let Some((start, end)) = partition_range_bounds(partition) else {
+            // Unreachable in practice (names pass the allowlist upstream);
+            // fail-closed anyway.
             self.record_failure(
                 table,
                 partition,
-                ArchiveOutcome::AuditFailed,
-                &format!("verified-audit flush not ACKed — drop withheld: {err:#}"),
+                ArchiveOutcome::ExportFailed,
+                "unparseable partition name",
                 summary,
             );
-            return;
+            return PartitionStep::Done;
+        };
+
+        // 0a. ONE COPIER AT A TIME (2026-11-15 audit, exportflow-4). This
+        //     path takes no quiesce lock on a day-path partition, so outside
+        //     the session the daily export could copy the same partition at
+        //     the same time; whichever uploaded second found other bytes at
+        //     the canonical key and wrote a second full copy, kept forever.
+        //     While the export holds the partition it is KEPT for a later
+        //     pass (not a failure), which then reuses the export's object.
+        //     Held for the whole copy, verify and drop.
+        let _copy_claim = if daily_export::export_order_by(table).is_some() {
+            let quiesce = self
+                .quiesce
+                .unwrap_or_else(crate::archive_quiesce::process_archive_quiesce);
+            match quiesce.try_claim_copy(crate::archive_quiesce::Copier::Archive, table, partition)
+            {
+                Some(claim) => Some(claim),
+                None => {
+                    metrics::counter!(
+                        "tv_partition_archive_skipped_total",
+                        "reason" => "export_copying"
+                    )
+                    .increment(1);
+                    info!(
+                        table,
+                        partition,
+                        "partition archive: the daily export is copying this partition — \
+                         KEPT for a later pass, which reuses its object (not a failure)"
+                    );
+                    return PartitionStep::Held;
+                }
+            }
+        } else {
+            None
+        };
+
+        // 0b. WAL-APPLIED GATE, before the export (2026-10-02). The run-start
+        //     probe only refuses SUSPENDED tables. A table that is merely
+        //     BEHIND holds acknowledged rows the export and both recounts
+        //     cannot see, so every count agrees and the drop proceeds. The
+        //     after-close deferred-depth pass (morning `market_depth` hours,
+        //     15:45–17:15) and the spill replay / seal DLQ drain (yesterday's
+        //     partitions) all write into partitions this archiver can select.
+        //     Probed fresh here, per partition, because the run-start snapshot
+        //     can be minutes old by the time a late worklist item is reached.
+        if !self.wal_applied_gate(table, partition, "pre_export").await {
+            return PartitionStep::WalNotAppliedBeforeExport;
         }
+
+        // 1–4. Export, never-overwrite upload, verify, audit-first.
+        let Some(copied) = self
+            .copy_and_verify_partition(table, partition, &start, &end, summary)
+            .await
+        else {
+            return PartitionStep::Done;
+        };
 
         // 4b. LAST-MOMENT RECOUNT (2026-08-19) — close the write-during-drop
         //     window.
@@ -1414,79 +3538,186 @@ impl PartitionArchiver {
         //     check and the DROP statement; it cannot close it entirely
         //     without a table lock QuestDB does not offer. What it converts
         //     is the FAILURE MODE: silent loss becomes a counted, coded
-        //     refusal that retries.
-        match self.recount_rows(table, &start, &end).await {
-            Some(rows) if rows == proof.rows => {}
-            other => {
-                let detail = match other {
-                    Some(rows) => format!(
-                        "row count CHANGED between verify and drop: verified \
-                         {} rows, now {rows} — a writer touched this partition \
-                         (15:31 sweep / WAL replay / DLQ drain). The S3 copy is \
-                         stale, so the partition is KEPT, the stale object is \
-                         removed, and it is re-exported next run",
-                        proof.rows
-                    ),
-                    None => format!(
-                        "pre-drop recount UNAVAILABLE (verified {} rows) — \
-                         cannot prove the partition is unchanged, so the drop is \
-                         withheld and retried next run",
-                        proof.rows
-                    ),
-                };
-                metrics::counter!("tv_partition_drop_withheld_total").increment(1);
-                // CLEAR THE STALE OBJECT so the next run is not deadlocked
-                // (2026-08-19, found by the adversarial audit — the comment
-                // above said "re-exported next run", and that was FALSE).
-                //
-                // The partition changed, so the object we just uploaded no
-                // longer matches it. On the next run the export produces
-                // DIFFERENT bytes, the never-overwrite policy compares
-                // SHA-256, sees a mismatch, and raises S3Conflict — "keep the
-                // partition, never overwrite". That repeats forever: the
-                // partition is never dropped and the disk grows without
-                // bound. A safety check that silently converts into a
-                // permanent leak is worse than the race it closed.
-                //
-                // Deleting is safe ONLY for an object this run uploaded. If
-                // the object was REUSED, some earlier run wrote it and its
-                // partition may already have been dropped — deleting it could
-                // destroy the only surviving copy of that data, which is the
-                // precise scenario the never-overwrite policy protects. So a
-                // reused object is left alone and the operator is told, which
-                // is the honest end of the fail-closed path rather than a
-                // silent one.
-                if uploaded_this_run && let Err(err) = self.delete_s3_object(&s3_key).await {
-                    warn!(
-                            table,
-                            partition,
-                            s3_key = %s3_key,
-                            error = %format!("{err:#}"),
-                            "could not remove the stale archive object after a \
-                             pre-drop mismatch — the next run will raise \
-                             S3Conflict on this key until it is removed"
-                    );
-                }
+        //     refusal that retries. (PR AA step 2: the snapshot-gate tables
+        //     close it with the archive quiesce lock instead.)
+        //
+        //     WAL-APPLIED GATE, again (2026-10-02), and deliberately BEFORE
+        //     the recount rather than after it. The recount can only see
+        //     APPLIED rows. Proving `writerTxn == sequencerTxn` first means
+        //     every row acknowledged up to that instant is visible to the
+        //     recount that follows; checking after the recount would let a
+        //     row applied between the two pass both. A table that has fallen
+        //     behind since the export keeps this partition AND the S3 object:
+        //     the object is a correct copy of what was applied at export
+        //     time, and the next run either reuses it (nothing landed here)
+        //     or writes a content-addressed sidecar beside it.
+        if !self.wal_applied_gate(table, partition, "pre_drop").await {
+            metrics::counter!("tv_partition_drop_withheld_total").increment(1);
+            return PartitionStep::WalNotAppliedBeforeDrop;
+        }
+        // 4b/5. The re-read (count AND max(ts) against the values taken right
+        // after the export) and the drop, shared with the snapshot gate. On a
+        // mismatch the stale object THIS run uploaded is removed (2026-08-19:
+        // otherwise the next export's different bytes raise S3Conflict
+        // forever and the partition is never dropped); a reused object, which
+        // an earlier run wrote and may be the only copy of dropped data, is
+        // left alone.
+        recheck_and_drop(self, table, partition, &start, &end, copied, summary).await
+    }
+
+    /// Steps 1–4 of an archive, shared by both gates: export (stream + gzip +
+    /// count, one partition on disk at a time), never-overwrite upload (F1),
+    /// verify (recount AFTER the export and S3 head, fail-closed), and the
+    /// audit-gated `verified` row (F2). `None` after a recorded failure: the
+    /// partition is kept and the temp file removed.
+    async fn copy_and_verify_partition(
+        &mut self,
+        table: &str,
+        partition: &str,
+        start: &str,
+        end: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> Option<CopiedPartition> {
+        // 1. Export (stream + gzip + count) — one partition on disk at a time.
+        let exported = match self
+            .export_partition_csv(table, partition, start, end)
+            .await
+        {
+            Ok(e) => e,
+            Err(err) => {
                 self.record_failure(
                     table,
                     partition,
-                    ArchiveOutcome::CountMismatch,
-                    &detail,
+                    ArchiveOutcome::ExportFailed,
+                    &format!("{err:#}"),
                     summary,
                 );
-                return;
+                return None;
             }
+        };
+        summary.csv_bytes_exported = summary
+            .csv_bytes_exported
+            .saturating_add(exported.csv_bytes);
+
+        // 2. Never-overwrite upload (F1): HeadObject first; reuse only on
+        //    content identity; a different object at the canonical key gets a
+        //    content-addressed sidecar instead. See `place_archive`. It also
+        //    reports whether THIS run put the object there: the pre-drop
+        //    mismatch arm may delete only an object this run uploaded.
+        let (s3_key, uploaded_this_run) = self
+            .place_archive(table, partition, &exported, summary)
+            .await?;
+
+        // 3. Verify — recount AFTER the export + S3 head. All fail-closed.
+        // The tally (count AND max(ts)) taken here is what the pre-drop
+        // re-read must reproduce exactly.
+        let verified_tally = self.recount_rows(table, start, end).await;
+        let recount = verified_tally.as_ref().map(|t| t.rows);
+        let s3_len = self.head_object_meta(&s3_key).await.map(|m| m.len);
+        let proof = match verify_archive(
+            table,
+            partition,
+            exported.rows,
+            exported.csv_bytes,
+            exported.gzip_bytes,
+            &exported.gzip_sha256_hex,
+            recount,
+            s3_len,
+        ) {
+            Ok(proof) => proof,
+            Err(failure) => {
+                self.record_failure(
+                    table,
+                    partition,
+                    failure.outcome(),
+                    &format!("{failure:?}"),
+                    summary,
+                );
+                remove_temp_file(&exported.path);
+                return None;
+            }
+        };
+        remove_temp_file(&exported.path);
+        summary.verified = summary.verified.saturating_add(1);
+        metrics::counter!("tv_partition_archive_verified_total").increment(1);
+
+        // Owner Quote 60 (2026-11-14 reviews): EVERY verified copy of an
+        // export-table partition gets its amend record BEFORE the audit row
+        // and the drop, whatever the day's DONE state, a reuse of the
+        // canonical object included: an hour an earlier export attempt
+        // placed and this pass reused and drops is in no manifest when the
+        // next attempt cannot yet read this pass's audit row. Not written:
+        // the drop is withheld and the partition retried next pass. With the
+        // export switched off it is still written for a day that has a DONE
+        // (2026-11-14 third review: the rollback must not hide later copies
+        // of sealed days from Brutex).
+        if let Err(err) = daily_export::note_archived_copy(
+            &self.cold,
+            self.cfg.brutex_export_enabled,
+            table,
+            partition,
+            &s3_key,
+            proof.rows,
+            proof.gzip_bytes,
+            &proof.gzip_sha256_hex,
+        )
+        .await
+        {
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::AuditFailed,
+                &format!("brutex amend record not written — drop withheld: {err:#}"),
+                summary,
+            );
+            return None;
         }
 
-        // 5. Drop — the ONLY destructive step, gated on the type-state proof.
-        match self.drop_partition(&proof).await {
+        // 4. Audit-GATED (F2): the `verified` row must be ACK-flushed
+        //    (ILP-over-HTTP) BEFORE the drop — a failed flush WITHHOLDS the
+        //    drop (the partition is kept; retried next run).
+        if let Err(err) = self.append_verified_audit_gated(table, partition, &proof, &s3_key) {
+            self.record_failure(
+                table,
+                partition,
+                ArchiveOutcome::AuditFailed,
+                &format!("verified-audit flush not ACKed — drop withheld: {err:#}"),
+                summary,
+            );
+            return None;
+        }
+        Some(CopiedPartition {
+            proof,
+            s3_key,
+            uploaded_this_run,
+            verified_tally,
+        })
+    }
+
+    /// Step 5 — the DROP, the ONLY destructive step, gated on the type-state
+    /// proof inside `copied`, with its audit row and counters.
+    async fn drop_copied_partition(
+        &mut self,
+        copied: CopiedPartition,
+        summary: &mut ArchiveRunSummary,
+    ) {
+        let CopiedPartition { proof, s3_key, .. } = copied;
+        let table = proof.table().to_string();
+        let partition = proof.partition().to_string();
+        // PR AA review finding 11: the drop-tally record of this partition
+        // was made by `ArchiveIo::note_drop_intent`, BEFORE the last-moment
+        // recount (review of the fix, 2026-11-09): no query runs between
+        // that recount and this DROP.
+        let dropped = self.drop_partition(&proof).await;
+        match dropped {
             Ok(()) => {
                 summary.dropped = summary.dropped.saturating_add(1);
                 summary.rows_archived = summary.rows_archived.saturating_add(proof.rows);
                 metrics::counter!("tv_partition_dropped_total").increment(1);
+                self.drop_ledger.note(chrono::Utc::now().timestamp());
                 self.append_audit(
-                    table,
-                    partition,
+                    &table,
+                    &partition,
                     ArchiveOutcome::Dropped,
                     &proof,
                     &s3_key,
@@ -1504,8 +3735,8 @@ impl PartitionArchiver {
             Err(err) => {
                 // S3 copy already verified — safe; retried next run.
                 self.append_audit(
-                    table,
-                    partition,
+                    &table,
+                    &partition,
                     ArchiveOutcome::DropFailed,
                     &proof,
                     &s3_key,
@@ -1519,45 +3750,249 @@ impl PartitionArchiver {
                     code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
                     table,
                     partition,
-                    "partition DROP failed AFTER verified S3 archive — partition kept, \
-                     retried next run (S3 copy is durable)"
+                    "partition DROP failed AFTER verified S3 archive — partition kept and \
+                     retried next run (S3 copy is durable); if only the answer was lost, \
+                     QuestDB may already have dropped it"
                 );
             }
         }
     }
 
-    /// F3 (review round 1): probes `wal_tables()` and returns the
-    /// currently-SUSPENDED table names via the SAME by-column-name parser
-    /// the WAL-SUSPEND-01 watcher uses. Errors when the probe cannot
-    /// produce a usable answer — the caller then skips the ENTIRE run
-    /// (fail-closed: no drop without proof the table's WAL is applied).
-    async fn fetch_wal_suspended_tables(&self) -> Result<Vec<String>> {
-        let response = self
-            .ddl_client
-            .get(&self.exec_url)
-            .query(&[("query", WAL_TABLES_PROBE_SQL)])
-            .send()
-            .await
-            .context("wal_tables() probe request failed")?;
-        if !response.status().is_success() {
-            anyhow::bail!("wal_tables() probe returned {}", response.status());
+    /// F3 (review round 1): probes `wal_tables()` and returns every row via
+    /// the SAME by-column-name parser the WAL-SUSPEND-01 watcher uses. Errors
+    /// when the probe cannot produce a usable answer — the run-start caller
+    /// then skips the ENTIRE run, and the per-partition gate skips the table
+    /// (fail-closed: no export or drop without proof the WAL is applied).
+    async fn fetch_wal_tables(&self) -> Result<Vec<WalTableRow>> {
+        // Plan item 51d: one implementation, shared with the cross-check's
+        // readiness wait. Same query, same capped body read, same fail-closed
+        // rule on a skipped row.
+        crate::wal_suspension_watcher::fetch_wal_tables(&self.ddl_client, &self.exec_url).await
+    }
+
+    /// Per-partition WAL-applied gate (2026-10-02). Probes `wal_tables()`
+    /// fresh and returns `true` ONLY when `table` is not suspended and its
+    /// `writerTxn == sequencerTxn`. Anything else — lagging, suspended,
+    /// absent from the probe, txn columns missing, or the probe itself
+    /// failing — returns `false` after counting
+    /// `tv_partition_archive_skipped_total{reason="wal_not_applied"}` and
+    /// logging once; the caller keeps the partition and skips the table for
+    /// the rest of the run.
+    ///
+    /// `stage` is `"pre_export"` or `"pre_drop"` (bounded metric label).
+    async fn wal_applied_gate(&self, table: &str, partition: &str, stage: &'static str) -> bool {
+        let verdict = match self.fetch_wal_tables().await {
+            Ok(rows) => wal_apply_verdict(&rows, table),
+            Err(err) => {
+                metrics::counter!(
+                    "tv_partition_archive_skipped_total",
+                    "reason" => "wal_not_applied",
+                    "cause" => "probe_failed",
+                    "stage" => stage
+                )
+                .increment(1);
+                error!(
+                    ?err,
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    "partition archive: wal_tables() could not be read, so the table's \
+                     WAL cannot be proven applied — partition KEPT and the table skipped \
+                     this run (fail-closed; the next run retries)"
+                );
+                return false;
+            }
+        };
+        if verdict == WalApplyVerdict::Applied {
+            return true;
         }
-        let body = read_body_capped(response).await?;
-        let value: serde_json::Value =
-            serde_json::from_str(&body).context("wal_tables() probe body is not JSON")?;
-        let rows = parse_wal_tables_response(&value)
-            .map_err(|f| anyhow::anyhow!("wal_tables() probe parse failed: {}", f.as_str()))?;
-        Ok(rows
-            .into_iter()
-            .filter(|r| r.suspended)
-            .map(|r| r.name)
-            .collect()) // O(1) EXEMPT: cold-path once-per-run probe
+        metrics::counter!(
+            "tv_partition_archive_skipped_total",
+            "reason" => "wal_not_applied",
+            "cause" => verdict.as_str(),
+            "stage" => stage
+        )
+        .increment(1);
+        match verdict {
+            WalApplyVerdict::Lagging {
+                writer_txn,
+                sequencer_txn,
+            } => {
+                // Expected and self-clearing (a writer is busy, or the
+                // after-close passes are still applying) — warn, not error.
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    writer_txn,
+                    sequencer_txn,
+                    "partition archive: table WAL is BEHIND (acknowledged rows not yet \
+                     applied would be invisible to the export and recount) — partition \
+                     KEPT and the table skipped this run; the next run retries"
+                );
+            }
+            WalApplyVerdict::Suspended => {
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    "partition archive: table became WAL-SUSPENDED during the run — \
+                     partition KEPT and the table skipped (see WAL-SUSPEND-01)"
+                );
+            }
+            WalApplyVerdict::NotReported
+            | WalApplyVerdict::TxnUnreadable
+            | WalApplyVerdict::Applied => {
+                // A table missing from wal_tables(), or a row with no txn
+                // columns, will not clear on its own — it needs a person.
+                error!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    stage,
+                    cause = verdict.as_str(),
+                    "partition archive: wal_tables() does not let the table's WAL be \
+                     proven applied — partition KEPT and the table skipped this run \
+                     (fail-closed)"
+                );
+            }
+        }
+        false
+    }
+
+    /// Is there anything in either spill directory that a replay could still
+    /// POST back with ORIGINAL timestamps?
+    ///
+    /// Conservative by construction: any unreadable directory counts as PENDING,
+    /// because "I could not check" must never read as "safe" -- the same posture
+    /// the pre-drop recount already takes for a missing count.
+    ///
+    /// ⚠ CHANGED 2026-10-09: this used to count ANY entry. A drained spill file
+    /// is emptied to 0 bytes and kept, never deleted, so after the first spill
+    /// the hour-window archive was deferred for good. See
+    /// [`spill_dir_has_pending_data`] for the rule now used.
+    ///
+    /// ⚠ CHANGED 2026-10-13 (top_volume spill plan item 6): scoped to the
+    /// table. A `top_volume_<tf>` table looks only at its own spill folder;
+    /// every other table keeps the depth + tick check, so a top_volume spill
+    /// can never defer the hour archive of `market_depth`.
+    ///
+    /// ⚠ CHANGED 2026-10-22 (plan item 62): the top_volume folder is no longer
+    /// read; every table sees the depth + tick folders (see
+    /// [`spill_dirs_for_table`]).
+    fn spill_dirs_have_pending_data(table: &str) -> bool {
+        spill_dirs_for_table(table)
+            .iter()
+            .any(|dir| spill_dir_has_pending_data(std::path::Path::new(dir)))
+    }
+
+    /// The window `table` gets in this pass: the hour window from
+    /// `hour_path::hour_window_for`, judged against the table's OWN spill
+    /// folder, or its day window. Counts a forced or deferred hour window.
+    /// The spill folder is read only for a table that could take the hour
+    /// path (one folder listing, off the runtime worker). Cold, once per
+    /// table per pass.
+    fn hour_window(&self, table: &str) -> HourWindowDecision {
+        let hours = hour_window_for(table, &self.cfg);
+        // See `list_eligible_partitions` for why a pending spill file matters.
+        let spill_pending = hours.is_some()
+            && crate::off_worker::off_worker(|| Self::spill_dirs_have_pending_data(table));
+        let decision = hour_window_decision(
+            hours,
+            spill_pending,
+            self.cfg.under_disk_pressure,
+            may_force_with_spill_pending(table, &self.cfg),
+        );
+        match decision {
+            HourWindowDecision::ForcedHours(_) => {
+                metrics::counter!("tv_partition_archive_hour_window_forced_total").increment(1);
+            }
+            HourWindowDecision::DeferredToDays => {
+                metrics::counter!("tv_partition_archive_hour_window_deferred_total").increment(1);
+            }
+            HourWindowDecision::Hours(_) | HourWindowDecision::DaysByClass => {}
+        }
+        decision
     }
 
     /// Lists a table's eligible (aged-out, inactive, well-formed-name)
-    /// partitions via the SAME primitives the detach path uses.
-    async fn list_eligible_partitions(&self, table: &str, hot_days: u32) -> Result<Vec<String>> {
-        let list_sql = build_detach_list_sql(table, hot_days);
+    /// partitions via the SAME primitives the detach path uses, by the hour
+    /// or by the day as `window` says ([`Self::hour_window`]).
+    async fn list_eligible_partitions(
+        &self,
+        table: &str,
+        window: HourWindowDecision,
+        hot_days: u32,
+    ) -> Result<PartitionListing> {
+        // Hour-granular where the table allows it, day-granular everywhere
+        // else. `hot_window_hours` returns `None` for every table outside the
+        // arrival-stamped allowlist and for a configured `0`, so the day path
+        // stays the default and the fallback — a table that is not provably
+        // safe for hour archival simply never reaches the hour builder.
+        // Hour granularity is DISABLED while a spill replay could still be
+        // in flight, and that guard is the difference between a narrow
+        // acknowledged race and a reachable one.
+        //
+        // The rescue payload is RAW ILP: `tick_spill_replay` POSTs the
+        // original buffer back verbatim, so replayed rows carry their
+        // ORIGINAL timestamps and land in their ORIGINAL partition. At day
+        // granularity that was near-harmless -- the partition a replay
+        // targets is normally today's, and today's is never eligible. At
+        // `depth_hot_hours = 4` (the live setting) a partition becomes
+        // eligible FOUR HOURS after it was written, so a spill file rescued
+        // at 09:30 and drained at 14:00 is writing into a partition that has
+        // been droppable since 13:00.
+        //
+        // The pre-drop recount below still catches it and refuses, so this is
+        // not silent loss -- but it converts a once-a-day arithmetic
+        // possibility into a per-episode one, and the recount's own comment
+        // concedes it "cannot close [the window] entirely without a table
+        // lock QuestDB does not offer".
+        //
+        // So: if either spill directory still holds anything, fall back to
+        // the DAY path for this run. That path is the proven default, the
+        // degradation is bounded (archival is deferred, never skipped), and
+        // it needs no coordination between two subsystems -- a directory
+        // check is a fact both can see without a lock.
+        // (2026-10-09: "holds anything" now means a NON-EMPTY file the replay
+        // could still read; drained 0-byte files and `quarantine/` do not
+        // count. See `spill_dir_has_pending_data`.)
+        //
+        // UNDER DISK PRESSURE the deferral inverts (2026-09-01). The spill
+        // dirs are non-empty BECAUSE the disk is full, so deferring makes the
+        // one hourly-reclaimable table unreclaimable at exactly the moment
+        // reclaiming it is the point. Measured on the live box that day:
+        // `market_depth` held 185.7 GB across 10 hourly partitions against a
+        // configured 4-hour window, on a 93%-full volume, while the pressure
+        // episode reclaimed zero and escalated STORAGE-GAP-05.
+        //
+        // Overriding is safe because the deferral is defence-in-depth, not
+        // the defence. The drop is unchanged and remains fail-closed: export
+        // -> post-export recount over the identical range -> `HeadObject` ->
+        // `VerifiedArchive`. A replay that lands mid-window moves the row
+        // count, verification fails, and the partition is KEPT. The residual
+        // that the recount "cannot close entirely without a table lock
+        // QuestDB does not offer" is a narrow race against ONE partition; the
+        // alternative under pressure is a full volume, which WAL-suspends
+        // EVERY table at once (precedent: 2026-08-25, 14 tables suspended,
+        // writes ACKed and never applied, box unreachable by SSM).
+        //
+        // ⚠ CHANGED 2026-11-07 (PR AA step 3): the decision is made by
+        // `hour_window` (each table sees its OWN spill folder; only
+        // `market_depth` may be forced, behind
+        // `market_depth_force_with_spill_pending`), and an hour is judged by
+        // its END (`build_closed_hour_list_sql`).
+        let list_sql = match window {
+            HourWindowDecision::Hours(hours) | HourWindowDecision::ForcedHours(hours) => {
+                build_closed_hour_list_sql(table, hours)
+            }
+            HourWindowDecision::DeferredToDays | HourWindowDecision::DaysByClass => {
+                archive_day_list_sql(table, hot_days)
+            }
+        };
         let response = self
             .ddl_client
             .get(&self.exec_url)
@@ -1566,21 +4001,67 @@ impl PartitionArchiver {
             .await
             .context("partition list query failed")?;
         if !response.status().is_success() {
-            // Table may not exist yet — the detach path treats this as
-            // empty; mirror it (the caller logs at debug).
-            anyhow::bail!("partition list returned {}", response.status());
+            let status = response.status();
+            let body = read_body_capped(response).await.unwrap_or_default();
+            // An absent table is not a failure: there is nothing to move.
+            // Only QuestDB's own "table does not exist" answer qualifies —
+            // any other non-2xx stays an error and keeps the day unlatched.
+            if is_table_absent_response(&body) {
+                return Ok(PartitionListing::TableAbsent);
+            }
+            anyhow::bail!(
+                "partition list returned {status}: {}",
+                capture_rest_error_body(&body)
+            );
         }
         let body = read_body_capped(response)
             .await
             .context("failed to read partition list response")?;
+        if is_table_absent_response(&body) {
+            // QuestDB can answer a 200 with an error envelope on some
+            // versions; classify it the same way.
+            return Ok(PartitionListing::TableAbsent);
+        }
         let rows = parse_partition_rows(&body);
-        Ok(select_partitions_to_detach(&rows))
+        Ok(PartitionListing::Eligible(select_partitions_to_detach(
+            &rows,
+        )))
+    }
+
+    /// The candidates of `worklist` whose canonical archive key may already
+    /// hold an object (2026-11-15): one HeadObject per candidate of an export
+    /// table (`daily_export::export_order_by`), read the way the export reads
+    /// it (`daily_export::canonical_maybe_exists`: a failed HEAD counts as
+    /// "may exist"). Other tables are never asked. Cold: O(candidates) HEAD
+    /// requests, only on a pressure pass inside the trading-day window. Asked
+    /// of every candidate BEFORE the per-run cap (2026-11-15 review fix), so
+    /// on a box with a backlog it is one HEAD per eligible partition of an
+    /// export table, not per capped slot (Assumed tens of ms each).
+    async fn canonical_exported(
+        &self,
+        worklist: &[(&'static str, String)],
+    ) -> std::collections::HashSet<(&'static str, String)> {
+        let mut exported = std::collections::HashSet::new();
+        for (table, partition) in worklist {
+            if daily_export::export_order_by(table).is_none() {
+                continue;
+            }
+            let head = self
+                .cold
+                .head(&canonical_archive_key(table, partition))
+                .await;
+            if daily_export::canonical_maybe_exists(&head) {
+                exported.insert((*table, partition.clone()));
+            }
+        }
+        exported
     }
 
     /// Streams the partition's `/exp` CSV through gzip into the temp dir,
-    /// counting rows from the RAW byte stream. Cold path — the small
-    /// blocking encoder writes are bounded per chunk and the task runs
-    /// post-market on a multi-thread runtime.
+    /// counting rows from the RAW byte stream. The disk-pressure loop can
+    /// call this mid-session, so every file step and each chunk's gzip write
+    /// runs through [`crate::off_worker::off_worker`] (sweep S5): the worker
+    /// the frame drain and the socket readers share is moved aside first.
     async fn export_partition_csv(
         &self,
         table: &str,
@@ -1588,68 +4069,79 @@ impl PartitionArchiver {
         start: &str,
         end: &str,
     ) -> Result<ExportedCsv> {
-        std::fs::create_dir_all(&self.temp_dir).context("create archive temp dir")?;
         let path = self.temp_dir.join(format!("{table}-{partition}.csv.gz"));
-        let sql = build_export_sql(table, start, end);
+        // Owner Quote 60 (2026-11-14 review): the export tables are exported
+        // in DEDUP-key order ONLY when an object already sits at the canonical
+        // key (the daily export placed it, or an earlier archive) and the
+        // clock is outside the trading-day window, so this archive reuses that
+        // object instead of writing a second copy. Never a sort on QuestDB in
+        // session; never dependent on the export switch. A FAILED HeadObject
+        // reads as "may exist" (2026-11-14 third review): read as absent, it
+        // made an unordered export that the next HEAD found different from
+        // the export's ordered object, a second full copy kept forever.
+        let in_window = (self.trading_window_now)();
+        let canonical_exists = daily_export::export_order_by(table).is_some()
+            && daily_export::canonical_maybe_exists(
+                &self
+                    .cold
+                    .head(&canonical_archive_key(table, partition))
+                    .await,
+            );
+        if canonical_exists && in_window {
+            metrics::counter!("tv_partition_archive_export_unordered_in_session_total")
+                .increment(1);
+        }
+        let order_by = daily_export::archiver_export_order(table, canonical_exists, in_window);
+        // 2026-11-15: the ordered export runs in `ts` slices, each its own
+        // request, joined into the same bytes the single query gave
+        // (`sliced_export`); the unordered export is one request, as before.
+        let exported = match order_by {
+            Some(key) => {
+                self.export_ordered_csv(table, partition, key, path.clone())
+                    .await
+            }
+            None => {
+                self.export_query_csv(&build_export_sql(table, start, end), path.clone())
+                    .await
+            }
+        };
+        match exported {
+            Err(err) if order_by.is_some() && self.cfg.under_disk_pressure => {
+                // Freeing the disk never waits on the sort: under pressure,
+                // one retry in the old order (cost: at worst a
+                // content-addressed second copy). Outside pressure the
+                // partition is kept and the ordered export retried next pass
+                // (2026-11-14 review), so a transient error never becomes a
+                // permanent duplicate in S3.
+                metrics::counter!("tv_partition_archive_export_unordered_fallback_total")
+                    .increment(1);
+                warn!(
+                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                    table,
+                    partition,
+                    error = %format!("{err:#}"),
+                    "partition archive: the ordered export failed; retrying once \
+                     without ORDER BY"
+                );
+                self.export_query_csv(&build_export_sql(table, start, end), path)
+                    .await
+            }
+            other => other,
+        }
+    }
 
-        let mut response = self
-            .export_client
-            .get(&self.exp_url)
-            .query(&[("query", sql.as_str())])
-            .send()
+    /// Streams the `/exp` CSV of `sql` through gzip into `path`, counting
+    /// records from the RAW byte stream and hashing the compressed bytes.
+    /// Shared by the partition export above and the rebuild's whole-table
+    /// export (plan item 66), so both use one counted, hashed path.
+    /// (2026-10-29: the whole-table export was deleted with the rebuild
+    /// tool; the partition export is now the only caller.)
+    async fn export_query_csv(&self, sql: &str, path: PathBuf) -> Result<ExportedCsv> {
+        // 2026-11-15: one request through the shared slice path, its joiner
+        // in pass-through mode (every byte unchanged) and no deadline beyond
+        // the export client's own timeout.
+        self.export_requests_csv(&[sql.to_string()], None, path)
             .await
-            .context("/exp export request failed")?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body =
-                capture_rest_error_body(&read_body_capped(response).await.unwrap_or_default());
-            anyhow::bail!("/exp export returned {status}: {body}");
-        }
-
-        let file = std::fs::File::create(&path).context("create archive temp file")?;
-        // Review round 2: the compressed stream is SHA-256-hashed as it is
-        // written — the digest is the content identity for the S3
-        // reuse/conflict decision and travels on the conditional PutObject.
-        let mut encoder = GzEncoder::new(
-            Sha256Writer::new(std::io::BufWriter::new(file)),
-            Compression::default(),
-        );
-        // F5 (review round 1): quote-aware RECORD counting — a raw `\n`
-        // count over-counts on STRING fields carrying embedded newlines.
-        let mut counter = CsvRecordCounter::default();
-        let mut csv_bytes: u64 = 0;
-        while let Some(chunk) = response.chunk().await.context("/exp stream read failed")? {
-            counter.update(&chunk);
-            csv_bytes = csv_bytes.saturating_add(chunk.len() as u64);
-            encoder.write_all(&chunk).context("gzip write failed")?;
-        }
-        let hashing_writer = encoder.finish().context("gzip finish failed")?;
-        let (mut writer, digest) = hashing_writer.finish();
-        writer.flush().context("temp file flush failed")?;
-        drop(writer);
-        let gzip_sha256_b64 = base64_encode(&digest);
-        let gzip_sha256_hex = hex_encode(&digest);
-
-        let records = counter.records();
-        if records == 0 {
-            // Not even the CSV header arrived — an empty body is an export
-            // failure, never "0 rows" (audit Rule 11: no false-OK).
-            remove_temp_file(&path);
-            anyhow::bail!("/exp export returned an empty body (no CSV header)");
-        }
-        let gzip_bytes = std::fs::metadata(&path)
-            .context("stat archive temp file")?
-            .len();
-        Ok(ExportedCsv {
-            // records − 1 header record = data rows (QuestDB /exp always
-            // emits the header record first).
-            rows: records.saturating_sub(1),
-            csv_bytes,
-            gzip_bytes,
-            gzip_sha256_b64,
-            gzip_sha256_hex,
-            path,
-        })
     }
 
     /// Uploads the gzip'd export to the cold bucket — CONDITIONAL create
@@ -1662,20 +4154,7 @@ impl PartitionArchiver {
     /// never stored), and the stored attribute is the content identity a
     /// later run's reuse decision requires.
     async fn upload_to_s3(&self, path: &Path, key: &str, sha256_b64: &str) -> Result<()> {
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(path)
-            .await
-            .context("open temp file for S3 upload")?;
-        self.s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .if_none_match("*")
-            .checksum_sha256(sha256_b64)
-            .body(body)
-            .send()
-            .await
-            .context("S3 conditional PutObject (If-None-Match + checksum_sha256) failed")?;
-        Ok(())
+        self.cold.put_if_absent_path(path, key, sha256_b64).await
     }
 
     /// Removes an archive object this run uploaded, after a pre-drop mismatch.
@@ -1689,19 +4168,13 @@ impl PartitionArchiver {
     /// which the next run reports as `S3Conflict` — visible and diagnosable,
     /// never silent.
     async fn delete_s3_object(&self, key: &str) -> Result<()> {
-        self.s3
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .context("S3 DeleteObject for a stale post-mismatch archive object")?;
-        Ok(())
+        self.cold.delete(key).await
     }
 
     /// Post-export recount over the identical range (verify leg (a)).
+    /// Returns `count()` and `max(ts)` from one statement.
     /// `None` = unavailable → verify fails → partition kept.
-    async fn recount_rows(&self, table: &str, start: &str, end: &str) -> Option<u64> {
+    async fn recount_rows(&self, table: &str, start: &str, end: &str) -> Option<RangeTally> {
         let sql = build_count_sql(table, start, end);
         let response = self
             .ddl_client
@@ -1722,25 +4195,11 @@ impl PartitionArchiver {
     /// review-round-2 content identity; requested via
     /// `ChecksumMode::Enabled`, `None` when the object was written without
     /// one, e.g. a foreign/legacy object). `None` overall = object missing.
+    /// A failed HeadObject also reads `None` here (unchanged since the
+    /// 2026-10-02 move into `s3_cold`): the conditional PutObject that follows
+    /// turns a lost race into a loud 412, never an overwrite.
     async fn head_object_meta(&self, key: &str) -> Option<S3ObjectMeta> {
-        let head = self
-            .s3
-            .head_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-            .send()
-            .await
-            .ok()?;
-        let len = head.content_length().and_then(|n| u64::try_from(n).ok())?;
-        Some(S3ObjectMeta {
-            len,
-            checksum_sha256_b64: head
-                .checksum_sha256()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToString::to_string),
-        })
+        self.cold.head(key).await.ok().flatten()
     }
 
     /// The ONLY destructive step — requires the [`VerifiedArchive`] proof,
@@ -1887,30 +4346,39 @@ impl PartitionArchiver {
 
     /// Ensures the audit table exists (idempotent, once per run).
     async fn ensure_audit_table(&self) {
-        let ddl = partition_archive_audit_create_ddl();
-        match self
-            .ddl_client
-            .get(&self.exec_url)
-            .query(&[("query", ddl.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {}
-            Ok(resp) => {
-                let status = resp.status();
-                error!(
-                    %status,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition_archive_audit: CREATE TABLE returned non-2xx (audit rows \
-                     for this run may be lost; archive flow continues fail-closed)"
-                );
-            }
-            Err(err) => {
-                error!(
-                    ?err,
-                    code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
-                    "partition_archive_audit: CREATE TABLE request failed"
-                );
+        let create = partition_archive_audit_create_ddl();
+        // CREATE first, then the self-heal statements. Every other audit table
+        // in this crate re-applies `ADD COLUMN IF NOT EXISTS` + the DEDUP key
+        // at boot; this one did not (2026-09-01 audit), so a column added to
+        // the DDL would have broken the writer on any box whose table
+        // pre-dated it — silently, since audit rows fail soft.
+        let mut statements = vec![create];
+        statements.extend(partition_archive_audit_self_heal_ddl());
+        for ddl in statements {
+            match self
+                .ddl_client
+                .get(&self.exec_url)
+                .query(&[("query", ddl.as_str())])
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    let status = resp.status();
+                    error!(
+                        %status,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition_archive_audit: DDL returned non-2xx (audit rows \
+                         for this run may be lost; archive flow continues fail-closed)"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        ?err,
+                        code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+                        "partition_archive_audit: DDL request failed"
+                    );
+                }
             }
         }
     }
@@ -1918,7 +4386,9 @@ impl PartitionArchiver {
     /// Clears stale temp files from a previous interrupted run (one file per
     /// in-flight partition; a crash mid-export leaves at most one).
     fn clean_temp_dir(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.temp_dir) else {
+        // Sweep S5: the listing runs off the shared tokio worker.
+        let Ok(entries) = crate::off_worker::off_worker(|| std::fs::read_dir(&self.temp_dir))
+        else {
             return; // dir absent — created lazily at first export
         };
         for entry in entries.flatten() {
@@ -1930,17 +4400,315 @@ impl PartitionArchiver {
     }
 }
 
+/// The production I/O behind the snapshot gate (PR AA step 2). Each method
+/// is the existing archiver step; the gate only fixes their ORDER.
+impl ArchiveIo for PartitionArchiver {
+    type Hold = tokio::sync::RwLockWriteGuard<'static, ()>;
+
+    async fn read_wal_rows(&mut self) -> Result<Vec<WalTableRow>> {
+        self.fetch_wal_tables().await
+    }
+
+    async fn hold_old_hour_writers(&mut self, wait: Duration) -> Option<Self::Hold> {
+        match self.quiesce {
+            Some(lock) => lock.hold_writers(wait).await,
+            None => crate::archive_quiesce::hold_writers_for_archive(wait).await,
+        }
+    }
+
+    fn in_flight_now(&mut self, table: &str, span: HourFrameSpan) -> InFlightVerdict {
+        let verdict = (self.in_flight_reader)(table, span);
+        if verdict != InFlightVerdict::Clear {
+            return verdict;
+        }
+        // PR AA review: the pass listed this table by the hour while its
+        // spill folder was empty, but a batch can be rescued to a spill file
+        // later in the same pass. A rescued batch counts as acknowledged, so
+        // the frame checks above cannot see it; the folder can. Read under
+        // the lock, where no spill replay is posting.
+        if self.spill_recheck_tables.contains(&table) && (self.spill_pending_reader)(table) {
+            return InFlightVerdict::SpillPending;
+        }
+        InFlightVerdict::Clear
+    }
+
+    async fn pause_for(&mut self, duration: Duration) {
+        tokio::time::sleep(self.pause_override.unwrap_or(duration)).await;
+    }
+
+    async fn copy_and_verify(
+        &mut self,
+        table: &str,
+        partition: &str,
+        start: &str,
+        end: &str,
+        summary: &mut ArchiveRunSummary,
+    ) -> Option<CopiedPartition> {
+        self.copy_and_verify_partition(table, partition, start, end, summary)
+            .await
+    }
+
+    async fn note_drop_intent(&mut self, table: &str, partition: &str) {
+        self.record_drop_in_tally(table, partition).await;
+    }
+
+    async fn recount_range(&mut self, table: &str, start: &str, end: &str) -> Option<RangeTally> {
+        self.recount_rows(table, start, end).await
+    }
+
+    async fn delete_own_upload(&mut self, key: &str) -> Result<()> {
+        self.delete_s3_object(key).await
+    }
+
+    fn note_failure(
+        &mut self,
+        table: &str,
+        partition: &str,
+        outcome: ArchiveOutcome,
+        detail: &str,
+        summary: &mut ArchiveRunSummary,
+    ) {
+        self.record_failure(table, partition, outcome, detail, summary);
+    }
+
+    async fn drop_verified(&mut self, copied: CopiedPartition, summary: &mut ArchiveRunSummary) {
+        self.drop_copied_partition(copied, summary).await;
+    }
+}
+
+// The rebuild copy section (plan item 66, Quotes 32/33/34: copy every
+// partition to the cold bucket before the 2026-10-22 rebuild, never drop)
+// was DELETED 2026-10-29 with the one-off rebuild and wipe tools that called
+// it (rust-only lock §§0.13/0.14). `place_archive` and `wal_applied_gate`,
+// which it shared, stay with `process_one`.
+
 /// The full swept-table set: HOUR + DAY constants + the 21 live candle
 /// tables from the single source of truth.
 fn swept_tables() -> Vec<&'static str> {
     let candles = crate::shadow_persistence::candle_table_names();
+    // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no longer
+    // fold frames, but their partitions on the box are still archived here
+    // until they are copied (operator Quote 34).
+    let archive_only = crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES;
     let mut tables: Vec<&'static str> = Vec::with_capacity(
-        HOUR_PARTITIONED_TABLES.len() + DAY_PARTITIONED_TABLES.len() + candles.len(),
+        HOUR_PARTITIONED_TABLES.len()
+            + DAY_PARTITIONED_TABLES.len()
+            + candles.len()
+            + archive_only.len(),
     );
     tables.extend_from_slice(HOUR_PARTITIONED_TABLES);
     tables.extend_from_slice(DAY_PARTITIONED_TABLES);
     tables.extend_from_slice(&candles);
+    tables.extend_from_slice(&archive_only);
     tables
+}
+
+/// Does one spill folder still hold rows a replay could POST back with their
+/// ORIGINAL timestamps?
+///
+/// Only a regular file at the top of the folder with bytes the replay has not
+/// yet drained counts. The rules:
+///
+/// - A 0-byte file is a drained file. The replay empties a closed file once
+///   QuestDB has accepted it and keeps it (so the age sweep can tell drained
+///   from abandoned); the replay skips 0-byte files. It holds no rows.
+/// - The NEWEST file of a folder is never emptied, because the writer may
+///   still append to it; the replay remembers how far it drained it
+///   (`tick_spill_replay::resume_offset_for`). Such a file counts only while
+///   it is longer than that offset. The offset lives in memory, so after a
+///   restart the file counts until the next replay round drains it again.
+/// - The `quarantine/` sub-folder is never read by the replay: it holds files
+///   QuestDB refused for good, kept and uploaded, never re-sent. It cannot
+///   write into a partition, so it cannot race the hour archive.
+/// - The rule does NOT look at the file extension. Any non-empty file counts,
+///   whatever it is called, so a new spill format (for example a framed depth
+///   file) is covered without touching this function.
+/// - Anything this function cannot classify (an unreadable folder or entry, a
+///   symlink, any sub-folder other than `quarantine/`) counts as PENDING.
+///   "I could not check" must never read as "safe".
+///
+/// A missing folder holds nothing and is not pending.
+///
+/// Cost: one `read_dir` plus one `lstat` per top-level entry, O(entries), on
+/// the archive task (off the worker), once per archive run. Stops at the first
+/// pending entry.
+fn spill_dir_has_pending_data(path: &Path) -> bool {
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        // Unreadable -> assume pending. Fail toward the SAFE path.
+        Err(_) => return true,
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        // `DirEntry::metadata` does not follow a symlink, so a link is seen
+        // as a link and counted as pending below.
+        let Ok(meta) = entry.metadata() else {
+            return true;
+        };
+        let file_type = meta.file_type();
+        if file_type.is_file() {
+            // The replay never empties the NEWEST file of a folder (the writer
+            // may still append to it); it records how far it drained instead.
+            // Bytes past that offset are pending; a file drained to its end is
+            // not. A process restart forgets the offset (it reads 0), so the
+            // file counts as pending until the next replay round drains it.
+            // Drained, but its latest acks are not yet confirmed (audit DA-13b
+            // review): a QuestDB suspicion episode can still rewind it and
+            // send those rows again, into an hour this archive would export
+            // and drop. Pending until confirmed. One helper reads the offset,
+            // the acks and the offset again, so a rewind or an ack landing
+            // between the reads cannot make a pending file read drained
+            // (2026-10-13 (DA-13b review); see `spill_file_pending`).
+            if crate::tick_spill_replay::spill_file_pending(&entry.path(), meta.len()) {
+                return true;
+            }
+            // Emptied (0 bytes) or drained to its end: nothing left to replay.
+            continue;
+        }
+        if file_type.is_dir() && entry.file_name() == crate::tick_spill_replay::QUARANTINE_DIR {
+            // Set-aside data, never replayed.
+            continue;
+        }
+        // An unknown sub-folder, a symlink or a special file: cannot prove it
+        // holds nothing, so count it as pending.
+        return true;
+    }
+    false
+}
+
+/// The per-run worklist of an in-session pressure pass (2026-11-15, Quote 60
+/// open limit; review fix the same day): the candidates NOT in
+/// `already_exported` fair-shared into the cap first, then the exported ones
+/// fair-shared into whatever slots they left (none when they fill it), each
+/// group oldest first within its table as [`fair_share_worklist`] gives it.
+/// Classified before the cap, so a not-yet-exported candidate (the newest of
+/// its table) is never cut while an exported one keeps a slot. `cap == 0`
+/// means no cap, as in [`fair_share_worklist`]. Pure, O(n log n) (the two
+/// sorts inside [`fair_share_worklist`]), cold.
+#[must_use]
+pub(crate) fn fair_share_preferring_unexported(
+    worklist: Vec<(&'static str, String)>,
+    already_exported: &std::collections::HashSet<(&'static str, String)>,
+    cap: usize,
+) -> Vec<(&'static str, String)> {
+    let (fresh, exported): (Vec<_>, Vec<_>) = worklist
+        .into_iter()
+        .partition(|candidate| !already_exported.contains(candidate));
+    let mut out = fair_share_worklist(fresh, cap);
+    let left = if cap == 0 {
+        Some(0)
+    } else {
+        cap.checked_sub(out.len()).filter(|left| *left > 0)
+    };
+    if let Some(left) = left {
+        out.extend(fair_share_worklist(exported, left));
+    }
+    out
+}
+
+/// Whether the pass loop skips a candidate (2026-11-15 review fix): only an
+/// already-exported one, and only once a not-yet-exported candidate has been
+/// dropped in this pass. Outside an in-session pressure pass no candidate is
+/// marked exported, so nothing is skipped. Pure, O(1).
+#[must_use]
+pub(crate) const fn skip_exported_candidate(candidate_exported: bool, fresh_dropped: bool) -> bool {
+    candidate_exported && fresh_dropped
+}
+
+/// Fair-shares the per-run partition budget across tables, oldest-first
+/// within each table.
+///
+/// # The incident this replaces (MEASURED on the prod box, 2026-08-25)
+///
+/// The previous form sorted the whole worklist by partition name — i.e.
+/// globally oldest-first across every table — and then truncated to
+/// `max_partitions_per_run`. Partition names sort chronologically, so that is
+/// a global date order, and a table whose backlog is OLDER takes every slot
+/// before a table whose backlog is NEWER gets one.
+///
+/// That is not a theoretical ordering nit. On the box that day:
+///
+/// | table | eligible partitions | oldest |
+/// |---|---|---|
+/// | `ticks` | 185 | `2026-07-30T09` |
+/// | `market_depth` | 4 | `2026-08-24T08` |
+///
+/// plus a handful of `2026-06-02` candle partitions that fail with
+/// `s3_conflict` every run and are re-listed the next run, permanently
+/// occupying the very front of the queue. With `max_partitions_per_run = 200`,
+/// the June conflicts and the 185 `ticks` entries filled the budget before a
+/// single `market_depth` partition was reached — so `market_depth` received
+/// **zero** archive attempts, deterministically, every run, forever.
+///
+/// `market_depth` was 174 GB of the 196 GB QuestDB volume at the time (~17 GB
+/// per HOUR-partition), so the one table that could actually relieve disk
+/// pressure was the one table structurally guaranteed never to be archived.
+/// The disk filled, QuestDB WAL-suspended 14 tables, and a suspended table
+/// keeps ACKing ILP writes while discarding them.
+///
+/// # Why round-robin rather than "biggest first"
+///
+/// Selecting by bytes-reclaimed would target disk pressure more directly, but
+/// it needs a size probe per partition (another QuestDB round trip per
+/// candidate) and it can starve small tables indefinitely — the same failure
+/// in the other direction. Round-robin needs no extra I/O, cannot starve
+/// anything, and is deterministic, which is what makes it testable.
+///
+/// Within a table the order stays oldest-first, so the monotonic-progress
+/// property the previous comment claimed is genuinely preserved: an
+/// interrupted run still advances every table from its oldest end.
+///
+/// `cap == 0` means "no cap" (the config's documented disable value) and
+/// returns every item, still grouped and fairly interleaved.
+fn fair_share_worklist(
+    worklist: Vec<(&'static str, String)>,
+    cap: usize,
+) -> Vec<(&'static str, String)> {
+    // Oldest-first overall first, so each table's queue is oldest-first when
+    // the entries are distributed below.
+    let mut sorted = worklist;
+    sorted.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // Group by table, preserving FIRST-SEEN table order so the output is
+    // deterministic (a HashMap iteration order would not be).
+    let mut queues: Vec<(&'static str, std::collections::VecDeque<String>)> = Vec::new();
+    for (table, partition) in sorted {
+        match queues.iter_mut().find(|(t, _)| *t == table) {
+            Some((_, q)) => q.push_back(partition),
+            None => {
+                let mut q = std::collections::VecDeque::new();
+                q.push_back(partition);
+                queues.push((table, q));
+            }
+        }
+    }
+
+    let total: usize = queues.iter().map(|(_, q)| q.len()).sum();
+    let limit = if cap == 0 { total } else { cap.min(total) };
+
+    let mut out: Vec<(&'static str, String)> = Vec::with_capacity(limit);
+    // One pass per round, one partition per table per round.
+    while out.len() < limit {
+        let mut progressed = false;
+        for (table, queue) in &mut queues {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(partition) = queue.pop_front() {
+                out.push((*table, partition));
+                progressed = true;
+            }
+        }
+        if !progressed {
+            // Every queue is empty — cannot happen while out.len() < limit,
+            // but a bounded loop beats a provably-unreachable infinite one.
+            break;
+        }
+    }
+    out
 }
 
 /// Builds a proof-backed audit row (verified/dropped/drop_failed classes).
@@ -1971,7 +4739,7 @@ fn audit_row_from_proof(
 /// a hostile / misrouted `/exec` response can never balloon memory. Bytes
 /// past [`ARCHIVE_MAX_EXEC_BODY_BYTES`] are dropped: truncation only
 /// affects diagnostics, or fails JSON parsing CLOSED (keep, never drop).
-async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
+pub(crate) async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
     let mut out: Vec<u8> = Vec::new(); // O(1) EXEMPT: cold-path bounded body read
     while let Some(chunk) = response.chunk().await.context("body read failed")? {
         let remaining = usize::try_from(ARCHIVE_MAX_EXEC_BODY_BYTES)
@@ -1987,7 +4755,8 @@ async fn read_body_capped(mut response: reqwest::Response) -> Result<String> {
 
 /// Best-effort temp-file removal (a leftover is cleaned at next run start).
 fn remove_temp_file(path: &Path) {
-    if let Err(err) = std::fs::remove_file(path) {
+    // Sweep S5: the unlink runs off the shared tokio worker.
+    if let Err(err) = crate::off_worker::off_worker(|| std::fs::remove_file(path)) {
         warn!(?err, path = %path.display(), "archive temp file removal failed");
     }
 }
@@ -2007,31 +4776,616 @@ fn now_ist_nanos() -> i64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod fair_share_tests {
+    use super::fair_share_worklist;
+
+    /// Reproduces the prod worklist of 2026-08-25 exactly.
+    ///
+    /// `ticks` had 185 eligible partitions starting `2026-07-30`;
+    /// `market_depth` had 4 starting `2026-08-24`; the cap was 200. Under the
+    /// previous global oldest-first sort + truncate, every `ticks` entry sorts
+    /// ahead of every `market_depth` entry, so the 200-slot budget was spent
+    /// before `market_depth` was reached — zero attempts, every run, forever.
+    ///
+    /// BITE: replace the call below with
+    /// `w.sort_by(|a, b| a.1.cmp(&b.1)); w.truncate(200);` and this fails with
+    /// `market_depth scheduled: 0`.
+    #[test]
+    fn the_heaviest_table_is_not_starved_by_an_older_backlog() {
+        let mut worklist: Vec<(&'static str, String)> = Vec::new();
+        // The stuck 2026-06-02-class candle partitions: OLDEST of all, they
+        // fail with s3_conflict every run and are re-listed the next one, so
+        // they permanently occupy the head of a globally date-sorted queue.
+        for tf in ["candles_1m", "candles_3m", "candles_5m", "candles_15m"] {
+            for day in 1..=5 {
+                worklist.push((tf, format!("2026-06-{day:02}")));
+            }
+        }
+        // 185 ticks partitions, all OLDER than any market_depth one.
+        for day in 1..=37 {
+            for hour in 9..14 {
+                worklist.push(("ticks", format!("2026-07-{day:02}T{hour:02}")));
+            }
+        }
+        // 4 market_depth partitions, all NEWER — and the only ones that free
+        // meaningful disk (~17 GB per hour-partition vs ticks' far smaller).
+        for hour in 8..12 {
+            worklist.push(("market_depth", format!("2026-08-24T{hour:02}")));
+        }
+        assert!(
+            worklist.len() > 200,
+            "the reproduction must EXCEED the cap, or the truncate is a no-op \
+             and this test proves nothing — it did exactly that when first \
+             written, and the bite-proof is what caught it"
+        );
+
+        let scheduled = fair_share_worklist(worklist, 200);
+
+        let depth = scheduled
+            .iter()
+            .filter(|(t, _)| *t == "market_depth")
+            .count();
+        assert_eq!(
+            depth, 4,
+            "market_depth scheduled: {depth} — an older backlog on another \
+             table must never consume the whole per-run budget"
+        );
+        assert!(scheduled.len() <= 200, "cap must still bound the run");
+    }
+
+    #[test]
+    fn each_table_is_still_processed_oldest_first() {
+        let worklist = vec![
+            ("ticks", "2026-08-03T09".to_string()),
+            ("ticks", "2026-08-01T09".to_string()),
+            ("ticks", "2026-08-02T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        let scheduled = fair_share_worklist(worklist, 0);
+        let ticks: Vec<&str> = scheduled
+            .iter()
+            .filter(|(t, _)| *t == "ticks")
+            .map(|(_, p)| p.as_str())
+            .collect();
+        assert_eq!(
+            ticks,
+            vec!["2026-08-01T09", "2026-08-02T09", "2026-08-03T09"],
+            "monotonic per-table progress must survive the fair share"
+        );
+    }
+
+    /// 2026-11-15 (Quote 60 open limit, review fix): candidates with nothing
+    /// at their canonical key fill the per-run cap first, the exported ones
+    /// take only the slots left, and the newest (unexported) hour survives a
+    /// cap smaller than the candidate count.
+    #[test]
+    fn test_fair_share_preferring_unexported_fills_the_cap_with_unexported_first() {
+        use super::fair_share_preferring_unexported;
+        let hour = |table: &'static str, h: u32| (table, format!("2026-08-01T{h:02}"));
+        let worklist = vec![
+            hour("ticks", 9),
+            hour("tick_quotes", 9),
+            hour("ticks", 10),
+            hour("tick_quotes", 10),
+        ];
+        let exported: std::collections::HashSet<(&'static str, String)> =
+            [hour("ticks", 9), hour("tick_quotes", 9)]
+                .into_iter()
+                .collect();
+        // No cap: every candidate, the unexported group first.
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &exported, 0),
+            vec![
+                hour("ticks", 10),
+                hour("tick_quotes", 10),
+                hour("ticks", 9),
+                hour("tick_quotes", 9),
+            ]
+        );
+        // Nothing exported: exactly the plain fair share.
+        let none = std::collections::HashSet::new();
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &none, 3),
+            fair_share_worklist(worklist.clone(), 3)
+        );
+        // Everything exported: exactly the plain fair share.
+        let all: std::collections::HashSet<_> = worklist.iter().cloned().collect();
+        assert_eq!(
+            fair_share_preferring_unexported(worklist.clone(), &all, 3),
+            fair_share_worklist(worklist, 3)
+        );
+
+        // More candidates than the cap, the one unexported hour the NEWEST:
+        // the plain fair share (oldest first) would cut it.
+        let backlog: Vec<_> = (9..=14).map(|h| hour("ticks", h)).collect();
+        let old: std::collections::HashSet<_> = (9..=13).map(|h| hour("ticks", h)).collect();
+        assert_eq!(
+            fair_share_worklist(backlog.clone(), 2),
+            vec![hour("ticks", 9), hour("ticks", 10)],
+            "the plain cap keeps only exported hours"
+        );
+        assert_eq!(
+            fair_share_preferring_unexported(backlog.clone(), &old, 2),
+            vec![hour("ticks", 14), hour("ticks", 9)]
+        );
+        assert_eq!(
+            fair_share_preferring_unexported(backlog.clone(), &old, 1),
+            vec![hour("ticks", 14)]
+        );
+        // Unexported hours fill the cap: no exported hour gets a slot.
+        let only_two: std::collections::HashSet<_> = (9..=12).map(|h| hour("ticks", h)).collect();
+        assert_eq!(
+            fair_share_preferring_unexported(backlog, &only_two, 2),
+            vec![hour("ticks", 13), hour("ticks", 14)]
+        );
+    }
+
+    /// 2026-11-15 review fix: the loop skips an exported candidate only once
+    /// an unexported one was dropped in the same pass.
+    #[test]
+    fn test_skip_exported_candidate_only_after_a_fresh_drop() {
+        use super::skip_exported_candidate;
+        assert!(!skip_exported_candidate(false, false));
+        assert!(!skip_exported_candidate(false, true));
+        assert!(!skip_exported_candidate(true, false));
+        assert!(skip_exported_candidate(true, true));
+    }
+
+    #[test]
+    fn a_zero_cap_means_no_cap_and_keeps_every_item() {
+        let worklist = vec![
+            ("ticks", "2026-08-01T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        assert_eq!(fair_share_worklist(worklist, 0).len(), 2);
+    }
+
+    #[test]
+    fn a_cap_smaller_than_the_table_count_still_reaches_more_than_one_table() {
+        let worklist = vec![
+            ("ticks", "2026-07-01T09".to_string()),
+            ("ticks", "2026-07-02T09".to_string()),
+            ("market_depth", "2026-08-24T09".to_string()),
+        ];
+        let scheduled = fair_share_worklist(worklist, 2);
+        assert_eq!(scheduled.len(), 2);
+        assert!(
+            scheduled.iter().any(|(t, _)| *t == "market_depth"),
+            "round-robin must hand the second slot to the second table, not \
+             to the older table's next partition"
+        );
+    }
+
+    #[test]
+    fn the_output_is_deterministic_across_runs() {
+        let build = || {
+            vec![
+                ("ticks", "2026-07-30T09".to_string()),
+                ("market_depth", "2026-08-24T08".to_string()),
+                ("candles_1m", "2026-06-02".to_string()),
+                ("ticks", "2026-07-30T10".to_string()),
+            ]
+        };
+        assert_eq!(
+            fair_share_worklist(build(), 3),
+            fair_share_worklist(build(), 3),
+            "selection must not depend on hash iteration order"
+        );
+    }
+
+    #[test]
+    fn an_empty_worklist_is_empty_and_does_not_hang() {
+        assert!(fair_share_worklist(Vec::new(), 200).is_empty());
+        assert!(fair_share_worklist(Vec::new(), 0).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::{PartitionListing, is_table_absent_response};
+
+    // (2026-10-29: `test_split_partition_parents_reads_day_and_hour_splits`
+    // left with `split_partition_parents`, a helper only the deleted rebuild
+    // copy used.)
+
+    /// The exact envelope QuestDB returns for a missing table is absence,
+    /// not failure — the 2026-09-23 shape that kept the day unlatched.
+    #[test]
+    fn a_missing_table_reads_as_absent_not_failed() {
+        let body = r#"{"query":"SELECT name FROM table_partitions('rest_spot_1m')","error":"table does not exist [table=rest_spot_1m]","position":0}"#;
+        assert!(is_table_absent_response(body));
+        let upper = r#"{"error":"Table Does Not Exist [table=x]"}"#;
+        assert!(is_table_absent_response(upper));
+    }
+
+    /// Every OTHER error must stay a failure, or a real outage latches the day.
+    #[test]
+    fn other_errors_are_never_read_as_absence() {
+        for body in [
+            r#"{"error":"timeout, query aborted"}"#,
+            r#"{"error":"table is suspended [table=ticks]"}"#,
+            r#"{"error":"unexpected token"}"#,
+            "",
+            "service unavailable",
+        ] {
+            assert!(!is_table_absent_response(body), "misread: {body}");
+        }
+    }
+
+    /// A 2xx result set carrying the phrase as DATA has no error key and
+    /// must never be read as absence.
+    #[test]
+    fn the_phrase_without_an_error_envelope_is_not_absence() {
+        let body = r#"{"columns":[{"name":"name"}],"dataset":[["table does not exist"]]}"#;
+        assert!(!is_table_absent_response(body));
+    }
+
+    #[test]
+    fn partition_listing_variants_are_distinct() {
+        assert_ne!(
+            PartitionListing::TableAbsent,
+            PartitionListing::Eligible(Vec::new())
+        );
+    }
+
+    /// Hour-granular archival must DEFER while a spill replay could still be
+    /// POSTing rows back with their ORIGINAL timestamps.
+    ///
+    /// The rescue payload is raw ILP, so a replay writes into the partition
+    /// the rows were BORN in -- and at `depth_hot_hours = 4` that partition
+    /// is droppable four hours later, while the file is still on disk. The
+    /// pre-drop recount catches it and refuses, but its own comment concedes
+    /// the window cannot be closed without a table lock QuestDB does not
+    /// offer, so the right move is not to open the window at all.
+    #[test]
+    fn hour_window_defers_to_the_day_path_while_spill_data_is_pending() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-archive-spill-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        assert!(
+            !super::spill_dir_has_pending_data(&dir),
+            "an empty spill directory must not defer archival"
+        );
+
+        std::fs::write(dir.join("depth-spill-0001.ilp"), b"x").expect("write");
+        assert!(
+            super::spill_dir_has_pending_data(&dir),
+            "a spill file a replay could still drain MUST defer the hour window"
+        );
+
+        // ⚠ CHANGED 2026-10-09: the quarantine tree no longer counts. The
+        // replay never reads it (it holds files QuestDB refused for good), so
+        // it cannot write into a partition; counting it deferred the hour
+        // window for as long as a single set-aside file existed.
+        std::fs::remove_file(dir.join("depth-spill-0001.ilp")).expect("rm");
+        std::fs::create_dir_all(dir.join("quarantine")).expect("mkdir");
+        std::fs::write(dir.join("quarantine").join("refused.ilp"), b"x").expect("write");
+        assert!(
+            !super::spill_dir_has_pending_data(&dir),
+            "a quarantine subdirectory is never replayed, so it is not pending"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable directory must count as PENDING, never as clear.
+    #[test]
+    fn an_unreadable_spill_directory_defers_rather_than_permits() {
+        let f = std::env::temp_dir().join(format!(
+            "tv-archive-not-a-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&f, b"not a directory").expect("write");
+        assert!(
+            super::spill_dir_has_pending_data(&f),
+            "cannot-check must never read as safe-to-drop"
+        );
+        std::fs::remove_file(&f).ok();
+    }
+
+    /// A fresh scratch folder for the spill-pending tests, removed on drop.
+    struct SpillScratch(std::path::PathBuf);
+    impl SpillScratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tv-archive-spill-pending-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for SpillScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Regression: 2026-10-09 — a drained spill file is emptied to 0 bytes and
+    // kept, and the old check counted ANY entry, so after the first spill the
+    // hour-window depth archive was deferred to the day path forever.
+    #[test]
+    fn test_regression_drained_spill_files_and_quarantine_are_not_pending() {
+        let dir = SpillScratch::new("drained");
+        std::fs::write(dir.path().join("ticks-dhan-2026100909.ilp"), b"").expect("write");
+        std::fs::write(dir.path().join("depth-dhan-2026100910.dspl"), b"").expect("write");
+        let quarantine = dir.path().join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine).expect("quarantine");
+        std::fs::write(quarantine.join("refused.ilp"), b"refused rows\n").expect("write");
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "only drained 0-byte files and quarantine/ are present: nothing can be replayed"
+        );
+    }
+
+    /// A non-empty file of ANY name still counts as pending, so a new spill
+    /// format is covered without an extension list.
+    #[test]
+    fn a_non_empty_spill_file_of_any_extension_is_pending() {
+        for (i, name) in [
+            "ticks-dhan-2026100909.ilp",
+            "depth-dhan-2026100910.dspl",
+            "unknown.bin",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = SpillScratch::new(&format!("nonempty-{i}"));
+            std::fs::write(dir.path().join("drained.ilp"), b"").expect("write");
+            std::fs::write(dir.path().join(name), b"rows\n").expect("write");
+            assert!(
+                super::spill_dir_has_pending_data(dir.path()),
+                "{name} must count"
+            );
+        }
+    }
+
+    /// Audit DA-13b review: a file drained to its end whose latest acks are
+    /// not yet confirmed can still be rewound and sent again by a QuestDB
+    /// suspicion episode, into an hour this archive would drop. Pending.
+    ///
+    /// Bite: drop the `has_unconfirmed_ack` read in `spill_file_pending` and the
+    /// first assert fails.
+    #[test]
+    fn test_regression_da13b_a_drained_file_with_unconfirmed_acks_is_pending() {
+        let dir = SpillScratch::new("unconfirmed-ack");
+        let path = dir.path().join("depth-dhan-2026100910.dspl");
+        std::fs::write(&path, b"rows\n").expect("write");
+        let len = std::fs::metadata(&path).expect("meta").len();
+        crate::tick_spill_replay::record_resume_offset(&path, len);
+        let mut view = crate::tick_spill_replay::SpillSinkView::current();
+        view.live = false;
+        view.suspect = false;
+        // Far ahead of any real probe count, so it can never be confirmed.
+        view.clean_probes = u64::MAX / 2;
+        crate::tick_spill_replay::note_spill_ack(&path, &view, 0, len);
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "unconfirmed acks: a rewind may still send these rows again"
+        );
+        crate::tick_spill_replay::forget_resume_offset(&path);
+        crate::tick_spill_replay::record_resume_offset(&path, len);
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "no acks pending: drained to its end holds nothing"
+        );
+        crate::tick_spill_replay::forget_resume_offset(&path);
+    }
+
+    // Regression: 2026-10-09 (review of BND-1) — the replay never empties the
+    // NEWEST spill file (the writer may still append to it); it records the
+    // drained offset instead. Counting every non-empty file kept the hour
+    // window deferred after every spill episode, until a newer spill came.
+    #[test]
+    fn test_regression_a_newest_file_drained_to_its_end_is_not_pending() {
+        let dir = SpillScratch::new("newest-drained");
+        let newest = dir.path().join("ticks-dhan-2026100910.ilp");
+        std::fs::write(&newest, b"rows\nmore rows\n").expect("write");
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "an undrained newest file holds rows a replay will post"
+        );
+
+        let len = std::fs::metadata(&newest).expect("meta").len();
+        crate::tick_spill_replay::record_resume_offset(&newest, len);
+        assert!(
+            !super::spill_dir_has_pending_data(dir.path()),
+            "a newest file the replay drained to its end holds nothing to replay"
+        );
+
+        // The writer appends after the drain: those bytes are pending again.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newest)
+            .expect("open");
+        std::io::Write::write_all(&mut file, b"late rows\n").expect("append");
+        drop(file);
+        assert!(
+            super::spill_dir_has_pending_data(dir.path()),
+            "bytes appended past the drained offset are pending"
+        );
+
+        // A restart forgets the offset: the file counts until it is re-drained.
+        crate::tick_spill_replay::forget_resume_offset(&newest);
+        assert!(super::spill_dir_has_pending_data(dir.path()));
+    }
+
+    /// A missing folder holds nothing; an empty folder holds nothing.
+    #[test]
+    fn a_missing_or_empty_spill_folder_is_not_pending() {
+        let dir = SpillScratch::new("empty");
+        assert!(!super::spill_dir_has_pending_data(dir.path()));
+        assert!(!super::spill_dir_has_pending_data(
+            &dir.path().join("absent")
+        ));
+    }
+
+    /// Anything the check cannot classify counts as pending: an unknown
+    /// sub-folder may hold rows, and "could not check" never reads as safe.
+    #[test]
+    fn an_unknown_sub_folder_counts_as_pending() {
+        let dir = SpillScratch::new("unknown-sub");
+        std::fs::create_dir_all(dir.path().join("replaying")).expect("subdir");
+        assert!(super::spill_dir_has_pending_data(dir.path()));
+    }
+
+    // ---- Content-addressed sidecar archive keys (2026-08-25) -------------
+    //
+    // These pin the property that unblocked retention on the live box without
+    // weakening the never-overwrite guarantee: a changed partition is written
+    // to a key DERIVED FROM ITS CONTENT, so it can never land on top of an
+    // existing archive.
+
+    const SHA_A: &str = "3b1f2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809";
+    const SHA_B: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    #[test]
+    fn canonical_archive_key_is_one_stable_key_per_partition() {
+        let a = canonical_archive_key("ticks", "2026-07-24T13");
+        assert_eq!(a, canonical_archive_key("ticks", "2026-07-24T13"));
+        assert!(
+            a.ends_with("/ticks/2026-07-24T13.csv.gz"),
+            "shape changed: {a}"
+        );
+        assert_ne!(a, canonical_archive_key("ticks", "2026-07-24T14"));
+        assert_ne!(a, canonical_archive_key("market_depth", "2026-07-24T13"));
+    }
+
+    #[test]
+    fn a_sidecar_key_can_never_collide_with_the_canonical_key() {
+        // The whole safety argument rests on this: if these could ever be
+        // equal, the sidecar upload would overwrite the object the
+        // never-overwrite policy exists to protect.
+        let canonical = canonical_archive_key("ticks", "2026-07-24T13");
+        for sha in [SHA_A, SHA_B] {
+            assert_ne!(
+                canonical,
+                sidecar_archive_key("ticks", "2026-07-24T13", sha),
+                "sidecar key collided with the canonical key"
+            );
+        }
+    }
+
+    #[test]
+    fn different_content_yields_different_sidecar_keys() {
+        // Two distinct exports of the same partition must never share a key,
+        // or the second would destroy the first.
+        assert_ne!(
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A),
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_B)
+        );
+    }
+
+    #[test]
+    fn identical_content_yields_the_same_sidecar_key_so_retries_reuse() {
+        // Idempotence is what stops a retry loop uploading a duplicate object
+        // on every run for a partition that is no longer changing.
+        assert_eq!(
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A),
+            sidecar_archive_key("ticks", "2026-07-24T13", SHA_A)
+        );
+    }
+
+    #[test]
+    fn the_sidecar_key_carries_the_full_digest_not_a_prefix() {
+        // A truncated digest reintroduces collision risk on the one path
+        // whose entire safety argument is "a different digest is a different
+        // key". Pin the full 64 hex characters.
+        let key = sidecar_archive_key("ticks", "2026-07-24T13", SHA_A);
+        assert!(key.contains(SHA_A), "full digest missing from key: {key}");
+        assert!(
+            key.ends_with(&format!(".sha-{SHA_A}.csv.gz")),
+            "unexpected sidecar shape: {key}"
+        );
+    }
+
+    #[test]
+    fn the_conflict_arm_never_uploads_to_the_canonical_key() {
+        // Source-scan ratchet. The mismatch arm must resolve to the sidecar
+        // key and nothing else — if a future edit points its upload back at
+        // `s3_key` while the canonical object is still present, the
+        // never-overwrite guarantee is silently gone and no unit test that
+        // does not read the source would notice.
+        let src = include_str!("partition_archive.rs");
+        let arm = src
+            .split("Some(meta) => {")
+            .nth(1)
+            .expect("the S3 mismatch arm must exist");
+        let arm = arm
+            .split("\n            None => {")
+            .next()
+            .expect("the mismatch arm must be followed by the absent arm");
+        assert!(
+            arm.contains("sidecar_archive_key("),
+            "the mismatch arm must derive a content-addressed key"
+        );
+        assert!(
+            arm.contains("&sidecar_key,"),
+            "the mismatch arm must upload to the sidecar key"
+        );
+        assert!(
+            !arm.contains("&s3_key,"),
+            "the mismatch arm must NEVER upload to the canonical key"
+        );
+    }
 
     // -----------------------------------------------------------------
     // INTRADAY class (2026-08-19) — ticks + second-level candles are
     // current-day; minute-level and above are the history that indicators
-    // and strategies read and keep the 35-day window.
+    // and strategies read and keep the 15-day window.
     // -----------------------------------------------------------------
 
     #[test]
     fn intraday_class_covers_ticks_and_every_second_level_candle() {
-        // These six are the heaviest tables on the box after depth. Before
-        // the split they inherited `market_data_hot_days`, which at the
+        // These are the heaviest tables on the box after depth. Before the
+        // split they inherited `market_data_hot_days`, which at the
         // 25,000-instrument target commits several hundred GB on a 200 GB
         // root — and a full disk stops EVERY table, not just these.
-        for table in [
-            "ticks",
-            "candles_1s",
-            "candles_2s",
-            "candles_14s",
-            "candles_30s",
-        ] {
+        //
+        // The names stay LITERAL on purpose. `is_intraday_table` derives the
+        // boundary from `seconds_per_bucket() < SECONDS_PER_MINUTE`, so
+        // deriving the expectation from that same predicate would pass under
+        // ANY boundary constant — a tautology. A literal `candles_1s` here
+        // and a literal `candles_1m` in the test below are what actually pin
+        // the minute boundary in place.
+        //
+        // What the literals CANNOT do is notice a retired frame: this list
+        // named `candles_2s`, `candles_14s` and `candles_30s` until the
+        // 2026-09-19 collapse took TF_COUNT to 9, and all three went on
+        // asserting about tables nothing produces. The liveness check below
+        // is the half that closes that, so a future retirement fails loudly
+        // instead of leaving the boundary pinned to a ghost.
+        let live = crate::shadow_persistence::candle_table_names();
+        for table in ["ticks", "candles_1s", "candles_3s", "candles_5s"] {
+            // 2026-10-22 (plan item 62): `candles_3s` / `candles_5s` are no
+            // longer written but stay archive-only on the intraday window.
+            let archive_only =
+                crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES.contains(&table);
+            assert!(
+                table == "ticks" || archive_only || live.contains(&table),
+                "{table} is not a live candle table — a frame was retired and \
+                 this guard is now pinning the boundary to a name nothing \
+                 writes (live: {live:?})"
+            );
             assert_eq!(
                 retention_class(table),
                 RetentionClass::Intraday,
-                "{table} must be current-day, not on the 35-day market-data window"
+                "{table} must be current-day, not on the 15-day market-data window"
             );
         }
     }
@@ -2042,7 +5396,18 @@ mod tests {
         // operator's stated requirement if it regressed: minute-level history
         // is what indicators and strategies read. Sweeping it at 2 days would
         // leave them with nothing to warm up from.
-        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_1d"] {
+        //
+        // Literal, and liveness-checked, for the reasons the test above
+        // gives. This list carried `candles_1d` until the 2026-09-19 collapse
+        // retired D1.
+        let live = crate::shadow_persistence::candle_table_names();
+        for table in ["candles_1m", "candles_5m", "candles_15m", "candles_60m"] {
+            assert!(
+                live.contains(&table),
+                "{table} is not a live candle table — a frame was retired and \
+                 this guard is now pinning the boundary to a name nothing \
+                 writes (live: {live:?})"
+            );
             assert_eq!(
                 retention_class(table),
                 RetentionClass::MarketData,
@@ -2056,7 +5421,7 @@ mod tests {
         // Pins the literal list against the timeframe enum in the ONE
         // direction that matters: a new second-level timeframe added to
         // `TfIndex` without being added to `INTRADAY_TABLES` would silently
-        // inherit the 35-day window. The list stays literal on purpose (the
+        // inherit the 15-day window. The list stays literal on purpose (the
         // class boundary is a retention decision, not an enum property), so
         // this test is what keeps the two honest.
         let second_level: Vec<&str> = crate::shadow_persistence::candle_table_names()
@@ -2181,19 +5546,77 @@ mod tests {
         );
     }
 
+    // Regression: audit 2026-11-15 (live-4) — the archive day list compared
+    // IST-stamped partitions with UTC now(), so ticks hours 11:00-15:00 of D
+    // reached S3 only on D+2.
+    #[test]
+    fn test_regression_live4_archive_day_list_sql_selects_all_of_yesterday_and_none_of_today() {
+        let ist = i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS);
+        let shift = format!("dateadd('s', {ist}, now())");
+        // Model of the server-side filter: `minTimestamp < cutoff`, with the
+        // cutoff read from the SQL (IST-shifted or not). Stamps are IST as Z.
+        let eligible = |sql: &str, now_utc: i64, min_ts: i64| {
+            let shifted = sql.contains(&shift);
+            assert!(sql.contains("dateadd('d', -1, "), "{sql}");
+            let cutoff = now_utc + if shifted { ist } else { 0 } - 86_400;
+            min_ts < cutoff
+        };
+        let day = 86_400_i64;
+        let hour = 3_600_i64;
+        for table in ["ticks", "tick_quotes", "market_depth", "market_depth_book"] {
+            let sql = archive_day_list_sql(table, 1);
+            assert_eq!(
+                sql,
+                crate::partition_manager::build_ist_day_list_sql(table, 1),
+                "{table}: IST-stamped class uses the IST frame"
+            );
+            for (h, m) in [(15_i64, 44_i64), (16, 21)] {
+                // D+1 at h:m IST, as UTC seconds in the IST-as-Z frame.
+                let now_utc = day + h * hour + m * 60 - ist;
+                for d_hour in 9..=15 {
+                    assert!(
+                        eligible(&sql, now_utc, d_hour * hour),
+                        "{table} at {h}:{m}: hour T{d_hour} of D must be eligible"
+                    );
+                }
+                for today_hour in 0..=h {
+                    assert!(
+                        !eligible(&sql, now_utc, day + today_hour * hour),
+                        "{table} at {h}:{m}: hour T{today_hour} of D+1 must stay"
+                    );
+                }
+            }
+        }
+        // Tables whose class is not IST-stamped keep the UTC form.
+        for table in ["ws_event_audit", "candles_1m"] {
+            assert_eq!(
+                archive_day_list_sql(table, 2),
+                crate::partition_manager::build_detach_list_sql(table, 2),
+                "{table}"
+            );
+        }
+    }
+
     #[test]
     fn intraday_hot_days_clamps_to_the_min_hot_days_floor() {
         // "Current day only" means the floor, because a day-partitioned
         // table's current partition cannot be dropped while rows still land
         // in it. Configuring 0 must not be able to express something unsafe.
-        let mut cfg = PartitionRetentionConfig::default();
-        cfg.intraday_hot_days = 0;
+        let cfg = PartitionRetentionConfig {
+            intraday_hot_days: 0,
+            ..PartitionRetentionConfig::default()
+        };
         assert_eq!(
             hot_window_days("ticks", &cfg),
             MIN_HOT_DAYS_MARKET_DATA,
             "a zero intraday window must clamp to the current-day floor, never to zero"
         );
     }
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     fn cfg(retention_days: u32, market_data_hot_days: u32) -> PartitionRetentionConfig {
@@ -2213,18 +5636,24 @@ mod tests {
     #[test]
     fn market_depth_is_its_own_retention_class_not_market_data() {
         // `market_depth` is HOUR-partitioned, so a naive class check that
-        // tests the market-data list first would classify it on the 35-day
+        // tests the market-data list first would classify it on the 15-day
         // window — 735 GB minimum on a 100 GB root at the measured ~21 GB/day.
         // The depth test must come FIRST, and this proves it does.
         assert_eq!(
             retention_class(crate::depth_persistence::MARKET_DEPTH_TABLE),
             RetentionClass::Depth,
-            "market_depth must NOT inherit the 35-day market-data window"
+            "market_depth must NOT inherit the 15-day market-data window"
         );
         // Re-blessed 2026-08-19: `ticks` moved to the Intraday class, so the
         // market-data comparator here is now a MINUTE candle — the data that
-        // actually still lives on the 35-day window.
+        // actually still lives on the 15-day window.
         assert_eq!(retention_class("candles_1m"), RetentionClass::MarketData);
+        // Item 45h: the auxiliary packet table is market data on the 15-day
+        // window (archived, then detached), never Standard and never Intraday.
+        assert_eq!(
+            retention_class(crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE),
+            RetentionClass::MarketData
+        );
     }
 
     #[test]
@@ -2269,6 +5698,21 @@ mod tests {
             HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_TABLE),
             "market_depth must be in a swept-table list or its retention class \
              never runs and the table grows until the disk dies"
+        );
+    }
+
+    #[test]
+    fn market_depth_book_is_swept_on_the_depth_window_like_market_depth() {
+        // Plan item 49e step 3: the array-row table holds the same depth, so
+        // it must take the depth window, never the 15-day market-data one it
+        // would get from HOUR-list membership alone.
+        let book = crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE;
+        assert_eq!(retention_class(book), RetentionClass::Depth);
+        assert!(HOUR_PARTITIONED_TABLES.contains(&book));
+        let c = cfg(90, 35);
+        assert_eq!(
+            hot_window_days(book, &c),
+            hot_window_days(crate::depth_persistence::MARKET_DEPTH_TABLE, &c)
         );
     }
 
@@ -2488,7 +5932,7 @@ mod tests {
         let count = build_count_sql("ticks", &start, &end);
         let export = build_export_sql("ticks", &start, &end);
         assert_eq!(
-            count.replace("count()", "*"),
+            count.replace("count(), max(ts)", "*"),
             export,
             "recount must cover the IDENTICAL range as the export"
         );
@@ -2504,13 +5948,113 @@ mod tests {
 
     #[test]
     fn test_parse_count_response_valid_and_garbage() {
-        let json = r#"{"columns":[{"name":"count","type":"LONG"}],"dataset":[[12345]],"count":1}"#;
-        assert_eq!(parse_count_response(json), Some(12345));
-        assert_eq!(parse_count_response(r#"{"dataset":[[0]]}"#), Some(0));
-        assert_eq!(parse_count_response(r#"{"dataset":[[-1]]}"#), None);
+        let json = r#"{"columns":[{"name":"count","type":"LONG"},{"name":"max","type":"TIMESTAMP"}],"dataset":[[12345,"2026-04-01T09:59:59.000000Z"]],"count":1}"#;
+        assert_eq!(
+            parse_count_response(json),
+            Some(RangeTally {
+                rows: 12345,
+                max_ts: Some("2026-04-01T09:59:59.000000Z".to_string()),
+            })
+        );
+        // Empty range: count 0, max(ts) null.
+        assert_eq!(
+            parse_count_response(r#"{"dataset":[[0,null]]}"#),
+            Some(RangeTally {
+                rows: 0,
+                max_ts: None
+            })
+        );
+        assert_eq!(parse_count_response(r#"{"dataset":[[-1,null]]}"#), None);
         assert_eq!(parse_count_response("not json"), None);
         assert_eq!(parse_count_response(r#"{"dataset":[]}"#), None);
-        assert_eq!(parse_count_response(r#"{"dataset":[["x"]]}"#), None);
+        assert_eq!(parse_count_response(r#"{"dataset":[["x",null]]}"#), None);
+        // Fail-closed: a missing max(ts) cell is not "no max".
+        assert_eq!(parse_count_response(r#"{"dataset":[[5]]}"#), None);
+        // Fail-closed: a max(ts) cell of the wrong type.
+        assert_eq!(parse_count_response(r#"{"dataset":[[5,7]]}"#), None);
+    }
+
+    fn wal_row(name: &str, suspended: bool, writer: Option<i64>, seq: Option<i64>) -> WalTableRow {
+        WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: writer,
+            sequencer_txn: seq,
+            error_tag: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn test_wal_apply_verdict_only_exact_txn_equality_is_applied() {
+        let rows = vec![
+            wal_row("ticks", false, Some(42), Some(42)),
+            wal_row("market_depth", false, Some(40), Some(42)),
+            wal_row("candles_1m", true, Some(42), Some(42)),
+            wal_row("candles_5m", false, None, Some(42)),
+            wal_row("candles_15m", false, Some(42), None),
+        ];
+        assert_eq!(wal_apply_verdict(&rows, "ticks"), WalApplyVerdict::Applied);
+        assert_eq!(
+            wal_apply_verdict(&rows, "market_depth"),
+            WalApplyVerdict::Lagging {
+                writer_txn: 40,
+                sequencer_txn: 42
+            }
+        );
+        // Suspended wins even when the txns happen to match.
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_1m"),
+            WalApplyVerdict::Suspended
+        );
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_5m"),
+            WalApplyVerdict::TxnUnreadable
+        );
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_15m"),
+            WalApplyVerdict::TxnUnreadable
+        );
+        // A table the probe does not report cannot be proven applied.
+        assert_eq!(
+            wal_apply_verdict(&rows, "candles_1h"),
+            WalApplyVerdict::NotReported
+        );
+        assert_eq!(
+            wal_apply_verdict(&[], "ticks"),
+            WalApplyVerdict::NotReported
+        );
+        // A writer AHEAD of the sequencer is not equality either.
+        let ahead = vec![wal_row("ticks", false, Some(43), Some(42))];
+        assert!(matches!(
+            wal_apply_verdict(&ahead, "ticks"),
+            WalApplyVerdict::Lagging { .. }
+        ));
+    }
+
+    #[test]
+    fn test_wal_apply_verdict_labels_are_stable_and_distinct() {
+        let all = [
+            WalApplyVerdict::Applied,
+            WalApplyVerdict::Suspended,
+            WalApplyVerdict::Lagging {
+                writer_txn: 1,
+                sequencer_txn: 2,
+            },
+            WalApplyVerdict::NotReported,
+            WalApplyVerdict::TxnUnreadable,
+        ];
+        let labels: Vec<&str> = all.iter().map(WalApplyVerdict::as_str).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "applied",
+                "suspended",
+                "lagging",
+                "not_reported",
+                "txn_unreadable"
+            ]
+        );
     }
 
     // ---- verify decision (every failure combination → keep) ----------------
@@ -2650,104 +6194,50 @@ mod tests {
         assert_eq!(streamed_newlines - 1, 3);
     }
 
-    // ---- content identity: base64 / hex / Sha256Writer (review round 2) ----
-
-    #[test]
-    fn test_base64_encode_known_vectors() {
-        // RFC 4648 vectors + the well-known sha256("abc") digest in the
-        // exact wire format S3's x-amz-checksum-sha256 carries.
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        use sha2::Digest as _;
-        let digest: [u8; 32] = sha2::Sha256::digest(b"abc").into();
-        assert_eq!(
-            base64_encode(&digest),
-            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
-            "sha256(\"abc\") base64 known vector"
-        );
-        assert_eq!(
-            hex_encode(&digest),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            "sha256(\"abc\") hex known vector"
-        );
-    }
-
-    #[test]
-    fn test_sha256_writer_digest_matches_oneshot_and_passes_bytes_through() {
-        use sha2::Digest as _;
-        let payload = b"the compressed archive bytes, split across writes";
-        let mut w = Sha256Writer::new(Vec::new());
-        w.write_all(&payload[..7]).expect("write 1");
-        w.write_all(&payload[7..]).expect("write 2");
-        w.flush().expect("flush");
-        let (inner, digest) = w.finish();
-        assert_eq!(
-            inner, payload,
-            "every byte must pass through to the inner writer"
-        );
-        let oneshot: [u8; 32] = sha2::Sha256::digest(payload).into();
-        assert_eq!(digest, oneshot, "streamed digest == one-shot digest");
-    }
-
-    // ---- bucket / environment resolution ------------------------------------
-
-    #[test]
-    fn test_resolve_archive_bucket_explicit_wins() {
-        assert_eq!(
-            resolve_archive_bucket("my-bucket", Some("prod")).as_deref(),
-            Some("my-bucket")
-        );
-        assert_eq!(
-            resolve_archive_bucket("  my-bucket  ", None).as_deref(),
-            Some("my-bucket"),
-            "explicit config needs no env var"
-        );
-    }
-
-    #[test]
-    fn test_resolve_archive_bucket_derives_cold_bucket_only_with_explicit_env() {
-        assert_eq!(
-            resolve_archive_bucket("", Some("prod")).as_deref(),
-            Some("tv-prod-cold")
-        );
-        assert_eq!(
-            resolve_archive_bucket("   ", Some("staging")).as_deref(),
-            Some("tv-staging-cold")
-        );
-        // F1b fail-closed: no explicit environment → NO bucket → archival
-        // skipped. A dev box can never default onto the prod cold bucket.
-        assert_eq!(resolve_archive_bucket("", None), None);
-        assert_eq!(resolve_archive_bucket("   ", None), None);
-    }
-
-    #[test]
-    fn test_resolve_environment_from_precedence_and_fail_closed() {
-        assert_eq!(
-            resolve_environment_from(Some("prod"), None).as_deref(),
-            Some("prod")
-        );
-        assert_eq!(
-            resolve_environment_from(Some("staging"), Some("prod")).as_deref(),
-            Some("staging")
-        );
-        assert_eq!(
-            resolve_environment_from(None, Some("dev-1")).as_deref(),
-            Some("dev-1")
-        );
-        // F1b: NO default — unset env vars resolve to None (skip archival).
-        assert_eq!(resolve_environment_from(None, None), None);
-        assert_eq!(resolve_environment_from(Some(""), Some("  ")), None);
-        // Bucket-hostile values also resolve None (fail-closed).
-        assert_eq!(resolve_environment_from(Some("../etc"), None), None);
-        assert_eq!(resolve_environment_from(Some("a b"), None), None);
-    }
-
     // ---- audit table contract -----------------------------------------------
+
+    /// Every non-designated column in the CREATE has a heal line, and the
+    /// DEDUP key is re-applied last — a column added to the CREATE without
+    /// a matching ALTER would break the writer on any pre-existing table.
+    #[test]
+    fn partition_archive_audit_self_heal_ddl_covers_every_create_column() {
+        let create = partition_archive_audit_create_ddl();
+        let heal = partition_archive_audit_self_heal_ddl();
+        // Columns are the `name TYPE,` pairs between the parens of the CREATE.
+        let body = create
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(") timestamp("))
+            .map(|(cols, _)| cols)
+            .expect("CREATE DDL has a column list");
+        let mut checked = 0usize;
+        for spec in body.split(',') {
+            let mut parts = spec.split_whitespace();
+            let (Some(name), Some(ty)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if name == "ts" {
+                continue; // the designated timestamp is never ALTERed in
+            }
+            let expect = format!("ADD COLUMN IF NOT EXISTS {name} {ty};");
+            assert!(
+                heal.iter().any(|s| s.contains(&expect)),
+                "no self-heal line for column {name} {ty}: {heal:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 10, "the CREATE has ten non-designated columns");
+        let last = heal.last().expect("non-empty");
+        assert!(
+            last.contains(&format!(
+                "DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_PARTITION_ARCHIVE_AUDIT})"
+            )),
+            "the DEDUP key must be re-applied last: {last}"
+        );
+        assert!(
+            heal.iter()
+                .all(|s| s.starts_with("ALTER TABLE partition_archive_audit "))
+        );
+    }
 
     #[test]
     fn test_archive_audit_ddl_contains_expected_columns() {
@@ -2949,6 +6439,10 @@ mod tests {
         let tables = swept_tables();
         assert!(tables.contains(&"ticks"));
         assert!(tables.contains(&"candles_1m"));
+        // 2026-10-22 (plan item 62, Quote 34): archived until copied.
+        assert!(tables.contains(&"candles_3s"));
+        assert!(tables.contains(&"candles_5s"));
+        assert!(tables.contains(&"top_volume_1s"));
         assert!(tables.contains(&"ws_event_audit"));
         assert!(tables.contains(&"partition_archive_audit"));
         // Exempt masters are filtered at run time; they must not be in the
@@ -2984,6 +6478,75 @@ mod tests {
             "ist-utc delta must be ~+5:30: {delta}"
         );
     }
+
+    // ---- cross-verification hold (no-rest lock §12.15) ----
+
+    fn d(y: i32, m: u32, day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap_or_default()
+    }
+
+    #[test]
+    fn crossverify_hold_decision_lets_a_verified_day_proceed() {
+        let today = d(2026, 9, 24);
+        let out = crossverify_hold_decision("2026-09-23", today, |_| true);
+        assert_eq!(out, CrossverifyHold::Proceed);
+    }
+
+    #[test]
+    fn an_unverified_day_inside_the_ceiling_is_held() {
+        let today = d(2026, 9, 24);
+        for age in 0..=MAX_CROSSVERIFY_HOLD_DAYS {
+            let day = today - chrono::Duration::days(age);
+            let name = day.format("%Y-%m-%d").to_string();
+            assert_eq!(
+                crossverify_hold_decision(&name, today, |_| false),
+                CrossverifyHold::Hold,
+                "age {age} must hold"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_day_past_the_ceiling_is_archived_anyway() {
+        let today = d(2026, 9, 24);
+        let day = today - chrono::Duration::days(MAX_CROSSVERIFY_HOLD_DAYS + 1);
+        let name = day.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            crossverify_hold_decision(&name, today, |_| false),
+            CrossverifyHold::OverrideAfterCeiling
+        );
+    }
+
+    #[test]
+    fn an_hour_partition_reads_its_day() {
+        let today = d(2026, 9, 24);
+        let seen = std::cell::Cell::new(None);
+        let out = crossverify_hold_decision("2026-09-23T14", today, |day| {
+            seen.set(Some(day));
+            false
+        });
+        assert_eq!(out, CrossverifyHold::Hold);
+        assert_eq!(seen.get(), Some(d(2026, 9, 23)));
+    }
+
+    #[test]
+    fn an_unparseable_partition_never_blocks() {
+        let today = d(2026, 9, 24);
+        for name in ["", "2026", "default", "not-a-date", "2026-13-40"] {
+            assert_eq!(
+                crossverify_hold_decision(name, today, |_| false),
+                CrossverifyHold::Unparseable,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_ceiling_is_bounded() {
+        // A longer hold would let a broken verifier pin a week of partitions
+        // on EBS; a shorter one would archive a Friday failure before Monday.
+        assert!((1..=7).contains(&MAX_CROSSVERIFY_HOLD_DAYS));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3003,7 +6566,26 @@ mod stub_integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
+
+    // PR TG (2026-11-06 incident): `/exp` 429 and slow-export regressions,
+    // in their own file so they reuse this harness without growing it.
+    mod tg_export_regressions_tests;
+    // PR TG-4: the real-QuestDB export contention test (#[ignore]d, weekly lane).
+    mod tg4_export_contention_tests;
+    // Owner Quote 60: the daily Brutex export against the same stubs.
+    mod daily_export_stub_tests;
+    // 2026-11-15: the sliced ordered export is byte-identical to one query.
+    mod sliced_export_stub_tests;
+    // 2026-11-16: every cold PutObject is unsigned-payload + SHA-256 checksum.
+    mod unsigned_payload_stub_tests;
+    // Quote 63: the 20 Nov quarantine copy and drop against the same stubs.
+    mod quarantine_copy_stub_tests;
 
     /// One parsed stub request (method + decoded target + lowercased headers).
     #[derive(Clone, Debug)]
@@ -3063,6 +6645,51 @@ mod stub_integration_tests {
             }
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Whether a stub `/exp` request is the FIRST (or only) request of its
+    /// export (2026-11-15): an ordered export arrives as `ts` slices
+    /// (`sliced_export`), and the stub's rows all sit in a partition's first
+    /// slice. An unordered request is always the only one.
+    fn is_first_export_slice(target: &str) -> bool {
+        if !target.contains("ORDER BY") {
+            return true;
+        }
+        let literal = |marker: &str| {
+            let rest = &target[target.find(marker)? + marker.len()..];
+            let s = &rest[..rest.find('\'')?];
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.6fZ").ok()
+        };
+        let (Some(lo), Some(hi)) = (literal("ts >= '"), literal("ts < '")) else {
+            return true;
+        };
+        use chrono::Timelike as _;
+        if hi - lo < chrono::TimeDelta::hours(1) {
+            lo.minute() == 0 && lo.second() == 0
+        } else {
+            lo.hour() == 0 && lo.minute() == 0
+        }
+    }
+
+    /// The stub's `/exp` answer for `target`: `body` for the first slice of
+    /// an export, its header line alone for every later slice.
+    fn stub_export_body(target: &str, body: &str) -> Vec<u8> {
+        if is_first_export_slice(target) {
+            body.as_bytes().to_vec()
+        } else {
+            let header_end = body.find('\n').map_or(body.len(), |i| i + 1);
+            body.as_bytes()[..header_end].to_vec()
+        }
+    }
+
+    /// One entry per export (its first slice): whether it was ordered.
+    fn export_runs(log: &Mutex<Vec<SeenRequest>>) -> Vec<bool> {
+        log.lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp") && is_first_export_slice(&r.target))
+            .map(|r| r.target.contains("ORDER BY"))
+            .collect()
     }
 
     /// Spawns a minimal HTTP/1.1 keep-alive stub on 127.0.0.1; returns
@@ -3213,35 +6840,131 @@ mod stub_integration_tests {
         wal_suspended: Vec<&'static str>,
         wal_status: u16,
     ) -> Responder {
+        let wal: WalStub = Arc::new(move |_probe| {
+            if wal_status != 200 {
+                return (wal_status, "{}".to_string());
+            }
+            (200, wal_tables_body(&wal_suspended, &[]))
+        });
+        qdb_responder_with(
+            partitions,
+            Arc::new(move |_call| (count, Some(STUB_MAX_TS.to_string()))),
+            csv_body,
+            wal,
+        )
+    }
+
+    /// `max(ts)` the plain stub reports for the partition range.
+    const STUB_MAX_TS: &str = "2026-04-01T09:59:59.000000Z";
+
+    /// `wal_tables()` behaviour: given the 0-based probe index, the status
+    /// and body to answer. Probe 0 is the run-start probe; for a single
+    /// partition, 1 is the pre-export gate and 2 the pre-drop gate.
+    type WalStub = Arc<dyn Fn(usize) -> (u16, String) + Send + Sync>;
+    /// `count(), max(ts)` behaviour: given the 0-based call index.
+    type TallyStub = Arc<dyn Fn(usize) -> (u64, Option<String>) + Send + Sync>;
+
+    /// A `wal_tables()` body listing EVERY swept table: those in
+    /// `suspended` suspended, those in `lagging` with `writerTxn` behind
+    /// `sequencerTxn`, every other one fully applied.
+    fn wal_tables_body(suspended: &[&str], lagging: &[&str]) -> String {
+        let rows: Vec<String> = swept_tables()
+            .into_iter()
+            .map(|n| {
+                let is_suspended = suspended.contains(&n);
+                let writer = if lagging.contains(&n) { 5 } else { 7 };
+                format!("[\"{n}\",{is_suspended},{writer},7]")
+            })
+            .collect();
+        format!(
+            "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}},\
+             {{\"name\":\"writerTxn\"}},{{\"name\":\"sequencerTxn\"}}],\
+             \"dataset\":[{}]}}",
+            rows.join(",")
+        )
+    }
+
+    fn qdb_responder_with(
+        partitions: Vec<&'static str>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
+        qdb_responder_listing("ticks", partitions, tally, csv_body, wal)
+    }
+
+    /// [`qdb_responder_with`] listing `partitions` for `listed_table` instead
+    /// of `ticks` (every other table lists none).
+    fn qdb_responder_listing(
+        listed_table: &'static str,
+        partitions: Vec<&'static str>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
+        qdb_responder_tables(vec![(listed_table, partitions)], tally, csv_body, wal)
+    }
+
+    /// [`qdb_responder_with`] listing each `(table, partitions)` pair (every
+    /// other table lists none).
+    fn qdb_responder_tables(
+        listed: Vec<(&'static str, Vec<&'static str>)>,
+        tally: TallyStub,
+        csv_body: &'static str,
+        wal: WalStub,
+    ) -> Responder {
+        let wal_probes = Arc::new(AtomicU64::new(0));
+        let tally_calls = Arc::new(AtomicU64::new(0));
+        let listed: Vec<(String, Vec<&'static str>)> = listed
+            .into_iter()
+            .map(|(table, parts)| (format!("table_partitions('{table}')"), parts))
+            .collect();
         Arc::new(move |req: &SeenRequest| {
             let t = &req.target;
             if t.starts_with("/exp") {
-                return (200, Vec::new(), csv_body.as_bytes().to_vec());
+                return (200, Vec::new(), stub_export_body(t, csv_body));
             }
             if t.contains("wal_tables()") {
-                if wal_status != 200 {
-                    return (wal_status, Vec::new(), b"{}".to_vec());
-                }
-                let rows: Vec<String> = wal_suspended
-                    .iter()
-                    .map(|n| format!("[\"{n}\",true]"))
-                    .collect();
-                let body = format!(
-                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}}],\
-                     \"dataset\":[{}]}}",
-                    rows.join(",")
-                );
-                return (200, Vec::new(), body.into_bytes());
+                let idx = usize::try_from(wal_probes.fetch_add(1, Ordering::SeqCst))
+                    .unwrap_or(usize::MAX);
+                let (status, body) = wal(idx);
+                return (status, Vec::new(), body.into_bytes());
             }
             if t.contains("CREATE TABLE") || t.contains("DROP PARTITION") {
                 return (200, Vec::new(), b"{\"ddl\":\"OK\"}".to_vec());
             }
             if t.contains("count()") {
-                let body =
-                    format!("{{\"columns\":[{{\"name\":\"count\"}}],\"dataset\":[[{count}]]}}");
+                let idx = usize::try_from(tally_calls.fetch_add(1, Ordering::SeqCst))
+                    .unwrap_or(usize::MAX);
+                let (count, max_ts) = tally(idx);
+                let max_cell = max_ts.map_or_else(|| "null".to_string(), |m| format!("\"{m}\""));
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"count\"}},{{\"name\":\"max\"}}],\
+                     \"dataset\":[[{count},{max_cell}]]}}"
+                );
                 return (200, Vec::new(), body.into_bytes());
             }
-            if t.contains("table_partitions('ticks')") {
+            // PR AA step 6: a size listing names each listed partition at
+            // `STUB_PARTITION_BYTES`.
+            if t.contains("diskSize") {
+                let rows: Vec<String> = listed
+                    .iter()
+                    .find(|(q, _)| t.contains(q.as_str()))
+                    .map(|(_, parts)| {
+                        parts
+                            .iter()
+                            .map(|p| format!("[\"{p}\",{STUB_PARTITION_BYTES}]"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                     \"dataset\":[{}]}}",
+                    rows.join(",")
+                );
+                return (200, Vec::new(), body.into_bytes());
+            }
+            if let Some((_, partitions)) = listed.iter().find(|(q, _)| t.contains(q.as_str())) {
                 let rows: Vec<String> = partitions
                     .iter()
                     .map(|p| format!("[\"{p}\",false]"))
@@ -3269,6 +6992,9 @@ mod stub_integration_tests {
     fn ilp_responder(status: u16) -> Responder {
         Arc::new(move |_req: &SeenRequest| (status, Vec::new(), Vec::new()))
     }
+
+    /// Bytes a stub size listing reports for each listed partition.
+    const STUB_PARTITION_BYTES: u64 = 1_000;
 
     fn test_retention_cfg(max_per_run: u32) -> PartitionRetentionConfig {
         PartitionRetentionConfig {
@@ -3328,7 +7054,7 @@ mod stub_integration_tests {
         let audit = PartitionArchiveAuditWriter::with_conf(&format!(
             "http::addr={ilp_addr};protocol_version=1;retry_timeout=0;request_timeout=5000;"
         ));
-        PartitionArchiver::from_parts(
+        let mut archiver = PartitionArchiver::from_parts(
             format!("{qdb_url}/exec"),
             format!("{qdb_url}/exp"),
             s3,
@@ -3337,11 +7063,248 @@ mod stub_integration_tests {
             cfg,
             audit,
         )
-        .expect("test archiver")
+        .expect("test archiver");
+        // Each test archiver records drops in its own tally (finding 11),
+        // so parallel tests never read each other's drops.
+        archiver.dropped_tally = Box::leak(Box::new(drop_tally::HourPathDropTally::new()));
+        // ... and counts its accepted DROPs in its own ledger (PR AA-G review).
+        archiver.drop_ledger = Box::leak(Box::new(super::ArchiveDropLedger::new()));
+        // Outside the trading-day window unless a test says otherwise, so a
+        // test never depends on the hour it runs at (owner Quote 60).
+        archiver.trading_window_now = Arc::new(|| false);
+        archiver
     }
 
     const CSV: &str = "ts,security_id\n1,13\n2,25\n3,51\n"; // header + 3 rows
     const TICKS_KEY: &str = "tv-test-cold/questdb-partitions/ticks/2026-04-01T09.csv.gz";
+
+    /// PR AA step 5: the session size is today's partitions of the five
+    /// Quote 51 tables, an absent table is 0, and one unreadable table makes
+    /// the whole reading an error (never a partial sum).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_sums_the_days_partitions_of_the_five_tables() {
+        let sizes = |rows: &str| -> StubResponse {
+            let body = format!(
+                "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                 \"dataset\":[{rows}]}}"
+            );
+            (200, Vec::new(), body.into_bytes())
+        };
+        let responder = |broken: bool| -> Responder {
+            Arc::new(move |req: &SeenRequest| {
+                let t = &req.target;
+                if t.contains("table_partitions('market_depth')") {
+                    return sizes(
+                        "[\"2026-11-07T09\",100],[\"2026-11-07T10\",50],[\"2026-11-06T15\",9999]",
+                    );
+                }
+                if t.contains("table_partitions('tick_quotes')") {
+                    if broken {
+                        return (500, Vec::new(), b"{\"error\":\"boom\"}".to_vec());
+                    }
+                    return sizes("[\"2026-11-07T11\",7]");
+                }
+                if t.contains("table_partitions('ticks')") {
+                    return sizes("[\"2026-11-07\",3]");
+                }
+                if t.contains("table_partitions('feed_aux_packets')") {
+                    return (
+                        400,
+                        Vec::new(),
+                        b"{\"error\":\"table does not exist [table=feed_aux_packets]\"}".to_vec(),
+                    );
+                }
+                sizes("")
+            })
+        };
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date");
+        let (qdb_url, log) = spawn_stub(responder(false)).await;
+        let archiver = build_archiver(
+            &qdb_url,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PartitionRetentionConfig::default(),
+        )
+        .await;
+        assert_eq!(archiver.session_bytes_on(day).await.expect("reads"), 160);
+        let seen: Vec<String> = log
+            .lock()
+            .expect("log")
+            .iter()
+            .map(|r| r.target.clone())
+            .collect();
+        for table in HOUR_PATH_TABLES {
+            assert!(
+                seen.iter()
+                    .any(|t| t.contains(&format!("diskSize FROM table_partitions('{table}')"))),
+                "{table} not read: {seen:?}"
+            );
+        }
+
+        let (qdb_url, _) = spawn_stub(responder(true)).await;
+        let archiver = build_archiver(
+            &qdb_url,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+            PartitionRetentionConfig::default(),
+        )
+        .await;
+        assert!(
+            archiver.session_bytes_on(day).await.is_err(),
+            "one unreadable table must fail the whole reading"
+        );
+    }
+
+    // Regression: recheck of PR AA finding 1 (2026-11-08). `ticks` is off
+    // the hour path on the shipped config, so its old hours went through the
+    // day path, which never took the quiesce lock. The after-close contract
+    // name repair could rewrite an hour between its export and its drop
+    // (same count, same max(ts)), and S3 kept the blank names. The day path
+    // of a table the repair can rewrite now holds the old-hour writers out:
+    // while a writer holds the shared side, nothing is exported or dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_day_path_of_a_repaired_table_waits_for_the_repair() {
+        use snapshot_gate::InFlightVerdict;
+
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let cfg = PartitionRetentionConfig {
+            archive_quiesce_wait_secs: 1,
+            ..test_retention_cfg(200)
+        };
+        assert!(!cfg.ticks_hour_path_enabled, "ticks takes the day path");
+        assert!(!uses_snapshot_gate("ticks", &[]));
+        assert!(crate::contract_name_repair::repair_may_rewrite("ticks"));
+        // 2026-04-01 is two days before this pass's IST day, a day the
+        // repair visits.
+        let repair_today = chrono::NaiveDate::from_ymd_opt(2026, 4, 3).expect("date");
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+            .with_test_repair_today(repair_today);
+
+        // The repair holds the writer side across its statement.
+        let repair = quiesce
+            .shared(Duration::from_secs(1))
+            .await
+            .expect("a free lock lets the repair in");
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(held.dropped, 0, "{held:?}");
+        assert_eq!(held.held_quiesce_busy, 1, "{held:?}");
+        assert_eq!(
+            held.failed, 0,
+            "a held partition is not a failure: {held:?}"
+        );
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.starts_with("/exp") || r.target.contains("DROP PARTITION")),
+            "nothing is exported or dropped while the repair may write"
+        );
+        assert!(objects.lock().expect("objects").is_empty());
+
+        // Once the repair is done the hour goes.
+        drop(repair);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.dropped, 1, "{freed:?}");
+        assert_eq!(freed.held_quiesce_busy, 0, "{freed:?}");
+    }
+
+    // Regression: recheck of the finding-1 fix (2026-11-08). The day-path
+    // lock covered every partition of a repaired table, so one 600 s repair
+    // statement kept the pressure leg from freeing partitions weeks older
+    // than anything the repair touches. Only a partition of a repair day
+    // waits now: with the repair holding the lock, an old hour is dropped
+    // and an hour of a repair day is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_day_path_locks_only_partitions_the_repair_can_reach() {
+        use snapshot_gate::InFlightVerdict;
+
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let repair = quiesce
+            .shared(Duration::from_secs(1))
+            .await
+            .expect("a free lock lets the repair in");
+        // (IST day of the pass, dropped, held busy): 2026-04-01 is 19 days
+        // old on 2026-04-20 (outside the repair days) and 1 day old on
+        // 2026-04-02 (inside).
+        for (today, dropped, busy) in [((2026, 4, 20), 1, 0), ((2026, 4, 2), 0, 1)] {
+            let (qdb_url, qdb_log) =
+                spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+            let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+            let objects = Arc::new(Mutex::new(HashMap::new()));
+            let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+            let cfg = PartitionRetentionConfig {
+                archive_quiesce_wait_secs: 1,
+                ..test_retention_cfg(200)
+            };
+            let day = chrono::NaiveDate::from_ymd_opt(today.0, today.1, today.2).expect("date");
+            let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+                .await
+                .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+                .with_test_repair_today(day);
+            let summary = archiver.run_archive_pass().await;
+            assert_eq!(summary.dropped, dropped, "{day}: {summary:?}");
+            assert_eq!(summary.held_quiesce_busy, busy, "{day}: {summary:?}");
+            assert_eq!(summary.failed, 0, "{day}: {summary:?}");
+            let dropped_sent = qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION"));
+            assert_eq!(dropped_sent, dropped == 1, "{day}");
+        }
+        drop(repair);
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review 2. "Raised only on an
+    // accepted DROP" was pinned by a source scan alone. A DROP QuestDB
+    // refuses (HTTP 500) must leave this archiver's ledger untouched, or a
+    // refused drop counts as drain-hold progress and keeps the box up on a
+    // backlog that frees nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_stub_refused_drop_is_not_counted_as_progress() {
+        let inner = qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200);
+        let refusing: Responder = Arc::new(move |req: &SeenRequest| {
+            if req.target.contains("DROP PARTITION") {
+                return (500, Vec::new(), b"{\"error\":\"refused\"}".to_vec());
+            }
+            inner(req)
+        });
+        let (qdb_url, qdb_log) = spawn_stub(refusing).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(
+            qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the DROP was sent (and refused): {summary:?}"
+        );
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.failed >= 1, "{summary:?}");
+        assert_eq!(
+            archiver.drop_ledger.total(),
+            0,
+            "a refused DROP is never drain-hold progress"
+        );
+        assert_eq!(archiver.drop_ledger.last_unix(), None);
+    }
 
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
     // a current_thread runtime would starve the stub server tasks while
@@ -3356,13 +7319,18 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.partitions_considered, 1);
         assert_eq!(summary.verified, 1);
         assert_eq!(summary.dropped, 1);
         assert_eq!(summary.failed, 0);
         assert_eq!(summary.rows_archived, 3);
+        // PR AA-G (finding 10): an accepted DROP is drain-hold progress,
+        // counted exactly once in this archiver's own ledger (2026-11-11
+        // review: the process statics let another test's drop pass this).
+        assert_eq!(archiver.drop_ledger.total(), 1);
+        assert!(archiver.drop_ledger.last_unix().is_some());
         assert!(summary.gzip_bytes_uploaded > 0);
 
         // F1: HeadObject preceded a CONDITIONAL PutObject.
@@ -3412,6 +7380,673 @@ mod stub_integration_tests {
         assert!(qdb_reqs.iter().any(|r| r.target.contains("wal_tables()")));
     }
 
+    // Regression: 2026-10-13 (DA-13d), reworked for PR AA step 2 — the
+    // after-close deferred-depth pass and the archiver ran on the same depth
+    // partitions with nothing between them, so a rewrite committed between
+    // the recount and the DROP was dropped with the partition. The all-night
+    // gate that fixed it is gone; the snapshot gate now holds an hour whose
+    // frames still carry after-close marks, and archives it once they clear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_da13d_depth_hour_with_after_close_marks_is_held_until_cleared() {
+        use snapshot_gate::InFlightVerdict;
+        use std::sync::atomic::AtomicBool;
+
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let marks_waiting = Arc::new(AtomicBool::new(true));
+        let reader_marks = Arc::clone(&marks_waiting);
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200))
+            .await
+            .with_test_snapshot_gate(
+                quiesce,
+                Arc::new(move |_table, _span| {
+                    if reader_marks.load(Ordering::SeqCst) {
+                        InFlightVerdict::DeferredDepth
+                    } else {
+                        InFlightVerdict::Clear
+                    }
+                }),
+            );
+
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(held.held_deferred_depth, 1, "the marked hour is held");
+        assert_eq!(held.dropped, 0, "nothing is dropped while marks wait");
+        assert_eq!(held.failed, 0, "a hold is not a failure");
+        let exported_while_held = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp") || r.target.contains("DROP PARTITION"))
+            .count();
+        assert_eq!(
+            exported_while_held, 0,
+            "a held depth hour is neither exported nor dropped"
+        );
+
+        marks_waiting.store(false, Ordering::SeqCst);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.held_deferred_depth, 0);
+        assert_eq!(freed.dropped, 1, "once the marks clear the hour goes");
+    }
+
+    /// How [`forgetting_responder`] answers (PR AA review finding 11 and its
+    /// review).
+    #[derive(Debug, Clone, Copy)]
+    struct ForgetStub {
+        /// Size listings of the table answer 500 until a DROP arrives.
+        fail_sizes_until_drop: bool,
+        /// Status of the DROP answer. A non-2xx status here still APPLIES the
+        /// drop (when `apply_drops`): the DROP ran and only its answer was
+        /// lost or wrong.
+        drop_status: u16,
+        /// A DROP removes the partition from later size listings. `false`:
+        /// QuestDB accepted it but has not applied it yet.
+        apply_drops: bool,
+        /// Bytes every partition gains on each size listing after the first
+        /// (rows applied after the pass-start listing).
+        grow_after_first_listing: u64,
+    }
+
+    impl ForgetStub {
+        const PLAIN: Self = Self {
+            fail_sizes_until_drop: false,
+            drop_status: 200,
+            apply_drops: true,
+            grow_after_first_listing: 0,
+        };
+    }
+
+    /// A QuestDB stub over `inner` that forgets each partition once a DROP
+    /// names it (size listings for `table` then omit it), shaped by `stub`.
+    fn forgetting_responder(
+        inner: Responder,
+        table: &'static str,
+        partitions: Vec<&'static str>,
+        stub: ForgetStub,
+    ) -> Responder {
+        let dropped: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listings = Arc::new(AtomicU64::new(0));
+        Arc::new(move |req: &SeenRequest| {
+            let t = &req.target;
+            if let Some(at) = t.find("DROP PARTITION LIST '") {
+                let rest = &t[at + "DROP PARTITION LIST '".len()..];
+                if let Some(end) = rest.find('\'') {
+                    dropped
+                        .lock()
+                        .expect("dropped")
+                        .push(rest[..end].to_string());
+                }
+                if stub.drop_status != 200 {
+                    return (
+                        stub.drop_status,
+                        Vec::new(),
+                        b"{\"error\":\"answer lost\"}".to_vec(),
+                    );
+                }
+            }
+            if t.contains("diskSize") && t.contains(&format!("table_partitions('{table}')")) {
+                let gone = dropped.lock().expect("dropped").clone();
+                if stub.fail_sizes_until_drop && gone.is_empty() {
+                    return (500, Vec::new(), b"{\"error\":\"boom\"}".to_vec());
+                }
+                let earlier = listings.fetch_add(1, Ordering::SeqCst);
+                let bytes = STUB_PARTITION_BYTES
+                    + if earlier == 0 {
+                        0
+                    } else {
+                        stub.grow_after_first_listing
+                    };
+                let rows: Vec<String> = partitions
+                    .iter()
+                    .filter(|p| !stub.apply_drops || !gone.iter().any(|g| g == *p))
+                    .map(|p| format!("[\"{p}\",{bytes}]"))
+                    .collect();
+                let body = format!(
+                    "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"diskSize\"}}],\
+                     \"dataset\":[{}]}}",
+                    rows.join(",")
+                );
+                return (200, Vec::new(), body.into_bytes());
+            }
+            inner(req)
+        })
+    }
+
+    /// One pass that copies and sends a DROP for the oldest of two
+    /// `market_depth` hours of 2026-11-07 (cap 1), then the archiver it ran
+    /// on. `dropped` is the count the pass must report.
+    async fn archiver_after_one_drop(stub: ForgetStub, dropped: u32) -> PartitionArchiver {
+        archiver_and_log_after_one_drop(stub, dropped).await.0
+    }
+
+    /// [`archiver_after_one_drop`], also returning the QuestDB request log.
+    async fn archiver_and_log_after_one_drop(
+        stub: ForgetStub,
+        dropped: u32,
+    ) -> (PartitionArchiver, Arc<Mutex<Vec<SeenRequest>>>) {
+        use snapshot_gate::InFlightVerdict;
+        let table = crate::depth_persistence::MARKET_DEPTH_TABLE;
+        let partitions = vec!["2026-11-07T09", "2026-11-07T14"];
+        let inner = qdb_responder_listing(
+            table,
+            partitions.clone(),
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        );
+        let (qdb_url, qdb_log) =
+            spawn_stub(forgetting_responder(inner, table, partitions, stub)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(1))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_t, _s| InFlightVerdict::Clear));
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, dropped, "{summary:?}");
+        (archiver, qdb_log)
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. The drop-tally
+    // size listing ran AFTER the last-moment recount, so a slow listing (up
+    // to 30 s) opened a gap between the proof the partition is unchanged and
+    // the DROP. The recount is now the last query before the DROP.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_recount_is_the_last_query_before_the_drop() {
+        let (_archiver, log) = archiver_and_log_after_one_drop(ForgetStub::PLAIN, 1).await;
+        let targets: Vec<String> = log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .map(|r| r.target.clone())
+            .collect();
+        let drop_at = targets
+            .iter()
+            .position(|t| t.contains("DROP PARTITION LIST"))
+            .expect("a DROP was sent");
+        assert!(drop_at > 0, "{targets:?}");
+        assert!(
+            targets[drop_at - 1].contains("SELECT count(), max(ts)"),
+            "the request before the DROP must be the recount: {:?}",
+            &targets[..=drop_at]
+        );
+        // The size listing for the tally still ran, before the recount.
+        let size_listings = targets[..drop_at]
+            .iter()
+            .filter(|t| t.contains("diskSize FROM table_partitions('market_depth')"))
+            .count();
+        assert!(size_listings >= 2, "pass-start + pre-recount: {targets:?}");
+    }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. A dropped
+    // partition gone with no known size refuses the reading PERMANENTLY
+    // (`Refused`, not retryable): no later tick of this process can read it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_unknown_dropped_size_is_a_permanent_refusal() {
+        let stub = ForgetStub {
+            fail_sizes_until_drop: true,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        let err = archiver
+            .session_bytes_on(day_2026_11_07())
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, SessionBytesError::Refused(_)), "{err}");
+        assert!(!err.retryable());
+        assert!(SessionBytesError::Unread(anyhow::anyhow!("boom")).retryable());
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    fn day_2026_11_07() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date")
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 11. A partition another
+    // archive pass (the disk-pressure leg) already dropped that day is added
+    // back to the day's session bytes; the listing alone read 1,000, not 2,000.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_partitions_a_pressure_pass_dropped() {
+        let archiver = archiver_after_one_drop(ForgetStub::PLAIN, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+        let other = chrono::NaiveDate::from_ymd_opt(2026, 11, 6).expect("date");
+        assert_eq!(archiver.session_bytes_on(other).await.expect("reads"), 0);
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 11. A drop whose size no
+    // listing could read, once its partition is gone, makes the day's reading
+    // an error, never a short sum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_session_bytes_on_refuses_a_day_with_an_unknown_dropped_size() {
+        let stub = ForgetStub {
+            fail_sizes_until_drop: true,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert!(archiver.session_bytes_on(day_2026_11_07()).await.is_err());
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. QuestDB ran the
+    // DROP but its answer came back as an error (a lost or late answer reads
+    // the same). The tally recorded "not dropped" and the day read 1,000 with
+    // no error; it now reads 2,000.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_a_drop_whose_answer_was_lost() {
+        let stub = ForgetStub {
+            drop_status: 500,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 0).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. QuestDB accepted
+    // the DROP but has not applied it, so the partition is still listed. The
+    // listing plus the tally read it twice (3,000); it is counted once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_session_bytes_on_counts_an_unapplied_drop_once() {
+        let stub = ForgetStub {
+            apply_drops: false,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * STUB_PARTITION_BYTES
+        );
+    }
+
+    // Regression: 2026-11-09 — review of PR AA finding 11. Rows applied after
+    // the pass-start listing are in the dropped partition; its size is read
+    // again just before the DROP, so the day reads both hours at their
+    // applied size, not the dropped one at its pass-start size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_drop_records_the_size_listed_just_before_it() {
+        let grow = 700;
+        let stub = ForgetStub {
+            grow_after_first_listing: grow,
+            ..ForgetStub::PLAIN
+        };
+        let archiver = archiver_after_one_drop(stub, 1).await;
+        assert_eq!(
+            archiver
+                .session_bytes_on(day_2026_11_07())
+                .await
+                .expect("reads"),
+            2 * (STUB_PARTITION_BYTES + grow)
+        );
+    }
+
+    /// PR AA step 6 (AA-5): a pass asked to measure reports the bytes of the
+    /// partitions it could have acted on and left on the box: not the ones
+    /// it dropped, not the ones it held in flight. A pass not asked reports
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_pass_measures_the_backlog_it_leaves() {
+        use snapshot_gate::InFlightVerdict;
+
+        let responder = || {
+            qdb_responder_listing(
+                crate::depth_persistence::MARKET_DEPTH_TABLE,
+                vec!["2026-04-01T09", "2026-04-01T10", "2026-04-01T11"],
+                Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+                CSV,
+                Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+            )
+        };
+        // Hour 10 is held in flight; the cap of 2 leaves hour 11 unreached.
+        let held_hour = snapshot_gate::hour_frame_seq_span("2026-04-01T10").expect("span");
+        let reader: InFlightReader = Arc::new(move |_table, span| {
+            if span == held_hour {
+                InFlightVerdict::NotAcked
+            } else {
+                InFlightVerdict::Clear
+            }
+        });
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let (qdb_url, _qdb_log) = spawn_stub(responder()).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(2))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::clone(&reader))
+            .with_backlog_measure();
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "{summary:?}");
+        assert_eq!(summary.held_in_flight, 1, "{summary:?}");
+        assert_eq!(
+            summary.archive_backlog_bytes,
+            Some(STUB_PARTITION_BYTES),
+            "only the unreached hour is copy work left: {summary:?}"
+        );
+
+        // Not asked: nothing is measured.
+        let (qdb_url, _qdb_log) = spawn_stub(responder()).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(2))
+            .await
+            .with_test_snapshot_gate(quiesce, reader);
+        assert_eq!(
+            archiver.run_archive_pass().await.archive_backlog_bytes,
+            None
+        );
+    }
+
+    /// PR AA step 2, the reason for the snapshot gate: the live writer keeps
+    /// committing, so `writerTxn` NEVER equals `sequencerTxn` on any probe.
+    /// The exact gate would skip the table forever; the snapshot gate reads
+    /// its target under the quiesce lock, waits until the writer reaches it,
+    /// and archives the old hour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_depth_hour_archived_while_the_live_writer_keeps_committing() {
+        use snapshot_gate::InFlightVerdict;
+
+        // Probe i: writerTxn 10 + 2i, sequencerTxn 12 + 2i — always behind.
+        let probe_body = |i: usize| -> String {
+            let writer = 10 + 2 * i64::try_from(i).unwrap_or(0);
+            let rows: Vec<String> = swept_tables()
+                .into_iter()
+                .map(|n| format!("[\"{n}\",false,{writer},{}]", writer + 2))
+                .collect();
+            format!(
+                "{{\"columns\":[{{\"name\":\"name\"}},{{\"name\":\"suspended\"}},\
+                 {{\"name\":\"writerTxn\"}},{{\"name\":\"sequencerTxn\"}}],\
+                 \"dataset\":[{}]}}",
+                rows.join(",")
+            )
+        };
+        // The exact gate refuses every one of these probes.
+        for i in 0..32 {
+            let body: serde_json::Value =
+                serde_json::from_str(&probe_body(i)).expect("stub body is JSON");
+            let (rows, _) = crate::wal_suspension_watcher::parse_wal_tables_response(&body)
+                .expect("stub body parses");
+            assert_ne!(
+                wal_apply_verdict(&rows, crate::depth_persistence::MARKET_DEPTH_TABLE),
+                WalApplyVerdict::Applied
+            );
+        }
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(move |probe| (200, probe_body(probe))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear));
+
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "the old hour is archived and dropped");
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        assert_eq!(summary.failed, 0);
+        let drops = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.contains("DROP PARTITION"))
+            .count();
+        assert_eq!(drops, 1);
+    }
+
+    /// PR AA review: the pass lists the table by the hour while its spill
+    /// folder is empty; later in the same pass a batch of that hour is
+    /// rescued to a spill file and counted as acknowledged, so every frame
+    /// check reads clear. The folder, read again under the quiesce lock,
+    /// holds the hour; once the replay has read the file the hour goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_spill_file_written_after_the_listing_holds_the_hour() {
+        use snapshot_gate::InFlightVerdict;
+        use std::sync::atomic::AtomicBool;
+
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let spill_pending = Arc::new(AtomicBool::new(true));
+        let reader_flag = Arc::clone(&spill_pending);
+        // `market_depth` on the hour path, as live (4 h).
+        let cfg = PartitionRetentionConfig {
+            depth_hot_hours: 4,
+            ..test_retention_cfg(200)
+        };
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, cfg)
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_, _| InFlightVerdict::Clear))
+            .with_test_spill_reader(Arc::new(move |table| {
+                table == crate::depth_persistence::MARKET_DEPTH_TABLE
+                    && reader_flag.load(Ordering::SeqCst)
+            }));
+
+        let held = archiver.run_archive_pass().await;
+        assert_eq!(
+            held.dropped, 0,
+            "a pending spill file holds the hour: {held:?}"
+        );
+        assert_eq!(held.held_in_flight, 1, "{held:?}");
+        assert_eq!(held.failed, 0, "{held:?}");
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "nothing is dropped while its rows wait in a spill file"
+        );
+
+        spill_pending.store(false, Ordering::SeqCst);
+        let freed = archiver.run_archive_pass().await;
+        assert_eq!(freed.dropped, 1, "once the replay read the file: {freed:?}");
+    }
+
+    /// PR AA review: hours that have ended but are not yet old enough for
+    /// the window are copy work for later tonight, so the drain hold counts
+    /// them. Before the fix the backlog counted only the worklist, read 0 at
+    /// 16:25 with the 12:00 to 15:00 hours still on the box, and the box
+    /// stopped at 16:30.
+    #[test]
+    fn test_add_pending_hour_sizes_counts_hours_eligible_later_tonight() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(16, 25, 0))
+            .expect("now");
+        let rows: Vec<(String, u64)> = [
+            ("2026-11-09T10", 10_u64), // listed already (start < 11:25): worklist's job
+            ("2026-11-09T11", 11),     // starts 11:00 < 11:25: listed, not pending
+            ("2026-11-09T12", 12),     // pending: eligible at 17:00
+            ("2026-11-09T15", 15),     // pending: eligible at 20:00
+            ("2026-11-09T16", 16),     // still open at 16:25
+            ("2026-11-08", 99),        // a day partition is never an hour
+            ("2026-11-09T13", 13),     // held by the cross-verification hold
+        ]
+        .into_iter()
+        .map(|(n, b)| (n.to_string(), b))
+        .collect();
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert(("market_depth_book", "2026-11-09T12".to_string()), 12);
+        add_pending_hour_sizes(
+            "market_depth_book",
+            4,
+            &rows,
+            now,
+            |p| p != "2026-11-09T13",
+            &mut sizes,
+        );
+        let mut got: Vec<(&str, u64)> = sizes.iter().map(|((_, p), b)| (p.as_str(), *b)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![("2026-11-09T12", 12), ("2026-11-09T15", 15)]);
+        // The bytes left include them even with nothing on the worklist.
+        assert_eq!(
+            backlog_bytes_left(&sizes, &std::collections::HashSet::new()),
+            27
+        );
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 12. At 18:30 the 15:00
+    // depth hours (and any 15:00 hour on the worklist) were counted as copy
+    // work although depth rows stop at 15:44 and no ack can pass 16:00 before
+    // tomorrow's session; the tick-sink hour and every earlier hour stay.
+    #[test]
+    fn test_retain_copyable_tonight_and_add_pending_hour_sizes_leave_out_a_depth_hour_that_cannot_clear_tonight()
+     {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(18, 30, 0))
+            .expect("now");
+        let rows: Vec<(String, u64)> = [("2026-11-09T14", 14_u64), ("2026-11-09T15", 15)]
+            .into_iter()
+            .map(|(n, b)| (n.to_string(), b))
+            .collect();
+        let mut sizes = std::collections::HashMap::new();
+        for table in ["market_depth", "market_depth_book", "tick_quotes"] {
+            add_pending_hour_sizes(table, 4, &rows, now, |_| true, &mut sizes);
+        }
+        // A worklist entry of the same hour (listed, not yet reached).
+        sizes.insert(("market_depth", "2026-11-08T15".to_string()), 7);
+        let before = sizes.clone();
+        retain_copyable_tonight(&mut sizes, now, false, None, true);
+        let mut got: Vec<(&str, &str)> = sizes.keys().map(|(t, p)| (*t, p.as_str())).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![
+                ("market_depth", "2026-11-08T15"),
+                ("market_depth", "2026-11-09T14"),
+                ("market_depth_book", "2026-11-09T14"),
+                ("tick_quotes", "2026-11-09T14"),
+                ("tick_quotes", "2026-11-09T15"),
+            ]
+        );
+        // An untrusted clock or a Muhurat evening keeps everything.
+        let mut untrusted = before.clone();
+        retain_copyable_tonight(&mut untrusted, now, false, None, false);
+        assert_eq!(untrusted, before);
+        let mut muhurat = before.clone();
+        retain_copyable_tonight(&mut muhurat, now, true, None, true);
+        assert_eq!(muhurat, before);
+    }
+
+    // Regression: 2026-11-09 — PR AA review finding 12, through a whole
+    // pass. The quiesce lock is busy (a replay intent), so the pass reaches
+    // no partition; the depth hour no ack can clear before the next session
+    // is not reported as copy work, the earlier one still is.
+    //
+    // Review of finding 12 (2026-11-09): the test named its partitions from
+    // the wall clock and the pass read the clock again, so it could fail at
+    // 09:00 or midnight IST, and between 09:00 and 16:00 its "stuck" hour had
+    // not ended and passed with the fix removed. The pass now takes one
+    // injected instant (18:30 IST), so the outcome is the same at any hour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_busy_pass_leaves_out_a_depth_hour_that_cannot_clear_tonight() {
+        use snapshot_gate::InFlightVerdict;
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 9)
+            .and_then(|d| d.and_hms_opt(18, 30, 0))
+            .expect("now");
+        let (stuck, earlier) = ("2026-11-09T15", "2026-11-08T15");
+        let backlog = |muhurat_active: bool| {
+            let stuck_excluded = snapshot_gate::depth_hour_cannot_clear_tonight(
+                crate::depth_persistence::MARKET_DEPTH_TABLE,
+                stuck,
+                now,
+                muhurat_active,
+                None,
+                true,
+            );
+            if stuck_excluded {
+                STUB_PARTITION_BYTES
+            } else {
+                2 * STUB_PARTITION_BYTES
+            }
+        };
+        assert_eq!(
+            backlog(false),
+            STUB_PARTITION_BYTES,
+            "the 15:00 hour is stuck"
+        );
+        let responder = qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec![earlier, stuck],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        );
+        let quiesce: &'static crate::archive_quiesce::ArchiveQuiesce =
+            Box::leak(Box::new(crate::archive_quiesce::ArchiveQuiesce::new()));
+        let _replay = quiesce.intend_replay();
+        let (qdb_url, _qdb_log) = spawn_stub(responder).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(10))
+            .await
+            .with_test_snapshot_gate(quiesce, Arc::new(|_t, _s| InFlightVerdict::NotAcked))
+            .with_backlog_measure();
+        archiver.depth_ack_bound_trusted = Arc::new(|| true);
+        archiver.backlog_now_override = Some(now);
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.held_quiesce_busy > 0, "{summary:?}");
+        // The process Muhurat flag is read by the pass; on its usual `false`
+        // only the earlier hour is copy work tonight.
+        assert_eq!(
+            summary.archive_backlog_bytes,
+            Some(backlog(tickvault_common::muhurat::current())),
+            "{summary:?}"
+        );
+        // An untrusted clock keeps the stuck hour counted (the production
+        // guard's own truth table is in snapshot_gate's tests).
+        archiver.depth_ack_bound_trusted = Arc::new(|| false);
+        let untrusted = archiver.run_archive_pass().await;
+        assert_eq!(
+            untrusted.archive_backlog_bytes,
+            Some(2 * STUB_PARTITION_BYTES),
+            "{untrusted:?}"
+        );
+    }
+
     // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
     // a current_thread runtime would starve the stub server tasks while
     // the flush blocks (deadlock until the request timeout).
@@ -3426,7 +8061,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.dropped, 0);
         assert_eq!(summary.failed, 1);
@@ -3457,29 +8092,59 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
-        assert_eq!(summary.dropped, 0);
-        assert_eq!(summary.failed, 1, "S3Conflict must count as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT"),
-            "a different-length existing object must NEVER be overwritten"
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
-        );
-        assert_eq!(
-            objects.lock().expect("objects").get(TICKS_KEY),
-            Some(&(999_999, None)),
-            "the pre-existing object must be untouched"
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
@@ -3501,7 +8166,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.verified, 1);
         assert_eq!(summary.dropped, 1, "reused archive still verifies + drops");
@@ -3550,24 +8215,59 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
-        assert_eq!(summary.dropped, 0, "checksum mismatch must never drop");
-        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT"),
-            "a same-length different-content object must NEVER be overwritten"
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
@@ -3589,23 +8289,59 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
-        assert_eq!(summary.dropped, 0, "unprovable content must never drop");
-        assert_eq!(summary.failed, 1, "S3Conflict counts as a failure");
+        // CONTRACT CHANGED 2026-08-25. This previously asserted
+        // "conflict => keep the partition forever". That policy deadlocked
+        // retention on the live box: 1,000 `s3_conflict` audit rows, ZERO
+        // successful archives ever recorded, tick data surviving back to
+        // 2026-06-02 against a ONE-DAY hot window, and the volume 86% full
+        // and projected to fill within three sessions.
+        //
+        // The cause is legitimate rather than a bug: `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10.0% of
+        // live ticks arrive with a timestamp over an hour behind their
+        // receive time, so an already-archived hourly partition keeps
+        // gaining rows and can never reproduce the archived bytes again.
+        //
+        // The guarantee that actually mattered is UNCHANGED and is still
+        // asserted below: the pre-existing object is never overwritten.
+        // What changed is that the partition's CURRENT content now goes to
+        // a content-addressed sidecar key, so both copies survive and the
+        // partition can finally be released.
+        assert_eq!(
+            summary.dropped, 1,
+            "a resolvable conflict must release the partition"
+        );
+        assert_eq!(
+            summary.failed, 0,
+            "the sidecar path is a success, not a failure"
+        );
+        let puts: Vec<String> = s3_log
+            .lock()
+            .expect("s3 log")
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(puts.len(), 1, "exactly one upload, to the sidecar key");
         assert!(
-            !s3_log
-                .lock()
-                .expect("s3 log")
-                .iter()
-                .any(|r| r.method == "PUT")
+            puts[0].contains(".sha-"),
+            "upload must use a content-addressed key, got {}",
+            puts[0]
         );
         assert!(
-            !qdb_log
+            !puts[0].ends_with("/2026-04-01T09.csv.gz"),
+            "upload must NEVER target the canonical key, got {}",
+            puts[0]
+        );
+        assert!(
+            qdb_log
                 .lock()
                 .expect("qdb log")
                 .iter()
-                .any(|r| r.target.contains("DROP PARTITION"))
+                .any(|r| r.target.contains("DROP PARTITION")),
+            "the partition must now be dropped"
         );
     }
 
@@ -3622,7 +8358,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.verified, 1, "the archive itself verified");
         assert_eq!(summary.dropped, 0, "drop must be WITHHELD without the ACK");
@@ -3664,7 +8400,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(
             summary.partitions_considered, 0,
@@ -3697,7 +8433,7 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.tables_scanned, 0);
         assert_eq!(summary.partitions_considered, 0);
@@ -3717,6 +8453,267 @@ mod stub_integration_tests {
     // a current_thread runtime would starve the stub server tasks while
     // the flush blocks (deadlock until the request timeout).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_wal_lagging_table_is_skipped_before_export() {
+        // `ticks` is behind on every probe: never suspended, so the
+        // run-start gate lets it through, and the per-partition gate must
+        // stop it before any export, for BOTH of its partitions.
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(summary.pass_ran);
+        assert_eq!(summary.tables_wal_suspended, 0);
+        assert_eq!(summary.partitions_considered, 2);
+        assert_eq!(summary.tables_wal_not_applied, 1, "counted once per table");
+        assert_eq!(summary.verified, 0);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(
+            !qdb_reqs.iter().any(|r| r.target.starts_with("/exp")),
+            "no export may run while the table's WAL is behind"
+        );
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
+        // Run-start probe + ONE per-partition probe: the second partition
+        // of the blocked table is skipped without probing again.
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.contains("wal_tables()"))
+                .count(),
+            2
+        );
+        assert!(s3_log.lock().expect("s3 log").is_empty(), "no S3 traffic");
+        assert!(objects.lock().expect("objects").is_empty());
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_wal_lag_between_export_and_drop_withholds_drop_and_keeps_s3_object() {
+        // Probe 0 = run start, 1 = pre-export (both applied); probe 2 =
+        // pre-drop, where the table has fallen behind.
+        let wal: WalStub = Arc::new(|probe| {
+            let lagging: &[&str] = if probe >= 2 { &["ticks"] } else { &[] };
+            (200, wal_tables_body(&[], lagging))
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.verified, 1, "the export itself verified");
+        assert_eq!(summary.dropped, 0, "the drop must be withheld");
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.starts_with("/exp"))
+                .count(),
+            1
+        );
+        assert!(
+            !qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")),
+            "no DROP while acknowledged rows may still be unapplied"
+        );
+        // The pre-drop gate runs BEFORE the pre-drop recount: only the
+        // verify recount was issued.
+        assert_eq!(
+            qdb_reqs
+                .iter()
+                .filter(|r| r.target.contains("count()"))
+                .count(),
+            1
+        );
+        // The S3 copy is KEPT (it is a correct copy of what was applied).
+        assert!(objects.lock().expect("objects").contains_key(TICKS_KEY));
+        assert!(
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "DELETE"),
+            "the archived object must not be deleted on a WAL-lag refusal"
+        );
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_unreadable_wal_tables_at_partition_gate_fails_closed() {
+        // The run-start probe succeeds; every later probe fails.
+        let wal: WalStub = Arc::new(|probe| {
+            if probe == 0 {
+                (200, wal_tables_body(&[], &[]))
+            } else {
+                (500, "{}".to_string())
+            }
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert!(summary.pass_ran);
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.starts_with("/exp")));
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
+        assert!(objects.lock().expect("objects").is_empty());
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_table_absent_from_wal_tables_fails_closed() {
+        // `ticks` is missing from the probe entirely (only the run-start
+        // shape check passes, via an empty dataset).
+        let wal: WalStub = Arc::new(|_probe| {
+            (
+                200,
+                "{\"columns\":[{\"name\":\"name\"},{\"name\":\"suspended\"},\
+                 {\"name\":\"writerTxn\"},{\"name\":\"sequencerTxn\"}],\"dataset\":[]}"
+                    .to_string(),
+            )
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_with(
+            vec!["2026-04-01T09"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(objects)).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        assert_eq!(summary.dropped, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.starts_with("/exp")));
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_fully_applied_table_probes_before_export_and_drop_then_drops() {
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, CSV, vec![], 200)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        let pos = |needle: &str| -> Vec<usize> {
+            qdb_reqs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.target.contains(needle) || r.target.starts_with(needle))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let probes = pos("wal_tables()");
+        let exports = pos("/exp");
+        let drops = pos("DROP PARTITION");
+        let counts = pos("count()");
+        assert_eq!(probes.len(), 3, "run start + pre-export + pre-drop");
+        assert_eq!(exports.len(), 1);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(counts.len(), 2, "verify recount + pre-drop re-read");
+        assert!(
+            probes[1] < exports[0],
+            "the pre-export gate precedes the export"
+        );
+        assert!(
+            probes[2] < counts[1] && counts[1] < drops[0],
+            "the pre-drop gate precedes the pre-drop re-read, which precedes the DROP"
+        );
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_max_ts_change_before_drop_withholds_drop() {
+        // Same count both times, but a later max(ts) at the pre-drop
+        // re-read: rows changed after the export.
+        let tally: TallyStub = Arc::new(|call| {
+            if call == 0 {
+                (3, Some(STUB_MAX_TS.to_string()))
+            } else {
+                (3, Some("2026-04-01T09:59:59.500000Z".to_string()))
+            }
+        });
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &[])));
+        let (qdb_url, qdb_log) =
+            spawn_stub(qdb_responder_with(vec!["2026-04-01T09"], tally, CSV, wal)).await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        let mut archiver =
+            build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
+        let summary = archiver.run_archive_pass().await;
+
+        assert_eq!(summary.verified, 1);
+        assert_eq!(summary.dropped, 0, "a moved max(ts) must withhold the drop");
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.tables_wal_not_applied, 0);
+        let qdb_reqs = qdb_log.lock().expect("qdb log").clone();
+        assert!(!qdb_reqs.iter().any(|r| r.target.contains("DROP PARTITION")));
+    }
+
+    // Multi-thread runtime: the questdb-rs ILP flush is SYNC-blocking;
+    // a current_thread runtime would starve the stub server tasks while
+    // the flush blocks (deadlock until the request timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stub_empty_export_body_is_export_failure() {
         let (qdb_url, qdb_log) =
             spawn_stub(qdb_responder(vec!["2026-04-01T09"], 3, "", vec![], 200)).await;
@@ -3726,12 +8723,18 @@ mod stub_integration_tests {
 
         let mut archiver =
             build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(200)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.failed, 1, "empty body = export failure, not 0 rows");
         assert_eq!(summary.dropped, 0);
+        // Owner Quote 60: the archiver HEADs the canonical key before an
+        // export-table export (to decide the order); nothing is PUT.
         assert!(
-            s3_log.lock().expect("s3 log").is_empty(),
+            !s3_log
+                .lock()
+                .expect("s3 log")
+                .iter()
+                .any(|r| r.method == "PUT"),
             "nothing uploaded"
         );
         assert!(
@@ -3761,7 +8764,7 @@ mod stub_integration_tests {
         let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
 
         let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(1)).await;
-        let summary = archiver.archive_and_drop_old_partitions().await;
+        let summary = archiver.run_archive_pass().await;
 
         assert_eq!(summary.partitions_considered, 1, "bounded per run");
         assert_eq!(summary.dropped, 1);
@@ -3782,4 +8785,895 @@ mod stub_integration_tests {
             "the OLDEST partition goes first (monotonic progress)"
         );
     }
+
+    // Regression: 2026-11-09 — review of the finding-11 fix. The pass-start
+    // drop-size listing ran before the depth skip, so a pressure pass that
+    // could not drop a depth hour still listed both depth tables for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_pass_start_size_listing_skips_tables_the_pass_cannot_drop() {
+        // Only `market_depth` has partitions to archive.
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_listing(
+            crate::depth_persistence::MARKET_DEPTH_TABLE,
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            Arc::new(|_probe| (200, wal_tables_body(&[], &[]))),
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let _summary = archiver.run_archive_pass().await;
+        let depth_listings: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| {
+                r.target
+                    .contains("diskSize FROM table_partitions('market_depth')")
+                    || r.target
+                        .contains("diskSize FROM table_partitions('market_depth_book')")
+            })
+            .map(|r| r.target.clone())
+            .collect();
+        assert!(
+            depth_listings.is_empty(),
+            "a depth-skipping pass lists no depth sizes: {depth_listings:?}"
+        );
+    }
+
+    // Regression: 2026-11-06 (PR DP-2) — a pressure pass exported 41
+    // partitions back to back, nine of them market_depth hours, through
+    // QuestDB's one HTTP thread while the session opened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stub_with_pass_limits_skip_depth_cap_and_deadline() {
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder(
+            vec!["2026-04-01T11", "2026-04-01T09", "2026-04-01T10"],
+            3,
+            CSV,
+            vec![],
+            200,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+
+        // One partition, no depth.
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.partitions_considered, 1, "one partition a pass");
+        assert!(summary.held_by_gate >= 2, "the rest are held: {summary:?}");
+        assert!(!summary.stopped_at_deadline);
+        let exports: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(
+            exports.iter().all(|t| !t.contains("market_depth")),
+            "no depth export while skip_depth: {exports:?}"
+        );
+
+        // A stop time already passed: nothing is exported, everything held.
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder(
+            vec!["2026-04-01T09", "2026-04-01T10"],
+            3,
+            CSV,
+            vec![],
+            200,
+        ))
+        .await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                stop_at_unix_secs: Some(0),
+                ..ArchivePassLimits::default()
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(summary.stopped_at_deadline);
+        assert_eq!(summary.dropped, 0);
+        assert!(summary.held_by_gate > 0);
+        assert!(
+            !qdb_log
+                .lock()
+                .expect("qdb log")
+                .iter()
+                .any(|r| r.target.starts_with("/exp")),
+            "nothing exported after the stop time"
+        );
+    }
+
+    // Regression: PR DP review H1 — the in-session cap took the oldest
+    // partition first; that is usually a ticks day still being written, so
+    // the pass read WalNotApplied, dropped nothing, and escalated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_h1_gated_pass_drops_wal_lagging_tables_before_its_cap() {
+        // `ticks` (older partition) lags on every probe; `tick_quotes` is applied.
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![
+                ("ticks", vec!["2026-04-01T09"]),
+                ("tick_quotes", vec!["2026-04-01T10"]),
+            ],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(summary.pass_gated);
+        assert_eq!(summary.tables_wal_not_applied, 1, "{summary:?}");
+        assert_eq!(
+            summary.dropped, 1,
+            "the applied table took the slot: {summary:?}"
+        );
+        let exports: Vec<String> = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .map(|r| r.target.clone())
+            .collect();
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert!(exports[0].contains("tick_quotes"), "{exports:?}");
+    }
+
+    // Regression: 2026-11-06 combined review — a pass limited only by a stop
+    // time (off-session / pre-open) is NOT the capped in-session pass, so a
+    // WAL-lagging table must leave `pass_gated` false and the pass escalates
+    // (the first DP version marked every limited pass gated and an overnight
+    // pass on a lagging table stood aside silently).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_deadline_only_pass_is_not_gated_on_wal_lag() {
+        let wal: WalStub = Arc::new(|_probe| (200, wal_tables_body(&[], &["ticks"])));
+        let (qdb_url, _qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![("ticks", vec!["2026-04-01T09"])],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: false,
+                max_partitions: None,
+                stop_at_unix_secs: Some(i64::MAX),
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert!(!summary.pass_gated, "{summary:?}");
+        assert_eq!(summary.dropped, 0, "{summary:?}");
+        assert!(summary.tables_wal_not_applied >= 1, "{summary:?}");
+    }
+
+    // Regression: PR DP review H1 — the cap counts EXPORTED partitions: one
+    // refused at its pre-export WAL gate (the table fell behind after the
+    // run-start probe) takes no slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_regression_h1_gated_cap_counts_only_exported_partitions() {
+        // Probe 0 (run start): all applied. Later probes: `ticks` lags.
+        let wal: WalStub = Arc::new(|probe| {
+            let lagging: &[&str] = if probe >= 1 { &["ticks"] } else { &[] };
+            (200, wal_tables_body(&[], lagging))
+        });
+        let (qdb_url, qdb_log) = spawn_stub(qdb_responder_tables(
+            vec![
+                ("ticks", vec!["2026-04-01T09"]),
+                ("tick_quotes", vec!["2026-04-01T10"]),
+            ],
+            Arc::new(|_call| (3, Some(STUB_MAX_TS.to_string()))),
+            CSV,
+            wal,
+        ))
+        .await;
+        let (ilp_url, _ilp_log) = spawn_stub(ilp_responder(204)).await;
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (s3_url, _s3_log) = spawn_stub(s3_responder(Arc::clone(&objects))).await;
+        let mut archiver = build_archiver(&qdb_url, &ilp_url, &s3_url, test_retention_cfg(50))
+            .await
+            .with_pass_limits(ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            });
+        let summary = archiver.run_archive_pass().await;
+        assert_eq!(summary.dropped, 1, "{summary:?}");
+        assert_eq!(summary.tables_wal_not_applied, 1);
+        let exports = qdb_log
+            .lock()
+            .expect("qdb log")
+            .iter()
+            .filter(|r| r.target.starts_with("/exp"))
+            .count();
+        assert_eq!(exports, 1, "exactly one export under the cap");
+    }
+
+    #[test]
+    fn test_wal_lagging_tables_and_drop_wal_lagging() {
+        let row = |name: &str, suspended, w, s| WalTableRow {
+            name: name.to_string(),
+            suspended,
+            writer_txn: w,
+            sequencer_txn: s,
+            error_tag: None,
+            error_message: None,
+        };
+        let rows = vec![
+            row("ticks", false, Some(5), Some(7)),
+            row("candles_1m", false, Some(7), Some(7)),
+            row("tick_quotes", true, Some(5), Some(7)),
+            row("feed_aux_packets", false, None, Some(7)),
+        ];
+        assert_eq!(wal_lagging_tables(&rows), vec!["ticks".to_string()]);
+        let worklist = vec![
+            ("ticks", "2026-04-01T09".to_string()),
+            ("candles_1m", "2026-04-01".to_string()),
+            ("ticks", "2026-04-01T10".to_string()),
+        ];
+        let (kept, removed) = drop_wal_lagging(worklist, &["ticks".to_string()]);
+        assert_eq!(kept, vec![("candles_1m", "2026-04-01".to_string())]);
+        assert_eq!(removed, vec!["ticks"]);
+        assert!(PartitionStep::Done.exported());
+        assert!(PartitionStep::WalNotAppliedBeforeDrop.exported());
+        assert!(!PartitionStep::WalNotAppliedBeforeExport.exported());
+        assert!(!PartitionStep::Done.wal_not_applied());
+        assert!(PartitionStep::WalNotAppliedBeforeExport.wal_not_applied());
+        assert!(!PartitionStep::Held.exported() && !PartitionStep::Held.wal_not_applied());
+        assert!(
+            !PartitionStep::QuiesceBusy.exported() && !PartitionStep::QuiesceBusy.wal_not_applied()
+        );
+    }
+
+    /// PR AA step 2: every hour-path partition goes through the snapshot
+    /// gate, every other table keeps the exact gate, and a depth table whose
+    /// WAL is merely behind is never dropped from a gated pass's worklist.
+    #[test]
+    fn test_non_hour_tables_keep_exact_gate() {
+        for table in swept_tables() {
+            assert_eq!(
+                snapshot_gate_table(table),
+                is_depth_table(table),
+                "{table}: only the depth tables take the snapshot gate"
+            );
+        }
+        let row = |name: &str| WalTableRow {
+            name: name.to_string(),
+            suspended: false,
+            writer_txn: Some(5),
+            sequencer_txn: Some(7),
+            error_tag: None,
+            error_message: None,
+        };
+        let rows = vec![row("ticks"), row("market_depth"), row("market_depth_book")];
+        assert_eq!(wal_lagging_tables(&rows), vec!["ticks".to_string()]);
+        // The exact gate still refuses a lagging non-hour table.
+        assert!(matches!(
+            wal_apply_verdict(&rows, "ticks"),
+            WalApplyVerdict::Lagging { .. }
+        ));
+    }
+
+    /// The marks-waiting accessor reads the process mark table.
+    #[test]
+    fn test_deferred_depth_marks_waiting_reads_the_process_marks() {
+        // No test in this crate marks the process table, so both reads agree.
+        let expected = !crate::wal_deferred_depth::deferred_depth()
+            .snapshot()
+            .is_empty();
+        assert_eq!(deferred_depth_marks_waiting(), expected);
+    }
+    #[test]
+    fn test_apply_pass_limits_skips_depth_and_caps() {
+        let worklist = vec![
+            ("market_depth", "2026-04-01T09".to_string()),
+            ("ticks", "2026-04-01".to_string()),
+            ("market_depth_book", "2026-04-01T10".to_string()),
+            ("candles_1m", "2026-04-01".to_string()),
+        ];
+        let (kept, held) = apply_pass_limits(worklist.clone(), ArchivePassLimits::default());
+        assert_eq!((kept.len(), held), (4, 0), "no limits = unchanged");
+        let (kept, held) = apply_pass_limits(
+            worklist.clone(),
+            ArchivePassLimits {
+                skip_depth: true,
+                ..ArchivePassLimits::default()
+            },
+        );
+        assert_eq!(held, 2);
+        assert!(kept.iter().all(|(t, _)| !t.starts_with("market_depth")));
+        let (kept, held) = apply_pass_limits(
+            worklist,
+            ArchivePassLimits {
+                skip_depth: true,
+                max_partitions: Some(1),
+                stop_at_unix_secs: None,
+            },
+        );
+        assert_eq!((kept.len(), held), (1, 3));
+        assert_eq!(kept[0].0, "ticks");
+        let (kept, held) = apply_pass_limits(
+            Vec::new(),
+            ArchivePassLimits {
+                max_partitions: Some(0),
+                ..ArchivePassLimits::default()
+            },
+        );
+        assert_eq!((kept.len(), held), (0, 0));
+    }
+
+    #[test]
+    fn test_pass_deadline_reached_boundaries() {
+        assert!(!pass_deadline_reached(None, i64::MAX));
+        assert!(!pass_deadline_reached(Some(100), 99));
+        assert!(pass_deadline_reached(Some(100), 100));
+        assert!(pass_deadline_reached(Some(100), 101));
+    }
+
+    /// `read_body_capped` (shared with the WAL watcher since plan item 51d)
+    /// returns a short body whole and stops at `ARCHIVE_MAX_EXEC_BODY_BYTES`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_read_body_capped_keeps_a_short_body_and_stops_at_the_cap() {
+        let cap = usize::try_from(ARCHIVE_MAX_EXEC_BODY_BYTES).unwrap_or(usize::MAX);
+        let (url, _log) = spawn_stub(Arc::new(move |req: &SeenRequest| {
+            let body = if req.target.starts_with("/big") {
+                vec![b'a'; cap + 4096]
+            } else {
+                b"{\"ok\":true}".to_vec()
+            };
+            (200, Vec::new(), body)
+        }))
+        .await;
+        let client = crate::http_client::build_probe_client(5).expect("probe client");
+        let small = client
+            .get(format!("{url}/small"))
+            .send()
+            .await
+            .expect("small request");
+        assert_eq!(
+            read_body_capped(small).await.expect("small body"),
+            "{\"ok\":true}"
+        );
+        let big = client
+            .get(format!("{url}/big"))
+            .send()
+            .await
+            .expect("big request");
+        assert_eq!(read_body_capped(big).await.expect("big body").len(), cap);
+    }
 }
+
+#[cfg(test)]
+mod hour_granular_eligibility_tests {
+    use super::*;
+    use crate::partition_manager::{build_closed_hour_list_sql, build_detach_list_sql};
+
+    /// THE safety property. `ticks` carries the exchange last-trade time, and
+    /// ~10% of a session's ticks arrive more than an hour behind it — into
+    /// partitions that are already closed. Hour-archiving it would race a live
+    /// write against a detach.
+    #[test]
+    fn ticks_can_never_reach_the_hour_path() {
+        for configured in [0, 1, 4, 6, 24, u32::MAX] {
+            assert_eq!(
+                hot_window_hours("ticks", configured),
+                None,
+                "ticks became hour-eligible at configured={configured} — its ts \
+                 is the exchange last-trade time, so a closed hour still \
+                 receives writes"
+            );
+        }
+        assert!(
+            !ARRIVAL_STAMPED_HOUR_TABLES.contains(&"ticks"),
+            "ticks must never join the arrival-stamped allowlist"
+        );
+    }
+
+    #[test]
+    fn only_arrival_stamped_tables_are_listed() {
+        // If this list ever grows, the new entry's `ts` must be the arrival
+        // instant. That is not checkable from here, so the test pins the list
+        // itself: adding a table is a deliberate act with a visible diff.
+        assert_eq!(ARRIVAL_STAMPED_HOUR_TABLES, &["market_depth"]);
+    }
+
+    #[test]
+    fn zero_hours_is_the_off_switch_not_an_empty_window() {
+        // The dangerous reading of 0 is "keep nothing", which makes the cutoff
+        // `now()` and matches the partition being actively written — the exact
+        // hazard MIN_HOT_DAYS_MARKET_DATA's own comment warns about, one unit
+        // down. It must mean OFF instead, falling back to the day path.
+        assert_eq!(hot_window_hours("market_depth", 0), None);
+    }
+
+    #[test]
+    fn a_configured_window_is_clamped_up_to_the_replay_floor() {
+        // Below the floor is where WAL replay bites: a replayed frame carries
+        // its ORIGINAL receipt, so a mid-session restart writes backwards into
+        // closed hours.
+        assert_eq!(hot_window_hours("market_depth", 1), Some(MIN_HOT_HOURS));
+        assert_eq!(hot_window_hours("market_depth", 3), Some(MIN_HOT_HOURS));
+        // At and above the floor the operator's value is honoured verbatim.
+        assert_eq!(hot_window_hours("market_depth", 4), Some(4));
+        assert_eq!(hot_window_hours("market_depth", 6), Some(6));
+        assert!(MIN_HOT_HOURS >= 4, "the replay margin must not shrink");
+    }
+
+    #[test]
+    fn the_hour_query_differs_from_the_day_query_only_in_its_unit() {
+        // A copy-paste that left 'd' in place would silently do nothing at all
+        // — the hour path would behave exactly like the day path it replaced,
+        // and the 78 GB would still not be reclaimed. Cheap to assert, and the
+        // failure is otherwise invisible.
+        //
+        // PR AA step 3: the hour query is judged by the hour's END, so a
+        // 6-hour window reads `-7` hours on `minTimestamp`.
+        let hours = build_closed_hour_list_sql("market_depth", 6);
+        let days = build_detach_list_sql("market_depth", 7);
+
+        assert!(hours.contains("dateadd('h', -7,"), "{hours}");
+        assert!(
+            !hours.contains("dateadd('d'"),
+            "hour query still says days: {hours}"
+        );
+        // The day query has no IST shift, so strip the hour query's before
+        // comparing: what must match is the SHAPE, minus unit and frame.
+        assert_eq!(
+            hours.replace("dateadd('h'", "dateadd('d'").replace(
+                &format!(
+                    "dateadd('s', {}, now())",
+                    tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+                ),
+                "now()"
+            ),
+            days,
+            "the two queries must differ ONLY in the unit and the IST shift"
+        );
+    }
+
+    #[test]
+    fn the_hour_cutoff_compares_against_ist_not_utc() {
+        // THE TEST ABOVE PINNED THE BUG IN PLACE, and that is the lesson.
+        //
+        // It asserted `dateadd('h', -6, now())` literally — the correct guard
+        // against a copy-pasted 'd', and simultaneously a hard pin on the UTC
+        // `now()` that made the whole feature inert. Its own comment says "the
+        // failure is otherwise invisible"; it was invisible to this test too.
+        //
+        // `minTimestamp` here is IST-shifted (depth_persistence's 2026-08-19
+        // correction), so an unshifted `now()` makes the effective window
+        // N + 5.5 hours. At the shipped depth_hot_hours = 4 that is 9.5 hours:
+        // depth written at 09:00 IST first qualifies at 18:30 IST, an hour
+        // after the box stops. A 14:00 pressure episode selected ZERO
+        // partitions while the disk filled — the exact reclaim this path
+        // exists to perform, never once performed.
+        let sql = build_closed_hour_list_sql("market_depth", 4);
+        assert!(
+            sql.contains(&format!(
+                "dateadd('s', {}, now())",
+                tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+            )),
+            "the hour cutoff must shift now() into the IST frame the data is \
+             stamped in, or the window is silently 5.5 hours wider than \
+             configured: {sql}"
+        );
+        assert!(
+            !sql.contains("-4, now())"),
+            "a bare UTC now() is the inert form this test exists to refuse: {sql}"
+        );
+    }
+
+    #[test]
+    fn the_table_name_is_quoted_so_the_query_is_well_formed() {
+        // Caught in review: an escaping slip had produced
+        // `table_partitions(.market_depth.)`, which QuestDB rejects. The
+        // detach path treats a failed list query as "no eligible partitions",
+        // so a malformed query reclaims nothing and says nothing.
+        let sql = build_closed_hour_list_sql("market_depth", 6);
+        assert!(
+            sql.contains("table_partitions('market_depth')"),
+            "table name must be single-quoted: {sql}"
+        );
+    }
+    // ---- hour-window decision under disk pressure (2026-09-01) ----------
+    //
+    // The measured incident these pin: `market_depth` held 185.7 GB in 10
+    // hourly partitions against a configured 4-hour window, on a 93%-full
+    // volume, while the pressure episode reclaimed ZERO. Cause: the spill
+    // dirs are non-empty BECAUSE the disk is full, so the hour window
+    // deferred to a 2-day one that protects every partition the box wrote
+    // that session.
+
+    #[test]
+    fn test_spill_dirs_for_table_is_own_folder_for_hour_tables() {
+        // 2026-10-22 (plan item 62): `top_volume_<tf>` sees no folder of its
+        // own. 2026-11-07 (PR AA step 3): each hour-path table sees only the
+        // folder its writer spills to; any other table keeps both.
+        for table in ["candles_1m", "order_audit", "top_volume_1m"] {
+            assert_eq!(
+                spill_dirs_for_table(table),
+                [
+                    crate::depth_persistence::DEPTH_SPILL_DIR,
+                    crate::tick_persistence::TICK_SPILL_DIR,
+                ],
+                "{table} keeps the depth + tick check"
+            );
+        }
+        assert_eq!(
+            spill_dirs_for_table("market_depth"),
+            [crate::depth_persistence::DEPTH_SPILL_DIR]
+        );
+        assert_eq!(
+            spill_dirs_for_table("ticks"),
+            [crate::tick_persistence::TICK_SPILL_DIR]
+        );
+    }
+
+    /// Exhaustive truth table for `hour_window_decision`.
+    ///
+    /// Every (hours, spill_pending, under_pressure, may_force) combination,
+    /// so a future edit cannot change one arm silently. The rule:
+    /// off-allowlist stays on days; no spill takes hours; a spill under
+    /// pressure FORCES hours (counted) only where forcing is allowed
+    /// (`market_depth` behind its switch); every other spill defers.
+    #[test]
+    fn hour_window_decision_truth_table_is_exhaustive() {
+        use HourWindowDecision as D;
+        let cases = [
+            (None, false, false, false, D::DaysByClass),
+            (None, false, true, false, D::DaysByClass),
+            (None, true, false, false, D::DaysByClass),
+            (None, true, true, false, D::DaysByClass),
+            (None, false, false, true, D::DaysByClass),
+            (None, false, true, true, D::DaysByClass),
+            (None, true, false, true, D::DaysByClass),
+            (None, true, true, true, D::DaysByClass),
+            (Some(4), false, false, false, D::Hours(4)),
+            (Some(4), false, true, false, D::Hours(4)),
+            (Some(4), true, false, false, D::DeferredToDays),
+            (Some(4), true, true, false, D::DeferredToDays),
+            (Some(4), false, false, true, D::Hours(4)),
+            (Some(4), false, true, true, D::Hours(4)),
+            (Some(4), true, false, true, D::DeferredToDays),
+            (Some(4), true, true, true, D::ForcedHours(4)),
+        ];
+        for (hours, spill, pressure, force, want) in cases {
+            assert_eq!(
+                hour_window_decision(hours, spill, pressure, force),
+                want,
+                "hours={hours:?} spill_pending={spill} under_pressure={pressure} may_force={force}"
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_keeps_the_hour_window_when_a_spill_is_pending() {
+        // The exact incident shape: hour-capable table, spill pending,
+        // pressure episode active. Before the fix this returned the day
+        // window and the pass reclaimed nothing. Since PR AA step 3 only
+        // `market_depth` (behind `market_depth_force_with_spill_pending`,
+        // on by default) may be forced.
+        assert_eq!(
+            hour_window_decision(Some(4), true, true, true),
+            HourWindowDecision::ForcedHours(4),
+            "under pressure the hour window must survive a pending spill — \
+             deferring is what made the 93%-full volume unreclaimable"
+        );
+        let cfg = PartitionRetentionConfig::default();
+        assert!(cfg.market_depth_force_with_spill_pending);
+        assert!(may_force_with_spill_pending("market_depth", &cfg));
+    }
+
+    #[test]
+    fn without_pressure_a_pending_spill_still_defers() {
+        // The conservative default is UNCHANGED off-pressure. This is the
+        // half that must not regress: the deferral exists for a real race.
+        for force in [false, true] {
+            assert_eq!(
+                hour_window_decision(Some(4), true, false, force),
+                HourWindowDecision::DeferredToDays
+            );
+        }
+    }
+
+    #[test]
+    fn no_spill_uses_the_hour_window_and_is_not_counted_as_forced() {
+        // Forcing must be distinguishable from the ordinary hour path, or
+        // the counter cannot tell an operator that a race window was opened.
+        assert_eq!(
+            hour_window_decision(Some(4), false, false, true),
+            HourWindowDecision::Hours(4)
+        );
+        assert_eq!(
+            hour_window_decision(Some(4), false, true, true),
+            HourWindowDecision::Hours(4),
+            "pressure alone must not mark the decision forced when there is \
+             no spill to race against"
+        );
+    }
+
+    #[test]
+    fn a_table_off_the_allowlist_never_reaches_the_hour_path() {
+        // `hours = None` is how every table `hour_window_for` keeps off the
+        // hour path arrives here. Pressure must not promote one onto an hour
+        // window it was never proven safe for.
+        for pressure in [false, true] {
+            for spill in [false, true] {
+                for force in [false, true] {
+                    assert_eq!(
+                        hour_window_decision(None, spill, pressure, force),
+                        HourWindowDecision::DaysByClass,
+                        "pressure={pressure} spill={spill} force={force} must stay on days"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pressure_marker_cannot_be_set_from_configuration() {
+        // It is `#[serde(skip)]` on purpose: the only writer is
+        // `disk_pressure_boot::pressure_config`. If TOML could set it, an
+        // operator could force the race window open permanently without
+        // ever being under pressure.
+        let cfg: tickvault_common::config::PartitionRetentionConfig =
+            toml::from_str("under_disk_pressure = true").expect("parses");
+        assert!(
+            !cfg.under_disk_pressure,
+            "under_disk_pressure must be unreachable from TOML"
+        );
+        assert!(
+            !tickvault_common::config::PartitionRetentionConfig::default().under_disk_pressure,
+            "the default must be off"
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_space_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn archive_space_verdict_reports_ample_at_or_above_the_floor() {
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Ample,
+            "exactly the floor must count as enough — the floor is the minimum \
+             that works, not the first value that fails"
+        );
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES * 10), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Ample
+        );
+    }
+
+    #[test]
+    fn below_the_floor_is_wedged() {
+        assert_eq!(
+            archive_space_verdict(Some(ARCHIVE_MIN_FREE_BYTES - 1), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged
+        );
+        assert_eq!(
+            archive_space_verdict(Some(0), ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged,
+            "a completely full volume is the case this exists to name"
+        );
+    }
+
+    /// An unreadable volume must NOT be reported as a full one. Reporting a
+    /// `df` that merely failed as evidence of a wedged disk would be a
+    /// fabricated finding, and it would page.
+    #[test]
+    fn an_unreadable_probe_is_unknown_not_wedged() {
+        assert_eq!(
+            archive_space_verdict(None, ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Unknown
+        );
+        assert_ne!(
+            archive_space_verdict(None, ARCHIVE_MIN_FREE_BYTES),
+            ArchiveSpaceVerdict::Wedged,
+            "'I could not measure' and 'it is full' are different claims and \
+             must never collapse into one"
+        );
+    }
+
+    /// The floor is sized against one gzipped partition, the largest of which
+    /// is an hour of `market_depth`. A floor below that would let the pass
+    /// start with no room for the export it is about to write.
+    #[test]
+    fn the_floor_is_large_enough_for_one_partition_export() {
+        assert!(
+            ARCHIVE_MIN_FREE_BYTES >= 1024 * 1024 * 1024,
+            "a sub-gigabyte floor cannot cover one hour of market_depth \
+             compressed, which is the working set this floor protects"
+        );
+    }
+}
+
+#[cfg(test)]
+mod archive_backlog_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_add_worklist_sizes_keeps_only_worklist_partitions_of_the_table() {
+        let worklist: Vec<(&'static str, String)> = vec![
+            ("market_depth", "2026-11-06T10".to_string()),
+            ("market_depth", "2026-11-06T11".to_string()),
+            ("tick_quotes", "2026-11-06T10".to_string()),
+        ];
+        let rows = vec![
+            ("2026-11-06T10".to_string(), 70),
+            ("2026-11-06T12".to_string(), 9_999), // not in the worklist
+        ];
+        let mut sizes = HashMap::new();
+        add_worklist_sizes(&worklist, "market_depth", &rows, &mut sizes);
+        assert_eq!(sizes.len(), 1, "an unlisted partition adds nothing");
+        assert_eq!(
+            sizes.get(&("market_depth", "2026-11-06T10".to_string())),
+            Some(&70)
+        );
+        add_worklist_sizes(
+            &worklist,
+            "tick_quotes",
+            &[("2026-11-06T10".to_string(), 5)],
+            &mut sizes,
+        );
+        assert_eq!(
+            sizes.get(&("tick_quotes", "2026-11-06T10".to_string())),
+            Some(&5)
+        );
+    }
+
+    #[test]
+    fn test_backlog_bytes_left_skips_settled_and_saturates() {
+        let mut sizes = HashMap::new();
+        sizes.insert(("market_depth", "a".to_string()), u64::MAX);
+        sizes.insert(("market_depth", "b".to_string()), 10);
+        sizes.insert(("tick_quotes", "a".to_string()), 7);
+        let mut settled = HashSet::new();
+        assert_eq!(backlog_bytes_left(&sizes, &settled), u64::MAX);
+        settled.insert(("market_depth", "a".to_string()));
+        assert_eq!(backlog_bytes_left(&sizes, &settled), 17);
+        settled.insert(("market_depth", "b".to_string()));
+        settled.insert(("tick_quotes", "a".to_string()));
+        assert_eq!(backlog_bytes_left(&sizes, &settled), 0);
+        assert_eq!(backlog_bytes_left(&HashMap::new(), &settled), 0);
+    }
+
+    #[test]
+    fn test_register_archive_snapshot_wait_gauge_names_the_series() {
+        register_archive_snapshot_wait_gauge();
+        assert_eq!(
+            WAL_SNAPSHOT_WAIT_GAUGE,
+            "tv_partition_archive_wal_snapshot_wait_secs"
+        );
+    }
+
+    /// PR AA-G (finding 10): the drop counter the drain hold reads as
+    /// progress, on a private ledger so the values are exact.
+    #[test]
+    fn test_archive_drops_total_and_last_archive_drop_unix_count_a_drop() {
+        let ledger = ArchiveDropLedger::new();
+        assert_eq!(ledger.total(), 0);
+        assert_eq!(ledger.last_unix(), None, "None before the first drop");
+        ledger.note(1_900_000_000);
+        assert_eq!(ledger.total(), 1, "a drop raises the count by one");
+        assert_eq!(ledger.last_unix(), Some(1_900_000_000));
+        // The process accessors (`archive_drops_total`,
+        // `last_archive_drop_unix`) only read `ARCHIVE_DROPS`; the equality
+        // that stood here repeated their bodies (2026-11-11 review 2). The
+        // accepted-only rule is pinned by the stub tests
+        // `test_stub_full_flow_verifies_audits_then_drops` (one drop, one
+        // count) and `test_regression_stub_refused_drop_is_not_counted_as_progress`.
+        // What the process accessors CAN be checked for: once the process
+        // ledger has counted a drop it always has a drop instant (read in
+        // that order, so a racing drop cannot fail it).
+        let total = archive_drops_total();
+        let last = last_archive_drop_unix();
+        if total > 0 {
+            assert!(last.is_some(), "a counted drop always has an instant");
+        }
+    }
+
+    // Regression: 2026-11-11 — PR AA-G review. `fetch_max` kept a drop
+    // instant stamped during a forward clock step after the clock stepped
+    // back, and swallowed every later drop until the clock passed it.
+    #[test]
+    fn test_regression_drop_ledger_keeps_the_latest_drop_not_the_largest_stamp() {
+        let ledger = ArchiveDropLedger::new();
+        ledger.note(1_900_000_600); // during a +10 min step
+        ledger.note(1_900_000_060); // the clock is back
+        assert_eq!(ledger.total(), 2);
+        assert_eq!(
+            ledger.last_unix(),
+            Some(1_900_000_060),
+            "the latest drop replaces a future stamp"
+        );
+    }
+
+    /// The counter is raised only in the accepted-DROP arm, never on a failed
+    /// drop, a verify or an upload (source scan of the production part).
+    /// ⚠ CHANGED 2026-11-11 (review): the scan matched one exact spelling, so
+    /// a second call written another way passed it; it now counts every
+    /// write of the ledger and every call of `note`, however written, and
+    /// places the one call inside `drop_copied_partition`'s accepted arm.
+    #[test]
+    fn test_archive_drops_total_is_raised_only_on_an_accepted_drop() {
+        let src = include_str!("partition_archive.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production part");
+        // The two atomics are written only inside `ArchiveDropLedger::note`
+        // (whitespace removed, so formatting cannot hide a second write).
+        let compact: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(compact.matches("self.total.fetch_add(").count(), 1);
+        assert_eq!(compact.matches("self.last_unix.store(").count(), 1);
+        assert_eq!(compact.matches(".last_unix.fetch_").count(), 0);
+        // Exactly one call of `.note(` on any ledger, however written.
+        assert_eq!(
+            compact.matches(".note(").count(),
+            compact.matches("drop_ledger.note(").count(),
+            "no other `.note(` call in this file"
+        );
+        let calls: Vec<usize> = prod
+            .match_indices("drop_ledger.note(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "exactly one drop-ledger call site");
+        assert_eq!(
+            prod.matches("ARCHIVE_DROPS.note(").count(),
+            0,
+            "the process ledger is reached only through the archiver's field"
+        );
+        let site = calls[0];
+        let fn_at = prod[..site].rfind("fn ").expect("inside a function");
+        assert!(
+            prod[fn_at..].starts_with("fn drop_copied_partition("),
+            "the call sits in drop_copied_partition"
+        );
+        let ok_arm = prod[..site].rfind("Ok(()) => {").expect("inside an Ok arm");
+        assert!(ok_arm > fn_at, "the Ok arm is drop_copied_partition's own");
+        let between = &prod[ok_arm..site];
+        assert!(
+            between.contains("tv_partition_dropped_total") && !between.contains("Err("),
+            "the call sits in the accepted-DROP arm"
+        );
+    }
+}
+
+// PR AA step 6 (owner Quote 51): the randomized 30-day proof of the archive
+// protocol. Declared last: source-scan guards treat everything after the
+// first `#[cfg(test)] mod` as test code.
+#[cfg(test)]
+mod archive_lifecycle_sim_tests;

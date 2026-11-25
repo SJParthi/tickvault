@@ -6,7 +6,9 @@
 //! - Default value correctness for optional config sections
 
 use chrono::NaiveDate;
-use tickvault_common::config::{ApplicationConfig, NseHolidayEntry, TradingConfig};
+use tickvault_common::config::{
+    ApplicationConfig, MuhuratTradingEntry, NseHolidayEntry, TradingConfig,
+};
 use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +134,15 @@ fn holiday(date: &str, name: &str) -> NseHolidayEntry {
     NseHolidayEntry {
         date: date.to_string(),
         name: name.to_string(),
+    }
+}
+
+/// Helper to create a Muhurat entry with no session times.
+fn muhurat(date: &str, name: &str) -> MuhuratTradingEntry {
+    MuhuratTradingEntry {
+        date: date.to_string(),
+        name: name.to_string(),
+        ..Default::default()
     }
 }
 
@@ -297,7 +308,7 @@ fn test_trading_calendar_all_entries_sorted_by_date() {
     // Add a Muhurat date that falls on a weekend.
     config
         .muhurat_trading_dates
-        .push(holiday("2026-11-08", "Diwali 2026"));
+        .push(muhurat("2026-11-08", "Diwali 2026"));
 
     let calendar = TradingCalendar::from_config(&config).expect("valid config");
     let entries = calendar.all_entries();
@@ -324,7 +335,7 @@ fn test_trading_calendar_muhurat_session() {
     let mut config = make_trading_config_with_holidays();
     config
         .muhurat_trading_dates
-        .push(holiday("2026-11-08", "Diwali 2026"));
+        .push(muhurat("2026-11-08", "Diwali 2026"));
 
     let calendar = TradingCalendar::from_config(&config).expect("valid config");
     let diwali = NaiveDate::from_ymd_opt(2026, 11, 8).expect("valid date");

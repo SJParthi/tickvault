@@ -14,7 +14,9 @@
 //!     not portable across macOS-dev + Linux-CI.
 //!   - **libc::setrlimit direct** — would add `libc` as a dev-dep on
 //!     `tickvault-storage`, which requires Parthiban approval per
-//!     CLAUDE.md.
+//!     CLAUDE.md. *(2026-10-12: `libc` is now a normal dependency of
+//!     `tickvault-storage` for the `statvfs` free-space probe, deep audit
+//!     DA-12; the `ulimit -f` path below is still the one used here.)*
 //!   - **`/dev/full`** — a char device, not a filesystem; the WAL
 //!     writer creates regular files under a directory, so the
 //!     character device trick doesn't apply.

@@ -355,19 +355,19 @@ mod tests {
 
         // Publishing one (feed, underlying) never disturbs another slot.
         let groww_bn = sample_snapshot(
-            Feed::Groww,
+            Feed::Truedata,
             ChainUnderlying::Banknifty,
             1_770_000_900_000_000_000,
         );
         publish_chain_snapshot(groww_bn);
-        let loaded = load_chain_snapshot(Feed::Groww, ChainUnderlying::Banknifty);
+        let loaded = load_chain_snapshot(Feed::Truedata, ChainUnderlying::Banknifty);
         assert_eq!(loaded.minute_ts_ist_nanos, 1_770_000_900_000_000_000);
         // The Dhan BANKNIFTY slot and the Groww SENSEX slot are untouched
         // (still whatever they held — for SENSEX in this test binary the
         // boot sentinel).
-        let sensex = load_chain_snapshot(Feed::Groww, ChainUnderlying::Sensex);
+        let sensex = load_chain_snapshot(Feed::Truedata, ChainUnderlying::Sensex);
         assert!(sensex.is_empty_sentinel());
-        assert_eq!(sensex.feed, Feed::Groww);
+        assert_eq!(sensex.feed, Feed::Truedata);
         assert_eq!(sensex.underlying, ChainUnderlying::Sensex);
     }
 

@@ -1,9 +1,13 @@
-//! Build-failing ratchet pinning the **budget kill-ceiling 4-way lockstep**.
+//! Build-failing ratchet pinning the **effective budget kill-ceiling lockstep**.
 //!
-//! The ceiling is not a display value — it is a KILL line. At 90% and 100% of
-//! `budget.tf limit_amount`, AWS Budget Actions run `STOP_EC2_INSTANCES` on the
-//! prod box, and the hard-stop-guard Lambda additionally DISABLES the morning
-//! start cron. Four places encode it:
+//! The ceiling is not a display value — it is a KILL line. At 100% of
+//! `budget.tf limit_amount`, the one native action stops the prod box; the
+//! hard-stop-guard Lambda additionally disables the morning start cron.
+//! The native line must equal the EFFECTIVE guard/digest line of the current
+//! UTC month: $140 in November 2026 only (Quote 52, raised by Quote 59), $62 from December
+//! (Quote 54, 2026-11-11; it was $75 under Quote 37).
+//! Their configured $185 values preserve the October-only allowance and are
+//! clamped by UTC billing month. Four places encode these two roles:
 //!
 //! | # | Site | Role |
 //! |---|---|---|
@@ -26,15 +30,19 @@
 //! safety argument still reading "kills later, never earlier". A comment
 //! cannot catch that. This test can.
 //!
-//! Authority: `.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`
-//! §0 Quote 13 + §7; `.claude/rules/project/aws-budget.md`.
+//! Authority: `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`
+//! §0 Quotes 13, 37, 45, 52 and 54 + §7; `.claude/rules/project/aws-budget.md`.
 
 #![cfg(test)]
 
 use std::path::{Path, PathBuf};
 
 use tickvault_aws_lambdas::budget_digest::BUDGET_USD;
-use tickvault_aws_lambdas::hard_stop_guard::DEFAULT_BUDGET_KILL_USD;
+use tickvault_aws_lambdas::hard_stop_guard::{
+    DEFAULT_BUDGET_KILL_USD, NOVEMBER_2026_ALLOWANCE, NOVEMBER_2026_KILL_USD,
+    OCTOBER_2026_ALLOWANCE, OCTOBER_2026_KILL_USD, SEPTEMBER_2026_ALLOWANCE,
+    STANDING_BUDGET_KILL_USD, effective_budget_kill_usd,
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -84,7 +92,46 @@ fn hcl_quoted_number(body: &str, key: &str) -> f64 {
     found.unwrap_or_else(|| panic!("no uncommented `{key} = \"<number>\"` assignment found"))
 }
 
-/// All four sites MUST agree. Any single-site edit fails the build here.
+/// Whether the native `limit_amount` in `budget.tf` is allowed in the UTC
+/// month `now_month`: from November 2026 exactly the line the hourly guard uses
+/// that month ($140 in November 2026 only, Quote 52/59; $62 from December, Quote 54). The refusal names the one-line fix and
+/// says the apply is still needed (2026-11-11 review 2: from 1 December every
+/// PR's All Green fails here until the follow-up lands, so the message must
+/// say exactly what to do). Pure.
+fn native_limit_verdict(tf_limit: f64, now_month: (i32, u32)) -> Result<(), String> {
+    // Before November 2026 (CI never runs then again) only the two lines this
+    // guard knows are accepted. From November 2026 the native line must EQUAL
+    // the line the hourly guard uses this month, so an early move to 62 in
+    // November is refused as firmly as a late one in December (PR 2221 review).
+    let expected = if now_month >= NOVEMBER_2026_ALLOWANCE {
+        effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, now_month.0, now_month.1)
+    } else {
+        STANDING_BUDGET_KILL_USD
+    };
+    if (tf_limit - expected).abs() < f64::EPSILON
+        || (now_month < NOVEMBER_2026_ALLOWANCE
+            && (tf_limit - NOVEMBER_2026_KILL_USD).abs() < f64::EPSILON)
+    {
+        return Ok(());
+    }
+    if now_month == NOVEMBER_2026_ALLOWANCE {
+        return Err(format!(
+            "the native limit (${tf_limit}) must be ${expected} for November 2026 (Quote 52/59): the \
+             hourly guard allows up to $140 this month, so a lower native stop would stop the box \
+             early. Set `limit_amount = \"140\"` in deploy/aws/terraform/budget.tf."
+        ));
+    }
+    Err(format!(
+        "the native limit (${tf_limit}) must be the standing ${expected}, or $140 only until \
+         the end of November 2026 (now {now_month:?}). Fix (Quote 52/54 follow-up, its own \
+         PR): set `limit_amount = \"{expected}\"` in deploy/aws/terraform/budget.tf, then run \
+         the terraform apply; until the apply runs the native AWS stop stays at $140 and only \
+         the Lambda's code clamp enforces ${expected}."
+    ))
+}
+
+/// Native $62 from December 2026 (Quote 54; $140 during November 2026 only, Quote 52/59) must match the
+/// effective lines, while the three configured values retain the explicitly historical October allowance.
 #[test]
 fn budget_ceiling_agrees_across_all_four_sites() {
     let root = repo_root();
@@ -96,30 +143,55 @@ fn budget_ceiling_agrees_across_all_four_sites() {
         &read(&root.join("deploy/aws/terraform/budget-guards.tf")),
         "BUDGET_KILL_USD",
     );
-
-    assert!(
-        (tf_limit - tf_kill).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != budget-guards.tf BUDGET_KILL_USD ({tf_kill})"
-    );
-    assert!(
-        (tf_limit - BUDGET_USD).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != budget_digest::BUDGET_USD ({BUDGET_USD}) — \
-         the operator's digest would report a percentage of the WRONG ceiling"
-    );
-    assert!(
-        (tf_limit - DEFAULT_BUDGET_KILL_USD).abs() < f64::EPSILON,
-        "budget.tf limit_amount ({tf_limit}) != hard_stop_guard::DEFAULT_BUDGET_KILL_USD \
-         ({DEFAULT_BUDGET_KILL_USD}) — see this file's header: a fallback BELOW the real \
-         ceiling stops the prod box mid-session whenever the env var is missing"
-    );
+    // The native line is the standing $62 (Quote 54), or November 2026's $140 (Quote 52/59)
+    // while the current UTC month is no later than November 2026. This reads
+    // the wall clock on purpose: from 1 December 2026 a native "140" fails the
+    // build, so the one-month raise cannot quietly become the new normal.
+    let now = chrono::Utc::now();
+    let now_month = (chrono::Datelike::year(&now), chrono::Datelike::month(&now));
+    let native_is_november = (tf_limit - NOVEMBER_2026_KILL_USD).abs() < f64::EPSILON;
+    if let Err(message) = native_limit_verdict(tf_limit, now_month) {
+        panic!("{message}");
+    }
+    for (site, configured) in [
+        ("BUDGET_KILL_USD", tf_kill),
+        ("budget_digest::BUDGET_USD", BUDGET_USD),
+        ("DEFAULT_BUDGET_KILL_USD", DEFAULT_BUDGET_KILL_USD),
+    ] {
+        assert_eq!(
+            configured, OCTOBER_2026_KILL_USD,
+            "{site} must preserve the historical October configuration"
+        );
+        for year in 2026..=2028 {
+            for month in 1..=12 {
+                if (year, month) < (2026, 11) {
+                    continue;
+                }
+                let expected = if (year, month) == NOVEMBER_2026_ALLOWANCE {
+                    NOVEMBER_2026_KILL_USD
+                } else {
+                    STANDING_BUDGET_KILL_USD
+                };
+                assert_eq!(
+                    effective_budget_kill_usd(configured, year, month),
+                    expected,
+                    "{site} resolves to the wrong line in {year}-{month:02}"
+                );
+            }
+        }
+    }
+    if native_is_november {
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            tf_limit,
+            "the November 2026 native line and the guard's November line disagree"
+        );
+    }
 }
 
-/// The fallback may never sit BELOW the real ceiling.
-///
-/// Kept as its own test with its own message because it is the property that
-/// actually protects the box, and because it states the safe direction
-/// explicitly: equal is correct, higher is merely harmless, lower is a
-/// mid-session outage.
+/// The effective November fallback may never sit below the native line.
+/// Compare after the month clamp: the historical raw $185 default is not
+/// the amount that the running November guard actually uses.
 #[test]
 fn fallback_kill_line_is_never_below_the_real_ceiling() {
     let root = repo_root();
@@ -127,51 +199,58 @@ fn fallback_kill_line_is_never_below_the_real_ceiling() {
         &read(&root.join("deploy/aws/terraform/budget.tf")),
         "limit_amount",
     );
+    let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11);
     assert!(
-        DEFAULT_BUDGET_KILL_USD >= tf_limit,
-        "DEFAULT_BUDGET_KILL_USD ({DEFAULT_BUDGET_KILL_USD}) is BELOW the real ceiling \
-         ({tf_limit}). Fail direction MUST be kills-later-never-earlier: a missing \
-         BUDGET_KILL_USD env var would otherwise stop the prod box at \
-         ${DEFAULT_BUDGET_KILL_USD} while the operator-approved ceiling is ${tf_limit}."
+        effective >= tf_limit,
+        "effective November fallback ({effective}) is below the native ceiling ({tf_limit})"
     );
 }
 
-/// The ceiling must stay a real guard, not a rubber stamp.
-///
-/// The AUTOMATIC budget actions fire at 90% of the limit, so the ceiling has to
-/// clear the recorded bill's high estimate ($73.60/mo at ~210 hrs on
-/// r8g.xlarge, daily-universe §7 "Bill 2026-08-08") with margin — otherwise the
-/// kill trips mid-session, which is the 2026-07-31 incident. It also must not
-/// drift so high that it stops being a guard at all.
+/// The recorded October bill estimate belongs to October's allowance,
+/// never to the November standing native line authorized by Quotes 37/45.
 #[test]
-fn ceiling_brackets_the_recorded_bill_high_estimate() {
-    let root = repo_root();
-    let tf_limit = hcl_quoted_number(
-        &read(&root.join("deploy/aws/terraform/budget.tf")),
-        "limit_amount",
-    );
-    // 2026-08-19 (operator Quote 17): the gp3 IOPS 3000->6000 + throughput
-    // 125->500 raise adds $30.00/mo, moving the recorded high estimate
-    // $82.72 -> $112.72 (daily-universe-scope-expansion-2026-05-27.md §0
-    // Quote 17). Leaving this at the stale $73.60 would have let the guard
-    // pass vacuously: 100 * 0.90 = $90 still "clears" $73.60 while sitting
-    // BELOW the real bill, which is precisely the mid-session stop this test
-    // exists to prevent. The number must track the recorded bill or the test
-    // guards nothing.
-    const BILL_HIGH_USD: f64 = 112.72;
-    let ninety_pct = tf_limit * 0.90;
+fn october_allowance_brackets_the_recorded_bill_high_estimate() {
+    let october_line = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10);
+    // 2026-10-13 (Quote 30): the IOPS reduction made the October projection
+    // about $165 (Assumed). Retain that historical check without imposing
+    // October's bill on the separately authorized later lines ($140 November, Quote 59; $62 from December).
+    const BILL_HIGH_USD: f64 = 165.0;
     assert!(
-        ninety_pct > BILL_HIGH_USD,
-        "the 90% budget-action line (${ninety_pct:.2}) does NOT clear the recorded \
-         bill high estimate (${BILL_HIGH_USD:.2}) — STOP_EC2_INSTANCES would fire \
-         mid-session. Raise limit_amount (all four sites) or re-cost the bill in \
-         daily-universe-scope-expansion-2026-05-27.md §7 first."
+        october_line > BILL_HIGH_USD,
+        "October's stop line (${october_line:.2}) must clear its recorded estimate \
+         (${BILL_HIGH_USD:.2}); this is not the November native limit"
     );
     assert!(
-        tf_limit <= 3.0 * BILL_HIGH_USD,
-        "limit_amount (${tf_limit}) is more than 3x the recorded bill high estimate \
-         (${BILL_HIGH_USD:.2}) — that is a rubber stamp, not a kill line. Re-cost the \
-         bill in §7 if the workload genuinely grew."
+        october_line <= 3.0 * BILL_HIGH_USD,
+        "October's line (${october_line}) is more than 3x its recorded estimate \
+         (${BILL_HIGH_USD:.2})"
+    );
+}
+
+/// Quote 30 (2026-10-13): exactly ONE native budget stop, at 100%. A second
+/// action below 100% would stop the box under the owner's ₹15,000 line
+/// (at $170, a 90% action fires at $153 ≈ ₹13,500).
+#[test]
+fn native_stop_is_one_action_at_100_percent() {
+    let body = read(&repo_root().join("deploy/aws/terraform/budget.tf"));
+    let live: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        live.matches("resource \"aws_budgets_budget_action\"")
+            .count(),
+        1,
+        "budget.tf must declare exactly one aws_budgets_budget_action (Quote 30)"
+    );
+    assert!(
+        live.contains("action_threshold_value = 100"),
+        "the one native stop must fire at 100% of limit_amount"
+    );
+    assert!(
+        !live.contains("stop_at_90"),
+        "the 90% early stop was removed by Quote 30; re-adding it needs a dated quote"
     );
 }
 
@@ -186,8 +265,9 @@ fn rule_files_record_the_current_ceiling() {
     );
     let dollars = format!("${}", tf_limit as i64);
 
-    let daily =
-        read(&root.join(".claude/rules/project/daily-universe-scope-expansion-2026-05-27.md"));
+    let daily = read(
+        &root.join("docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md"),
+    );
     assert!(
         daily.contains(&dollars),
         "daily-universe §7 must record the current kill ceiling ({dollars})"
@@ -197,4 +277,98 @@ fn rule_files_record_the_current_ceiling() {
         budget_rules.contains(&dollars),
         "aws-budget.md must record the current kill ceiling ({dollars})"
     );
+}
+
+/// Quote 23 (2026-09-23): the September 2026 allowance is ONE month, and the
+/// standing ceiling after it was $150; operator Quote 30 (2026-10-13) set it
+/// to $170 (≈₹15,000); operator Quote 33 (2026-10-21) set it to $100 from
+/// November 2026, with October 2026 capped at $170; operator Quote 36 (the
+/// same evening) lowered November onward to $85, and operator Quote 37 to $75
+/// (GST included); operator Quote 54 (2026-11-11) lowered December onward to
+/// $62 (GST included, about ₹5,500). Pinned so an allowance can
+/// never quietly become the new normal, and so the clamp can never sit ABOVE
+/// the configured ceiling (which would make it a raise, not a clamp).
+#[test]
+fn standing_cap_is_62_from_december_and_each_allowance_is_one_month() {
+    assert!(
+        (STANDING_BUDGET_KILL_USD - 62.0).abs() < f64::EPSILON,
+        "the standing ceiling moved off $62 without a dated operator quote (Quote 54)"
+    );
+    // "The clamp never sits above the configured ceiling" is a compile-time
+    // assert in hard_stop_guard.rs, next to the two constants.
+    assert_eq!(SEPTEMBER_2026_ALLOWANCE, (2026, 9));
+    assert_eq!(OCTOBER_2026_ALLOWANCE, (2026, 10));
+    // Operator Quote 45 (2026-10-28): October 2026 only, $170 -> $185.
+    assert!((OCTOBER_2026_KILL_USD - 185.0).abs() < f64::EPSILON);
+    // Operator Quote 52 (2026-11-11): November 2026 only, $75 -> $90.
+    assert_eq!(NOVEMBER_2026_ALLOWANCE, (2026, 11));
+    // Quote 59 (2026-11-14): November 2026 only, $90 -> $140.
+    assert!((NOVEMBER_2026_KILL_USD - 140.0).abs() < f64::EPSILON);
+
+    // Every month of the next three years EXCEPT 2026-09, 2026-10 and 2026-11
+    // resolves to $62.
+    for year in 2026..=2028 {
+        for month in 1..=12 {
+            let effective = effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, year, month);
+            if (year, month) == SEPTEMBER_2026_ALLOWANCE {
+                assert!((effective - DEFAULT_BUDGET_KILL_USD).abs() < f64::EPSILON);
+            } else if (year, month) == OCTOBER_2026_ALLOWANCE {
+                assert!((effective - OCTOBER_2026_KILL_USD).abs() < f64::EPSILON);
+            } else if (year, month) == NOVEMBER_2026_ALLOWANCE {
+                assert!((effective - NOVEMBER_2026_KILL_USD).abs() < f64::EPSILON);
+            } else {
+                assert!(
+                    (effective - STANDING_BUDGET_KILL_USD).abs() < f64::EPSILON,
+                    "{year}-{month:02} resolved to ${effective}, not the standing $62"
+                );
+            }
+        }
+    }
+
+    // Both rule files record BOTH numbers.
+    let root = repo_root();
+    for rel in [
+        "docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md",
+        ".claude/rules/project/aws-budget.md",
+    ] {
+        let body = read(&root.join(rel));
+        assert!(
+            body.contains("$150")
+                && body.contains("$225")
+                && body.contains("$170")
+                && body.contains("$185")
+                && body.contains("$75 from 1 November")
+                && body.contains("$62 from 1 December"),
+            "{rel} must record $150, $225, $170, $185, $75 from 1 November and \
+             $62 from 1 December"
+        );
+    }
+}
+
+// Regression: 2026-11-11 — review 2. From 1 December 2026 a native "140"
+// fails every PR; the refusal must name the one-line fix and say the
+// terraform apply is still needed, so an unrelated hotfix author can act on it.
+#[test]
+fn native_limit_verdict_names_the_fix_from_december() {
+    assert!(native_limit_verdict(STANDING_BUDGET_KILL_USD, (2026, 12)).is_ok());
+    assert!(native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 11)).is_ok());
+    assert!(native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 10)).is_ok());
+    let refusal = native_limit_verdict(NOVEMBER_2026_KILL_USD, (2026, 12))
+        .expect_err("$140 is refused from December 2026");
+    assert!(refusal.contains("limit_amount = \"62\""), "{refusal}");
+    // Quote 54: the old standing $75 is refused from December too.
+    let stale = native_limit_verdict(75.0, (2026, 12)).expect_err("$75 is refused from December");
+    assert!(stale.contains("limit_amount = \"62\""), "{stale}");
+    assert!(native_limit_verdict(62.0, (2027, 1)).is_ok());
+    assert!(
+        refusal.contains("deploy/aws/terraform/budget.tf"),
+        "{refusal}"
+    );
+    assert!(refusal.contains("terraform apply"), "{refusal}");
+    assert!(native_limit_verdict(100.0, (2026, 11)).is_err());
+    // An early revert in November is refused too: the native stop would sit
+    // below the guard's $140 and stop the box early (PR 2221 review).
+    let early = native_limit_verdict(STANDING_BUDGET_KILL_USD, (2026, 11))
+        .expect_err("$62 is refused in November 2026");
+    assert!(early.contains("limit_amount = \"140\""), "{early}");
 }

@@ -1,0 +1,638 @@
+//! Plan item K2 (2026-10-26) regressions for the WAL core: a failed segment
+//! sync raises the lost mark, an abandoned shutdown is counted, an unreadable
+//! segment is kept for retry, an unlistable folder refuses the pass, staging
+//! failures are counted, a discarded segment is synced and unregistered, the
+//! queue byte budget is resolved at construction, and the replay header no
+//! longer claims re-capture. A child of `ws_frame_spill::tests`, kept in its
+//! own file so the parent stays under its size pin; it reuses the parent's
+//! test helpers (`tmp_dir`, `Da13dCounters`, `encode_v4_record_raw`,
+//! `wal_files_in`).
+
+use super::*;
+
+/// A frame sequence at base `b` above any wall-clock base, so the global
+/// marks other tests raise cannot reach it.
+fn k2_seq(b: u64) -> u64 {
+    ((1u64 << 47) + b) << PACKET_INDEX_BITS
+}
+
+fn k2_replay(dir: &Path) -> anyhow::Result<WalReplayBatch> {
+    replay_all_with_report_guarded(dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+}
+
+// Regression: 2026-10-26 (K2 fix 1) — a failed segment sync was logged at
+// warn and treated as harmless, though a failed fsync can drop the dirty
+// pages; the rescue kept deferring failed flushes to the WAL.
+#[test]
+fn test_regression_k2_failed_sync_raises_the_lost_mark_so_rescues_stop_deferring() {
+    let s = k2_seq(1);
+    crate::wal_frame_fate::note_flushed_through(s);
+    assert!(
+        crate::wal_frame_fate::flushed_high_seq() >= s,
+        "setup: the flushed mark covers the batch"
+    );
+    let ok = record_sync_result(
+        Err(std::io::Error::other("injected EIO")),
+        Instant::now(),
+        WAL_PERIODIC_FSYNC_STAGE,
+    );
+    assert!(!ok, "a failed sync reports failure");
+    assert!(
+        crate::wal_frame_fate::lost_high_seq() >= s,
+        "a failed sync raises the lost mark through the flushed high-water"
+    );
+    assert!(
+        !crate::wal_frame_fate::rescue_may_defer_to_wal(s, s, false),
+        "a batch at or below the failed sync is spilled, never deferred to the WAL"
+    );
+    // The arm logs at error with the WS-SPILL-01 code (source scan: the
+    // warn level is gone from both branches).
+    let src = include_str!("../../ws_frame_spill.rs");
+    let body = src
+        .split("fn record_sync_result(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .expect("record_sync_result exists");
+    assert!(body.contains("sync_failure_raises_lost_mark();"));
+    assert_eq!(body.matches(concat!("error", "!(")).count(), 2);
+    assert!(!body.contains(concat!("warn", "!(")));
+}
+
+/// A spill whose writer thread never finishes inside the shutdown budget,
+/// with `persisted` and `flushed` preset. Returns the spill, the sender
+/// that releases the stuck thread, and the channel's receiver (kept so the
+/// queue reads empty, not disconnected).
+fn k2_spill_with_stuck_writer(
+    persisted: u64,
+    flushed: u64,
+) -> (WsFrameSpill, Sender<()>, Receiver<WalRecord>) {
+    let dir = tmp_dir("k2-stuck-writer");
+    let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
+    let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
+    let (release_tx, release_rx) = bounded::<()>(1);
+    let stuck = thread::spawn(move || {
+        let _released = release_rx.recv_timeout(Duration::from_secs(30));
+    });
+    let spill = WsFrameSpill {
+        spill_tx: tx,
+        queued_bytes: Arc::new(AtomicU64::new(0)),
+        queue_budget_bytes: wal_queue_max_bytes(),
+        drop_critical: Arc::new(AtomicU64::new(0)),
+        persisted_total: Arc::new(AtomicU64::new(persisted)),
+        flushed_total: Arc::new(AtomicU64::new(flushed)),
+        drop_counters: SpillDropCounters::new(),
+        feed_health: None,
+        stop: Arc::new(AtomicBool::new(false)),
+        writer: std::sync::Mutex::new(Some(stuck)),
+        syncer: Arc::new(WalSyncer::new()),
+        syncer_thread: std::sync::Mutex::new(None),
+        wal_dir: dir,
+        _dir_guard: dir_guard,
+        abort_drain: Arc::new(AbortDrain::default()),
+    };
+    (spill, release_tx, rx)
+}
+
+// Regression: 2026-10-26 (K2 fix 2) — a shutdown that abandoned a stuck
+// writer with an EMPTY queue logged "final drain complete" and returned 0
+// while the writer still held counted records in its segment buffer.
+#[test]
+fn test_regression_k2_shutdown_abandoning_a_stuck_writer_counts_its_unflushed_records() {
+    let (spill, release, _rx) = k2_spill_with_stuck_writer(5, 2);
+    let recorder = Da13dCounters::default();
+    let outcome = metrics::with_local_recorder(&recorder, || {
+        spill.shutdown_outcome(Duration::from_millis(200))
+    });
+    assert_eq!(
+        outcome,
+        WalShutdownOutcome::Abandoned {
+            queued: 0,
+            unflushed: 3
+        },
+        "an abandoned writer is a distinct outcome, never Drained"
+    );
+    assert_eq!(
+        outcome.lost_records(),
+        3,
+        "shutdown returns persisted − flushed"
+    );
+    assert_eq!(
+        recorder.get(WAL_SPILL_SHUTDOWN_INCOMPLETE_COUNTER),
+        3,
+        "the unflushed records reach the shutdown-incomplete counter"
+    );
+    let _ = release.send(());
+    let src = include_str!("../../ws_frame_spill.rs");
+    let body = src
+        .split("fn shutdown_outcome(")
+        .nth(1)
+        .and_then(|b| b.split("\n    }\n}\n").next())
+        .expect("shutdown_outcome exists");
+    let complete_at = body.find("final drain complete").expect("the clean line");
+    let abandoned_return = body
+        .find("return WalShutdownOutcome::Abandoned")
+        .expect("abandoned returns early");
+    assert!(
+        abandoned_return < complete_at,
+        "an abandoned shutdown returns before the 'complete' line"
+    );
+}
+
+/// K2 fix 2, the counting half: `flushed` moves only for records that
+/// reached the kernel, so `persisted − flushed` is the open buffer.
+#[test]
+fn test_regression_k2_tally_counts_flushed_records_including_a_discards_kept_part() {
+    let dir = tmp_dir("k2-flushed-count");
+    let persisted = AtomicU64::new(0);
+    let flushed = AtomicU64::new(0);
+    let mut tally = UnflushedTally::new(&persisted).counting_flushed_into(&flushed);
+    let mut w = open_new_segment(&dir).unwrap();
+    let record = |seq: u64| WalRecord {
+        ws_type: WsType::LiveFeed,
+        frame_seq: seq,
+        received_at_nanos: 1_000,
+        endpoint: WalEndpoint::MainFeed,
+        frame: Bytes::from(vec![seq as u8; 40]),
+    };
+    for seq in 1..=3 {
+        write_record(&mut w, &record(seq)).unwrap();
+        tally.note_written(record_disk_size(&record(seq)), seq, WsType::LiveFeed);
+    }
+    assert_eq!(flushed.load(Ordering::Relaxed), 0, "nothing flushed yet");
+    w.flush().unwrap();
+    tally.flushed();
+    assert_eq!(flushed.load(Ordering::Relaxed), 3);
+    // Two more written into the buffer, one of which reaches the file.
+    write_record(&mut w, &record(4)).unwrap();
+    tally.note_written(record_disk_size(&record(4)), 4, WsType::LiveFeed);
+    w.flush().unwrap();
+    write_record(&mut w, &record(5)).unwrap();
+    tally.note_written(record_disk_size(&record(5)), 5, WsType::LiveFeed);
+    discard_segment_writer(w, &mut tally, "test");
+    assert_eq!(persisted.load(Ordering::Relaxed), 4, "record 5 is lost");
+    assert_eq!(
+        flushed.load(Ordering::Relaxed),
+        4,
+        "record 4 reached the file, so it counts as flushed"
+    );
+    clear_open_segment_under(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 3) — a segment that hit an I/O error on
+// open/read was counted consumed, STAGED and archived by the confirm
+// without one frame read. A directory named like a segment gives a real
+// EISDIR from `read_to_end`.
+#[test]
+fn test_regression_k2_unreadable_segment_is_kept_for_retry_not_archived() {
+    let dir = tmp_dir("k2-io-retry");
+    let replaying = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&replaying).unwrap();
+    let a = dir.join("ws-frames-77777777770000000001.wal");
+    let b_name = "ws-frames-77777777770000000002.wal";
+    let c = dir.join("ws-frames-77777777770000000003.wal");
+    std::fs::write(
+        &a,
+        encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 8]),
+    )
+    .unwrap();
+    std::fs::write(
+        &c,
+        encode_v4_record_raw(WsType::LiveFeed, 300, 3, 0, &[3; 8]),
+    )
+    .unwrap();
+    // B is a leftover in `replaying/` that cannot be read.
+    std::fs::create_dir_all(replaying.join(b_name)).unwrap();
+
+    let recorder = Da13dCounters::default();
+    let first = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("pass 1");
+    assert_eq!(first.frames.len(), 2, "A and C are read");
+    assert!(
+        dir.join(b_name).is_dir(),
+        "the unreadable leftover goes back to the live folder"
+    );
+    assert!(!replaying.join(b_name).exists(), "it is not left staged");
+    assert!(
+        replaying.join(a.file_name().unwrap()).exists(),
+        "A is staged"
+    );
+    assert_eq!(recorder.get(WAL_REPLAY_READ_RETRIED_COUNTER), 1);
+    // B1 (2026-11-13): the batch itself reports the unread segment, so a
+    // caller draining in rounds cannot mistake it for a drained backlog.
+    assert_eq!(first.read_failed_segments, 1);
+    confirm_replayed(&dir);
+    assert!(
+        dir.join(b_name).is_dir(),
+        "the confirm cannot archive what was never staged"
+    );
+    assert!(!dir.join(ARCHIVE_SUBDIR).join(b_name).exists());
+
+    // Pass 2 retries and keeps it; pass 3 reaches the cap and gives up,
+    // which is the old behaviour, counted on the corrupted counter.
+    let second = k2_replay(&dir).expect("pass 2");
+    assert_eq!(second.frames.len(), 0);
+    // Regression B1: the exact shape that read as "drained" before: no
+    // frames, nothing deferred, only the unread segment left.
+    assert_eq!(second.deferred_segments, 0);
+    assert_eq!(
+        second.read_failed_segments, 1,
+        "an empty pass with an unread segment must say so"
+    );
+    assert!(dir.join(b_name).is_dir(), "attempt 2 is still kept");
+    let recorder = Da13dCounters::default();
+    let _third = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("pass 3");
+    assert_eq!(
+        recorder.get("tv_wal_replay_corrupted_segments_total"),
+        1,
+        "at the cap it is counted on the paged counter"
+    );
+    assert!(
+        replaying.join(b_name).exists(),
+        "at the cap it is staged as before (archived by the confirm)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 4) — `wal_segments_in` read a listing
+// error as "no segments", so a `replaying/` that could not be listed let
+// the pass stage live segments beside leftovers it never saw.
+#[test]
+fn test_regression_k2_unlistable_replaying_folder_refuses_the_pass() {
+    let dir = tmp_dir("k2-unlistable");
+    let a = dir.join("ws-frames-77777777771000000001.wal");
+    std::fs::write(
+        &a,
+        encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 8]),
+    )
+    .unwrap();
+    // A FILE where the folder should be: `read_dir` fails with ENOTDIR.
+    std::fs::write(dir.join(REPLAYING_SUBDIR), b"not a folder").unwrap();
+    assert!(try_wal_segments_in(&dir.join(REPLAYING_SUBDIR)).is_err());
+    assert!(
+        try_wal_segments_in(&dir.join("missing"))
+            .unwrap()
+            .is_empty(),
+        "only a missing folder reads as empty"
+    );
+    let recorder = Da13dCounters::default();
+    let pass = metrics::with_local_recorder(&recorder, || k2_replay(&dir));
+    assert!(pass.is_err(), "the pass is refused, fail closed");
+    assert!(a.exists(), "the live segment is not staged");
+    assert_eq!(recorder.get(WAL_REPLAY_LISTING_REFUSED_COUNTER), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 5) — the staging `create_dir_all` and
+// `rename` were `drop(..)`ed. A dangling symlink at `replaying/` lists as
+// missing (empty) but refuses both the mkdir and the rename.
+#[test]
+fn test_regression_k2_staging_failures_are_counted_and_the_segment_stays_live() {
+    let dir = tmp_dir("k2-stage-fail");
+    let a = dir.join("ws-frames-77777777772000000001.wal");
+    std::fs::write(
+        &a,
+        encode_v4_record_raw(WsType::LiveFeed, 100, 1, 0, &[1; 8]),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(dir.join("no-such-target"), dir.join(REPLAYING_SUBDIR)).unwrap();
+    let recorder = Da13dCounters::default();
+    let pass = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("pass");
+    assert_eq!(pass.frames.len(), 1);
+    assert!(a.exists(), "a failed stage leaves the segment a live *.wal");
+    assert_eq!(
+        recorder.get(&format!(
+            "{WAL_REPLAY_STAGE_FAILED_COUNTER},step=replay_stage_mkdir"
+        )),
+        1
+    );
+    assert_eq!(
+        recorder.get(&format!(
+            "{WAL_REPLAY_STAGE_FAILED_COUNTER},step=replay_stage_rename"
+        )),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 6) — a discarded segment writer was not
+// synced, stayed registered as the OPEN segment (so a replay before the
+// next open skipped it), and its bytes kept counting toward the next
+// segment's rotation.
+#[test]
+fn test_regression_k2_discarded_segment_is_synced_unregistered_and_resets_the_count() {
+    let src = include_str!("../../ws_frame_spill.rs");
+    let production = src
+        .split(concat!("\n#[cfg(", "test)]\n"))
+        .next()
+        .unwrap_or(src);
+    let discard = production
+        .split("fn discard_segment_writer(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .expect("discard_segment_writer exists");
+    assert!(
+        discard.contains("file.sync_data()"),
+        "a discard syncs what it keeps"
+    );
+    for caller in [
+        "discard_segment_writer(w, &mut tally, \"flush\");",
+        "discard_segment_writer(w, tally, \"write_record\");",
+    ] {
+        let at = production.find(caller).expect("discard caller exists");
+        let after = &production[at..at + 200];
+        assert!(
+            after.contains("clear_open_segment_under(wal_dir);"),
+            "`{caller}` must clear the open-segment registration"
+        );
+    }
+    let open = production
+        .split("fn open_segment_resilient(")
+        .nth(1)
+        .and_then(|b| b.split("\n}\n").next())
+        .expect("open_segment_resilient exists");
+    assert_eq!(
+        open.matches("clear_open_segment_under(wal_dir);").count(),
+        2,
+        "both open-failure arms clear the registration"
+    );
+    assert!(production.contains("bytes_written = bytes_written.min(tally.segment_bytes);"));
+
+    // Behaviour: the caller pattern really unregisters the file.
+    let dir = tmp_dir("k2-discard-unregister");
+    let w = open_new_segment(&dir).unwrap();
+    let path = wal_files_in(&dir).pop().expect("one segment");
+    assert!(
+        is_open_segment(&path),
+        "setup: an open segment is registered"
+    );
+    let persisted = AtomicU64::new(0);
+    let mut tally = UnflushedTally::new(&persisted);
+    discard_segment_writer(w, &mut tally, "test");
+    clear_open_segment_under(&dir);
+    assert!(!is_open_segment(&path));
+    assert_eq!(wal_segments_in(&dir), vec![path], "a replay now sees it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 7) — the queue byte budget was resolved
+// on the first `append`, on a socket read task.
+#[test]
+fn test_regression_k2_queue_byte_budget_is_resolved_at_construction() {
+    let dir = tmp_dir("k2-budget");
+    let spill = WsFrameSpill::new(&dir).expect("spill opens");
+    assert_eq!(spill.queue_budget_bytes, wal_queue_max_bytes());
+    assert!(spill.queue_budget_bytes >= WAL_QUEUE_MIN_BYTES);
+    assert_eq!(spill.shutdown(Duration::from_secs(5)), 0);
+    drop(spill);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Regression: 2026-10-26 (K2 fix 8) — the replay header claimed replayed
+// frames are re-captured into the WAL; they are not.
+#[test]
+fn test_regression_k2_replay_header_no_longer_claims_recapture() {
+    // Every literal is split with `concat!` so this test cannot match
+    // its own source.
+    let src = include_str!("../../ws_frame_spill.rs");
+    let stale = concat!("durably RE-", "captures them into a fresh");
+    assert!(!src.contains(stale), "the stale re-capture claim is back");
+    assert!(src.contains(concat!("ACK-BEFORE-", "CONFIRM")));
+    assert!(src.contains(concat!("they are NEVER written ", "to the WAL a")));
+}
+
+// Regression: 2026-11-13 (B1 review): the read-failure count lived only in
+// memory, and a boot reads a failing segment at most twice (the boot pass,
+// then one catch-up round, which then stops on it), so the retry cap was
+// never reached: a segment that stays unreadable was never given up on or
+// counted on the paged corrupted counter. The count now survives a restart
+// in a book beside the WAL; the third failed read, on whichever boot, gives
+// the segment up.
+#[test]
+fn test_regression_b1_read_failure_count_survives_a_restart_and_reaches_the_cap() {
+    let dir = tmp_dir("b1-io-retry-book");
+    let b_name = "ws-frames-77777777770000000012.wal";
+    // An unreadable segment (a directory under a segment's name: EISDIR).
+    std::fs::create_dir_all(dir.join(b_name)).unwrap();
+    let book = dir.join(READ_FAILURE_BOOK_FILE);
+    // B1 review 4: a production boot reads a failing segment TWICE in
+    // seconds (the boot pass, then the first catch-up round). Both count as
+    // one boot in the book, so a short blip on one boot never uses two of
+    // the three attempts.
+    for boot in 1..=2u32 {
+        for pass_in_boot in 1..=2u32 {
+            let pass = k2_replay(&dir).expect("pass");
+            assert_eq!(
+                pass.read_failed_segments, 1,
+                "boot {boot} pass {pass_in_boot} keeps it"
+            );
+            assert!(dir.join(b_name).is_dir(), "boot {boot} does not archive it");
+            let text = std::fs::read_to_string(&book).expect("the book is written");
+            assert_eq!(
+                text,
+                format!("{boot} {b_name}\n"),
+                "one per boot, not per pass"
+            );
+        }
+        // A restart: this process's memory is gone, the book stays.
+        forget_in_memory_for_test(b_name);
+    }
+    let recorder = Da13dCounters::default();
+    let third = metrics::with_local_recorder(&recorder, || k2_replay(&dir)).expect("boot 3");
+    assert_eq!(third.read_failed_segments, 0, "given up, not kept");
+    assert_eq!(
+        recorder.get("tv_wal_replay_corrupted_segments_total"),
+        1,
+        "the third failed read across restarts is counted on the paged counter"
+    );
+    assert!(!book.exists(), "a given-up segment leaves the book");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// B1 review: a counted segment that reads again leaves the book, so a
+// later, unrelated failure starts from one.
+#[test]
+fn test_b1_a_segment_that_reads_again_leaves_the_book() {
+    let dir = tmp_dir("b1-io-retry-forget");
+    let name = "ws-frames-77777777770000000013.wal";
+    std::fs::create_dir_all(dir.join(name)).unwrap();
+    let book = dir.join(READ_FAILURE_BOOK_FILE);
+    let _ = k2_replay(&dir).expect("pass 1");
+    assert!(book.exists());
+    std::fs::remove_dir(dir.join(name)).unwrap();
+    std::fs::write(
+        dir.join(name),
+        encode_v4_record_raw(WsType::LiveFeed, 500, 5, 0, &[5; 8]),
+    )
+    .unwrap();
+    let pass = k2_replay(&dir).expect("pass 2");
+    assert_eq!(pass.read_failed_segments, 0);
+    assert!(
+        !book.exists(),
+        "read again: the count is forgotten on disk too"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failed_deferred_restore_holds_every_unconfirmed_segment_for_retry() {
+    let dir = tmp_dir("replay-restore-obstructed");
+    let staging = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    let pre_staged = write_wm_segment(&staging, 10, 1, WalEndpoint::MainFeed);
+    let live = write_wm_segment(&dir, 15, 1, WalEndpoint::MainFeed);
+    let restored = write_wm_segment(&staging, 20, 1, WalEndpoint::MainFeed);
+    let blocked = write_wm_segment(&staging, 30, 1, WalEndpoint::MainFeed);
+    let obstruction = dir.join(blocked.file_name().unwrap());
+    std::fs::create_dir(&obstruction).unwrap();
+
+    // Only the first segment fits. Returning the third succeeds; returning
+    // the fourth fails because a directory occupies its live destination.
+    let failed = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT);
+    assert!(
+        failed
+            .expect_err("failed restore must hold the pass")
+            .to_string()
+            .contains("could not be restored")
+    );
+    assert!(pre_staged.is_file() && live.is_file() && blocked.is_file());
+    assert!(!restored.exists() && dir.join(restored.file_name().unwrap()).is_file());
+    assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+
+    std::fs::remove_dir(&obstruction).unwrap();
+    let retry =
+        replay_all_with_report_guarded(&dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("both restored and still-staged segments must be offered again");
+    let sequences: Vec<_> = retry.frames.iter().map(|frame| frame.frame_seq).collect();
+    assert_eq!(sequences, [wm_seq(10), wm_seq(15), wm_seq(20), wm_seq(30)]);
+    confirm_replayed(&dir);
+    assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 4);
+    assert!(wal_segments_in(&staging).is_empty() && wal_segments_in(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_replay_names_preserves_both_conflicting_captures_until_resolved() {
+    let dir = tmp_dir("replay-name-conflict");
+    let staging = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    let first = write_wm_segment(&dir, 10, 1, WalEndpoint::MainFeed);
+    let second = write_wm_segment(&staging, 20, 1, WalEndpoint::MainFeed);
+    let conflict = staging.join(first.file_name().unwrap());
+    std::fs::rename(&second, &conflict).unwrap();
+    let before = (
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&conflict).unwrap(),
+    );
+    assert_ne!(before.0, before.1);
+    assert!(
+        k2_replay(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting segment names")
+    );
+    assert_eq!(
+        (
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&conflict).unwrap()
+        ),
+        before
+    );
+    assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+    std::fs::rename(&conflict, &second).unwrap();
+    let retry = k2_replay(&dir).unwrap();
+    assert_eq!(
+        retry
+            .frames
+            .iter()
+            .map(|frame| frame.frame_seq)
+            .collect::<Vec<_>>(),
+        [wm_seq(10), wm_seq(20)]
+    );
+    confirm_replayed(&dir);
+    assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn same_size_wal_replacement_survives_age_byte_and_disk_floor_prunes() {
+    for (tag, aged, floor) in [
+        ("age", true, false),
+        ("bytes", false, false),
+        ("floor", false, true),
+    ] {
+        let dir = tmp_dir(&format!("restore-prune-{tag}"));
+        let now = SystemTime::now();
+        let candidate = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let applied = all_applied_through(wm_seq(5_000));
+        let deferred = floor.then(|| deferred_at(wm_seq(100)));
+        let len = len_of(&candidate);
+        mark_uploaded(&dir, &candidate, len);
+        let replaced = (0..3)
+            .flat_map(|i| {
+                encode_v4_record(
+                    WsType::LiveFeed,
+                    wm_seq(i),
+                    7,
+                    WalEndpoint::MainFeed,
+                    &[0x38; 32],
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&candidate, &replaced).unwrap();
+        assert_eq!(len_of(&candidate), len);
+        if aged {
+            backdate(&candidate, now, 400_000);
+        }
+        let markers = crate::raw_frame_upload::markers_dir(&dir);
+        let prune = || {
+            prune_active_segments_deferred_at(
+                &dir,
+                172_800,
+                if aged { u64::MAX } else { 0 },
+                now,
+                Some(&applied),
+                deferred.as_ref(),
+                floor,
+                UploadGate::Required {
+                    markers_dir: &markers,
+                },
+            )
+        };
+        let held = prune();
+        assert_eq!(
+            held.age_kept_not_uploaded + held.size_refused_not_uploaded,
+            1,
+            "{tag}"
+        );
+        assert_eq!(held.deleted + held.size_deleted, 0, "{tag}");
+        assert_eq!(std::fs::read(&candidate).unwrap(), replaced, "{tag}");
+        assert!(
+            !markers.join(candidate.file_name().unwrap()).exists(),
+            "{tag}"
+        );
+        mark_uploaded(&dir, &candidate, len);
+        let matched = prune();
+        assert_eq!(matched.deleted + matched.size_deleted, 1, "{tag}");
+        assert!(!candidate.exists(), "{tag}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn previously_applied_archive_records_the_watermark_decision() {
+    let dir = tmp_dir("archived-watermark-decision");
+    write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+    write_wm_segment(&dir, 1000, 5, WalEndpoint::MainFeed);
+    write_wm_watermark(&dir, &all_applied_through(wm_seq(5000)));
+    let batch = replay_unguarded(&dir);
+    assert_eq!(batch.skipped_segments, 1);
+    for archived in wal_segments_in(&dir.join(ARCHIVE_SUBDIR)) {
+        let mut value = [0u8; 32];
+        let n = rustix::fs::getxattr(archived, "user.tickvault.replay_archive.v1", &mut value[..])
+            .unwrap();
+        assert_eq!(&value[..n], b"applied_watermark");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -26,7 +26,7 @@
 #![cfg(test)]
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -53,6 +53,19 @@ fn rs_files_named_in_table_rows(claude_md: &str) -> BTreeSet<String> {
             // whitespace and slashes so each filename is checked.
             for token in span.split(['/', ' ', ',']) {
                 let token = token.trim();
+                // Strip a `::member` suffix before the `.rs` test.
+                //
+                // 2026-08-21: without this the guard was blind to its OWN most
+                // common citation style. The non-O(1) table cites
+                // `path/to/file.rs::field`, and that token does not END with
+                // ".rs" -- so all 22 such citations were skipped, including two
+                // rows naming modules deleted hours earlier. The guard reported
+                // a clean run while pointing at code that was gone, which is
+                // precisely the failure it exists to catch, in its own scanner.
+                let token = match token.find("::") {
+                    Some(at) => &token[..at],
+                    None => token,
+                };
                 if !token.ends_with(".rs") || token.is_empty() {
                     continue;
                 }
@@ -72,8 +85,8 @@ fn rs_files_named_in_table_rows(claude_md: &str) -> BTreeSet<String> {
 }
 
 /// Recursively test whether a file with this exact name exists under `crates/`.
-fn exists_under_crates(root: &PathBuf, filename: &str) -> bool {
-    fn walk(dir: &PathBuf, filename: &str, depth: usize) -> bool {
+fn exists_under_crates(root: &Path, filename: &str) -> bool {
+    fn walk(dir: &Path, filename: &str, depth: usize) -> bool {
         if depth > 12 {
             return false;
         }
@@ -162,6 +175,36 @@ fn scanner_detects_a_planted_ghost_row() {
     );
 }
 
+/// A `path.rs::member` citation must be extracted, not skipped.
+///
+/// This is the guard's OWN dominant citation style: the non-O(1) table in
+/// CLAUDE.md names 22 paths that way. Until 2026-08-21 the scanner tested
+/// `token.ends_with(".rs")` on the whole token, and `file.rs::field` does not
+/// end with ".rs" -- so every one of them was silently skipped. Two rows
+/// naming modules deleted the same day passed a green run.
+///
+/// The negative half matters as much: a `::member` suffix must not become a
+/// way to smuggle a ghost path past the guard.
+#[test]
+fn scanner_sees_through_a_member_suffix() {
+    let row = "| `crates/trading/src/candles/seal_ring.rs::push` | a real file |\n";
+    let found = rs_files_named_in_table_rows(row);
+    assert!(
+        found.contains("seal_ring.rs"),
+        "a `path.rs::member` citation must yield the filename: {found:?}"
+    );
+
+    // Bite proof: the same shape naming a file that does NOT exist must be
+    // extracted too, so `every_rs_file_named_in_claude_md_table_exists` fails
+    // on it rather than waving it through.
+    let ghost = "| `crates/app/src/definitely_not_a_real_module_xyz.rs::field` | ghost |\n";
+    let found_ghost = rs_files_named_in_table_rows(ghost);
+    assert!(
+        found_ghost.contains("definitely_not_a_real_module_xyz.rs"),
+        "a ghost path with a `::member` suffix must still be caught: {found_ghost:?}"
+    );
+}
+
 #[test]
 fn scanner_skips_glob_patterns() {
     // CLAUDE.md's TESTING STRATEGY table cites file FAMILIES by pattern, e.g.
@@ -196,4 +239,140 @@ fn scanner_handles_multi_file_cells() {
         found.contains("seal_writer_loop.rs") && found.contains("seal_writer_task.rs"),
         "multi-file cell not fully extracted: {found:?}"
     );
+}
+
+/// The CLAUDE.md O(1) table row whose first cell starts with `prefix`.
+fn table_row_starting_with<'a>(claude_md: &'a str, prefix: &str) -> &'a str {
+    claude_md
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("CLAUDE.md has no table row starting with {prefix:?}"))
+}
+
+/// PR AA finding 7: the archive quiesce and snapshot gate rows went stale in
+/// the reassuring direction the day they were written. The snapshot gate row
+/// said only the two depth tables take it, while `tick_quotes` and
+/// `feed_aux_packets` take it on every hour-path pass; the quiesce row never
+/// named `ReplayIntent`, which makes the archiver stand aside at once.
+#[test]
+fn archive_quiesce_and_snapshot_gate_rows_name_what_the_code_does() {
+    let root = repo_root();
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md"))
+        .unwrap_or_else(|e| panic!("cannot read CLAUDE.md: {e}"));
+
+    let gate_row = table_row_starting_with(
+        &claude_md,
+        "| `crates/storage/src/partition_archive/snapshot_gate.rs::",
+    );
+    for table in ["tick_quotes", "feed_aux_packets"] {
+        assert!(
+            gate_row.contains(table),
+            "the snapshot_gate row must name `{table}`: it takes the snapshot \
+             gate and the exclusive lock on every hour-path pass \
+             (partition_archive/hour_path.rs::uses_snapshot_gate)"
+        );
+    }
+
+    let quiesce_row =
+        table_row_starting_with(&claude_md, "| `crates/storage/src/archive_quiesce.rs::");
+    assert!(
+        quiesce_row.contains("ReplayIntent"),
+        "the archive_quiesce row must name `ReplayIntent`: while one is \
+         registered the archiver refuses at once (ArchiveQuiesce::hold_writers)"
+    );
+}
+
+/// Byte offsets in `text` where a dollar amount was eaten by shell expansion.
+///
+/// A double-quoted shell string turns `$0.05` into the shell's own name (or
+/// `-e` when run through `bash -c`), so the text reads `-e.05`. This finds a
+/// `-e.` that starts a word and is followed by a digit. Prose and command
+/// lines in CLAUDE.md never write a real `-e.5`; only the mangle does.
+fn shell_mangled_amounts(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut hits = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("-e.") {
+        let at = from.saturating_add(rel);
+        let starts_word = at == 0 || matches!(bytes[at - 1], b' ' | b'(' | b'\t');
+        let digit_after = bytes
+            .get(at.saturating_add(3))
+            .is_some_and(u8::is_ascii_digit);
+        if starts_word && digit_after {
+            hits.push(at);
+        }
+        from = at.saturating_add(3);
+    }
+    hits
+}
+
+/// B3 review, 2026-11-13: the `hot_path_telemetry` row's cost note was
+/// written through a double-quoted shell string and read `(Assumed under
+/// -e.05 a month)`, so nobody could tell the price of the new stage. This
+/// fails on any such mangle anywhere in CLAUDE.md.
+#[test]
+fn claude_md_carries_no_shell_mangled_dollar_amount() {
+    let root = repo_root();
+    let claude_md = std::fs::read_to_string(root.join("CLAUDE.md"))
+        .unwrap_or_else(|e| panic!("cannot read CLAUDE.md: {e}"));
+    let hits = shell_mangled_amounts(&claude_md);
+    let lines: Vec<usize> = hits
+        .iter()
+        .map(|&at| claude_md[..at].matches('\n').count().saturating_add(1))
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "CLAUDE.md lines {lines:?} carry a dollar amount eaten by shell \
+         expansion (`-e.<digits>`). Rewrite it as `$<amount>` with an editor \
+         or a single-quoted heredoc, never a double-quoted shell string."
+    );
+
+    let telemetry_row =
+        table_row_starting_with(&claude_md, "| `crates/storage/src/hot_path_telemetry.rs::");
+    assert!(
+        telemetry_row.contains("(Assumed under $0.05 a month)"),
+        "the hot_path_telemetry row must state the drain_frame_post cost as \
+         `(Assumed under $0.05 a month)`"
+    );
+}
+
+/// 2026-11-14 review: the Quote 60 cost note in `aws-budget.md` (auto-loaded
+/// every session) read "about -e.05 to -e.15 a trading day" for the one
+/// Assumed number the owner is told to measure. CLAUDE.md alone was scanned;
+/// this scans every auto-loaded project rule file too.
+#[test]
+fn rule_files_carry_no_shell_mangled_dollar_amount() {
+    let dir = repo_root().join(".claude/rules/project");
+    let mut bad = Vec::new();
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        for at in shell_mangled_amounts(&text) {
+            let line = text[..at].matches('\n').count().saturating_add(1);
+            bad.push(format!("{}:{line}", path.display()));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "dollar amounts eaten by shell expansion (`-e.<digits>`): {bad:?}. Rewrite \
+         each as `$<amount>` with an editor or a single-quoted heredoc."
+    );
+}
+
+#[test]
+fn shell_mangle_scanner_finds_the_planted_case_and_skips_real_flags() {
+    assert_eq!(
+        shell_mangled_amounts("(Assumed under -e.05 a month)").len(),
+        1
+    );
+    assert_eq!(shell_mangled_amounts("costs -e.5 now").len(), 1);
+    assert!(shell_mangled_amounts("run grep -e.foo here").is_empty());
+    assert!(shell_mangled_amounts("under $0.05 a month").is_empty());
+    assert!(shell_mangled_amounts("tile-e.5").is_empty());
 }

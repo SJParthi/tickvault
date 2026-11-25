@@ -30,18 +30,23 @@
 //! way a day cannot pass without a build attempt, which is the property that
 //! actually matters.
 
+mod mtf_history;
+
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tickvault_common::config::{DhanUniverseConfig, QuestDbConfig};
 use tickvault_common::constants::{
-    DHAN_DETAILED_CSV_URL, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
+    DHAN_DETAILED_CSV_URL, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS,
+    IST_UTC_OFFSET_SECONDS_I64,
 };
 use tickvault_core::instrument::master_csv::{
     Constituent, JoinOutcome, NSE_MEMBERSHIP_TOLERANCE, build_isin_index, join_constituents,
-    parse_master_csv, split_csv_line,
+    parse_detailed_master, split_csv_line,
 };
 use tickvault_core::instrument::master_download::{
-    build_hardened_csv_client, fetch_csv_hardened, nse_index_csv_url, nse_user_agent,
+    build_hardened_csv_client, fetch_csv_hardened, fetch_csv_with_provenance, nse_index_csv_url,
+    nse_user_agent,
 };
 use tracing::{error, info, warn};
 
@@ -60,6 +65,68 @@ const MIGRATION_GATE_WAIT_SECS: u64 = 120;
 /// Provenance stamped on every persisted constituent row.
 const CONSTITUENCY_SOURCE: &str = "niftyindices";
 
+/// Provenance tag stamped on F&O stock UNDERLYING mappings so a consumer can
+/// tell them apart from index-constituent rows without re-parsing the master.
+/// Mirrors the `"NSE_INDEX"` literal `nse_index_mappings` already uses — the
+/// artifact field exists; only the value is new.
+const FNO_UNDERLYING_TAG: &str = "FNO_UNDERLYING";
+
+/// The niftyindices DISPLAY NAME of the Nifty Total Market list.
+///
+/// This string is a JOIN KEY, not a label: `join_constituents` stamps
+/// `index_name` from the display name in [`INDEX_CONSTITUENCY_SLUGS`], and
+/// [`ntm_spot_mappings`] selects on it. A typo here does not fail loudly — it
+/// selects ZERO constituents and the session quietly carries indices alone,
+/// which is why `ntm_display_name_matches_a_real_slug` pins the two together
+/// rather than trusting that two copies of a string stay equal.
+const NTM_INDEX_NAME: &str = "Nifty Total Market";
+
+/// Row ceiling for a SINGLE index constituent list.
+///
+/// # The number, and what justifies it
+///
+/// The broadest NSE India index is Nifty Total Market at roughly **750**
+/// constituents; every other list in [`INDEX_CONSTITUENCY_SLUGS`] is a subset
+/// of that membership and therefore smaller. 5,000 is **~6.6x the largest
+/// real list**, so no legitimate response can reach it — which is the property
+/// a fail-closed ceiling needs. A list that returns more than this is not a
+/// big list; it is a malformed or wrong response.
+///
+/// # Why this exists
+///
+/// [`MAX_CSV_BODY_BYTES`] (50 MiB) bounds each DOWNLOAD, and each body is
+/// dropped as the loop advances — but it does not bound the ACCUMULATED
+/// `constituents` vector. At ~40 B/row a 50 MiB body parses to ~1.25 M rows,
+/// and 49 lists of those is roughly **10 GB on a 32 GiB host**; at a minimal
+/// row it approaches 41 GB. The input is vendor-controlled, so one oversized
+/// or malformed niftyindices response could OOM the process — which takes
+/// every WebSocket down at once, the single worst outcome for a feed whose
+/// requirement is no tick loss.
+///
+/// # Why over-cap is a FAILED list, not a truncation
+///
+/// Truncating to the first 5,000 rows would produce a WRONG universe that
+/// reports a healthy day: the join would succeed, the gauges would look
+/// normal, and the missing membership would be invisible. Counting it as a
+/// failed list instead routes it through [`MAX_FAILED_INDEX_LIST_FRACTION`],
+/// the gate that already exists to judge exactly this — a build missing too
+/// much membership is rejected outright rather than shipped quietly.
+const MAX_CONSTITUENTS_PER_LIST: usize = 5_000;
+
+/// Ceiling on the ACCUMULATED rows across every list in one build.
+///
+/// A second bound behind [`MAX_CONSTITUENTS_PER_LIST`], not a duplicate of it:
+/// the per-list cap assumes the list count is the fixed
+/// [`INDEX_CONSTITUENCY_SLUGS`] set, and this one holds even if that set grows
+/// or a future caller loops differently. 49 lists x 5,000 = 245,000, so 250,000
+/// is the per-list bound made total, with room for the slug list to gain a few
+/// entries without a silent behaviour change.
+///
+/// At ~168 B per `Constituent` (three owned `String`s plus the struct) this
+/// caps the accumulation at roughly **42 MB** — a bound in BYTES, which is
+/// what the previous count-free version lacked.
+const MAX_CONSTITUENTS_TOTAL: usize = 250_000;
+
 /// Backoff before respawning a died rider task. Matches the house sibling
 /// (`groww_universe`, `disk_health_watcher`) — short, because the thing that
 /// is not happening while we wait is the day's entire instrument mapping.
@@ -75,7 +142,15 @@ const RESPAWN_COUNTER: &str = "tv_dhan_universe_respawn_total";
 const BUILD_COUNTER: &str = "tv_dhan_universe_builds_total";
 
 /// Constituents resolved in the last successful build.
+///
+/// One row per `(index, symbol)` PAIR, so a stock in twelve index lists counts
+/// twelve times. Read [`DISTINCT_INSTRUMENTS_GAUGE`] for the number that
+/// decides how many instruments the feed subscribes.
 const RESOLVED_GAUGE: &str = "tv_dhan_universe_resolved_constituents";
+
+/// Distinct instruments in the last successful build — the number the live
+/// subscription actually dials, after I-P1-11 dedup.
+const DISTINCT_INSTRUMENTS_GAUGE: &str = "tv_dhan_universe_distinct_instruments";
 
 /// Unresolved fraction of the last successful build, in `[0, 1]`.
 ///
@@ -131,7 +206,7 @@ const RETRY_BASE_SECS: u64 = 10;
 const BUILD_DEADLINE_SECS: u64 = 900;
 
 /// Directory for the resolved mapping artifact.
-const MAPPING_DIR: &str = "data/instrument-cache";
+pub(crate) const MAPPING_DIR: &str = "data/instrument-cache";
 
 /// Path of the day's resolved mapping artifact.
 ///
@@ -142,7 +217,43 @@ const MAPPING_DIR: &str = "data/instrument-cache";
 /// resolved nothing usable" in every log line and counter.
 #[must_use]
 pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
-    std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date_ist}.json"))
+    mapping_artifact_in(std::path::Path::new(MAPPING_DIR), date_ist)
+}
+
+fn mapping_artifact_in(dir: &std::path::Path, date_ist: &str) -> std::path::PathBuf {
+    dir.join(format!("dhan-nse-mapping-{date_ist}.json"))
+}
+
+/// Path of the day's F&O stock UNDERLYING artifact.
+///
+/// A SEPARATE file rather than extra rows in the mapping artifact, and that is
+/// the whole safety argument: the mapping artifact is what the live lane reads
+/// at boot TODAY. Adding rows to it would change the default spot universe the
+/// moment this ships, before anyone chose to switch anything on. A file no
+/// current consumer opens cannot do that — the narrowed universe arrives only
+/// when the flag that reads it is turned on.
+///
+/// Same single-definition discipline as [`mapping_artifact_path`]: two copies
+/// of this filename would let the reader look for a name the writer never
+/// produces, find nothing, and fall back — indistinguishable from "the master
+/// had no F&O rows" in every log line.
+#[must_use]
+pub fn fno_underlying_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-fno-underlyings-{date_ist}.json"))
+}
+
+/// Path of the day's NSE-indices + Nifty-Total-Market spot artifact.
+///
+/// A THIRD file, for the same reason the F&O one is a second: the live lane
+/// reads the mapping artifact by default, and a set that arrives only when its
+/// own flag is on cannot change anybody's universe by merely shipping.
+///
+/// The filename must not collide with either sibling — a collision would have
+/// one writer overwrite the other and the reader would subscribe whichever ran
+/// last, silently. Pinned by `ntm_spot_artifact_path_never_collides_with_its_two_siblings`.
+#[must_use]
+pub fn ntm_spot_artifact_path(date_ist: &str) -> std::path::PathBuf {
+    std::path::Path::new(MAPPING_DIR).join(format!("dhan-ntm-spot-{date_ist}.json"))
 }
 
 /// Today's IST date as `YYYY-MM-DD`, recomputed per attempt.
@@ -217,9 +328,38 @@ pub fn next_wait(
 }
 
 /// One day's resolved mapping, as written to disk.
+/// The F&O stock UNDERLYING artifact.
+///
+/// Its OWN shape rather than a reuse of [`MappingArtifact`]: that struct
+/// carries join diagnostics (`ambiguous_isins`, `constituents_seen`, …) that
+/// describe the ISIN join this set never performs. Filling them with zeros
+/// would publish seven fields of meaningless provenance, and a later reader
+/// would have no way to tell a real zero from a placeholder.
+///
+/// `count` is redundant with `underlyings.len()` and is written anyway: a
+/// truncated file that still parses as JSON is caught by comparing them, which
+/// is cheaper than trusting a length nobody checked.
+#[derive(serde::Serialize)]
+/// The narrowed spot artifact: NSE indices PLUS the F&O stock underlyings.
+/// The type and the filename keep the `fno` name for continuity with the
+/// path helper and its tests, but the CONTENTS are both halves — see
+/// `narrowed_spot_mappings` for why the indices half is not optional.
+struct FnoUnderlyingArtifact {
+    count: usize,
+    /// Named `mappings` -- the SAME key the mapping artifact uses -- so the
+    /// consumer reads this file with `parse_mapping_artifact`, the parser
+    /// already hardened to fail LOUD on garbage and to distinguish "parsed to
+    /// an empty list" from "did not parse". A second bespoke parser for a
+    /// second shape would be a second place for that distinction to be got
+    /// wrong.
+    mappings: Vec<MappingEntry>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct MappingArtifact {
     trading_date_ist: String,
+    #[serde(flatten)]
+    mtf: mtf_history::ReceiptState,
     master_rows: usize,
     isin_index_len: usize,
     ambiguous_isins: usize,
@@ -227,10 +367,95 @@ struct MappingArtifact {
     resolved: usize,
     unresolved: usize,
     unresolved_fraction: f64,
+    /// Distinct `(security_id, exchange_segment)` pairs across ALL mappings —
+    /// i.e. how many instruments the live feed will actually SUBSCRIBE.
+    ///
+    /// This is NOT `resolved` and the difference is large. `join_constituents`
+    /// dedups on `(index_name, security_id, segment)`, so a stock that belongs to
+    /// twelve NSE index lists produces TWELVE resolved rows. Summed over the 46
+    /// downloaded lists that inflates a real universe of roughly 750 NIFTY Total
+    /// Market stocks plus ~120 NSE indices into a `mappings` array of several
+    /// thousand entries.
+    ///
+    /// The subscribe path then dedups on the I-P1-11 composite key
+    /// (`dhan_live_universe::select_live_universe`), so the number of sockets and
+    /// instruments the lane opens has always followed THIS count, not `resolved`.
+    /// Nothing published it, so the only figure available to a reader was the
+    /// inflated one — and it was read, and recorded in a rule file, as "SIDs in
+    /// the live set". A count that is five times the truth is worse than no count.
+    distinct_instruments: usize,
     /// Every unresolved constituent, BY NAME. §31.1 item 4 requires the
     /// operator can see which security failed, not merely how many did.
     unresolved_detail: Vec<String>,
     mappings: Vec<MappingEntry>,
+}
+
+impl MappingArtifact {
+    /// Fit optional MTF history into the Stocks reader's existing byte ceiling.
+    /// The broad mapping and its capture consumers remain available even if its
+    /// mandatory fields alone exceed what Stocks can accept.
+    fn encode(&mut self, limit: usize) -> serde_json::Result<Vec<u8>> {
+        let intervals = std::mem::take(&mut self.mtf.mtf_history);
+        let mut base = serde_json::to_vec(self)?;
+        if base.len() > limit && self.mtf.current.take().is_some() {
+            // No partially serialized leverage map may certify a security.
+            base = serde_json::to_vec(self)?;
+        }
+        self.mtf.mtf_history = mtf_history::fitting_history(intervals, base.len(), limit)?;
+        if self.mtf.mtf_history.is_empty() {
+            if base.len() < limit {
+                let pretty = serde_json::to_vec_pretty(self)?;
+                if pretty.len() <= limit {
+                    return Ok(pretty);
+                }
+            }
+            Ok(base)
+        } else {
+            serde_json::to_vec(self)
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct DailyMtfTerms {
+    // APPROVED: this wire field contains only the master's NSE/E/EQ/EQUITY terms.
+    mtf_leverage_by_security_id: HashMap<u64, f64>,
+    mtf_observed_at_epoch_secs: i64,
+    mtf_source_modified_at_epoch_secs: i64,
+}
+
+impl DailyMtfTerms {
+    /// The stable master URL serves the latest file. Unverified or stale
+    /// publisher dates must not supply terms for a different trading day.
+    fn for_date(
+        trading_date: &str,
+        observed: chrono::DateTime<chrono::Utc>,
+        last_modified: Option<&str>,
+        // APPROVED: the sole producer is parse_detailed_master's NSE/E/EQ/EQUITY map.
+        terms: HashMap<u64, f64>,
+    ) -> Option<Self> {
+        let date = chrono::NaiveDate::parse_from_str(trading_date, "%Y-%m-%d").ok()?;
+        let modified = chrono::DateTime::parse_from_rfc2822(last_modified?)
+            .ok()?
+            .to_utc();
+        let ist = chrono::FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)?;
+        if terms.is_empty()
+            || modified > observed
+            || modified.with_timezone(&ist).date_naive() != date
+            || observed.with_timezone(&ist).date_naive() != date
+        {
+            return None;
+        }
+        // A subsecond observation did not yet exist at the start of its second.
+        let observed_by = observed
+            .timestamp()
+            .checked_add(i64::from(observed.timestamp_subsec_nanos() > 0))?;
+        Some(Self {
+            mtf_leverage_by_security_id: terms,
+            mtf_observed_at_epoch_secs: observed_by,
+            mtf_source_modified_at_epoch_secs: modified.timestamp(),
+        })
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -240,6 +465,200 @@ struct MappingEntry {
     isin: String,
     security_id: u64,
     exchange_segment: u8,
+}
+
+/// Distinct `(security_id, exchange_segment)` pairs in a mapping array.
+///
+/// The subscribe path (`dhan_live_universe::select_live_universe`) dedups on
+/// exactly this key, so this is the count of instruments the live feed will
+/// dial — the answer to "how many will actually be subscribed?", available at
+/// 08:30 from the artifact rather than only after the sockets come up.
+fn distinct_instrument_count(mappings: &[MappingEntry]) -> usize {
+    mappings
+        .iter()
+        .map(|m| (m.security_id, m.exchange_segment))
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// Every NSE index in the master, as mapping entries.
+///
+/// # Why the ISIN join structurally cannot produce these
+///
+/// The constituency join answers *"which cash equities make up each index?"*
+/// and filters to `NSE && SEGMENT=E && SERIES=EQ`. An index is none of those:
+/// it has no ISIN (the master leaves the column empty), no series, and no
+/// order book. So the join emits the ~750 CONSTITUENTS of NIFTY 50 and never
+/// NIFTY 50 itself — and the live universe, which is built from the join's
+/// output, inherited that hole.
+///
+/// The consequence, measured on the box 2026-08-20: the lane subscribed FOUR
+/// indices, and those four came from a hardcoded constant rather than from
+/// the master at all. Every other NSE index — and there are dozens, each one
+/// a reference price something is quoted against — was absent, not because
+/// anything refused it but because nothing ever asked for it.
+///
+/// These ride the SAME `mappings` array the constituents use, so the live
+/// The NSE F&O stock UNDERLYING set — the cash-equity rows that actually have
+/// futures or options written on them.
+///
+/// **Why this exists (operator, 2026-08-21, recorded in
+/// `websocket-connection-scope-lock.md`):** the authorized contract set —
+/// full NIFTY/BANKNIFTY current-expiry chains plus every F&O stock's
+/// current-expiry options at ATM ± 25 — does not fit inside the 25,000
+/// subscription capacity alongside the master-sourced spot universe. The
+/// code says so itself in `dhan_feed_stack`: ~4,565 spot instruments leave
+/// ~20,435 for contracts against an authorized set of ~23,820. Narrowing the
+/// spot side to indices + the underlyings we actually trade options on is the
+/// lever that makes the operator's stated design fit, and it is the ONLY one
+/// that does not change the contract shape he specified.
+///
+/// **Derived from the daily master, never a hardcoded list.** An F&O list
+/// written into Rust goes stale on the next SEBI revision and nothing would
+/// notice — the standing no-manual-intervention mandate forbids it. Both
+/// passes below read the same master the rest of the build already parsed, so
+/// this adds no fetch and no second parse.
+///
+/// # Complexity
+/// Two O(n) passes over the master with O(1)-average hash operations — one to
+/// collect the underlying SYMBOLS that derivatives name, one to resolve those
+/// symbols to their cash-equity `security_id`. No nested scan: resolving by
+/// filtering the master per underlying would be O(underlyings × rows), which
+/// at ~220 × ~150,000 is the quadratic shape this codebase has already had to
+/// repair three times.
+///
+/// # What it deliberately does NOT do
+/// - It does not invent an underlying for a derivative whose `underlying_symbol`
+///   is empty — that row is skipped and counted by the caller, never guessed.
+/// - It does not include an underlying whose cash-equity row is absent from the
+///   master. A symbol we cannot resolve to a `security_id` cannot be subscribed,
+///   and emitting a zero id would subscribe instrument 0 and look healthy.
+/// - It does not dedupe on `security_id` alone across segments: every row it
+///   emits is NSE cash equity by construction, so the segment half of the
+///   I-P1-11 composite is a constant here — stated at the filter rather than
+///   assumed, exactly as `nse_index_mappings` does one function below.
+/// The ticker of an NSE cash-equity master row.
+///
+/// Dhan's detailed master puts the trading symbol in `UNDERLYING_SYMBOL` for
+/// cash-equity rows too, and the COMPANY name in `SYMBOL_NAME`
+/// (`RELIANCE INDUSTRIES LTD` / `RELIANCE`, verified on prod 2026-09-23). A
+/// row with no `UNDERLYING_SYMBOL` falls back to `SYMBOL_NAME` rather than
+/// being dropped — never guessed from anything else. O(1), no allocation.
+fn equity_ticker(row: &tickvault_core::instrument::master_csv::MasterRow) -> &str {
+    if row.underlying_symbol.is_empty() {
+        row.symbol_name.as_str()
+    } else {
+        row.underlying_symbol.as_str()
+    }
+}
+
+fn fno_underlying_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    use tickvault_core::instrument::master_csv::InstrumentClass;
+
+    // Pass 1 — which symbols do NSE stock derivatives name as their underlying?
+    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for row in master {
+        if row.exch_id != "NSE" {
+            continue;
+        }
+        if !matches!(
+            row.class,
+            InstrumentClass::StockFuture | InstrumentClass::StockOption
+        ) {
+            continue;
+        }
+        if row.underlying_symbol.is_empty() {
+            continue;
+        }
+        wanted.insert(row.underlying_symbol.as_str());
+    }
+
+    // Pass 2 — resolve those symbols to their NSE cash-equity security_id.
+    // APPROVED: single-segment context — only NSE EQ-series cash-equity rows (NSE_EQ) reach this set.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in master {
+        if row.class != InstrumentClass::Equity || row.exch_id != "NSE" {
+            continue;
+        }
+        // `EQ` is the cash series. A non-EQ series (BE, BZ, trade-to-trade)
+        // is a different instrument with its own id, and subscribing it in
+        // place of the EQ line would price the ATM window off the wrong book.
+        if row.series != "EQ" {
+            continue;
+        }
+        // The TICKER is the join key, and on a real NSE cash-equity row it
+        // lives in `underlying_symbol` — `symbol_name` carries the COMPANY
+        // name. Verified on prod 2026-09-23: security_id 2885 reads
+        // symbol_name="RELIANCE INDUSTRIES LTD", underlying_symbol="RELIANCE",
+        // while its future reads underlying_symbol="RELIANCE". Joining on
+        // `symbol_name` matched ONLY the vendor's test rows (whose company
+        // name happens to equal the ticker), so the 2026-09-23 artifact held
+        // 19 `NSETEST` dummies instead of ~208 real underlyings. Falls back
+        // to `symbol_name` for a row that carries no ticker, which is the
+        // shape the older fixtures use.
+        let ticker = equity_ticker(row);
+        if !wanted.contains(ticker) {
+            continue;
+        }
+        // A zero id is the parser's "absent or unusable" answer. Subscribing
+        // instrument 0 would look healthy and receive nothing.
+        if row.security_id == 0 || !seen.insert(row.security_id) {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: FNO_UNDERLYING_TAG.to_owned(),
+            // The ticker, not the company name: it is the key every consumer
+            // of this artifact joins on, and the label an operator reads.
+            symbol: ticker.to_owned(),
+            isin: row.isin.clone(),
+            security_id: row.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
+        });
+    }
+    out
+}
+
+/// universe widens through the path it already has: no new artifact, no new
+/// parser, no new consumer. They carry `IDX_I` (segment code 0), which is
+/// what makes them indices rather than equities on the wire.
+///
+/// `index_name` is the literal `NSE_INDEX` rather than a parent index, because
+/// an index is not a constituent OF anything — the field exists to say which
+/// list a row came from, and this row came from the master itself.
+///
+/// Deduped on `security_id` alone, deliberately, and that is NOT an I-P1-11
+/// violation: every row here is `IDX_I` by construction, so the segment half
+/// of the composite is a constant and a pair would add a field that cannot
+/// vary. The equality is documented at the filter rather than assumed.
+fn nse_index_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    use tickvault_core::instrument::master_csv::InstrumentClass;
+
+    // APPROVED: single-segment context — only NSE index rows (IDX_I) reach this set; see the doc above.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in master {
+        if row.class != InstrumentClass::Index || row.exch_id != "NSE" {
+            continue;
+        }
+        // A zero id is the parser's "absent or unusable" answer. Subscribing
+        // instrument 0 would look healthy and receive nothing.
+        if row.security_id == 0 || !seen.insert(row.security_id) {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: "NSE_INDEX".to_owned(),
+            symbol: row.symbol_name.clone(),
+            isin: String::new(),
+            security_id: row.security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI.binary_code(),
+        });
+    }
+    out
 }
 
 /// Fraction of index lists that failed, in `[0.0, 1.0]`.
@@ -328,10 +747,304 @@ fn parse_constituent_csv(index_name: &str, csv: &str) -> Vec<Constituent> {
 ///
 /// The per-list bodies are dropped as the loop advances, so the 50 MB download
 /// cap bounds each list individually but NOT the accumulated `constituents`
-/// vector — a vendor serving millions of minimal rows across 49 lists could
-/// still grow it without limit. Recorded rather than fixed here: the honest
-/// bound is a row-count ceiling per list, which needs a number the vendor's
-/// real list sizes have to justify.
+/// vector.
+///
+/// **FIXED 2026-09-01.** That gap was real and vendor-controlled: a
+/// niftyindices response of millions of minimal rows across 49 lists could
+/// grow the accumulation to ~10 GB (41 GB at a minimal row) on a 32 GiB host,
+/// and an OOM kill drops every WebSocket at once. The comment here asked for
+/// "a number the vendor's real list sizes have to justify" — the broadest NSE
+/// index is Nifty Total Market at ~750 constituents and every other list is a
+/// subset of it, so [`MAX_CONSTITUENTS_PER_LIST`] (5,000, ~6.6x the largest
+/// real list) cannot be reached by a legitimate response.
+///
+/// Over-cap is treated as a FAILED list rather than truncated, so it routes
+/// through the existing [`MAX_FAILED_INDEX_LIST_FRACTION`] gate instead of
+/// silently shipping a short universe. [`MAX_CONSTITUENTS_TOTAL`] bounds the
+/// accumulation at ~42 MB in BYTES, which the count-free version lacked.
+/// How many days of instrument artifacts stay on disk.
+///
+/// Every reader takes TODAY's date (`mapping_artifact_path(date_ist)` and its
+/// three siblings), and the documented fallback when today's file is missing is
+/// the four hardcoded index SIDs -- never yesterday's file. So correctness
+/// needs a window of ONE day and every day beyond that is forensics: what the
+/// universe actually WAS on a day whose session behaved oddly.
+///
+/// Seven keeps a full trading week, which is the span over which a
+/// "the contract set looked wrong on Tuesday" question is asked and answered.
+///
+/// These JSON files are the rider-to-lane handoff. `index_constituency` is a
+/// QuestDB table written a few lines above this sweep and nothing here touches
+/// it; `instrument_lifecycle` and `instrument_lifecycle_audit` are frozen
+/// history since owner Quote 44 (2026-10-28) and nothing writes them.
+///
+/// **Since Quote 44 these files ARE the point-in-time record.** Each dated
+/// file is copied to `s3://tv-<env>-cold/instrument-snapshots/<date>/` and
+/// verified (`instrument_snapshot_upload`), kept there forever, and this sweep
+/// deletes a local dated file only once that verified copy is recorded. With
+/// no verified copy the file stays and is counted, so a broken upload costs
+/// disk (about 10 MB a day), never the record.
+///
+/// The live lane reads this same number as its lookback when today's list is
+/// missing (`dhan_live_universe`, audit D3): a file older than this has already
+/// been swept, so looking further back could only find nothing.
+pub(crate) const ARTIFACT_RETENTION_DAYS: i64 = 7;
+
+/// The artifact filename prefixes this sweep is allowed to delete.
+///
+/// An allowlist rather than a `*.json` glob, and that is the whole safety
+/// argument: a glob deletes whatever a future change happens to put in this
+/// directory, and it would do it silently on a path that already runs
+/// unattended once a day. A name this list does not know is left alone.
+const SWEEPABLE_PREFIXES: [&str; 4] = [
+    "dhan-nse-mapping-",
+    "dhan-fno-underlyings-",
+    "dhan-ntm-spot-",
+    "dhan-contracts-",
+];
+
+/// The suffix of a crash leftover between `write` and `rename`. Never a
+/// snapshot itself (the complete `.json` beside it is); swept only once that
+/// `.json` has a verified copy (Quote 44), see `tmp_sibling_is_copied`.
+const ARTIFACT_TMP_SUFFIX: &str = ".json.tmp";
+
+/// The date a sweepable artifact filename carries, or `None`.
+///
+/// `Some` requires ALL of: a known prefix, a `.json` or `.json.tmp` suffix, and
+/// exactly `YYYY-MM-DD` between them. Anything else returns `None` and is
+/// therefore never deleted -- a file that does not parse is kept, never removed
+/// on a guess.
+///
+/// `.json.tmp` is swept too: a crash between `write` and `rename` leaves one
+/// beside the real file forever, and it is the same artifact by another name.
+pub(crate) fn sweepable_artifact_date(file_name: &str) -> Option<&str> {
+    let rest = SWEEPABLE_PREFIXES
+        .iter()
+        .find_map(|p| file_name.strip_prefix(p))?;
+    // Order is NOT load-bearing here and the first draft of this comment said
+    // it was: `.json` is a prefix of `.json.tmp` as a string, but these are
+    // SUFFIX checks, and a name ending `.json.tmp` does not end in `.json`.
+    // Reversing the two arms was tried and changed nothing. Longest first is
+    // kept as a reading convention, not as a correctness argument.
+    let date = rest
+        .strip_suffix(ARTIFACT_TMP_SUFFIX)
+        .or_else(|| rest.strip_suffix(".json"))?;
+    // ISO dates sort lexically, which is why the caller can compare them as
+    // strings. That only holds for a fixed-width, zero-padded shape, so the
+    // shape is checked rather than assumed.
+    let b = date.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let digits_ok = [0, 1, 2, 3, 5, 6, 8, 9]
+        .iter()
+        .all(|&i| b[i].is_ascii_digit());
+    digits_ok.then_some(date)
+}
+
+/// The oldest date this sweep keeps, as `YYYY-MM-DD`.
+#[must_use]
+fn artifact_retention_cutoff(today_ist: &str) -> Option<String> {
+    let today = chrono::NaiveDate::parse_from_str(today_ist, "%Y-%m-%d").ok()?;
+    Some(
+        today
+            .checked_sub_signed(chrono::TimeDelta::days(ARTIFACT_RETENTION_DAYS))?
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+/// What one sweep did. Returned rather than logged inside so the decision
+/// logic is testable without a filesystem.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepTally {
+    removed: usize,
+    bytes: u64,
+    /// Files whose names this sweep does not recognise. Counted, never removed.
+    skipped_unknown: usize,
+    /// Removals the filesystem refused. Counted, never fatal.
+    failed: usize,
+    /// Old dated artifacts KEPT because no verified S3 copy is recorded for
+    /// them (owner Quote 44: never sweep a local artifact before its verified
+    /// copy exists). Counted on the held counter, never deleted.
+    held_without_copy: usize,
+}
+
+/// Deletes instrument artifacts older than [`ARTIFACT_RETENTION_DAYS`].
+///
+/// # Why this exists
+///
+/// Four files land in `data/instrument-cache` every trading day and NOTHING
+/// removed them. Every `remove_file` touching this directory was inside a
+/// `#[cfg(test)]` block; the only production deletion is the operator's manual
+/// `rm -rf` in the wipe runbook. Worse, two comments asserted the opposite --
+/// `dhan_contract_universe.rs` said the shared directory meant "one cleanup and
+/// one retention policy covers both", and a test in this file said "same
+/// directory, so one cleanup path covers both". Both described a policy that
+/// did not exist. A reader auditing disk growth would have read them, believed
+/// the artifacts were managed, and looked elsewhere.
+///
+/// The volume is small next to the ~140 GB a session writes -- the four files
+/// are order 10 MB/day, dominated by the contract artifact's ~22,000 rows --
+/// so this is unbounded growth on a disk that has no room to spare, not an
+/// imminent outage. It is fixed because "grows forever" and "is bounded" are
+/// different claims and only one of them was true.
+///
+/// # Failure posture
+///
+/// Every failure is counted and logged; none propagates. A sweep that cannot
+/// run costs disk, and a build that aborts because a stale file would not
+/// delete costs the session its universe -- strictly worse.
+///
+/// O(files in the directory), once per day, on the cold daily-rider path.
+fn sweep_stale_artifacts(
+    today_ist: &str,
+    proven: &std::collections::BTreeSet<String>,
+) -> SweepTally {
+    sweep_stale_artifacts_in(
+        std::path::Path::new(MAPPING_DIR),
+        today_ist,
+        tickvault_storage::raw_frame_upload::CopyGate::Required,
+        proven,
+    )
+}
+
+/// [`sweep_stale_artifacts`] over `dir`, deleting a dated `.json` artifact only
+/// when `gate` allows it (production passes `CopyGate::Required`: a verified
+/// S3 copy with this file's length and mtime must be recorded in
+/// `<dir>/uploaded/`). A `.json.tmp` crash leftover is not a snapshot (the
+/// complete `.json` beside it is the one copied); it is deleted only when
+/// that `.json` exists with a verified copy, and kept and counted otherwise.
+/// The `uploaded/` marker folder is skipped, never counted as unknown, and a
+/// deleted file's marker is removed with it.
+///
+/// Under `CopyGate::Required` the marker alone is NOT enough (2026-10-28
+/// review): the file's name must also be in `proven`, the names whose copy
+/// the snapshot pass that ran just before this sweep confirmed itself (a
+/// HeadObject that matched, or a fresh upload it verified). A marker that
+/// survived its copy (a bucket-wide delete, then a marker unlink that failed
+/// and a re-upload that failed too) therefore deletes nothing. A `.json.tmp`
+/// leftover follows its `.json` sibling's proof. `proven` is ignored under
+/// `CopyGate::NotRequired` (no copy required). One `BTreeSet` probe per old
+/// file, O(log proven), cold.
+pub(crate) fn sweep_stale_artifacts_in(
+    dir: &std::path::Path,
+    today_ist: &str,
+    gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
+) -> SweepTally {
+    let mut tally = SweepTally::default();
+    let Some(cutoff) = artifact_retention_cutoff(today_ist) else {
+        // An unparseable date means the caller is broken, not the disk. Delete
+        // nothing rather than compute a cutoff from a guess.
+        return tally;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // No directory yet is the normal first-boot state, not an error.
+        return tally;
+    };
+    // A `.json.tmp` is judged by its `.json` sibling, so every `.json.tmp` is
+    // looked at BEFORE any `.json` is deleted in this sweep (otherwise a
+    // sibling deleted a moment earlier would leave its leftover held for
+    // ever). O(files log files), once a day, cold.
+    let mut entries: Vec<std::fs::DirEntry> = entries.flatten().collect();
+    entries.sort_by_key(|e| {
+        !e.file_name()
+            .to_string_lossy()
+            .ends_with(ARTIFACT_TMP_SUFFIX)
+    });
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            tally.skipped_unknown += 1;
+            continue;
+        };
+        if name == tickvault_storage::raw_frame_upload::UPLOADED_SUBDIR {
+            // The verified-copy markers (Quote 44), not an artifact.
+            continue;
+        }
+        let Some(date) = sweepable_artifact_date(name) else {
+            tally.skipped_unknown += 1;
+            continue;
+        };
+        // Lexical compare is a real date compare for zero-padded ISO dates,
+        // and the shape check above is what makes that true.
+        if date >= cutoff.as_str() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            // Unreadable metadata: no copy can be proven, so keep it.
+            tally.held_without_copy += 1;
+            continue;
+        };
+        let is_snapshot = !name.ends_with(ARTIFACT_TMP_SUFFIX);
+        let copied = if is_snapshot {
+            gate.allows_delete(&path, &meta) && (!gate.copy_in_s3() || proven.contains(name))
+        } else {
+            // A crash leftover is never copied itself. It may go only when the
+            // complete `.json` of the same name exists with its own verified
+            // copy; otherwise it could be the only record of that day (every
+            // attempt died between write and rename), so it is kept and
+            // counted (Quote 44).
+            tmp_sibling_is_copied(&path, gate, proven)
+        };
+        if !copied {
+            tally.held_without_copy += 1;
+            continue;
+        }
+        let bytes = meta.len();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tally.removed += 1;
+                tally.bytes = tally.bytes.saturating_add(bytes);
+                if is_snapshot {
+                    gate.forget(&path);
+                }
+            }
+            Err(err) => {
+                tally.failed += 1;
+                warn!(
+                    path = %path.display(),
+                    %err,
+                    "stale instrument artifact could not be removed — it stays on disk; \
+                     this costs space, never correctness"
+                );
+            }
+        }
+    }
+    tally
+}
+
+/// Whether the complete `.json` beside the `.json.tmp` leftover at `tmp_path`
+/// exists, `gate` allows deleting it (its verified S3 copy is recorded) and
+/// its copy is in `proven` (confirmed by the pass just before this sweep).
+/// `false` for any other name or an unreadable sibling: keep the leftover.
+fn tmp_sibling_is_copied(
+    tmp_path: &std::path::Path,
+    gate: tickvault_storage::raw_frame_upload::CopyGate,
+    proven: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(json_name) = tmp_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(ARTIFACT_TMP_SUFFIX))
+    else {
+        return false;
+    };
+    if !gate.copy_in_s3() {
+        // No copy is required (the shape before Quote 44): age alone.
+        return true;
+    }
+    let json_file = format!("{json_name}.json");
+    if !proven.contains(&json_file) {
+        return false;
+    }
+    let json_path = tmp_path.with_file_name(json_file);
+    std::fs::metadata(&json_path)
+        .is_ok_and(|meta| meta.is_file() && gate.allows_delete(&json_path, &meta))
+}
+
 async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinOutcome> {
     let client = build_hardened_csv_client().map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -340,16 +1053,31 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         source = "dhan_master",
         date, "downloading instrument master"
     );
-    let master_csv = fetch_csv_hardened(&client, DHAN_DETAILED_CSV_URL, None)
+    let master_csv = fetch_csv_with_provenance(&client, DHAN_DETAILED_CSV_URL, None)
         .await
         .map_err(|e| anyhow::anyhow!("dhan master download: {e}"))?;
-    let master = parse_master_csv(&master_csv).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let observed = chrono::Utc::now();
+    let detailed = parse_detailed_master(&master_csv.body).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mtf = DailyMtfTerms::for_date(
+        date,
+        observed,
+        master_csv.last_modified.as_deref(),
+        detailed.mtf_leverage_by_security_id,
+    );
+    drop(master_csv);
+    let master = detailed.rows;
     let index = build_isin_index(&master);
     info!(
         source = "dhan_master",
         rows = master.len(),
         isins = index.len(),
         ambiguous = index.ambiguous.len(),
+        mtf_equities_with_reported_terms = mtf
+            .as_ref()
+            .map_or(0, |terms| terms.mtf_leverage_by_security_id.len()),
+        mtf_source_modified_at_epoch_secs = mtf
+            .as_ref()
+            .map(|terms| terms.mtf_source_modified_at_epoch_secs),
         "instrument master parsed"
     );
 
@@ -380,37 +1108,6 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
         ),
     }
 
-    // 1c. The never-delete lifecycle record.
-    //
-    // Operator directive 2026-08-19: an expired instrument is MARKED expired,
-    // never removed, so the table answers "was this tradeable on that day?"
-    // for every instrument that has ever existed.
-    //
-    // NON-FATAL, like the artifact above: the mapping build is what the rider
-    // exists for, and a lifecycle write that fails must not cost the day its
-    // universe. It also runs AFTER the artifact so a failure here cannot stop
-    // the live lane getting its contracts.
-    let today_ymd = crate::dhan_feed_stack::ymd_from_ist_date(date);
-    let today_nanos = ist_midnight_nanos(date);
-    match crate::dhan_lifecycle::write_dhan_lifecycle(questdb, &master, today_ymd, today_nanos, "")
-        .await
-    {
-        Ok(tally) => info!(
-            active = tally.active,
-            expired_by_date = tally.expired_by_date,
-            expired_by_absence = tally.expired_by_absence,
-            "instrument lifecycle recorded"
-        ),
-        Err(err) => error!(
-            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-            %err,
-            date,
-            "instrument lifecycle could NOT be written — nothing was deleted (the table is \
-             append-and-upsert only), but today's expiry marks are missing, so a query \
-             asking which instruments were tradeable today will read yesterday's answer."
-        ),
-    }
-
     // 2. Every NSE India index list. A single list failing does NOT abort the
     // day: the tolerance gate below judges the RESULT, so one flaky index out
     // of ~49 degrades the fraction rather than losing the other 48. Aborting
@@ -426,6 +1123,37 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
                 if rows.is_empty() {
                     failed_lists += 1;
                     warn!(index = display_name, "index list parsed to zero rows");
+                } else if rows.len() > MAX_CONSTITUENTS_PER_LIST {
+                    // Fail the LIST, never truncate it — see
+                    // `MAX_CONSTITUENTS_PER_LIST`. A silently shortened list
+                    // would join cleanly and report a healthy day while
+                    // carrying a fraction of the intended membership; the
+                    // failed-fraction gate below exists to judge exactly that.
+                    failed_lists += 1;
+                    warn!(
+                        index = display_name,
+                        rows = rows.len(),
+                        ceiling = MAX_CONSTITUENTS_PER_LIST,
+                        "index list REFUSED — more rows than any real NSE index has \
+                         (the broadest, Nifty Total Market, is ~750). Treated as a failed \
+                         list rather than truncated: a shortened list would look healthy \
+                         while missing membership. Accumulating it unbounded is what could \
+                         OOM the process, which drops every socket at once"
+                    );
+                } else if constituents.len().saturating_add(rows.len()) > MAX_CONSTITUENTS_TOTAL {
+                    // The accumulation bound. Reachable only if many lists are
+                    // individually legal yet collectively enormous, which the
+                    // per-list cap alone cannot catch.
+                    failed_lists += 1;
+                    warn!(
+                        index = display_name,
+                        accumulated = constituents.len(),
+                        rows = rows.len(),
+                        ceiling = MAX_CONSTITUENTS_TOTAL,
+                        "index list REFUSED — would push the accumulated constituent set \
+                         past its total ceiling. Refusing bounds the build's memory in \
+                         BYTES; the failed-fraction gate decides whether the day survives"
+                    );
                 } else {
                     constituents.extend(rows);
                 }
@@ -451,6 +1179,25 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // see a missing list — see MAX_FAILED_INDEX_LIST_FRACTION.
     let failed_fraction = failed_list_fraction(failed_lists, INDEX_CONSTITUENCY_SLUGS.len());
     if failed_fraction > MAX_FAILED_INDEX_LIST_FRACTION {
+        // Audit D3c-1: the FULL mapping stays refused (its membership would be
+        // partial and read as complete), but the two narrowed spot sets do
+        // not depend on the lists that failed, and they are what the live
+        // lane boots on. Writing them keeps a bad niftyindices morning from
+        // costing the session today's spots. The build still fails and
+        // retries; the next success rewrites both.
+        let partial = join_constituents(&constituents, &index);
+        tokio::task::block_in_place(|| write_narrowed_spot_artifacts(date, &master, &partial));
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "rider_index_lists_rejected",
+            date,
+            failed = failed_lists,
+            lists = INDEX_CONSTITUENCY_SLUGS.len(),
+            "daily instrument build: too many NSE index lists failed, so the full mapping is \
+             NOT written today (it would read as complete while missing membership). The F&O \
+             and Nifty Total Market spot sets were written from the lists that did arrive; \
+             the build retries until the lists come back."
+        );
         anyhow::bail!(
             "build REJECTED: {failed_lists} of {} NSE index lists failed ({:.1}%), above the \
              {:.1}% ceiling — the surviving lists would join cleanly and report a healthy day \
@@ -471,6 +1218,8 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     if fraction > NSE_MEMBERSHIP_TOLERANCE {
         for u in outcome.unresolved.iter().take(50) {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "rider_constituent_unresolved",
                 index = %u.index_name,
                 symbol = %u.symbol,
                 isin = %u.isin,
@@ -492,9 +1241,103 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // Disk first, then the table. The artifact is the cheaper, more reliable
     // record; writing it before the network call means a QuestDB outage
     // cannot cost us the day's mapping.
-    write_mapping_atomic(date, &master, &index, &outcome)?;
+    //
+    // WRAPPED IN `block_in_place` 2026-09-01 — this call is synchronous and
+    // heavy, and it was running directly on a tokio worker.
+    //
+    // What it does: `serde_json::to_vec_pretty` over the whole mapping
+    // artifact plus two more artifacts, then `create_dir_all` + `write` +
+    // `rename` for each — multi-megabyte serialisation followed by blocking
+    // file I/O, three times.
+    //
+    // Why that mattered: the runtime has TWO workers (`main.rs`
+    // `host_cpu_allowance`, cpuset 1-2). A plain synchronous block holds a
+    // worker so it cannot poll ANYTHING else — including the WebSocket read
+    // loops. That is the documented mechanism by which a stall becomes a
+    // dropped socket: the reader stops pumping pongs, the peer closes, and on
+    // reconnect the whole instrument set is re-subscribed cold. An infra
+    // audit measured ten watchdog restarts in 24h, each a simultaneous
+    // 14-socket disconnect.
+    //
+    // `block_in_place` tells tokio the current worker is about to block, so it
+    // migrates the remaining work to another thread and the runtime keeps
+    // making progress. It is the same primitive already used for the
+    // equivalent hazard in `cadence_escalation`, `seal_writer_loop` and the
+    // ILP flush path.
+    //
+    // HONEST LIMIT: `spawn_blocking` would be better still — it would leave
+    // BOTH workers free instead of consuming one and its replacement. It is
+    // not used here because `master`, `index` and `outcome` are borrowed and
+    // `outcome` is still needed by the constituency write below, so
+    // moving them into a `'static` closure means an ownership refactor of
+    // `build_once` (wrapping them in `Arc`s). That is a larger change than
+    // this fix, and doing it badly would risk the correctness of a daily
+    // artifact for a second-order scheduling gain. Recorded rather than
+    // silently settled for.
+    tokio::task::block_in_place(|| {
+        write_mapping_atomic(date, &master, &index, &outcome, observed, mtf)
+    })?;
+
+    // No `instrument_lifecycle` / `instrument_lifecycle_audit` write.
+    //
+    // Owner Quote 44 (2026-10-28): the daily write of both SEBI tables
+    // STOPPED. Nothing on the live path read them (subscriptions, contracts,
+    // candles, ticks and orders come from the artifact files written above),
+    // and the lifecycle table had grown to 18,784,013 rows for 161,886 ids
+    // because every run appended a full copy. Both tables and every row in
+    // them are kept, frozen as history, never deleted. The point-in-time
+    // record from 2026-10-28 on is the dated snapshot of these artifact
+    // files in the cold bucket (`instrument_snapshot_upload`, started by the
+    // rider after this build returns, off the boot critical path). Restarting
+    // a write to either table needs a fresh dated quote first; the guard
+    // `no_production_code_writes_the_frozen_lifecycle_tables` fails the build
+    // otherwise.
     persist_constituents(questdb, date, &outcome).await;
+
+    // Retention does NOT run here any more (2026-10-28, Quote 44 review): it
+    // runs in the snapshot task the rider starts after this build returns,
+    // after a pass that re-checked every marked copy against the cold bucket
+    // (`sweep_artifacts_after_verified_copies`). A marker can outlive its
+    // copy (a bucket-wide delete), and only that task holds a bucket client.
+    // It still runs after every artifact for today has landed: the rider
+    // starts it only after this build succeeded.
+
     Ok(outcome)
+}
+
+/// The retention sweep, run by the snapshot task only after a pass that
+/// re-checked every marked copy against the cold bucket
+/// ([`crate::instrument_snapshot_upload`], `SnapshotPassSummary::sweep_allowed`).
+/// Ordering is the safety property: it runs after today's build succeeded
+/// (the rider starts the task only then), so it can never delete the only
+/// artifact a failed build would have left the lane, and after the re-check,
+/// so a marker whose copy was deleted from the bucket deletes nothing.
+/// `proven` names the files whose copy that pass confirmed itself; a file
+/// outside it is kept whatever its marker says (`sweep_stale_artifacts_in`).
+/// The folder walk runs off the shared worker (`off_worker`).
+// TEST-EXEMPT: thin wrapper (off_worker + counter + log) over
+// `sweep_stale_artifacts_in`, whose behaviour is tested directly; the call
+// site and the held-counter emit are pinned by source in
+// `test_sweep_artifacts_after_verified_copies_counts_the_held_files`.
+pub(crate) fn sweep_artifacts_after_verified_copies(
+    date: &str,
+    proven: &std::collections::BTreeSet<String>,
+) {
+    // Sweep S5: the directory walk runs off the shared tokio worker.
+    let swept = tickvault_storage::off_worker::off_worker(|| sweep_stale_artifacts(date, proven));
+    metrics::counter!(crate::instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER)
+        .increment(swept.held_without_copy as u64);
+    if swept.removed > 0 || swept.failed > 0 || swept.held_without_copy > 0 {
+        info!(
+            removed = swept.removed,
+            bytes = swept.bytes,
+            failed = swept.failed,
+            skipped_unknown = swept.skipped_unknown,
+            held_without_copy = swept.held_without_copy,
+            retention_days = ARTIFACT_RETENTION_DAYS,
+            "stale instrument artifacts swept (a file with no verified S3 copy is kept)"
+        );
+    }
 }
 
 /// Persists the resolved mapping into the SEBI `index_constituency` table.
@@ -513,6 +1356,12 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
 /// persistent failure means the SEBI point-in-time history is developing a
 /// hole, which is worth waking someone for — just not worth discarding good
 /// work over.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of QDB-2).** "The row lands then" is
+/// false: each row is stamped with its own trading date, so tomorrow's write
+/// lands tomorrow's row and today's stays missing. What narrows the hole is
+/// the writer's 10 s retry on a transport failure or a 5xx answer
+/// (`sebi_master_ilp_http_conf`); a failure past that is a missing day.
 async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &JoinOutcome) {
     if outcome.resolved.is_empty() {
         // Unreachable while the tolerance gate stands (an empty join reports
@@ -536,6 +1385,8 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
         .await
     {
         error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "rider_constituency_gate_closed",
             timeout_secs = MIGRATION_GATE_WAIT_SECS,
             "index_constituency migration gate did not open — SKIPPING the persist rather than \
              writing rows a later TRUNCATE would erase"
@@ -595,16 +1446,23 @@ async fn persist_constituents(questdb: &QuestDbConfig, date: &str, outcome: &Joi
             )
             .await;
         }
-        Err(err) => error!(
-            rows = rows.len(),
-            date,
-            error = %err,
-            "index_constituency persist FAILED — the mapping file is still correct on disk and \
-             tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing. \
-             The rebalance-expiry pass is deliberately SKIPPED: a failed write is \
-             indistinguishable from every constituent being dropped, so running it here \
-             would expire the live universe"
-        ),
+        Err(err) => {
+            metrics::counter!("tv_index_constituency_persist_failed_total").increment(1);
+            // Audit OBS-2 (2026-10-11): STORAGE-GAP-03, not WS-GAP-03.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::StorageGap03AuditWriteFailed
+                    .code_str(),
+                source = "rider_constituency_persist_failed",
+                rows = rows.len(),
+                date,
+                error = %err,
+                "index_constituency persist FAILED — the mapping file is still correct on disk and \
+                 tomorrow's write is DEDUP-idempotent, but today's point-in-time row is missing. \
+                 The rebalance-expiry pass is deliberately SKIPPED: a failed write is \
+                 indistinguishable from every constituent being dropped, so running it here \
+                 would expire the live universe"
+            );
+        }
     }
 }
 
@@ -634,7 +1492,32 @@ fn write_mapping_atomic(
     master: &[tickvault_core::instrument::master_csv::MasterRow],
     index: &tickvault_core::instrument::master_csv::IsinIndex,
     outcome: &JoinOutcome,
+    observed: chrono::DateTime<chrono::Utc>,
+    mtf: Option<DailyMtfTerms>,
 ) -> anyhow::Result<()> {
+    let _lock = write_broad_mapping(
+        std::path::Path::new(MAPPING_DIR),
+        date,
+        master,
+        index,
+        outcome,
+        observed,
+        mtf,
+    )?;
+    write_narrowed_spot_artifacts(date, master, outcome);
+    Ok(())
+}
+
+/// Keep the dated writer lock until its caller has also written the narrowed sets.
+fn write_broad_mapping(
+    dir: &std::path::Path,
+    date: &str,
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    index: &tickvault_core::instrument::master_csv::IsinIndex,
+    outcome: &JoinOutcome,
+    observed: chrono::DateTime<chrono::Utc>,
+    mtf: Option<DailyMtfTerms>,
+) -> anyhow::Result<std::fs::File> {
     // Path-traversal guard BEFORE the filename is built (§18 row 4). The date
     // is derived internally, but a validated input is validated regardless of
     // where it came from — that is what makes it a guard rather than a habit.
@@ -642,8 +1525,23 @@ fn write_mapping_atomic(
         date.len() == 10 && date.bytes().all(|b| b.is_ascii_digit() || b == b'-'),
         "refusing to write a mapping for a malformed date {date:?}"
     );
+    std::fs::create_dir_all(dir)?;
+    // Concurrent refreshes must merge receipts from the last committed file.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".dhan-nse-mapping.lock"))?;
+    lock.lock()?;
+    let path = mapping_artifact_in(dir, date);
+    let at = observed
+        .timestamp()
+        .saturating_add(i64::from(observed.timestamp_subsec_nanos() > 0));
+    let mtf = mtf_history::ReceiptState::refresh(&path, date, at, mtf)?;
     let artifact = MappingArtifact {
         trading_date_ist: date.to_string(),
+        mtf,
         master_rows: master.len(),
         isin_index_len: index.len(),
         ambiguous_isins: index.ambiguous.len(),
@@ -651,6 +1549,9 @@ fn write_mapping_atomic(
         resolved: outcome.resolved.len(),
         unresolved: outcome.unresolved.len(),
         unresolved_fraction: outcome.unresolved_fraction(),
+        // Filled below, once the NSE index entries have been appended: the
+        // count must cover the WHOLE mappings array, not just the join half.
+        distinct_instruments: 0,
         unresolved_detail: outcome
             .unresolved
             .iter()
@@ -676,18 +1577,252 @@ fn write_mapping_atomic(
             })
             .collect(),
     };
-    std::fs::create_dir_all(MAPPING_DIR)?;
-    let path = mapping_artifact_path(date);
+    // The indices go in AFTER the constituents so the join's own output is
+    // never reordered by this addition — a diff between two days stays a diff
+    // about the market, not about where a block was spliced.
+    let mut artifact = artifact;
+    let indices = nse_index_mappings(master);
+    let index_count = indices.len();
+    artifact.mappings.extend(indices);
+    artifact.distinct_instruments = distinct_instrument_count(&artifact.mappings);
+    metrics::gauge!(DISTINCT_INSTRUMENTS_GAUGE).set(artifact.distinct_instruments as f64);
+    use tickvault_common::operator_movers_universe::MAX_DAILY_MAPPING_BYTES;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&artifact)?)?;
+    let bytes = artifact.encode(MAX_DAILY_MAPPING_BYTES)?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &path)?;
     info!(
         path = %path.display(),
         resolved = artifact.resolved,
         unresolved = artifact.unresolved,
+        nse_indices = index_count,
+        mappings = artifact.mappings.len(),
+        distinct_instruments = artifact.distinct_instruments,
         "instrument mapping written"
     );
-    Ok(())
+
+    Ok(lock)
+}
+
+/// The two narrowed spot artifacts (F&O underlyings, NTM), each on its own
+/// terms and neither able to fail the caller.
+///
+/// Called after the full mapping, and ALSO by the index-list reject in
+/// `build_once` (audit D3c-1): neither artifact depends on the lists that
+/// failed. The F&O set is the master alone; the NTM set is the master plus the
+/// Nifty Total Market list, and a failed NTM list resolves zero NTM rows, which
+/// the zero-constituent refusal below already turns into "not written". So a
+/// day that loses five unrelated lists no longer loses the lists the live lane
+/// actually boots on.
+///
+/// O(master + outcome), once per build attempt, cold path.
+fn write_narrowed_spot_artifacts(
+    date: &str,
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    outcome: &JoinOutcome,
+) {
+    // The F&O underlying set, written AFTER the mapping artifact has landed
+    // and deliberately NOT allowed to fail this function.
+    //
+    // Ordering is the point: the mapping artifact is what the live lane blocks
+    // on at boot. If deriving or writing the F&O file went wrong, returning
+    // `Err` here would report the whole build as failed when the artifact the
+    // lane actually needs is already on disk and correct -- trading a real
+    // outage for a cosmetic one.
+    //
+    // The consumer treats an absent file as "narrowing was requested and is
+    // NOT in effect" and falls back loudly, so a miss here degrades to today's
+    // behaviour rather than to a silently narrower universe. That is the
+    // safe direction: too many instruments is a capacity error the lane
+    // reports; too few is a coverage hole nothing reports.
+    let narrowed = narrowed_spot_mappings(master);
+    let fno_count = narrowed
+        .iter()
+        .filter(|e| e.index_name == FNO_UNDERLYING_TAG)
+        .count();
+    let index_count_narrowed = narrowed.len() - fno_count;
+    match write_fno_underlying_artifact(date, narrowed) {
+        Ok(fno_path) => info!(
+            path = %fno_path.display(),
+            fno_underlyings = fno_count,
+            nse_indices = index_count_narrowed,
+            "F&O underlying set written"
+        ),
+        Err(e) => error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            error = %e,
+            fno_underlyings = fno_count,
+            "F&O underlying artifact could not be written — a narrowed-universe \
+             boot will fall back to the master-sourced spot set and say so"
+        ),
+    }
+
+    // The NTM spot set (NSE indices + Nifty Total Market), written on the same
+    // terms as the F&O one directly above and for the same reasons: AFTER the
+    // mapping artifact the live lane blocks on, and never able to fail this
+    // function. A miss here degrades to today's behaviour — the wider set —
+    // not to a silently narrower universe.
+    let ntm = ntm_spot_mappings(master, outcome);
+    let ntm_constituents = ntm
+        .iter()
+        .filter(|e| e.index_name == NTM_INDEX_NAME)
+        .count();
+    let ntm_indices = ntm.len() - ntm_constituents;
+    if ntm_constituents == 0 {
+        // Counted as an ERROR, not a warning, and deliberately not fatal.
+        // Writing the file anyway would hand the reader an indices-only set
+        // that looks like a successful narrowing; refusing to write it makes
+        // the consumer fall THROUGH to the full master and say so, which is
+        // the direction that never loses coverage silently.
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            date,
+            list = NTM_INDEX_NAME,
+            "the Nifty Total Market list resolved ZERO constituents — the NTM spot artifact \
+             was NOT written, so an NTM-narrowed boot falls through to the full \
+             master-sourced set. Indices alone would have looked like a successful narrowing."
+        );
+    } else {
+        match write_spot_artifact(ntm_spot_artifact_path(date), ntm) {
+            Ok(p) => info!(
+                path = %p.display(),
+                ntm_constituents,
+                nse_indices = ntm_indices,
+                "NTM spot set written"
+            ),
+            Err(e) => error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                error = %e,
+                ntm_constituents,
+                "NTM spot artifact could not be written — an NTM-narrowed boot will fall \
+                 back to the master-sourced spot set and say so"
+            ),
+        }
+    }
+}
+
+/// The NTM spot universe: NSE indices PLUS the Nifty Total Market constituents.
+///
+/// # Why this exists as its own function (operator, 2026-08-22)
+///
+/// Every one of the ~750 Nifty Total Market rows was ALREADY being resolved —
+/// `build_once` downloads `ind_niftytotalmarket_list` with the other 48 lists
+/// and `join_constituents` matches each row to the Dhan master by ISIN. What
+/// did not exist was anything that took THAT list back out: the join's dedup
+/// key is `(index_name, security_id, segment)`, scoped per list, so the
+/// artifact carries the UNION of all 49 and the live selector dedupes it to
+/// ~4,565 SIDs. The operator asked for one list and got the pile.
+///
+/// So this is a SELECTION, not a new fetch: no extra download, no second
+/// parser, no new failure mode on the network path.
+///
+/// # Why the indices half is not optional
+///
+/// Same argument as `narrowed_spot_mappings`, and it is not theoretical:
+/// `select_live_universe` REPLACES the four hardcoded index seeds with the
+/// artifact's `IDX_I` rows and leaves the seeds standing only when there are
+/// none. An artifact of constituents alone would therefore ship 4 indices
+/// instead of ~119 while every log line still read "widened".
+///
+/// # What it deliberately does NOT do
+/// - It does not fall back to a different list when NTM resolves to nothing.
+///   An empty NTM half means the vendor served us something wrong, and
+///   substituting Nifty 500 would answer a different question than the one
+///   asked while looking identical downstream. The caller counts and reports
+///   it; `resolve_live_universe` falls THROUGH to the full master.
+/// - It does not re-filter by exchange. Every resolved constituent is NSE
+///   cash equity by construction (`build_isin_index` indexes only that
+///   subset), and every index row comes from `nse_index_mappings`, which
+///   filters `exch_id == "NSE"` itself. Stated here rather than assumed,
+///   because "skip BSE" is an operator lock and a reader must be able to see
+///   where it holds.
+///
+/// # Complexity
+///
+/// O(indices + resolved constituents) — one pass over the master for the
+/// index half and one pass over the join's output for the other, with a
+/// string equality per row. Cold path, once per day, off the tick path.
+fn ntm_spot_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    outcome: &JoinOutcome,
+) -> Vec<MappingEntry> {
+    let mut out = nse_index_mappings(master);
+    for r in &outcome.resolved {
+        if r.index_name != NTM_INDEX_NAME {
+            continue;
+        }
+        out.push(MappingEntry {
+            index_name: r.index_name.clone(),
+            symbol: r.symbol.clone(),
+            isin: r.isin.clone(),
+            security_id: r.security_id,
+            // `binary_code()`, never `as u8`: Dhan's wire codes have a gap at
+            // 6, so declaration order and wire value diverge above it. Same
+            // reasoning as the mapping artifact's own write.
+            exchange_segment: r.exchange_segment.binary_code(),
+        });
+    }
+    out
+}
+/// The NARROWED spot universe: NSE indices PLUS the F&O stock underlyings.
+///
+/// The indices half is not optional and is the reason this function exists
+/// rather than the write site calling `fno_underlying_mappings` directly.
+/// `select_live_universe` REPLACES the hardcoded index seeds with the
+/// artifact's index rows and leaves the seeds standing when there are none —
+/// so an artifact carrying only underlyings would have produced 4 indices
+/// instead of ~119, silently, while every log line still read "widened".
+/// Composing both halves in ONE named function is what makes that a testable
+/// claim instead of an assumption about a call site.
+///
+/// Indices go FIRST: the file's whole point is "indices + underlyings", and a
+/// reader opening it should meet the anchor set at the top.
+fn narrowed_spot_mappings(
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+) -> Vec<MappingEntry> {
+    let mut out = nse_index_mappings(master);
+    out.extend(fno_underlying_mappings(master));
+    out
+}
+
+/// Serialise the NARROWED SPOT SET — NSE indices plus the F&O stock
+/// underlyings — atomically (tmp then rename), so a reader
+/// never observes a half-written file. Same shape as the mapping artifact's
+/// own write for exactly that reason.
+fn write_fno_underlying_artifact(
+    date: &str,
+    entries: Vec<MappingEntry>,
+) -> std::io::Result<std::path::PathBuf> {
+    write_spot_artifact(fno_underlying_artifact_path(date), entries)
+}
+
+/// Serialise ONE narrowed spot set atomically (tmp then rename) to `path`.
+///
+/// One function for both narrowed sets rather than two near-identical writers.
+/// The duplication it removes is not cosmetic: the tmp-then-rename is the only
+/// thing stopping a reader from parsing a half-written file, and a second copy
+/// is a second place for that to be got subtly wrong — the exact shape of bug
+/// this file has already recorded twice for duplicated filenames.
+///
+/// The envelope stays [`FnoUnderlyingArtifact`] for both, deliberately: the
+/// consumer is `parse_mapping_artifact`, which reads `mappings` and nothing
+/// else, so a second envelope type would add a second parser for an identical
+/// payload. The type name now under-describes what it carries; renaming it
+/// would touch the F&O artifact's on-disk shape, which is a separate change.
+fn write_spot_artifact(
+    path: std::path::PathBuf,
+    entries: Vec<MappingEntry>,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(MAPPING_DIR)?;
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec_pretty(&FnoUnderlyingArtifact {
+        count: entries.len(),
+        mappings: entries,
+    })
+    .map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
 }
 
 /// Spawns the SUPERVISED daily rider.
@@ -711,6 +1846,11 @@ fn write_mapping_atomic(
 /// Honest limit: release builds use `panic = "abort"`, so the respawn arm is
 /// reachable only in unwind builds. The counter is what makes a panic loop
 /// visible in production, where the process dies instead.
+///
+/// `snapshot_bucket` is the configured cold bucket for the daily instrument
+/// snapshot copy (owner Quote 44): `[partition_retention] archive_bucket`, the
+/// same value the raw-frame uploader uses, so every cold copy lands in one
+/// bucket. Empty means `tv-<env>-cold` from the runtime environment.
 #[must_use]
 // TEST-EXEMPT: tokio supervisor wiring over an infinite daily control-plane loop driving live
 // network + QuestDB I/O. The pure primitives it composes (`next_wait`, `ist_secs_of_day`,
@@ -718,6 +1858,7 @@ fn write_mapping_atomic(
 pub fn spawn_dhan_universe_rider(
     config: DhanUniverseConfig,
     questdb: QuestDbConfig,
+    snapshot_bucket: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if !config.enabled {
@@ -730,8 +1871,13 @@ pub fn spawn_dhan_universe_rider(
         metrics::counter!(RESPAWN_COUNTER, "reason" => "panic").increment(0);
         metrics::counter!(BUILD_COUNTER, "outcome" => "ok").increment(0);
         metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(0);
+        crate::instrument_snapshot_upload::register_snapshot_metrics();
         loop {
-            let inner = tokio::spawn(run_dhan_universe_rider(config.clone(), questdb.clone()));
+            let inner = tokio::spawn(run_dhan_universe_rider(
+                config.clone(),
+                questdb.clone(),
+                snapshot_bucket.clone(),
+            ));
             let result = inner.await;
             if let Err(join_err) = &result
                 && join_err.is_cancelled()
@@ -742,6 +1888,8 @@ pub fn spawn_dhan_universe_rider(
             let reason = tickvault_storage::disk_health_watcher::classify_join_exit(&result);
             metrics::counter!(RESPAWN_COUNTER, "reason" => reason).increment(1);
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "rider_task_died",
                 reason,
                 backoff_secs = RESPAWN_BACKOFF_SECS,
                 "[dhan_universe] daily rider task DIED — respawning. Until this respawn \
@@ -753,7 +1901,11 @@ pub fn spawn_dhan_universe_rider(
 }
 
 /// The rider loop body (supervised above): one build per IST day, forever.
-async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbConfig) {
+async fn run_dhan_universe_rider(
+    config: DhanUniverseConfig,
+    questdb: QuestDbConfig,
+    snapshot_bucket: String,
+) {
     {
         info!(
             target_secs_of_day_ist = config.target_secs_of_day_ist,
@@ -807,6 +1959,17 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                         unresolved_fraction = outcome.unresolved_fraction(),
                         "[dhan_universe] daily build COMPLETE"
                     );
+                    // Owner Quote 44 (2026-10-28): copy today's dated artifact
+                    // files (and any earlier date still missing) to the cold
+                    // bucket, verified. Its own task, after the build: the
+                    // live lane already has its mapping artifact, so nothing
+                    // here can delay it. A running pass is not doubled; it runs once more.
+                    // The retention sweep runs in that task, after the pass
+                    // re-checked every marked copy against the bucket.
+                    drop(crate::instrument_snapshot_upload::spawn_snapshot_upload(
+                        snapshot_bucket.clone(),
+                        today.clone(),
+                    ));
                 }
                 Err(err) => {
                     metrics::counter!(BUILD_COUNTER, "outcome" => "failed").increment(1);
@@ -822,8 +1985,16 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
                         warn!(date = %today, attempt, backoff_secs = backoff, error = %err,
                               "[dhan_universe] build failed — retrying");
                     } else {
-                        error!(date = %today, attempt, backoff_secs = backoff, error = %err,
-                               "[dhan_universe] build STILL failing — the day has no mapping yet");
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState
+                                .code_str(),
+                            source = "rider_build_still_failing",
+                            date = %today,
+                            attempt,
+                            backoff_secs = backoff,
+                            error = %err,
+                            "[dhan_universe] build STILL failing — the day has no full mapping yet"
+                        );
                     }
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                 }
@@ -833,8 +2004,1011 @@ async fn run_dhan_universe_rider(config: DhanUniverseConfig, questdb: QuestDbCon
 }
 
 #[cfg(test)]
+mod constituent_bound_tests {
+    use super::{
+        INDEX_CONSTITUENCY_SLUGS, MAX_CONSTITUENTS_PER_LIST, MAX_CONSTITUENTS_TOTAL,
+        MAX_FAILED_INDEX_LIST_FRACTION, failed_list_fraction,
+    };
+
+    /// The per-list ceiling must clear the largest REAL list by a wide margin,
+    /// or a legitimate vendor response would start failing builds.
+    #[test]
+    fn max_constituents_per_list_is_far_above_the_broadest_real_index() {
+        // Nifty Total Market, the broadest NSE index, is ~750 constituents and
+        // every other list is a subset of its membership.
+        const BROADEST_REAL_LIST: usize = 750;
+        assert!(
+            MAX_CONSTITUENTS_PER_LIST >= BROADEST_REAL_LIST * 5,
+            "the ceiling must be unreachable by a legitimate response, or it \
+             becomes a source of false build failures rather than a memory bound"
+        );
+        assert_eq!(MAX_CONSTITUENTS_PER_LIST, 5_000);
+    }
+
+    /// The total must be the per-list bound made total, with headroom for the
+    /// slug set to grow — not an independently invented number.
+    #[test]
+    fn max_constituents_total_covers_every_slug_at_the_per_list_ceiling() {
+        let implied = INDEX_CONSTITUENCY_SLUGS.len() * MAX_CONSTITUENTS_PER_LIST;
+        assert!(
+            MAX_CONSTITUENTS_TOTAL >= implied,
+            "the total ceiling ({MAX_CONSTITUENTS_TOTAL}) must not be below what the \
+             per-list ceiling already permits across {} slugs ({implied}), or the \
+             total would reject builds the per-list rule considers legal",
+            INDEX_CONSTITUENCY_SLUGS.len()
+        );
+    }
+
+    /// The bound is a BYTE bound in effect, which is the property the previous
+    /// count-free version lacked. ~168 B per `Constituent` (three owned
+    /// `String`s plus the struct).
+    #[test]
+    fn the_total_ceiling_bounds_accumulation_in_bytes_not_just_rows() {
+        const BYTES_PER_CONSTITUENT: usize = 168;
+        let worst_case_bytes = MAX_CONSTITUENTS_TOTAL * BYTES_PER_CONSTITUENT;
+        assert!(
+            worst_case_bytes < 128 * 1024 * 1024,
+            "worst-case accumulation is {worst_case_bytes} bytes; it must stay far \
+             below the host's memory so a malformed vendor response cannot OOM the \
+             process — an OOM drops every WebSocket at once"
+        );
+    }
+
+    /// An over-cap list must be REFUSED (counted as failed), never truncated —
+    /// and the refusal must flow into the gate that already judges missing
+    /// membership. This pins the routing, which is the load-bearing half: a
+    /// truncated list would join cleanly and report a healthy day.
+    #[test]
+    fn refusing_lists_feeds_the_existing_failed_fraction_gate() {
+        let total = INDEX_CONSTITUENCY_SLUGS.len();
+        // A single refused list is tolerated — one malformed index must not
+        // lose the other 48.
+        assert!(
+            failed_list_fraction(1, total) <= MAX_FAILED_INDEX_LIST_FRACTION,
+            "one refused list out of {total} must degrade the build, not abort it"
+        );
+        // Refusing most of them must NOT pass: that is a build carrying a
+        // fraction of the intended membership.
+        assert!(
+            failed_list_fraction(total, total) > MAX_FAILED_INDEX_LIST_FRACTION,
+            "every list refused must reject the build outright — shipping it would \
+             report a healthy day with almost no membership"
+        );
+    }
+}
+
+#[cfg(test)]
+/// Feed the real dated writer the same parsed master and constituent join
+/// that it receives from its network inputs, in the supplied artifact directory.
+pub(crate) fn write_mtf_mapping_fixture(
+    dir: &std::path::Path,
+    observed_rfc3339: &str,
+    last_modified: Option<&str>,
+    multiplier: &str,
+) -> std::path::PathBuf {
+    use tickvault_core::instrument::master_csv::{Constituent, MIN_PLAUSIBLE_MASTER_ROWS};
+    let mut csv =
+        String::from("SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES,INSTRUMENT,MTF_LEVERAGE");
+    let mut constituents = Vec::new();
+    for (n, leverage) in ["1.0", multiplier, "0", ""].into_iter().enumerate() {
+        let id = n + 1;
+        csv.push_str(&format!(
+            "\n{id},INE{id:09},S{id},NSE,E,EQ,EQUITY,{leverage}"
+        ));
+        constituents.push(Constituent {
+            index_name: "Nifty 50".into(),
+            symbol: format!("S{id}"),
+            isin: format!("INE{id:09}"),
+        });
+    }
+    for n in 5..=MIN_PLAUSIBLE_MASTER_ROWS {
+        csv.push_str(&format!("\n{n},INE{n:09},S{n},NSE,E,EQ,EQUITY,"));
+    }
+    let detailed = parse_detailed_master(&csv).unwrap();
+    let observed = chrono::DateTime::parse_from_rfc3339(observed_rfc3339)
+        .unwrap()
+        .to_utc();
+    let mtf = DailyMtfTerms::for_date(
+        "2026-11-06",
+        observed,
+        last_modified,
+        detailed.mtf_leverage_by_security_id,
+    );
+    let index = build_isin_index(&detailed.rows);
+    let outcome = join_constituents(&constituents, &index);
+    write_broad_mapping(
+        dir,
+        "2026-11-06",
+        &detailed.rows,
+        &index,
+        &outcome,
+        observed,
+        mtf,
+    )
+    .unwrap();
+    mapping_artifact_in(dir, "2026-11-06")
+}
+
+#[cfg(test)]
 mod tests {
+
+    #[test]
+    fn daily_mtf_terms_require_observed_same_day_publication_and_serialize_known_zero() {
+        let observed = "2026-11-25T01:00:00.500Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let publish = |date, modified| {
+            super::DailyMtfTerms::for_date(date, observed, modified, [(1, 1.0), (2, 0.0)].into())
+        };
+        // The HTTP timestamp is UTC. The publisher and observer were both
+        // on Nov 25 in IST, on opposite sides of UTC midnight.
+        let modified = Some("Tue, 24 Nov 2026 21:00:00 GMT");
+        let recorded = serde_json::to_value(publish("2026-11-25", modified).unwrap()).unwrap();
+        assert_eq!(recorded["mtf_leverage_by_security_id"]["1"], 1.0);
+        assert_eq!(recorded["mtf_leverage_by_security_id"]["2"], 0.0);
+        assert_eq!(
+            recorded["mtf_observed_at_epoch_secs"],
+            observed.timestamp() + 1
+        );
+        assert_eq!(
+            recorded["mtf_source_modified_at_epoch_secs"],
+            observed.timestamp() - 4 * 3600
+        );
+        for header in [
+            None,
+            Some("invalid"),
+            Some("Tue, 24 Nov 2026 18:00:00 GMT"),
+            Some("Wed, 25 Nov 2026 01:00:01 GMT"),
+        ] {
+            assert!(publish("2026-11-25", header).is_none());
+        }
+        assert!(publish("2026-11-24", modified).is_none());
+        assert!(
+            super::DailyMtfTerms::for_date("2026-11-25", observed, modified, Default::default())
+                .is_none()
+        );
+        let whole_second = chrono::DateTime::from_timestamp(observed.timestamp(), 0).unwrap();
+        let exact =
+            super::DailyMtfTerms::for_date("2026-11-25", whole_second, modified, [(1, 1.0)].into())
+                .unwrap();
+        assert_eq!(exact.mtf_observed_at_epoch_secs, whole_second.timestamp());
+    }
+
+    // Audit OBS-2 (2026-10-11): failed writes to the SEBI lifecycle and
+    // constituency tables were coded WS-GAP-03 (a socket state), the lifecycle
+    // arm carried no `source`, and neither had a failure counter.
+    #[test]
+    fn test_lifecycle_and_constituency_persist_failures_are_coded_storage_gap_03() {
+        let src = include_str!("dhan_universe.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        let main_src = include_str!("main.rs");
+        // Owner Quote 44 (2026-10-28): the lifecycle write and its failure arm
+        // are gone with the writer; neither the source nor the counter may
+        // come back without a fresh dated quote.
+        for gone in [
+            "lifecycle_persist_failed",
+            "tv_instrument_lifecycle_persist_failed_total",
+            "tv_instrument_lifecycle_audit_failed_total",
+        ] {
+            assert!(!prod.contains(gone), "{gone} left with the writer");
+            assert!(
+                !main_src.contains(gone),
+                "{gone} must not be seeded for a writer that no longer exists"
+            );
+        }
+        let (source, counter) = (
+            "source = \"rider_constituency_persist_failed\"",
+            "tv_index_constituency_persist_failed_total",
+        );
+        {
+            let at = prod
+                .find(source)
+                .unwrap_or_else(|| panic!("{source} must exist"));
+            let start = prod[..at].rfind("Err(err) => {").expect("an Err arm");
+            let end = at + prod[at..].find("\n        }\n").expect("the arm ends");
+            let arm = &prod[start..end];
+            assert!(arm.contains("StorageGap03AuditWriteFailed"), "{arm}");
+            assert!(!arm.contains("WsGapConnectionState"), "{arm}");
+            assert!(
+                arm.contains(&format!("counter!(\"{counter}\").increment(1)")),
+                "{arm}"
+            );
+            // Seeded at boot after the recorder install (review of OBS-2,
+            // 2026-10-11): a seed milliseconds before the write that may fail
+            // is a series no scrape ever sees at 0.
+            assert!(
+                main_src.contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must be seeded at 0 at boot"
+            );
+            assert!(
+                !prod.contains(&format!("counter!(\"{counter}\").increment(0)")),
+                "{counter} must not be seeded right before its write"
+            );
+        }
+    }
+
+    // ---- F&O stock underlying derivation (operator 2026-08-21) ----
+
+    fn mrow(
+        id: u64,
+        sym: &str,
+        class: tickvault_core::instrument::master_csv::InstrumentClass,
+        underlying: &str,
+        series: &str,
+        exch: &str,
+    ) -> tickvault_core::instrument::master_csv::MasterRow {
+        tickvault_core::instrument::master_csv::MasterRow {
+            security_id: id,
+            isin: String::new(),
+            symbol_name: sym.to_owned(),
+            exch_id: exch.to_owned(),
+            segment: String::new(),
+            series: series.to_owned(),
+            class,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
+            underlying_symbol: underlying.to_owned(),
+            lot_size: 0,
+        }
+    }
+
+    #[test]
+    fn the_narrowed_spot_set_carries_the_indices_and_not_only_the_underlyings() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            mrow(13, "NIFTY 50", InstrumentClass::Index, "", "", "NSE"),
+            mrow(25, "NIFTY BANK", InstrumentClass::Index, "", "", "NSE"),
+            mrow(500, "RELIANCE", InstrumentClass::Equity, "", "EQ", "NSE"),
+            mrow(
+                900,
+                "RELIANCE28AUGFUT",
+                InstrumentClass::StockFuture,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+        ];
+
+        let out = narrowed_spot_mappings(&master);
+
+        // The defect this test exists for: an artifact of underlyings ALONE
+        // leaves `select_live_universe` standing on the 4 hardcoded seeds,
+        // so ~115 NSE indices vanish while the log still says "widened".
+        let indices: Vec<u64> = out
+            .iter()
+            .filter(|m| {
+                m.exchange_segment == tickvault_common::types::ExchangeSegment::IdxI.binary_code()
+            })
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(
+            indices,
+            vec![13, 25],
+            "every NSE index must be in the narrowed set — it is half of what the operator named"
+        );
+
+        let underlyings: Vec<u64> = out
+            .iter()
+            .filter(|m| m.index_name == FNO_UNDERLYING_TAG)
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(underlyings, vec![500], "and the F&O underlying half too");
+
+        assert_eq!(out.len(), 3, "indices + underlyings, nothing else");
+    }
+
+    #[test]
+    fn a_master_with_no_indices_narrows_to_the_underlyings_without_inventing_any() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            mrow(500, "RELIANCE", InstrumentClass::Equity, "", "EQ", "NSE"),
+            mrow(
+                900,
+                "RELIANCE28AUGFUT",
+                InstrumentClass::StockFuture,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+        ];
+        let out = narrowed_spot_mappings(&master);
+        assert_eq!(out.len(), 1, "no index rows are fabricated to fill a gap");
+        assert_eq!(out[0].security_id, 500);
+    }
+
+    #[test]
+    fn fno_underlying_artifact_path_is_date_stamped_and_never_collides_with_the_mapping_file() {
+        let a = fno_underlying_artifact_path("2026-08-21");
+        let b = fno_underlying_artifact_path("2026-08-22");
+        assert_ne!(
+            a, b,
+            "the filename must carry the date — one shared name would let a \
+             stale day's set be read as today's"
+        );
+        assert!(
+            a.to_string_lossy().contains("2026-08-21"),
+            "the date must appear verbatim so an operator can find the file"
+        );
+        assert_ne!(
+            a,
+            mapping_artifact_path("2026-08-21"),
+            "must NOT collide with the mapping artifact: one overwriting the \
+             other would feed the live lane the wrong universe entirely"
+        );
+        assert_eq!(
+            a.parent(),
+            mapping_artifact_path("2026-08-21").parent(),
+            "same directory, so the one retention sweep covers both"
+        );
+    }
+
+    /// The sweep publishes every artifact it KEPT for lack of a verified copy
+    /// on the held counter (Quote 44): without it a broken copy would only
+    /// grow the folder, with no number anywhere saying so. Since the 2026-10-28
+    /// review the sweep runs in the snapshot task after a pass that re-checked
+    /// every marked copy against the bucket, never inside `build_once`.
+    #[test]
+    fn test_sweep_artifacts_after_verified_copies_counts_the_held_files() {
+        let src = include_str!("dhan_universe.rs");
+        let prod = src
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        let build_at = prod
+            .find("async fn build_once(")
+            .expect("`build_once` must exist");
+        let build_end = build_at
+            + prod[build_at..]
+                // The escape is a closing brace, written escaped so the braces on
+                // this line stay balanced for the banned-pattern scanner's
+                // test-module tracking.
+                .find("\n\u{7d}\n")
+                .expect("`build_once` body must close");
+        assert!(
+            !prod[build_at..build_end].contains("sweep_stale_artifacts("),
+            "`build_once` must not sweep: it holds no bucket client to re-check a \
+             marker against, so a marker whose copy was deleted would let it delete \
+             the only remaining file"
+        );
+        let fn_at = prod
+            .find("pub(crate) fn sweep_artifacts_after_verified_copies(")
+            .expect("the sweep wrapper must exist");
+        let wrapper = &prod[fn_at..];
+        let sweep_at = wrapper
+            .find("sweep_stale_artifacts(date, proven)")
+            .expect("the wrapper must run the sweep");
+        let after = &wrapper[sweep_at..];
+        let held_at = after
+            .find("instrument_snapshot_upload::SNAPSHOT_SWEEP_HELD_COUNTER")
+            .expect("the held counter must be bumped after the sweep");
+        assert!(
+            after[held_at..].contains(".increment(swept.held_without_copy as u64)"),
+            "the held counter must carry the sweep's held count"
+        );
+    }
+
+    /// `sweepable_artifact_date` is shared with the snapshot upload (Quote
+    /// 44): the sweep accepts the `.json.tmp` leftover, the snapshot does not.
+    #[test]
+    fn test_sweepable_artifact_date_takes_the_tmp_leftover_the_snapshot_skips() {
+        let tmp = "dhan-contracts-2026-10-28.json.tmp";
+        assert_eq!(sweepable_artifact_date(tmp), Some("2026-10-28"));
+        assert_eq!(
+            crate::instrument_snapshot_upload::snapshot_artifact_date(tmp),
+            None
+        );
+        let json = "dhan-contracts-2026-10-28.json";
+        assert_eq!(sweepable_artifact_date(json), Some("2026-10-28"));
+        assert_eq!(
+            crate::instrument_snapshot_upload::snapshot_artifact_date(json),
+            Some("2026-10-28")
+        );
+    }
+
+    #[test]
+    fn only_the_four_known_artifact_names_are_ever_sweepable() {
+        // The safety property. A `*.json` glob would delete whatever a future
+        // change puts in this directory, silently, on an unattended daily path.
+        assert_eq!(
+            sweepable_artifact_date("dhan-nse-mapping-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-contracts-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-fno-underlyings-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        assert_eq!(
+            sweepable_artifact_date("dhan-ntm-spot-2026-08-21.json"),
+            Some("2026-08-21")
+        );
+        // A crash between write and rename leaves this beside the real file
+        // forever. Same artifact, another name.
+        assert_eq!(
+            sweepable_artifact_date("dhan-contracts-2026-08-21.json.tmp"),
+            Some("2026-08-21"),
+            "the .tmp leftover is the same artifact and must be sweepable"
+        );
+        // Everything this sweep does not KNOW, it must not touch.
+        for foreign in [
+            "plan-snapshot-2026-08-21.json",
+            "token-cache.json",
+            "notes.txt",
+            "dhan-nse-mapping.json",
+            "2026-08-21.json",
+            "",
+        ] {
+            assert_eq!(
+                sweepable_artifact_date(foreign),
+                None,
+                "{foreign} is not a known artifact and must never be deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filename_whose_date_is_not_a_real_shape_is_kept_not_guessed_at() {
+        // Lexical comparison is only a date comparison for a fixed-width
+        // zero-padded ISO date. A name that does not have that shape cannot be
+        // compared, so it is kept -- never removed on a guess.
+        for bad in [
+            "dhan-contracts-2026-8-21.json",   // not zero-padded
+            "dhan-contracts-2026_08_21.json",  // wrong separator
+            "dhan-contracts-20260821.json",    // no separators
+            "dhan-contracts-2026-08-2a.json",  // non-digit
+            "dhan-contracts-2026-08-211.json", // too long
+            "dhan-contracts-.json",            // empty
+        ] {
+            assert_eq!(
+                sweepable_artifact_date(bad),
+                None,
+                "{bad} has no parseable date and must be kept"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cutoff_keeps_today_and_the_retention_window_and_drops_what_precedes_it() {
+        let cutoff = artifact_retention_cutoff("2026-08-21").expect("a real date parses");
+        assert_eq!(
+            cutoff, "2026-08-14",
+            "seven days back from the 21st, month arithmetic included"
+        );
+        // Today is always kept: the lane reads it THIS session.
+        assert!("2026-08-21" >= cutoff.as_str());
+        // The oldest kept day is the cutoff itself.
+        assert!("2026-08-14" >= cutoff.as_str());
+        // One day older goes.
+        assert!("2026-08-13" < cutoff.as_str());
+        // Month and year boundaries, where naive string arithmetic breaks.
+        assert_eq!(
+            artifact_retention_cutoff("2026-01-03").as_deref(),
+            Some("2025-12-27"),
+            "crossing a year boundary must not produce a same-year date"
+        );
+        assert_eq!(
+            artifact_retention_cutoff("2026-03-03").as_deref(),
+            Some("2026-02-24"),
+            "crossing February must use real calendar arithmetic"
+        );
+        assert_eq!(
+            artifact_retention_cutoff("not-a-date"),
+            None,
+            "an unparseable date must yield NO cutoff, so the sweep deletes nothing"
+        );
+    }
+
+    /// A scratch folder for a sweep test (never `MAPPING_DIR`, so a test can
+    /// never delete a real artifact).
+    fn sweep_scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "tv_artifact_sweep_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Records a verified copy of `path` the way the snapshot upload does:
+    /// a marker in `<dir>/uploaded/` with the file's length and mtime.
+    fn mark_copied(path: &std::path::Path) {
+        let meta = std::fs::metadata(path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let marker = tickvault_storage::raw_frame_upload::UploadMarker {
+            version: 1,
+            bucket: "tv-test-cold".to_string(),
+            key: format!("instrument-snapshots/x/{name}.gz"),
+            gzip_sha256: String::new(),
+            gzip_len: 0,
+            raw_sha256: String::new(),
+            raw_len: meta.len(),
+            raw_mtime_secs: mtime,
+            first_frame_seq: None,
+        };
+        let markers = tickvault_storage::raw_frame_upload::sibling_markers_dir(path).unwrap();
+        std::fs::create_dir_all(&markers).unwrap();
+        std::fs::write(markers.join(&name), serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_removes_only_what_is_both_known_and_old() {
+        // The end-to-end shape, on a real directory, with the copy gate off
+        // (the shape before owner Quote 44). The Required gate has its own
+        // test below.
+        use tickvault_storage::raw_frame_upload::CopyGate;
+        let dir = sweep_scratch_dir("known_old");
+        let old_known = dir.join("dhan-contracts-1999-01-01.json");
+        let old_tmp = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        let old_foreign = dir.join("plan-snapshot-1999-01-01.json");
+        let recent_known = dir.join("dhan-contracts-1999-01-08.json");
+        for p in [&old_known, &old_tmp, &old_foreign, &recent_known] {
+            std::fs::write(p, b"{}").unwrap();
+        }
+
+        // Sweeping as if today were 1999-01-08: the cutoff is 1999-01-01, so
+        // the 01-01 files are AT the cutoff and kept.
+        let at_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-08",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(
+            at_cutoff.removed, 0,
+            "a file exactly at the cutoff is inside the window and must be kept"
+        );
+        assert!(old_known.exists(), "kept at the boundary");
+
+        // One day later the 01-01 files fall out; the 01-08 one and the
+        // foreign name stay.
+        let past_cutoff = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::NotRequired,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(
+            past_cutoff.removed, 2,
+            "both the .json and its .tmp sibling go, and nothing else"
+        );
+        assert!(!old_known.exists());
+        assert!(!old_tmp.exists());
+        assert!(
+            old_foreign.exists(),
+            "an unknown name is counted, never deleted — this is the whole \
+             safety argument for the allowlist"
+        );
+        assert!(
+            past_cutoff.skipped_unknown >= 1,
+            "the unknown name must be COUNTED, so a directory quietly filling \
+             with something this sweep cannot manage is visible"
+        );
+        assert!(
+            recent_known.exists(),
+            "a known artifact inside the window must survive"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Owner Quote 44 (2026-10-28): a dated artifact is deleted only once its
+    /// verified S3 copy is recorded. No copy: kept and counted. A marker for a
+    /// different length or mtime does not count. A `.tmp` leftover goes only
+    /// when its complete `.json` sibling has a verified copy; an orphan `.tmp`
+    /// (the only record of its day) or one beside an uncopied `.json` is kept.
+    /// The marker folder is never counted as an unknown name.
+    #[test]
+    fn test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy() {
+        use tickvault_storage::raw_frame_upload::{CopyGate, UPLOADED_SUBDIR};
+        let dir = sweep_scratch_dir("required");
+        let copied = dir.join("dhan-contracts-1999-01-01.json");
+        let not_copied = dir.join("dhan-nse-mapping-1999-01-01.json");
+        let stale_marker = dir.join("dhan-ntm-spot-1999-01-01.json");
+        // Orphan: no `.json` of that name ever landed.
+        let tmp = dir.join("dhan-fno-underlyings-1999-01-01.json.tmp");
+        // Beside a copied `.json`: goes with it.
+        let tmp_of_copied = dir.join("dhan-contracts-1999-01-01.json.tmp");
+        // Beside an uncopied `.json`: kept.
+        let tmp_of_not_copied = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        for p in [
+            &copied,
+            &not_copied,
+            &stale_marker,
+            &tmp,
+            &tmp_of_copied,
+            &tmp_of_not_copied,
+        ] {
+            std::fs::write(p, b"{\"rows\":1}").unwrap();
+        }
+        mark_copied(&copied);
+        mark_copied(&stale_marker);
+        // The file changed after its copy: the marker no longer matches.
+        std::fs::write(&stale_marker, b"{\"rows\":1,\"rewritten\":true}").unwrap();
+
+        // Both marked files were proven by the pass; the stale marker still
+        // blocks its file because the marker no longer matches it.
+        let proven: std::collections::BTreeSet<String> = [
+            "dhan-contracts-1999-01-01.json",
+            "dhan-ntm-spot-1999-01-01.json",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
+        assert!(!copied.exists(), "a verified copy lets the file go");
+        assert!(
+            !dir.join(UPLOADED_SUBDIR)
+                .join("dhan-contracts-1999-01-01.json")
+                .exists(),
+            "the deleted file's marker goes with it"
+        );
+        assert!(not_copied.exists(), "no copy, no delete");
+        assert!(
+            stale_marker.exists(),
+            "a marker for other bytes is not a copy"
+        );
+        assert!(
+            tmp.exists(),
+            "an orphan leftover may be the only record of its day: kept"
+        );
+        assert!(
+            !tmp_of_copied.exists(),
+            "a leftover beside a copied .json goes (it was judged before the .json was deleted)"
+        );
+        assert!(
+            tmp_of_not_copied.exists(),
+            "a leftover beside an uncopied .json is kept"
+        );
+        assert_eq!(tally.removed, 2, "{tally:?}");
+        assert_eq!(tally.held_without_copy, 4, "{tally:?}");
+        assert_eq!(
+            tally.skipped_unknown, 0,
+            "the marker folder is not an unknown artifact: {tally:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2026-10-28 review: a marker that matches its file is NOT enough to
+    /// delete it. The file must also be in `proven` (the pass just before
+    /// the sweep confirmed its copy). A matching marker this pass did not
+    /// prove (its copy was found gone, the unlink of the marker failed and
+    /// the re-upload failed) keeps the file, and its `.json.tmp` leftover.
+    #[test]
+    fn test_sweep_stale_artifacts_in_keeps_a_marked_file_this_pass_did_not_prove() {
+        use tickvault_storage::raw_frame_upload::{CopyGate, UPLOADED_SUBDIR};
+        let dir = sweep_scratch_dir("unproven");
+        let proven_file = dir.join("dhan-contracts-1999-01-01.json");
+        let unproven_file = dir.join("dhan-nse-mapping-1999-01-01.json");
+        let unproven_tmp = dir.join("dhan-nse-mapping-1999-01-01.json.tmp");
+        for p in [&proven_file, &unproven_file, &unproven_tmp] {
+            std::fs::write(p, b"{\"rows\":1}").unwrap();
+        }
+        // Both carry a marker that matches the file's length and mtime.
+        mark_copied(&proven_file);
+        mark_copied(&unproven_file);
+        let proven: std::collections::BTreeSet<String> =
+            std::iter::once("dhan-contracts-1999-01-01.json".to_string()).collect();
+
+        let tally = sweep_stale_artifacts_in(&dir, "1999-01-09", CopyGate::Required, &proven);
+        assert!(!proven_file.exists(), "proven and marked: deleted");
+        assert!(
+            unproven_file.exists(),
+            "a matching marker this pass did not prove deletes nothing"
+        );
+        assert!(
+            dir.join(UPLOADED_SUBDIR)
+                .join("dhan-nse-mapping-1999-01-01.json")
+                .exists(),
+            "the kept file keeps its marker"
+        );
+        assert!(
+            unproven_tmp.exists(),
+            "a leftover beside an unproven .json is kept"
+        );
+        assert_eq!(tally.removed, 1, "{tally:?}");
+        assert_eq!(tally.held_without_copy, 2, "{tally:?}");
+
+        // An empty proof set (a pass that proved nothing) deletes nothing.
+        let none = sweep_stale_artifacts_in(
+            &dir,
+            "1999-01-09",
+            CopyGate::Required,
+            &std::collections::BTreeSet::new(),
+        );
+        assert_eq!(none.removed, 0, "{none:?}");
+        assert!(unproven_file.exists() && unproven_tmp.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fno_artifact_round_trips_to_a_file_a_reader_can_actually_parse() {
+        // The derivation being right is worth nothing if what lands on disk is
+        // unreadable. This writes the real file through the real function and
+        // parses it back as a reader would.
+        let dir = std::path::Path::new(MAPPING_DIR);
+        let date = "2099-01-02"; // far future: cannot collide with a real run
+        let entries = vec![MappingEntry {
+            index_name: FNO_UNDERLYING_TAG.to_owned(),
+            symbol: "RELIANCE".to_owned(),
+            isin: "INE002A01018".to_owned(),
+            security_id: 2885,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity.binary_code(),
+        }];
+        let path = match write_fno_underlying_artifact(date, entries) {
+            Ok(p) => p,
+            // A sandbox with no write access must not fail the suite for a
+            // reason that has nothing to do with the logic under test.
+            Err(_) => return,
+        };
+        let body = std::fs::read_to_string(&path).expect("written file must be readable");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("must be valid JSON");
+        assert_eq!(v["count"], 1, "count must match what was written");
+        assert_eq!(v["mappings"][0]["security_id"], 2885);
+        assert_eq!(
+            v["mappings"][0]["index_name"], FNO_UNDERLYING_TAG,
+            "the tag is how a consumer tells these from constituent rows"
+        );
+        assert_eq!(
+            v["mappings"].as_array().map(Vec::len),
+            Some(v["count"].as_u64().unwrap() as usize),
+            "count and list length must agree — that mismatch is how a \
+             truncated-but-still-parseable file is caught"
+        );
+        // No .tmp left behind: a reader that globbed the directory would
+        // otherwise find a half-written sibling.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file must be renamed away, never left beside the real one"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = dir; // silence unused in the early-return path
+    }
+
+    #[test]
+    fn fno_underlyings_resolves_only_stocks_that_actually_have_derivatives() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // RELIANCE has options -> wanted, and its EQ row resolves it.
+            mrow(2885, "RELIANCE", C::Equity, "", "EQ", "NSE"),
+            mrow(
+                50001,
+                "RELIANCE24SEP",
+                C::StockOption,
+                "RELIANCE",
+                "",
+                "NSE",
+            ),
+            // TCS has a future -> wanted.
+            mrow(11536, "TCS", C::Equity, "", "EQ", "NSE"),
+            mrow(50002, "TCS24SEPFUT", C::StockFuture, "TCS", "", "NSE"),
+            // ZEEL is cash-only -> must NOT be selected.
+            mrow(3812, "ZEEL", C::Equity, "", "EQ", "NSE"),
+        ];
+        let got = fno_underlying_mappings(&master);
+        let ids: Vec<u64> = got.iter().map(|m| m.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![2885, 11536],
+            "only underlyings that actually carry derivatives may be subscribed"
+        );
+        assert!(
+            got.iter().all(|m| m.index_name == FNO_UNDERLYING_TAG),
+            "every emitted row must be tagged so the consumer can filter without re-parsing"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_join_on_the_ticker_not_the_company_name() {
+        // The REAL prod row shape, read off instrument_lifecycle 2026-09-23:
+        // a cash-equity row carries the COMPANY name in symbol_name and the
+        // ticker in underlying_symbol. Joining on symbol_name matched only
+        // the vendor's NSETEST dummies (company name == ticker), so the live
+        // artifact held 19 test rows instead of ~208 real stocks.
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(
+                2885,
+                "RELIANCE INDUSTRIES LTD",
+                C::Equity,
+                "RELIANCE",
+                "EQ",
+                "NSE",
+            ),
+            mrow(70001, "RELIFUT", C::StockFuture, "RELIANCE", "", "NSE"),
+            mrow(1333, "HDFC BANK LTD", C::Equity, "HDFCBANK", "EQ", "NSE"),
+            mrow(70002, "HDBKFUT", C::StockFuture, "HDFCBANK", "", "NSE"),
+            // A cash-only company must still stay out.
+            mrow(3812, "ZEE ENTERTAINMENT", C::Equity, "ZEEL", "EQ", "NSE"),
+        ];
+        let got = fno_underlying_mappings(&master);
+        let ids: Vec<u64> = got.iter().map(|m| m.security_id).collect();
+        assert_eq!(
+            ids,
+            vec![2885, 1333],
+            "the ticker join must resolve real stocks"
+        );
+        let labels: Vec<&str> = got.iter().map(|m| m.symbol.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["RELIANCE", "HDFCBANK"],
+            "the emitted label is the ticker every consumer joins on, never the company name"
+        );
+    }
+
+    #[test]
+    fn equity_ticker_prefers_the_underlying_symbol_and_falls_back_to_the_name() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let real = mrow(
+            2885,
+            "RELIANCE INDUSTRIES LTD",
+            C::Equity,
+            "RELIANCE",
+            "EQ",
+            "NSE",
+        );
+        assert_eq!(equity_ticker(&real), "RELIANCE");
+        let bare = mrow(9, "TCS", C::Equity, "", "EQ", "NSE");
+        assert_eq!(equity_ticker(&bare), "TCS");
+    }
+
+    #[test]
+    fn fno_underlyings_never_emit_a_zero_or_duplicate_id() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(50003, "INFY24SEP", C::StockOption, "INFY", "", "NSE"),
+            // id 0 is the parser's "unusable" answer -- subscribing instrument
+            // 0 would look healthy and receive nothing.
+            mrow(0, "INFY", C::Equity, "", "EQ", "NSE"),
+            mrow(1594, "INFY", C::Equity, "", "EQ", "NSE"),
+            mrow(1594, "INFY", C::Equity, "", "EQ", "NSE"),
+        ];
+        let ids: Vec<u64> = fno_underlying_mappings(&master)
+            .iter()
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(ids, vec![1594], "zero refused, duplicate deduped");
+    }
+
+    #[test]
+    fn fno_underlyings_take_the_eq_series_not_a_trade_to_trade_line() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            mrow(50004, "IDEA24SEP", C::StockOption, "IDEA", "", "NSE"),
+            // Same symbol, different series -> a DIFFERENT instrument with its
+            // own book. Pricing the ATM window off it would centre the strike
+            // window on the wrong price.
+            mrow(9999, "IDEA", C::Equity, "", "BE", "NSE"),
+            mrow(14366, "IDEA", C::Equity, "", "EQ", "NSE"),
+        ];
+        let ids: Vec<u64> = fno_underlying_mappings(&master)
+            .iter()
+            .map(|m| m.security_id)
+            .collect();
+        assert_eq!(ids, vec![14366], "only the EQ cash line may be subscribed");
+    }
+
+    #[test]
+    fn fno_underlyings_skip_a_derivative_with_no_underlying_named() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // Empty underlying -> skipped, never guessed from the symbol text.
+            mrow(50005, "MYSTERY24SEP", C::StockOption, "", "", "NSE"),
+            mrow(4321, "MYSTERY", C::Equity, "", "EQ", "NSE"),
+        ];
+        assert!(
+            fno_underlying_mappings(&master).is_empty(),
+            "an underlying we cannot read is never inferred"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_ignore_other_exchanges_and_index_derivatives() {
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let master = vec![
+            // BSE stock option -> out of scope for the NSE spot set.
+            mrow(60001, "SENSTK24SEP", C::StockOption, "SENSTK", "", "BSE"),
+            mrow(60002, "SENSTK", C::Equity, "", "EQ", "BSE"),
+            // Index options must not drag an "underlying equity" in -- NIFTY
+            // has no cash-equity line, and inventing one would subscribe a
+            // wrong id.
+            mrow(60003, "NIFTY24SEP", C::IndexOption, "NIFTY", "", "NSE"),
+            mrow(60004, "NIFTY", C::Index, "", "", "NSE"),
+        ];
+        assert!(
+            fno_underlying_mappings(&master).is_empty(),
+            "NSE cash equities only: no BSE rows, no index legs"
+        );
+    }
+
+    #[test]
+    fn fno_underlyings_do_not_rescan_the_master_per_underlying() {
+        // Guards the complexity, not the output. Resolving by filtering the
+        // master once per underlying is O(underlyings x rows) -- at ~220 x
+        // ~150,000 that is the quadratic shape this codebase has repaired
+        // three times. Two linear passes must stay linear: 10x the rows costs
+        // ~10x, never ~100x.
+        use tickvault_core::instrument::master_csv::InstrumentClass as C;
+        let build = |n: u64| -> Vec<_> {
+            let mut m = Vec::new();
+            for i in 0..n {
+                m.push(mrow(
+                    100_000 + i,
+                    &format!("S{i}OPT"),
+                    C::StockOption,
+                    &format!("S{i}"),
+                    "",
+                    "NSE",
+                ));
+                m.push(mrow(i + 1, &format!("S{i}"), C::Equity, "", "EQ", "NSE"));
+            }
+            m
+        };
+        let small = build(50);
+        let large = build(500);
+        assert_eq!(fno_underlying_mappings(&small).len(), 50);
+        assert_eq!(
+            fno_underlying_mappings(&large).len(),
+            500,
+            "10x the underlyings must still resolve every one"
+        );
+    }
     use super::*;
+
+    /// The dashboard's F&O stocks endpoint (`tickvault_api::handlers::fno_stocks`,
+    /// 2026-10-30) reads this writer's F&O list from its own copy of the path
+    /// and the row tag, because the api crate cannot depend on this one. Two
+    /// copies of a filename let the reader look for a name the writer never
+    /// produces, so both copies, and the on-disk shape, are pinned here.
+    #[test]
+    fn test_fno_list_path_tag_and_shape_match_the_dashboard_reader() {
+        use tickvault_api::handlers::fno_stocks as reader;
+        assert_eq!(
+            fno_underlying_artifact_path("2026-10-30"),
+            reader::fno_underlying_artifact_path(
+                std::path::Path::new(reader::FNO_UNDERLYING_ARTIFACT_DIR),
+                "2026-10-30"
+            )
+        );
+        assert_eq!(FNO_UNDERLYING_TAG, reader::FNO_UNDERLYING_TAG);
+        let body = serde_json::to_vec(&FnoUnderlyingArtifact {
+            count: 2,
+            mappings: vec![
+                MappingEntry {
+                    index_name: FNO_UNDERLYING_TAG.to_string(),
+                    symbol: "RELIANCE".to_string(),
+                    isin: "INE002A01018".to_string(),
+                    security_id: 2885,
+                    exchange_segment: 1,
+                },
+                MappingEntry {
+                    index_name: "NIFTY 50".to_string(),
+                    symbol: "NIFTY 50".to_string(),
+                    isin: String::new(),
+                    security_id: 13,
+                    exchange_segment: 0,
+                },
+            ],
+        })
+        .expect("serialises");
+        let list = reader::parse_fno_underlyings(&body).expect("the reader parses the writer");
+        assert_eq!(list.len(), 1, "only the F&O stock row counts");
+        assert_eq!(list.name_of(2885, 1), Some("RELIANCE"));
+    }
 
     #[test]
     fn test_next_wait_runs_immediately_when_the_target_already_passed() {
@@ -1054,6 +3228,307 @@ mod tests {
         );
         assert_eq!(rows[1].symbol, "INFY");
         assert_eq!(rows[1].isin, "INE009A01021");
+    }
+
+    fn master_row(
+        security_id: u64,
+        symbol: &str,
+        exch: &str,
+        class: tickvault_core::instrument::master_csv::InstrumentClass,
+    ) -> tickvault_core::instrument::master_csv::MasterRow {
+        tickvault_core::instrument::master_csv::MasterRow {
+            security_id,
+            isin: String::new(),
+            symbol_name: symbol.to_owned(),
+            exch_id: exch.to_owned(),
+            segment: "I".into(),
+            series: String::new(),
+            class,
+            expiry_ymd: 0,
+            strike_paise: 0,
+            option_leg: tickvault_core::instrument::master_csv::OptionLeg::None,
+            underlying_symbol: String::new(),
+            lot_size: 0,
+        }
+    }
+
+    /// Builds one resolved constituent, tagged with the list it came from.
+    fn resolved(
+        index_name: &str,
+        symbol: &str,
+        security_id: u64,
+    ) -> tickvault_core::instrument::master_csv::ResolvedConstituent {
+        tickvault_core::instrument::master_csv::ResolvedConstituent {
+            index_name: index_name.to_owned(),
+            symbol: symbol.to_owned(),
+            isin: format!("INE{security_id:09}"),
+            security_id,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseEquity,
+        }
+    }
+
+    /// `NTM_INDEX_NAME` is a JOIN KEY, not a label — `join_constituents`
+    /// stamps `index_name` from the slug table's display name and
+    /// `ntm_spot_mappings` selects on it. A typo would not fail loudly: it
+    /// would select ZERO constituents, the artifact would not be written, and
+    /// the session would fall through to the full 4,565 set — which is exactly
+    /// the state the operator was complaining about, restored silently.
+    #[test]
+    fn ntm_display_name_matches_a_real_slug() {
+        assert!(
+            tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS
+                .iter()
+                .any(|(display, _)| *display == NTM_INDEX_NAME),
+            "NTM_INDEX_NAME {NTM_INDEX_NAME:?} is not a display name in \
+             INDEX_CONSTITUENCY_SLUGS — the join stamps index_name from that table, so this \
+             selector would match nothing and narrow to indices alone"
+        );
+    }
+
+    /// Audit D3c-1: the index-list reject writes the two narrowed spot sets
+    /// BEFORE it fails the build, and the normal path writes them through the
+    /// same function, so the two paths cannot drift into different sets.
+    #[test]
+    fn write_narrowed_spot_artifacts_runs_before_the_index_list_reject() {
+        // The whole file: a doc comment above mentions the test attribute, so a
+        // split on it would cut production short. `find` takes the first
+        // (production) occurrence of each needle.
+        let production = include_str!("dhan_universe.rs");
+        let gate = production
+            .find("if failed_fraction > MAX_FAILED_INDEX_LIST_FRACTION {")
+            .expect("the list-count gate exists");
+        let gate_body = &production[gate..];
+        let bail = gate_body
+            .find("anyhow::bail!(")
+            .expect("the gate still fails the build");
+        assert!(
+            gate_body[..bail].contains("write_narrowed_spot_artifacts(date, &master, &partial)"),
+            "the narrowed spot sets must be written before the reject, not after or never"
+        );
+        assert!(
+            gate_body[..bail].contains(concat!("source = \"rider_index_lists_", "rejected\"")),
+            "the reject must carry its own coded source"
+        );
+        let mapping = production
+            .find(concat!("fn write_mapping_", "atomic("))
+            .expect("mapping writer exists");
+        let narrowed = production
+            .find(concat!("fn write_narrowed_spot_", "artifacts("))
+            .expect("narrowed writer exists");
+        assert!(
+            production[mapping..narrowed]
+                .contains("write_narrowed_spot_artifacts(date, master, outcome);"),
+            "the normal path must write the narrowed sets through the same function"
+        );
+    }
+
+    /// Three writers, three readers, one directory. A collision would have one
+    /// set overwrite another and the lane would subscribe whichever ran last,
+    /// with every log line still naming the set that was asked for.
+    #[test]
+    fn ntm_spot_artifact_path_never_collides_with_its_two_siblings() {
+        let d = "2026-08-22";
+        let paths = [
+            mapping_artifact_path(d),
+            fno_underlying_artifact_path(d),
+            ntm_spot_artifact_path(d),
+        ];
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i + 1) {
+                assert_ne!(a, b, "two spot artifacts share a filename: {a:?}");
+            }
+        }
+        // And the date must actually reach the name, or every day overwrites
+        // the last and a stale set is served as today's.
+        assert!(
+            ntm_spot_artifact_path(d).to_string_lossy().contains(d),
+            "NTM artifact name drops the date"
+        );
+    }
+
+    /// The whole point of the 2026-08-22 change: ONE list out of the 49, not
+    /// the union. A selector that let a sibling list through would reproduce
+    /// the ~4,565 pile under a name that claims to be ~750.
+    #[test]
+    fn ntm_spot_mappings_selects_only_the_total_market_list() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index)];
+        let outcome = JoinOutcome {
+            resolved: vec![
+                resolved(NTM_INDEX_NAME, "RELIANCE", 2885),
+                resolved(NTM_INDEX_NAME, "TCS", 11536),
+                resolved("Nifty 500", "SOMEOTHER", 4444),
+                resolved("Nifty Microcap 250", "TINYCO", 5555),
+            ],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        let ids: Vec<u64> = out
+            .iter()
+            .filter(|e| e.index_name == NTM_INDEX_NAME)
+            .map(|e| e.security_id)
+            .collect();
+        assert_eq!(ids, vec![2885, 11536], "took rows from a non-NTM list");
+        assert!(
+            !out.iter()
+                .any(|e| e.security_id == 4444 || e.security_id == 5555),
+            "a sibling list leaked into the NTM set"
+        );
+    }
+
+    /// `select_live_universe` REPLACES the four hardcoded index seeds with the
+    /// artifact's IDX_I rows whenever there is at least one. An NTM set of
+    /// constituents alone would therefore ship 4 indices instead of ~119 while
+    /// every log line still read "widened" — so the anchor set is not optional
+    /// and this asserts it is present, with the right segment code.
+    #[test]
+    fn ntm_spot_mappings_carries_the_index_anchor_set() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(25, "NIFTY BANK", "NSE", InstrumentClass::Index),
+            // BSE stays out — the operator lock, asserted where it holds.
+            master_row(51, "SENSEX", "BSE", InstrumentClass::Index),
+        ];
+        let outcome = JoinOutcome {
+            resolved: vec![resolved(NTM_INDEX_NAME, "RELIANCE", 2885)],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        let idx: Vec<u64> = out
+            .iter()
+            .filter(|e| {
+                e.exchange_segment == tickvault_common::types::ExchangeSegment::IdxI.binary_code()
+            })
+            .map(|e| e.security_id)
+            .collect();
+        assert_eq!(
+            idx,
+            vec![13, 25],
+            "index anchor set wrong (BSE must not appear)"
+        );
+        assert_eq!(out.len(), 3, "expected 2 indices + 1 NTM constituent");
+    }
+
+    /// An NTM half that resolves to nothing must NOT be written. Writing it
+    /// would hand the reader an indices-only file that parses cleanly and
+    /// looks like a successful narrowing; not writing it makes the consumer
+    /// fall through to the full master and say so.
+    #[test]
+    fn ntm_spot_mappings_with_no_constituents_is_indices_only_so_the_caller_can_refuse() {
+        use tickvault_core::instrument::master_csv::{InstrumentClass, JoinOutcome};
+        let master = vec![master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index)];
+        let outcome = JoinOutcome {
+            resolved: vec![resolved("Nifty 50", "RELIANCE", 2885)],
+            unresolved: Vec::new(),
+        };
+        let out = ntm_spot_mappings(&master, &outcome);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.index_name == NTM_INDEX_NAME)
+                .count(),
+            0,
+            "the caller's zero-constituent refusal would never trigger"
+        );
+    }
+
+    /// The gap this closes: the ISIN join emits CONSTITUENTS, never the
+    /// indices themselves, so the live universe had four hardcoded indices
+    /// and no path to the rest.
+    #[test]
+    fn test_nse_index_mappings_collects_every_nse_index_as_idx_i() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(25, "NIFTY BANK", "NSE", InstrumentClass::Index),
+            master_row(999, "NIFTY MIDCAP 150", "NSE", InstrumentClass::Index),
+            // Not an index.
+            master_row(500, "RELIANCE", "NSE", InstrumentClass::Equity),
+            // An index, but not NSE — out of scope per the 2026-08-20 narrowing.
+            master_row(51, "SENSEX", "BSE", InstrumentClass::Index),
+        ];
+        let out = nse_index_mappings(&master);
+        assert_eq!(out.len(), 3, "three NSE indices, and only those");
+        assert!(
+            out.iter().all(|m| m.exchange_segment
+                == tickvault_common::types::ExchangeSegment::IdxI.binary_code())
+        );
+        assert!(out.iter().all(|m| m.index_name == "NSE_INDEX"));
+        let ids: Vec<u64> = out.iter().map(|m| m.security_id).collect();
+        assert_eq!(ids, vec![13, 25, 999]);
+        assert!(
+            !ids.contains(&51),
+            "SENSEX is BSE — the operator narrowed to NSE alone"
+        );
+        assert!(!ids.contains(&500), "an equity is not an index");
+    }
+
+    /// A zero id is the parser's "unusable" answer. Subscribing instrument 0
+    /// would look healthy on every counter and receive nothing.
+    #[test]
+    fn test_nse_index_mappings_refuses_a_zero_id_and_dedupes() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![
+            master_row(0, "BROKEN", "NSE", InstrumentClass::Index),
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+            master_row(13, "NIFTY 50", "NSE", InstrumentClass::Index),
+        ];
+        let out = nse_index_mappings(&master);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].security_id, 13);
+    }
+
+    /// An empty answer must stay empty rather than inventing a fallback: a
+    /// master with no index rows is a master problem, and quietly substituting
+    /// the old hardcoded four would hide it.
+    #[test]
+    fn test_nse_index_mappings_on_a_master_with_no_indices_is_empty() {
+        use tickvault_core::instrument::master_csv::InstrumentClass;
+        let master = vec![master_row(500, "RELIANCE", "NSE", InstrumentClass::Equity)];
+        assert!(nse_index_mappings(&master).is_empty());
+    }
+
+    #[test]
+    fn distinct_instrument_count_collapses_a_stock_that_sits_in_many_indices() {
+        // The real shape: one stock (id 2885, NSE_EQ) is a member of three of
+        // the 46 downloaded index lists, so the join emits three rows for it.
+        let e = |index: &str, id: u64, seg: u8| MappingEntry {
+            index_name: index.to_owned(),
+            symbol: "RELIANCE".to_owned(),
+            isin: "INE002A01018".to_owned(),
+            security_id: id,
+            exchange_segment: seg,
+        };
+        let mappings = vec![
+            e("Nifty 50", 2885, 1),
+            e("Nifty 100", 2885, 1),
+            e("Nifty Total Market", 2885, 1),
+            e("NSE_INDEX", 13, 0),
+        ];
+        assert_eq!(
+            mappings.len(),
+            4,
+            "the artifact really does carry one row per (index, symbol) pair"
+        );
+        assert_eq!(
+            distinct_instrument_count(&mappings),
+            2,
+            "one stock plus one index — this is what the feed subscribes"
+        );
+    }
+
+    #[test]
+    fn distinct_instrument_count_keeps_one_id_that_appears_in_two_segments() {
+        // I-P1-11: the same numeric id in two segments is two instruments, and
+        // collapsing them would under-count the subscription.
+        let e = |id: u64, seg: u8| MappingEntry {
+            index_name: "x".to_owned(),
+            symbol: "x".to_owned(),
+            isin: String::new(),
+            security_id: id,
+            exchange_segment: seg,
+        };
+        assert_eq!(distinct_instrument_count(&[e(27, 0), e(27, 1)]), 2);
     }
 
     #[test]

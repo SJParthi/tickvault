@@ -1,5 +1,7 @@
 //! Order runtime (dry-run) — the single-owner task that finally gives the
-//! order machinery real inputs on the prod (dhan-off, groww-on) profile.
+//! order machinery real inputs. (CORRECTED 2026-08-26: this said "on the
+//! prod (dhan-off, groww-on) profile" — prod has been dhan-ON since the
+//! 2026-08-11 flip, and the Groww feed was removed entirely on 2026-08-21.)
 //!
 //! Cluster A, operator directive 2026-07-14
 //! (`.claude/plans/active-plan-order-runtime-dryrun.md`). Before this module,
@@ -19,10 +21,29 @@
 //!   re-arm (fresh dated quote per dhan-rest-only-noise-lock-2026-07-14 §3)
 //!   re-attaches the socket + WAL producers to this SAME channel,
 //! - the RiskEngine fed by [`FillEvent`]s (the widened `handle_order_update`
-//!   return) and by Groww marks (the zero-alloc [`MarkForwarder`] tap at the
-//!   Groww per-minute REST legs' persist-confirm seam — re-homed 2026-07-16,
-//!   the live-bridge per-tick source died with #1581; 2026-07-17 truth-sync
-//!   — → bounded mpsc → `update_market_price`),
+//!   return) and by marks (the zero-alloc [`MarkForwarder`] tap → bounded
+//!   mpsc → `update_market_price`). ⚠ CORRECTED TWICE, and the second
+//!   correction is the one that is live:
+//!
+//!   2026-09-13 — this said "Groww marks", stale since the 2026-08-21 Groww
+//!   removal, and named `dhan_cadence_executor` as the producer.
+//!
+//!   ⚠ 2026-09-18 — that producer NO LONGER EXISTS. The operator's
+//!   SOCKETS-ONLY narrowing (`no-rest-except-live-feed-2026-06-27.md` §12.10)
+//!   removed the per-minute REST legs on 2026-09-16, and `CadenceExecutor`
+//!   declared exactly the three removed fetch methods, so the executor, its
+//!   boot and the scheduler went with them. `cadence_mark_source_guard`'s
+//!   pins 1-4 were RETIRED in that change for the same reason.
+//!
+//!   So `mark_forward` has **ZERO production call sites** today — verified,
+//!   not assumed: every remaining caller is a `#[cfg(test)]` one in this
+//!   file. The paper book therefore runs UNMARKED, which §12.10.7(a) records
+//!   and which `main.rs` makes AUDIBLE by explicitly dropping
+//!   `order_runtime_mark_forwarder` so the channel CLOSES and the
+//!   producer-less warn can actually fire. Re-arming a mark producer is the
+//!   follow-up; naming a deleted module as the live source would be exactly
+//!   the reassuring-direction staleness the 2026-09-13 note was written to
+//!   complain about,
 //! - the next-mark PAPER FILLER (a pending `PAPER-n` order fills at the next
 //!   mark for its sid — fill-once, terminal orders never re-fill, finite>0
 //!   mark required, else deferred + counted),
@@ -55,7 +76,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -71,6 +92,7 @@ use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
 use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::ExchangeSegment;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
 use tickvault_trading::oms::engine::{OmsAlert, OmsAlertSink};
@@ -80,7 +102,7 @@ use tickvault_trading::oms::{
 };
 use tickvault_trading::risk::engine::{RiskAlertSink, RiskEngine};
 
-use crate::oms_wiring::{TokenHandleBridge, build_oms_http_client};
+use crate::oms_wiring::TokenHandleBridge;
 
 // ---------------------------------------------------------------------------
 // Constants (module-scoped, named per rust-code.md "no hardcoded values")
@@ -121,10 +143,11 @@ const ORDER_UPDATE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 const HOUSEKEEPING_TICK_SECS: u64 = 1;
 
 // ---------------------------------------------------------------------------
-// Mark forwarding (the Groww per-minute REST-leg tap — re-homed 2026-07-16)
+// Mark forwarding (the DHAN per-minute REST-leg tap — re-homed 2026-07-16;
+// broker corrected 2026-09-13, see the module header)
 // ---------------------------------------------------------------------------
 
-/// A mark-to-market price update. `Copy`, 16 bytes — sent from the Groww
+/// A mark-to-market price update. `Copy`, 16 bytes — sent from the Dhan
 /// per-minute REST legs at each persist-confirm choke point (own-fire
 /// just-closed 1m candle closes: ≤4 spot indices + the bounded ~30-contract
 /// selection per minute; 2026-07-17 truth-sync — the "per-tick" live-bridge
@@ -133,12 +156,23 @@ const HOUSEKEEPING_TICK_SECS: u64 = 1;
 /// tokio mpsc's AMORTIZED block-reuse alloc profile, see [`MarkForwarder`]).
 #[derive(Clone, Copy, Debug)]
 pub struct MarkUpdate {
-    /// Feed-native security id (Groww exchange_token space; bit-62 indices).
+    /// Feed-native security id — Dhan `security_id` today. The Groww token
+    /// space this doc used to name went with the feed (PR #1796).
     pub security_id: u64,
     /// Numeric `ExchangeSegment` code of the tick.
     pub segment_code: u8,
-    /// Last traded price (f32 as delivered — the runtime widens for math).
-    pub price: f32,
+    /// Last traded price.
+    ///
+    /// `f64`, matching BOTH ends of the pipe. It was `f32` on the premise
+    /// "f32 as delivered" — true while a live WS bridge delivered f32 ticks,
+    /// and false since that source died with #1581. Every remaining caller is
+    /// a REST leg delivering `f64` (`candle.close`; `leg.last_price`), and the
+    /// far end, `RiskEngine::update_market_price_in_segment`, takes `f64` and
+    /// feeds the daily-loss auto-halt. Narrowing in between bought nothing and
+    /// cost precision above 131,072, where f32's step (0.0156) is coarser than
+    /// a paisa. No current price reaches that, so widening removes a latent
+    /// class rather than fixing a live defect.
+    pub price: f64,
 }
 
 /// The hot-path-grade side of the mark bridge, cloned into the Groww
@@ -178,7 +212,7 @@ impl MarkForwarder {
     /// per-minute REST legs' persist-confirm points; alloc profile per the
     /// struct-level honesty note).
     #[inline]
-    pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f32) {
+    pub fn mark_forward(&self, security_id: u64, segment_code: u8, price: f64) {
         if !self.marks_wanted.load(Ordering::Relaxed) {
             return;
         }
@@ -224,6 +258,27 @@ impl MarkForwarder {
 // Alert sink — the FIRST production implementer of both alert traits
 // ---------------------------------------------------------------------------
 
+/// Seconds without an order rate-limit refusal that end an episode: the
+/// Telegram page fires once per episode, the coded log line on every refusal
+/// (LF-6b review round 3, finding 3: a burst of paper exits refused by the
+/// 10-a-second limiter paged once per refusal, at the Immediate lane).
+const RATE_LIMIT_PAGE_EPISODE_GAP_SECS: i64 = 60;
+
+/// Wall second (UTC epoch) of the newest order rate-limit refusal the sink
+/// saw, `i64::MIN` for none. One per process: there is one order runtime.
+static RATE_LIMIT_LAST_REFUSAL_SECS: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// Records a rate-limit refusal at `now_secs` in `last` and says whether it
+/// starts a new episode (no refusal in the previous
+/// [`RATE_LIMIT_PAGE_EPISODE_GAP_SECS`], or the clock stepped back), the only
+/// refusal that pages. O(1): one atomic swap.
+fn rate_limit_refusal_starts_episode(last: &AtomicI64, now_secs: i64) -> bool {
+    let prev = last.swap(now_secs, Ordering::Relaxed);
+    prev == i64::MIN
+        || now_secs < prev
+        || now_secs.saturating_sub(prev) >= RATE_LIMIT_PAGE_EPISODE_GAP_SECS
+}
+
 /// Bridges OMS + Risk alerts to `NotificationService` (Telegram). `notify()`
 /// is sync fire-and-forget (service.rs — F19: never blocks this task).
 pub struct NotifierAlertSink(pub Arc<NotificationService>);
@@ -263,13 +318,21 @@ impl OmsAlertSink for NotifierAlertSink {
                 self.0.notify(NotificationEvent::CircuitBreakerClosed);
             }
             OmsAlert::RateLimitExhausted { limit_type } => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+                let page =
+                    rate_limit_refusal_starts_episode(&RATE_LIMIT_LAST_REFUSAL_SECS, now_secs);
                 error!(
                     code = ErrorCode::OmsGapRateLimit.code_str(),
                     limit_type = %limit_type,
+                    paged = page,
                     "OMS-GAP-04: order rate limit exhausted — order rejected"
                 );
-                self.0
-                    .notify(NotificationEvent::RateLimitExhausted { limit_type });
+                if page {
+                    self.0
+                        .notify(NotificationEvent::RateLimitExhausted { limit_type });
+                }
             }
             // Cluster-F alert classes (#1558: readiness refusal / OMS halt /
             // DH-904 ladder exhaustion / DATA-805 stop-all) are
@@ -324,8 +387,8 @@ pub struct OrderRuntimeParams {
     /// producer exists in the socket-free shape; the gated live re-arm's
     /// socket/WAL drain must keep subscribing BEFORE any producer starts).
     pub first_order_update_rx: broadcast::Receiver<OrderUpdate>,
-    /// Bounded mark channel (the Groww per-minute REST legs' tap → this
-    /// runtime; re-homed 2026-07-16).
+    /// Bounded mark channel (the DHAN per-minute REST legs' tap → this
+    /// runtime; re-homed 2026-07-16, broker corrected 2026-09-13).
     pub mark_rx: mpsc::Receiver<MarkUpdate>,
     /// Shared arm flag (the hot-path gate half of the mark bridge).
     pub marks_wanted: Arc<AtomicBool>,
@@ -344,6 +407,10 @@ pub struct OrderRuntimeParams {
     pub auth_notify: Arc<Notify>,
     /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
     pub leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
+    /// The live paper fill chain's commands and event channel (plan item
+    /// LF-6b). `None` unless the chain runs, which needs an approved strategy
+    /// engine: never today.
+    pub live_fill: Option<crate::live_fill::PaperLink>,
 }
 
 /// Spawn the supervised order runtime. Returns the SUPERVISOR handle.
@@ -363,7 +430,18 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             client_id,
             auth_notify,
             leg_pnl_tx,
+            live_fill,
         } = params;
+        // LF-6b: like the mark receiver, the paper-command receiver survives
+        // inner respawns behind a tokio Mutex.
+        let (live_fill_rx, live_fill_events, live_fill_positions) = match live_fill {
+            Some(link) => (
+                Some(Arc::new(tokio::sync::Mutex::new(link.cmds))),
+                Some(link.events),
+                Some(link.positions),
+            ),
+            None => (None, None, None),
+        };
         // The mark receiver survives inner respawns behind a tokio Mutex —
         // the inner run holds the guard for its lifetime; an (unwind-build)
         // death releases it for the respawn.
@@ -389,11 +467,16 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
                 client_id: client_id.clone(),
                 auth_notify: Arc::clone(&auth_notify),
                 leg_pnl_tx: leg_pnl_tx.clone(),
+                live_fill_events: live_fill_events.clone(),
+                live_fill_positions: live_fill_positions.clone(),
+                safety: crate::trade_safety::default_switch(),
             };
             let mark_rx_shared = Arc::clone(&mark_rx);
+            let live_fill_shared = live_fill_rx.clone();
             let run_started = std::time::Instant::now();
-            let inner =
-                tokio::spawn(async move { run_order_runtime(ctx, order_rx, mark_rx_shared).await });
+            let inner = tokio::spawn(async move {
+                run_order_runtime(ctx, order_rx, mark_rx_shared, live_fill_shared).await
+            });
             let reason = match inner.await {
                 // The inner loop is infinite; a clean return means the
                 // order-update broadcast CLOSED — structurally impossible
@@ -429,6 +512,11 @@ pub fn spawn_order_runtime(params: OrderRuntimeParams) -> tokio::task::JoinHandl
             // REAL-account fill frames surface as loud orphan warns.
             error!(
                 code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                // The ONE OMS-GAP-06 site that pages: the CloudWatch filter
+                // `oms-gap-06` matches `$.source = "runtime_respawn"` only,
+                // because the other three sites are self-test diagnostics.
+                // Renaming this value silences the page — keep it in lockstep.
+                source = "runtime_respawn",
                 reason,
                 backoff_secs,
                 consecutive_abnormal_exits,
@@ -456,7 +544,24 @@ struct RuntimeCtx {
     auth_notify: Arc<Notify>,
     /// Order-leg P&L sink (None = feature OFF; byte-identical no-op path).
     leg_pnl_tx: Option<mpsc::Sender<LegPnlEvent>>,
+    /// LF-6b: where the live paper fill arm writes its order event rows.
+    live_fill_events:
+        Option<mpsc::Sender<tickvault_storage::live_order_events_persistence::LiveOrderEvent>>,
+    /// LF-9 finding 2: where the arm reports what it booked for each paper
+    /// Execute, so the chain's position follows the paper book.
+    live_fill_positions: Option<
+        tickvault_core::websocket::frame_ring::FrameRingSender<
+            crate::live_fill::chain::PositionReport,
+        >,
+    >,
+    /// The trade-safety switch (UTC-SAFETY, §28.7): gates C and D read it
+    /// for entries only. `trade_safety::SWITCH` in production.
+    safety: &'static crate::trade_safety::SafetySwitch,
 }
+
+// LF-6b: the live paper fill chain's arm (paper commands → dry-run OMS).
+#[path = "order_runtime_live_fill.rs"]
+mod live_fill_arm;
 
 // ---------------------------------------------------------------------------
 // Time helpers (pure)
@@ -616,35 +721,74 @@ struct LocalReconcileReport {
     order_fold_divergences: usize,
 }
 
+/// The working sets [`local_reconcile`] fills on each run, kept between runs
+/// so a heartbeat clears them instead of allocating them again (audit PR18,
+/// plan row 213).
+///
+/// Cleared, never shrunk: after the first runs they hold the capacity the
+/// largest book needed and a later run allocates nothing until the book grows
+/// past it. Bounded by the book itself (`BookState::MAX_TRACKED_SIDS`
+/// instruments, `MAX_TRACKED_ORDERS` orders), and emptied with the book at
+/// the daily reset.
+#[derive(Debug, Default)]
+struct ReconcileScratch {
+    /// The union of instrument keys one leg compares over.
+    keys: HashSet<(u64, ExchangeSegment)>,
+    /// Leg 2: per-instrument signed fold of order `traded_qty` lots.
+    folded: HashMap<(u64, ExchangeSegment), i64>,
+}
+
+impl ReconcileScratch {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.folded.clear();
+    }
+}
+
 /// Compares (leg 1) the runtime's FillEvent-folded net-lots mirror against
 /// the risk engine's positions over the UNION of both key sets, and
-/// (leg 2, C7) the per-sid signed fold of every tracked order's cumulative
-/// `traded_qty` lots against the risk engine's net lots.
+/// (leg 2, C7) the per-instrument signed fold of every tracked order's
+/// cumulative `traded_qty` lots against the risk engine's net lots.
 ///
 /// Leg-2 honesty: valid for the DRY-RUN book (PAPER order ids never
 /// re-index, so `all_orders()` holds one entry per order); the live-mode
 /// correlation re-index keeps a stale clone under the old order_no and
 /// would double-count — the caller only runs this in dry-run.
+///
+/// # I-P1-11 coverage (audit M7, 2026-10-04)
+/// Both legs compare per COMPOSITE `(security_id, segment)` instrument: the
+/// mirror is keyed on the segment `apply_fill` books to, and every
+/// `ManagedOrder` now records the segment it was placed in. So a fill booked
+/// to the wrong segment row now shows as a divergence on both rows. Until
+/// 2026-10-04 both legs compared bare-sid sums (`ManagedOrder` had no segment
+/// field), which a cross-segment mis-booking left unchanged.
+///
+/// # Performance
+/// O(mirror + positions + orders), cold: runs on the reconcile heartbeat.
+/// Its working sets live in `scratch` and are cleared, not rebuilt, so a run
+/// allocates only while the book is larger than on any earlier run.
 fn local_reconcile(
     oms: &OrderManagementSystem,
     risk: &RiskEngine,
-    mirror: &HashMap<u64, i64>,
+    mirror: &HashMap<(u64, ExchangeSegment), i64>,
+    scratch: &mut ReconcileScratch,
 ) -> LocalReconcileReport {
     let mut report = LocalReconcileReport::default();
+    scratch.clear();
+    let ReconcileScratch { keys, folded } = scratch;
     // Leg 1: mirror vs risk over the UNION of keys (C7 — a risk-side
     // position absent from the mirror is a divergence too).
-    let mut sids: HashSet<u64> = mirror.keys().copied().collect();
-    sids.extend(risk.position_security_ids());
-    for &sid in &sids {
+    keys.extend(mirror.keys().copied());
+    keys.extend(risk.position_keys());
+    for &(sid, segment) in keys.iter() {
         report.sids_checked += 1;
-        let mirror_lots = mirror.get(&sid).copied().unwrap_or(0);
-        if i64::from(risk.net_lots_for(sid)) != mirror_lots {
+        let mirror_lots = mirror.get(&(sid, segment)).copied().unwrap_or(0);
+        if i64::from(risk.net_lots_for_in_segment(sid, segment)) != mirror_lots {
             report.divergences += 1;
         }
     }
-    // Leg 2: per-sid signed order fold (floor of cumulatives — the same
-    // math the engine's fill delta uses) vs risk net lots.
-    let mut folded: HashMap<u64, i64> = HashMap::with_capacity(mirror.len());
+    // Leg 2: per-instrument signed order fold (floor of cumulatives — the
+    // same math the engine's fill delta uses) vs risk net lots.
     for order in oms.all_orders().values() {
         let lot = i64::from(order.lot_size.max(1));
         let lots = order.traded_qty.max(0) / lot;
@@ -652,13 +796,17 @@ fn local_reconcile(
             TransactionType::Buy => lots,
             TransactionType::Sell => -lots,
         };
-        *folded.entry(order.security_id).or_insert(0) += signed;
+        *folded
+            .entry((order.security_id, order.exchange_segment))
+            .or_insert(0) += signed;
     }
-    let mut fold_sids: HashSet<u64> = folded.keys().copied().collect();
-    fold_sids.extend(risk.position_security_ids());
-    for &sid in &fold_sids {
-        let fold_lots = folded.get(&sid).copied().unwrap_or(0);
-        if i64::from(risk.net_lots_for(sid)) != fold_lots {
+    // The same set is reused for leg 2's union of keys.
+    keys.clear();
+    keys.extend(folded.keys().copied());
+    keys.extend(risk.position_keys());
+    for &(sid, segment) in keys.iter() {
+        let fold_lots = folded.get(&(sid, segment)).copied().unwrap_or(0);
+        if i64::from(risk.net_lots_for_in_segment(sid, segment)) != fold_lots {
             report.order_fold_divergences += 1;
         }
     }
@@ -668,6 +816,16 @@ fn local_reconcile(
 // ---------------------------------------------------------------------------
 // Self-test state machine
 // ---------------------------------------------------------------------------
+
+/// The skip text when no live price mark is available.
+const SKIP_TEXT_NO_MARK: &str = "no live price mark is available, so the order machinery was \
+     not exercised (this is not a failure of the machinery)";
+/// The skip text when today's feed-time alarm blocks new entries (UTC-SAFETY
+/// gate D).
+const SKIP_TEXT_FEED_TIME: &str = "new paper entries are paused today because Dhan feed times \
+     are flagged wrong (this is not a failure of the machinery)";
+/// The `tv_paper_selftest_total{outcome}` label of a gate-D skip.
+const SKIP_OUTCOME_FEED_TIME: &str = "skipped_feed_time_alarm";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SelfTestPhase {
@@ -701,6 +859,31 @@ impl SelfTestState {
         }
     }
 
+    /// The self-test could not RUN, which is not the same as it FAILING
+    /// (2026-09-23). With no live mark producer (the per-minute REST legs
+    /// were removed on 2026-09-16, so the mark channel closes at boot) the
+    /// cycle has nothing to price its paper order against. Reporting that as
+    /// an `OMS-GAP-06` failure paged every trading morning for a machine that
+    /// was never exercised. It is a coded `warn!` plus
+    /// `tv_paper_selftest_total{outcome}` instead, latched once per day.
+    fn skip(&mut self, today: i64, outcome: &'static str) {
+        self.skip_with(today, outcome, SKIP_TEXT_NO_MARK);
+    }
+
+    /// [`Self::skip`] with its own reason text (UTC-SAFETY gate D: the
+    /// feed-time alarm, not a missing mark). Same counter, same day latch.
+    fn skip_with(&mut self, today: i64, outcome: &'static str, why: &'static str) {
+        warn!(
+            code = ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "selftest_skipped",
+            outcome,
+            "paper self-test did not run today: {why}"
+        );
+        metrics::counter!("tv_paper_selftest_total", "outcome" => outcome).increment(1);
+        self.phase = SelfTestPhase::Idle;
+        self.last_run_day = today;
+    }
+
     fn fail(&mut self, today: i64, stage: &'static str) {
         error!(
             code = ErrorCode::OmsGapDryRunSafety.code_str(),
@@ -721,38 +904,121 @@ impl SelfTestState {
 
 /// Book-side runtime state folded by the loop arms.
 struct BookState {
-    /// Σ FillEvent net-lots mirror per sid (the local reconcile invariant).
-    /// I-P1-11 note: sid-keyed by design THIS PR — the first-seen-segment
-    /// tripwire below makes a cross-segment collision LOUD; the composite
-    /// key rewrite is the mandatory pre-live follow-up.
-    mirror: HashMap<u64, i64>,
+    /// Σ FillEvent net-lots mirror per COMPOSITE `(security_id, segment)`
+    /// instrument (the local reconcile invariant). Keyed on the same row the
+    /// risk engine books the fill to, so a fill on one segment can never
+    /// balance a position on another (I-P1-11, audit M7 2026-10-04; it was
+    /// keyed on the bare sid until then).
+    mirror: HashMap<(u64, ExchangeSegment), i64>,
     /// First-seen segment code per sid (the I-P1-11 tripwire). Footprint
     /// (HP-6): while armed, EVERY sid the tap forwards gets an entry — the
-    /// mark source is the Groww per-minute REST legs (≤4 spot indices + the
+    /// mark source is the DHAN per-minute REST legs (≤4 spot indices + the
     /// bounded ~30-contract selection per minute; 2026-07-17 truth-sync of
     /// the stale "~770-sid watch universe" live-bridge bound), so the map
     /// stays trivially small and is cleared at the daily reset.
+    // APPROVED: bare id on purpose — the I-P1-11 tripwire: the first segment seen per sid, to detect a second.
     tripwire: HashMap<u64, u8>,
     /// HP-3/E3 edge latch: sids whose divergence has already fired the
     /// coded `error!` this episode (cleared at the daily reset). The
     /// counter keeps counting per event; the LOG fires once per sid per
     /// day (audit-findings Rule 4 — edge-triggered alerts only).
+    // APPROVED: bare id on purpose — the I-P1-11 tripwire latch: one entry per sid seen on two segments.
     tripwire_reported: HashSet<u64>,
-    /// HP-2: sid → pending PAPER order ids — the O(1) per-mark filler
-    /// index. REBUILT (O(N_all_orders), cold — order events are low-rate)
+    /// HP-2: composite `(security_id, segment)` → pending PAPER order ids —
+    /// the O(1) per-mark filler index. Composite since audit M7 (2026-10-04):
+    /// `ManagedOrder` records its segment, so a mark on another segment of the
+    /// same numeric id finds nothing to fill. REBUILT (O(N_all_orders), cold — order events are low-rate)
     /// via [`Self::rebuild_pending_paper`] after every order-mutating
     /// event; per-mark reads are one HashMap lookup, zero alloc on the
     /// no-pending path.
-    pending_paper: HashMap<u64, Vec<String>>,
+    pending_paper: HashMap<(u64, ExchangeSegment), Vec<String>>,
+    /// The local reconcile's working sets, kept between heartbeats (PR18).
+    reconcile_scratch: ReconcileScratch,
+    /// LF-6b: live paper fill exits a time-rolling OMS gate refused, resent
+    /// on the 1 s housekeeping tick (bounded by
+    /// `live_fill_arm::LIVE_FILL_EXIT_RETRY_CAPACITY`; emptied at the daily
+    /// reset).
+    live_fill_exit_retry: Vec<live_fill_arm::ExitRetry>,
 }
 
 impl BookState {
+    /// Hard ceiling on distinct security ids this book tracks per day.
+    ///
+    /// # Why this exists (added 2026-08-22)
+    ///
+    /// `mirror`, `tripwire` and `tripwire_reported` had no cap. The
+    /// `with_capacity` figures above are pre-sizes, not bounds, and the doc on
+    /// `tripwire` reasons about how small the set *should* stay -- a statement
+    /// about the caller, not a property of the code. `clear()` at the daily
+    /// reset was the only thing holding them, and the box being switched off
+    /// at 17:30 was the backstop behind that.
+    ///
+    /// `pending_paper` is deliberately NOT checked here: it is rebuilt from
+    /// scratch out of the OMS book on every order event, so capping
+    /// `OrderManagementSystem::MAX_TRACKED_ORDERS` bounds it transitively. A
+    /// second check would suggest a second source of growth that does not
+    /// exist.
+    ///
+    /// Refusal is the safe direction on THIS path, and only this path. The
+    /// tripwire's job is to make a cross-segment collision LOUD; a refused new
+    /// sid simply is not watched, and it is counted and logged rather than
+    /// dropped in silence. The fill itself still flows — `tripwire_ok` returns
+    /// `true` on refusal, because dropping a fill would hide a leg we hold.
+    ///
+    /// **AMENDED 2026-08-25 — this ceiling no longer touches the mirror.** It
+    /// did from 2026-08-22, and that was wrong: `risk.record_fill` is
+    /// unconditional, so a refused mirror key left risk holding a position the
+    /// mirror read as `0`, which `local_reconcile` reports as a permanent
+    /// divergence — manufacturing the exact signal the reconcile exists to
+    /// detect. The mirror gains a key only where risk gains one, so it is
+    /// bounded transitively by `RiskEngine::MAX_TRACKED_POSITIONS` and the
+    /// `PositionCapacityExhausted` halt that stops the inflow.
+    ///
+    /// Set to 25,000, matching every other per-entity ceiling in the
+    /// workspace.
+    const MAX_TRACKED_SIDS: usize = 25_000;
+
+    /// `true` when a NEW sid can still be admitted to the TRIPWIRE.
+    ///
+    /// Already-tracked sids are never refused: the check runs only where a
+    /// fresh key would be created.
+    ///
+    /// Counts the tripwire ALONE (2026-08-25). It used to take
+    /// `tripwire.len().max(mirror.len())`, which — now that the mirror grows
+    /// freely with risk — would let the mirror's size refuse tripwire slots
+    /// the tripwire has room for. Two maps with different growth axes need
+    /// their own bounds; conflating them is the mistake `oms/engine.rs`
+    /// already had to revert once.
+    fn can_admit_sid(&self, sid: u64) -> bool {
+        if self.tripwire.contains_key(&sid) {
+            return true;
+        }
+        let tracked = self.tripwire.len();
+        if tracked >= Self::MAX_TRACKED_SIDS {
+            metrics::counter!("tv_order_runtime_sid_refused_total").increment(1);
+            error!(
+                code = ErrorCode::RiskGapPositionPnl.code_str(),
+                security_id = sid,
+                tracked,
+                max = Self::MAX_TRACKED_SIDS,
+                "paper book is FULL - refusing a new security id for the segment \
+                 tripwire. Its fills are still recorded and mirrored; what is lost \
+                 is the I-P1-11 cross-segment check for this id today. Already \
+                 tracked ids are unaffected; cleared by the daily reset."
+            );
+            return false;
+        }
+        true
+    }
+
     fn new() -> Self {
         Self {
             mirror: HashMap::with_capacity(64),
             tripwire: HashMap::with_capacity(64),
             tripwire_reported: HashSet::with_capacity(8),
             pending_paper: HashMap::with_capacity(8),
+            reconcile_scratch: ReconcileScratch::default(),
+            live_fill_exit_retry: Vec::new(),
         }
     }
 
@@ -761,44 +1027,84 @@ impl BookState {
         self.tripwire.clear();
         self.tripwire_reported.clear();
         self.pending_paper.clear();
+        self.reconcile_scratch.clear();
+        self.live_fill_exit_retry.clear();
     }
 
     /// Rebuilds the sid → pending-PAPER-order index from the OMS book.
-    /// O(N_all_orders) + per-pending-id clones — COLD path (called on
+    /// O(active-set capacity + active orders) + per-pending-id clones (O(N_all_orders) until
+    /// 2026-11-23, audit plan PR6) — COLD path (called on
     /// order-mutating events only, never per mark). Honest trade-off: a
     /// full rebuild per order event beats maintaining incremental deltas
     /// across 6 mutation sites (drift there would silently kill fills).
     fn rebuild_pending_paper(&mut self, oms: &OrderManagementSystem) {
         self.pending_paper.clear();
-        for order in oms.all_orders().values() {
-            if !order.is_terminal() && order.order_id.starts_with("PAPER-") {
+        // O(active-set capacity + active orders): the OMS keeps the active keys beside its map, so
+        // the terminal orders of the day are not visited (audit plan PR6).
+        for order in oms.active_orders_iter() {
+            if order.order_id.starts_with("PAPER-") {
                 self.pending_paper
-                    .entry(order.security_id)
+                    .entry((order.security_id, order.exchange_segment))
                     .or_default()
                     .push(order.order_id.clone());
             }
         }
     }
 
-    /// O(1) per-mark check: does this sid have a pending paper order?
-    fn has_pending_paper(&self, sid: u64) -> bool {
+    /// O(1) per-mark check: does this composite instrument have a pending
+    /// paper order?
+    fn has_pending_paper(&self, sid: u64, segment: ExchangeSegment) -> bool {
         // Entries are inserted non-empty by construction (rebuild).
-        self.pending_paper.contains_key(&sid)
+        self.pending_paper.contains_key(&(sid, segment))
     }
 
-    /// Tripwire check: `true` = segment consistent (or unknown), proceed.
-    /// A DIVERGENT segment for a known sid → RISK-GAP-02 (edge-latched
-    /// `error!` once per sid per episode; counter per event) + `false`.
-    fn tripwire_ok(&mut self, sid: u64, segment_code: u8) -> bool {
+    /// Records the segment this numeric `security_id` was seen in, and reports
+    /// a cross-segment collision. ALWAYS returns — it never refuses an event.
+    ///
+    /// # What changed on 2026-08-29, and why the refusal is gone
+    /// This was `tripwire_ok`, and it returned `false` on a divergent segment
+    /// so the caller would DROP the fill. That was the correct call while the
+    /// risk engine was reached through its segment-less overloads: every fill
+    /// landed on `(sid, IdxI)` whatever its real segment, so admitting a second
+    /// segment meant a long in one and a short in another NETTING to zero in
+    /// one row — a position-limit check that approves an order actually in
+    /// breach, and a daily-loss halt measuring a fabricated number.
+    ///
+    /// Dropping the fill bought that safety at a price the risk engine's own
+    /// `MAX_TRACKED_POSITIONS` doc forbids paying: *"refusing a fill would hide
+    /// a leg we actually hold"*. And it hid it thoroughly — the OMS had already
+    /// advanced the order to PART_TRADED/TRADED before the drop, so the order
+    /// book believed the fill while the risk engine and the mirror never learned
+    /// it, and the caller discarded the `false` without a word.
+    ///
+    /// The callers now pass the segment through to `*_in_segment`, so the engine
+    /// keys the composite `(security_id, segment)` row the collision needed all
+    /// along. Two segments no longer net, so there is nothing left to refuse:
+    /// both legs are recorded, and this stays as the OBSERVABILITY of a real
+    /// data-quality signal — the same counter, the same edge-latched line.
+    ///
+    /// # Performance
+    /// O(1) — one hash lookup, plus one insert on a sid's first sighting.
+    fn observe_segment(&mut self, sid: u64, segment_code: u8) {
         if segment_code == SEGMENT_CODE_UNKNOWN {
-            return true;
+            return;
         }
         match self.tripwire.get(&sid) {
             None => {
-                self.tripwire.insert(sid, segment_code);
-                true
+                // 2026-08-22: refuse a NEW sid once the book is full. Counted
+                // and logged in `can_admit_sid`, never silent. What is refused
+                // is the permanent per-sid observability slot, never the event
+                // — and since 2026-08-29 never the fill either, because the
+                // engine's composite key no longer depends on this map being
+                // complete. Before that it did, and a full book therefore
+                // turned this into a permanent blind spot for every new sid:
+                // an un-inserted sid re-entered this same arm on every later
+                // event, so its cross-segment fills netted unchecked.
+                if self.can_admit_sid(sid) {
+                    self.tripwire.insert(sid, segment_code);
+                }
             }
-            Some(&first) if first == segment_code => true,
+            Some(&first) if first == segment_code => {}
             Some(&first) => {
                 // HP-3/E3: counter EVERY event; error! on the RISING EDGE
                 // only — a colliding sid ticking 1-4/s for hours must never
@@ -811,13 +1117,13 @@ impl BookState {
                         first_seen_segment = first,
                         conflicting_segment = segment_code,
                         reason = "sid_segment_collision",
-                        "RISK-GAP-02: cross-segment security_id collision — skipping \
-                         this and every further divergent event for this sid today \
-                         (counted per event; logged once per episode). I-P1-11; the \
-                         composite-key rewrite is the mandatory pre-live follow-up"
+                        "RISK-GAP-02: cross-segment security_id collision — BOTH legs \
+                         are recorded against their own composite (security_id, \
+                         segment) row and do NOT net (counted per event; logged once \
+                         per episode). I-P1-11. Until 2026-08-29 the divergent leg was \
+                         dropped here instead; it no longer is"
                     );
                 }
-                false
             }
         }
     }
@@ -901,7 +1207,16 @@ fn emit_leg_pnl(
     if !LEG_PNL_FNO_SEGMENT_CODES.contains(&segment_code) {
         return;
     }
-    let Some(pos) = risk.position(security_id) else {
+    // Read the position from the leg's OWN composite row. Until 2026-08-29
+    // this was `risk.position(security_id)`, which resolves to `(sid, IdxI)` —
+    // so an NSE_FNO leg's P&L row was stamped `segment_code = 2` while its
+    // numbers came from an IdxI row. Those two agreed only because the fill
+    // side was equally segment-blind; the moment fills became composite this
+    // read had to move with them, or every FNO leg would silently emit nothing.
+    let Some(leg_segment) = ExchangeSegment::from_byte(segment_code) else {
+        return;
+    };
+    let Some(pos) = risk.position_in_segment(security_id, leg_segment) else {
         return;
     };
     let event = LegPnlEvent {
@@ -953,37 +1268,70 @@ fn apply_fill(
     leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
 ) -> bool {
     // S2 (fix-round 2026-07-14): a fill whose segment chars were UNMAPPABLE
-    // cannot be partition-checked — treating UNKNOWN as compatible-with-
-    // everything was the exact tripwire bypass. Refuse the fill (loud);
-    // every legitimate dry-run fill round-trips a known segment.
-    if fill.segment_code == SEGMENT_CODE_UNKNOWN {
+    // was refused here because it could not be partition-checked. The reason
+    // has changed, the refusal has not — see below.
+    // The segment is resolved ONCE here and carried into the engine, so the
+    // position lands on its real composite `(security_id, segment)` row.
+    //
+    // `from_byte` rather than a `!= SEGMENT_CODE_UNKNOWN` compare: the sentinel
+    // is `u8::MAX`, and the Dhan annexure has a GAP at code 6 — so a `6` passed
+    // the old inequality and was then keyed as if it were a real segment. There
+    // is exactly one definition of "mappable", and this is it.
+    let Some(fill_segment) = ExchangeSegment::from_byte(fill.segment_code) else {
         error!(
             code = ErrorCode::RiskGapPositionPnl.code_str(),
             security_id = fill.security_id,
             order_id = %log_safe_id(&fill.order_id),
+            segment_code = fill.segment_code,
             reason = "unknown_segment_fill",
             "RISK-GAP-02: fill with an UNMAPPABLE exchange/segment refused — \
-             it would bypass the I-P1-11 tripwire partition check"
+             it cannot be keyed on the I-P1-11 composite (security_id, segment)"
         );
         metrics::counter!("tv_oms_unknown_segment_fills_refused_total").increment(1);
         return false;
-    }
-    if !book.tripwire_ok(fill.security_id, fill.segment_code) {
-        return false;
-    }
-    risk.record_fill(
+    };
+    book.observe_segment(fill.security_id, fill.segment_code);
+    risk.record_fill_in_segment(
         fill.security_id,
+        fill_segment,
         fill.fill_lots,
         fill.avg_price,
         fill.lot_size,
     );
-    *book.mirror.entry(fill.security_id).or_insert(0) += i64::from(fill.fill_lots);
-    let kind = if fill.order_id.starts_with("PAPER-") {
-        "paper"
+    // 2026-08-25 — the `can_admit_sid` gate that sat here from 2026-08-22 is
+    // REMOVED, because it manufactured the exact divergence the reconcile
+    // exists to detect.
+    //
+    // `risk.record_fill` above is UNCONDITIONAL — deliberately, per
+    // `RiskEngine::MAX_TRACKED_POSITIONS`: refusing a fill would hide a leg we
+    // actually hold. So past the ceiling risk held the position while the
+    // mirror was refused a key, and `local_reconcile` reads a missing mirror
+    // key as `0` against a non-zero `net_lots_for` — a PERMANENT self-inflicted
+    // divergence for the rest of the day, firing OMS-GAP-02 on every reconcile
+    // cycle and raising a floor that would mask a genuinely lost fill.
+    //
+    // It also broke the invariant this file states at `LocalReconcileReport`:
+    // "mirror + risk are mutated together in `apply_fill`" — the property leg 1
+    // depends on for its meaning.
+    //
+    // The mirror needs no independent bound. It gains a key ONLY where risk
+    // gains one, so it is bounded transitively at `MAX_TRACKED_POSITIONS +
+    // in-flight`, and risk halts with `PositionCapacityExhausted` at the
+    // ceiling, which stops the inflow. `can_admit_sid` still bounds the
+    // tripwire, whose growth axis is different (every cadence-fetched contract
+    // id, fill or no fill).
+    *book
+        .mirror
+        .entry((fill.security_id, fill_segment))
+        .or_insert(0) += i64::from(fill.fill_lots);
+    // Literal labels on both arms: a non-literal label value sends the macro
+    // down its allocating arm (a label `Vec` per fill, 2026-10-30). Same
+    // metric name and labels as before.
+    if fill.order_id.starts_with("PAPER-") {
+        metrics::counter!("tv_risk_fills_recorded_total", "kind" => "paper").increment(1);
     } else {
-        "live"
-    };
-    metrics::counter!("tv_risk_fills_recorded_total", "kind" => kind).increment(1);
+        metrics::counter!("tv_risk_fills_recorded_total", "kind" => "live").increment(1);
+    }
     emit_leg_pnl(
         leg_pnl_tx,
         risk,
@@ -1001,6 +1349,15 @@ async fn run_order_runtime(
     ctx: RuntimeCtx,
     mut order_rx: broadcast::Receiver<OrderUpdate>,
     mark_rx_shared: Arc<tokio::sync::Mutex<mpsc::Receiver<MarkUpdate>>>,
+    live_fill_shared: Option<
+        Arc<
+            tokio::sync::Mutex<
+                tickvault_core::websocket::frame_ring::FrameRingReceiver<
+                    crate::live_fill::chain::PaperCmd,
+                >,
+            >,
+        >,
+    >,
 ) {
     let config = &ctx.config;
     // ---- Construction (the proven trading_pipeline template) ----
@@ -1011,7 +1368,14 @@ async fn run_order_runtime(
     // subsides. Never a panic/abort for a dry-run client that issues no
     // HTTP (the pre-fix `.unwrap_or_default()` aborted the WHOLE process,
     // REST capture legs included, under `panic = "abort"`).
-    let Ok(http_client) = build_oms_http_client() else {
+    // No-rest rule §12.16 (default OFF): with the order-host pre-warm on, the
+    // client shares its TLS session store with the 09:14 pre-warm.
+    let built = crate::order_prewarm::order_runtime_http_client(
+        config.order_runtime.prewarm_order_connection,
+        &config.dhan.rest_api_base_url,
+        Arc::clone(&ctx.calendar),
+    );
+    let Ok(http_client) = built else {
         return;
     };
     let api_client = OrderApiClient::new(
@@ -1041,7 +1405,16 @@ async fn run_order_runtime(
 
     let mut book = BookState::new();
     let mut self_test = SelfTestState::new();
+    // UTC-SAFETY: the edge log and gauge of the trade-safety switch, on this
+    // 1 s tick (never the frame drain).
+    let mut safety_edge = crate::trade_safety::EdgePublisher::new();
     let mut mark_rx = mark_rx_shared.lock().await;
+    // LF-6b: held for this run's lifetime, released on a respawn.
+    let mut live_fill_rx = match live_fill_shared.as_ref() {
+        Some(m) => Some(m.lock().await),
+        None => None,
+    };
+    let mut live_fill_open = live_fill_rx.is_some();
 
     let reconcile_interval = config.order_runtime.reconcile_interval_secs.max(60);
     let mut next_reconcile =
@@ -1052,7 +1425,7 @@ async fn run_order_runtime(
     // DELTA rather than re-reporting a cumulative total forever.
     let mut marks_dropped_reported: u64 = 0;
     // Fix F (2026-07-17 respawn flap): the mark producers are DAY-SCOPED —
-    // the Groww per-minute REST legs' supervisors exit at day completion
+    // the DHAN per-minute REST legs' supervisors exit at day completion
     // ("day complete — supervisor exiting", ~15:31 IST after the
     // post-session sweep) and drop the last MarkForwarder clones, CLOSING
     // the mark mpsc for the rest of the process lifetime. That is a
@@ -1080,7 +1453,7 @@ async fn run_order_runtime(
         paper_fill = config.order_runtime.paper_fill,
         self_test = config.order_runtime.self_test,
         reconcile_interval_secs = reconcile_interval,
-        "order runtime started (paper book live — order updates + Groww marks now \
+        "order runtime started (paper book live — order updates + Dhan marks now \
          reach the OMS/RiskEngine; alert sinks wired). Paper book starts EMPTY: \
          paper fills are in-RAM only, so a restart zeroes paper positions + day \
          P&L (socket-free shape: no order-event frames are captured or replayed)"
@@ -1118,6 +1491,12 @@ async fn run_order_runtime(
                         } else {
                             warn!(skipped, "order runtime receiver lagged — events skipped");
                         }
+                        // PR14 (2026-10-11): check the book now rather than at
+                        // the next heartbeat (up to `reconcile_interval_secs`
+                        // later). The order-fold leg flags a skipped fill of a
+                        // tracked order; the reconcile is not gated on market
+                        // hours here, since a lag is itself the signal.
+                        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Structurally unreachable (the supervisor holds a
@@ -1199,10 +1578,32 @@ async fn run_order_runtime(
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
             }
 
+            // ---- Arm 2b (LF-6b): live paper fill commands (dry-run only) ----
+            cmd = live_fill_arm::recv_live_fill(&mut live_fill_rx), if live_fill_open => {
+                match cmd {
+                    Some(cmd) => {
+                        // LF-9 finding 4: a Mark changes no order and no
+                        // position, so it skips the O(orders) republish scan
+                        // (one per marked second per traded instrument).
+                        let changes_orders = live_fill_arm::handle_live_fill_cmd(
+                            &mut oms, &mut risk, &mut book, &ctx, cmd,
+                        )
+                        .await;
+                        if changes_orders {
+                            republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                        }
+                    }
+                    None => {
+                        warn!("order runtime: live paper fill channel closed — arm disarmed");
+                        live_fill_open = false;
+                    }
+                }
+            }
+
             // ---- Arm 3: one-shot reconcile on first WS auth ----
             _ = ctx.auth_notify.notified() => {
                 info!("order runtime: order-update WS authenticated — running reconcile cycle");
-                run_reconcile_cycle(&mut oms, &risk, &book).await;
+                run_reconcile_cycle(&mut oms, &risk, &mut book).await;
             }
 
             // ---- Arm 4: 1s housekeeping (timers ride one cold tick) ----
@@ -1219,7 +1620,7 @@ async fn run_order_runtime(
                     if reconcile_window_ok(secs_of_day)
                         && ctx.calendar.is_trading_day_today()
                     {
-                        run_reconcile_cycle(&mut oms, &risk, &book).await;
+                        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
                         // Rides the SAME market-hours + trading-day gate as
                         // the reconcile (audit Rule 3): a drop outside the
                         // session is not an operator signal, and reporting
@@ -1231,6 +1632,14 @@ async fn run_order_runtime(
 
                 // Mark-to-market halt backstop (marks may be idle).
                 risk.evaluate_daily_loss_halt();
+
+                // LF-6b: paper exits a rate or budget gate refused, sent
+                // again (O(1) when none wait).
+                live_fill_arm::retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+
+                // Placement-duration buckets to `/metrics` (cold, O(14) loads, a
+                // no-op when nothing was placed this second).
+                oms.publish_placement_latency();
 
                 // 15:30 IST close sweep: cancel pending paper orders.
                 // Trading-day gated like the reconcile scheduler above —
@@ -1269,9 +1678,13 @@ async fn run_order_runtime(
                 // cleanup cancels the outstanding self-test order).
                 drive_self_test_timers(
                     &mut self_test, &ctx, &mut oms, &risk, &mut book, secs_of_day, today,
-                    config.order_runtime.self_test,
+                    SelfTestGates {
+                        enabled: config.order_runtime.self_test,
+                        marks_available: mark_channel_open,
+                    },
                 ).await;
                 republish_marks_wanted(&ctx.marks_wanted, &oms, &risk, &self_test);
+                safety_edge.tick(ctx.safety, today);
             }
         }
     }
@@ -1344,14 +1757,22 @@ async fn process_mark(
     paper_fill: bool,
     leg_pnl_tx: Option<&mpsc::Sender<LegPnlEvent>>,
 ) {
-    if !book.tripwire_ok(mark.security_id, mark.segment_code) {
+    // A mark whose segment is unmappable cannot address a composite position
+    // row, so it is dropped here rather than silently marking `(sid, IdxI)` —
+    // which is what the segment-less overload did for EVERY mark until
+    // 2026-08-29, whatever segment the mark actually carried.
+    let Some(mark_segment) = ExchangeSegment::from_byte(mark.segment_code) else {
+        metrics::counter!("tv_order_runtime_unmappable_segment_marks_total").increment(1);
         return;
-    }
-    // C14: shortest-decimal widening — plain `f64::from(f32)` carries the
-    // IEEE 754 artifact (10.2f32 → 10.19999980926514) into every paper
-    // fill price and P&L log line. Cold path (the runtime side, not the
-    // bridge tap).
-    let price = tickvault_common::price_precision::f32_to_f64_clean(mark.price);
+    };
+    book.observe_segment(mark.security_id, mark.segment_code);
+    // No widening step: the mark is `f64` end to end. Until 2026-08-23 this
+    // read `f32_to_f64_clean(mark.price)` — correct for an f32 field (plain
+    // `f64::from` carries the IEEE 754 artifact, 10.2f32 → 10.19999980926514,
+    // into every paper fill and P&L line) and pointless once the field stopped
+    // being f32. The C14 rule it served still binds wherever an f32 genuinely
+    // arrives from a wire.
+    let price = mark.price;
 
     // Self-test sid pick: the first usable INDEX-SPOT mark starts the
     // cycle. E4: restricted to IDX_I (segment 0) — index spots tick ~1/s,
@@ -1363,21 +1784,33 @@ async fn process_mark(
         && price.is_finite()
         && price > 0.0
     {
-        start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
-        // HP-2: the entry placement changed the pending set.
-        book.rebuild_pending_paper(oms);
+        // Gate D, second half (UTC-SAFETY): the alarm fired after the cycle
+        // armed. The entry is not placed; the day is skipped, not failed. A
+        // cycle already past its entry finishes (its close is an exit).
+        // The mark still prices positions below (no early return).
+        let today = crate::trade_safety::ist_day_now();
+        if ctx.safety.blocked_on(today).is_some() {
+            self_test.skip_with(today, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        } else {
+            start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
+            // HP-2: the entry placement changed the pending set.
+            book.rebuild_pending_paper(oms);
+        }
     }
 
     // Runtime-side filter: only sids with a position or a pending paper
     // order reach the risk engine's market_prices map (keeps it small).
     // HP-2: both checks are O(1) lookups — NO per-mark scan/alloc over the
     // whole order book (the pending index is rebuilt on order events).
-    let has_position = risk.net_lots_for(mark.security_id) != 0;
-    let has_pending_paper = book.has_pending_paper(mark.security_id);
+    // Composite lookups (audit M7): a position or pending order on another
+    // segment of the same numeric id is a different instrument and must not
+    // admit this mark.
+    let has_position = risk.net_lots_for_in_segment(mark.security_id, mark_segment) != 0;
+    let has_pending_paper = book.has_pending_paper(mark.security_id, mark_segment);
     if !(has_position || has_pending_paper) {
         return;
     }
-    risk.update_market_price(mark.security_id, price);
+    risk.update_market_price_in_segment(mark.security_id, mark_segment, price);
     emit_leg_pnl(
         leg_pnl_tx,
         risk,
@@ -1390,13 +1823,19 @@ async fn process_mark(
     // Next-mark paper filler (F12 fill-once: the pending index holds
     // non-terminal PAPER orders only, and a filled order goes terminal
     // Traded + drops out on the rebuild).
+    // `pending_paper` is keyed on the composite `(security_id, segment)` since
+    // audit M7 (2026-10-04), so a mark on a DIFFERENT segment of the same
+    // numeric id finds no pending order here and cannot fill one placed on
+    // another segment (`synthesize_paper_fill` stamps the MARK's segment).
+    // Until then the index was bare-sid and `segment_matches_first_seen`
+    // closed that path; the key now closes it by construction.
     if paper_fill && oms.is_dry_run() && has_pending_paper {
-        // Cold branch by construction (only reached when THIS sid has a
-        // pending paper order); the id Vec clone is bounded by that sid's
-        // pending count (1-2 in practice — self-test legs).
+        // Cold branch by construction (only reached when THIS instrument has
+        // a pending paper order); the id Vec clone is bounded by its pending
+        // count (1-2 in practice — self-test legs).
         let pending: Vec<String> = book
             .pending_paper
-            .get(&mark.security_id)
+            .get(&(mark.security_id, mark_segment))
             .cloned()
             .unwrap_or_default();
         for order_id in pending {
@@ -1521,10 +1960,14 @@ fn report_marks_dropped(marks_dropped: &AtomicU64, last_reported: &mut u64) {
     );
 }
 
-async fn run_reconcile_cycle(oms: &mut OrderManagementSystem, risk: &RiskEngine, book: &BookState) {
+async fn run_reconcile_cycle(
+    oms: &mut OrderManagementSystem,
+    risk: &RiskEngine,
+    book: &mut BookState,
+) {
     if oms.is_dry_run() {
         metrics::counter!("tv_oms_reconcile_runs_total", "mode" => "paper_noop").increment(1);
-        let report = local_reconcile(oms, risk, &book.mirror);
+        let report = local_reconcile(oms, risk, &book.mirror, &mut book.reconcile_scratch);
         if report.divergences > 0 || report.order_fold_divergences > 0 {
             error!(
                 code = ErrorCode::OmsGapReconciliation.code_str(),
@@ -1629,7 +2072,12 @@ fn perform_daily_reset(
 /// all day for the ghost). Report it loudly — the position still shows in
 /// every reconcile heartbeat and is cleared by the 16:00 reset.
 fn report_dangling_self_test_position(risk: &RiskEngine, sid: u64, stage: &'static str) {
-    let net = risk.net_lots_for(sid);
+    // The self-test places and closes on an IDX_I mark only (see the E4 gate in
+    // `process_mark`), so the composite row it touches is `(sid, IdxI)`. Naming
+    // that segment explicitly is what makes this correct rather than merely
+    // lucky: the legacy `net_lots_for` read the same row, but only because its
+    // hardcoded default happened to be the one the self-test uses.
+    let net = risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI);
     if net != 0 {
         error!(
             code = ErrorCode::OmsGapDryRunSafety.code_str(),
@@ -1641,6 +2089,17 @@ fn report_dangling_self_test_position(risk: &RiskEngine, sid: u64, stage: &'stat
              (visible in every reconcile heartbeat)"
         );
     }
+}
+
+/// The two switches that decide whether the daily self-test may arm this
+/// tick. Bundled so the timer driver stays under the argument budget.
+#[derive(Debug, Clone, Copy)]
+struct SelfTestGates {
+    /// `[order_runtime] self_test` — the operator switch.
+    enabled: bool,
+    /// The mark channel still has a producer. When it has closed, arming
+    /// would only wait out the timeout, so the day is skipped instead.
+    marks_available: bool,
 }
 
 /// Housekeeping-tick half: arm the daily cycle when gates pass; time out a
@@ -1656,12 +2115,22 @@ async fn drive_self_test_timers(
     book: &mut BookState,
     secs_of_day: u32,
     today: i64,
-    enabled: bool,
+    gates: SelfTestGates,
 ) {
+    let SelfTestGates {
+        enabled,
+        marks_available,
+    } = gates;
     // Timeout first: a stuck cycle fails loudly + latches for the day.
     if self_test.phase != SelfTestPhase::Idle
         && self_test.started_at.elapsed() > Duration::from_secs(SELF_TEST_TIMEOUT_SECS)
     {
+        // No mark ever arrived: nothing was placed, so nothing failed. The
+        // machinery was simply never exercised — say so without paging.
+        if self_test.phase == SelfTestPhase::AwaitingMark {
+            self_test.skip(today, "no_mark");
+            return;
+        }
         // C6 cleanup: cancel the outstanding self-test order so the filler
         // can never fill it after the state machine stopped watching.
         let outstanding = match &self_test.phase {
@@ -1690,7 +2159,21 @@ async fn drive_self_test_timers(
     {
         return;
     }
-    info!("paper self-test armed — waiting for the first Groww mark to pick a sid");
+    // Gate D (UTC-SAFETY, §28.7): the self-test places an ENTRY, so on a day
+    // the feed-time alarm is on it is skipped, never failed. Seeds today from
+    // the markers once a day (the drain may be gone). Cold.
+    crate::trade_safety::ensure_seeded(ctx.safety, today);
+    if ctx.safety.blocked_on(today).is_some() {
+        self_test.skip_with(today, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        return;
+    }
+    if !marks_available {
+        // The mark channel is closed (no producer): arming would only wait out
+        // the timeout. Skip once for the day instead.
+        self_test.skip(today, "skipped_no_marks");
+        return;
+    }
+    info!("paper self-test armed — waiting for the first Dhan mark to pick a sid");
     self_test.phase = SelfTestPhase::AwaitingMark;
     self_test.started_at = std::time::Instant::now();
 }
@@ -1705,6 +2188,7 @@ async fn start_self_test_entry(
 ) {
     let request = PlaceOrderRequest {
         security_id: sid,
+        exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
         transaction_type: TransactionType::Buy,
         order_type: OrderType::Market,
         product_type: ProductType::Intraday,
@@ -1748,7 +2232,8 @@ async fn advance_self_test_on_fill(
     match &self_test.phase {
         SelfTestPhase::AwaitingEntryFill { order_id, sid } if order_id == filled_order_id => {
             let sid = *sid;
-            if risk.net_lots_for(sid) == 0 {
+            // IDX_I by the E4 self-test gate — see `report_dangling_self_test_position`.
+            if risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI) == 0 {
                 self_test.fail(today, "entry_fill_net_lots_zero");
                 return;
             }
@@ -1761,6 +2246,7 @@ async fn advance_self_test_on_fill(
             // Place the close (opposite side, same 1-lot size).
             let request = PlaceOrderRequest {
                 security_id: sid,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Sell,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -1791,7 +2277,8 @@ async fn advance_self_test_on_fill(
         }
         SelfTestPhase::AwaitingCloseFill { order_id, sid } if order_id == filled_order_id => {
             let sid = *sid;
-            let flat = risk.net_lots_for(sid) == 0;
+            // IDX_I by the E4 self-test gate — see `report_dangling_self_test_position`.
+            let flat = risk.net_lots_for_in_segment(sid, ExchangeSegment::IdxI) == 0;
             let pnl_finite = risk.total_realized_pnl().is_finite();
             if flat && pnl_finite {
                 info!(
@@ -1890,6 +2377,9 @@ mod tests {
             client_id: "100".to_string(),
             auth_notify: Arc::new(Notify::new()),
             leg_pnl_tx: None,
+            live_fill_events: None,
+            live_fill_positions: None,
+            safety: crate::trade_safety::default_switch(),
         }
     }
 
@@ -1914,6 +2404,7 @@ mod tests {
     ) -> String {
         oms.place_order(PlaceOrderRequest {
             security_id: sid,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2030,11 +2521,27 @@ mod tests {
     }
 
     /// MarkUpdate stays a small Copy payload (the zero-alloc contract).
+    ///
+    /// The bound moved 16 → 24 on 2026-08-23 when `price` widened `f32` → `f64`
+    /// (ITEM 11b): `u64 + u8 + f64` pads to 24. What this test protects is the
+    /// CONTRACT — a `Copy` payload small enough to pass by value with no heap
+    /// behind it — and that is intact; only the byte count moved, and it moved
+    /// for a reason recorded at the field.
+    ///
+    /// The cost is measured, not waved through. The mark channel is bounded at
+    /// `mark_channel_capacity` (default 8,192, config max 65,536), so 8 extra
+    /// bytes per slot is +64 KiB at the default and +512 KiB at the ceiling —
+    /// against a 32 GiB host, and against the alternative of narrowing every
+    /// price to f32 and back on a path that is f64 at both ends.
     #[test]
     fn test_mark_update_is_copy_and_small() {
         fn assert_copy<T: Copy>() {}
         assert_copy::<MarkUpdate>();
-        assert!(std::mem::size_of::<MarkUpdate>() <= 16);
+        assert!(
+            std::mem::size_of::<MarkUpdate>() <= 24,
+            "MarkUpdate is {} bytes — it must stay a small by-value payload",
+            std::mem::size_of::<MarkUpdate>()
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2055,11 +2562,55 @@ mod tests {
         };
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
         assert_eq!(risk.net_lots_for(13), 2, "fill must reach the risk engine");
-        assert_eq!(book.mirror.get(&13), Some(&2));
+        assert_eq!(book.mirror.get(&(13, ExchangeSegment::IdxI)), Some(&2));
     }
 
+    /// 2026-10-30: `tv_risk_fills_recorded_total` moved from a label variable
+    /// to one literal label per arm. Under the production recorder a PAPER-
+    /// fill must count as `kind="paper"` and any other as `kind="live"`.
     #[test]
-    fn test_sid_segment_collision_skips_and_errors() {
+    fn test_apply_fill_counts_paper_and_live_under_their_literal_labels() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut risk = make_risk();
+            let mut book = BookState::new();
+            for (order_id, lots) in [("PAPER-1", 1), ("PAPER-2", 1), ("1234567", -1)] {
+                let fill = FillEvent {
+                    security_id: 13,
+                    segment_code: 0,
+                    fill_lots: lots,
+                    avg_price: 100.0,
+                    lot_size: 25,
+                    order_id: order_id.to_owned(),
+                };
+                assert!(apply_fill(&mut risk, &mut book, &fill, None));
+            }
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("tv_risk_fills_recorded_total{kind=\"paper\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("tv_risk_fills_recorded_total{kind=\"live\"} 1"),
+            "{rendered}"
+        );
+    }
+    /// I-P1-11 BITE TEST (2026-08-29): a long in one segment and a short in
+    /// another, on the SAME numeric id, must not net.
+    ///
+    /// Until 2026-08-29 the second fill was DROPPED here — the position we
+    /// actually held simply never reached the engine, which the engine's own
+    /// `MAX_TRACKED_POSITIONS` doc forbids. It was dropped because both fills
+    /// would otherwise have landed on `(27, IdxI)` and cancelled out. Now they
+    /// land on their own composite rows, so both are recorded AND neither
+    /// cancels the other.
+    ///
+    /// Revert `record_fill_in_segment` to `record_fill` here and this test
+    /// fails on the `net_lots_for_in_segment` assertions: both rows read 0.
+    #[test]
+    fn a_long_and_a_short_on_one_id_in_two_segments_do_not_net() {
         let mut risk = make_risk();
         let mut book = BookState::new();
         let fill_a = FillEvent {
@@ -2073,27 +2624,144 @@ mod tests {
         let fill_b = FillEvent {
             security_id: 27,
             segment_code: 1, // NSE_EQ — the FINNIFTY id=27 collision class
-            fill_lots: 1,
+            fill_lots: -1,   // SHORT — nets to zero against fill_a if both share a row
             avg_price: 200.0,
             lot_size: 1,
             order_id: "PAPER-2".to_string(),
         };
         assert!(apply_fill(&mut risk, &mut book, &fill_a, None));
         assert!(
-            !apply_fill(&mut risk, &mut book, &fill_b, None),
-            "a divergent segment for a known sid must be SKIPPED (loud), \
-             never silently merged into the same position"
+            apply_fill(&mut risk, &mut book, &fill_b, None),
+            "the divergent-segment leg is a position we ACTUALLY HOLD — it must \
+             be recorded, not dropped"
         );
-        assert_eq!(risk.net_lots_for(27), 1, "second fill must not apply");
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::IdxI),
+            1,
+            "the IDX_I leg keeps its own long"
+        );
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::NseEquity),
+            -1,
+            "the NSE_EQ leg keeps its own short — this reads 0 if the fills \
+             collapse into one row"
+        );
+        assert_eq!(
+            risk.net_lots_for_any_segment(27),
+            0,
+            "the BARE-SID sum is 0 — which is exactly why the reconcile's \
+             bare-sid legs cannot see a cross-segment mis-booking, and why the \
+             position limit must never be checked on this number"
+        );
+        assert!(
+            book.tripwire_reported.contains(&27),
+            "the collision is still REPORTED — disarming the refusal did not \
+             disarm the signal"
+        );
+    }
+
+    /// BITE TEST: a mark on segment B must not fill a paper order placed on
+    /// segment A, because `synthesize_paper_fill` stamps the fill with the
+    /// MARK's segment and would book the position to the wrong composite row.
+    ///
+    /// Since audit M7 (2026-10-04) `ManagedOrder` records its segment and
+    /// `pending_paper` is keyed on `(security_id, segment)`, so the KEY keeps
+    /// this path shut. The sid is deliberately NOT pre-observed on any segment:
+    /// the old `segment_matches_first_seen` gate relied on that observation,
+    /// and the key must hold without it. Key `pending_paper` on the bare sid
+    /// again and this test fails: the NSE_EQ mark fills the IDX_I order.
+    #[tokio::test]
+    async fn a_mark_on_another_segment_must_not_fill_a_pending_paper_order() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+
+        let order_id = oms
+            .place_order(PlaceOrderRequest {
+                security_id: 27,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
+                transaction_type: TransactionType::Buy,
+                order_type: OrderType::Market,
+                product_type: ProductType::Intraday,
+                validity: OrderValidity::Day,
+                quantity: 1,
+                price: 0.0,
+                trigger_price: 0.0,
+                lot_size: 1,
+                expiry_date: None,
+            })
+            .await
+            .expect("paper placement never fails"); // APPROVED: test
+        book.rebuild_pending_paper(&oms);
+        assert!(book.has_pending_paper(27, ExchangeSegment::IdxI));
+        assert!(
+            !book.has_pending_paper(27, ExchangeSegment::NseEquity),
+            "the pending index is per composite instrument"
+        );
+
+        // A mark for the SAME numeric id on a DIFFERENT segment.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 27,
+                segment_code: 1, // NSE_EQ — the documented id=27 collision class
+                price: 500.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            oms.order(&order_id).map(|o| o.traded_qty),
+            Some(0),
+            "an NSE_EQ mark must NOT fill an IDX_I order"
+        );
+        assert_eq!(
+            risk.net_lots_for_any_segment(27),
+            0,
+            "and no position may be booked on any segment"
+        );
+
+        // The order's OWN segment still fills it — the key blocks the wrong
+        // segment, it does not break the right one.
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 27,
+                segment_code: 0,
+                price: 500.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            risk.net_lots_for_in_segment(27, ExchangeSegment::IdxI),
+            1,
+            "the matching segment fills normally"
+        );
     }
 
     #[test]
-    fn test_tripwire_unknown_segment_is_compatible() {
+    fn test_unknown_segment_never_poisons_first_seen() {
         let mut book = BookState::new();
-        assert!(book.tripwire_ok(13, SEGMENT_CODE_UNKNOWN));
-        assert!(book.tripwire_ok(13, 0), "unknown never poisons first-seen");
-        assert!(book.tripwire_ok(13, SEGMENT_CODE_UNKNOWN));
-        assert!(!book.tripwire_ok(13, 2), "real divergence still trips");
+        book.observe_segment(13, SEGMENT_CODE_UNKNOWN);
+        assert!(
+            !book.tripwire.contains_key(&13),
+            "an unknown code must not become the first-seen segment"
+        );
+        book.observe_segment(13, 0);
+        assert_eq!(book.tripwire.get(&13), Some(&0));
     }
 
     // -------------------------------------------------------------------
@@ -2105,6 +2773,7 @@ mod tests {
             order_id: order_id.to_string(),
             correlation_id: "corr".to_string(),
             security_id: 13,
+            exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -2177,14 +2846,108 @@ mod tests {
             .flatten()
             .expect("fill event"); // APPROVED: test
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
-        let ok = local_reconcile(&oms, &risk, &book.mirror);
+        let ok = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(ok.sids_checked, 1);
         assert_eq!(ok.divergences, 0, "mirror==net_lots after a clean fill");
         assert_eq!(ok.order_fold_divergences, 0, "order fold matches too");
         // Poison the mirror → the mirror leg must flag it.
-        book.mirror.insert(13, 99);
-        let bad = local_reconcile(&oms, &risk, &book.mirror);
+        book.mirror.insert((13, ExchangeSegment::IdxI), 99);
+        let bad = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(bad.divergences, 1, "a poisoned mirror must be flagged");
+    }
+
+    /// Audit PR18 (plan row 213): the reconcile's working sets are kept
+    /// between runs. A reused scratch gives the same verdict as a fresh one,
+    /// carries nothing over from the previous run, and keeps its capacity,
+    /// so a later run over a book no larger allocates nothing.
+    #[tokio::test]
+    async fn test_local_reconcile_reuses_its_working_sets_between_runs() {
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        for sid in [13_u64, 25, 51] {
+            let order_id = place_paper(&mut oms, sid, TransactionType::Buy).await;
+            let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+            let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+            let fill = oms
+                .handle_order_update(&synthetic)
+                .ok()
+                .flatten()
+                .expect("fill event"); // APPROVED: test
+            assert!(apply_fill(&mut risk, &mut book, &fill, None));
+        }
+        let mut scratch = ReconcileScratch::default();
+        let first = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        let keys_capacity = scratch.keys.capacity();
+        let folded_capacity = scratch.folded.capacity();
+        assert_eq!(first.sids_checked, 3);
+        assert_eq!(first.divergences + first.order_fold_divergences, 0);
+
+        // A divergence in one run must not leak into the next.
+        book.mirror.insert((13, ExchangeSegment::IdxI), 99);
+        let poisoned = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        assert_eq!(poisoned.divergences, 1);
+        book.mirror.insert((13, ExchangeSegment::IdxI), 1);
+        let again = local_reconcile(&oms, &risk, &book.mirror, &mut scratch);
+        assert_eq!(
+            again, first,
+            "a reused scratch gives the fresh-scratch verdict"
+        );
+        assert_eq!(
+            again,
+            local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default())
+        );
+        assert_eq!(scratch.keys.capacity(), keys_capacity, "kept, not regrown");
+        assert_eq!(
+            scratch.folded.capacity(),
+            folded_capacity,
+            "kept, not regrown"
+        );
+
+        // The daily reset empties the book and its scratch.
+        book.clear();
+        assert!(book.reconcile_scratch.keys.is_empty());
+        assert!(book.reconcile_scratch.folded.is_empty());
+    }
+
+    /// Audit M7 (2026-10-04): a fill booked to the WRONG segment of the same
+    /// numeric id is now a divergence. The order is placed on IDX_I; its fill
+    /// arrives stamped NSE_EQ, so risk and the mirror book it to `(13, NSE_EQ)`.
+    /// The order fold puts it on `(13, IDX_I)`, so both rows disagree.
+    ///
+    /// The old bare-sid reconcile summed every segment of id 13 on both sides
+    /// (1 == 1) and reported zero divergences; key the order fold on the bare
+    /// sid again and this test fails.
+    #[tokio::test]
+    async fn test_local_reconcile_catches_a_fill_booked_to_the_wrong_segment() {
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        assert_eq!(order.exchange_segment, ExchangeSegment::IdxI);
+        // Segment code 1 = NSE_EQ: the fill names another instrument.
+        let synthetic = synthesize_paper_fill(&order, 100.0, 1).expect("fill"); // APPROVED: test
+        let fill = oms
+            .handle_order_update(&synthetic)
+            .ok()
+            .flatten()
+            .expect("fill event"); // APPROVED: test
+        assert!(apply_fill(&mut risk, &mut book, &fill, None));
+        assert_eq!(
+            risk.net_lots_for_in_segment(13, ExchangeSegment::NseEquity),
+            1,
+            "the fill is booked where its segment says"
+        );
+        let report = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
+        assert_eq!(
+            report.divergences, 0,
+            "mirror and risk move together, so leg 1 agrees"
+        );
+        assert_eq!(
+            report.order_fold_divergences, 2,
+            "the order's IDX_I row and the fill's NSE_EQ row both disagree"
+        );
     }
 
     /// C7 second leg: a fill LOST between the engine and `record_fill` (the
@@ -2206,7 +2969,7 @@ mod tests {
             .ok()
             .flatten()
             .expect("fill event produced then dropped"); // APPROVED: test
-        let report = local_reconcile(&oms, &risk, &book.mirror);
+        let report = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
         assert_eq!(
             report.divergences, 0,
             "mirror leg CANNOT see a lost fill (both sides 0)"
@@ -2215,6 +2978,66 @@ mod tests {
             report.order_fold_divergences, 1,
             "the order-fold leg MUST flag the lost fill for a tracked order"
         );
+    }
+
+    /// PR14: the order-update channel holds about 7 minutes of events at the
+    /// 10-a-second order limit, and the REST stack sizes the channel from
+    /// the constant rather than a literal.
+    #[test]
+    fn order_update_broadcast_capacity_is_4096() {
+        assert_eq!(
+            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+            4_096
+        );
+        let stack =
+            tickvault_common::source_scan::production_region(include_str!("dhan_rest_stack.rs"))
+                .expect("dhan_rest_stack.rs keeps its test module"); // APPROVED: test
+        assert!(
+            stack.contains("tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY"),
+            "the order-runtime channel must be sized by ORDER_UPDATE_BROADCAST_CAPACITY"
+        );
+        assert!(
+            !stack.contains("OrderUpdate>(256)"),
+            "the 256-slot literal is back on the order-runtime channel"
+        );
+    }
+
+    /// PR14: a lagged receiver runs the reconcile at once, inside the
+    /// `Lagged` arm, before the `Closed` arm.
+    #[test]
+    fn lag_triggers_reconcile() {
+        let src =
+            tickvault_common::source_scan::production_region(include_str!("order_runtime.rs"))
+                .expect("order_runtime.rs keeps its test module"); // APPROVED: test
+        let lagged = src
+            .find("Err(broadcast::error::RecvError::Lagged(skipped)) => {")
+            .expect("the Lagged arm exists"); // APPROVED: test
+        let closed = src[lagged..]
+            .find("Err(broadcast::error::RecvError::Closed) => {")
+            .map(|i| lagged + i)
+            .expect("the Closed arm follows the Lagged arm"); // APPROVED: test
+        assert!(
+            src[lagged..closed].contains("run_reconcile_cycle(&mut oms, &risk, &mut book).await;"),
+            "the Lagged arm no longer runs the reconcile; a skipped fill would wait \
+             for the next heartbeat"
+        );
+    }
+
+    /// The reconcile the `Lagged` arm runs flags a fill the risk book never
+    /// received, in paper mode.
+    #[tokio::test]
+    async fn lag_reconcile_flags_a_skipped_fill() {
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
+        let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
+        let _skipped = oms.handle_order_update(&synthetic);
+        let before = local_reconcile(&oms, &risk, &book.mirror, &mut ReconcileScratch::default());
+        assert_eq!(before.order_fold_divergences, 1);
+        // Must not panic, and runs the paper (local) arm.
+        run_reconcile_cycle(&mut oms, &risk, &mut book).await;
     }
 
     /// Property-style sweep: random signed fill sequences keep the mirror
@@ -2246,7 +3069,12 @@ mod tests {
         // Leg 1 only: this synthetic walk applies fills WITHOUT tracked
         // orders, so the order-fold leg legitimately diverges (empty book
         // vs positions) — it is asserted by its own dedicated test above.
-        let report = local_reconcile(&make_oms(), &risk, &book.mirror);
+        let report = local_reconcile(
+            &make_oms(),
+            &risk,
+            &book.mirror,
+            &mut ReconcileScratch::default(),
+        );
         assert_eq!(
             report.divergences, 0,
             "after any fill sequence the mirror must equal risk net_lots"
@@ -2433,7 +3261,10 @@ mod tests {
             &mut book,
             SELF_TEST_WINDOW_START_SECS_OF_DAY_IST,
             today,
-            true,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
         )
         .await;
         assert_eq!(
@@ -2475,6 +3306,108 @@ mod tests {
             SelfTestPhase::AwaitingMark,
             "a non-index mark must not pick the self-test sid (E4)"
         );
+    }
+
+    /// UTC-SAFETY gate D, mark half: the alarm fired after the cycle armed.
+    /// The first index mark places no entry; the day is skipped (Idle,
+    /// latched), never failed; the mark is still applied below.
+    #[tokio::test]
+    async fn test_gate_d_mark_arm_skips_after_arming() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let today = crate::trade_safety::ist_day_now();
+        ctx.safety.engage(today, crate::trade_safety::CAUSE_A);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: ExchangeSegment::IdxI.binary_code(),
+                price: 23_000.0,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "skipped, not placed");
+        assert_eq!(self_test.last_run_day, today, "latched for the day");
+        assert_eq!(oms.active_order_count(), 0, "no entry placed");
+    }
+
+    /// Without the alarm the same mark places the self-test entry (the gate
+    /// is the only difference); an alarm that fires once the entry is placed
+    /// does not stop the cycle: the next mark fills its close (an exit), the
+    /// book is flat, and the day latches as a pass, never a failure.
+    #[tokio::test]
+    async fn test_gate_d_inflight_self_test_finishes() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let mark = |price: f64| MarkUpdate {
+            security_id: 13,
+            segment_code: ExchangeSegment::IdxI.binary_code(),
+            price,
+        };
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(100.0),
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(self_test.phase, SelfTestPhase::AwaitingCloseFill { .. }),
+            "the entry filled and the close is placed: {:?}",
+            self_test.phase
+        );
+        assert_eq!(risk.net_lots_for(13), 1);
+        // The alarm fires now; the close is an exit and still goes out.
+        let today = crate::trade_safety::ist_day_now();
+        ctx.safety.engage(today, crate::trade_safety::CAUSE_B);
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(101.0),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle, "the cycle completed");
+        assert_eq!(self_test.last_run_day, today, "latched as a pass");
+        assert_eq!(risk.net_lots_for(13), 0, "flat after the close fill");
+    }
+
+    /// A gate-D skip is a skip: the counter label and the day latch, and the
+    /// state never fails (no OMS-GAP-06 failure line).
+    #[test]
+    fn test_gate_d_not_counted_failed() {
+        let mut st = SelfTestState::new();
+        st.phase = SelfTestPhase::AwaitingMark;
+        st.skip_with(42, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
+        assert_eq!(st.phase, SelfTestPhase::Idle);
+        assert_eq!(st.last_run_day, 42);
+        // The no-mark skip keeps its own text.
+        st.skip(43, "no_mark");
+        assert_eq!(st.last_run_day, 43);
     }
 
     #[test]
@@ -2604,6 +3537,36 @@ mod tests {
         assert!(oms.all_orders().is_empty(), "orphan never tracked");
     }
 
+    /// LF-6b review round 3, finding 3: order rate-limit refusals page once
+    /// per episode. A refusal every second for a minute is one episode (one
+    /// page); a refusal after 60 s of quiet, or after the clock stepped back,
+    /// starts a new one.
+    #[test]
+    fn test_regression_rate_limit_refusal_starts_episode_pages_once_per_episode() {
+        let last = AtomicI64::new(i64::MIN);
+        let t0 = 1_800_000_000;
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0),
+            "first refusal pages"
+        );
+        let pages = (1..=300)
+            .filter(|s| rate_limit_refusal_starts_episode(&last, t0 + s))
+            .count();
+        assert_eq!(
+            pages, 0,
+            "a refusal every second for 5 minutes is one episode"
+        );
+        assert!(!rate_limit_refusal_starts_episode(&last, t0 + 359));
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0 + 359 + RATE_LIMIT_PAGE_EPISODE_GAP_SECS),
+            "60 s of quiet ends the episode"
+        );
+        assert!(
+            rate_limit_refusal_starts_episode(&last, t0),
+            "a clock step back pages"
+        );
+    }
+
     /// M4 (partial — honest scope): exercises every NotifierAlertSink arm
     /// (all 4 OmsAlert variants + the risk halt) through the PRODUCTION sink
     /// against a disabled NotificationService — the mapping code executes;
@@ -2679,6 +3642,7 @@ mod tests {
         let order_id = oms
             .place_order(PlaceOrderRequest {
                 security_id: 13,
+                exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
@@ -2692,7 +3656,7 @@ mod tests {
             .await
             .expect("paper placement never fails"); // APPROVED: test
         book.rebuild_pending_paper(&oms);
-        assert!(book.has_pending_paper(13));
+        assert!(book.has_pending_paper(13, ExchangeSegment::IdxI));
 
         // 2. FILL: a mark @400 through the REAL arm-2 body — the paper
         //    filler synthesizes the fill through the canonical arm-1 path.
@@ -2794,13 +3758,13 @@ mod tests {
     #[test]
     fn test_tripwire_divergence_error_latched_per_sid() {
         let mut book = BookState::new();
-        assert!(book.tripwire_ok(27, 0));
-        assert!(!book.tripwire_ok(27, 2), "first divergence skips");
+        book.observe_segment(27, 0);
+        book.observe_segment(27, 2);
         assert!(
             book.tripwire_reported.contains(&27),
             "first divergence must latch the reported set (error! fired)"
         );
-        assert!(!book.tripwire_ok(27, 2), "later divergences still skip");
+        book.observe_segment(27, 2);
         assert_eq!(
             book.tripwire_reported.len(),
             1,
@@ -2816,18 +3780,21 @@ mod tests {
     async fn test_pending_paper_index_tracks_placements_and_fills() {
         let mut oms = make_oms();
         let mut book = BookState::new();
-        assert!(!book.has_pending_paper(13));
+        assert!(!book.has_pending_paper(13, ExchangeSegment::IdxI));
         let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await;
         book.rebuild_pending_paper(&oms);
-        assert!(book.has_pending_paper(13));
-        assert!(!book.has_pending_paper(14), "index is per-sid");
+        assert!(book.has_pending_paper(13, ExchangeSegment::IdxI));
+        assert!(
+            !book.has_pending_paper(14, ExchangeSegment::IdxI),
+            "index is per-sid"
+        );
         // Fill → terminal → drops out on rebuild.
         let order = oms.order(&order_id).cloned().expect("tracked"); // APPROVED: test
         let synthetic = synthesize_paper_fill(&order, 100.0, 0).expect("fill"); // APPROVED: test
         let _ = oms.handle_order_update(&synthetic);
         book.rebuild_pending_paper(&oms);
         assert!(
-            !book.has_pending_paper(13),
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
             "a terminal order must leave the pending index"
         );
     }
@@ -2859,7 +3826,10 @@ mod tests {
             &mut book,
             12 * 3600,
             ist_day_number(chrono::Utc::now().timestamp()),
-            true,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
         )
         .await;
         assert_eq!(self_test.phase, SelfTestPhase::Idle, "timeout latches");
@@ -2870,8 +3840,102 @@ mod tests {
              (a later paper fill would open a ghost position — C6)"
         );
         assert!(
-            !book.has_pending_paper(13),
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
             "the pending index must drop the cancelled order"
+        );
+    }
+
+    /// 2026-09-23: a self-test that timed out while still WAITING FOR A MARK
+    /// placed nothing, so nothing failed. It must end as a skip (latched for
+    /// the day) and never leave an order behind — this is the shape that paged
+    /// `OMS-GAP-06` every morning once the mark producers were removed.
+    #[tokio::test]
+    async fn test_selftest_awaiting_mark_timeout_is_a_skip_not_a_failure() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(SELF_TEST_TIMEOUT_SECS + 5))
+            .expect("monotonic clock has > timeout of history"); // APPROVED: test
+        let today = ist_day_number(chrono::Utc::now().timestamp());
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            12 * 3600,
+            today,
+            SelfTestGates {
+                enabled: true,
+                marks_available: true,
+            },
+        )
+        .await;
+        assert_eq!(self_test.phase, SelfTestPhase::Idle);
+        assert_eq!(self_test.last_run_day, today, "the skip latches the day");
+        assert!(
+            !book.has_pending_paper(13, ExchangeSegment::IdxI),
+            "no order was ever placed"
+        );
+    }
+
+    /// 2026-09-23: with the mark channel closed the self-test must never
+    /// ARM — arming could only wait out the timeout. Whether the calendar and
+    /// window gates pass on the day this runs, the phase can never become
+    /// `AwaitingMark`.
+    #[tokio::test]
+    async fn test_selftest_never_arms_without_a_mark_producer() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        drive_self_test_timers(
+            &mut self_test,
+            &ctx,
+            &mut oms,
+            &risk,
+            &mut book,
+            SELF_TEST_WINDOW_START_SECS_OF_DAY_IST,
+            ist_day_number(chrono::Utc::now().timestamp()),
+            SelfTestGates {
+                enabled: true,
+                marks_available: false,
+            },
+        )
+        .await;
+        assert_ne!(
+            self_test.phase,
+            SelfTestPhase::AwaitingMark,
+            "a closed mark channel must never arm the self-test"
+        );
+    }
+
+    /// The paging filter scopes `OMS-GAP-06` to `$.source = "runtime_respawn"`.
+    /// A renamed or dropped field would leave the alarm matching nothing.
+    #[test]
+    fn test_respawn_error_carries_the_paged_source_field() {
+        let src = include_str!("order_runtime.rs");
+        let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+        // Count FIELD lines only — the comment beside the emit quotes the
+        // filter pattern, and a prose mention must never satisfy (or break)
+        // a scan for real code.
+        let field_lines = prod
+            .lines()
+            .filter(|l| l.trim_start() == "source = \"runtime_respawn\",")
+            .count();
+        assert_eq!(
+            field_lines, 1,
+            "exactly one production OMS-GAP-06 site carries the paged source"
+        );
+        let tf = include_str!("../../../deploy/aws/terraform/error-code-alarms.tf");
+        assert!(
+            tf.contains("$.source = \\\"runtime_respawn\\\""),
+            "the oms-gap-06 filter must match the same source value"
         );
     }
 
@@ -2994,7 +4058,13 @@ mod tests {
             order_id: "PAPER-OFF".to_string(),
         };
         assert!(apply_fill(&mut risk, &mut book, &fill, None));
-        assert_eq!(risk.net_lots_for(888), 3);
+        // The fill was booked on segment 2, so it must be READ on segment 2.
+        // Before 2026-08-29 this asserted `net_lots_for(888)` — the IdxI row —
+        // and passed only because the fill had been booked there too.
+        assert_eq!(
+            risk.net_lots_for_in_segment(888, ExchangeSegment::NseFno),
+            3
+        );
     }
 
     #[tokio::test]
@@ -3005,8 +4075,11 @@ mod tests {
         let mut book = BookState::new();
         let mut self_test = SelfTestState::new();
         let (tx, mut rx) = make_leg_pnl_channel();
-        risk.record_fill(901, 2, 100.0, 25);
-        risk.record_fill(13, 1, 22_000.0, 1);
+        // Seed on the SAME segment the mark below carries. The legacy overload
+        // booked this to IdxI while the mark claimed NSE_FNO — an inconsistent
+        // world that only "worked" because emit_leg_pnl read IdxI too.
+        risk.record_fill_in_segment(901, ExchangeSegment::NseFno, 2, 100.0, 25);
+        risk.record_fill_in_segment(13, ExchangeSegment::IdxI, 1, 22_000.0, 1);
         process_mark(
             &mut oms,
             &mut risk,
@@ -3059,8 +4132,10 @@ mod tests {
         // A pending paper order for sid 555 WITHOUT any position — the mark
         // passes the has_pending_paper gate, but emit_leg_pnl finds no
         // position entry and must emit nothing.
-        book.pending_paper
-            .insert(555, vec!["PAPER-PEND".to_string()]);
+        book.pending_paper.insert(
+            (555, ExchangeSegment::NseFno),
+            vec!["PAPER-PEND".to_string()],
+        );
         process_mark(
             &mut oms,
             &mut risk,
@@ -3079,6 +4154,107 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "pending-paper-only mark (no position) must NOT emit a row"
+        );
+    }
+
+    // -- 2026-08-22: the paper book's per-sid maps are bounded ---------------
+
+    #[test]
+    fn paper_book_refuses_a_new_sid_at_the_ceiling() {
+        let mut book = BookState::new();
+        for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            book.observe_segment(sid, 2);
+        }
+        assert_eq!(book.tripwire.len(), BookState::MAX_TRACKED_SIDS);
+
+        let beyond = BookState::MAX_TRACKED_SIDS as u64;
+        book.observe_segment(beyond, 2);
+        assert!(
+            !book.tripwire.contains_key(&beyond),
+            "but it must not take a permanent slot either"
+        );
+        assert_eq!(book.tripwire.len(), BookState::MAX_TRACKED_SIDS);
+    }
+
+    #[test]
+    fn an_already_tracked_sid_is_never_refused() {
+        // The collision tripwire is the whole point of this map — a full book
+        // must keep watching every sid it already holds.
+        let mut book = BookState::new();
+        for sid in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            book.observe_segment(sid, 2);
+        }
+        // sid 0 is tracked at segment 2; a DIVERGENT segment must still fire.
+        book.observe_segment(0, 8);
+        assert!(
+            book.tripwire_reported.contains(&0),
+            "a tracked sid's collision must still be detected at the ceiling"
+        );
+    }
+
+    #[test]
+    fn the_paper_book_ceiling_agrees_with_the_others() {
+        assert_eq!(BookState::MAX_TRACKED_SIDS, 25_000);
+    }
+    /// BITE TEST for the 2026-08-25 mirror fix.
+    ///
+    /// The 2026-08-22 ceiling gated the MIRROR insert while
+    /// `risk.record_fill` stayed unconditional. Past the ceiling risk held the
+    /// position and the mirror had no key, so `local_reconcile` — which reads a
+    /// missing mirror key as `0` — reported a divergence forever, on every
+    /// reconcile cycle, for a book that was perfectly consistent.
+    ///
+    /// Re-adding `if book.can_admit_sid(fill.security_id)` around the mirror
+    /// insert makes this test fail on the LAST assertion.
+    #[test]
+    fn a_full_tripwire_never_manufactures_a_mirror_divergence() {
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+
+        // Fill the TRIPWIRE to its ceiling with ids that never take a fill —
+        // the real growth axis (every cadence-fetched contract id).
+        for i in 0..BookState::MAX_TRACKED_SIDS as u64 {
+            book.tripwire.insert(1_000_000 + i, 0);
+        }
+        assert!(
+            !book.can_admit_sid(42),
+            "a NEW tripwire slot must be refused at the ceiling"
+        );
+
+        // A fill for a brand-new sid now arrives.
+        let fill = FillEvent {
+            security_id: 42,
+            segment_code: 0,
+            fill_lots: 3,
+            avg_price: 100.0,
+            lot_size: 25,
+            order_id: "PAPER-full".to_string(),
+        };
+        assert!(
+            apply_fill(&mut risk, &mut book, &fill, None),
+            "a full tripwire must never drop a fill — that would hide a leg we hold"
+        );
+
+        // Risk recorded it, so the mirror MUST have recorded it too.
+        assert_eq!(risk.net_lots_for(42), 3, "risk always records the fill");
+        assert_eq!(
+            book.mirror.get(&(42, ExchangeSegment::IdxI)),
+            Some(&3),
+            "the mirror must move with risk — a refused mirror key is read as 0 \
+             and reported as a permanent divergence"
+        );
+
+        let report = local_reconcile(
+            &make_oms(),
+            &risk,
+            &book.mirror,
+            &mut ReconcileScratch::default(),
+        );
+        assert_eq!(
+            report.divergences, 0,
+            "a consistent book past the tripwire ceiling must report ZERO \
+             divergences; a non-zero count here is self-inflicted and would mask \
+             a genuinely lost fill"
         );
     }
 }

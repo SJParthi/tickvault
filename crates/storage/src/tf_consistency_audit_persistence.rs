@@ -268,6 +268,20 @@ impl TfConsistencyAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_tf_verify_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed the discard series at zero BEFORE the first row can be dropped.
+        //
+        // A counter never incremented is ABSENT from the exporter, not zero,
+        // and an absent series reads as health -- when it may mean the single
+        // discard episode is the only sample there will ever be. If this name
+        // is ever EMF-selected the CloudWatch agent's dropped-first-sample rule
+        // turns that into total silence on the one episode that matters; that
+        // rule cost 104,540 depth rows their classification on 2026-08-28.
+        //
+        // Only the DHAN name is seeded. The Groww sibling sits on a branch with
+        // no production caller since the 2026-08-21 feed removal, and a
+        // permanently-zero series for a path that cannot write implies a live
+        // path that was deleted -- the false-OK this seeding exists to prevent.
+        metrics::counter!("tv_tf_verify_audit_rows_discarded_total").increment(0);
         let conf = tf_consistency_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {

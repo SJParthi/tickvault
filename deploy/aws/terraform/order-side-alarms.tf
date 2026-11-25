@@ -13,6 +13,13 @@
 #   3. order-fill-lag-high  — SHIPS DISARMED (actions_enabled = false; the
 #      arming contract is in its description).
 #
+# ⚠ CHANGED 2026-10-22: #3 order-fill-lag-high is DELETED (the alarm review
+# under operator Quote 37, dhan-rest-only-noise-lock-2026-07-14.md §2.14,
+# docs/audits/2026-10-alarm-review.md). tv_order_fill_lag_seconds still has no
+# emit site, and the alarm shipped with actions_enabled = false, so it could
+# page nobody and measured nothing. A fill-lag alarm returns with its emitter
+# at Phase-1. The ledger text below is kept as history.
+#
 # COST (see aws-budget.md COST NOTE 2026-07-14): +3 alarms ≈ $0.30/mo;
 # +1 derived custom-metric series (tv_orders_placed_delta_total) ≈ $0.30/mo;
 # of the 2 new EMF allowlist names, tv_daily_pnl went LIVE 2026-08-10 (its
@@ -23,9 +30,30 @@
 # RiskEngine::daily_loss_state publishes the gauge (the shared helper both
 # the order gate and the standalone halt evaluation call, so the published
 # value is by construction the value the halt decided on).
-# tv_order_fill_lag_seconds still has NO Rust emit site — Phase-1 owns it,
-# and its alarm arms on data arrival with zero further tf changes. The
-# emit-site guard (cloudwatch_app_alarms_wiring.rs
+# tv_order_fill_lag_seconds still has NO Rust emit site — Phase-1 owns it.
+#
+# ⚠ CHANGED 2026-08-21: "its alarm arms on data arrival with zero further tf
+# changes" is NO LONGER TRUE, and the arming PR must know why. The name was
+# REMOVED from the EMF `metric_selectors` allowlist (both copies) on that date
+# to free bytes in the EC2 user-data budget, which is a hard 16,384-byte AWS
+# limit that terraform refuses a PLAN above. It was the only selector entry in
+# the whole allowlist with zero emit sites anywhere in `crates/*/src`, so it
+# was shipping a name nothing could ever publish while three live counters —
+# depth row drops, depth persist errors, and the new ILP overflow bound — had
+# no CloudWatch presence at all.
+#
+# Nothing observable changed: a selector entry for a metric with no emitter
+# publishes nothing either way. What changed is the arming contract. The
+# Phase-1 arming PR MUST now restore `tv_order_fill_lag_seconds` to BOTH
+# selector copies (`deploy/aws/cloudwatch-agent.json` and
+# `deploy/aws/terraform/user-data.sh.tftpl`, pinned byte-identical by
+# cw_agent_selector_lockstep_guard.rs) in the same change as the emit site —
+# and must re-check the user-data byte budget, since restoring it costs those
+# bytes back. Arming the alarm without the selector entry produces a
+# permanently-INSUFFICIENT_DATA pager: the exact dead-monitor shape this
+# alarm's own dormancy note was written to avoid.
+#
+# The emit-site guard (cloudwatch_app_alarms_wiring.rs
 # test_every_alarm_metric_has_a_rust_emit_site) deliberately does NOT scan
 # this file — the dormant names would fail it; the shape guard
 # crates/app/tests/order_side_paging_wiring_guard.rs covers this file
@@ -198,27 +226,12 @@ resource "aws_cloudwatch_metric_alarm" "daily_loss_breach" {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Order fill lag — SHIPS DISARMED (arming contract in the description)
+# 4. Order fill lag — DELETED 2026-10-22 (see the CHANGED note in the header).
+#    The three steps recorded here on 2026-08-25 were done together: the
+#    resource, test_fill_lag_alarm_ships_disarmed_with_arming_description and
+#    the dormancy rows in cloudwatch_dormant_alarms_guard,
+#    alarm_metric_has_a_route_guard and cloudwatch_app_alarms_wiring.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
-  alarm_name          = "tv-${var.environment}-order-fill-lag-high"
-  alarm_description   = "[DORMANT 2026-08-09 - NO PRODUCTION EMIT SITE: tv_order_fill_lag_seconds is written by ZERO non-test code paths. This alarm additionally ships with actions_enabled=false, so it can page nobody regardless of state.] ARMED at Phase-1 live promotion (phase-0-architecture.md promotion criterion #5) — in dry-run the metric never publishes and an armed alarm would be a permanently-INSUFFICIENT_DATA dead pager. The arming PR must also decide: join the market-hours window gate (12→13 + dated doc corrections) OR make the emitter publish in-session-only (the gauge holds its last value across scrapes)."
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 10
-  evaluation_periods  = 1
-  metric_name         = "tv_order_fill_lag_seconds"
-  namespace           = local.app_namespace
-  period              = 300
-  statistic           = "Maximum"
-  dimensions          = local.app_dimensions
-  treat_missing_data  = "notBreaching"
-  # DISARMED until Phase-1 (see description — the one-line flip at arming
-  # is `actions_enabled = true`). tv_order_fill_lag_seconds has NO emit
-  # site in this PR (cluster A / Phase-1 ships it).
-  actions_enabled = false
-  alarm_actions   = local.app_alarm_actions
-  ok_actions      = []
-}
 
 # ---------------------------------------------------------------------------
 # 5. SEBI FORENSIC CHAIN LOSING ROWS — ONE composite alarm over FIVE counters
@@ -246,6 +259,7 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 #   tv_order_audit_rows_discarded_total          -> crates/storage/src/order_audit_persistence.rs:479
 #   tv_order_audit_persist_errors_total          -> crates/app/src/order_observability.rs:564,575
 #                                                   crates/app/src/dhan_order_push_observability.rs:195,206
+#                                                   crates/storage/src/audit_spill.rs (run_drain_loop, stage=spill_backlog: rows waiting on disk for 30 min, once per backlog episode; ADDED 2026-10-01, audit PR42b)
 #   tv_order_update_events_dropped_total         -> crates/app/src/dhan_order_push_observability.rs:257
 #                                                   crates/trading/src/oms/groww/push/order_events.rs:384
 #   tv_order_update_events_persist_errors_total  -> crates/app/src/order_update_events_boot.rs:344,358,381,395
@@ -254,6 +268,18 @@ resource "aws_cloudwatch_metric_alarm" "order_fill_lag_high" {
 # All five are already in the EMF metric_selectors list in
 # user-data.sh.tftpl, so this adds NO new metric name and no new EMF cost —
 # it consumes five series we were already paying to ship.
+#
+# ADDED 2026-10-01 (audit PR42a) — a sixth leg, one counter for three losses
+# that no alarm saw:
+#   tv_order_audit_chain_lost_total{source}      -> crates/storage/src/pnl_audit_persistence.rs (discard_pending, source=pnl_audit_discarded)
+#                                                   crates/storage/src/order_leg_pnl_persistence.rs (discard_pending, source=order_leg_pnl_discarded)
+#                                                   crates/app/src/dhan_order_push_observability.rs (RecvError::Lagged, source=order_push_lagged)
+# ONE new EMF name rather than three (~$0.30/mo, not $0.90; aws-budget.md COST
+# NOTE 2026-10-01): the agent folds `source` into one summed series per host,
+# and the coded log line on each arm names which one it was. The per-writer
+# counters (tv_pnl_audit_rows_discarded_total,
+# tv_order_leg_pnl_rows_discarded_total, tv_dhan_order_push_lagged_total)
+# stay local on /metrics for the split.
 #
 # HONEST SCOPE: the order push channels run in PAPER mode today
 # (`[dhan_order_push] enabled`, `[groww_orders] order_push_enabled`, both
@@ -265,7 +291,7 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
   # NOTE: AWS caps alarm_description at 1024 characters (terraform validate
   # failure, 2026-08-19). Long-form reasoning belongs in comments like this
   # one, which has no cap; the description is the pager text.
-  alarm_description = "SEBI order/position forensic chain LOST A ROW. Sums five counters: order_audit rows discarded, order_audit persist errors, order/position events dropped pre-persistence, order_update_events persist errors, order_update_events rows discarded. Five-year retention - these tables are the only record of what the system did with an order, and the broker event is not replayed. DO: (1) grep /tickvault/<env>/app for coded ORDER-AUDIT / ORDER-UPDATE lines - they name which mechanism, the stage (append vs flush) and the reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); rows may still be re-appendable. (3) rows_discarded or events_dropped means it is already gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
+  alarm_description = "SEBI order/P&L forensic chain LOST A ROW, or rows are stuck on local disk. Sums six counters: order_audit rows discarded and persist errors, order/position events dropped, order_update_events persist errors and rows discarded, and one counter for pnl_audit / order_leg_pnl rows discarded and order-push updates skipped by a lagging consumer. Five-year retention, and the broker does not replay events. DO: (1) grep /tickvault/<env>/app for coded AUDIT-06 / ORDER-EVT / ORDER-PNL lines - they name the mechanism, stage and reason. (2) persist_errors points at QuestDB (ILP flush latency, WAL-suspended gauge); stage=spill_backlog means rows have waited 30 min on local disk under data/spill/audit - kept, not lost, but not yet in the database. (3) discarded, dropped or lagged means the rows are gone - record the window. Order push is receive-only PAPER today, so a breach now is the rehearsal failing, not live-order data."
 
   comparison_operator = "GreaterThanOrEqualToThreshold"
   threshold           = 1
@@ -283,16 +309,16 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
   # restored when it was not (Rule 11, no false recovery).
   ok_actions = []
 
-  # Metric math: SUM of the five, with each leg's own metric NOT returned, so
+  # Metric math: SUM of the six (five until 2026-10-01), with each leg's own metric NOT returned, so
   # only the total drives the alarm state and CloudWatch charges for one alarm.
-  # FILL(m, 0) on each leg is load-bearing: an expression over five series
+  # FILL(m, 0) on each leg is load-bearing: an expression over several series
   # evaluates to no-data if ANY leg is missing, and a counter that never
   # incremented in the window legitimately has no sample — without FILL, the
-  # arithmetic would be silenced by the four healthy legs.
+  # arithmetic would be silenced by the healthy legs.
   metric_query {
     id          = "audit_loss_total"
-    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)"
-    label       = "order/position audit rows lost (all five mechanisms)"
+    expression  = "FILL(m1,0)+FILL(m2,0)+FILL(m3,0)+FILL(m4,0)+FILL(m5,0)+FILL(m6,0)"
+    label       = "order/P&L audit rows lost (all six legs)"
     return_data = true
   }
 
@@ -349,6 +375,18 @@ resource "aws_cloudwatch_metric_alarm" "order_audit_chain_loss" {
     return_data = false
     metric {
       metric_name = "tv_order_update_events_rows_discarded_total"
+      namespace   = local.app_namespace
+      period      = 300
+      stat        = "Sum"
+      dimensions  = local.app_dimensions
+    }
+  }
+
+  metric_query {
+    id          = "m6"
+    return_data = false
+    metric {
+      metric_name = "tv_order_audit_chain_lost_total"
       namespace   = local.app_namespace
       period      = 300
       stat        = "Sum"

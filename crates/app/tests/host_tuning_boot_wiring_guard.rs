@@ -30,6 +30,13 @@
 //! 5. The deploy workflow installs AND restarts it, so tuning lands without
 //!    waiting for the next stop/start.
 //! 6. Tuning failure never gates the app — a slower host beats no host.
+//! 7. (2026-10-20) The deploy ENABLES the holiday gate as well, after
+//!    `systemctl daemon-reload`. It copied that unit on every deploy and
+//!    enabled only `tickvault` and `tickvault-host-tuning`; only first-boot
+//!    user-data enabled the gate, and terraform ignores `user_data` changes, so
+//!    the live box never had it enabled and ran on the 2026-10-02 and
+//!    2026-10-20 NSE holidays. The same per-instance-vs-per-deploy gap as
+//!    point 4, one unit over.
 
 use std::path::{Path, PathBuf};
 
@@ -91,13 +98,13 @@ fn boot_unit_applies_both_halves_of_the_tuning() {
     // The non-sysctl half is the whole reason a BOOT unit is required: THP is a
     // /sys write and is lost on every reboot.
     assert!(
-        unit.contains("apply-host-tuning.sh"),
+        unit.contains("tickvault-host host-tuning apply"),
         "the unit must run the non-sysctl half (THP + clock) — THP is a /sys \
          write that does NOT survive a reboot, which is the single strongest \
          reason this unit exists"
     );
     assert!(
-        unit.contains("verify-net-tuning.sh"),
+        unit.contains("tickvault-host host-tuning verify"),
         "the unit must verify what it applied — applying without verifying is \
          how a silently-ineffective setting survives"
     );
@@ -144,9 +151,15 @@ fn deploy_installs_and_applies_tuning_without_waiting_for_a_reboot() {
         "the deploy workflow must ship the unit file, or a tuning change never \
          reaches the box between instance replacements"
     );
+    // 2026-10-20: the deploy enables all its units in ONE element
+    // (`systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate`),
+    // so this reads the units the payload enables rather than one literal.
+    let enabled =
+        units_enabled_after_daemon_reload(&deploy).unwrap_or_else(|e| panic!("{DEPLOY}: {e}"));
     assert!(
-        deploy.contains("systemctl enable tickvault-host-tuning"),
-        "deploy must enable the unit so it arms for future boots"
+        enabled.iter().any(|u| u == "tickvault-host-tuning"),
+        "deploy must enable the unit so it arms for future boots; enabled after \
+         daemon-reload: {enabled:?}"
     );
     assert!(
         deploy.contains("systemctl restart tickvault-host-tuning"),
@@ -219,8 +232,9 @@ fn questdb_memory_cap_matches_the_locked_host_size() {
     let downsize = read(".github/workflows/downsize-instance.yml");
 
     assert!(
-        compose.contains("QDB_MEM_LIMIT:-12g"),
-        "the compose default is no longer 12g — on a 32 GiB host that is the \
+        compose.contains("QDB_MEM_LIMIT:-6g"),
+        "the compose default is no longer 6g — on the 16 GiB r8g.large (Quotes 32/33, \
+         2026-10-21) that is the \
          value a box with no .env override must land on"
     );
 
@@ -239,12 +253,12 @@ fn questdb_memory_cap_matches_the_locked_host_size() {
             }
             assert_eq!(
                 value,
-                "12g",
+                "6g",
                 "downsize-instance.yml:{} writes QDB_MEM_LIMIT={} to the on-box \
-                 .env, but the host is 32 GiB and compose defaults to 12g.\n\n\
+                 .env, but the host is 16 GiB and compose defaults to 6g.\n\n\
                  That override WINS over the compose default, so this one line \
                  caps the database at a fraction of the machine — silently, \
-                 with no error anywhere. This workflow targets r8g.xlarge; the \
+                 with no error anywhere. This workflow targets r8g.large; the \
                  value must match the host it now flips to.",
                 idx + 1,
                 value
@@ -331,10 +345,33 @@ fn deploy_self_heals_a_stale_questdb_memory_cap() {
     // Writing the value without recreating the container would fix the FILE and
     // leave the RUNNING database throttled until something else happened to
     // restart it — a fix that reports success while changing nothing.
+    //
+    // 2026-09-09 — THE NAME. This assertion read `--force-recreate questdb`
+    // for the whole life of the step, and it PASSED the entire time, on a
+    // command that could never do anything: the compose service is
+    // `tv-questdb` (deploy/docker/docker-compose.yml), so `questdb` matched no
+    // service, and the step's own `|| echo WARNING` swallowed the miss. The
+    // guard was not merely wrong about a spelling — it CERTIFIED A NO-OP, and
+    // a reader auditing "does the corrected cap reach the running container?"
+    // would have found this green and stopped. That is the false-OK class this
+    // repository's audit rules forbid, arriving inside the guard written to
+    // prevent it, and it is the same lesson the comment above records about
+    // literal anchoring: a literal that is WRONG is worse than a literal that
+    // is merely brittle, because a brittle one fails loudly.
+    //
+    // Anchored on the real service name now, and the dead spelling is asserted
+    // GONE so a revert cannot pass by putting the correct name beside it.
     assert!(
-        deploy.contains("--force-recreate questdb"),
-        "the deploy path corrects the .env but never recreates questdb, so the \
-         corrected cap would not take effect on the running container"
+        deploy.contains("--force-recreate tv-questdb"),
+        "the deploy path corrects the .env but never recreates tv-questdb, so \
+         the corrected cap would not take effect on the running container"
+    );
+    assert!(
+        !deploy.contains("--force-recreate questdb"),
+        "the deploy path recreates a compose service called `questdb`, which \
+         does not exist — the service is `tv-questdb`. That command is a \
+         silent no-op behind `|| echo WARNING`, so the corrected memory cap \
+         would never reach the running container while every signal read green"
     );
 
     // And it must only recreate when the value actually CHANGED — recreating the
@@ -424,4 +461,614 @@ fn test_the_questdb_memory_cap_is_derived_and_self_consistent() {
             }
         }
     }
+}
+
+/// The boot units run the subcommands from `bin/tickvault-host`, never from
+/// `bin/tickvault` (audit D6b, 2026-10-01).
+///
+/// A binary from before the port does not know `host-tuning`: it ignores the
+/// arguments and boots the whole trading app — here as root, inside a oneshot
+/// that `tickvault.service` is ordered behind, so the real app waits forever.
+/// The deploy rollback restores `bin/tickvault` from `bin/tickvault.backup`,
+/// which on the first deploy of the port IS such a binary. So the units must
+/// call a copy the rollback never touches, installed only after the smoke
+/// test passed, and the oneshot must carry a start timeout as a backstop.
+#[test]
+fn boot_units_never_run_the_rollback_restored_binary() {
+    let unit = read(UNIT);
+    for line in unit.lines().filter(|l| l.starts_with("Exec")) {
+        assert!(
+            !line.contains("/opt/tickvault/bin/tickvault "),
+            "{UNIT} runs `bin/tickvault` directly: {line}\nA rollback can put a \
+             pre-port binary there, which would boot the trading app as root in \
+             this oneshot. Run `/opt/tickvault/bin/tickvault-host` instead."
+        );
+    }
+    assert!(
+        unit.contains("/opt/tickvault/bin/tickvault-host host-tuning"),
+        "{UNIT} no longer calls the subcommand binary"
+    );
+    assert!(
+        unit.lines().any(|l| l.starts_with("TimeoutStartSec=")),
+        "{UNIT} has no start timeout. A oneshot defaults to none, and \
+         tickvault.service is ordered after it, so a hung step keeps the app down."
+    );
+
+    let deploy = read(DEPLOY);
+    // All three binaries are downloaded into bin/.next. The smoke binary
+    // reads config and spill paths relative to /opt/tickvault. The outer
+    // shell returns there before config/smoke; promotion runs in a subshell
+    // so host installation keeps that same working directory.
+    let staging = deploy
+        .find("cd /opt/tickvault/bin/.next; TVS3=")
+        .expect("the deploy no longer enters the staged binary directory");
+    let app_directory = deploy[staging..]
+        .find("\"cd /opt/tickvault\",")
+        .map(|offset| staging + offset)
+        .expect("the deploy no longer returns to the app directory before smoke");
+    let smoke = deploy
+        .find("\"timeout 40 bin/.next/smoke_test --duration 30\"")
+        .expect("the deploy no longer runs the staged smoke test from the app directory");
+    let promote = deploy
+        .find("(cd bin/.next; chown ec2-user:ec2-user tickvault smoke_test tv-movers; mv tickvault smoke_test tv-movers ..)")
+        .expect("the deploy no longer promotes all three staged binaries");
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect(
+            "the deploy no longer installs bin/tickvault-host, so the boot units \
+             have nothing to run",
+        );
+    assert!(
+        staging < app_directory && app_directory < smoke && smoke < promote && promote < install,
+        "bin/tickvault-host must be installed AFTER staged smoke and promotion, \
+         with the shell returned to the app directory before installation"
+    );
+    let rollback = deploy
+        .find("cp -f bin/tickvault.backup bin/tickvault")
+        .expect("the deploy rollback no longer restores bin/tickvault");
+    let rollback_line = deploy[rollback..].lines().next().unwrap_or_default();
+    assert!(
+        !rollback_line.contains("tickvault-host"),
+        "the rollback touches bin/tickvault-host, which would let it restore a \
+         pre-port binary into the boot units"
+    );
+}
+
+/// The holiday gate (audit D6c) is the second boot unit on the subcommand
+/// binary, with one extra hazard: it is copied into /etc/systemd/system by the
+/// deploy, so the deploy must copy it only AFTER `bin/tickvault-host` holds a
+/// binary that knows `holiday-gate`. A deploy that fails its smoke test stops
+/// before the copy and leaves the previous unit in place.
+#[test]
+fn holiday_gate_unit_runs_the_subcommand_binary_and_is_copied_after_it() {
+    const HOLIDAY_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+    let unit = read(HOLIDAY_UNIT);
+    let exec: Vec<&str> = unit.lines().filter(|l| l.starts_with("Exec")).collect();
+    assert_eq!(
+        exec,
+        ["ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate"],
+        "{HOLIDAY_UNIT} must run exactly the subcommand, from the rollback-proof \
+         copy, fail-open when the copy is missing"
+    );
+    assert!(
+        unit.lines().any(|l| l.starts_with("TimeoutStartSec=")),
+        "{HOLIDAY_UNIT} has no start timeout; tickvault.service waits behind it"
+    );
+
+    let deploy = read(DEPLOY);
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect("the deploy no longer installs bin/tickvault-host");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault-holiday-gate.service")
+        .expect("the deploy no longer refreshes the holiday-gate unit");
+    assert!(
+        install < copy,
+        "the deploy copies the holiday-gate unit before bin/tickvault-host is \
+         refreshed, so a failed deploy can leave the new unit calling an older \
+         copy that would boot the whole app instead of the gate"
+    );
+}
+
+/// The units named by the `systemctl enable` elements of the deploy's SSM
+/// payload, counting only elements AFTER the `"systemctl daemon-reload"`
+/// element and inside the same `commands=[…]` payload (it ends at the line
+/// that starts with `]`). An element is one whole quoted line; comment lines
+/// are skipped; a leading `sudo ` is allowed; a unit is any non-flag word
+/// before the first `|`, `&`, `;` or `>`, with `.service` dropped. An enable
+/// buried inside an `if …; then …` element is not counted, so the check fails
+/// closed rather than trusting a conditional. A later `systemctl disable` or
+/// `systemctl mask` element naming a unit removes it again (a later enable
+/// re-adds it). `Err` when the payload has no `daemon-reload` element at all.
+fn units_enabled_after_daemon_reload(deploy: &str) -> Result<Vec<String>, String> {
+    let mut reloaded = false;
+    let mut units = Vec::new();
+    for line in deploy.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if reloaded && trimmed.starts_with(']') {
+            break;
+        }
+        let Some(element) = trimmed
+            .trim_end_matches(',')
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if element == "systemctl daemon-reload" {
+            reloaded = true;
+            continue;
+        }
+        if !reloaded {
+            continue;
+        }
+        let command = element.strip_prefix("sudo ").unwrap_or(element);
+        let (enable, args) = if let Some(args) = command.strip_prefix("systemctl enable ") {
+            (true, args)
+        } else if let Some(args) = command
+            .strip_prefix("systemctl disable ")
+            .or_else(|| command.strip_prefix("systemctl mask "))
+        {
+            (false, args)
+        } else {
+            continue;
+        };
+        let args = args.split(['|', '&', ';', '>']).next().unwrap_or_default();
+        let named = args
+            .split_whitespace()
+            .filter(|a| !a.starts_with('-'))
+            .map(|a| a.trim_end_matches(".service").to_string());
+        if enable {
+            units.extend(named);
+        } else {
+            // 2026-10-20: a later `disable` or `mask` undoes an earlier enable.
+            for unit in named {
+                units.retain(|u| u != &unit);
+            }
+        }
+    }
+    if !reloaded {
+        return Err("no `\"systemctl daemon-reload\"` element in the SSM payload".to_string());
+    }
+    Ok(units)
+}
+
+/// The holiday gate is armed by EVERY deploy, not only by first-boot
+/// user-data (2026-10-20).
+///
+/// # The defect this pins
+///
+/// The deploy copied `tickvault-holiday-gate.service` into
+/// `/etc/systemd/system` on every run, but its only `systemctl enable`
+/// elements named `tickvault` and `tickvault-host-tuning`. The gate was
+/// enabled only by `user-data.sh.tftpl`, which runs once per instance, and
+/// terraform ignores `user_data` changes, so an instance created before the
+/// gate existed never got it. A copied-but-not-enabled unit is inert and
+/// silent: the live box ran through the 2026-10-02 and 2026-10-20 NSE
+/// holidays with nothing in any log. The enable must come after
+/// `systemctl daemon-reload`, so systemd has read the freshly copied unit.
+#[test]
+fn deploy_enables_the_holiday_gate_after_daemon_reload() {
+    const HOLIDAY_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
+    let unit = read(HOLIDAY_UNIT);
+    assert!(
+        unit.contains("WantedBy=multi-user.target"),
+        "{HOLIDAY_UNIT} must be WantedBy=multi-user.target, or `systemctl enable` \
+         arms nothing and the gate never runs at boot"
+    );
+
+    let deploy = read(DEPLOY);
+    let enabled =
+        units_enabled_after_daemon_reload(&deploy).unwrap_or_else(|e| panic!("{DEPLOY}: {e}"));
+    for wanted in [
+        "tickvault",
+        "tickvault-host-tuning",
+        "tickvault-holiday-gate",
+    ] {
+        assert!(
+            enabled.iter().any(|u| u == wanted),
+            "{DEPLOY}: no `systemctl enable` element names `{wanted}` after \
+             `systemctl daemon-reload` (enabled there: {enabled:?}). A unit the \
+             deploy copies but never enables is inert on every instance that \
+             predates it; for the holiday gate that means the box runs on NSE \
+             holidays"
+        );
+    }
+
+    let reload = deploy
+        .find("\"systemctl daemon-reload\"")
+        .expect("checked above: the payload has a daemon-reload element");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault-holiday-gate.service")
+        .expect("the deploy no longer refreshes the holiday-gate unit");
+    assert!(
+        copy < reload,
+        "{DEPLOY}: the holiday-gate unit is copied after `systemctl daemon-reload`, \
+         so the enable that follows reads the previous unit file"
+    );
+}
+
+/// The check above must reject each way the enable can go missing.
+#[test]
+fn holiday_gate_enable_check_bites() {
+    fn payload(body: &str) -> String {
+        format!("            --parameters 'commands=[\n{body}\n            ]' \\\n")
+    }
+    let has_gate = |text: &str| {
+        units_enabled_after_daemon_reload(text)
+            .map(|units| units.iter().any(|u| u == "tickvault-holiday-gate"))
+    };
+
+    // The fixed shape passes, `.service` suffix and `sudo` included.
+    let fixed = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&fixed), Ok(true));
+    let suffixed = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"sudo systemctl enable tickvault-holiday-gate.service\",",
+    );
+    assert_eq!(has_gate(&suffixed), Ok(true));
+
+    // The shape that shipped until 2026-10-20: the gate is never enabled.
+    let shipped = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault || true\",\n              \
+         \"systemctl enable tickvault-host-tuning || true\",",
+    );
+    assert_eq!(has_gate(&shipped), Ok(false));
+
+    // Enabled BEFORE daemon-reload.
+    let early = payload(
+        "              \"systemctl enable tickvault-holiday-gate || true\",\n              \
+         \"systemctl daemon-reload\",",
+    );
+    assert_eq!(has_gate(&early), Ok(false));
+
+    // Commented out.
+    let commented = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         # \"systemctl enable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&commented), Ok(false));
+
+    // In a later payload, past the end of the one that reloads.
+    let later = format!(
+        "{}{}",
+        payload("              \"systemctl daemon-reload\","),
+        payload("              \"systemctl enable tickvault-holiday-gate || true\","),
+    );
+    assert_eq!(has_gate(&later), Ok(false));
+
+    // A near-miss name, or the unit only after `||` (a fallback, not an enable).
+    let near = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault-holiday-gate-old || true\",\n              \
+         \"systemctl enable tickvault || systemctl enable tickvault-holiday-gate\",",
+    );
+    assert_eq!(has_gate(&near), Ok(false));
+
+    // Disabled, or started only, is not enabled.
+    let disabled = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",\n              \
+         \"systemctl start tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&disabled), Ok(false));
+
+    // Enabled, then disabled or masked by a later element: not enabled.
+    let enable_then_disable = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault tickvault-host-tuning tickvault-holiday-gate || true\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&enable_then_disable), Ok(false));
+    let enable_then_mask = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl enable tickvault-holiday-gate || true\",\n              \
+         \"sudo systemctl mask --now tickvault-holiday-gate.service\",",
+    );
+    assert_eq!(has_gate(&enable_then_mask), Ok(false));
+    // The disable removes only the unit it names.
+    let others_kept = units_enabled_after_daemon_reload(&enable_then_disable)
+        .expect("the payload has a daemon-reload element");
+    assert!(others_kept.iter().any(|u| u == "tickvault-host-tuning"));
+    // A later enable re-arms it.
+    let disable_then_enable = payload(
+        "              \"systemctl daemon-reload\",\n              \
+         \"systemctl disable tickvault-holiday-gate || true\",\n              \
+         \"systemctl enable tickvault-holiday-gate || true\",",
+    );
+    assert_eq!(has_gate(&disable_then_enable), Ok(true));
+
+    // No daemon-reload at all fails closed.
+    let no_reload = payload("              \"systemctl enable tickvault-holiday-gate || true\",");
+    assert!(units_enabled_after_daemon_reload(&no_reload).is_err());
+}
+
+/// The QuestDB self-heal (audit D6d) runs from the app unit itself, as an
+/// `ExecStartPre`. The same two hazards as the holiday gate apply: it must
+/// call the rollback-proof copy, and the deploy must copy `tickvault.service`
+/// only after that copy knows `ensure-questdb`. The operator console also
+/// calls it over SSM, and its Lambda can deploy before the box, so every
+/// console call must first check the installed binary for the subcommand's
+/// log prefix, which no older binary contains.
+#[test]
+fn ensure_questdb_runs_the_subcommand_binary_and_every_caller_checks_for_it() {
+    const APP_UNIT: &str = "deploy/systemd/tickvault.service";
+    let unit = read(APP_UNIT);
+    let pre: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("ExecStartPre=") && l.contains("ensure-questdb"))
+        .collect();
+    assert_eq!(
+        pre,
+        ["ExecStartPre=-/opt/tickvault/bin/tickvault-host ensure-questdb"],
+        "{APP_UNIT} must run exactly the subcommand, from the rollback-proof \
+         copy, fail-open (the app's own compose ladder still runs)"
+    );
+    let live: Vec<&str> = unit
+        .lines()
+        .filter(|l| !l.starts_with('#') && l.contains("ensure-questdb.sh"))
+        .collect();
+    assert!(
+        live.is_empty(),
+        "{APP_UNIT} still calls the deleted script: {live:?}"
+    );
+
+    let deploy = read(DEPLOY);
+    let install = deploy
+        .find("install -m 0755 -o root -g root bin/tickvault bin/tickvault-host")
+        .expect("the deploy no longer installs bin/tickvault-host");
+    let copy = deploy
+        .find("cp -f repo/deploy/systemd/tickvault.service")
+        .expect("the deploy no longer refreshes the app unit");
+    assert!(
+        install < copy,
+        "the deploy copies tickvault.service before bin/tickvault-host is \
+         refreshed, so a failed deploy can leave the new ExecStartPre calling \
+         an older copy that would boot the whole app as a pre-step"
+    );
+
+    let marker = tickvault_app::ensure_questdb::LOG_PREFIX;
+    let guard = format!("grep -qaF '{marker}' /opt/tickvault/bin/tickvault-host");
+    for lambda in [
+        "crates/aws-lambdas/src/operator_control_action_commands.rs",
+        "crates/aws-lambdas/src/operator_control.rs",
+    ] {
+        let src = read(lambda);
+        for (n, line) in src.lines().enumerate() {
+            if line.contains("tickvault-host ensure-questdb")
+                && !line.trim_start().starts_with("//")
+                && !line.contains("assert")
+                && !line.contains("let call")
+            {
+                assert!(
+                    line.contains(&guard),
+                    "{lambda}:{} calls the subcommand without first checking \
+                     the installed binary for `{marker}`",
+                    n + 1
+                );
+            }
+        }
+    }
+    assert!(
+        read("crates/aws-lambdas/src/operator_control_action_commands.rs").contains(&guard),
+        "the console's self-heal command no longer checks the binary version"
+    );
+}
+
+/// (2026-10-20, moved here from `holiday_gate.rs` to keep app self-source
+/// scans shrink-only.) The gate's worst case, a marker read plus two marker
+/// puts and the retry delay (92 s), must fit the unit's `TimeoutStartSec`.
+#[test]
+fn holiday_gate_unit_timeout_covers_the_marker_retries() {
+    let unit = read("deploy/systemd/tickvault-holiday-gate.service");
+    assert!(
+        unit.contains("TimeoutStartSec=300"),
+        "the holiday gate unit must keep TimeoutStartSec=300 (worst case 92 s)"
+    );
+}
+
+/// (2026-10-20, moved here from `holiday_gate.rs`.) The gate's window start is
+/// the launch floor from which the `market_open_readiness` Lambda reads a
+/// stopped box as the gate's holiday self-stop. If either side moves, a gate
+/// stop pages as "box not running" or a non-gate stop goes silent.
+#[test]
+fn holiday_gate_window_start_matches_the_readiness_lambdas_floor() {
+    let src = read("crates/aws-lambdas/src/market_open_readiness.rs");
+    assert!(
+        src.contains("pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;"),
+        "market_open_readiness must keep its 08:25 holiday self-stop floor"
+    );
+    assert_eq!(
+        tickvault_app::holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST,
+        (8 * 60 + 25) * 60
+    );
+}
+
+/// (2026-11-13, owner card "Yes, measure 1 day (Recommended)".) The NIC
+/// receive-coalescing trial is switched by two lines of the unit and must stay
+/// bounded: the unit names the switch AND an end date, the code's defaults
+/// match them (so a box whose unit lost the lines runs the same bounded trial,
+/// never an unbounded one), and `apply` actually runs the step. Paired
+/// behaviour tests: `host_tuning::nic_rx::tests` (save-first, restore, skip
+/// paths) and `network::nic_coalesce::tests` (struct layout, date bound).
+#[test]
+fn nic_rx_coalesce_trial_is_wired_and_bounded() {
+    let unit = read(UNIT);
+    let code = read("crates/app/src/host_tuning/nic_rx.rs");
+    let line_value = |prefix: &str| -> String {
+        unit.lines()
+            .find_map(|l| l.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("{UNIT} must carry `{prefix}…`"))
+            .trim()
+            .to_string()
+    };
+    let switch = line_value("Environment=TV_NIC_RX_COALESCE=");
+    let until = line_value("Environment=TV_NIC_RX_COALESCE_UNTIL=");
+    assert!(
+        switch == "off" || switch == "keep",
+        "the switch is `off` (trial) or `keep` (undo), got {switch:?}"
+    );
+    assert!(
+        chrono::NaiveDate::parse_from_str(&until, "%Y-%m-%d").is_ok(),
+        "the trial end date must be a valid YYYY-MM-DD date, got {until:?}; \
+         an unreadable date silently ends the trial"
+    );
+    assert!(
+        code.contains(&format!(
+            "pub const NIC_RX_COALESCE_UNTIL_DEFAULT: &str = \"{until}\";"
+        )),
+        "the code's default end date must equal the unit's ({until})"
+    );
+    assert!(
+        code.contains("pub const NIC_RX_COALESCE_SWITCH_DEFAULT: &str = \"off\";"),
+        "the code's default switch is the owner card's `off` (trial on)"
+    );
+    let apply = read("crates/app/src/host_tuning.rs");
+    let body = apply
+        .split("fn run_apply() -> i32 {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("host_tuning.rs must define run_apply"));
+    assert!(
+        body.contains("nic_rx::apply_nic_rx_coalesce("),
+        "run_apply must run the NIC receive-coalescing step"
+    );
+}
+
+/// One file's text as prose: comment markers (`#`, `//!`) dropped and line
+/// breaks folded, so a phrase wrapped across comment lines still matches.
+fn prose(rel: &str) -> String {
+    read(rel)
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            t.strip_prefix("//!")
+                .or_else(|| t.strip_prefix('#'))
+                .unwrap_or(t)
+                .trim()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// (PR C review.) Every NIC trial undo that edits the UNIT must reload systemd
+/// before the restart: without `daemon-reload` systemd keeps the cached unit,
+/// only warns that the file changed, and the restart applies the trial again.
+/// (The env-file route needs no reload: `EnvironmentFile` is read at each
+/// start.) The anchor is the unit-edit step in each of the three places that
+/// tell an operator how to undo; the check is that `daemon-reload` comes
+/// between it and the next restart of the tuning unit.
+#[test]
+fn nic_rx_coalesce_unit_edit_undo_reloads_systemd_before_the_restart() {
+    for (rel, anchor) in [
+        (UNIT, "change `off` to `keep` on the next line"),
+        (
+            "crates/app/src/host_tuning/nic_rx.rs",
+            "`TV_NIC_RX_COALESCE=keep` in the unit",
+        ),
+        (
+            "docs/runbooks/hot-path-capacity-proof.md",
+            "to `keep` in the unit",
+        ),
+    ] {
+        let text = prose(rel);
+        let at = text
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{rel}: the unit-edit undo step `{anchor}` is gone"));
+        let rest = &text[at..];
+        let restart = rest
+            .find("restart tickvault-host-tuning")
+            .unwrap_or_else(|| panic!("{rel}: the undo names no restart of the tuning unit"));
+        assert!(
+            rest[..restart].contains("daemon-reload"),
+            "{rel}: the unit-edit undo must run `systemctl daemon-reload` before \
+             `systemctl restart tickvault-host-tuning`, or the edit is not loaded"
+        );
+    }
+}
+
+/// (PR C review.) Every deploy copies the repo unit over the box copy, reloads
+/// systemd and restarts `tickvault-host-tuning`, and the code's own defaults
+/// are the trial (`off`, same date), so neither a unit edit nor deleting the
+/// two lines outlasts the next deploy. Each of the three places that tell an
+/// operator how to undo the trial must lead with the env-file route and say
+/// that it is the only one that survives a deploy. Each file is read from the
+/// start of its NIC undo text (`anchor`), so an earlier, unrelated mention of
+/// the env file (the unit's `EnvironmentFile=` line) cannot satisfy it.
+fn undo_order_holds(rel: &str, text: &str, anchor: &str) -> Result<(), String> {
+    let at = text
+        .find(anchor)
+        .ok_or_else(|| format!("{rel}: the NIC undo text `{anchor}` is gone"))?;
+    let text = &text[at..];
+    let survives = text
+        .find("Only the env-file route survives a deploy")
+        .ok_or_else(|| {
+            format!(
+                "{rel}: the undo text must say that only the env-file route \
+                 survives a deploy (a deploy copies the unit back with `off`)"
+            )
+        })?;
+    let env_file = text
+        .find("/etc/tickvault/host-tuning.env")
+        .ok_or_else(|| format!("{rel}: the NIC undo text must name the env file"))?;
+    let unit_edit = text
+        .find("lasts only until the next deploy")
+        .ok_or_else(|| {
+            format!("{rel}: a unit-edit undo must be marked as lasting only until the next deploy")
+        })?;
+    if !(env_file < survives && survives < unit_edit) {
+        return Err(format!(
+            "{rel}: the env-file undo comes first, then the deploy warning, then the \
+             unit-edit undo that lasts only until the next deploy"
+        ));
+    }
+    if !text.contains("does not undo it either") {
+        return Err(format!(
+            "{rel}: say that deleting the unit lines is not an undo (the code defaults are `off`)"
+        ));
+    }
+    Ok(())
+}
+
+/// The three undo texts and where each one's NIC undo starts.
+const NIC_UNDO_ANCHORS: [(&str, &str); 3] = [
+    (UNIT, "NIC RECEIVE COALESCING OFF FOR ONE MEASURED DAY"),
+    ("crates/app/src/host_tuning/nic_rx.rs", "Undo is one line"),
+    ("docs/runbooks/hot-path-capacity-proof.md", "Undo early"),
+];
+
+#[test]
+fn nic_rx_coalesce_undo_text_names_the_env_file_as_the_one_that_survives_a_deploy() {
+    for (rel, anchor) in NIC_UNDO_ANCHORS {
+        if let Err(e) = undo_order_holds(rel, &prose(rel), anchor) {
+            panic!("{e}");
+        }
+    }
+}
+
+/// Bite test: an env file named only BEFORE the NIC block (the unit's own
+/// `EnvironmentFile=` line) does not satisfy the check; before the fix the
+/// first mention in the whole file was used, so this passed.
+#[test]
+fn nic_undo_order_check_ignores_an_env_file_named_before_the_nic_block() {
+    let early = "EnvironmentFile=-/etc/tickvault/host-tuning.env NIC RECEIVE COALESCING OFF \
+                 FOR ONE MEASURED DAY UNDO: change `off` to `keep`. Only the env-file route \
+                 survives a deploy, and deleting these lines does not undo it either. A \
+                 quicker undo that lasts only until the next deploy: edit the unit.";
+    assert!(undo_order_holds("unit", early, NIC_UNDO_ANCHORS[0].1).is_err());
+    let good = "EnvironmentFile=-/etc/tickvault/host-tuning.env NIC RECEIVE COALESCING OFF \
+                FOR ONE MEASURED DAY UNDO: set keep in /etc/tickvault/host-tuning.env. Only \
+                the env-file route survives a deploy, and deleting these lines does not undo \
+                it either. A quicker undo that lasts only until the next deploy: edit it.";
+    assert!(undo_order_holds("unit", good, NIC_UNDO_ANCHORS[0].1).is_ok());
 }

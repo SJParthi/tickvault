@@ -12,7 +12,6 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 figment = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 rkyv = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
@@ -61,7 +60,9 @@ tokio = { workspace = true }
 # the CVE-fix version deliberately: raising it to match the workspace pin
 # would couple a security floor to an unrelated upgrade decision.
 # SECURITY-FLOOR: AWS-LC X.509 Name Constraints Bypass + CRL scope check (HIGH)
-aws-lc-sys = "0.44.0"
+# Pair this floor with aws-lc-rs 1.19.0, which requires sys ^0.47.0.
+# A 0.46 caret excludes 0.47 and would retain a second native library.
+aws-lc-sys = "0.47.0"
 # SECURITY-FLOOR: transitive of aws-lc-sys; floor tracks the same advisories
 aws-lc-rs = "1.17.0"
 # SECURITY-FLOOR: CRLs-not-authoritative (Moderate) + name-constraints (Low x2)
@@ -74,7 +75,6 @@ rand = "0.10.1"
 # §39.2). NON-DEFAULT — the broker_order_events seam is always compiled, but
 # this feature marks the order-side build surface so the lattice guard can
 # assert it exists in BOTH manifests and is never in a `default = [...]` set.
-groww_orders = []
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -89,4 +89,4 @@ name = "config"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid", "aws-lc-sys", "aws-lc-rs", "rustls-webpki", "rand"]
+ignored = ["figment", "secrecy", "toml", "tracing", "uuid", "aws-lc-sys", "aws-lc-rs", "rustls-webpki", "rand"]

@@ -42,16 +42,40 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// Returns the PRODUCTION region of a source file — everything before the
-/// first `#[cfg(test)]` marker.
+/// Blank the actual test module while retaining production code after any
+/// test-only field/helper attribute and after the test module itself.
 ///
 /// 2026-07-06 hostile-review medium A: ratchets that pin production call
 /// sites MUST scan this half only. The in-file test module calls the same
 /// pure helpers (`should_page_outage(...)` etc.), so a whole-file substring
 /// count stayed green even after the sole production call site was deleted
 /// — a vacuous ratchet.
-fn production_region(src: &str) -> &str {
-    src.split("#[cfg(test)]").next().unwrap_or(src)
+fn production_region(src: &str) -> String {
+    tickvault_common::source_scan::production_region(src)
+        .expect("order-update source must retain its cfg(test) mod tests boundary")
+}
+
+#[test]
+fn test_regression_telegram_guard_keeps_calls_after_test_only_fields() {
+    // Regression: 2026-11-02 — the per-session idle-signal field made the
+    // old first-attribute splitter blind to both production paging arms.
+    let src = "struct Session {\n    #[cfg(test)]\n    signal: (),\n}\n\
+               fn read_loop() { should_page_outage(); }\n\
+               #[cfg(test)]\nmod tests { fn fixture() { should_page_outage(); } }\n\
+               fn trailing() { should_page_outage(); }\n";
+    assert_eq!(
+        production_region(src)
+            .matches("should_page_outage();")
+            .count(),
+        2
+    );
+    let test_only =
+        "fn live() {}\n#[cfg(test)]\nmod tests { fn fixture() { should_page_outage(); } }";
+    assert!(!production_region(test_only).contains("should_page_outage();"));
+    assert!(
+        std::panic::catch_unwind(|| production_region("fn no_test_module() {}")).is_err(),
+        "a missing test-module boundary must fail loudly"
+    );
 }
 
 // ---------------------------------------------------------------------------

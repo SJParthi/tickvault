@@ -60,8 +60,24 @@ pub const DHAN_AUTH_BASE_URL_ENV: &str = "DHAN_AUTH_BASE_URL";
 /// Path appended to the auth base URL to mint a token.
 pub const DHAN_GENERATE_TOKEN_PATH: &str = "/app/generateAccessToken";
 
-/// SSM service segment for every Dhan parameter.
+/// SSM service segment for the PRIMARY Dhan account's parameters.
 pub const SSM_DHAN_SERVICE: &str = "dhan";
+
+/// SSM service segment for the depth-only second Dhan account
+/// (`groww-shared-token-minter-2026-07-02.md` §10.9). Its minter is a separate
+/// Lambda built from THIS code; the two never share a segment, so neither can
+/// read the other's credentials or overwrite the other's token.
+pub const SSM_DHAN_DEPTH_SERVICE: &str = "dhan-depth";
+
+/// Environment variable naming which account this deployment mints for.
+///
+/// Unset means the primary account, so the existing Lambda keeps working
+/// without a terraform change. Any value outside [`ALLOWED_SSM_SERVICES`] fails
+/// the mint loudly: a typo must never mint into a guessed namespace.
+pub const SSM_SERVICE_ENV: &str = "SSM_SERVICE";
+
+/// The closed set of service segments a minter may target: one per account.
+pub const ALLOWED_SSM_SERVICES: [&str; 2] = [SSM_DHAN_SERVICE, SSM_DHAN_DEPTH_SERVICE];
 
 /// The parameter this Lambda WRITES — the shared token consumers read.
 pub const DHAN_ACCESS_TOKEN_SECRET: &str = "access-token";
@@ -461,12 +477,14 @@ impl TokenMinter for DhanHttpMinter<'_> {
 pub async fn fetch_credentials_from<S: SecretStore>(
     store: &S,
     environment: &str,
+    service: &str,
 ) -> Result<DhanCredentials, MintError> {
-    let client_id_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-    let pin_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
-    let totp_path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
+    let client_id_path = build_ssm_path(environment, service, DHAN_CLIENT_ID_SECRET);
+    let pin_path = build_ssm_path(environment, service, DHAN_CLIENT_SECRET_SECRET);
+    let totp_path = build_ssm_path(environment, service, DHAN_TOTP_SECRET);
 
     info!(
+        service,
         client_id_path = %client_id_path,
         pin_path = %pin_path,
         totp_path = %totp_path,
@@ -486,33 +504,175 @@ pub async fn fetch_credentials_from<S: SecretStore>(
     })
 }
 
-/// Mints a fresh Dhan access token via the TOTP flow.
+/// The vendor's own rejection text, whichever envelope carried it.
+///
+/// Dhan is documented to answer a wrong PIN or a wrong TOTP as **200 with an
+/// error body** (`DhanError`), and the 2026-09-04 / 2026-09-10 rejections are
+/// only recorded in CloudWatch, not in this tree — so the status code they
+/// actually carried is **Unknown here**. Matching `DhanError` alone would make
+/// the retry unreachable on its own incident if that rejection was a 4xx.
+///
+/// Both envelopes are therefore read. The cost of being wrong in this
+/// direction is one extra login attempt on a body that merely mentions the
+/// word; the cost of being wrong the other way is the retry never firing at
+/// all. Every other variant (transport, config, SSM, malformed token) returns
+/// `None`: none of them is a code the next step can fix.
+fn totp_rejection_message(err: &MintError) -> Option<&str> {
+    match err {
+        MintError::DhanError(message) => Some(message.as_str()),
+        MintError::HttpStatus { body, .. } => Some(body.as_str()),
+        MintError::CredentialRead(_)
+        | MintError::TotpGeneration(_)
+        | MintError::Transport(_)
+        | MintError::NoToken(_)
+        | MintError::MalformedToken(_)
+        | MintError::Configuration(_)
+        | MintError::Publish(_) => None,
+    }
+}
+
+/// Rejections Dhan phrases as a TOTP problem, and nothing else.
+///
+/// Matched case-insensitively on the token `totp` because the wording is
+/// Dhan's, not ours. A PIN or client-id rejection must NOT be retried: a
+/// second identical PIN is a second failed login on the account and cannot
+/// succeed, whereas a TOTP rejection is a CLOCK problem that the next 30 s
+/// step genuinely resolves.
+#[must_use]
+pub fn is_totp_rejection(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("totp")
+}
+
+/// Mint attempts per invocation: the first, plus ONE retry with the NEXT TOTP
+/// step's code after a TOTP rejection.
+///
+/// # Why one, and why in-invocation (MEASURED 2026-09-04 and 2026-09-10)
+///
+/// The 12 s freshness floor ([`secs_to_sleep_for_fresh_totp`]) ended the
+/// sub-second coin flip, and the mint STILL came back `Invalid TOTP` on the
+/// first attempt on two of the seven trading days to 2026-09-10 (09-04 and
+/// 09-10), each time succeeding on the platform's async retry about a minute
+/// later. So the code was fresh and Dhan rejected it anyway — a validator-side
+/// clock offset larger than the floor covers, or a step boundary crossed in
+/// flight. Two consequences: every such morning FIRED the Lambda `Errors`
+/// alarm and paged for a condition that healed itself, and the shared token
+/// stayed stale for the minute the platform retry takes. Waiting for the NEXT
+/// step and trying once more with a code generated at that step's start turns
+/// the page into a WARN line and the stale minute into ~30 s.
+///
+/// One, not more: a second consecutive rejection is not a clock artefact — it
+/// is a wrong secret, a changed PIN, or a Dhan-side outage — and looping on it
+/// would spend the account's login attempts. Two rejections fail the
+/// invocation exactly as before, so the alarm still fires when something is
+/// actually wrong. Budget: 12 s floor + 20 s HTTP + 30 s step + 20 s HTTP =
+/// 82 s worst case, inside the Lambda's 120 s timeout.
+pub const MAX_TOTP_ATTEMPTS: u8 = 2;
+
+/// Seconds until the NEXT TOTP step begins: `1..=30`, never 0.
+///
+/// Unlike [`secs_to_sleep_for_fresh_totp`], which sleeps ONLY when the current
+/// code is nearly spent, this always crosses the boundary — the retry must
+/// generate a code from a step Dhan has not yet judged.
+#[must_use]
+pub fn secs_to_sleep_for_next_totp_step(unix_secs: u64) -> u64 {
+    TOTP_STEP_SECS - (unix_secs % TOTP_STEP_SECS)
+}
+
+/// The unix clock in whole seconds, or `None` if it predates the epoch.
+fn now_unix_secs() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Mints a token with a freshly generated TOTP code, retrying ONCE with the
+/// next step's code on a TOTP rejection (see [`MAX_TOTP_ATTEMPTS`]).
 ///
 /// # Errors
 ///
 /// Returns the [`MintError`] describing which stage failed.
-// TEST-EXEMPT: live Dhan HTTP call — its two decision points (URL building, response classification) are covered by build_mint_url + parse_mint_response tests.
+// TEST-EXEMPT: thin shell over mint_token_with_sleeper with the real tokio sleep — the retry ladder is tested through the injected sleeper.
 pub async fn mint_token(
     http: &reqwest::Client,
     auth_base_url: &str,
     credentials: &DhanCredentials,
 ) -> Result<SecretString, MintError> {
-    // Never spend a TOTP code that is about to expire. Without this the mint
-    // POST went out with 200–540 ms of code life on every invocation, which
-    // failed as "Invalid TOTP" whenever Dhan's round-trip or clock offset
-    // exceeded that — twice in the week of 2026-08-17. See
-    // `secs_to_sleep_for_fresh_totp` for the measured evidence.
-    let sleep_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| secs_to_sleep_for_fresh_totp(d.as_secs()))
-        .unwrap_or(0);
-    if sleep_secs > 0 {
-        info!(
-            sleep_secs,
-            "waiting for the next TOTP step so the mint uses a code with a full 30s of life"
-        );
-        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+    mint_token_with_sleeper(http, auth_base_url, credentials, |secs| async move {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    })
+    .await
+}
+
+/// [`mint_token`] with the sleep injected, so the retry ladder is testable
+/// without waiting out a real TOTP step.
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed. A TOTP rejection
+/// on the LAST permitted attempt is returned as-is (`dhan_rejected`), so the
+/// operator alarm still keys on it.
+pub async fn mint_token_with_sleeper<F, Fut>(
+    http: &reqwest::Client,
+    auth_base_url: &str,
+    credentials: &DhanCredentials,
+    sleep: F,
+) -> Result<SecretString, MintError>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut attempt: u8 = 1;
+    loop {
+        // Never spend a TOTP code that is about to expire. Without this the
+        // mint POST went out with 200–540 ms of code life on every invocation,
+        // which failed as "Invalid TOTP" whenever Dhan's round-trip or clock
+        // offset exceeded that — twice in the week of 2026-08-17. See
+        // `secs_to_sleep_for_fresh_totp` for the measured evidence.
+        let fresh_wait = now_unix_secs().map_or(0, secs_to_sleep_for_fresh_totp);
+        if fresh_wait > 0 {
+            info!(
+                sleep_secs = fresh_wait,
+                "waiting for the next TOTP step so the mint uses a code with a full 30s of life"
+            );
+            sleep(fresh_wait).await;
+        }
+        match mint_token_once(http, auth_base_url, credentials).await {
+            Err(err)
+                if attempt < MAX_TOTP_ATTEMPTS
+                    && totp_rejection_message(&err).is_some_and(is_totp_rejection) =>
+            {
+                let next_step =
+                    now_unix_secs().map_or(TOTP_STEP_SECS, secs_to_sleep_for_next_totp_step);
+                // The vendor rejection text — never the code, the PIN or the
+                // token. Read from EITHER envelope: a non-2xx carrying the same
+                // wording must retry too, or the fix misses its own incident.
+                warn!(
+                    attempt,
+                    wait_secs = next_step,
+                    reason = %capture_body(totp_rejection_message(&err).unwrap_or_default(), 300),
+                    "Dhan rejected the TOTP code; waiting for the next step and \
+                     retrying ONCE with a code generated from it"
+                );
+                sleep(next_step).await;
+                attempt = attempt.saturating_add(1);
+            }
+            outcome => return outcome,
+        }
     }
+}
+
+/// ONE mint attempt with the CURRENT step's code — no freshness wait, no retry.
+///
+/// # Errors
+///
+/// Returns the [`MintError`] describing which stage failed.
+// TEST-EXEMPT: live Dhan HTTP call — its two decision points (URL building, response classification) are covered by build_mint_url + parse_mint_response tests, and the call itself by the loopback-server tests through mint_token_with_sleeper.
+async fn mint_token_once(
+    http: &reqwest::Client,
+    auth_base_url: &str,
+    credentials: &DhanCredentials,
+) -> Result<SecretString, MintError> {
     let totp_code = generate_totp_code(&credentials.totp_secret)?;
     let url = build_mint_url(auth_base_url);
 
@@ -579,9 +739,10 @@ pub fn describe_transport_error(err: &reqwest::Error) -> String {
 pub async fn publish_token_to<S: SecretStore>(
     store: &S,
     environment: &str,
+    service: &str,
     token: &SecretString,
 ) -> Result<String, MintError> {
-    let path = build_ssm_path(environment, SSM_DHAN_SERVICE, DHAN_ACCESS_TOKEN_SECRET);
+    let path = build_ssm_path(environment, service, DHAN_ACCESS_TOKEN_SECRET);
     store.write_secure(path.clone(), token.clone()).await?;
     Ok(path)
 }
@@ -598,8 +759,9 @@ pub async fn run_mint_and_publish_with<S: SecretStore, M: TokenMinter>(
     store: &S,
     minter: &M,
     environment: &str,
+    service: &str,
 ) -> Result<String, MintError> {
-    let credentials = fetch_credentials_from(store, environment).await?;
+    let credentials = fetch_credentials_from(store, environment, service).await?;
     let token = minter.mint(&credentials).await?;
 
     // THE GATE. A non-JWT value never reaches the write, so an error body or a
@@ -624,7 +786,7 @@ pub async fn run_mint_and_publish_with<S: SecretStore, M: TokenMinter>(
         "mint succeeded; publishing to SSM"
     );
 
-    let path = publish_token_to(store, environment, &token).await?;
+    let path = publish_token_to(store, environment, service, &token).await?;
 
     info!(
         parameter = %path,
@@ -643,12 +805,14 @@ pub async fn run_mint_and_publish(
     ssm: &SsmClient,
     http: &reqwest::Client,
     environment: &str,
+    service: &str,
     auth_base_url: &str,
 ) -> Result<String, MintError> {
     run_mint_and_publish_with(
         &SsmSecretStore::new(ssm),
         &DhanHttpMinter::new(http, auth_base_url),
         environment,
+        service,
     )
     .await
 }
@@ -701,6 +865,41 @@ pub fn resolve_auth_base_url() -> Result<String, MintError> {
     }
 }
 
+/// Maps the raw [`SSM_SERVICE_ENV`] value to the service segment to mint for.
+///
+/// `None` or blank → the primary account ([`SSM_DHAN_SERVICE`]). A value in
+/// [`ALLOWED_SSM_SERVICES`] → that segment. Anything else is a deployment error.
+///
+/// # Errors
+///
+/// Returns [`MintError::Configuration`] for a value outside the allowlist.
+pub fn parse_ssm_service(raw: Option<&str>) -> Result<&'static str, MintError> {
+    let value = match raw.map(str::trim) {
+        None | Some("") => return Ok(SSM_DHAN_SERVICE),
+        Some(value) => value,
+    };
+    ALLOWED_SSM_SERVICES
+        .iter()
+        .copied()
+        .find(|allowed| *allowed == value)
+        .ok_or_else(|| {
+            MintError::Configuration(format!(
+                "{SSM_SERVICE_ENV}={value:?} is not one of {ALLOWED_SSM_SERVICES:?} — \
+                 refusing to mint into an unknown namespace"
+            ))
+        })
+}
+
+/// Resolves the service segment from the [`SSM_SERVICE_ENV`] environment variable.
+///
+/// # Errors
+///
+/// Returns [`MintError::Configuration`] for a value outside the allowlist.
+pub fn resolve_ssm_service() -> Result<&'static str, MintError> {
+    let raw = std::env::var(SSM_SERVICE_ENV).ok();
+    parse_ssm_service(raw.as_deref())
+}
+
 /// Lambda entry point.
 ///
 /// Mints and publishes, then reports which parameter was written. A failure
@@ -715,22 +914,26 @@ pub fn resolve_auth_base_url() -> Result<String, MintError> {
 // TEST-EXEMPT: Lambda entry point — builds live AWS clients; the logic it delegates to is unit-tested and the failure mapping is covered by the stage-label test.
 pub async fn handle(_event: serde_json::Value) -> Result<serde_json::Value, lambda_runtime::Error> {
     let environment = resolve_environment();
+    let service = resolve_ssm_service()?;
     let auth_base_url = resolve_auth_base_url()?;
 
     let config = crate::clients::sdk_config().await;
     let ssm = crate::clients::ssm(&config);
     let http = build_http_client()?;
 
-    match run_mint_and_publish(&ssm, &http, &environment, &auth_base_url).await {
+    match run_mint_and_publish(&ssm, &http, &environment, service, &auth_base_url).await {
         Ok(path) => Ok(serde_json::json!({
             "status": "ok",
             "environment": environment,
+            "service": service,
             "parameter": path,
         })),
         Err(err) => {
             // One coded ERROR line, then propagate. The message carries the
             // failing stage and never the token, PIN or TOTP.
             tracing::error!(
+                code = "LAMBDA-MINT-01",
+                service,
                 stage = err.stage(),
                 reason = %err,
                 "Dhan token mint FAILED — consumers will keep serving a stale token \
@@ -1135,7 +1338,9 @@ mod tests {
     // test threads flipped an asserted branch.
     // -----------------------------------------------------------------------
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // One crate-wide lock: the SDK loopback tests in other modules set the
+    // same AWS_* variables.
+    use crate::test_support::ENV_LOCK;
 
     struct EnvGuard {
         key: &'static str,
@@ -1211,6 +1416,26 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ssm_service_reads_the_env_var_through_the_allowlist() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, None);
+            assert_eq!(resolve_ssm_service(), Ok(SSM_DHAN_SERVICE));
+        }
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
+            assert_eq!(resolve_ssm_service(), Ok(SSM_DHAN_DEPTH_SERVICE));
+        }
+        {
+            let _guard = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
+            assert_eq!(
+                resolve_ssm_service().map_err(|err| err.stage()),
+                Err("configuration")
+            );
+        }
+    }
+
+    #[test]
     fn test_build_http_client_succeeds_and_is_bounded() {
         assert!(
             build_http_client().is_ok(),
@@ -1277,17 +1502,21 @@ mod tests {
 
     impl FakeStore {
         fn healthy(env: &str) -> Self {
+            Self::healthy_for(env, SSM_DHAN_SERVICE)
+        }
+
+        fn healthy_for(env: &str, service: &str) -> Self {
             let mut reads = HashMap::new();
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
+                build_ssm_path(env, service, DHAN_CLIENT_ID_SECRET),
                 Some("1106656882".to_string()),
             );
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
+                build_ssm_path(env, service, DHAN_CLIENT_SECRET_SECRET),
                 Some("123456".to_string()),
             );
             reads.insert(
-                build_ssm_path(env, SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
+                build_ssm_path(env, service, DHAN_TOTP_SECRET),
                 Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
             );
             Self {
@@ -1354,7 +1583,7 @@ mod tests {
         let jwt = sample_jwt();
         let minter = FakeMinter(Ok(jwt.clone()));
 
-        let path = run_mint_and_publish_with(&store, &minter, "prod")
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy flow must publish");
 
@@ -1371,7 +1600,7 @@ mod tests {
         let store = FakeStore::healthy("staging");
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        let path = run_mint_and_publish_with(&store, &minter, "staging")
+        let path = run_mint_and_publish_with(&store, &minter, "staging", SSM_DHAN_SERVICE)
             .await
             .expect("the staging flow must publish");
 
@@ -1386,7 +1615,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        run_mint_and_publish_with(&store, &minter, "prod")
+        run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy flow must publish");
 
@@ -1406,7 +1635,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok("{\"status\":\"error\"}".to_string()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a non-JWT value must be refused");
 
@@ -1422,7 +1651,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Ok(String::new()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("an empty value must be refused");
 
@@ -1438,7 +1667,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = FakeMinter(Err(MintError::DhanError("wrong TOTP".to_string())));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a rejected mint must fail the job");
 
@@ -1457,7 +1686,7 @@ mod tests {
             None,
         );
 
-        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod")
+        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a missing credential must fail the job");
 
@@ -1471,7 +1700,7 @@ mod tests {
         store.write_fails = true;
         let minter = FakeMinter(Ok(sample_jwt()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a failed write must fail the job");
 
@@ -1493,7 +1722,7 @@ mod tests {
         let jwt = sample_jwt();
         let minter = FakeMinter(Ok(jwt.clone()));
 
-        let err = run_mint_and_publish_with(&store, &minter, "prod")
+        let err = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect_err("a failed write must fail the job");
 
@@ -1506,7 +1735,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_credentials_from_reads_exactly_the_three_dhan_paths() {
         let store = FakeStore::healthy("prod");
-        let creds = fetch_credentials_from(&store, "prod")
+        let creds = fetch_credentials_from(&store, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the healthy reads must succeed");
 
@@ -1528,7 +1757,7 @@ mod tests {
 
         // Deliberately NOT `expect_err` — that needs `Debug` on the Ok side, and
         // DhanCredentials must never gain a Debug impl it does not need.
-        let stage = match fetch_credentials_from(&store, "prod").await {
+        let stage = match fetch_credentials_from(&store, "prod", SSM_DHAN_SERVICE).await {
             Ok(_) => panic!("an empty PIN must fail rather than mint blank"),
             Err(err) => err.stage(),
         };
@@ -1539,11 +1768,98 @@ mod tests {
     async fn publish_token_to_targets_the_access_token_path() {
         let store = FakeStore::healthy("prod");
         let token = SecretString::from(sample_jwt());
-        let path = publish_token_to(&store, "prod", &token)
+        let path = publish_token_to(&store, "prod", SSM_DHAN_SERVICE, &token)
             .await
             .expect("the write must succeed");
         assert_eq!(path, "/tickvault/prod/dhan/access-token");
         assert_eq!(store.writes().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // One minter per account (§10.9): the service segment is chosen by
+    // SSM_SERVICE from a closed list of two, and a depth-account run reads and
+    // writes ONLY the dhan-depth segment.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_ssm_service_defaults_to_the_primary_account_when_unset_or_blank() {
+        assert_eq!(parse_ssm_service(None), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(parse_ssm_service(Some("")), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(parse_ssm_service(Some("   ")), Ok(SSM_DHAN_SERVICE));
+    }
+
+    #[test]
+    fn parse_ssm_service_accepts_exactly_the_two_account_segments() {
+        assert_eq!(parse_ssm_service(Some("dhan")), Ok(SSM_DHAN_SERVICE));
+        assert_eq!(
+            parse_ssm_service(Some("dhan-depth")),
+            Ok(SSM_DHAN_DEPTH_SERVICE)
+        );
+        assert_eq!(
+            parse_ssm_service(Some(" dhan-depth ")),
+            Ok(SSM_DHAN_DEPTH_SERVICE)
+        );
+    }
+
+    #[test]
+    fn parse_ssm_service_refuses_anything_outside_the_allowlist() {
+        for bad in [
+            "groww",
+            "dhan/",
+            "dhan-depth-2",
+            "DHAN",
+            "*",
+            "dhan/*",
+            "api",
+        ] {
+            let err = parse_ssm_service(Some(bad))
+                .expect_err("an unknown service segment must fail the mint");
+            assert_eq!(err.stage(), "configuration", "value {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_account_segments_never_share_a_parameter_path() {
+        for secret in [
+            DHAN_CLIENT_ID_SECRET,
+            DHAN_CLIENT_SECRET_SECRET,
+            DHAN_TOTP_SECRET,
+            DHAN_ACCESS_TOKEN_SECRET,
+        ] {
+            let primary = build_ssm_path("prod", SSM_DHAN_SERVICE, secret);
+            let depth = build_ssm_path("prod", SSM_DHAN_DEPTH_SERVICE, secret);
+            assert_ne!(primary, depth);
+            // A prefix match would let a `/dhan/*`-style grant reach the other
+            // account; the segment boundary must separate them.
+            assert!(!depth.starts_with(&format!("/tickvault/prod/{SSM_DHAN_SERVICE}/")));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_depth_account_run_reads_and_writes_only_the_depth_segment() {
+        let store = FakeStore::healthy_for("prod", SSM_DHAN_DEPTH_SERVICE);
+        let minter = FakeMinter(Ok(sample_jwt()));
+
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_DEPTH_SERVICE)
+            .await
+            .expect("the depth-account mint must succeed");
+
+        assert_eq!(path, "/tickvault/prod/dhan-depth/access-token");
+        let writes = store.writes();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "/tickvault/prod/dhan-depth/access-token");
+    }
+
+    #[tokio::test]
+    async fn a_depth_account_run_never_falls_back_to_the_primary_credentials() {
+        // The store holds ONLY the primary account's credentials. A depth run
+        // must fail at the read, never mint with the primary account's secrets.
+        let store = FakeStore::healthy("prod");
+        let err = run_mint_and_publish_with(&store, &NeverMinter, "prod", SSM_DHAN_DEPTH_SERVICE)
+            .await
+            .expect_err("missing depth credentials must fail the job");
+        assert_eq!(err.stage(), "credential_read");
+        assert!(store.writes().is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1555,12 +1871,14 @@ mod tests {
     // classification, body reading — rather than a mock of it.
     // -----------------------------------------------------------------------
 
-    /// Starts a one-shot HTTP server that captures the request line and
-    /// answers with `status` and `body`. Returns (base_url, captured_request).
-    async fn start_mint_server(
-        status_line: &'static str,
-        body: &'static str,
-    ) -> (String, std::sync::Arc<Mutex<String>>) {
+    /// Starts a loopback HTTP server that answers ONE connection per entry of
+    /// `responses`, in order, capturing each request. Returns
+    /// (base_url, captured_requests). A caller that connects more times than
+    /// there are responses gets a refused connection — which is what proves a
+    /// retry did NOT happen.
+    async fn start_mint_server_sequence(
+        responses: &'static [(&'static str, &'static str)],
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
@@ -1572,29 +1890,64 @@ mod tests {
             .expect("local_addr must be readable")
             .port();
         let base_url = format!("http://127.0.0.1:{port}");
-        let captured = std::sync::Arc::new(Mutex::new(String::new()));
+        let captured = std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&captured);
 
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut buf = vec![0u8; 8192];
-            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
-                .await
-                .unwrap_or(0);
-            if let Ok(mut guard) = sink.lock() {
-                *guard = String::from_utf8_lossy(&buf[..read]).to_string();
+            for (status_line, body) in responses {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 8192];
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                if let Ok(mut guard) = sink.lock() {
+                    guard.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
             }
-            let response = format!(
-                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
         });
 
         (base_url, captured)
+    }
+
+    /// One-shot variant: a single response, then the listener closes.
+    async fn start_mint_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        let responses: &'static [(&'static str, &'static str)] =
+            Box::leak(vec![(status_line, body)].into_boxed_slice());
+        start_mint_server_sequence(responses).await
+    }
+
+    /// The boxed future a recording sleeper hands back — named so the tuple
+    /// below stays readable (clippy::type_complexity).
+    type RecordedSleep = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// A sleeper that records what it was asked and returns at once.
+    fn recording_sleeper() -> (
+        impl Fn(u64) -> RecordedSleep,
+        std::sync::Arc<Mutex<Vec<u64>>>,
+    ) {
+        let sleeps = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let recorder = std::sync::Arc::clone(&sleeps);
+        let sleeper = move |secs: u64| {
+            let recorder = std::sync::Arc::clone(&recorder);
+            Box::pin(async move {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(secs);
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        };
+        (sleeper, sleeps)
     }
 
     fn test_credentials() -> DhanCredentials {
@@ -1624,7 +1977,9 @@ mod tests {
         let request = captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .first()
+            .cloned()
+            .unwrap_or_default();
         assert!(
             request.starts_with("POST /app/generateAccessToken?"),
             "must POST the documented path; got: {}",
@@ -1658,21 +2013,281 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_token_maps_dhans_200_with_error_envelope_to_dhan_rejected() {
-        // Dhan answers 200 with an error envelope for a wrong PIN or TOTP.
-        let (base, _) = start_mint_server(
+    async fn mint_token_maps_a_repeated_totp_rejection_to_dhan_rejected() {
+        // Dhan answers 200 with an error envelope for a wrong TOTP. Since
+        // 2026-09-10 the FIRST such answer is retried once with the next
+        // step's code; a SECOND one is final and keeps the `dhan_rejected`
+        // stage so the operator alarm still fires on a genuinely wrong secret.
+        const TOTP_REJECTED: &str = "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}";
+        let (base, served) =
+            start_mint_server_sequence(&[("200 OK", TOTP_REJECTED), ("200 OK", TOTP_REJECTED)])
+                .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, sleeps) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("two rejections must fail even at HTTP 200");
+
+        assert_eq!(err.stage(), "dhan_rejected");
+        assert!(err.to_string().contains("Invalid TOTP"), "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            usize::from(MAX_TOTP_ATTEMPTS),
+            "exactly MAX_TOTP_ATTEMPTS mints, never a loop"
+        );
+        let waited = sleeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            waited.iter().any(|s| (1..=30).contains(s)),
+            "the retry must wait for the NEXT TOTP step, got sleeps {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_token_retries_once_with_the_next_step_after_a_totp_rejection() {
+        // The 2026-09-04 / 2026-09-10 shape: first attempt rejected on TOTP,
+        // the next step's code accepted. Before 2026-09-10 this paged the
+        // Lambda Errors alarm and left the shared token stale for a minute.
+        let jwt = sample_jwt();
+        let ok_body: &'static str = Box::leak(
+            format!("{{\"accessToken\":\"{jwt}\",\"dhanClientId\":\"1106656882\"}}")
+                .into_boxed_str(),
+        );
+        let (base, served) = start_mint_server_sequence(Box::leak(
+            vec![
+                (
+                    "200 OK",
+                    "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
+                ),
+                ("200 OK", ok_body),
+            ]
+            .into_boxed_slice(),
+        ))
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, sleeps) = recording_sleeper();
+
+        let token = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect("the retry must succeed on the second response");
+
+        assert_eq!(token.expose_secret(), jwt);
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+        let waited = sleeps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            waited.iter().any(|s| (1..=30).contains(s)),
+            "a retry without waiting for the next step would resend the code Dhan \
+             just rejected; got sleeps {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_token_does_not_retry_a_pin_rejection() {
+        // A one-shot server: if the code retried, the second connection would
+        // be refused and the stage would read `transport`, not `dhan_rejected`.
+        let (base, served) = start_mint_server(
             "200 OK",
+            "{\"status\":\"error\",\"message\":\"Invalid PIN\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, _) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("a PIN rejection must fail");
+
+        assert_eq!(err.stage(), "dhan_rejected", "got: {err}");
+        assert!(err.to_string().contains("Invalid PIN"), "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "a second identical PIN is a second failed login and cannot succeed"
+        );
+    }
+
+    /// A TOTP rejection delivered as a **non-2xx** must retry too.
+    ///
+    /// Dhan is documented to answer credential problems as 200-with-error, and
+    /// the retry originally matched that envelope alone. The status code the
+    /// 2026-09-04 / 2026-09-10 rejections actually carried is not recorded in
+    /// this tree, so a 4xx would have left the fix unreachable on the very
+    /// incident it was written for.
+    #[tokio::test]
+    async fn mint_token_retries_a_totp_rejection_carried_by_a_non_2xx_status() {
+        // One-shot server: the retry is REFUSED at the socket, so reaching
+        // `transport` proves a SECOND attempt was made. A no-retry build stops
+        // at the first response and reports `http_status`.
+        let (base, served) = start_mint_server(
+            "401 Unauthorized",
             "{\"status\":\"error\",\"message\":\"Invalid TOTP\"}",
         )
         .await;
         let http = build_http_client().expect("client must build");
+        let (sleeper, waits) = recording_sleeper();
 
-        let err = mint_token(&http, &base, &test_credentials())
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
             .await
-            .expect_err("an error envelope must fail even at HTTP 200");
+            .expect_err("a one-shot server cannot serve the retry");
 
-        assert_eq!(err.stage(), "dhan_rejected");
-        assert!(err.to_string().contains("Invalid TOTP"), "got: {err}");
+        assert_eq!(
+            err.stage(),
+            "transport",
+            "the second attempt must have been made and refused; got: {err}"
+        );
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the one-shot server served the first attempt only"
+        );
+        let waited = waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // NO COUNT IS ASSERTED, and that is deliberate: a count here would
+        // pin an artefact of the fake sleeper rather than a product property.
+        // The recording sleeper returns AT ONCE and never advances the clock,
+        // so both freshness reads see the same second and fire together or
+        // not at all — the reachable counts are 1 and 3, never 2. In
+        // PRODUCTION the sleeps are real, the step boundary is crossed, and
+        // the second freshness read returns 0, so the true count is 2. An
+        // `== 2` assertion therefore encoded the production shape and failed
+        // whenever the wall clock started with more than `MIN_CODE_LIFE_SECS`
+        // of code life; relaxing it to `2 || 3` still failed the other ~63%
+        // of the step (measured over 250 isolated runs of the compiled
+        // binary). The two assertions ABOVE are what actually prove the
+        // retry: `stage() == "transport"` says a second attempt reached the
+        // socket, and `served.len() == 1` says the one-shot server answered
+        // only the first. What is left to check here is the timeout budget.
+        assert!(
+            !waited.is_empty(),
+            "the rejection path always waits for the next TOTP step before \
+             the second attempt: {waited:?}"
+        );
+        assert!(
+            waited.iter().all(|secs| *secs <= TOTP_STEP_SECS),
+            "no single wait may exceed one TOTP step, or the 82 s worst case \
+             behind the 120 s Lambda timeout stops holding: {waited:?}"
+        );
+    }
+
+    /// A non-2xx that is NOT a TOTP problem still must not burn a second login.
+    #[tokio::test]
+    async fn mint_token_does_not_retry_a_non_totp_http_error() {
+        let (base, served) = start_mint_server(
+            "401 Unauthorized",
+            "{\"status\":\"error\",\"message\":\"Invalid client id\"}",
+        )
+        .await;
+        let http = build_http_client().expect("client must build");
+        let (sleeper, _) = recording_sleeper();
+
+        let err = mint_token_with_sleeper(&http, &base, &test_credentials(), sleeper)
+            .await
+            .expect_err("a client-id rejection must fail");
+
+        assert_eq!(err.stage(), "http_status", "got: {err}");
+        assert_eq!(
+            served
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "a wrong client id cannot be fixed by the next TOTP step"
+        );
+    }
+
+    /// The rejection text is read from BOTH envelopes and from nothing else.
+    #[test]
+    fn totp_rejection_message_reads_either_envelope_and_no_other_variant() {
+        assert_eq!(
+            totp_rejection_message(&MintError::DhanError("Invalid TOTP".into())),
+            Some("Invalid TOTP")
+        );
+        assert_eq!(
+            totp_rejection_message(&MintError::HttpStatus {
+                status: 401,
+                body: "Invalid TOTP".into(),
+            }),
+            Some("Invalid TOTP")
+        );
+        for other in [
+            MintError::Transport("dns".into()),
+            MintError::TotpGeneration("bad base32".into()),
+            MintError::CredentialRead("denied".into()),
+            MintError::NoToken("{}".into()),
+            MintError::MalformedToken("nope".into()),
+            MintError::Configuration("missing".into()),
+            MintError::Publish("ssm".into()),
+        ] {
+            assert_eq!(
+                totp_rejection_message(&other),
+                None,
+                "no TOTP step can fix {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_totp_rejection_matches_dhans_wording_and_nothing_else() {
+        assert!(is_totp_rejection("Invalid TOTP"));
+        assert!(is_totp_rejection("invalid totp code"));
+        assert!(is_totp_rejection("TOTP expired"));
+        assert!(!is_totp_rejection("Invalid PIN"));
+        assert!(!is_totp_rejection("Invalid client id"));
+        assert!(!is_totp_rejection(""));
+    }
+
+    #[test]
+    fn test_secs_to_sleep_for_next_totp_step_always_crosses_the_boundary() {
+        for base in [0u64, 1_700_000_010, 1_756_705_200] {
+            for offset in 0..TOTP_STEP_SECS {
+                let now = base + offset;
+                let wait = secs_to_sleep_for_next_totp_step(now);
+                assert!(
+                    (1..=TOTP_STEP_SECS).contains(&wait),
+                    "now={now} wait={wait}"
+                );
+                assert_eq!(
+                    (now + wait) % TOTP_STEP_SECS,
+                    0,
+                    "must land on a step boundary"
+                );
+                assert_ne!(
+                    (now + wait) / TOTP_STEP_SECS,
+                    now / TOTP_STEP_SECS,
+                    "the retry must use a DIFFERENT step's code"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_max_totp_attempts_is_exactly_one_retry() {
+        // One retry heals a clock artefact; a loop would spend login attempts
+        // on a wrong secret. Changing this needs the dated record in
+        // groww-shared-token-minter-2026-07-02.md §10.8 updated first.
+        assert_eq!(MAX_TOTP_ATTEMPTS, 2);
     }
 
     #[tokio::test]
@@ -1732,7 +2347,7 @@ mod tests {
         let store = FakeStore::healthy("prod");
         let minter = DhanHttpMinter::new(&http, &base);
 
-        let path = run_mint_and_publish_with(&store, &minter, "prod")
+        let path = run_mint_and_publish_with(&store, &minter, "prod", SSM_DHAN_SERVICE)
             .await
             .expect("the end-to-end flow must publish");
 
@@ -1807,6 +2422,478 @@ mod tests {
                 life_left >= MIN_CODE_LIFE_SECS,
                 "t={t} left only {life_left}s of code life after the wait"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The live-AWS and live-HTTP shells, driven through the REAL SDK and the
+    // REAL reqwest client against loopback servers (crate::test_support).
+    // These cover the adapters every fake-driven test above stands in for:
+    // `SsmSecretStore`, `run_mint_and_publish`, `handle`, and the transport
+    // classifier — and they check, on the wire, that no secret travels
+    // anywhere it should not.
+    // -----------------------------------------------------------------------
+    mod sdk_loopback {
+        use super::*;
+        use crate::test_support::{
+            LoopbackResponse, aws_env_guards, json_error, loopback_sdk_config, recorded,
+            start_loopback_aws,
+        };
+
+        const PIN: &str = "918273";
+        const FAKE_DHAN_ACCOUNT: &str = "loopback-account";
+        const TOTP_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+        fn get_parameter_reply(value: &str) -> LoopbackResponse {
+            LoopbackResponse::json(
+                200,
+                format!(
+                    r#"{{"Parameter":{{"Name":"/x","Type":"SecureString","Value":"{value}","Version":1}}}}"#
+                ),
+            )
+        }
+
+        /// An SSM endpoint holding the three Dhan credentials and accepting
+        /// one `PutParameter`.
+        fn credential_ssm(req: &crate::test_support::LoopbackRequest) -> LoopbackResponse {
+            if req.target.ends_with("PutParameter") {
+                return LoopbackResponse::json(200, r#"{"Version":2,"Tier":"Standard"}"#);
+            }
+            if req.body.contains("/client-id") {
+                get_parameter_reply(FAKE_DHAN_ACCOUNT)
+            } else if req.body.contains("/client-secret") {
+                get_parameter_reply(PIN)
+            } else if req.body.contains("/totp-secret") {
+                get_parameter_reply(TOTP_SECRET)
+            } else {
+                json_error("ParameterNotFound", "no such parameter")
+            }
+        }
+
+        async fn ssm_client(endpoint: &str) -> SsmClient {
+            aws_sdk_ssm::Client::new(&loopback_sdk_config(endpoint).await)
+        }
+
+        #[test]
+        fn test_mint_error_display_names_every_stage() {
+            let cases = [
+                (MintError::Configuration("x".into()), "misconfigured: x"),
+                (
+                    MintError::CredentialRead("x".into()),
+                    "could not read Dhan credentials from SSM: x",
+                ),
+                (
+                    MintError::TotpGeneration("x".into()),
+                    "TOTP generation failed: x",
+                ),
+                (
+                    MintError::Transport("x".into()),
+                    "generateAccessToken request failed: x",
+                ),
+                (
+                    MintError::HttpStatus {
+                        status: 503,
+                        body: "x".into(),
+                    },
+                    "generateAccessToken HTTP 503: x",
+                ),
+                (
+                    MintError::DhanError("x".into()),
+                    "Dhan rejected the mint: x",
+                ),
+                (
+                    MintError::NoToken("x".into()),
+                    "mint response carried no accessToken: x",
+                ),
+                (
+                    MintError::MalformedToken("x".into()),
+                    "refusing to publish a malformed token: x",
+                ),
+            ];
+            for (err, expected) in cases {
+                assert_eq!(err.to_string(), expected, "stage {}", err.stage());
+            }
+            assert!(MintError::Publish("x".into()).to_string().contains('x'));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_reads_a_secure_parameter_with_decryption() {
+            let (endpoint, requests) = start_loopback_aws(|_| get_parameter_reply(PIN)).await;
+            let client = ssm_client(&endpoint).await;
+            let store = SsmSecretStore::new(&client);
+            let value = store
+                .read("/tickvault/prod/dhan/client-secret".to_string())
+                .await
+                .expect("a present value must read");
+            assert_eq!(value.expose_secret(), PIN);
+            let seen = recorded(&requests);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].target, "AmazonSSM.GetParameter");
+            assert!(seen[0].body.contains("\"WithDecryption\":true"));
+            assert!(seen[0].body.contains("/tickvault/prod/dhan/client-secret"));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_refuses_a_blank_value() {
+            let (endpoint, _) = start_loopback_aws(|_| get_parameter_reply("   ")).await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("a blank value must be refused");
+            assert_eq!(err, MintError::CredentialRead("/p: value is empty".into()));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_refuses_a_parameter_with_no_value() {
+            let (endpoint, _) = start_loopback_aws(|_| {
+                LoopbackResponse::json(200, r#"{"Parameter":{"Name":"/p"}}"#)
+            })
+            .await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("a value-less parameter must be refused");
+            assert_eq!(
+                err,
+                MintError::CredentialRead("/p: parameter has no value".into())
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_maps_an_sdk_error_to_credential_read() {
+            let (endpoint, _) =
+                start_loopback_aws(|_| json_error("ParameterNotFound", "missing")).await;
+            let client = ssm_client(&endpoint).await;
+            let err = SsmSecretStore::new(&client)
+                .read("/p".to_string())
+                .await
+                .expect_err("an SDK error must surface");
+            assert_eq!(err.stage(), "credential_read");
+            assert!(
+                err.to_string().contains("/p"),
+                "the path names the parameter: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_writes_a_secure_string_with_overwrite() {
+            let (endpoint, requests) = start_loopback_aws(|_| {
+                LoopbackResponse::json(200, r#"{"Version":2,"Tier":"Standard"}"#)
+            })
+            .await;
+            let client = ssm_client(&endpoint).await;
+            let token = sample_jwt();
+            SsmSecretStore::new(&client)
+                .write_secure(
+                    "/tickvault/prod/dhan/access-token".to_string(),
+                    SecretString::from(token.clone()),
+                )
+                .await
+                .expect("the write must succeed");
+            let seen = recorded(&requests);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].target, "AmazonSSM.PutParameter");
+            assert!(seen[0].body.contains("\"Type\":\"SecureString\""));
+            assert!(seen[0].body.contains("\"Overwrite\":true"));
+            assert!(seen[0].body.contains(&token));
+        }
+
+        #[tokio::test]
+        async fn test_ssm_secret_store_write_failure_is_a_publish_error_without_the_token() {
+            let (endpoint, _) =
+                start_loopback_aws(|_| json_error("AccessDeniedException", "denied")).await;
+            let client = ssm_client(&endpoint).await;
+            let token = sample_jwt();
+            let err = SsmSecretStore::new(&client)
+                .write_secure("/p".to_string(), SecretString::from(token.clone()))
+                .await
+                .expect_err("a refused write must surface");
+            assert_eq!(err.stage(), "publish");
+            assert!(
+                !err.to_string().contains(&token),
+                "a publish error must never echo the token"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_run_mint_and_publish_reads_mints_and_publishes_end_to_end() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
+            let body: &'static str =
+                Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
+            let (dhan_url, dhan_requests) = start_mint_server("200 OK", body).await;
+            let client = ssm_client(&ssm_endpoint).await;
+            let http = build_http_client().expect("client builds");
+
+            let path = run_mint_and_publish(&client, &http, "prod", SSM_DHAN_SERVICE, &dhan_url)
+                .await
+                .expect("the full job must succeed");
+            assert_eq!(path, "/tickvault/prod/dhan/access-token");
+
+            let seen = recorded(&ssm_requests);
+            let puts: Vec<_> = seen
+                .iter()
+                .filter(|r| r.target == "AmazonSSM.PutParameter")
+                .collect();
+            assert_eq!(puts.len(), 1, "exactly one publish");
+            assert!(puts[0].body.contains(token));
+            assert!(puts[0].body.contains("/tickvault/prod/dhan/access-token"));
+            for get in seen.iter().filter(|r| r.target == "AmazonSSM.GetParameter") {
+                assert!(!get.body.contains(token), "a read never carries the token");
+            }
+            assert_eq!(seen.len(), 4, "three reads and one write");
+
+            let mint = dhan_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert_eq!(mint.len(), 1);
+            assert!(mint[0].contains(&format!("pin={PIN}")));
+            assert!(mint[0].contains(&format!("dhanClientId={FAKE_DHAN_ACCOUNT}")));
+        }
+
+        #[tokio::test]
+        async fn test_run_mint_and_publish_never_writes_after_a_dhan_rejection() {
+            let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+            let (dhan_url, _) =
+                start_mint_server("200 OK", r#"{"status":"error","message":"Invalid Pin"}"#).await;
+            let client = ssm_client(&ssm_endpoint).await;
+            let http = build_http_client().expect("client builds");
+
+            let err = run_mint_and_publish(&client, &http, "prod", SSM_DHAN_SERVICE, &dhan_url)
+                .await
+                .expect_err("a PIN rejection must fail the job");
+            assert_eq!(err, MintError::DhanError("Invalid Pin".into()));
+            assert!(
+                recorded(&ssm_requests)
+                    .iter()
+                    .all(|r| r.target != "AmazonSSM.PutParameter"),
+                "a failed mint must leave the old token in place"
+            );
+            assert!(
+                !err.to_string().contains(PIN),
+                "the PIN never reaches the error"
+            );
+        }
+
+        #[test]
+        fn test_handle_mints_and_reports_the_parameter_it_wrote() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+                    let token: &'static str = Box::leak(sample_jwt().into_boxed_str());
+                    let body: &'static str =
+                        Box::leak(format!(r#"{{"accessToken":"{token}"}}"#).into_boxed_str());
+                    let (dhan_url, _) = start_mint_server("200 OK", body).await;
+
+                    let _aws = aws_env_guards(&ssm_endpoint);
+                    let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("dhan-depth"));
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+                    let reply = handle(serde_json::json!({}))
+                        .await
+                        .expect("handle must succeed");
+                    assert_eq!(reply["status"], "ok");
+                    assert_eq!(reply["service"], "dhan-depth");
+                    assert_eq!(
+                        reply["parameter"],
+                        "/tickvault/prod/dhan-depth/access-token"
+                    );
+                    let reply_text = reply.to_string();
+                    assert!(
+                        !reply_text.contains(token),
+                        "the reply never carries the token"
+                    );
+                    assert!(
+                    recorded(&ssm_requests)
+                        .iter()
+                        .any(|r| r.target == "AmazonSSM.PutParameter" && r.body.contains(token))
+                );
+                });
+        }
+
+        #[test]
+        fn test_handle_fails_loudly_and_publishes_nothing_on_a_rejected_mint() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let (ssm_endpoint, ssm_requests) = start_loopback_aws(credential_ssm).await;
+                    let (dhan_url, _) =
+                        start_mint_server("401 Unauthorized", r#"{"errorMessage":"bad client"}"#)
+                            .await;
+
+                    let _aws = aws_env_guards(&ssm_endpoint);
+                    let _env = EnvGuard::set("TV_ENVIRONMENT", Some("prod"));
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, Some(&dhan_url));
+
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("a rejected mint must fail the invocation");
+                    let text = err.to_string();
+                    assert!(text.contains("HTTP 401"), "{text}");
+                    assert!(
+                        !text.contains(PIN),
+                        "the PIN never reaches the Lambda error"
+                    );
+                    assert!(
+                        recorded(&ssm_requests)
+                            .iter()
+                            .all(|r| r.target != "AmazonSSM.PutParameter")
+                    );
+                });
+        }
+
+        #[test]
+        fn test_handle_refuses_an_unknown_service_before_any_call() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, Some("groww"));
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("an unknown namespace must be refused");
+                    assert!(
+                        err.to_string()
+                            .contains("refusing to mint into an unknown namespace")
+                    );
+                });
+        }
+
+        #[test]
+        fn test_handle_refuses_to_guess_the_auth_host() {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread fixture runtime")
+                .block_on(async {
+                    let _service = EnvGuard::set(SSM_SERVICE_ENV, None);
+                    let _host = EnvGuard::set(DHAN_AUTH_BASE_URL_ENV, None);
+                    let err = handle(serde_json::json!({}))
+                        .await
+                        .expect_err("an unset auth host must be refused");
+                    assert!(err.to_string().contains(DHAN_AUTH_BASE_URL_ENV));
+                });
+        }
+
+        // ---- describe_transport_error, on real reqwest errors -------------
+
+        /// A loopback listener that accepts and then does `behaviour` with
+        /// the socket, for a single connection.
+        async fn one_shot_server<F, Fut>(behaviour: F) -> String
+        where
+            F: FnOnce(tokio::net::TcpStream) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = ()> + Send,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    behaviour(stream).await;
+                }
+            });
+            format!("http://127.0.0.1:{port}/app/generateAccessToken?pin={PIN}")
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_timeout_without_the_url() {
+            let url = one_shot_server(|stream| async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(stream);
+            })
+            .await;
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .expect("client");
+            let err = client.post(&url).send().await.expect_err("must time out");
+            let described = describe_transport_error(&err);
+            assert_eq!(described, "timed out");
+            assert!(!described.contains(PIN));
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_refused_connection() {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            drop(listener);
+            let err = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/?pin={PIN}"))
+                .send()
+                .await
+                .expect_err("a closed port must refuse");
+            assert_eq!(describe_transport_error(&err), "connection failed");
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_dropped_request() {
+            let url = one_shot_server(|stream| async move { drop(stream) }).await;
+            let err = reqwest::Client::new()
+                .post(&url)
+                .send()
+                .await
+                .expect_err("a connection closed before any reply must fail");
+            let described = describe_transport_error(&err);
+            assert!(
+                [
+                    "request could not be sent",
+                    "transport error",
+                    "connection failed"
+                ]
+                .contains(&described.as_str()),
+                "unexpected class {described}"
+            );
+            assert!(!described.contains(PIN));
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_classifies_a_truncated_body() {
+            let url = one_shot_server(|mut stream| async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\nshort")
+                    .await;
+                let _ = stream.shutdown().await;
+            })
+            .await;
+            let response = reqwest::Client::new()
+                .post(&url)
+                .send()
+                .await
+                .expect("the headers arrive");
+            let err = response.text().await.expect_err("the body is cut short");
+            assert_eq!(
+                describe_transport_error(&err),
+                "response body could not be read"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_describe_transport_error_falls_back_for_a_builder_error() {
+            let err = reqwest::Client::new()
+                .post("not a url")
+                .send()
+                .await
+                .expect_err("an unparsable URL must fail");
+            assert_eq!(describe_transport_error(&err), "transport error");
         }
     }
 }

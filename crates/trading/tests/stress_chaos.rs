@@ -791,8 +791,9 @@ mod stress_state_machine {
     #[test]
     fn test_stress_state_machine_parse_unknown_strings() {
         let unknown = [
-            "", "INVALID", "traded", "pending", "unknown", "42", "NULL", "nil", "none", "ACTIVE",
-            "FILLED",
+            // "traded" and "pending" left this list 2026-10-11 (audit INP-7):
+            // matching ignores ASCII case, so they parse now.
+            "", "INVALID", "unknown", "42", "NULL", "nil", "none", "ACTIVE", "FILLED", "TRADED_",
         ];
         for &s in &unknown {
             assert!(

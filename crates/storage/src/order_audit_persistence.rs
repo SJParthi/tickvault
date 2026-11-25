@@ -9,6 +9,11 @@
 //! does NOT write an `order_audit` row (it is not an order lifecycle event —
 //! the coded `error!` + the Critical Telegram are its record).
 //!
+//! **⚠ CORRECTED 2026-10-11 (audit OBS-8) — a RiskHalt now DOES write one
+//! `order_audit` row** (`event = risk_halt`, `order_id = "n/a"`, the plain
+//! reason in `detail`), like the circuit-breaker system rows. A halt stops
+//! every later order, so the SEBI order trail needs to say when and why.
+//!
 //! BEST-EFFORT ONLY: a forensics write failure must NEVER affect the order
 //! path — the app-crate consumer logs (coded AUDIT-06, staged) + counts and
 //! continues; orders (paper today) are never blocked by this table.
@@ -43,6 +48,11 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
 
 use tickvault_common::config::QuestDbConfig;
+
+use crate::audit_spill::{AuditSpill, AuditSpillTable, spill_failed_batch};
+
+/// This writer's disk-tier table (audit PR42b).
+const SPILL_TABLE: AuditSpillTable = AuditSpillTable::OrderAudit;
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::sanitize_audit_string;
 
@@ -92,6 +102,11 @@ pub enum OrderAuditEvent {
     CircuitClosed,
     /// The SEBI rate limiter denied an order.
     RateLimited,
+    /// The risk engine HALTED trading for the day (daily-loss or other breach).
+    /// Added 2026-10-11 (audit OBS-8): a halt paged Telegram but left no row,
+    /// so the SEBI order trail had no record of when or why trading stopped.
+    /// A system event like `CircuitOpen`: `order_id` is `"n/a"`.
+    RiskHalt,
 }
 
 impl OrderAuditEvent {
@@ -107,6 +122,7 @@ impl OrderAuditEvent {
             Self::CircuitOpen => "circuit_open",
             Self::CircuitClosed => "circuit_closed",
             Self::RateLimited => "rate_limited",
+            Self::RiskHalt => "risk_halt",
         }
     }
 }
@@ -184,9 +200,14 @@ pub fn order_audit_create_ddl() -> String {
 /// HTTP-CLIENT-01-class consequence: a failed ensure leaves the table to be
 /// auto-created by the first ILP write WITHOUT dedup (a duplicate-row
 /// window until a later ensure succeeds).
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested; the 200/500/unreachable arms exercised via the mock-HTTP tokio tests below)
 // FINANCIAL-TEST-EXEMPT: idempotent DDL runner — no financial arithmetic ("order" is the table name)
-pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -207,7 +228,7 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
                  ensured (first ILP write may auto-create it WITHOUT dedup — \
                  duplicate-row window until the next successful boot)"
             );
-            return;
+            return false;
         }
     };
     let mut statements = vec![order_audit_create_ddl()];
@@ -237,14 +258,16 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
     statements.push(format!(
         "ALTER TABLE {ORDER_AUDIT_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_ORDER_AUDIT});"
     ));
-    for ddl in &statements {
+    let dedup_index = statements.len().saturating_sub(1);
+    let mut keyed = false;
+    for (index, ddl) in statements.iter().enumerate() {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => keyed |= index == dedup_index,
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -274,6 +297,7 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
             }
         }
     }
+    keyed
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -286,13 +310,18 @@ fn order_audit_ilp_http_conf(config: &QuestDbConfig) -> String {
 }
 
 /// Lazy ILP-over-HTTP writer for `order_audit`. Unreachable QuestDB at
-/// construction still builds (rows buffer locally); a failed flush
-/// DISCARDS the pending buffer (poisoned-buffer defense) — the rows are
-/// best-effort forensics; the discard is counted + coded, never silent.
+/// construction still builds (rows buffer locally). A failed flush writes
+/// the pending rows to the disk tier (`audit_spill`, audit PR42b), which
+/// replays them once QuestDB answers; only when the disk tier refuses the
+/// batch are the rows DISCARDED (poisoned-buffer defense), counted + coded.
 pub struct OrderAuditWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending: usize,
+    /// Buffer length after the last whole row (audit PR42b).
+    committed_len: usize,
+    /// Disk tier for a failed flush (audit PR42b); `None` in `for_test`.
+    spill: Option<AuditSpill>,
 }
 
 impl OrderAuditWriter {
@@ -300,6 +329,25 @@ impl OrderAuditWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_order_audit_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Pre-register the discard counter at ZERO before any row is written.
+        //
+        // WHY (measured on the live box 2026-08-26): this series had ZERO lines
+        // in /metrics out of 756 exported, because a counter that has never been
+        // incremented is never exported -- and the CloudWatch agent computes a
+        // counter alarm value as a DELTA between consecutive samples. With no
+        // previous sample it DROPS the first one as its baseline. So the FIRST
+        // discarded SEBI audit row would have been swallowed and
+        // `tv-<env>-order-audit-rows-discarded` would only have fired on the
+        // SECOND. For a rare, legally-retained record, the first is the one that
+        // matters -- and a discard that happens exactly once would never page at
+        // all.
+        //
+        // Publishing a harmless zero here makes THAT the dropped baseline sample.
+        // Same discipline as `SpillDropCounters::new` and `WalRingSink::pre_register`.
+        // The counter is BARE (no labels) at its only emit site in
+        // `discard_pending`, so this pre-registration creates the identical
+        // series rather than a phantom sibling -- verified before writing it.
+        metrics::counter!("tv_order_audit_rows_discarded_total").increment(0);
         let conf = order_audit_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -308,6 +356,8 @@ impl OrderAuditWriter {
                     sender: Some(s),
                     buffer: b,
                     pending: 0,
+                    committed_len: 0,
+                    spill: Some(AuditSpill::for_table(SPILL_TABLE)),
                 }
             }
             Err(err) => {
@@ -319,6 +369,8 @@ impl OrderAuditWriter {
                     sender: None,
                     buffer: Buffer::new(ProtocolVersion::V1),
                     pending: 0,
+                    committed_len: 0,
+                    spill: Some(AuditSpill::for_table(SPILL_TABLE)),
                 }
             }
         }
@@ -332,6 +384,8 @@ impl OrderAuditWriter {
             sender: None,
             buffer: Buffer::new(ProtocolVersion::V1),
             pending: 0,
+            committed_len: 0,
+            spill: None,
         }
     }
 
@@ -425,27 +479,53 @@ impl OrderAuditWriter {
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        self.committed_len = self.buffer.len();
+        // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
+        //
+        // This increments when the row enters the BUFFER, before any flush. A
+        // failed flush discards the batch, so on a bad day this reads a number
+        // of rows the table does not contain. That is not hypothetical: on
+        // 2026-08-25 a disk-full session left this at 6 with the table EMPTY,
+        // and the operator found out by asking why his order was missing.
+        //
+        // The truth is derivable and the arithmetic is the point:
+        //   acked = <this> - <the *_rows_discarded_total sibling>
+        // Every failure path routes through `discard_pending`, which counts
+        // what it drops (pinned for every writer in the crate by
+        // `ilp_overflow_bound_guard::every_flushing_writer_declares_its_failure_treatment`),
+        // so the subtraction always closes.
+        //
+        // Deliberately NOT moved to the flush-success arm: this counter carries
+        // a per-row LABEL that a batch-sized increment at ack time cannot
+        // preserve, and re-pointing a live series at a different quantity makes
+        // its history incomparable across the change. Recording what it means
+        // is the honest fix; a second acked series is an operator decision with
+        // its own CloudWatch cost line.
         metrics::counter!("tv_order_audit_rows_total", "event" => r.event.as_str()).increment(1);
         Ok(())
     }
 
     /// Flushes buffered rows over ILP-HTTP (per-flush server ACK). On ANY
-    /// failed flush the pending buffer is DISCARDED (poisoned-buffer
-    /// defense) — the rows are best-effort forensics; the discard is
-    /// counted (`tv_order_audit_rows_discarded_total`), never silent.
+    /// failed flush the pending rows go to the disk tier (audit PR42b) and
+    /// the flush reports `Ok`; if the disk tier refuses them they are
+    /// DISCARDED (poisoned-buffer defense) and counted
+    /// (`tv_order_audit_rows_discarded_total`), never silent.
     ///
     /// # Errors
-    /// `Err` when disconnected or the HTTP flush fails (pending discarded).
+    /// `Err` when the flush failed AND the disk tier refused the batch
+    /// (pending discarded).
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
         }
         if self.sender.is_none() {
-            let dropped = self.discard_pending();
-            anyhow::bail!(
-                "order_audit: no ILP sender (QuestDB unreachable) — \
-                 {dropped} pending forensics row(s) discarded (best-effort)"
-            );
+            return match self.spill_or_discard() {
+                Ok(_spilled) => Ok(()),
+                Err(dropped) => anyhow::bail!(
+                    "order_audit: no ILP sender (QuestDB unreachable) and the disk tier \
+                     refused the batch — {dropped} pending forensics row(s) discarded"
+                ),
+            };
         }
         let flushed = self
             .sender
@@ -454,20 +534,23 @@ impl OrderAuditWriter {
         match flushed {
             Some(Ok(())) => {
                 self.pending = 0;
+                self.committed_len = 0;
                 Ok(())
             }
-            Some(Err(err)) => {
-                let dropped = self.discard_pending();
-                Err(anyhow::Error::new(err).context(format!(
-                    "order_audit ILP flush failed — {dropped} pending \
-                     forensics row(s) discarded (poisoned-buffer defense)"
-                )))
-            }
+            Some(Err(err)) => match self.spill_or_discard() {
+                Ok(_spilled) => Ok(()),
+                Err(dropped) => Err(anyhow::Error::new(err).context(format!(
+                    "order_audit ILP flush failed and the disk tier refused the batch — \
+                     {dropped} pending forensics row(s) discarded (poisoned-buffer defense)"
+                ))),
+            },
             // Unreachable (checked above) — treated as the no-sender arm.
-            None => {
-                let dropped = self.discard_pending();
-                anyhow::bail!("order_audit: ILP sender vanished — {dropped} row(s) discarded");
-            }
+            None => match self.spill_or_discard() {
+                Ok(_spilled) => Ok(()),
+                Err(dropped) => {
+                    anyhow::bail!("order_audit: ILP sender vanished — {dropped} row(s) discarded")
+                }
+            },
         }
     }
 
@@ -480,7 +563,35 @@ impl OrderAuditWriter {
         }
         self.buffer.clear();
         self.pending = 0;
+        self.committed_len = 0;
         dropped
+    }
+
+    /// Writes the pending rows to the disk tier (audit PR42b) and returns how
+    /// many were spilled, or discards them (counted) and returns `Err` with
+    /// how many were dropped when there is no spill target or it refused.
+    ///
+    /// Only the bytes of whole rows are written: `committed_len` is the buffer
+    /// length after the last fully appended row, so a row whose append failed
+    /// half-way never reaches the disk tier.
+    fn spill_or_discard(&mut self) -> std::result::Result<usize, usize> {
+        let rows = self.pending;
+        let len = self.committed_len.min(self.buffer.len());
+        let bytes = self.buffer.as_bytes().get(..len).unwrap_or_default();
+        if spill_failed_batch(self.spill.as_ref(), bytes, rows) {
+            self.buffer.clear();
+            self.pending = 0;
+            self.committed_len = 0;
+            return Ok(rows);
+        }
+        Err(self.discard_pending())
+    }
+
+    /// Points this writer's disk tier at `dir` (tests).
+    #[cfg(test)]
+    pub(crate) fn with_spill_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.spill = Some(AuditSpill::in_dir(SPILL_TABLE, dir));
+        self
     }
 }
 
@@ -511,6 +622,12 @@ mod tests {
             outcome: "ok",
             detail: "market order placed".to_string(),
         }
+    }
+
+    /// Audit OBS-8 (2026-10-11): a risk halt has its own stable wire string.
+    #[test]
+    fn test_order_audit_event_risk_halt_wire_string_is_stable() {
+        assert_eq!(OrderAuditEvent::RiskHalt.as_str(), "risk_halt");
     }
 
     #[test]
@@ -588,6 +705,7 @@ mod tests {
             (OrderAuditEvent::CircuitOpen, "circuit_open"),
             (OrderAuditEvent::CircuitClosed, "circuit_closed"),
             (OrderAuditEvent::RateLimited, "rate_limited"),
+            (OrderAuditEvent::RiskHalt, "risk_halt"),
         ];
         for (variant, wire) in all {
             assert_eq!(variant.as_str(), wire);
@@ -782,18 +900,27 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_order_audit_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_order_audit_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_order_audit_table(&mock_cfg(port)).await,
+            "200 everywhere reads keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_order_audit_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_order_audit_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_order_audit_table(&mock_cfg(port)).await,
+            "a refused DDL must not read keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_order_audit_table_unreachable_degrades_without_panic() {
-        ensure_order_audit_table(&unreachable_cfg()).await;
+        assert!(
+            !ensure_order_audit_table(&unreachable_cfg()).await,
+            "unreachable must not read keyed"
+        );
     }
 
     #[tokio::test]
@@ -844,6 +971,8 @@ mod tests {
     async fn test_order_audit_flush_server_reject_hits_some_err_and_discards() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
         let mut w = OrderAuditWriter::new(&mock_cfg(port));
+        // No disk tier: this pins the discard arm itself.
+        w.spill = None;
         w.append_order_audit_row(&sample_row())
             .expect("append must succeed");
         assert_eq!(w.pending(), 1);
@@ -854,5 +983,86 @@ mod tests {
         );
         assert_eq!(w.pending(), 0, "failed flush discards pending");
         assert!(w.buffer_utf8().is_empty(), "ILP buffer cleared on discard");
+    }
+
+    // Audit PR42b: a failed flush goes to the disk tier, not the bin.
+
+    /// The same real server reject, with the disk tier: the batch is spilled,
+    /// not discarded, and the flush reports `Ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_orderauditwriter_server_reject_spills_instead_of_discarding() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let port = spawn_mock_http(MOCK_HTTP_500).await;
+        let mut w = OrderAuditWriter::new(&mock_cfg(port)).with_spill_dir(dir.path().to_path_buf());
+        w.append_order_audit_row(&sample_row())
+            .expect("append must succeed");
+        w.flush().expect("a spilled batch is not an error");
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer_utf8().is_empty());
+        assert_eq!(
+            crate::tick_spill_replay::list_spill_files(dir.path()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_order_audit_failed_flush_spills_the_exact_bytes_and_reports_ok() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let mut w = OrderAuditWriter::for_test().with_spill_dir(dir.path().to_path_buf());
+        w.append_order_audit_row(&sample_row()).expect("append");
+        w.append_order_audit_row(&sample_row()).expect("append");
+        let expected = w.buffer.as_bytes().to_vec();
+        w.flush().expect("a spilled batch is not an error");
+        assert_eq!(w.pending(), 0);
+        assert!(w.buffer_utf8().is_empty());
+        let files = crate::tick_spill_replay::list_spill_files(dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).expect("read"), expected);
+        assert_eq!(
+            crate::audit_spill::rows_in_spill_file_name(&files[0]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_order_audit_spill_leaves_out_a_half_appended_row() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let mut w = OrderAuditWriter::for_test().with_spill_dir(dir.path().to_path_buf());
+        w.append_order_audit_row(&sample_row()).expect("append");
+        let whole = w.buffer.as_bytes().to_vec();
+        // A row whose append stopped after its table name.
+        let _ = w.buffer.table(ORDER_AUDIT_TABLE);
+        assert!(w.buffer.as_bytes().len() > whole.len());
+        w.flush().expect("spilled");
+        let files = crate::tick_spill_replay::list_spill_files(dir.path());
+        assert_eq!(std::fs::read(&files[0]).expect("read"), whole);
+    }
+
+    #[test]
+    fn test_order_audit_refused_spill_still_discards_and_errors() {
+        let dir = crate::audit_spill::test_support::TestDir::new();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write");
+        let mut w = OrderAuditWriter::for_test().with_spill_dir(blocker);
+        w.append_order_audit_row(&sample_row()).expect("append");
+        let err = w.flush().expect_err("a refused spill is a loss");
+        assert!(err.to_string().contains("discarded"));
+        assert_eq!(w.pending(), 0);
+    }
+
+    #[test]
+    fn test_order_audit_writer_new_spills_to_the_production_dir() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let w = OrderAuditWriter::new(&cfg);
+        assert_eq!(
+            w.spill.as_ref().map(|s| s.dir().to_path_buf()),
+            Some(std::path::PathBuf::from("data/spill/audit/order_audit"))
+        );
+        assert!(OrderAuditWriter::for_test().spill.is_none());
     }
 }

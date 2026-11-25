@@ -279,7 +279,7 @@ const BOARD_HTML: &str = r##"<!DOCTYPE html>
   }
 
   // ---------- 2. feed cards ----------
-  var FEED_EMOJI = { dhan: "🔷 DHAN", groww: "🟢 GROWW" };
+  var FEED_EMOJI = { dhan: "🔷 DHAN", truedata: "🟠 TRUEDATA" };
   function verdictClass(v) {
     if (v === "ok") return "";
     if (v === "degraded" || v === "unknown") return "warn";

@@ -86,12 +86,17 @@
 //! acceptable; it is still kept modest (`&'static str` symbols, one reusable
 //! ILP buffer, no per-row `String`).
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
-use tracing::{error, warn};
+use questdb::ingress::Sender;
+
+use crate::tick_ilp::{IlpLine, TickIlpEncoder, TickIlpError, TickIlpSender, TickRowBuffer};
+use crate::tick_stage::{ExtraRow, MAX_PRODUCER_ROWS, STAGED_SLOT_BYTES, StagedBatch, StagedRow};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::QUESTDB_TABLE_TICKS;
@@ -101,6 +106,14 @@ use tickvault_common::price_precision::{f32_to_f64_clean, round_to_2dp};
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_common::tick_types::ParsedTick;
+
+use crate::feed_aux_persistence::{AuxPacketKind, AuxPacketRow, FEED_AUX_ROWS_COUNTER};
+use crate::ilp_table_gate::GatedTable;
+
+/// The raw tick the drain stages (speed fix 6, 2026-11-17); a child module so
+/// it shares this module's private refusal and conversion helpers.
+#[path = "tick_stage_raw.rs"]
+pub(crate) mod raw;
 
 // ---------------------------------------------------------------------------
 // Table + key contract
@@ -145,11 +158,19 @@ pub const DEDUP_KEY_TICKS: &str = "ts, security_id, segment, capture_seq, feed";
 /// [`Feed`] enum so the wire label can never drift from a duplicated literal.
 pub const TICK_FEED_DHAN: &str = Feed::Dhan.as_str();
 
-/// `feed` SYMBOL value for Groww-sourced rows.
-pub const TICK_FEED_GROWW: &str = Feed::Groww.as_str();
-
 /// `feed` SYMBOL value for TrueData-sourced rows.
 pub const TICK_FEED_TRUEDATA: &str = Feed::Truedata.as_str();
+
+/// `source` label on every HOT-PATH-02 line whose rows were RESCUED to the
+/// spill tier (tick AND depth). Added 2026-09-23
+/// (`dhan-rest-only-noise-lock-2026-07-14.md` §2.3x): the
+/// `tv-<env>-errcode-hot-path-02` pager filter excludes it, because a rescued
+/// batch is on disk and re-ingestable — a degrade, never a loss. Every arm that
+/// truly LOSES rows (rescue failed, append failed, quarantine pruned, ensure
+/// failed) deliberately carries no such source and still pages. The literal is
+/// pinned against `deploy/aws/terraform/error-code-alarms.tf` by
+/// `crates/storage/tests/hot_path_02_rescued_filter_guard.rs`.
+pub const RESCUED_TO_SPILL_SOURCE: &str = "rescued_to_spill";
 
 /// Timeout for the idempotent QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -254,11 +275,302 @@ pub enum TickRowError {
         /// The raw wire id that could not be represented.
         raw: u64,
     },
+    /// A price field on the tick is NON-FINITE (`NaN` / `±Inf`).
+    ///
+    /// Fail-closed on purpose, and this is a REAL wire shape rather than a
+    /// theoretical one: `parse_quote_packet` is proven by its own test
+    /// (`quote.rs::…day_open.is_nan()`) to propagate `f32::NAN` into
+    /// `day_open/high/low/close`, and IDX_I moved to Quote mode on
+    /// 2026-08-21, so the packet type that carries it is live.
+    ///
+    /// The old `opt_price` gate was `(v != 0.0).then(…)`, which **NaN
+    /// passes** (NaN compares unequal to everything), and
+    /// [`f32_to_f64_clean`] returns non-finite values unchanged — so a NaN
+    /// reached the ILP line, QuestDB REJECTED the whole batch, the rejected
+    /// buffer was rescued to the spill tier, and `tick_spill_replay` retries
+    /// a permanently-unacceptable file first in every round (files are
+    /// sorted, and there is no DLQ for this tier). One malformed field
+    /// therefore disabled tick recovery for every hour that followed.
+    /// Refusing ONE loud row is strictly better than losing the batch and
+    /// wedging the recovery tier behind it.
+    ///
+    /// Since 2026-10-01 only the LTP reaches this refusal. A non-finite day
+    /// open, high, low or close is written as NULL and counted instead, so a
+    /// good LTP is never lost to an auxiliary column.
+    ///
+    /// The depth path in the same drain already does this
+    /// (`dhan_feed_stack.rs` — "the depth twin of `tick_price_is_sane`");
+    /// the tick path did not.
+    #[error(
+        "tick price field `{field}` is non-finite (NaN/Inf) — row refused \
+         rather than emitted as a NaN/Inf ILP value that QuestDB rejects, \
+         which would spill the whole batch and wedge the replay tier"
+    )]
+    PriceNotFinite {
+        /// Which column carried the non-finite value.
+        field: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Row
 // ---------------------------------------------------------------------------
+
+/// Below this magnitude an `f32` step is at most 2^-7 (0.0078), smaller than
+/// 0.01, so at most one two-decimal number rounds to any given `f32`. That
+/// uniqueness is what makes [`tick_price_f64`]'s fast path exact.
+const TICK_PRICE_FAST_PATH_MAX_MAGNITUDE: f32 = 131_072.0;
+
+/// Exactly `round_to_2dp(f32_to_f64_clean(v))`, bit for bit, for every `f32`
+/// (plan ITEM DT, 2026-10-30). The price written to every `ticks` /
+/// `tick_quotes` price column.
+///
+/// # Why the fast path is exact
+///
+/// For `0 < |v| < 2^17` it takes the nearest whole number of hundredths to
+/// `v` (`cents`) and returns `cents / 100` when that rounds back to `v` as an
+/// `f32`. Then `cents / 100` is the ONLY two-decimal number that does (see
+/// [`TICK_PRICE_FAST_PATH_MAX_MAGNITUDE`]). `f32_to_f64_clean` tries scales
+/// 1, 10 and 100 first, and every hit it can make there is a two-decimal
+/// number that rounds back to `v`, so it is the same number, and at scale 100
+/// its nearest candidate is `cents` itself (|v - d| <= 2^-8, so `v * 100` is
+/// within 0.39 of `100 d`), so it always hits by scale 100. A decimal `m / s`
+/// and `(100 m / s) / 100` are the same rational, and IEEE division returns
+/// the nearest `f64` to it, so both paths return the same `f64`; and
+/// `round_to_2dp` leaves a value of at most two decimals unchanged (and never
+/// sees zero here). Anything else (zero, non-finite, larger, or a price with
+/// more than two decimals) takes the original path unchanged.
+///
+/// Pinned by the proptests in `tick_row_identity_tests` and by the
+/// exhaustive `#[ignore]`d test over every `f32` below 2^17.
+///
+/// # Performance
+///
+/// O(1). The fast path is one multiply, one add, one divide and three
+/// conversions, where `f32_to_f64_clean` tries up to six candidates (a divide
+/// and a software `round` each) and `round_to_2dp` one more `round`.
+/// Allocation-free.
+#[inline]
+#[must_use]
+pub(crate) fn tick_price_f64(v: f32) -> f64 {
+    let magnitude = v.abs();
+    if magnitude > 0.0 && magnitude < TICK_PRICE_FAST_PATH_MAX_MAGNITUDE {
+        // The widening is exact and only locates the two-decimal candidate;
+        // the widened value itself is never returned.
+        let scaled = f64::from(v) * 100.0; // APPROVED: exact widening, never stored
+        // DATA-INTEGRITY-EXEMPT: rounds the hundredths count, never a price.
+        // |scaled| < 1.4e7, so the cast is exact and cannot saturate; the
+        // value is within 0.39 of an integer, so adding 0.5 (with its sign)
+        // and truncating gives that integer.
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: exact, see above
+        let cents = (scaled + 0.5_f64.copysign(scaled)) as i64;
+        // APPROVED: |cents| < 1.4e7 < 2^24, exact in f64
+        #[allow(clippy::cast_precision_loss)]
+        let candidate = cents as f64 / 100.0;
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: narrowing is the round-trip test itself
+        if candidate as f32 == v {
+            return candidate;
+        }
+    }
+    round_to_2dp(f32_to_f64_clean(v))
+}
+
+/// `sanitize_ilp_symbol(segment)`, without the per-character UTF-8 walk when
+/// `ilp_symbol_is_clean` already holds (plain printable ASCII, no `,` or `=`,
+/// at most `ILP_SYMBOL_MAX_BYTES`; every
+/// `segment_code_to_str` value). Identical output: such a string has no
+/// character `sanitize_ilp_symbol` strips, and the length check is the same.
+/// O(len), allocation-free on that path.
+#[inline]
+fn ilp_segment_symbol(segment: &str) -> std::borrow::Cow<'_, str> {
+    if tickvault_common::sanitize::ilp_symbol_is_clean(segment) {
+        std::borrow::Cow::Borrowed(segment)
+    } else {
+        sanitize_ilp_symbol(segment)
+    }
+}
+
+/// Counter for float columns of a tick row that were non-finite at append
+/// time (QuestDB would store them as NULL). Expected to stay at zero.
+pub const TICK_NONFINITE_COLUMNS_COUNTER: &str = "tv_tick_nonfinite_columns_total";
+
+/// How many of a tick row's float columns (`ltp` plus the optional OHLC and
+/// average price) are NaN or infinite. An absent optional column is not
+/// counted: it is written as NULL on purpose. O(1): at most six compares.
+#[must_use]
+pub fn count_nonfinite_tick_floats(row: &TickRow) -> u64 {
+    let optional = [row.open, row.high, row.low, row.close, row.avg_price];
+    u64::from(!row.ltp.is_finite())
+        + optional.iter().flatten().filter(|v| !v.is_finite()).count() as u64
+}
+
+/// Every feed label is ILP-safe, proven at COMPILE TIME (the depth writer's
+/// pattern), so `write_tick_line` passes `feed` through without
+/// `sanitize_ilp_symbol`. Adding a label with a comma, an equals sign, a
+/// control byte or a non-ASCII character is a build failure here.
+const _: () = {
+    let feeds = Feed::ALL;
+    let mut i = 0;
+    while i < feeds.len() {
+        assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+            feeds[i].as_str()
+        ));
+        i += 1;
+    }
+};
+
+/// Runs `write` inside an ILP marker: on `Err` the buffer is rewound to
+/// exactly what it held before, so a half-written line can never poison it.
+///
+/// If the marker cannot be set (the buffer is already mid-line, which this
+/// function exists to make impossible) the error is returned and nothing is
+/// written. If the rewind itself fails (it cannot: the marker was just set)
+/// both errors are returned; the half line then fails the next flush, whose
+/// rescue keeps every buffered row. O(1) around `write`, no allocation.
+pub(crate) fn append_within_marker(
+    buffer: &mut TickRowBuffer,
+    write: impl FnOnce(&mut TickRowBuffer) -> Result<()>,
+) -> Result<()> {
+    buffer.set_marker().context("marker")?;
+    if let Err(err) = write(buffer) {
+        return Err(match buffer.rewind_to_marker() {
+            Ok(()) => err,
+            Err(rewind_err) => err
+                .context(rewind_err)
+                .context("tick append: rewinding the half-written line also failed"),
+        });
+    }
+    buffer.clear_marker();
+    Ok(())
+}
+
+/// Writes one line of the `ticks` columns into `table`, with the
+/// contract-name table passed in (plan item PF-4, 2026-11-06). `exchange_ts_ist_nanos`
+/// is written as `exchange_timestamp` (the `tick_quotes` column, plan item M5);
+/// `ticks` passes `None` and has no such column. Every caller writes inside a
+/// marker. Before PF-4 the drain called a form that read the global table at
+/// append time (kept for the tests in `tick_test_writers.rs`); now a staged
+/// row is written later, by another thread, with the table pinned when the
+/// drain accepted it (`tick_stage`), so its bytes are the ones the drain
+/// would have written then. O(1), no allocation.
+pub(crate) fn write_tick_line_with_labels(
+    buffer: &mut TickRowBuffer,
+    table: &'static str,
+    feed: &'static str,
+    row: &TickRow,
+    exchange_ts_ist_nanos: Option<i64>,
+    labels: &crate::candle_contract_labels::CandleContractLabels,
+) -> Result<()> {
+    // No context wrapper: the `ilp_append_failed` log prints `%err`, which shows
+    // only the outermost message, so the questdb error itself (which names the
+    // refused call and why) is kept as that message.
+    // One match per ROW picks the encoder, so each column call below is a
+    // direct call into that encoder (no per-column branch).
+    match buffer {
+        TickRowBuffer::Library(b) => {
+            write_tick_line_columns(b, table, feed, row, exchange_ts_ist_nanos, labels)
+        }
+        TickRowBuffer::Own(b) => {
+            write_tick_line_columns(b, table, feed, row, exchange_ts_ist_nanos, labels)
+        }
+    }
+    .map_err(anyhow::Error::from)
+}
+
+/// The body of [`write_tick_line_into`], written ONCE over [`IlpLine`] so the
+/// library buffer and our own encoder (`[tick_storage] own_ilp_encoder`,
+/// plan ITEM DT, 2026-10-30) write the same columns in the same order: only
+/// the primitive encoders differ, and each is tested against the library. The
+/// happy path pays no per-column `anyhow` wrapping; the caller converts the
+/// error unchanged, so its message (the refused call and why) is what the
+/// append-failure log prints. O(1), no allocation.
+///
+/// Every column name is a literal of this function. A debug assertion in each
+/// encoder checks it against the library's validator on every call (the
+/// full-row tests write every column); release builds skip it (deep audit
+/// DA-12, 2026-10-12).
+fn write_tick_line_columns<B: IlpLine>(
+    buffer: &mut B,
+    table: &'static str,
+    feed: &'static str,
+    row: &TickRow,
+    exchange_ts_ist_nanos: Option<i64>,
+    labels: &crate::candle_contract_labels::CandleContractLabels,
+) -> Result<(), TickIlpError> {
+    debug_assert!(tickvault_common::sanitize::ilp_symbol_is_clean(feed));
+    buffer.table(table)?;
+    buffer.symbol("segment", ilp_segment_symbol(row.segment).as_ref())?;
+    buffer.symbol("feed", feed)?;
+    // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+    // SAME table the candle writer reads (operator 2026-09-22: "put either
+    // contract or symbol name right in each and every table"). One ArcSwap
+    // load + one hash probe per row, zero allocation: the name is borrowed
+    // out of the published snapshot, already made ILP-safe once at publish
+    // (`candle_contract_labels::sanitize_labels`, J1 2026-10-26; before that
+    // every row re-ran `sanitize_ilp_symbol`, a `chars()` scan per tick).
+    // Debug builds re-check it per row. Written only when the table knows this exact
+    // `(security_id, segment)`; otherwise OMITTED, so the cell reads NULL —
+    // never a guessed name. It must sit among the symbols: ILP rejects a
+    // symbol after the first column. PF-4 (2026-11-06): the table is the one
+    // pinned when the drain staged the row, passed in by the caller.
+    if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+        debug_assert!(crate::candle_contract_labels::label_is_ilp_clean(name));
+        buffer.symbol("contract", name)?;
+    }
+    buffer.column_i64("security_id", row.security_id)?;
+    buffer.column_f64("ltp", row.ltp)?;
+
+    // Per-feed OPTIONAL columns — omitted (NULL) when None.
+    if let Some(v) = row.open {
+        buffer.column_f64("open", v)?;
+    }
+    if let Some(v) = row.high {
+        buffer.column_f64("high", v)?;
+    }
+    if let Some(v) = row.low {
+        buffer.column_f64("low", v)?;
+    }
+    if let Some(v) = row.close {
+        buffer.column_f64("close", v)?;
+    }
+    buffer.column_i64("volume", row.volume)?;
+    if let Some(v) = row.oi {
+        buffer.column_i64("oi", v)?;
+    }
+    if let Some(v) = row.oi_day_high {
+        buffer.column_i64("oi_day_high", v)?;
+    }
+    if let Some(v) = row.oi_day_low {
+        buffer.column_i64("oi_day_low", v)?;
+    }
+    if let Some(v) = row.avg_price {
+        buffer.column_f64("avg_price", v)?;
+    }
+    if let Some(v) = row.last_trade_qty {
+        buffer.column_i64("last_trade_qty", v)?;
+    }
+    if let Some(v) = row.total_buy_qty {
+        buffer.column_i64("total_buy_qty", v)?;
+    }
+    if let Some(v) = row.total_sell_qty {
+        buffer.column_i64("total_sell_qty", v)?;
+    }
+    if let Some(v) = row.received_at_ist_nanos {
+        buffer.column_ts_nanos("received_at", v)?;
+    }
+    if let Some(v) = row.payload_hash {
+        buffer.column_i64("payload_hash", v)?;
+    }
+    if let Some(v) = exchange_ts_ist_nanos {
+        buffer.column_ts_nanos("exchange_timestamp", v)?;
+    }
+
+    // capture_seq is the LAST column before the designated timestamp.
+    buffer.column_i64("capture_seq", row.capture_seq)?;
+    buffer.at_nanos(row.ts_ist_nanos)
+}
 
 /// One `ticks` row, ready for ILP append. Feed-agnostic and `Copy`.
 ///
@@ -288,6 +600,11 @@ pub struct TickRow {
     pub close: Option<f64>,
     /// Open interest. `None` → NULL.
     pub oi: Option<i64>,
+    /// Day-high open interest (Full packet bytes 38-41, NSE_FNO only). `None`
+    /// → NULL. Persisted since 2026-10-02 (item 45h); it never feeds a candle.
+    pub oi_day_high: Option<i64>,
+    /// Day-low open interest (Full packet bytes 42-45, NSE_FNO only). `None` → NULL.
+    pub oi_day_low: Option<i64>,
     /// Average traded price (VWAP). `None` → NULL.
     pub avg_price: Option<f64>,
     /// Last trade quantity. `None` → NULL.
@@ -296,8 +613,6 @@ pub struct TickRow {
     pub total_buy_qty: Option<i64>,
     /// Total sell quantity. `None` → NULL.
     pub total_sell_qty: Option<i64>,
-    /// Raw exchange timestamp (IST epoch SECONDS), verbatim audit column.
-    pub exchange_timestamp: Option<i64>,
     /// Local receive instant as IST nanoseconds. `None` → NULL.
     pub received_at_ist_nanos: Option<i64>,
     /// Deterministic content fingerprint (integrity column, NOT in the key).
@@ -311,6 +626,7 @@ impl TickRow {
     /// * `volume` `u32` → `i64` widens losslessly through the saturating
     ///   boundary helper.
     /// * every `f32` price widens via `f32_to_f64_clean` then `round_to_2dp`
+    ///   (computed by [`tick_price_f64`], the same value bit for bit)
     ///   (STORAGE-GAP-02 + the 2-dp price rule) — never a bare `as f64`.
     /// * a zero-valued Ticker-packet field stays `Some(0.0)` only where the
     ///   exchange really sent it; fields a Ticker packet does not carry
@@ -319,54 +635,160 @@ impl TickRow {
     /// # Errors
     /// [`TickRowError::SecurityIdNotRepresentable`] when the id has bit 63 set.
     pub fn from_parsed_tick(tick: &ParsedTick, capture_seq: i64) -> Result<Self, TickRowError> {
-        let security_id = i64::try_from(tick.security_id).map_err(|_| {
-            metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width")
-                .increment(1);
-            error!(
-                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
-                raw_security_id = tick.security_id,
-                segment = segment_code_to_str(tick.exchange_segment_code),
-                "tick row refused — security_id does not fit the LONG column; \
-                 narrowing it would alias two instruments onto one DEDUP key \
-                 (silent cross-instrument corruption). Row NOT written."
-            );
-            TickRowError::SecurityIdNotRepresentable {
-                raw: tick.security_id,
-            }
-        })?;
+        let security_id = checked_tick_identity(tick)?;
 
         // A Ticker (16-byte) packet carries only LTP + LTT; Quote/Full add the
-        // rest. Zero means "not carried" for those, so it becomes NULL.
-        let opt_price = |v: f32| (v != 0.0).then(|| round_to_2dp(f32_to_f64_clean(v)));
+        // rest. Zero means "not carried" for those, so it becomes NULL. A
+        // non-finite value is NULL too (the `is_finite` arm below), so the
+        // `!= 0.0` gate means exactly what it reads as.
+        // 2026-08-25 — `is_finite()` added, and it is NOT redundant with the
+        // LTP check (now in `checked_tick_identity`).
+        //
+        // That loop then covered five fields; `average_traded_price` was a
+        // SIXTH caller of this closure and was never in it. Since 2026-10-01
+        // the loop covers the LTP alone and the day OHLC use this closure too.
+        // `NaN != 0.0` is TRUE, and both `f32_to_f64_clean` and `round_to_2dp`
+        // pass non-finite straight through — so a NaN ATP went to ILP. The
+        // parser proves it can: Dhan Quote packets carry NaN there, asserted
+        // by `parser::quote`'s own `average_traded_price.is_nan()` test.
+        //
+        // The consequence is exactly the chain `TickRowError::PriceNotFinite`
+        // documents as CLOSED: QuestDB rejects the whole batch, `discard_pending`
+        // clears up to 1,000 good rows, the rescued buffer spills, and the replay
+        // tier wedges behind a file it can never accept.
+        //
+        // A non-finite OPTIONAL price becomes NULL and is counted, rather than
+        // refusing the row the way a non-finite LTP does. Refusing here
+        // would discard a tick whose LTP is perfectly good — losing a tick to
+        // protect an auxiliary column, which is the wrong trade.
+        let opt_price = |v: f32| {
+            if !v.is_finite() {
+                note_non_finite_optional_price(
+                    tick.security_id,
+                    segment_code_to_str(tick.exchange_segment_code),
+                );
+                return None;
+            }
+            (v != 0.0).then(|| tick_price_f64(v))
+        };
         let opt_qty = |v: u32| (v != 0).then(|| i64::from(v));
+
+        // Hoisted: the receipt time is now needed TWICE — once as its own
+        // column and once as the fallback designated timestamp for a row whose
+        // LTT is the vendor's never-traded sentinel.
+        let received_at_ist_nanos = (tick.received_at_nanos != 0).then_some(
+            tick.received_at_nanos
+                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
+        );
 
         Ok(Self {
             security_id,
             segment: segment_code_to_str(tick.exchange_segment_code),
-            ltp: round_to_2dp(f32_to_f64_clean(tick.last_traded_price)),
+            ltp: tick_price_f64(tick.last_traded_price),
             volume: saturate_volume_to_i64(u64::from(tick.volume), security_id),
             // Dhan sends exchange_timestamp already in IST epoch SECONDS — no
-            // +19800 offset (`.claude/rules/dhan/live-market-feed.md`).
-            ts_ist_nanos: i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000),
+            // +19800 offset (`.claude/rules/dhan/live-market-feed.md`). A
+            // never-traded SENTINEL falls back to the receipt time — see
+            // [`row_timestamp_ist_nanos`].
+            ts_ist_nanos: row_timestamp_ist_nanos(tick.exchange_timestamp, received_at_ist_nanos),
             capture_seq,
             open: opt_price(tick.day_open),
             high: opt_price(tick.day_high),
             low: opt_price(tick.day_low),
             close: opt_price(tick.day_close),
             oi: opt_qty(tick.open_interest),
+            oi_day_high: opt_qty(tick.oi_day_high),
+            oi_day_low: opt_qty(tick.oi_day_low),
             avg_price: opt_price(tick.average_traded_price),
             last_trade_qty: (tick.last_trade_quantity != 0)
                 .then(|| i64::from(tick.last_trade_quantity)),
             total_buy_qty: opt_qty(tick.total_buy_quantity),
             total_sell_qty: opt_qty(tick.total_sell_quantity),
-            exchange_timestamp: Some(i64::from(tick.exchange_timestamp)),
-            received_at_ist_nanos: (tick.received_at_nanos != 0).then_some(
-                tick.received_at_nanos
-                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
-            ),
+            received_at_ist_nanos,
             payload_hash: None,
         })
     }
+}
+
+/// The two refusals every tick row passes first, shared by
+/// [`TickRow::from_parsed_tick`] and the drain's raw staging (speed fix 6,
+/// 2026-11-17), so both count exactly the same refusals: the id must fit the
+/// `LONG` column and the LTP must be finite. Returns the narrowed id. O(1).
+///
+/// `#[inline]` with the two refusal bodies in `#[cold]` helpers (review,
+/// 2026-11-17): the happy path is one `try_from` and one `is_finite` in the
+/// caller, as it was inside the old `from_parsed_tick`, with no call and no
+/// `Result` returned through memory.
+#[inline]
+fn checked_tick_identity(tick: &ParsedTick) -> Result<i64, TickRowError> {
+    let Ok(security_id) = i64::try_from(tick.security_id) else {
+        return Err(refuse_security_id_width(tick));
+    };
+
+    // Fail-closed on a non-finite LTP BEFORE it can reach an ILP line.
+    // NaN compares unequal to everything, so a `!= 0.0` gate does NOT
+    // stop it, and `f32_to_f64_clean` passes non-finite through
+    // unchanged — see `TickRowError::PriceNotFinite` for the full chain
+    // this closes (rejected batch -> spilled buffer -> permanently-wedged
+    // replay round).
+    //
+    // ONLY the LTP is mandatory (2026-10-01 reality check). This check
+    // used to refuse the whole row for a non-finite day open, high, low
+    // or close as well, so one bad day-OHLC field threw away a tick whose
+    // LTP was good: the row was missing from `ticks`, an `error!` fired
+    // for every such tick on the drain, every replay refused it again,
+    // and the candle fold (which reads the LTP) still counted it, so
+    // `ticks` and `candles_*` disagreed. The day OHLC are auxiliary
+    // columns exactly like the average price, so they now take the same
+    // path: a non-finite value becomes NULL and is counted on
+    // `tv_tick_optional_price_dropped_total` (`opt_price` below).
+    //
+    // `0.0` stays legal everywhere: it is the documented "not carried"
+    // sentinel for a Ticker (16-byte) packet and becomes NULL below.
+    // Zero-alloc: one register compare on the happy path.
+    if !tick.last_traded_price.is_finite() {
+        return Err(refuse_price_not_finite(tick, "ltp", tick.last_traded_price));
+    }
+    Ok(security_id)
+}
+
+/// The id-width refusal of [`checked_tick_identity`]: counted and logged.
+/// Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_security_id_width(tick: &ParsedTick) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        raw_security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        "tick row refused — security_id does not fit the LONG column; \
+         narrowing it would alias two instruments onto one DEDUP key \
+         (silent cross-instrument corruption). Row NOT written."
+    );
+    TickRowError::SecurityIdNotRepresentable {
+        raw: tick.security_id,
+    }
+}
+
+/// The non-finite price refusal of [`checked_tick_identity`]: counted and
+/// logged. Cold. O(1).
+#[cold]
+#[inline(never)]
+fn refuse_price_not_finite(tick: &ParsedTick, field: &'static str, value: f32) -> TickRowError {
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(1);
+    error!(
+        code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+        security_id = tick.security_id,
+        segment = segment_code_to_str(tick.exchange_segment_code),
+        field,
+        value = %value,
+        "tick row refused — price field is non-finite (NaN/Inf); \
+         emitting it would make QuestDB reject the whole batch, \
+         spill the rescued buffer, and wedge the replay tier \
+         behind a file it can never accept. Row NOT written."
+    );
+    TickRowError::PriceNotFinite { field }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,8 +801,12 @@ impl TickRow {
 /// `TIMESTAMP(ts) PARTITION BY HOUR WAL`). Pure — no I/O.
 #[must_use]
 pub fn ticks_create_ddl() -> String {
+    // APPROVED: table DDL, built once at boot in ticks_create_ddl
     format!(
         "CREATE TABLE IF NOT EXISTS {TICKS_TABLE} (\
+            received_at TIMESTAMP, \
+            ts TIMESTAMP, \
+            contract SYMBOL, \
             feed SYMBOL, \
             segment SYMBOL, \
             security_id LONG, \
@@ -391,21 +817,22 @@ pub fn ticks_create_ddl() -> String {
             close DOUBLE, \
             volume LONG, \
             oi LONG, \
+            oi_day_high LONG, \
+            oi_day_low LONG, \
             avg_price DOUBLE, \
             last_trade_qty LONG, \
             total_buy_qty LONG, \
             total_sell_qty LONG, \
-            exchange_timestamp LONG, \
-            received_at TIMESTAMP, \
             payload_hash LONG, \
-            capture_seq LONG, \
-            ts TIMESTAMP\
+            capture_seq LONG\
         ) TIMESTAMP(ts) PARTITION BY HOUR WAL"
     )
 }
 
 /// Every `ticks` column with its type, for the per-column self-heal ALTERs.
-const TICKS_COLUMNS: &[(&str, &str)] = &[
+pub(crate) const TICKS_COLUMNS: &[(&str, &str)] = &[
+    ("received_at", "TIMESTAMP"),
+    ("contract", "SYMBOL"),
     ("feed", "SYMBOL"),
     ("segment", "SYMBOL"),
     ("security_id", "LONG"),
@@ -416,12 +843,12 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
     ("close", "DOUBLE"),
     ("volume", "LONG"),
     ("oi", "LONG"),
+    ("oi_day_high", "LONG"),
+    ("oi_day_low", "LONG"),
     ("avg_price", "DOUBLE"),
     ("last_trade_qty", "LONG"),
     ("total_buy_qty", "LONG"),
     ("total_sell_qty", "LONG"),
-    ("exchange_timestamp", "LONG"),
-    ("received_at", "TIMESTAMP"),
     ("payload_hash", "LONG"),
     ("capture_seq", "LONG"),
 ];
@@ -431,12 +858,14 @@ const TICKS_COLUMNS: &[(&str, &str)] = &[
 /// Pure, so the statement set is unit-testable without a live QuestDB.
 #[must_use]
 pub fn ticks_ensure_statements() -> Vec<String> {
-    let mut out = vec![ticks_create_ddl()];
+    let mut out = vec![ticks_create_ddl()]; // APPROVED: boot DDL statement list, never per row
     for (col, ty) in TICKS_COLUMNS {
+        // APPROVED: per-column ADD COLUMN, boot schema self-heal
         out.push(format!(
             "ALTER TABLE {TICKS_TABLE} ADD COLUMN IF NOT EXISTS {col} {ty}"
         ));
     }
+    // APPROVED: DEDUP ENABLE statement, boot only
     out.push(format!(
         "ALTER TABLE {TICKS_TABLE} DEDUP ENABLE UPSERT KEYS({DEDUP_KEY_TICKS})"
     ));
@@ -449,10 +878,99 @@ pub fn ticks_ensure_statements() -> Vec<String> {
 /// A failed ensure leaves the table to be auto-created by the first ILP write
 /// WITHOUT the DEDUP keys — an intra-second duplicate/collapse window until a
 /// later ensure succeeds. That consequence is logged, never swallowed.
+///
+/// Returns `true` only when EVERY statement was accepted. Until 2026-09-08 the
+/// verdict was discarded: the boot ran this once, and a QuestDB that answered
+/// its readiness probe but refused the DDL (a WAL-suspended or still-loading
+/// table) left the DEDUP key missing for the whole session with one log line
+/// as the only trace. The caller now retries on `false` —
+/// `candle_ddl_boot::run_live_table_ddl_at_boot`.
 // TEST-EXEMPT: live-QuestDB DDL runner; the statement set is unit-tested via
 // ticks_ensure_statements(), and the 200 / 500 / unreachable arms are exercised
 // by the mock-HTTP tokio tests below.
-pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
+#[must_use = "a false verdict means the DEDUP key may be missing; retry it"]
+pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) -> bool {
+    let verdict = ensure_ticks_tables_verdict(questdb_config).await;
+    // 2026-11-07 (`ilp_table_gate`): only now may the spill replay post rows
+    // for these two tables; before, a spilled row could let QuestDB create
+    // them itself with the wrong designated timestamp.
+    if verdict.every_statement_accepted {
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::Ticks);
+        crate::ilp_table_gate::mark_table_ensured(crate::ilp_table_gate::GatedTable::TickQuotes);
+    }
+    // B1 review 3 (2026-11-13): each table is keyed on its OWN key
+    // statements. One chained verdict meant a `tick_quotes` QuestDB had
+    // created itself (its DEDUP refused for good) left `ticks` unkeyed too,
+    // and every live tick of the session went to the spill.
+    for (table, key) in [
+        (crate::ilp_table_gate::GatedTable::Ticks, verdict.ticks),
+        (
+            crate::ilp_table_gate::GatedTable::TickQuotes,
+            verdict.tick_quotes,
+        ),
+    ] {
+        if key.accepted {
+            crate::ilp_table_gate::mark_table_keyed(table);
+        } else if key.refused_by_server {
+            // B1 review 2: name a table QuestDB created itself (it can never
+            // be keyed, so the live feed for it stays held) instead of
+            // holding silently. Only the table whose own key was refused.
+            crate::ilp_table_gate::diagnose_refused_key(questdb_config, table).await;
+        }
+    }
+    verdict.every_statement_accepted
+}
+
+/// One table's key verdict from one ensure (B1 review 3): `accepted` when
+/// every KEY-BEARING statement of that table was accepted (see
+/// `ilp_table_gate::ddl_is_key_bearing`), `refused_by_server` when QuestDB
+/// answered one of them with a refusal (not a transport error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableKeyVerdict {
+    pub(crate) accepted: bool,
+    pub(crate) refused_by_server: bool,
+}
+
+impl TableKeyVerdict {
+    const OK: Self = Self {
+        accepted: true,
+        refused_by_server: false,
+    };
+
+    /// Folds one statement's outcome in: `server_refused` true for a non-2xx
+    /// answer, false for a transport error. A column self-heal never counts.
+    fn note_failed(&mut self, ddl: &str, server_refused: bool) {
+        let key = crate::ilp_table_gate::ddl_is_key_bearing(ddl);
+        self.accepted &= !key;
+        self.refused_by_server |= key && server_refused;
+    }
+}
+
+/// What one run of the `ticks` + `tick_quotes` ensure found (B1 review 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TicksEnsureVerdict {
+    /// Every statement of both tables was accepted.
+    pub(crate) every_statement_accepted: bool,
+    /// `ticks`' own key statements.
+    pub(crate) ticks: TableKeyVerdict,
+    /// `tick_quotes`' own key statements.
+    pub(crate) tick_quotes: TableKeyVerdict,
+}
+
+/// Runs every `ticks` and `tick_quotes` statement and returns the verdicts,
+/// without touching the process gate (so its test cannot open it for the
+/// other tests in this binary). Cold, once per ensure.
+async fn ensure_ticks_tables_verdict(questdb_config: &QuestDbConfig) -> TicksEnsureVerdict {
+    let mut verdict = TicksEnsureVerdict {
+        every_statement_accepted: false,
+        ticks: TableKeyVerdict::OK,
+        tick_quotes: TableKeyVerdict::OK,
+    };
+    let unreachable = TableKeyVerdict {
+        accepted: false,
+        refused_by_server: false,
+    };
+    // APPROVED: QuestDB base URL, once per ensure_ticks_table at boot
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -473,10 +991,28 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                  ILP write may auto-create the table WITHOUT the 5-key DEDUP, \
                  which collapses intra-second ticks until a later ensure succeeds"
             );
-            return;
+            verdict.ticks = unreachable;
+            verdict.tick_quotes = unreachable;
+            return verdict;
         }
     };
-    for ddl in &ticks_ensure_statements() {
+    let mut every_statement_accepted = true;
+    // M5 (2026-10-27): `tick_quotes` is written by the same writer, so it is
+    // ensured here with `ticks`, under the same verdict and retry.
+    // B1 review: the live gate and the spill replay need only the key-bearing
+    // statements (CREATE, DEDUP ENABLE); a refused column self-heal on an
+    // already-keyed table must not shut them for the session. B1 review 2:
+    // QuestDB ANSWERED a key statement with a refusal (not a transport
+    // error), so a probe of the table's shape is worth one query. B1 review
+    // 3: judged per table (the `ticks` statements come first).
+    let ticks_statements = ticks_ensure_statements();
+    let quotes = crate::tick_quotes_persistence::tick_quotes_ensure_statements(TICKS_COLUMNS);
+    for (i, ddl) in ticks_statements.iter().chain(quotes.iter()).enumerate() {
+        let own = if i < ticks_statements.len() {
+            &mut verdict.ticks
+        } else {
+            &mut verdict.tick_quotes
+        };
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
@@ -498,6 +1034,8 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                     "ticks DDL returned non-2xx — the 5-key DEDUP may be missing, \
                      which collapses intra-second ticks"
                 );
+                every_statement_accepted = false;
+                own.note_failed(ddl, true);
             }
             Err(err) => {
                 metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl")
@@ -509,23 +1047,1437 @@ pub async fn ensure_ticks_table(questdb_config: &QuestDbConfig) {
                     ddl = ddl.as_str(),
                     "ticks DDL request failed"
                 );
+                every_statement_accepted = false;
+                own.note_failed(ddl, false);
             }
         }
     }
+    verdict.every_statement_accepted = every_statement_accepted;
+    verdict
 }
 
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tick ILP spill — the rescue tier the ticks writer never had
+// ---------------------------------------------------------------------------
+
+/// Directory the failed-flush ILP payloads are appended to.
+///
+/// Sibling of the frame WAL (`data/ws_wal`) and the seal spill, deliberately
+/// under the same `data/` root so one retention sweep can see all three.
+pub const TICK_SPILL_DIR: &str = "data/spill/ticks";
+
+/// Floor for the spill-directory ceiling, in bytes (512 MiB).
+///
+/// This WAS the whole ceiling, a fixed 512 MiB, and it cost 1,695,983 ticks in
+/// one event on the live box on 2026-08-25. The log timeline, in full, because
+/// the shape of it is the argument:
+///
+/// | 08:31:09 | boot #1's WAL-replay flush fails. **1,774,802 rows are
+///              RESCUED, writing 544,034,728 bytes** — a single rescue that on
+///              its own exceeds the 512 MiB ceiling |
+/// | 08:31:56 | the deploy swaps the binary; the process restarts |
+/// | 08:33:44 | boot #2's flush fails. **1,695,983 rows REFUSED** — "tick spill
+///              dir at or past its 536870912-byte cap". `tv_ticks_spilled_total`
+///              stays 0: no rescue, permanent loss |
+///
+/// **The ceiling was smaller than ONE unit of the work it existed to rescue.**
+/// A WAL-replay flush is the largest single buffer this process ever holds, and
+/// at ~544 MB it could not fit even once — so the first rescue consumed the
+/// entire budget and the second was guaranteed to be refused. That is not a
+/// tuning miss; it is a bound that could never do its job.
+///
+/// The volume it was protecting is **200 GB**, so the ceiling that destroyed
+/// the data was **0.26% of the disk**.
+///
+/// The rationale for HAVING a ceiling was and remains right — QuestDB and the
+/// frame WAL share this disk, and a rescue that can fill the root volume trades
+/// a bounded tick loss for an unbounded outage of everything. What was wrong is
+/// that the number was pinned to no machine in particular. That is a shape this
+/// repository has already repaired once, for exactly this reason: the RAM-store
+/// budget was a hardcoded 10 GiB "sized against the r8g.xlarge 32 GiB host"
+/// until 2026-08-21, when it became a runtime fraction of the host's real
+/// memory. [`tick_spill_max_bytes`] applies that same pattern here.
+///
+/// Retained as the FLOOR so the ceiling can never end up smaller than it was,
+/// and as the fallback when the volume cannot be measured.
+pub const TICK_SPILL_MIN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Free bytes a tick-spill write must leave behind, after its own payload.
+///
+/// 2 GiB. The spill tier shares this volume with QuestDB and the frame WAL, so
+/// a rescue that fills the disk converts a bounded tick loss into an unbounded
+/// outage of every table on the box — the exact trade the ceiling exists to
+/// prevent, arrived at from the other direction. Sized against the measured
+/// trough: free space on the prod volume cycles down to ~1.94 GB while QuestDB
+/// stages and releases files, so this refuses precisely in the window where a
+/// half-gigabyte write is most dangerous.
+pub const SPILL_MIN_FREE_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Free-space floor that turns the spill SOFT CEILING into a refusal.
+///
+/// Past `tick_spill_max_bytes()` the rescue keeps writing while the disk has
+/// genuine room, and refuses only once free space falls to this reserve. It is
+/// deliberately EIGHT TIMES [`SPILL_MIN_FREE_HEADROOM_BYTES`]: that guard is a
+/// per-write floor sized against one ~544 MB rescue landing in a momentary
+/// trough, whereas this one is a standing reserve for a spill directory that
+/// has already outgrown its rail and will keep growing until the drain catches
+/// up. QuestDB needs room to stage and merge partitions, not merely room for
+/// one more file.
+///
+/// 16 GiB against the live 322 GB volume is ~5% held back — an order of
+/// magnitude more protection than the 2 GiB per-write floor, while still
+/// leaving ~127 GB of today's free space usable for rescue instead of the
+/// 9.37 GB the old total-derived rail allowed.
+///
+/// # Why this exists at all
+///
+/// MEASURED 2026-09-01: the total-derived ceiling refused 4 tick rescues and
+/// 48 depth rescues with 143 GB free, permanently discarding 5,142,980 ticks
+/// and 238,615,500 depth rows. A rail that fires at a fixed fraction of a
+/// disk's TOTAL size fires identically on an empty disk and a full one, which
+/// makes it useless as a protection and effective only as a data shredder.
+pub const SPILL_SOFT_CEILING_FREE_RESERVE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Worst case bytes ONE session of ticks can spill if the database is
+/// unreachable for the entire session.
+///
+/// DERIVED, not chosen. Measured 2026-09-01: 83,446,729 ticks ingested in a
+/// session, and a `ticks` row is 144 bytes on the wire (4 SYMBOL columns at
+/// 4 B of interned key + 7 eight-byte columns + the designated timestamp).
+/// 83.4M x 144 B = 12.0 GB. Rounded up to 16 GiB so a busier session at
+/// TODAY'S universe still fits.
+///
+/// # ⚠ CORRECTED 2026-09-01 (same day, adversarial review) — it does NOT
+/// # cover the 25,000-instrument target, and the first version claimed it did
+///
+/// The sentence above originally ended "…or a universe grown toward the
+/// 25,000-instrument ceiling, still fits." **That is false, by roughly 21x,
+/// and it was my claim.** The 83.4M-tick session ran the deduped live set of
+/// ~868 instruments. Scaling to the authorized ~24,600 is 28.3x, i.e. ~2.36
+/// billion ticks x 144 B ≈ **340 GB** — larger than the entire 300 GB volume,
+/// so no reserve can cover it and none should pretend to.
+///
+/// The number itself is NOT raised, because a reserve bigger than the disk is
+/// not a reserve. What changes is the claim: this figure covers a full-session
+/// database outage **at today's ~868-instrument universe**, and at the 24,600
+/// target a full-session outage overflows the volume no matter how the reserve
+/// is set. The protection at that scale is the shed ladder and the archival
+/// tier draining the disk, not this constant.
+///
+/// Recorded rather than quietly narrowed because the failure mode is the one
+/// this repository keeps paying for: a measurement taken at one scale, written
+/// up as if it held at another, and then trusted by the next reader.
+///
+/// This exists only to derive [`DEPTH_SPILL_FREE_RESERVE_BYTES`] below. It is
+/// deliberately a named constant rather than a literal inside that
+/// expression, because the number it encodes is a MEASUREMENT and a future
+/// reader must be able to see what it was measured from.
+pub const WORST_CASE_SESSION_TICK_SPILL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Per-write free-space floor for the DEPTH rescue tier.
+///
+/// # The gap this closes (found by adversarial review, 2026-09-01)
+///
+/// The tick tier has TWO independent free-space defences: the soft ceiling's
+/// reserve (which engages only once the spill directory is past its size
+/// rail) and [`SPILL_MIN_FREE_HEADROOM_BYTES`], a per-write floor checked on
+/// EVERY rescue regardless of directory size.
+///
+/// The depth tier had only the first. Below its size rail it wrote with no
+/// free-space consultation at all, which meant the regime it spends most of
+/// its life in — a small spill directory on a disk that QuestDB is staging
+/// merges onto — had no bound whatsoever. Measured free-space troughs of
+/// 1.94 GB are on the record in this file; a depth rescue landing in one had
+/// nothing to stop it.
+///
+/// # Why it is the TICK CEILING RESERVE, and not merely double the tick floor
+///
+/// CRITICAL DEFECT FOUND BY ADVERSARIAL REVIEW, 2026-09-01 — inside the very
+/// change written to prevent it.
+///
+/// The first version of this constant was `2 * SPILL_MIN_FREE_HEADROOM_BYTES`
+/// (4 GiB), reasoning that it should mirror the ceiling reserves' 2:1 ratio.
+/// That reasoning is WRONG, because the two tiers' ceiling arms are gated by
+/// INDEPENDENT directory sizes, so a ratio between the reserves only expresses
+/// a priority while both tiers happen to be in the same regime. With the tick
+/// spill directory OVER its size rail and the depth directory UNDER its own:
+///
+/// | free space | tick tier | depth tier |
+/// |---|---|---|
+/// | 5 GiB | ceiling arm fires, `free <= 16 GiB` reserve → **REFUSE** | `UnderCeiling`, `free >= payload + 4 GiB` → **WRITE** |
+///
+/// Decision-critical ticks discarded while record-only depth keeps writing —
+/// the exact inversion the reserve split exists to prevent, reintroduced
+/// through the OTHER of the two defences. Neither `const _` assert could see
+/// it: one compared floor-to-floor and the other reserve-to-reserve, and the
+/// failure is CROSS-KIND.
+///
+/// # The invariant, stated so it can be checked mechanically
+///
+/// **At every free-space value where the tick tier can refuse, the depth tier
+/// must already have refused.**
+///
+/// The tick tier refuses at `free <= SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`
+/// (ceiling arm) or at `free < payload + SPILL_MIN_FREE_HEADROOM_BYTES`
+/// (floor). Setting this floor to the tick tier's CEILING reserve dominates
+/// both — on every write, regardless of either directory's size. That is what
+/// makes the priority hold in *every* regime rather than only in matching
+/// ones, and it is why a ratio was the wrong shape for this constant.
+pub const DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES: u64 = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+
+const _: () = assert!(
+    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES > SPILL_MIN_FREE_HEADROOM_BYTES,
+    "depth's per-write floor MUST exceed the tick tier's, or the two \
+     defences disagree about which lane gives way first."
+);
+
+/// Pre-register every `tier` label value of `tv_spill_free_probe_blind_total`
+/// at 0: `tick`, `depth` and `seal` (since deep audit DA-14). The
+/// `top_volume` tier (2026-10-13) went with the top_volume spill on
+/// 2026-10-22 (plan item 62, operator Quote 34).
+///
+/// That counter records rescues written WITHOUT a free-space answer, because
+/// the `df` probe failed. A per-write floor must NOT fail closed — one broken
+/// probe would disable the entire rescue tier — so the write proceeds; what
+/// was wrong before is that it proceeded SILENTLY.
+///
+/// A counter that is never incremented is never REGISTERED as a series, and an
+/// absent series is indistinguishable from a healthy zero — the failure this
+/// repository has already paid for once, on the depth loss counters.
+///
+/// Emitted as a STRING LITERAL at every site, deliberately:
+/// `loss_writer_metrics_are_shipped_guard` extracts metric names by scanning
+/// for literals, so routing this through a `const` would make it invisible to
+/// the very guard added to catch unshipped loss counters. It is listed in that
+/// guard's `DELIBERATELY_LOCAL_ONLY` with its cost reason instead, so the
+/// guard stays honest about it rather than silently not noticing.
+pub fn seed_spill_free_probe_blind_counters() {
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(0);
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "depth").increment(0);
+    // Deep audit DA-14: the seal escalation floor's blind writes.
+    metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "seal").increment(0);
+}
+
+// THE CROSS-KIND ASSERT — the one whose absence let the inversion through.
+//
+// The two same-kind asserts (floor-vs-floor above, reserve-vs-reserve below)
+// are both satisfiable while the inversion is live, because the tick tier's
+// STRONGEST guard is its ceiling reserve while the depth tier's ALWAYS-ON
+// guard is its per-write floor. Those are different kinds, so no same-kind
+// comparison can relate them. This one does.
+const _: () = assert!(
+    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES >= SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    "depth's ALWAYS-ON per-write floor MUST be at least the tick tier's \
+     ceiling reserve. Below that there is a band of free-space values in \
+     which ticks are refused and depth is still written — decision-critical \
+     data discarded to make room for record-only data, which is the exact \
+     inversion this split exists to prevent."
+);
+
+/// Free-space reserve the DEPTH rescue tier must leave behind — deliberately
+/// LARGER than the tick tier's.
+///
+/// # Why the two tiers cannot share one reserve
+///
+/// Until 2026-09-01 they did, and it was backwards. The operator's own rule
+/// for this system is that ticks are decision-critical (a strategy reads
+/// folded tick state from RAM and can never wait on the database) while depth
+/// is record-only (nothing reads it back — verified: zero readers in the
+/// indicator, strategy and risk paths). So when disk gets tight, the lane
+/// that must survive is ticks.
+///
+/// A single shared reserve produces the opposite outcome, because depth is
+/// the bigger writer by every measure:
+///
+/// | | ticks | depth |
+/// |---|---|---|
+/// | rows per packet | 1 | 10 (5 levels x 2 sides) |
+/// | disk footprint (measured) | 14 GB | 110 GB |
+/// | rescue success (measured 2026-09-01) | 84.6% | 23.7% |
+///
+/// With one reserve, depth consumes the remaining free space first and BOTH
+/// tiers then refuse together — so the lane nothing reads starves the lane
+/// every trade depends on. The 84.6% vs 23.7% split is that already happening.
+///
+/// # The derivation
+///
+/// Depth must stop rescuing while there is still room for an ENTIRE session
+/// of ticks to spill on top of the database's own reserve:
+///
+/// ```text
+/// DEPTH_SPILL_FREE_RESERVE_BYTES
+///   = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES   (the database keeps operating)
+///   + WORST_CASE_SESSION_TICK_SPILL_BYTES     (every tick of a session fits)
+/// ```
+///
+/// That is 32 GiB against the tick tier's 16 GiB. The 16 GiB BAND between
+/// them is the point of the whole change: inside it depth refuses and ticks
+/// are still rescued, which is the priority order stated above expressed as
+/// a number rather than as a comment.
+///
+/// A bigger multiple was rejected: every extra byte here is depth data
+/// discarded on a disk that still has room, which is the exact defect the
+/// 2026-09-01 fix was made to stop. The reserve is sized to what ticks
+/// provably need and no more.
+pub const DEPTH_SPILL_FREE_RESERVE_BYTES: u64 =
+    SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + WORST_CASE_SESSION_TICK_SPILL_BYTES;
+
+const _: () = assert!(
+    DEPTH_SPILL_FREE_RESERVE_BYTES > SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+    "depth MUST reserve more than ticks. If these are ever equal the two \
+     tiers refuse together and record-only depth can starve decision-critical \
+     ticks out of their rescue path — the defect this constant exists to fix."
+);
+
+/// What the soft ceiling decides for one rescue write.
+///
+/// Extracted as a pure function for a reason the CI failure of 2026-09-01
+/// made concrete: the test that pinned the old behaviour could only ever
+/// exercise the REFUSE arm by having the ceiling refuse unconditionally,
+/// because a unit test cannot manufacture a nearly-full filesystem. So the
+/// arm that actually protects the database was the one arm no test could
+/// reach, and the arm that discarded 243 million rows was the one it pinned.
+///
+/// With the decision separated from the I/O, every arm is reachable from a
+/// table of numbers, including the two that matter most: at the ceiling with
+/// room (allow) and at the ceiling without it (refuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCeilingVerdict {
+    /// Below the rail. Nothing to decide.
+    UnderCeiling,
+    /// Past the rail, but the volume demonstrably has room. Allow, and count.
+    OverCeilingWithRoom,
+    /// Past the rail and free space is at or under the database reserve.
+    /// Refuse — this is the case the rail exists for.
+    OverCeilingNoRoom,
+    /// Past the rail and free space is unknown. Refuse: an unreadable
+    /// free-space number is exactly when unbounded growth is least
+    /// affordable.
+    OverCeilingProbeFailed,
+}
+
+/// Decides whether a rescue write may proceed past the soft ceiling.
+///
+/// `free` is `None` when the free-space probe failed. `reserve` is the room
+/// left for the database — see [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`].
+///
+/// The comparison is strictly greater-than, so a volume sitting exactly on
+/// the reserve refuses. At a boundary the safe direction is the database's.
+#[must_use]
+pub const fn classify_spill_ceiling(
+    dir_bytes: u64,
+    ceiling: u64,
+    free: Option<u64>,
+    reserve: u64,
+) -> SpillCeilingVerdict {
+    if dir_bytes < ceiling {
+        return SpillCeilingVerdict::UnderCeiling;
+    }
+    match free {
+        Some(free_bytes) if free_bytes > reserve => SpillCeilingVerdict::OverCeilingWithRoom,
+        Some(_) => SpillCeilingVerdict::OverCeilingNoRoom,
+        None => SpillCeilingVerdict::OverCeilingProbeFailed,
+    }
+}
+
+/// What a tier does at the per-write floor when the free-space probe FAILS.
+///
+/// The two tiers answer this differently ON PURPOSE, and the difference is the
+/// whole point of the type existing rather than each site hard-coding an `else`
+/// arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlindWritePolicy {
+    /// Write anyway, counted. Correct for TICKS: one failed free-space probe must not
+    /// disable the tier that carries decision-critical rows.
+    FailOpen,
+    /// Refuse. Correct for DEPTH: it is record-only, carries ~24x the tick row
+    /// volume, and writing it blind is how the volume fills under ticks.
+    FailClosed,
+}
+
+/// The per-write floor's verdict, separated from the I/O for the same reason
+/// [`SpillCeilingVerdict`] was: an arm reachable only when `df` is broken on a
+/// live box is an arm no test can otherwise drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillFloorVerdict {
+    /// Free space is known and sufficient for the payload plus the floor.
+    Allow,
+    /// Free space is known and insufficient. Refuse.
+    RefuseNoRoom,
+    /// The probe failed and this tier writes blind, counted.
+    AllowProbeFailed,
+    /// The probe failed and this tier refuses rather than write blind.
+    RefuseProbeFailed,
+}
+
+/// Decides whether a rescue write may proceed at the per-write floor.
+///
+/// # Why the blind arm is asymmetric, and why that asymmetry is now a TYPE
+///
+/// Found by an adversarial sweep on 2026-09-01, hours after the reserve split
+/// it defeats was shipped. Both tiers refuse on a failed probe INSIDE their
+/// ceiling arm, and that arm engages only once the tier's OWN spill directory
+/// is past its rail. The two directories are INDEPENDENT. So with `df` broken,
+/// the tick directory over its ceiling, and the depth directory still under
+/// its cap:
+///
+/// | tier | path | outcome |
+/// |---|---|---|
+/// | tick | `OverCeilingProbeFailed` | **REFUSE** |
+/// | depth | ceiling arm skipped, floor fails open | **WRITE** |
+///
+/// Decision-critical ticks discarded while record-only depth is written — the
+/// exact inversion the two-reserve split exists to prevent, arriving through
+/// the one door the split's `const _` assert cannot watch. That assert compares
+/// BYTE VALUES, and the probe-failure path carries no byte value at all: it is
+/// the whole `None` domain rather than a band inside it.
+///
+/// It is reachable, not theoretical. A single-table WAL suspension grows one
+/// spill directory and not the other, which is what happened on 2026-08-25
+/// when fourteen tables suspended individually.
+///
+/// A `floor` of zero means the floor is DISABLED (the value tests inject when
+/// they need the allow arm without depending on the build machine's free
+/// space). A disabled floor cannot refuse, blind or otherwise — otherwise
+/// adding this policy would silently break every test that injects zero.
+#[must_use]
+pub const fn classify_spill_floor(
+    free: Option<u64>,
+    payload_len: u64,
+    floor: u64,
+    blind: BlindWritePolicy,
+) -> SpillFloorVerdict {
+    match free {
+        Some(free_bytes) => {
+            // saturating: a payload near u64::MAX must refuse, never wrap into
+            // a small `needed` that then compares as plenty of room.
+            let needed = payload_len.saturating_add(floor);
+            if free_bytes < needed {
+                SpillFloorVerdict::RefuseNoRoom
+            } else {
+                SpillFloorVerdict::Allow
+            }
+        }
+        None => match blind {
+            BlindWritePolicy::FailOpen => SpillFloorVerdict::AllowProbeFailed,
+            // NO `floor == 0` CARVE-OUT (removed 2026-09-01, adversarial review).
+            //
+            // It read reasonably — "a disabled floor stays disabled even when
+            // blind" — and it was a trap. `DepthWriter::for_test` is `pub`,
+            // sets `spill_min_free_headroom: 0`, and IS reachable from
+            // production: `dhan_feed_stack` builds one as a `mem::replace`
+            // placeholder. Today that placeholder is overwritten two lines
+            // later, so the window is transient — but any future edit that
+            // returns or `?`s in between would leave a fail-CLOSED tier
+            // silently writing BLIND, which is the precise inversion this
+            // policy type was introduced to make impossible.
+            //
+            // The policy is about BLINDNESS, not about the floor value. A
+            // tier that asked to fail closed when it cannot see free space
+            // still cannot see free space when its floor happens to be zero.
+            BlindWritePolicy::FailClosed => SpillFloorVerdict::RefuseProbeFailed,
+        },
+    }
+}
+
+/// Reads free bytes for `dir`, or `None` when the probe failed.
+///
+/// Collapses the probe's richer outcome to the one bit
+/// [`classify_spill_ceiling`] needs, so the decision stays a pure function of
+/// numbers rather than of a filesystem type.
+#[must_use]
+pub fn spill_free_bytes(dir: &std::path::Path) -> Option<u64> {
+    match crate::disk_health_watcher::probe_disk_free_bytes(dir) {
+        crate::disk_health_watcher::DiskHealthOutcome::Ok { free_bytes, .. } => Some(free_bytes),
+        crate::disk_health_watcher::DiskHealthOutcome::ProbeFailed { .. } => None,
+    }
+}
+
+/// Fraction of the volume the spill tier may occupy: one thirty-second.
+///
+/// Not a round number chosen for looks. It has to satisfy two bounds at once:
+/// large enough that a realistic episode of flush failures is absorbed rather
+/// than dropped, and small enough that the tier can never threaten the database
+/// it is rescuing from. On the live 200 GB volume it yields ~6.25 GB — twelve
+/// times the old ceiling, and still leaving over 96.8% of the disk for QuestDB,
+/// the frame WAL and everything else.
+pub const TICK_SPILL_VOLUME_FRACTION: u64 = 32;
+
+/// Ceiling on the spill directory, in bytes — DERIVED from the volume.
+///
+/// Resolved ONCE into a `OnceLock`, so every subsequent read is O(1) and the
+/// enforcement can never disagree with the number a log line quotes. An
+/// unmeasurable volume falls back to [`TICK_SPILL_MIN_MAX_BYTES`] with a coded
+/// warning, never silently.
+///
+/// # Complexity
+/// O(1) after the first call. The first call makes one `statvfs` call, on the
+/// cold flush-failure path only.
+#[must_use]
+pub fn tick_spill_max_bytes() -> u64 {
+    static RESOLVED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let probe_at = std::path::Path::new(TICK_SPILL_DIR);
+        // Probe the deepest EXISTING ancestor: `statvfs` on a path that does
+        // not exist yet fails, and the spill dir is created lazily.
+        let mut probe: &std::path::Path = probe_at;
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent,
+                None => break,
+            }
+        }
+        match crate::disk_health_watcher::probe_disk_free_bytes(probe) {
+            crate::disk_health_watcher::DiskHealthOutcome::Ok { total_bytes, .. }
+                if total_bytes > 0 =>
+            {
+                let derived = total_bytes / TICK_SPILL_VOLUME_FRACTION;
+                // Never BELOW what the fixed cap already allowed: this change
+                // exists to stop losing ticks, so it must not reduce headroom
+                // on a small volume.
+                let ceiling = derived.max(TICK_SPILL_MIN_MAX_BYTES);
+                tracing::info!(
+                    total_bytes,
+                    ceiling_bytes = ceiling,
+                    fraction = TICK_SPILL_VOLUME_FRACTION,
+                    "tick spill ceiling derived from the volume — a failed flush can be \
+                     rescued to disk up to this size before rows are dropped"
+                );
+                ceiling
+            }
+            _ => {
+                tracing::warn!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    fallback_bytes = TICK_SPILL_MIN_MAX_BYTES,
+                    "could not measure the spill volume, so the tick spill ceiling falls back \
+                     to the fixed floor. Rescues past that size will be refused and their \
+                     ticks dropped — on a large volume this is far more conservative than \
+                     necessary"
+                );
+                TICK_SPILL_MIN_MAX_BYTES
+            }
+        }
+    })
+}
+
+// O(1) EXEMPT: begin — the spill fdatasync runs only on the writer and
+// rescue threads after a failed flush, never on the frame drain (the drain's
+// inline spill passes no sync).
+/// How a spill write is made durable before its batch counts as rescued
+/// (Z8a, 2026-10-02). Injectable so a test can make the sync fail.
+pub(crate) type SpillSyncFn = fn(&std::fs::File) -> std::io::Result<()>;
+
+/// `fdatasync` on the spill file.
+///
+/// `File::flush` is a no-op for `std::fs::File`, so until 2026-10-02 a rescued
+/// payload sat in the page cache while the watermark it advanced was fsynced:
+/// a host crash kept the watermark, lost the spill bytes, and nothing counted
+/// it. A failed sync returns `Err`, which the callers treat exactly like a
+/// failed write: the range is marked unapplied and the loss counted.
+pub(crate) fn sync_spill_data(file: &std::fs::File) -> std::io::Result<()> {
+    file.sync_data()
+}
+// O(1) EXEMPT: end
+
+/// Writer thread and rescue thread: the spill is synced before the batch
+/// counts as rescued. Both run off the frame drain, so the wait blocks only
+/// them (a slow sync fills the rescue queue, whose overflow defers to the
+/// WAL — the safe direction).
+pub(crate) const SPILL_SYNC_OFF_DRAIN: Option<SpillSyncFn> = Some(sync_spill_data);
+
+/// The frame drain's own inline spill (rows with no WAL backing, or a busy
+/// rescue thread with unbacked rows). **Limitation:** NOT synced — an fsync
+/// there would block the task that empties the sockets. Those bytes reach the
+/// disk on the kernel's writeback, the same assumption the persisted
+/// watermark's durability lag (`WATERMARK_DURABILITY_LAG_SECS`) relies on.
+pub(crate) const SPILL_UNSYNCED_ON_DRAIN: Option<SpillSyncFn> = None;
+
+/// Which spill tier a write belongs to (top_volume plan item 1, 2026-10-13).
+///
+/// Names the tier in refusal messages and picks the `tier` label of
+/// `tv_spill_free_probe_blind_total`. An enum rather than a free string on
+/// purpose: a non-literal label value drops the `metrics` macro to its
+/// allocating arm (it builds a `Vec` of labels), and the tick drain's inline
+/// fallback runs through this function. Each variant therefore counts with a
+/// LITERAL label, exactly as the tick-only code did before.
+///
+/// Depth is not here: it keeps its own `spill_failed_depth_ilp` (framed
+/// `.dspl` format); folding it in is a separate follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillTier {
+    /// `data/spill/ticks` — decision-critical, refused LAST.
+    Tick,
+    // `TopVolume` (`data/spill/top_volume`) REMOVED 2026-10-22 (plan item 62,
+    // operator Quote 34) with the top_volume writer and spill.
+}
+
+impl SpillTier {
+    /// The tier's name in refusal messages and in the blind-probe counter's
+    /// `tier` label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tick => "tick",
+        }
+    }
+
+    /// Counts one write decided without a free-space answer, under this
+    /// tier's literal label. O(1), no allocation.
+    fn count_free_probe_blind(self) {
+        match self {
+            Self::Tick => {
+                metrics::counter!("tv_spill_free_probe_blind_total", "tier" => "tick").increment(1);
+            }
+        }
+    }
+}
+
+/// What a tier does once its folder is at or past its size ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillCeilingKind {
+    /// A SOFT rail: past the ceiling, refuse only when free space is at or
+    /// below `reserve` ([`classify_spill_ceiling`]); with room, write and
+    /// count the growth on `tv_tick_spill_over_soft_ceiling_total`.
+    ///
+    /// Only the tick tier is soft, and that counter is the tick tier's. A
+    /// second soft tier must add its own growth counter before it uses this
+    /// arm (pinned by `test_only_the_tick_spec_is_a_soft_ceiling`).
+    Soft {
+        /// The room the database keeps; see
+        /// [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`].
+        reserve: u64,
+    },
+    /// A HARD rail: past the ceiling, refuse whatever the free space. For a
+    /// lowest-priority tier, whose growth must never be paid for by a tier
+    /// above it.
+    Hard,
+}
+
+/// Everything that differs between two ILP spill tiers (top_volume plan
+/// item 1, 2026-10-13). One function, [`spill_failed_ilp_to`], serves every
+/// tier through this, so the rules (append, sync before `Ok`, ceiling,
+/// per-write floor, blind policy) are written once and cannot drift the way
+/// the depth twin once did.
+///
+/// Built by [`tick_spill_spec`] (today's tick constants, byte-identical
+/// behaviour) (the top_volume spec went with its tier on 2026-10-22, plan item 62).
+#[derive(Clone, Copy)]
+pub struct IlpSpillSpec<'a> {
+    /// The spill folder. Production passes the tier's `*_SPILL_DIR`; tests
+    /// pass a scratch folder.
+    pub(crate) dir: &'a Path,
+    /// First part of the file name: `<prefix>-<feed>-<unix hour>.ilp`.
+    pub(crate) file_prefix: &'static str,
+    /// The feed the rows came from (second part of the file name).
+    pub(crate) feed: Feed,
+    /// The folder's size ceiling in bytes. A function so the value is
+    /// resolved lazily (once, into the tier's `OnceLock`) and so a test can
+    /// inject a tiny one.
+    pub(crate) ceiling: fn() -> u64,
+    /// Soft (ticks) or hard (top_volume) at the ceiling.
+    pub(crate) ceiling_kind: SpillCeilingKind,
+    /// The per-write floor: a write must leave at least this many bytes
+    /// free. Ticks: [`SPILL_MIN_FREE_HEADROOM_BYTES`]; top_volume: its
+    /// reserve, which sits above every depth guard.
+    pub(crate) free_reserve: u64,
+    /// What the floor does when the free-space probe fails.
+    pub(crate) blind: BlindWritePolicy,
+    /// The tier, for messages and the blind-probe counter.
+    pub(crate) tier: SpillTier,
+    /// The frame drain's remembered folder total, consulted ONLY when `sync`
+    /// is `None` (the drain's inline fallback). Tick-only: no other tier
+    /// spills on the drain, so every other spec carries `None` and lists the
+    /// folder on every write.
+    pub(crate) drain_held: Option<&'static SpillHeldBytesCache>,
+    /// Truncate the file back to its pre-write length when the append or
+    /// its sync fails, so a short write cannot leave a torn line that merges
+    /// with the next append (2026-10-13, top_volume spill PR-B review).
+    ///
+    /// ONLY for a tier whose caller serialises every append to the folder
+    /// (top_volume: one lock in its spiller). Ticks keep `false`: the drain's
+    /// inline fallback and the rescue thread can append to the same hourly
+    /// file at once, and a truncate there could cut the other writer's rows.
+    pub(crate) truncate_failed_append: bool,
+}
+
+/// The tick tier's spill spec, built from the same constants the tick-only
+/// function used before 2026-10-13, so tick behaviour is unchanged: folder
+/// `dir`, file `ticks-<feed>-<unix hour>.ilp`, soft ceiling
+/// [`tick_spill_max_bytes`] with the [`SPILL_SOFT_CEILING_FREE_RESERVE_BYTES`]
+/// database reserve, per-write floor [`SPILL_MIN_FREE_HEADROOM_BYTES`],
+/// fail-OPEN when blind, and the drain's remembered folder total.
+#[must_use]
+pub(crate) fn tick_spill_spec(dir: &Path, feed: Feed) -> IlpSpillSpec<'_> {
+    IlpSpillSpec {
+        dir,
+        file_prefix: "ticks",
+        feed,
+        ceiling: tick_spill_max_bytes,
+        ceiling_kind: SpillCeilingKind::Soft {
+            reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES,
+        },
+        free_reserve: SPILL_MIN_FREE_HEADROOM_BYTES,
+        blind: BlindWritePolicy::FailOpen,
+        tier: SpillTier::Tick,
+        drain_held: Some(&TICK_DRAIN_SPILL_HELD),
+        truncate_failed_append: false,
+    }
+}
+
+/// The spill file prefix for rows set aside because their table alone is not
+/// keyed (B1 review 3): `held-<table>`, so the file is
+/// `held-<table>-<feed>-<hour>.ilp` beside the tick rescue files in the same
+/// folder (the replay lists every `.ilp` there and parses the hour from the
+/// last `-` part). Kept apart from `ticks-*.ilp` because the replay holds a
+/// whole file from its first row for a table not yet keyed. O(1).
+#[must_use]
+pub(crate) const fn held_spill_prefix(table: GatedTable) -> &'static str {
+    match table {
+        GatedTable::TickQuotes => "held-tick_quotes",
+        GatedTable::FeedAuxPackets => "held-feed_aux_packets",
+        // Never set aside today (the whole batch is rescued when `ticks` is
+        // not keyed); named so a new caller still gets its own file.
+        GatedTable::Ticks => "held-ticks",
+        GatedTable::MarketDepth => "held-market_depth",
+        GatedTable::MarketDepthBook => "held-market_depth_book",
+    }
+}
+
+/// Appends a failed flush's ILP payload to the tick spill directory.
+///
+/// A thin wrapper since 2026-10-13: the rules live in [`spill_failed_ilp_to`],
+/// fed the tick spec ([`tick_spill_spec`]). See that function for why the
+/// payload is stored verbatim and for the `sync` contract.
+fn spill_failed_ilp(
+    dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    now_unix_secs: i64,
+    sync: Option<SpillSyncFn>,
+) -> std::io::Result<PathBuf> {
+    spill_failed_ilp_to(&tick_spill_spec(dir, feed), payload, now_unix_secs, sync)
+}
+
+/// Appends a failed flush's ILP payload to a tier's spill directory.
+///
+/// # Why the payload is stored verbatim
+///
+/// `Buffer::as_bytes()` is InfluxDB line protocol — exactly the body
+/// QuestDB's own `/write` endpoint accepts. So a spill file is not an archive
+/// format needing a bespoke parser; it is directly re-ingestable:
+///
+/// ```text
+/// curl --data-binary @data/spill/ticks/<file> http://localhost:9000/write
+/// ```
+///
+/// Re-ingest is idempotent because the `ticks` DEDUP key
+/// `(ts, security_id, segment, capture_seq, feed)` carries `capture_seq`, so a
+/// replayed row UPSERTs onto itself rather than duplicating. (The top_volume
+/// tables' key `(ts, tf, family, feed, security_id, segment)` gives the same
+/// property for their rows.)
+///
+/// # Errors
+///
+/// `Err` when the directory cannot be created, the ceiling or the free-space
+/// floor refuses, or the append fails. The caller treats that as "rescue
+/// unavailable" and falls back to the counted drop — a spill that cannot be
+/// written must never mask the loss.
+///
+/// `sync`: [`SPILL_SYNC_OFF_DRAIN`] from the writer and rescue threads (the
+/// payload is `fdatasync`ed before `Ok`), [`SPILL_UNSYNCED_ON_DRAIN`] from the
+/// drain's inline fallback. A failed sync is an `Err` like a failed write.
+///
+/// # Complexity
+///
+/// Not O(1), and flagged: one folder listing (O(files in the folder and its
+/// flat quarantine), skipped on the drain while the tick drain total is
+/// fresh), at most two `statvfs` probes, and an O(payload bytes) append plus
+/// the optional sync. Runs only after a flush already failed.
+pub(crate) fn spill_failed_ilp_to(
+    spec: &IlpSpillSpec<'_>,
+    payload: &[u8],
+    now_unix_secs: i64,
+    sync: Option<SpillSyncFn>,
+) -> std::io::Result<PathBuf> {
+    // O(1) EXEMPT: begin — cold path, runs only on a flush failure.
+    let dir = spec.dir;
+    let tier = spec.tier.label();
+    std::fs::create_dir_all(dir)?;
+
+    // The ceiling is a SOFT rail for ticks, not a refusal.
+    //
+    // MEASURED IN PRODUCTION 2026-09-01: this arm refused four times with
+    // `ceiling = 10_063_871_360` (1/32 of a 322 GB volume) while `df` reported
+    // **143 GB free**. 5,142,980 ticks were permanently discarded onto a disk
+    // that was 53% used. The depth twin fired 48 times the same morning and
+    // discarded 238,615,500 rows. Neither disk was anywhere near full.
+    //
+    // The rail's INTENT is right and is kept: the spill tier must never be able
+    // to starve the database it rescues from. What was wrong is the quantity it
+    // measured. `tick_spill_max_bytes()` derives from the volume's TOTAL size —
+    // a constant that never changes — so it fires at the same 3% whether the
+    // disk is empty or nearly full. Total size cannot threaten QuestDB. Only
+    // FREE space can.
+    //
+    // New rule: past the soft ceiling, refuse ONLY when free space is already
+    // at or below the headroom the live guard below enforces anyway. Above it
+    // there is demonstrably room, and discarding market data we have somewhere
+    // to put is indefensible. (A HARD tier — top_volume — refuses past its
+    // ceiling whatever the free space: it is the lowest-priority tier, so its
+    // growth must never be paid for by depth or ticks.)
+    let ceiling = (spec.ceiling)();
+    // The drain's inline fallback (no sync) reuses a fresh listing; the writer
+    // and rescue threads list every time (deep audit DA-12, NT-1). Only the
+    // tick spec carries a drain total.
+    let on_drain = sync.is_none();
+    let held = match spec.drain_held {
+        Some(cache) if on_drain => cache.held(dir, std::time::Instant::now(), spill_dir_bytes),
+        _ => spill_dir_bytes(dir),
+    };
+    // The probe is deliberately INSIDE this branch, not an argument to the
+    // call below.
+    //
+    // REGRESSION FIXED 2026-09-01 (adversarial review). Extracting the
+    // decision into a pure function made `spill_free_bytes(dir)` an eagerly
+    // evaluated argument, so every rescue forked `df` -- including the common
+    // under-ceiling case, which is most of them, and which needs no free-space
+    // answer at all.
+    if held >= ceiling {
+        match spec.ceiling_kind {
+            SpillCeilingKind::Soft { reserve } => {
+                match classify_spill_ceiling(held, ceiling, spill_free_bytes(dir), reserve) {
+                    SpillCeilingVerdict::UnderCeiling => {}
+                    SpillCeilingVerdict::OverCeilingWithRoom => {
+                        // Room to spare. Allow the rescue and record that we are
+                        // past the soft rail, so the growth is never silent.
+                        // Tick-only counter: see `SpillCeilingKind::Soft`.
+                        metrics::counter!("tv_tick_spill_over_soft_ceiling_total").increment(1);
+                    }
+                    SpillCeilingVerdict::OverCeilingNoRoom => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::StorageFull,
+                            format!(
+                                "{tier} spill dir past its {ceiling}-byte soft ceiling and free \
+                                 space is at or below the {reserve}-byte database reserve — \
+                                 refusing so QuestDB keeps room to operate"
+                            ),
+                        ));
+                    }
+                    SpillCeilingVerdict::OverCeilingProbeFailed => {
+                        // COUNT THE BLINDNESS (2026-09-01, adversarial review):
+                        // a failed probe refusing every rescue at the ceiling
+                        // must not leave `tv_spill_free_probe_blind_total` at
+                        // its seeded 0 while the drop counter climbs.
+                        spec.tier.count_free_probe_blind();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::StorageFull,
+                            format!(
+                                "{tier} spill dir past its {ceiling}-byte soft ceiling and the \
+                                 free-space probe failed — refusing rather than growing blind"
+                            ),
+                        ));
+                    }
+                }
+            }
+            SpillCeilingKind::Hard => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "{tier} spill dir at or past its {ceiling}-byte hard ceiling — \
+                         refusing whatever the free space, so this lowest-priority tier \
+                         never grows at the expense of depth or ticks"
+                    ),
+                ));
+            }
+        }
+    }
+    // LIVE FREE-SPACE GUARD (2026-08-25). The ceiling above is derived from
+    // the volume's TOTAL size, which is the right bound for "how much of this
+    // disk may the spill tier own" — and the wrong question to ask a disk that
+    // is nearly full RIGHT NOW.
+    //
+    // Measured on the prod box the day this landed: free space cycling between
+    // 1.94 GB and 12.9 GB on a 200 GB volume, because QuestDB stages large
+    // files and releases them. A 544 MB rescue — the real observed size —
+    // landing in a 1.94 GB trough would take the disk to under 1.4 GB and can
+    // take QuestDB down with it, which is the outage this whole tier exists to
+    // avoid trading a bounded tick loss for.
+    //
+    // So the write is refused when it would leave less than the spec's
+    // `free_reserve` behind. This is deliberately NOT memoised, unlike the
+    // ceiling: free space is a moving quantity, and a cached value would be
+    // answering a question about a disk that no longer exists. One probe per
+    // rescue is free — a rescue only happens when a flush already failed, and
+    // since 2026-10-12 (deep audit DA-12) the probe is one `statvfs` syscall,
+    // no longer a forked `df` process.
+    //
+    // A refusal here is still an honest counted drop, not a silent one: the
+    // caller's `Err` arm logs naming this reason.
+    //
+    // The blind arm follows the spec's policy. Ticks FAIL OPEN: one failed
+    // free-space probe must not disable the rescue path that carries
+    // decision-critical rows, and the blind write is counted. Depth and
+    // top_volume FAIL CLOSED for the mirror-image reason — see
+    // `classify_spill_floor` for why the asymmetry is a typed policy rather
+    // than hand-written `else` arms that silently diverged.
+    let free_now = spill_free_bytes(dir);
+    match classify_spill_floor(
+        free_now,
+        payload.len() as u64,
+        spec.free_reserve,
+        spec.blind,
+    ) {
+        SpillFloorVerdict::Allow => {}
+        SpillFloorVerdict::AllowProbeFailed => {
+            spec.tier.count_free_probe_blind();
+        }
+        SpillFloorVerdict::RefuseProbeFailed => {
+            spec.tier.count_free_probe_blind();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte {tier} spill: the free-space probe failed and this \
+                     tier refuses rather than write blind",
+                    payload.len(),
+                ),
+            ));
+        }
+        SpillFloorVerdict::RefuseNoRoom => {
+            let floor = spec.free_reserve;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "refusing a {}-byte {tier} spill: {} free, and the write must leave \
+                     {floor} bytes of headroom so it cannot take QuestDB down with it",
+                    payload.len(),
+                    match free_now {
+                        Some(b) => format!("only {b} bytes"),
+                        None => "an unreadable amount".to_string(),
+                    }
+                ),
+            ));
+        }
+    }
+
+    // One file per feed per hour: bounded file count, and an operator replaying
+    // a known-bad window does not have to read a single ever-growing file.
+    let hour = now_unix_secs / 3_600;
+    let path = dir.join(format!(
+        "{}-{}-{hour}.ilp",
+        spec.file_prefix,
+        spec.feed.as_str()
+    ));
+    // `read` too, so the newline guard below can look at the last byte.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&path)?;
+    // The length before this append, taken only by a tier that serialises
+    // its appends (see `IlpSpillSpec::truncate_failed_append`).
+    let pre_len = if spec.truncate_failed_append {
+        Some(file.metadata()?.len())
+    } else {
+        None
+    };
+    let mut separator_bytes: u64 = 0;
+    let mut append = || -> std::io::Result<()> {
+        let mut writer = &file;
+        // Audit K1: a failed partial write (a full disk, a crash of the other
+        // appender) can leave a fragment with no newline at the end of the
+        // file, and this append would join onto it, so the replay sees ONE
+        // malformed line and refuses a good row with the torn one. End the
+        // fragment first. Two appenders racing here can both add one, which
+        // leaves an empty line: harmless to ILP, never a joined row.
+        if file_ends_mid_line(&file)? {
+            writer.write_all(b"\n")?;
+            separator_bytes = 1;
+        }
+        writer.write_all(payload)?;
+        writer.flush()?;
+        if let Some(sync) = sync {
+            sync(&file)?;
+        }
+        Ok(())
+    };
+    if let Err(err) = append() {
+        if let Some(len) = pre_len
+            && let Err(truncate_err) = file.set_len(len)
+        {
+            return Err(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "{err}; and truncating the failed append back to {len} bytes also \
+                     failed: {truncate_err}"
+                ),
+            ));
+        }
+        return Err(err);
+    }
+    if on_drain && let Some(cache) = spec.drain_held {
+        cache.note_written(dir, (payload.len() as u64).saturating_add(separator_bytes));
+    }
+    Ok(path)
+    // O(1) EXEMPT: end
+}
+
+/// `true` when `file` is non-empty and its last byte is not `\n`: a torn
+/// fragment a failed append left behind (audit K1). One `fstat` and one
+/// one-byte positioned read; cold path (spill appends only).
+// O(1) EXEMPT: cold path, runs only on a spill append after a failed flush.
+fn file_ends_mid_line(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt as _;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut last = [0_u8; 1];
+    file.read_exact_at(&mut last, len - 1)?;
+    Ok(last[0] != b'\n')
+}
+/// Total bytes of the spill directory, INCLUDING the quarantine subtree.
+///
+/// # Why quarantine is counted (2026-08-28)
+///
+/// This was non-recursive, and `quarantine/` is a subdirectory — so files the
+/// replay set aside as permanently refused counted toward NOTHING: not this
+/// ceiling, and not any free-space check. They accumulated with no bound at
+/// all, on the same volume that filled completely on 2026-08-25 and
+/// WAL-suspended fifteen tables while every writer reported success.
+///
+/// Quarantined files are not junk. The quarantine docstring records that of
+/// 1,293 rows in one refused file, 1,292 were recoverable — a whole file is
+/// set aside because ONE row is malformed. So they are real ticks, they are
+/// never retried, and they were silently eating the disk.
+///
+/// Counting them is a deliberate trade and worth stating both ways. It means a
+/// large quarantine can consume the rescue ceiling and cause new spills to be
+/// refused — bounded, counted, loud tick loss. Not counting them means the
+/// quarantine consumes the VOLUME instead, which is unbounded and takes every
+/// table down with it. The 2026-08-25 incident is what that second option
+/// actually costs, so the first is the better failure.
+///
+/// Still best-effort: an unreadable entry contributes 0 rather than aborting
+/// the sweep, because failing to MEASURE the cap must not also fail the rescue
+/// the cap is protecting. Descent is exactly one level deep — the quarantine
+/// subtree is flat — so this cannot become an unbounded walk.
+fn spill_dir_bytes(dir: &Path) -> u64 {
+    // O(1) EXEMPT: begin — cold path, bounded by the per-feed-per-hour file count.
+    fn files_in(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.metadata().ok())
+            .filter(std::fs::Metadata::is_file)
+            .map(|m| m.len())
+            .sum()
+    }
+    files_in(dir).saturating_add(files_in(
+        &dir.join(crate::tick_spill_replay::QUARANTINE_DIR),
+    ))
+    // O(1) EXEMPT: end
+}
+
+/// How long the drain may reuse a spill-folder byte total before listing the
+/// folder again (deep audit DA-12, NT-1).
+pub(crate) const SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS: u64 = 5;
+
+/// [`SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS`] as a `Duration`.
+pub(crate) const SPILL_HELD_BYTES_CACHE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(SPILL_HELD_BYTES_CACHE_MAX_AGE_SECS);
+
+/// The spill folder's byte total, remembered for the drain's inline fallback
+/// (deep audit DA-12, NT-1, 2026-10-12).
+///
+/// The size ceiling needs the bytes the folder holds, and measuring that is a
+/// listing of every spill file. The writer and rescue threads still list on
+/// every write; the drain, which must not wait on a slow folder, lists at most
+/// once per [`SPILL_HELD_BYTES_CACHE_MAX_AGE`] per folder and in between uses
+/// the last total plus the bytes it has written since. Under the cap the drain
+/// pays one uncontended lock and one path hash per spill: O(path length), no
+/// allocation.
+///
+/// Honest limit: files the replay or the archive removed inside the window are
+/// still counted until the next listing, so the total can read HIGH for up to
+/// five seconds. High only moves the write into the over-ceiling branch, which
+/// then asks the free-space probe; it never lets the folder grow past a limit
+/// it would otherwise refuse.
+pub(crate) struct SpillHeldBytesCache {
+    /// `(folder tag, bytes, when listed)` of the last listing.
+    last: std::sync::Mutex<Option<(u64, u64, std::time::Instant)>>,
+}
+
+impl SpillHeldBytesCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn folder_tag(dir: &Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        dir.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The folder's bytes: the remembered total while it is fresh and for the
+    /// same folder, otherwise `scan(dir)`, which is then remembered.
+    pub(crate) fn held(
+        &self,
+        dir: &Path,
+        now: std::time::Instant,
+        scan: impl FnOnce(&Path) -> u64,
+    ) -> u64 {
+        let tag = Self::folder_tag(dir);
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held_tag, bytes, at)) = *last
+            && held_tag == tag
+            && now
+                .checked_duration_since(at)
+                .is_some_and(|age| age < SPILL_HELD_BYTES_CACHE_MAX_AGE)
+        {
+            return bytes;
+        }
+        let bytes = scan(dir);
+        *last = Some((tag, bytes, now));
+        bytes
+    }
+
+    /// Adds `written` bytes to the remembered total when it is for `dir`.
+    pub(crate) fn note_written(&self, dir: &Path, written: u64) {
+        let tag = Self::folder_tag(dir);
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((held_tag, bytes, _)) = last.as_mut()
+            && *held_tag == tag
+        {
+            *bytes = bytes.saturating_add(written);
+        }
+    }
+}
+
+/// The tick drain's spill-folder byte total (see [`SpillHeldBytesCache`]).
+static TICK_DRAIN_SPILL_HELD: SpillHeldBytesCache = SpillHeldBytesCache::new();
+
+/// The share of the tick spill ceiling that quarantined files may occupy.
+///
+/// # Why quarantine needs a bound at all
+///
+/// `quarantine_spill_file` promises QUARANTINE, NEVER DELETE, and that promise
+/// is right: on 2026-08-25 a single torn line stranded a file whose other 1,292
+/// lines were recoverable by hand, and a rescue tier that destroys what it
+/// cannot parse is worse than the loss it prevents.
+///
+/// But nothing in this workspace ever removed from `quarantine/`, and since
+/// 2026-08-28 its bytes count toward the spill ceiling. Those two facts
+/// together are a RATCHET: once accumulated quarantine reaches
+/// `tick_spill_max_bytes()`, `spill_failed_ilp` returns `StorageFull` for every
+/// future rescue — for this process AND every subsequent boot — and the only
+/// symptom is a HOT-PATH-02 drop that reads like ordinary backpressure. The
+/// rescue tier would be permanently dead, killed by the tier that exists to
+/// preserve data.
+///
+/// So the promise is kept for a BOUNDED share rather than forever. A quarter,
+/// because the arithmetic has to leave the LIVE rescue path the clear majority
+/// of the budget: quarantine holds files QuestDB has already refused, while the
+/// remaining three quarters hold rows it would still accept. Preferring the
+/// refused ones would trade recoverable-by-hand bytes for rows lost outright.
+pub const QUARANTINE_BUDGET_FRACTION: u64 = 4;
+
+/// Counter: quarantined files deleted to keep the quarantine directory inside
+/// its share of the spill ceiling.
+pub const QUARANTINE_PRUNED_COUNTER: &str = "tv_tick_spill_quarantine_pruned_total";
+
+/// Trims the quarantine directory to its byte budget, OLDEST FIRST.
+///
+/// Boot-time only, and loud: every deletion names the file and the byte count,
+/// because this is the one place in the rescue chain that destroys data on
+/// purpose. Returns the number of files removed.
+///
+/// Oldest-first because a quarantined file's recoverability decays: the operator
+/// who could reconstruct today's torn line from the day's context cannot do that
+/// for a file from three weeks ago, and the newest files are the ones an active
+/// investigation is about.
+///
+/// A directory that cannot be read is not an error here — there may simply be no
+/// quarantine yet, and failing a boot over a missing subdirectory would turn a
+/// housekeeping step into an outage.
+///
+/// # The copy gate (plan item 45e-1, operator Quotes 27 + 28)
+///
+/// With `require_upload` on, a quarantined file is deleted only when its
+/// marker in `quarantine/uploaded/` records its current length and mtime —
+/// a verified gzip copy is in the cold bucket (`tick-quarantine/` or
+/// `depth-quarantine/`), so nothing is lost. A file with no such copy is
+/// KEPT even while the directory is over budget, counted on
+/// `tv_quarantine_prune_refused_not_uploaded_total`, with one coded line per
+/// pass. The cost, stated plainly: until the uploader catches up, quarantine
+/// may hold more than its share of the spill ceiling, and new rescues can be
+/// refused sooner. The operator's rule is that no market data leaves the box
+/// without a copy; the rescue tier's refusals stay counted and loud.
+///
+/// `spill_max_bytes` is the ceiling of the spill directory THIS quarantine
+/// belongs to — the tick one or the depth one (see
+/// `tick_spill_replay::spill_max_bytes_for_dir`).
+pub fn prune_quarantine(spill_dir: &Path, spill_max_bytes: u64, require_upload: bool) -> usize {
+    let gate = crate::raw_frame_upload::CopyGate::from_config(require_upload);
+    let budget = spill_max_bytes / QUARANTINE_BUDGET_FRACTION;
+    let dir = spill_dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+    // O(1) EXEMPT: begin — cold housekeeping over a flat directory, never
+    // on any per-tick or per-frame path.
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::fs::Metadata, std::path::PathBuf)> = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some((
+                meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+                meta,
+                e.path(),
+            ))
+        })
+        .collect();
+    let mut total: u64 = files.iter().map(|(_, meta, _)| meta.len()).sum();
+    if total <= budget {
+        return 0;
+    }
+    files.sort_by_key(|(mtime, _, _)| *mtime);
+    let mut removed = 0usize;
+    let mut refused = 0usize;
+    let mut refused_bytes = 0u64;
+    for (_, meta, path) in files {
+        if total <= budget {
+            break;
+        }
+        let len = meta.len();
+        if !gate.allows_delete(&path, &meta) {
+            refused += 1;
+            refused_bytes = refused_bytes.saturating_add(len);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                gate.forget(&path);
+                total = total.saturating_sub(len);
+                removed += 1;
+                metrics::counter!(QUARANTINE_PRUNED_COUNTER).increment(1);
+                if gate.copy_in_s3() {
+                    info!(
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "deleted a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling; a verified copy is in the \
+                         cold bucket, so nothing is lost"
+                    );
+                } else {
+                    error!(
+                        code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                        path = %path.display(),
+                        bytes = len,
+                        budget,
+                        "DELETED a quarantined spill file to keep the quarantine directory \
+                         inside its share of the spill ceiling, with NO cold copy (the copy \
+                         gate is off). Its recoverable lines are gone. This is deliberate \
+                         and it is the lesser loss: quarantine counts toward the spill \
+                         ceiling, so an unbounded quarantine would return StorageFull for \
+                         every future rescue — permanently disabling the tier that keeps \
+                         live data, for this process and every boot after it."
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    code = ErrorCode::StorageGap05DiskPressureUnrelievable.code_str(),
+                    path = %path.display(),
+                    error = %err,
+                    "could not delete a quarantined spill file to keep the quarantine \
+                     inside its budget — it stays and is retried on the next pass"
+                );
+            }
+        }
+    }
+    // O(1) EXEMPT: end
+    if refused > 0 {
+        // APPROVED: cast — a per-pass file count, always <= u64.
+        metrics::counter!(QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER).increment(refused as u64);
+        error!(
+            code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(),
+            source = "quarantine_prune",
+            dir = %dir.display(),
+            files = refused,
+            bytes = refused_bytes,
+            budget,
+            "quarantined spill files over the quarantine budget were KEPT, not deleted: no \
+             verified copy of them is in the cold bucket yet. They go once the uploader has \
+             copied them; until then the quarantine holds more than its share of the spill \
+             ceiling."
+        );
+    }
+    removed
+}
+
+/// Counter: quarantined spill files the budget trim KEPT because no verified
+/// cold copy is recorded for them (plan item 45e-1). The trim logs one coded
+/// STORAGE-GAP-04 line per pass that refuses any.
+pub const QUARANTINE_PRUNE_REFUSED_NOT_UPLOADED_COUNTER: &str =
+    "tv_quarantine_prune_refused_not_uploaded_total";
 /// ILP-over-HTTP conf: per-flush server ACK (the 2026-07-05 fire-and-forget
 /// lesson) with `retry_timeout=0` (the caller owns retry cadence) and a bounded
 /// `request_timeout` so a hung flush cannot wedge the pipeline.
-fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
+pub(crate) fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
+    // APPROVED: ILP conf string, once per TickWriter::new
     format!(
         "http::addr={}:{};protocol_version=1;retry_timeout=0;request_timeout=5000;",
         config.host, config.http_port
     )
+}
+
+/// The designated timestamp for a `ticks` row, in IST-epoch nanoseconds.
+///
+/// # The problem this solves
+///
+/// Dhan signals "this contract has not traded today" with an LTT that is not a
+/// time at all — measured on the live box 2026-08-21, it is **315,532,800**
+/// (1980-01-01) for 945,501 rows and a literal `0` for 7,282 more. Those rows
+/// are NOT empty: 99.2% of them carry a real `total_buy_qty`, `total_sell_qty`
+/// and previous `close`. They are contracts with a live order book that simply
+/// have no last trade yet, and the drain keeps them deliberately — discarding
+/// them would lose the ability to tell "did not trade" from "did not capture",
+/// and would throw away the book with it.
+///
+/// Stamping the row with the vendor's sentinel put ~950,000 rows of real data
+/// per session into a permanent `1980-01-01` partition, where **no time-range
+/// query can ever reach them**. Data that cannot be found is not kept in any
+/// useful sense, and every one of those writes also lands out-of-order against
+/// the current partition rather than appending to it.
+///
+/// # The rule
+///
+/// An LTT below [`MIN_PLAUSIBLE_EXCHANGE_TS_SECS`] is a sentinel, not a time,
+/// so the row is stamped with its RECEIPT time — which is the only real time
+/// such an observation has. The raw sentinel VALUE is not stored (the
+/// `exchange_timestamp` column was removed from `ticks` 2026-09-22, operator
+/// directive), but "never traded" stays recoverable in SQL: a real trade's `ts`
+/// is a whole second, while a fallback row's `ts` equals `received_at` to the
+/// nanosecond, so `WHERE ts = received_at` isolates them. The
+/// same floor the aggregator uses to refuse the candle is the one used here, so
+/// the two cannot drift apart.
+///
+/// # Convention safety
+///
+/// Both inputs are already IST-epoch (`.claude/rules/project/data-integrity.md`
+/// calls the WebSocket timestamp rule "THE SINGLE MOST CRITICAL DATA INTEGRITY
+/// RULE"): `exchange_timestamp` arrives IST-epoch with NO `+19800` applied, and
+/// `received_at_ist_nanos` has already had the offset added by its caller. So
+/// this function only ever CHOOSES between two values in one space — it never
+/// converts, and cannot introduce the sign error that rule warns about.
+///
+/// # Fail-safe
+///
+/// If the LTT is a sentinel AND no receipt time was carried, there is no real
+/// time available, so the sentinel is kept unchanged. That row stays out of the
+/// live range exactly as it does today — a guess would be worse than a value
+/// that is visibly wrong.
+/// Counts and reports a non-finite OPTIONAL price, throttled to powers of two.
+///
+/// The counter and the log line live together deliberately. `crates/common`'s
+/// `loss_counter_visibility_guard` refuses a loss counter that reaches no
+/// operator surface — "a counter that measures data loss and reaches nobody is
+/// worse than no counter: the loss is measured, the measurement is discarded,
+/// and the dashboard stays green" — and it is right. The counter alone was the
+/// first version of this fix and the guard caught it.
+///
+/// The counter is now EMF-SHIPPED as well as logged.
+///
+/// ⚠ CORRECTED 2026-09-01. This paragraph used to read: *"A `warn!` rather
+/// than an EMF metric because the deployed selector list lives in a user-data
+/// template that currently renders at EXACTLY its 15,872-byte budget, with
+/// zero free bytes."*
+///
+/// **Both halves of that were false by the time they were being relied on.**
+/// The selector no longer lives in the user-data template at all — it moved to
+/// `deploy/aws/cloudwatch-agent.json` on 2026-08-25 and a guard now *forbids*
+/// a second copy in the template. And the template does not render at its
+/// budget: measured 2026-09-01 by running the guard, it renders **13,869 of
+/// 15,872 bytes, with 2,003 free**.
+///
+/// So a drop counter on the one writer that can permanently destroy market
+/// data was kept off CloudWatch by a blocker that had already been removed.
+/// The reusable lesson is not "check the number" — it is that a MEASUREMENT
+/// copied into a justification carries no date, and this one was copied from a
+/// rule-file section that is itself stale. Adding an EMF name now costs
+/// ~$0.30/mo and **zero** user-data bytes.
+///
+/// Powers of two: 1, 2, 4, 8, … The first occurrence always logs, the rate
+/// decays logarithmically so a corruption storm cannot flood the sink, and the
+/// running total rides in the line so a throttled message still states the true
+/// magnitude rather than implying a single event.
+fn note_non_finite_optional_price(security_id: u64, segment: &'static str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    metrics::counter!("tv_tick_optional_price_dropped_total").increment(1);
+    let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if total.is_power_of_two() {
+        warn!(
+            code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+            security_id,
+            segment,
+            dropped_total = total,
+            "an OPTIONAL tick price was non-finite and is stored as NULL rather \
+             than sent to the database, where a NaN would make QuestDB reject the \
+             whole batch. The tick itself is kept — its mandatory prices are \
+             valid. This log is throttled to powers of two; dropped_total is the \
+             true running count."
+        );
+    }
+}
+
+#[must_use]
+pub fn row_timestamp_ist_nanos(exchange_timestamp: u32, received_at_ist_nanos: Option<i64>) -> i64 {
+    let ltt_nanos = i64::from(exchange_timestamp).saturating_mul(1_000_000_000);
+    // A CEILING as well as a floor, added 2026-08-25.
+    //
+    // This had only the floor, and `exchange_timestamp` is a `u32` read raw
+    // off the wire: `0xFFFFFFFF` is ~year 2106 and sailed past a
+    // `>= MIN_PLAUSIBLE` test. `ts` is the DESIGNATED timestamp, so such a row
+    // creates a far-future QuestDB partition that retention and archival — both
+    // keyed on the trading day — can never reach, while every `max(ts)` and
+    // range scan over `ticks` silently includes it.
+    //
+    // The aggregator now refuses that tick outright (the band check moved above
+    // its untraded-sentinel return in the same change), so this ceiling is
+    // defence in depth rather than the only guard. It is here anyway because a
+    // second writer must not be able to reintroduce the hole by calling this
+    // helper directly: the band belongs where the stamp is MADE.
+    //
+    // Out of band falls back to the receipt time, exactly as below-floor does.
+    use tickvault_trading::candles::multi_tf_aggregator::{
+        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+    };
+    if (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+        // O(1) EXEMPT: RangeInclusive::contains — two integer comparisons on a const range, not a Vec scan (the scanner greps `.contains(&` and cannot tell them apart)
+        .contains(&exchange_timestamp)
+    {
+        return ltt_nanos;
+    }
+    received_at_ist_nanos.unwrap_or(ltt_nanos)
 }
 
 /// Batched `ticks` ILP writer — one per feed CONNECTION.
@@ -535,14 +2487,344 @@ fn ticks_ilp_http_conf(config: &QuestDbConfig) -> String {
 /// HTTP ACK — and the pending buffer is discarded LOUDLY so one poisoned row
 /// can never wedge the rest of the session.
 pub struct TickWriter {
-    sender: Option<Sender>,
-    buffer: Buffer,
+    sender: Option<TickIlpSender>,
+    /// The rows accepted since the last hand-off, staged as typed rows with
+    /// the contract-name tables they saw (plan item PF-4, 2026-11-06). The
+    /// ILP text is written by the thread that sends or spills the batch.
+    staged: StagedBatch,
+    /// The row encoder every text this writer's rows become is written with:
+    /// the sink's, the rescue thread's and the cold paths' scratch buffers.
+    encoder: TickIlpEncoder,
+    /// Scratch text for the drain's cold paths that already block (the
+    /// inline spill and the unsplit synchronous flush). Empty, with no
+    /// allocation, until one of them first runs.
+    cold_encode: TickRowBuffer,
     pending: usize,
+    /// Lowest / highest `capture_seq` among the pending rows (`0` = none).
+    /// Carried on every hand-off and rescue so the WAL applied-watermark can
+    /// learn which captured frames this batch covers once it LANDS.
+    pending_min_seq: u64,
+    pending_max_seq: u64,
+    /// True once any pending row has NO write-ahead-log backing (a zero or
+    /// freshly minted capture sequence). Such a buffer is never deferred to
+    /// the WAL; it keeps the inline spill (2026-09-26 audit fix PR3).
+    /// Cleared only when `discard_pending` consumes it — a stale `true` is
+    /// conservative (inline spill, the old behaviour), never a loss.
+    pending_unbacked: bool,
+    /// Decides whether a failed flush the rescue thread cannot take may be
+    /// handed to the WAL (`(min_seq, max_seq, unbacked)`). Production is
+    /// always [`crate::wal_frame_fate::rescue_may_defer_to_wal`]; tests swap
+    /// it so they do not depend on the process-global WAL marks (J1).
+    wal_defer_check: fn(u64, u64, bool) -> bool,
     /// The `feed` SYMBOL stamped on every row from this writer.
     feed: Feed,
+    /// Pre-resolved session-window refusal counters -- see
+    /// [`OutOfWindowCounters`] for why they are resolved once.
+    out_of_window: OutOfWindowCounters,
     /// Highest `capture_seq` this connection has stamped — the per-connection
     /// monotonicity witness (`0` before the first row).
     last_capture_seq: i64,
+    /// Where a failed flush rescues its ILP payload.
+    ///
+    /// A field rather than a constant so the rescue PATH itself is testable:
+    /// a test that can only exercise the helper proves the file format and
+    /// not that `discard_pending` actually calls it.
+    spill_dir: PathBuf,
+    /// Set by [`TickWriter::split_for_offload`]. When present, `flush` hands
+    /// the buffer to the writer thread instead of doing the network round
+    /// trip inline.
+    ///
+    /// `None` by DEFAULT and on every existing constructor, so a writer that
+    /// was never split behaves byte-for-byte as before — this is an opt-in
+    /// added to one call site, not a behaviour change to the type.
+    offload: Option<std::sync::mpsc::SyncSender<FlushBatch>>,
+    /// Set by [`TickWriter::split_rescue_offload`]. When present,
+    /// [`TickPersistenceWriter::discard_pending`] hands the buffer to a
+    /// dedicated rescue thread instead of writing up to 32 MiB to disk on the
+    /// frame-drain task.
+    ///
+    /// `None` by DEFAULT and on every existing constructor, so an unsplit
+    /// writer behaves exactly as before. Separate from `offload` on purpose:
+    /// the rescue exists precisely for the two cases where the offload queue
+    /// cannot help — it is FULL, or its thread is GONE.
+    rescue: Option<std::sync::mpsc::SyncSender<RescueBatch>>,
+    /// Rescue batches that met a FULL rescue queue and would otherwise have
+    /// been written to disk on the frame drain (H4, 2026-10-03): rows with no
+    /// write-ahead-log backing, which the WAL cannot defer. Parked in RAM
+    /// while [`PARKED_RESCUE_MAX_BATCHES`] and [`PARKED_RESCUE_MAX_BYTES`]
+    /// allow, retried at the start of every flush and every rescue, and handed
+    /// to the rescue thread by [`TickPersistenceWriter::close_rescue_offload`]
+    /// at shutdown. Each keeps its watermark floor while parked. Pre-sized by
+    /// [`TickWriter::split_rescue_offload`], so parking never allocates.
+    parked_rescue: std::collections::VecDeque<RescueBatch>,
+    /// Row SLOTS (capacity) held in `parked_rescue` (PF-4: was its ILP bytes;
+    /// review round 1, 2026-11-06: was its rows, which under-stated the RAM a
+    /// pre-sized batch holds).
+    parked_rescue_slots: usize,
+    /// Consecutive flushes whose rows the producer RETAINED because the queue
+    /// was full. Reset to zero on every successful hand-off.
+    ///
+    /// This is the batch-WIDTH bound, and it is the one the live measurement
+    /// made load-bearing — see [`MAX_RETAINED_FLUSH_SPANS`].
+    retained_spans: u32,
+    /// Flush-path counter handles, resolved once at construction — see
+    /// [`TickFlushCounters`] (2026-09-22, item 44g).
+    flush_counters: TickFlushCounters,
+    /// Cleared buffers the writer thread hands back for reuse, so a hand-off
+    /// does not start the next batch from a zero-capacity buffer. `None`
+    /// until [`TickWriter::split_for_offload`] runs (item 44g). Review round
+    /// 1 (2026-11-06): the rescue thread returns its spent batches through
+    /// the same lane, so the lane opens at whichever split runs first.
+    spare_buffers: Option<std::sync::mpsc::Receiver<StagedBatch>>,
+    /// The sending end of the spare lane, cloned into the writer and rescue
+    /// sinks at their splits. `None` until a split opens the lane.
+    spare_lane: Option<std::sync::mpsc::SyncSender<StagedBatch>>,
+    /// `tv_feed_aux_rows_total{kind}` handles, one per
+    /// [`AuxPacketKind`], resolved once so an append is a counter increment
+    /// and never a label-vector allocation (plan item 45h).
+    aux_counters: [metrics::Counter; AuxPacketKind::ALL.len()],
+    /// `feed_aux_packets` rows appended by this writer over its life. The
+    /// buffer carries `ticks` and `feed_aux_packets` rows together, so
+    /// `pending` alone cannot say which table a pending row is for.
+    aux_rows_appended: u64,
+    /// `tick_quotes` rows appended by this writer over its life (plan item
+    /// M5). The buffer carries both tables, as it does `feed_aux_packets`.
+    quote_rows_appended: u64,
+    /// `ticks` rows appended by this writer over its life (2026-11-21, the
+    /// day repair's verify gate compares the database with it per table).
+    tick_rows_appended: u64,
+    /// B1 (2026-11-13): whether a batch may be posted now, given the tables
+    /// it can hold rows for. Always [`crate::ilp_table_gate::live_tables_writable`]
+    /// outside this module's tests, which hold it shut regardless of any other
+    /// test that runs an ensure. One call per flush, never per row.
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+}
+
+/// Pre-resolves the per-kind `tv_feed_aux_rows_total` handles (plan item 45h).
+/// The label value is a `&'static str` from a closed set, resolved once per
+/// writer, so the append path never builds a label vector.
+fn aux_row_counters() -> [metrics::Counter; AuxPacketKind::ALL.len()] {
+    AuxPacketKind::ALL.map(|k| {
+        let c = metrics::counter!(FEED_AUX_ROWS_COUNTER, "kind" => k.as_str());
+        c.increment(0);
+        c
+    })
+}
+
+/// Pre-resolved refusal counters -- one handle per reason, per writer.
+///
+/// PRE-RESOLVED, and that is the whole point (2026-09-05). The first version
+/// called `metrics::counter!(NAME, "feed" => .., "reason" => ..)` at the
+/// refusal site, and DHAT caught it in CI: 10,010 blocks over 10,000 ticks
+/// against a ceiling of 500 -- one allocation PER TICK on the live path.
+///
+/// The mechanism is the one CLAUDE.md already records from `record_ws_lag`: a
+/// non-literal label value drops the `metrics!` macro to its allocating arm.
+/// Both of ours are non-literal (the metric name is a `const`, the reason is a
+/// variable), so every call built a fresh label vector.
+///
+/// It looked harmless because a refusal "should be rare". It is not: OUTSIDE
+/// 09:00-15:39 IST EVERY tick is a refusal, so the pre-open burst -- the
+/// busiest stretch of the morning -- would have allocated once per tick, on
+/// the drain task, in exactly the window the operator asked us to be strict
+/// about.
+///
+/// Resolving the three handles once at construction makes the refusal path a
+/// counter increment and nothing else. Gated by
+/// `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`,
+/// which feeds a 05:30 IST receipt so every frame is refused -- the gates that
+/// measure the FOLD cannot cover this path, because their receipt is
+/// deliberately in-window.
+#[derive(Debug)]
+pub(crate) struct OutOfWindowCounters {
+    /// The reason vocabulary this writer uses, parallel to `handles`.
+    ///
+    /// Carried rather than hard-coded because DEPTH speaks a different one.
+    /// `ticks` has two clocks and says `ts_out_of_window`; `market_depth` has
+    /// exactly ONE clock -- its designated `ts` IS the arrival stamp, there is
+    /// no exchange timestamp anywhere in the depth protocol -- so it says
+    /// `arrival_out_of_window`. Reusing the tick words there would tell an
+    /// operator the EXCHANGE stamped the row out of window, which is not a
+    /// thing depth can even express.
+    reasons: [&'static str; 3],
+    /// Pre-resolved handles, index-aligned with `reasons`.
+    handles: [metrics::Counter; 3],
+    /// Log-throttle state, index-aligned with `reasons` -- one per reason, per
+    /// writer instance.
+    ///
+    /// PER-REASON, and that is the whole point (2026-09-06). This was a single
+    /// `static SEEN` inside `note`, i.e. ONE counter shared by every call site
+    /// in the process: two on the tick writer and three on the depth writer.
+    /// Depth carries a MEASURED 24x the tick row volume, and outside
+    /// 09:00-15:39:59 IST every row is a refusal -- so an ordinary pre-open
+    /// depth burst drives the shared counter past 2^18 within minutes, and the
+    /// next power of two is 2^19. A genuinely rare tick refusal arriving after
+    /// it -- `ts_out_of_plausible_band`, the CORRUPT-FRAME signal -- then has
+    /// to wait for a further ~260,000 events before it is allowed to log, and
+    /// the log is its only production surface (this counter reaches no EMF
+    /// selector and no alarm, see the `note` docs).
+    ///
+    /// A common benign event starving the rare real one is the throttle
+    /// failing in the exact direction a throttle exists to avoid. One state
+    /// per reason per writer means a depth storm cannot silence a tick
+    /// corruption, and the first occurrence of each reason always logs.
+    seen: [AtomicU64; 3],
+}
+
+impl OutOfWindowCounters {
+    pub(crate) fn new(feed: Feed, counter: &'static str, reasons: [&'static str; 3]) -> Self {
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(
+                counter,
+                "feed" => feed.as_str(),
+                "reason" => reason,
+            );
+            // Seed at 0 here rather than in `register_drop_baseline`: the
+            // CloudWatch agent drops the first sample of a series it has never
+            // seen, so an unseeded counter publishes nothing on the one sample
+            // that matters. Same discipline, one place.
+            c.increment(0);
+            c
+        };
+        Self {
+            reasons,
+            handles: [make(reasons[0]), make(reasons[1]), make(reasons[2])],
+            seen: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        }
+    }
+
+    /// Allocation-free on the common path: pick a pre-resolved handle,
+    /// increment, and log only on a power of two.
+    ///
+    /// The scan is over exactly THREE `&'static str` of at most 26 bytes, so
+    /// it is O(1) with a fixed bound and no allocation -- the DHAT gates on
+    /// both the tick seam and `dhat_depth_append_zero_alloc` hold it to that.
+    ///
+    /// The `warn!` lives HERE, beside the increment, and not in a helper --
+    /// because a log three functions away is a log nobody finds from the
+    /// counter. That is a readability argument, and it is the only one:
+    /// an earlier version of this comment claimed the placement also satisfied
+    /// `loss_counter_visibility_guard`, and it does NOT. Verified 2026-09-05 by
+    /// running it: the scanner resolves a `const` name alias and a local
+    /// `let h = metrics::counter!(..)` handle, but not `const -> struct field ->
+    /// method`, so it locates the emit inside `OutOfWindowCounters::new` --
+    /// where no log sits -- rather than here. That is the same chain already
+    /// allowlisted for `tv_dhan_feed_ingest_seq_refused_total`, and both of
+    /// these counters are allowlisted beside it for the same reason.
+    ///
+    /// Deliberately a log and not an EMF metric. The guard offers three routes;
+    /// this takes the log because (a) these counters measure the gate WORKING
+    /// -- outside 09:00-15:39:59 IST every row increments one of them, so an
+    /// EMF series would chart normal behaviour, not a defect -- and (b) an EMF
+    /// name costs ~0.30 USD/mo against a September forecast of 130.39 with the
+    /// automatic STOP_EC2_INSTANCES line at 135.00, i.e. 4.61 of margin, and
+    /// the noise lock's standing rule is that the next addition comes with a
+    /// LEVER, not a cost note. This change carries no lever.
+    ///
+    /// Powers of two, so a pre-open storm costs one line per doubling rather
+    /// than one per row; the running total rides in the line so a throttled
+    /// message still states the true magnitude.
+    /// Advance this reason's log throttle; `Some(running_count)` when the
+    /// caller should emit, `None` when it is suppressed.
+    ///
+    /// Per-reason AND per-writer -- never a process-wide `static`. See the
+    /// [`Self::seen`] field docs for the storm that starved the rare signal.
+    ///
+    /// Split out of [`Self::note`] deliberately: it is the DECISION, and the
+    /// tests assert on it directly. Asserting on the `seen` field instead
+    /// would pass against a refactor that reintroduced a static and left the
+    /// field behind as an unread mirror -- a guard satisfied by the thing you
+    /// did not break.
+    fn throttle_tick(&self, idx: usize) -> Option<u64> {
+        let total = self.seen[idx]
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        total.is_power_of_two().then_some(total)
+    }
+
+    pub(crate) fn note(&self, reason: &'static str) {
+        self.note_n(reason, 1);
+    }
+
+    /// [`Self::note`] for `n` rows refused together, as one array row
+    /// carrying `n` depth levels is: the counter moves by `n`, so it reads
+    /// the same unit whichever depth table is written; the log throttle
+    /// advances once. `n == 0` does nothing.
+    pub(crate) fn note_n(&self, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut idx = self.reasons.len() - 1;
+        let mut i = 0;
+        while i < self.reasons.len() {
+            if self.reasons[i] == reason {
+                idx = i;
+                break;
+            }
+            i += 1;
+        }
+        self.handles[idx].increment(n);
+
+        if let Some(total) = self.throttle_tick(idx) {
+            warn!(
+                code = ErrorCode::StorageGapTickDedupSegment.code_str(),
+                reason,
+                refused_total = total,
+                "a row was REFUSED or flagged by the session-window gate. A \
+                 refusal is deliberate, NOT data loss: the operator's rule is \
+                 that every persisted row sits inside 09:00:00-15:39:59.999 \
+                 IST. Throttled to powers of two PER REASON PER WRITER; \
+                 refused_total is this writer's running count for THIS reason, \
+                 not a process-wide total."
+            );
+        }
+    }
+}
+
+/// Counter for rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss — named so it can never be mistaken for one on a
+/// dashboard. `tv_ticks_dropped_total` means "rows left the fold without
+/// reaching QuestDB and are gone"; this means "rows we deliberately declined to
+/// write because they fall outside 09:00-15:39:59 IST".
+pub const TICK_OUT_OF_WINDOW_COUNTER: &str = "tv_ticks_out_of_window_refused_total";
+
+/// Refusal reason for a `ts` outside the plausible epoch band.
+///
+/// Distinct from the two `WindowVerdict` reasons because it answers a
+/// different question: those say "wrong time of day", this says "not a real
+/// date at all". Folding it into either would hide a corrupt-frame signal
+/// inside an ordinary pre-open count.
+pub const TICK_TS_OUT_OF_BAND_REASON: &str = "ts_out_of_plausible_band";
+
+/// The three reason labels `ticks` reports, in the order the counter handles
+/// are resolved.
+///
+/// Index 2 is the fallback arm of [`OutOfWindowCounters::note`], so the band
+/// reason must sit there: an unrecognised reason is counted as the most
+/// alarming of the three rather than silently attributed to a time-of-day
+/// refusal.
+pub const TICK_OUT_OF_WINDOW_REASONS: [&str; 3] = [
+    tickvault_common::session_window::WindowVerdict::TsOutOfWindow.reason(),
+    tickvault_common::session_window::WindowVerdict::ReceivedAtOutOfWindow.reason(),
+    TICK_TS_OUT_OF_BAND_REASON,
+];
+
+/// Build the session-window counters for a TICK writer.
+///
+/// Exists so [`TICK_OUT_OF_WINDOW_COUNTER`] is named exactly ONCE outside its
+/// own declaration. That is not tidiness: `loss_counter_visibility_guard`
+/// treats every line mentioning a counter const as an emit site and asks
+/// whether a log sits within twelve lines AFTER it. Spelling the const at the
+/// three struct-literal sites put it nine lines above the `error!` in the
+/// ILP-connect failure arm, so the guard reported this counter as reachable on
+/// the strength of a log about a completely different event. An accidental
+/// pass is worse than a recorded exemption -- it retires the question without
+/// answering it. With the const named only here, the guard's verdict is honest
+/// (no log is near, because the real one is in `note()` two indirections away)
+/// and the allowlist row states the reason in the open.
+fn tick_out_of_window_counters(feed: Feed) -> OutOfWindowCounters {
+    OutOfWindowCounters::new(feed, TICK_OUT_OF_WINDOW_COUNTER, TICK_OUT_OF_WINDOW_REASONS)
 }
 
 /// Publish a zero on this feed's drop series before any row can be written.
@@ -566,43 +2848,134 @@ pub struct TickWriter {
 /// [`TickWriter::for_test`] for why that is not merely tidiness. Idempotent:
 /// `increment(0)` on an already-registered series is a no-op.
 fn register_drop_baseline(feed: Feed) {
+    // M5 (2026-10-27): the `tick_quotes` row counter exists from boot.
+    crate::tick_quotes_persistence::register_baseline();
     metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str()).increment(0);
+    // The rescue counter needs the SAME treatment for the same reason: a
+    // spill episode is rare, so its first increment would otherwise be
+    // consumed as the delta baseline and the episode would go unreported.
+    metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str()).increment(0);
+    // Same discipline for the persist-error series (2026-08-28). These fire
+    // only on a broken boot, which makes them RARER than a drop episode, not
+    // safer: a first occurrence with no prior sample is consumed as the delta
+    // baseline and publishes nothing, so the alarm is silent through the one
+    // event it exists for. Both `stage` label values are seeded, because a
+    // label set is a separate series.
+    metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_client_build")
+        .increment(0);
+    metrics::counter!("tv_tick_persist_errors_total", "stage" => "ensure_ddl").increment(0);
+    // The rescue-ABANDONED series needs the same seed, and it is the one that
+    // matters most: it fires exactly when `dropped == spilled` stops being
+    // true — rows counted as rescued whose payload may never have reached the
+    // spill file. Unseeded, its first and only increment is consumed as the
+    // delta baseline, so the one event that invalidates the rescue proof
+    // publishes nothing.
+    metrics::counter!(TICK_RESCUE_ABANDONED_COUNTER, "writer" => "tick").increment(0);
+    // 2026-09-05: the session-window refusal series is seeded in
+    // `OutOfWindowCounters::new`, not here. It was seeded in BOTH places for
+    // half a day, and the copy here listed only TWO of the three reasons --
+    // `ts_out_of_plausible_band` was missing, so on the one shape that matters
+    // (a garbage epoch) the first increment would still have been swallowed as
+    // the CloudWatch delta baseline. Two seed sites for one series is how that
+    // happens: the second one is written from memory of the first. Seeding
+    // lives with the handles, which is the only place that cannot fall behind
+    // the reason vocabulary, because it IS the reason vocabulary.
+    // 2026-09-05: the optional-price drop series. It fires when a tick
+    // carries a non-finite optional price and that field is dropped from
+    // the row — rare by construction, which is exactly what makes the
+    // unseeded first occurrence invisible. Same delta-baseline rule as
+    // every series above it.
+    metrics::counter!("tv_tick_optional_price_dropped_total").increment(0);
 }
 
 impl TickWriter {
-    /// Production constructor — ILP-over-HTTP, lazy on connect failure.
+    /// Production constructor — ILP-over-HTTP through the library, lazy on
+    /// connect failure. Same as [`TickWriter::new_with_encoder`] with
+    /// [`TickIlpEncoder::Library`].
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor; the lazy-build contract is
     // exercised by tick_writer_new_is_lazy_and_buffers_without_network, and every
     // append/flush path is covered via for_test().
     pub fn new(config: &QuestDbConfig, feed: Feed) -> Self {
+        Self::new_with_encoder(config, feed, TickIlpEncoder::Library)
+    }
+
+    /// Production constructor with the row encoder chosen by
+    /// `[tick_storage] own_ilp_encoder` (plan ITEM DT, 2026-10-30; default
+    /// OFF = [`TickIlpEncoder::Library`]). [`TickIlpEncoder::Own`] writes rows
+    /// with our encoder and POSTs them with our sender; every flush, retry,
+    /// rescue, spill and replay path is the same code for both. A sender that
+    /// cannot be built leaves the writer buffering locally, as before.
+    #[must_use]
+    pub fn new_with_encoder(config: &QuestDbConfig, feed: Feed, encoder: TickIlpEncoder) -> Self {
         register_drop_baseline(feed);
-        match Sender::from_conf(ticks_ilp_http_conf(config)) {
-            Ok(s) => {
-                let b = s.new_buffer();
-                Self {
-                    sender: Some(s),
-                    buffer: b,
-                    pending: 0,
-                    feed,
-                    last_capture_seq: 0,
-                }
+        crate::tick_ts_placement::register_baseline();
+        let sender = match encoder {
+            TickIlpEncoder::Library => Sender::from_conf(ticks_ilp_http_conf(config))
+                .map(TickIlpSender::Library)
+                .map_err(|err| err.to_string()), // APPROVED: once at construction, error path only
+            TickIlpEncoder::Own => {
+                crate::tick_ilp::RawIlpSender::new(&config.host, config.http_port)
+                    .map(TickIlpSender::Own)
             }
+        };
+        match sender {
+            Ok(sender) => Self::from_parts(feed, Some(sender), encoder),
             Err(err) => {
                 warn!(
-                    ?err,
+                    %err,
                     feed = feed.as_str(),
+                    encoder = ?encoder,
                     "ticks writer: QuestDB unreachable — buffering locally"
                 );
-                Self {
-                    sender: None,
-                    buffer: Buffer::new(ProtocolVersion::V1),
-                    pending: 0,
-                    feed,
-                    last_capture_seq: 0,
-                }
+                Self::from_parts(feed, None, encoder)
             }
         }
+    }
+
+    /// Every field but the sender at its starting value. K6 / PF-4: the
+    /// staged batch is reserved and its pages touched up front, so no batch
+    /// regrows or faults on the drain.
+    fn from_parts(feed: Feed, sender: Option<TickIlpSender>, encoder: TickIlpEncoder) -> Self {
+        Self {
+            sender,
+            staged: StagedBatch::presized(),
+            encoder,
+            cold_encode: TickRowBuffer::new(encoder),
+            pending: 0,
+            pending_min_seq: 0,
+            pending_max_seq: 0,
+            pending_unbacked: false,
+            wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,
+            feed,
+            out_of_window: tick_out_of_window_counters(feed),
+            last_capture_seq: 0,
+            spill_dir: PathBuf::from(TICK_SPILL_DIR),
+            offload: None,
+            rescue: None,
+            parked_rescue: std::collections::VecDeque::new(),
+            parked_rescue_slots: 0,
+            retained_spans: 0,
+            flush_counters: TickFlushCounters::new(feed),
+            spare_buffers: None,
+            spare_lane: None,
+            aux_counters: aux_row_counters(),
+            aux_rows_appended: 0,
+            quote_rows_appended: 0,
+            tick_rows_appended: 0,
+            table_gate: crate::ilp_table_gate::live_tables_writable,
+        }
+    }
+
+    /// Test-only: replaces the live table gate (B1).
+    #[cfg(test)]
+    #[must_use]
+    fn with_table_gate_for_test(
+        mut self,
+        gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+    ) -> Self {
+        self.table_gate = gate;
+        self
     }
 
     /// Test constructor — disconnected writer with an empty buffer.
@@ -615,15 +2988,35 @@ impl TickWriter {
     /// lives in one shared place that both constructors call.
     #[must_use]
     // TEST-EXEMPT: test-only helper used by the append/flush unit tests below.
+    /// Redirects the rescue tier at a scratch dir.
+    ///
+    /// Test-only: production always uses [`TICK_SPILL_DIR`].
+    #[cfg(test)]
+    pub fn with_spill_dir_for_test(mut self, dir: PathBuf) -> Self {
+        self.spill_dir = dir;
+        self
+    }
+
+    /// Test-only: replaces the WAL-deferral decision (J1) so a test does not
+    /// depend on the process-global WAL flushed / lost marks.
+    #[cfg(test)]
+    #[must_use]
+    fn with_wal_defer_check_for_test(mut self, check: fn(u64, u64, bool) -> bool) -> Self {
+        self.wal_defer_check = check;
+        self
+    }
+
     pub fn for_test(feed: Feed) -> Self {
+        Self::for_test_with_encoder(feed, TickIlpEncoder::Library)
+    }
+
+    /// [`TickWriter::for_test`] with the row encoder chosen, so the bench and
+    /// the zero-allocation test measure both encoders through the production
+    /// append path. Disconnected, like `for_test`.
+    #[must_use]
+    pub fn for_test_with_encoder(feed: Feed, encoder: TickIlpEncoder) -> Self {
         register_drop_baseline(feed);
-        Self {
-            sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
-            pending: 0,
-            feed,
-            last_capture_seq: 0,
-        }
+        Self::from_parts(feed, None, encoder)
     }
 
     /// Rows appended but not yet flushed.
@@ -642,10 +3035,12 @@ impl TickWriter {
         self.last_capture_seq
     }
 
-    /// Test-only view of the raw ILP buffer bytes (wire-shape assertions).
+    /// Test-only view of the pending rows as the ILP text they will become
+    /// (wire-shape assertions). PF-4: the rows are staged, so this encodes a
+    /// copy of them; nothing is counted or changed.
     #[cfg(test)]
-    fn buffer_utf8(&self) -> String {
-        String::from_utf8(self.buffer.as_bytes().to_vec()).unwrap_or_default()
+    pub(crate) fn buffer_utf8(&self) -> String {
+        String::from_utf8(self.staged.encode_readonly(self.feed, self.encoder)).unwrap_or_default()
     }
 
     /// Appends a live tick, minting a fresh strictly-monotonic `capture_seq`.
@@ -658,7 +3053,33 @@ impl TickWriter {
     /// # Errors
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick(&mut self, tick: &ParsedTick) -> Result<()> {
+        // A freshly MINTED sequence is not in the write-ahead log, so this row
+        // can never be deferred to it (2026-09-26 audit fix PR3).
+        self.pending_unbacked = true;
         self.append_tick_with_seq(tick, next_capture_seq())
+    }
+
+    /// Marks the pending rows as having NO write-ahead-log record behind them
+    /// (2026-10-02).
+    ///
+    /// For a frame whose WAL append was REFUSED but which still entered the
+    /// ring (`CapturedFrame::wal_backed == false`). Its rows carry a non-zero,
+    /// replay-shaped `capture_seq`, so without this flag a busy rescue thread
+    /// would hand them "to the WAL for replay" and drop them — but no WAL
+    /// segment holds them, so that replay never comes. Marked, they keep the
+    /// inline spill: written, never dropped on that assumption.
+    ///
+    /// One `bool` store, no allocation. Sticky until `discard_pending`
+    /// consumes it; a stale `true` only costs one inline spill, never a row.
+    pub fn mark_pending_unbacked(&mut self) {
+        self.pending_unbacked = true;
+    }
+
+    /// Whether the pending rows are marked as lacking WAL backing.
+    #[must_use]
+    // TEST-EXEMPT: accessor, asserted by `mark_pending_unbacked_keeps_rows_in_the_inline_spill`.
+    pub fn pending_unbacked(&self) -> bool {
+        self.pending_unbacked
     }
 
     /// Appends a live tick with a caller-supplied, replay-stable `capture_seq`
@@ -667,99 +3088,504 @@ impl TickWriter {
     /// # Errors
     /// [`TickRow::from_parsed_tick`] refusals and ILP buffer errors.
     pub fn append_tick_with_seq(&mut self, tick: &ParsedTick, capture_seq: i64) -> Result<()> {
-        let row = TickRow::from_parsed_tick(tick, capture_seq)?;
-        self.append_row(&row)
+        self.append_tick_into(tick, capture_seq, false)
+    }
+
+    /// Appends a main-feed packet whose trade time is stale against its WAL
+    /// receipt (routed by the drain, owner Quote 43) to `tick_quotes`
+    /// (plan item M5, owner Quote 41, 2026-10-27), with the same replay-stable
+    /// `capture_seq`.
+    ///
+    /// Every gate is the one [`Self::append_tick_with_seq`] applies, judged on
+    /// the same `ticks` row: a packet that `ticks` would refuse to
+    /// `feed_aux_packets` is refused there exactly as before, so `ticks` plus
+    /// `tick_quotes` holds exactly the rows `ticks` held before the split. The
+    /// row then takes the ARRIVAL time as its designated `ts` (the `received_at`
+    /// value, already UTC + the IST offset) and keeps the vendor's last trade
+    /// time unchanged in `exchange_timestamp`. A packet with no receipt time
+    /// cannot be stamped at arrival and is written to `ticks` instead.
+    ///
+    /// O(1), allocation-free apart from the buffer's amortised growth.
+    ///
+    /// # Errors
+    /// As [`Self::append_tick_with_seq`].
+    pub fn append_tick_quote_with_seq(
+        &mut self,
+        tick: &ParsedTick,
+        capture_seq: i64,
+    ) -> Result<()> {
+        self.append_tick_into(tick, capture_seq, true)
+    }
+
+    /// `tick_quotes` rows this writer has appended over its life.
+    #[must_use]
+    pub const fn quote_rows_appended(&self) -> u64 {
+        self.quote_rows_appended
+    }
+
+    /// `ticks` rows this writer has appended over its life. O(1).
+    #[must_use]
+    pub const fn tick_rows_appended(&self) -> u64 {
+        self.tick_rows_appended
+    }
+
+    /// The shared body of the two tick appends: `to_quotes` picks the table
+    /// AFTER every gate, so both tables see the same refusals.
+    fn append_tick_into(
+        &mut self,
+        tick: &ParsedTick,
+        capture_seq: i64,
+        to_quotes: bool,
+    ) -> Result<()> {
+        // Speed fix 6 (2026-11-17): the drain stages the RAW tick; the six
+        // price conversions run on the thread that writes the text. Every
+        // refusal and counter below is the one the converted row had.
+        let outcome = match raw::RawTick::from_parsed_tick(tick, capture_seq) {
+            Ok(row) => {
+                // THE SESSION-WINDOW GATE (operator requirement, 2026-09-05).
+                //
+                // Deliberately here and NOT inside `from_parsed_tick`: every
+                // `Err` from that constructor is treated by the block below as
+                // a LOSS -- it calls `note_unapplied` and increments
+                // `tv_ticks_dropped_total`, which `dhan_ticks_dropped` PAGES
+                // on. An out-of-window tick is a deliberate refusal, not a
+                // loss, so routing it through that path would page the
+                // operator on every ordinary pre-open tick and train him to
+                // ignore the one alarm that reports real tick loss.
+                //
+                // It is also AFTER row construction rather than before, so the
+                // check reads the SAME `ts_ist_nanos` and `received_at_ist_nanos`
+                // the row would have carried -- including the sentinel-LTT
+                // fallback, where `ts` becomes the receipt. Checking the raw
+                // `ParsedTick` would test a different pair of numbers than the
+                // ones that reach the table.
+                //
+                // `note_unapplied` is deliberately NOT called: the frame is
+                // handled, not deferred. Re-offering it on the next replay
+                // would refuse it again forever.
+                //
+                // THE ABSOLUTE BAND, checked BEFORE the window (2026-09-05).
+                //
+                // `session_window` asks only "what time of DAY is this?" —
+                // `(nanos / 1e9) % 86_400`. That is the operator's requirement
+                // and it is deliberately date-blind, which leaves a hole this
+                // gate must close rather than inherit: `exchange_timestamp` is
+                // a raw `u32` off the wire, so a garbage `2_600_000_000`
+                // (year 2052) has seconds-of-day 51_200 = 14:13:20 and reads
+                // as perfectly in-window.
+                //
+                // `row_timestamp_ist_nanos` already carries a band ceiling for
+                // exactly this reason, but its out-of-band arm FALLS BACK to
+                // the receipt — and when the receipt is absent (a pre-TVW3 WAL
+                // record, or a receipt `plausible_receipt_nanos` mapped to 0)
+                // the fallback is the out-of-band LTT itself. `ts` is the
+                // DESIGNATED timestamp, so such a row opens a far-future
+                // QuestDB partition that retention and archival — both keyed
+                // on the trading day — can never reach, while every `max(ts)`
+                // over `ticks` silently includes it.
+                //
+                // The band is READ from `tickvault_trading`, never re-declared
+                // here: `constants.rs` records that two constants naming the
+                // same bound with different values is the real hazard, because
+                // a future reader tightening one would change nothing and
+                // believe otherwise.
+                {
+                    use tickvault_trading::candles::multi_tf_aggregator::{
+                        MAX_PLAUSIBLE_EXCHANGE_TS_SECS, MIN_PLAUSIBLE_EXCHANGE_TS_SECS,
+                    };
+                    let secs = row.ts_ist_nanos().div_euclid(1_000_000_000);
+                    let in_band = u32::try_from(secs).is_ok_and(|s| {
+                        (MIN_PLAUSIBLE_EXCHANGE_TS_SECS..=MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                            // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+                            .contains(&s)
+                    });
+                    if !in_band {
+                        self.out_of_window.note(TICK_TS_OUT_OF_BAND_REASON);
+                        // Refused by `ticks`, kept in `feed_aux_packets` (plan item 45h):
+                        // the row is stamped at receipt there, so no partition moves.
+                        self.persist_refused_tick(tick, capture_seq);
+                        return Ok(());
+                    }
+                }
+                let verdict = tickvault_common::session_window::verdict(
+                    row.ts_ist_nanos(),
+                    row.received_at_ist_nanos(),
+                );
+                // COUNT first, REFUSE second, and they are not the same set.
+                // A late RECEIPT is noteworthy but never a refusal -- see
+                // `WindowVerdict::is_refusal`, which records why refusing it
+                // was destroying the closing auction at the measured p99 lag.
+                if verdict.is_noteworthy() {
+                    self.out_of_window.note(verdict.reason());
+                }
+                if verdict.is_refusal() {
+                    // Out of the 09:00-15:40 window: not a `ticks` row (operator,
+                    // 2026-09-05), but never dropped (operator, 2026-09-29) —
+                    // it goes to `feed_aux_packets`, stamped at receipt.
+                    self.persist_refused_tick(tick, capture_seq);
+                    return Ok(());
+                }
+                // M5 (2026-10-27): a packet routed to quotes with a receipt goes to
+                // `tick_quotes`, stamped at arrival (`received_at`, the same
+                // value as that column); every other row goes to `ticks`.
+                if let (true, Some(arrival)) = (to_quotes, row.received_at_ist_nanos()) {
+                    let appended = self.append_raw_quote_row(&row);
+                    if appended.is_ok() {
+                        self.quote_rows_appended = self.quote_rows_appended.saturating_add(1);
+                        crate::tick_quotes_persistence::note_row();
+                        // K4: `tick_quotes` rows are counted too, under their
+                        // own designated `ts`; the daily check counts both.
+                        if self.feed == Feed::Dhan {
+                            crate::tick_conservation_ledger::ledger().note_row_appended(arrival);
+                        }
+                    }
+                    appended
+                } else {
+                    let appended = self.append_raw_row(&row);
+                    if appended.is_ok() {
+                        self.tick_rows_appended = self.tick_rows_appended.saturating_add(1);
+                    }
+                    // K4 (2026-10-26): the daily conservation check's process
+                    // side. One relaxed add per accepted Dhan row, O(1), no alloc.
+                    if appended.is_ok() && self.feed == Feed::Dhan {
+                        crate::tick_conservation_ledger::ledger()
+                            .note_row_appended(row.ts_ist_nanos());
+                        // M1 (2026-10-26): append, late in its hour, or older
+                        // partition. One `fetch_max`, one counter add, O(1).
+                        let _placement = crate::tick_ts_placement::note_row(row.ts_ist_nanos());
+                    }
+                    appended
+                }
+            }
+            Err(err) => Err(err.into()),
+        };
+        if let Err(err) = &outcome {
+            // The frame was captured to the WAL and will NOT reach the
+            // database from this session: the next replay must re-offer it.
+            crate::wal_applied_watermark::applied_watermark()
+                .note_unapplied(u64::try_from(capture_seq).unwrap_or(0));
+            // A LOSS, counted on the ALARMED metric — found 2026-09-01.
+            //
+            // Until this line the only record of an append failure was the
+            // drain's `tv_dhan_feed_drain_frames_total{outcome="write_failed"}`
+            // label. The EMF processor folds every label value of one metric
+            // into a single summed series per host, so that failure was added
+            // to the ~83M `folded` frames of a session and vanished: no alarm
+            // reads the label, no dashboard line separates it, and the coded
+            // ERROR line carried no `source` a log filter could key on. A
+            // poisoned buffer could have refused every tick of a session with
+            // every loss pager green.
+            //
+            // `tv_ticks_dropped_total` is the right home, not a new name: it
+            // means "rows left the fold without reaching QuestDB", which is
+            // exactly this, and `dhan_ticks_dropped` (`live-lane-alarms.tf`)
+            // pages on `dropped - spilled >= 1`. An append failure never
+            // spills — there is no row to rescue — so it lands on the
+            // permanent-loss side of that subtraction, which is where it
+            // belongs. Same `feed` label as the seeded baseline so the series
+            // exists from boot rather than registering on the first failure.
+            self.flush_counters.append_dropped.increment(1);
+            self.flush_counters.append_failures =
+                self.flush_counters.append_failures.saturating_add(1);
+            // Power-of-two throttle (2026-09-26 audit fix, PR1): this arm is
+            // per TICK, and a poisoned buffer fails every tick. One log line
+            // per tick would put a synchronous-looking write storm on the
+            // drain and bury the sink; the loss itself is still counted
+            // per tick on the alarmed `tv_ticks_dropped_total` above.
+            if self.flush_counters.append_failures.is_power_of_two() {
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    security_id = tick.security_id,
+                    capture_seq,
+                    source = "ilp_append_failed",
+                    failures_so_far = self.flush_counters.append_failures,
+                    error = %err,
+                    "tick row could not be appended to the ILP buffer — LOST, counted on \
+                     tv_ticks_dropped_total (the row never existed, so nothing spills). \
+                     Logged at powers of two; failures_so_far is the exact count."
+                );
+            }
+        }
+        outcome
     }
 
     /// Appends one prepared [`TickRow`] to the ILP buffer (no flush).
     ///
+    /// ⚠ CHANGED 2026-11-17 (speed fix 6): test-only. The drain stages the
+    /// raw tick (`append_raw_row`), so nothing in production calls this; the
+    /// tests that drive hostile rows through the writer still do.
+    ///
+    /// **`pub(crate)`, and that visibility is the point.** This is the raw
+    /// append: it does NOT consult the session window. The gate lives one
+    /// level up in [`TickWriter::append_tick_with_seq`], so a caller reaching
+    /// this directly writes an ungated row. It was `pub` until 2026-09-05 with
+    /// no caller outside this crate — an open door nobody had walked through
+    /// yet, which is exactly when a door is cheap to close. Narrowing it means
+    /// a future bypass has to be written inside `tickvault-storage`, where the
+    /// gate's own tests live and where a reviewer is looking for it.
+    ///
     /// ILP requires every SYMBOL before any field column, so `segment` and
-    /// `feed` are written first. Both are routed through `sanitize_ilp_symbol`
-    /// (defence in depth against line-protocol injection) even though both come
-    /// from closed `&'static str` sets today. `None` columns are OMITTED so the
-    /// cell is NULL rather than `0`.
+    /// `feed` are written first. `segment` is routed through
+    /// `sanitize_ilp_symbol` (defence in depth against line-protocol
+    /// injection: [`TickRow::segment`] is a `pub` field, and the hostile-value
+    /// test drives it with arbitrary text). `feed` is NOT: it comes from the
+    /// closed [`Feed`] set, which the `const _` block beside
+    /// [`tick_ilp_column`] proves ILP-safe at compile time (deep audit DA-12,
+    /// 2026-10-12, the depth writer's pattern). `None` columns are OMITTED so
+    /// the cell is NULL rather than `0`.
+    ///
+    /// # Atomic per row (deep audit DA-12, 2026-10-12)
+    ///
+    /// A marker is set before the line and the buffer is rewound to it when
+    /// any step fails, so a half-written row can no longer poison the buffer
+    /// and fail every later tick until a flush cleared it (the depth writer
+    /// has done this since its array rows). `set_marker`, `rewind_to_marker`
+    /// and `clear_marker` are O(1) and allocate nothing.
     ///
     /// # Errors
-    /// Propagates ILP buffer errors (table/column append failure).
-    pub fn append_row(&mut self, row: &TickRow) -> Result<()> {
-        let feed = self.feed.as_str();
-        self.buffer
-            .table(TICKS_TABLE)
-            .context("table")?
-            .symbol("segment", sanitize_ilp_symbol(row.segment).as_ref())
-            .context("segment")?
-            .symbol("feed", sanitize_ilp_symbol(feed).as_ref())
-            .context("feed")?
-            .column_i64("security_id", row.security_id)
-            .context("security_id")?
-            .column_f64("ltp", row.ltp)
-            .context("ltp")?;
-
-        // Per-feed OPTIONAL columns — omitted (NULL) when None.
-        if let Some(v) = row.open {
-            self.buffer.column_f64("open", v).context("open")?;
+    /// Propagates ILP buffer errors (table/column append failure). The buffer
+    /// then holds exactly what it held before the call.
+    #[cfg(test)]
+    pub(crate) fn append_row(&mut self, row: &TickRow) -> Result<()> {
+        // Tripwire (2026-09-26 audit fix PR2), the tick twin of the candle
+        // writer's. QuestDB stores a non-finite ILP float as NULL with no
+        // trace; this makes it visible. Six float compares per row, and the
+        // counter is touched only on a hit.
+        let nonfinite = count_nonfinite_tick_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(TICK_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
         }
-        if let Some(v) = row.high {
-            self.buffer.column_f64("high", v).context("high")?;
-        }
-        if let Some(v) = row.low {
-            self.buffer.column_f64("low", v).context("low")?;
-        }
-        if let Some(v) = row.close {
-            self.buffer.column_f64("close", v).context("close")?;
-        }
-        self.buffer
-            .column_i64("volume", row.volume)
-            .context("volume")?;
-        if let Some(v) = row.oi {
-            self.buffer.column_i64("oi", v).context("oi")?;
-        }
-        if let Some(v) = row.avg_price {
-            self.buffer
-                .column_f64("avg_price", v)
-                .context("avg_price")?;
-        }
-        if let Some(v) = row.last_trade_qty {
-            self.buffer
-                .column_i64("last_trade_qty", v)
-                .context("last_trade_qty")?;
-        }
-        if let Some(v) = row.total_buy_qty {
-            self.buffer
-                .column_i64("total_buy_qty", v)
-                .context("total_buy_qty")?;
-        }
-        if let Some(v) = row.total_sell_qty {
-            self.buffer
-                .column_i64("total_sell_qty", v)
-                .context("total_sell_qty")?;
-        }
-        if let Some(v) = row.exchange_timestamp {
-            self.buffer
-                .column_i64("exchange_timestamp", v)
-                .context("exchange_timestamp")?;
-        }
-        if let Some(v) = row.received_at_ist_nanos {
-            self.buffer
-                .column_ts("received_at", TimestampNanos::new(v))
-                .context("received_at")?;
-        }
-        if let Some(v) = row.payload_hash {
-            self.buffer
-                .column_i64("payload_hash", v)
-                .context("payload_hash")?;
-        }
-
-        // capture_seq is the LAST column before the designated timestamp.
-        self.buffer
-            .column_i64("capture_seq", row.capture_seq)
-            .context("capture_seq")?
-            .at(TimestampNanos::new(row.ts_ist_nanos))
-            .context("designated timestamp")?;
-
-        self.pending = self.pending.saturating_add(1);
-        self.last_capture_seq = self.last_capture_seq.max(row.capture_seq);
+        // PF-4 (2026-11-06): staged, not written. The text is written by the
+        // thread that sends or spills the batch, with the name table pinned
+        // here. Staging cannot fail; a row the encoder later refuses is
+        // counted there (owner decision 2026-11-06). Speed fix 6: a prepared
+        // row is a side row; drain ticks go through `append_raw_row`.
+        self.stage_extra(ExtraRow::Tick(*row));
+        self.note_tick_row_staged(row.capture_seq);
         Ok(())
+    }
+
+    /// Stages one drain-accepted `ticks` row RAW (speed fix 6, 2026-11-17):
+    /// the 88-byte raw tick; the prices are converted on the thread that
+    /// writes the text. The non-finite tripwire is a `debug_assert!` only:
+    /// it cannot move on a drain tick (see `tick_stage_raw`'s module docs).
+    /// O(1), no allocation.
+    ///
+    /// # Errors
+    /// None: staging cannot fail (see [`Self::append_row`]).
+    fn append_raw_row(&mut self, row: &raw::RawTick) -> Result<()> {
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
+        let raw = *row;
+        self.stage_row(|pin| StagedRow::Tick { raw, pin });
+        self.note_tick_row_staged(row.capture_seq());
+        Ok(())
+    }
+
+    /// Stages one `tick_quotes` row RAW (plan item M5; raw since speed fix 6):
+    /// written with the arrival time as its designated `ts` and the vendor's
+    /// last trade time in `exchange_timestamp` ([`raw::RawTick::to_quote_row`]).
+    /// Called only for a tick with a receipt time. Same buffer, same pending
+    /// range as a `ticks` row. O(1), no allocation.
+    ///
+    /// # Errors
+    /// None: staging cannot fail.
+    fn append_raw_quote_row(&mut self, row: &raw::RawTick) -> Result<()> {
+        debug_assert_eq!(row.nonfinite_floats(), 0, "a drain tick is finite");
+        let raw = *row;
+        self.stage_row(|pin| StagedRow::Quote { raw, pin });
+        self.note_tick_row_staged(row.capture_seq());
+        Ok(())
+    }
+
+    /// The bookkeeping every staged `ticks` or `tick_quotes` row does: one
+    /// more pending row, and the capture sequence ranges. O(1).
+    fn note_tick_row_staged(&mut self, capture_seq: i64) {
+        self.pending = self.pending.saturating_add(1);
+        self.last_capture_seq = self.last_capture_seq.max(capture_seq);
+        self.note_pending_seq(capture_seq);
+    }
+
+    /// Appends one `feed_aux_packets` row to this writer's ILP buffer (plan
+    /// item 45h).
+    ///
+    /// Same buffer as the `ticks` rows on purpose: the rows then share the
+    /// offload thread, the rescue tier, the spill files (an ILP payload may
+    /// name several tables) and the WAL applied-watermark range, so an aux row
+    /// is exactly as durable as a tick and needs no second writer. `pending`
+    /// counts it, so the size trigger and the flush see it.
+    ///
+    /// O(1), no allocation inside the staged batch's pre-size.
+    ///
+    /// # Errors
+    /// None since PF-4 (2026-11-06): the row is staged, and a row the encoder
+    /// later refuses is a counted loss on the thread that encodes it, exactly
+    /// as an append failure was here (frame marked unapplied so the next
+    /// replay re-offers it, `tv_ticks_dropped_total` incremented). The
+    /// `Result` is kept so callers keep their handling.
+    pub fn append_aux(&mut self, row: &AuxPacketRow) -> Result<()> {
+        // PF-4: staged, written later (see `append_row`).
+        self.stage_extra(ExtraRow::Aux(*row));
+        self.pending = self.pending.saturating_add(1);
+        self.aux_rows_appended = self.aux_rows_appended.saturating_add(1);
+        if let Some(c) = self.aux_counters.get(row.kind.index()) {
+            c.increment(1);
+        }
+        self.note_pending_seq(row.capture_seq);
+        Ok(())
+    }
+
+    /// Stages one row (PF-4, 2026-11-06): pins the contract-name table in
+    /// force now (one table load, one pointer compare) and pushes the row
+    /// into the pre-sized batch. O(1), no allocation inside the pre-size; a
+    /// push past it grows the batch (cold, counted on
+    /// `tv_tick_stage_grow_total`), never drops.
+    ///
+    /// Speed fix 5 (2026-11-17): the table load is skipped while no name
+    /// table was published since the batch's last pin was loaded (one
+    /// acquire load and one compare, see
+    /// `StagedBatch::current_pin_at_generation`); the pin is the index the
+    /// load would have produced, so every row and every byte is unchanged.
+    fn stage_row(&mut self, make: impl FnOnce(u8) -> StagedRow) {
+        let pin = self.stage_pin();
+        if self.staged.push(make(pin)) {
+            self.flush_counters.stage_grow.increment(1);
+        }
+    }
+
+    /// [`Self::stage_row`] for a side row (speed fix 6: aux rows and prepared
+    /// rows, kept whole beside the 96-byte staged rows). Same pin, same grow
+    /// count. O(1), no allocation inside the pre-size.
+    fn stage_extra(&mut self, extra: ExtraRow) {
+        let pin = self.stage_pin();
+        if self.staged.push_extra(extra, pin) {
+            self.flush_counters.stage_grow.increment(1);
+        }
+    }
+
+    /// The pin index for the name table in force now (see [`Self::stage_row`]);
+    /// may hand the batch off first on a ninth table ([`Self::pin_after_cut`]).
+    #[inline]
+    fn stage_pin(&mut self) -> u8 {
+        let generation = crate::candle_contract_labels::candle_contract_labels_generation();
+        match self.staged.current_pin_at_generation(generation) {
+            Some(pin) => pin,
+            None => {
+                // Read the generation BEFORE the load: a publish bumps to odd,
+                // stores, then bumps to even, so the loaded table is at least
+                // that generation's, and an odd one is never kept (`try_pin_at_generation`).
+                let labels = crate::candle_contract_labels::candle_contract_labels();
+                match self.staged.try_pin_at_generation(labels, generation) {
+                    Ok(pin) => pin,
+                    Err(labels) => self.pin_after_cut(labels),
+                }
+            }
+        }
+    }
+
+    /// A ninth contract-name table inside one batch (PF-4): the batch is
+    /// handed off early through the normal flush path, then the table is
+    /// pinned in the fresh batch. A hand-off the full queue refuses is
+    /// rescued through `discard_pending` (durable, counted), never dropped.
+    /// Counted on `tv_tick_stage_pin_cut_total`. Cold: names are published a
+    /// few times a day.
+    #[cold]
+    fn pin_after_cut(
+        &mut self,
+        labels: arc_swap::Guard<
+            std::sync::Arc<crate::candle_contract_labels::CandleContractLabels>,
+        >,
+    ) -> u8 {
+        self.flush_counters.stage_pin_cut.increment(1);
+        // The unbacked mark is set for a frame BEFORE its rows are staged
+        // (`mark_frame_unbacked` in the app). A cut on that frame's first row
+        // hands the old batch off and clears the mark, so the frame's own rows
+        // would land in the new batch unmarked. Keep it: a stale `true` costs
+        // one inline spill, never a row (review round 1, 2026-11-06).
+        let unbacked = self.pending_unbacked;
+        if self.offload.is_some() {
+            if let OffloadOutcome::QueueFull(_) = self.offload_flush() {
+                self.retained_spans = 0;
+                let _rescued = self.discard_pending();
+            }
+        } else {
+            // The synchronous arm: sends, or rescues the rows on failure.
+            let _sent_or_rescued = self.flush().is_ok();
+        }
+        self.pending_unbacked |= unbacked;
+        match self.staged.try_pin(labels) {
+            Ok(pin) => pin,
+            Err(labels) => {
+                // Review round 1 (2026-11-06): a split writer keeps a batch's
+                // pins when the drain clears its rows (a WAL deferral, an
+                // inline spill, an empty discard), so the batch can come back
+                // from the arms above with no rows and every pin slot full of
+                // tables no row uses. Rescue any rows still held, then drop
+                // those stale pins: the ONE place a split writer still
+                // releases pins on the drain, reached only when a ninth name
+                // table arrives while the writer queue refused the hand-off.
+                // At most `TICK_STAGE_LABEL_PINS` `Arc` drops; counted on
+                // `tv_tick_stage_pin_cut_total` above.
+                let unbacked = self.pending_unbacked;
+                let _rescued = self.discard_pending();
+                self.pending_unbacked |= unbacked;
+                self.staged.clear();
+                self.staged.try_pin(labels).unwrap_or(0)
+            }
+        }
+    }
+
+    /// Persists a tick the `ticks` window or band gate refused as a
+    /// `feed_aux_packets` row of kind `out_of_window_tick`, stamped at receipt.
+    ///
+    /// Returns nothing on purpose: a failed append is already counted, logged
+    /// and marked unapplied inside [`Self::append_aux`]. Handing that `Err`
+    /// back would run the caller's tick-loss block a second time for the same
+    /// frame, and the window refusal itself is not a loss.
+    fn persist_refused_tick(&mut self, tick: &ParsedTick, capture_seq: i64) {
+        if let Some(row) =
+            AuxPacketRow::from_tick(AuxPacketKind::OutOfWindowTick, tick, capture_seq)
+        {
+            // Failure handled (counted + unapplied) inside `append_aux`.
+            let _handled = self.append_aux(&row).is_ok();
+        }
+        // `None` is unreachable: `from_parsed_tick` already proved the id
+        // fits, and the refusal is counted inside `from_header` either way.
+    }
+
+    /// `feed_aux_packets` rows this writer has appended over its life.
+    #[must_use]
+    pub const fn aux_rows_appended(&self) -> u64 {
+        self.aux_rows_appended
+    }
+
+    /// Widens the pending sequence range to cover one appended row.
+    fn note_pending_seq(&mut self, capture_seq: i64) {
+        let seq = u64::try_from(capture_seq).unwrap_or(0);
+        if seq == 0 {
+            self.pending_unbacked = true;
+            return;
+        }
+        if self.pending_min_seq == 0 || seq < self.pending_min_seq {
+            self.pending_min_seq = seq;
+        }
+        if seq > self.pending_max_seq {
+            self.pending_max_seq = seq;
+        }
+    }
+
+    /// Takes the pending range, leaving it empty.
+    fn take_pending_range(&mut self) -> (u64, u64) {
+        let r = (self.pending_min_seq, self.pending_max_seq);
+        self.pending_min_seq = 0;
+        self.pending_max_seq = 0;
+        r
+    }
+
+    /// Restores a range the hand-off gave back (queue full / thread gone).
+    fn restore_pending_range(&mut self, range: (u64, u64)) {
+        self.pending_min_seq = range.0;
+        self.pending_max_seq = range.1;
     }
 
     /// Flushes buffered rows over ILP-HTTP with a per-flush server ACK.
@@ -772,8 +3598,39 @@ impl TickWriter {
     /// # Errors
     /// `Err` when disconnected or when the HTTP flush fails.
     pub fn flush(&mut self) -> Result<()> {
+        // H4: a parked rescue goes to its thread before anything else, so a
+        // quiet stretch with nothing pending still empties the park.
+        self.retry_parked_rescue();
         if self.pending == 0 {
             return Ok(());
+        }
+        // The offload branch sits FIRST, above the no-sender check, because a
+        // split writer has no `Sender` at all — the sink took it. Checking
+        // `sender.is_none()` first would treat every offloaded flush as
+        // "QuestDB unreachable" and rescue every batch to disk.
+        if self.offload.is_some() {
+            return match self.offload_flush() {
+                // Handed off. The rows are the sink's problem now, and the
+                // sink is the one that reports whether they landed.
+                OffloadOutcome::Sent(_) => Ok(()),
+                // NOT an error. The rows are still here and still pending;
+                // the next flush tries again. Returning `Err` would make the
+                // drain report a loss that did not happen.
+                OffloadOutcome::QueueFull(_) => Ok(()),
+                OffloadOutcome::WidthCapped(rows) => {
+                    anyhow::bail!(
+                        "ticks: the writer stayed behind for more than \
+                         {MAX_RETAINED_FLUSH_SPANS} flush span(s) — {rows} row(s) were \
+                         RESCUED to the spill tier rather than widening the commit, \
+                         because commit width is the measured write amplifier"
+                    )
+                }
+                OffloadOutcome::SinkGone(rows) => {
+                    anyhow::bail!(
+                        "ticks: the offload writer thread is gone — {rows} row(s) rescued"
+                    )
+                }
+            };
         }
         if self.sender.is_none() {
             let dropped = self.discard_pending();
@@ -782,17 +3639,64 @@ impl TickWriter {
                  row(s) discarded"
             );
         }
-        let flushed = self
-            .sender
-            .as_mut()
-            .map(|sender| sender.flush(&mut self.buffer));
+        // B1: never post into a table this process has not keyed (QuestDB
+        // would create it in a shape that can never take the key). The rows
+        // take the rescue: WAL deferral or the spill, replayed once keyed.
+        // B1 review 2: `ticks` gates the batch; the auxiliary table does only
+        // when the batch holds an aux row (this unsplit arm does not split a
+        // batch; the writer thread does). B1 review 3: `tick_quotes` the
+        // same way. The O(rows) scans run only while their table is not keyed.
+        let held_part =
+            |table: GatedTable| !(self.table_gate)(&[table]) && self.staged.has_rows_for(table);
+        if !(self.table_gate)(&[GatedTable::Ticks])
+            || held_part(GatedTable::TickQuotes)
+            || held_part(GatedTable::FeedAuxPackets)
+        {
+            crate::ilp_table_gate::note_live_batch_held("ticks");
+            let dropped = self.discard_pending();
+            anyhow::bail!("ticks: table not keyed yet; {dropped} pending row(s) rescued");
+        }
+        // The synchronous ILP round trip: the other place a flush blocks, so
+        // it runs through `off_worker` (the drain calls `flush` bare). PF-4:
+        // the staged rows are written as text here too, inside the same
+        // closure, into the cold scratch (this arm is the unsplit writer's,
+        // never the steady state of a split one).
+        let Self {
+            staged,
+            cold_encode: scratch,
+            sender,
+            feed,
+            ..
+        } = self;
+        scratch.clear();
+        let encoded = crate::off_worker::off_worker(|| staged.encode_into(*feed, scratch));
+        let flushed = sender.as_mut().map(|sender| {
+            if encoded == 0 {
+                // Every row refused (each already counted): nothing to send.
+                return Ok(());
+            }
+            crate::off_worker::off_worker(|| sender.flush(scratch))
+        });
+        scratch.clear();
         match flushed {
             Some(Ok(())) => {
+                self.clear_staged_on_drain();
                 self.pending = 0;
+                // Every pending row landed, so the unbacked mark goes with them
+                // (review of G4-audit, 2026-10-11). Left set, it read every
+                // LATER batch as unbacked and reported its rescue failure as
+                // lost although the WAL backs it.
+                self.pending_unbacked = false;
+                // The synchronous arm (offload not wired, or its spawn failed)
+                // acks the watermark itself; otherwise a lane on this path
+                // would never skip a replayed frame.
+                let (_, max_seq) = self.take_pending_range();
+                crate::wal_applied_watermark::applied_watermark().note_ticks_acked(max_seq);
                 Ok(())
             }
             Some(Err(err)) => {
                 let dropped = self.discard_pending();
+                // APPROVED: flush-FAILURE error context, never the append path
                 Err(anyhow::Error::new(err).context(format!(
                     "ticks ILP flush failed — {dropped} pending row(s) discarded \
                      (poisoned-buffer defence)"
@@ -806,27 +3710,1755 @@ impl TickWriter {
         }
     }
 
-    /// Drops every buffered-but-unflushed row (poisoned-buffer defence).
+    /// Rescues every buffered-but-unflushed row to the spill tier, then clears.
     ///
-    /// Returns the discarded count and reports it LOUDLY —
-    /// `tv_ticks_dropped_total` plus a coded `error!` — so tick loss is never
-    /// silent.
-    pub fn discard_pending(&mut self) -> usize {
-        let dropped = self.pending;
-        if dropped > 0 {
-            metrics::counter!("tv_ticks_dropped_total", "feed" => self.feed.as_str())
-                .increment(dropped as u64);
+    /// Replaces a bare discard. The rows are good — today's live evidence is
+    /// `Could not flush buffer: http://localhost:9000/write: timeout: per
+    /// call`, a CLIENT-side timeout with no matching error in QuestDB's own
+    /// log, so nothing was rejected and the buffer was never poisoned. The
+    /// "poisoned-buffer defence" rationale is real but applies to a row the
+    /// SERVER refused; it was being applied to every failure alike, and 1,377
+    /// unrepeatable ticks were dropped on 2026-08-21 because of it.
+    ///
+    /// Ticks are the one payload class that cannot be re-fetched — the REST
+    /// legs' rows carry "rows are re-fetchable" in their own discard message
+    /// and are genuinely fine to drop. So this writer, and not those, gets the
+    /// rescue tier that `seal_absorption` has always had for seals.
+    ///
+    /// Returns the number of rows that left the buffer, whether rescued or
+    /// dropped, so the caller's accounting is unchanged.
+    /// Splits this writer into a PRODUCER half and a network SINK half.
+    ///
+    /// The producer keeps the ILP buffer and the row accounting and stays on
+    /// the drain task; the sink takes the `Sender` and belongs on a thread of
+    /// its own. They are joined by a bounded queue, so the drain can never be
+    /// blocked by the network and can never grow the queue without bound.
+    ///
+    /// # Why this exists
+    ///
+    /// `flush` is a blocking ILP-over-HTTP round trip with a 5 s timeout, and
+    /// it was being called from the frame-drain task. `block_in_place` bounded
+    /// the DAMAGE — the runtime spins up a replacement worker so the other
+    /// tasks keep running — but it does not remove the drain from the flush's
+    /// critical path: the drain itself is what stops, and the drain is the
+    /// only thing emptying the socket. A slow database therefore stalled the
+    /// fold, filled the receive buffer, and Dhan — which skips a slow consumer
+    /// forward to "the latest available state" with no sequence number —
+    /// discarded the intermediate ticks at THEIR side, invisibly. That is the
+    /// mechanism by which a storage hiccup became unrecoverable tick loss, and
+    /// no amount of disk throughput removes it, because the coupling is
+    /// structural rather than a matter of speed.
+    ///
+    /// Consuming `self` and returning a new one is deliberate: it makes the
+    /// split a one-way door at the type level, so no caller can hold a handle
+    /// that still believes it owns the network.
+    #[must_use]
+    // TEST-EXEMPT: the split itself is exercised by every offload test below,
+    // each of which calls it to obtain the producer/sink pair.
+    pub fn split_for_offload(
+        mut self,
+    ) -> (Self, TickWriterSink, std::sync::mpsc::Receiver<FlushBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
+        let spare_tx = self.spare_lane();
+        let sink = TickWriterSink {
+            sender: self.sender.take(),
+            feed: self.feed,
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the offload writer, once per process at wiring
+            spare_return: Some(spare_tx),
+            counters: TickSinkCounters::new(self.feed),
+            // PF-4: the batches arrive as staged rows; their text is written
+            // here, in the writer's encoder (the sender speaks that one).
+            encode_buf: presized_row_buffer(self.encoder),
+            table_gate: self.table_gate,
+        };
+        self.offload = Some(tx);
+        (self, sink, rx)
+    }
+
+    /// The sending end of the spare lane, opened on first use (cold: once per
+    /// split). The return lane for spent batches (item 44g): same depth as the
+    /// hand-off queue, and a full lane drops the spare (on the returning
+    /// thread) rather than waiting. Review round 1 (2026-11-06): the writer
+    /// sink AND the rescue sink return through it, so whichever split runs
+    /// first opens it.
+    fn spare_lane(&mut self) -> std::sync::mpsc::SyncSender<StagedBatch> {
+        if let Some(tx) = self.spare_lane.as_ref() {
+            return tx.clone(); // APPROVED: one sender handle per split, cold
+        }
+        let (spare_tx, spare_rx) = std::sync::mpsc::sync_channel(FLUSH_QUEUE_DEPTH);
+        self.spare_buffers = Some(spare_rx);
+        self.spare_lane = Some(spare_tx.clone()); // APPROVED: one sender handle per split, cold
+        spare_tx
+    }
+
+    /// Empties the staged batch ON THE DRAIN (review round 1, 2026-11-06).
+    ///
+    /// A split writer (a spare lane is open) clears only the rows and keeps
+    /// the name pins: dropping a pin here could free the last reference to a
+    /// replaced name table (about 120,000 entries) inside a frame. The pins
+    /// travel with the batch to the writer or rescue thread, whose clear drops
+    /// them. An unsplit writer (tests and cold synchronous paths) has no other
+    /// thread to drop them on, so it drops them here. O(1) either way.
+    fn clear_staged_on_drain(&mut self) {
+        if self.spare_lane.is_some() {
+            self.staged.clear_rows();
+        } else {
+            self.staged.clear();
+        }
+    }
+
+    /// Closes the hand-off queue, so the writer thread sees the end of the
+    /// stream and can exit.
+    ///
+    /// Shutdown-only. Dropping the sender is what turns the writer's blocking
+    /// `recv` into a clean exit; without it, a caller that joins the thread
+    /// waits forever on a queue nothing will ever close.
+    ///
+    /// Leaves the writer in the UNSPLIT state, so a flush after this point
+    /// takes the synchronous arm and — with the sender long gone to the sink —
+    /// rescues to the spill tier rather than silently discarding. That is the
+    /// correct end-of-session behaviour: rows are on disk and named, not lost.
+    pub fn close_offload(&mut self) {
+        self.offload = None;
+    }
+
+    /// Hands the rescue write to a dedicated thread.
+    ///
+    /// Separate from [`TickWriter::split_for_offload`] because it solves the
+    /// case that split CANNOT: the rescue fires exactly when the flush queue is
+    /// full or its thread is gone, so it cannot ride the same queue.
+    ///
+    /// Returns the thread's half and the receiver. Until the caller wires
+    /// them, `discard_pending` keeps writing inline — this is opt-in, and the
+    /// unwired behaviour is the old behaviour.
+    pub fn split_rescue_offload(
+        &mut self,
+    ) -> (TickRescueSink, std::sync::mpsc::Receiver<RescueBatch>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(RESCUE_QUEUE_DEPTH);
+        let spare_return = Some(self.spare_lane());
+        let sink = TickRescueSink {
+            spill_dir: self.spill_dir.clone(), // APPROVED: PathBuf moved into the rescue offload writer, once per process
+            feed: self.feed,
+            spill_sync: SPILL_SYNC_OFF_DRAIN,
+            scratch: std::cell::RefCell::new(TickRowBuffer::new(self.encoder)),
+            spare_return,
+        };
+        self.rescue = Some(tx);
+        // Once per process, so a park on the drain never allocates.
+        self.parked_rescue.reserve_exact(PARKED_RESCUE_MAX_BATCHES);
+        (sink, rx)
+    }
+
+    /// Closes the rescue queue so its thread can exit.
+    ///
+    /// Shutdown-only, and it leaves the writer in the INLINE state on purpose:
+    /// a rescue after this point writes synchronously rather than being
+    /// refused, so the end-of-session rows still reach the spill tier.
+    ///
+    /// H4 (2026-10-03): every parked batch is handed to the rescue thread
+    /// first. Audit K1 (2026-10-26): the hand-off has a DEADLINE
+    /// ([`RESCUE_SHUTDOWN_HANDOFF_BUDGET`] for all parked batches together),
+    /// where it used to be a blocking `send` with none, so a rescue thread
+    /// stuck on a wedged disk held the whole shutdown. A batch the thread does
+    /// not take in time, or a thread already gone, is written inline instead;
+    /// if that write fails too, its unbacked rows are counted lost on
+    /// `tv_ticks_lost_total{source="rescue_abandoned"}` with a coded `error!`.
+    pub fn close_rescue_offload(&mut self) {
+        if let Some(tx) = self.rescue.take() {
+            let deadline = std::time::Instant::now() + RESCUE_SHUTDOWN_HANDOFF_BUDGET;
+            while let Some(batch) = self.parked_rescue.pop_front() {
+                self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(batch.slots());
+                let rows = batch.rows;
+                match hand_off_before(&tx, batch, deadline) {
+                    ShutdownHandOff::Sent => {
+                        self.flush_counters.rescue_queued.increment(rows as u64);
+                    }
+                    ShutdownHandOff::Gone(batch) => {
+                        self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                    ShutdownHandOff::TimedOut(batch) => {
+                        self.spill_parked_at_shutdown(batch);
+                    }
+                }
+            }
+        }
+        // Unreachable with batches still parked (only a split writer parks),
+        // and written inline rather than dropped if it ever is.
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            self.spill_parked_at_shutdown(batch);
+        }
+        self.parked_rescue_slots = 0;
+        self.flush_counters.rescue_parked_bytes.set(0.0);
+    }
+
+    /// True when `batch` fits in the park without passing either bound.
+    /// PF-4: the second bound is row SLOTS ([`PARKED_RESCUE_MAX_ROWS`]), the
+    /// old 128 MiB text bound restated at the worst-case line. Review round 1
+    /// (2026-11-06): counted on each batch's CAPACITY, not its rows, because
+    /// a parked batch holds its whole pre-touched allocation however few rows
+    /// it carries; so the bound is the RAM the park really holds.
+    fn park_rescue_fits(&self, batch: &RescueBatch) -> bool {
+        self.parked_rescue.len() < PARKED_RESCUE_MAX_BATCHES
+            && self.parked_rescue_slots.saturating_add(batch.slots()) <= PARKED_RESCUE_MAX_ROWS
+    }
+
+    /// Publishes the RAM the park holds (PF-4: staged row slots, capacity and
+    /// not just rows; see [`TICK_RESCUE_PARKED_BYTES_GAUGE`]).
+    fn publish_parked_bytes(&self) {
+        self.flush_counters
+            .rescue_parked_bytes
+            .set(self.parked_rescue_slots.saturating_mul(STAGED_SLOT_BYTES) as f64);
+    }
+
+    /// Parks one refused rescue batch in RAM (H4). O(1), no allocation (the
+    /// queue was pre-sized when the rescue was split), floor kept.
+    fn park_rescue(&mut self, batch: RescueBatch) {
+        self.parked_rescue_slots = self.parked_rescue_slots.saturating_add(batch.slots());
+        self.flush_counters
+            .rescue_parked
+            .increment(batch.rows as u64);
+        self.parked_rescue.push_back(batch);
+        self.publish_parked_bytes();
+    }
+
+    /// Hands parked rescue batches to the rescue thread, oldest first, until
+    /// its queue is full again (H4). One branch when nothing is parked;
+    /// otherwise at most [`PARKED_RESCUE_MAX_BATCHES`] `try_send`s, never a
+    /// wait. A thread that has gone is the one case written inline, exactly
+    /// as an unparked rescue would be.
+    fn retry_parked_rescue(&mut self) {
+        if self.parked_rescue.is_empty() {
+            return;
+        }
+        while let Some(batch) = self.parked_rescue.pop_front() {
+            let parked = batch.slots();
+            let rows = batch.rows as u64;
+            let Some(tx) = self.rescue.as_ref() else {
+                self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
+                self.spill_parked_on_drain(batch);
+                continue;
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
+                    self.flush_counters.rescue_queued.increment(rows);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(batch)) => {
+                    // Back to the FRONT: the capacity the pop freed is reused.
+                    self.parked_rescue.push_front(batch);
+                    break;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
+                    self.parked_rescue_slots = self.parked_rescue_slots.saturating_sub(parked);
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    self.spill_parked_on_drain(batch);
+                }
+            }
+        }
+        self.publish_parked_bytes();
+    }
+
+    /// Writes a parked batch inline, the one place a PARKED batch can reach
+    /// the disk on the drain (thread gone). Completes it exactly as the rescue
+    /// thread would: outcome, floor, completion count.
+    fn spill_parked_on_drain(&mut self, mut batch: RescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let landed = self.spill_on_drain(&mut batch.staged, fate);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_ticks_completed();
+        // Review round 1 (2026-11-06): not dropped here, where its pins could
+        // free a replaced name table inside a frame. Rows cleared, pins kept,
+        // it goes to the spare lane; the next hand-off carries the pins to a
+        // thread that drops them. A full lane drops it here (thread-gone
+        // path only, cold).
+        let mut spent = batch.staged;
+        spent.clear_rows();
+        if let Some(lane) = self.spare_lane.as_ref() {
+            let _dropped_if_refused = lane.try_send(spent);
+        }
+    }
+
+    /// [`Self::spill_parked_on_drain`] at shutdown (audit K1): a batch whose
+    /// inline write also fails and whose rows the WAL does not hold is counted
+    /// lost on `tv_ticks_lost_total{source="rescue_abandoned"}`, with a coded
+    /// line. Rows the WAL holds are left to the next boot's replay (the fate
+    /// line from the failed write already says so).
+    fn spill_parked_at_shutdown(&mut self, mut batch: RescueBatch) {
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(
+            batch.min_seq,
+            batch.max_seq,
+            batch.unbacked,
+        );
+        let rows = batch.rows;
+        let landed = self.spill_on_drain(&mut batch.staged, fate);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        wm.note_ticks_completed();
+        if !landed && fate == crate::wal_applied_watermark::RESCUE_FATE_LOST {
+            metrics::counter!("tv_ticks_lost_total", "source" => SHUTDOWN_RESCUE_ABANDONED_SOURCE)
+                .increment(rows as u64);
             error!(
                 code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
                 feed = self.feed.as_str(),
-                dropped,
-                "tick auto-flush failed — buffered tick rows discarded from the \
-                 ILP buffer; these ticks are NOT in QuestDB"
+                rows,
+                source = SHUTDOWN_RESCUE_ABANDONED_SOURCE,
+                "shutdown: a parked tick rescue batch could not be handed to the rescue thread \
+                 in time AND could not be written to the spill file, and the WAL does not hold \
+                 its rows. These ticks are LOST."
             );
         }
-        self.buffer.clear();
+    }
+
+    /// The drain's only spill write, NOT synced (see `SPILL_UNSYNCED_ON_DRAIN`).
+    ///
+    /// It is a file write (and a `statvfs` free-space probe), so it runs through
+    /// `off_worker`: the drain calls `flush` bare, and this is one of the two
+    /// places a flush can block.
+    ///
+    /// PF-4 (2026-11-06): the batch is staged rows, so its ILP text is written
+    /// here first, inside the same `off_worker` closure, into the cold scratch:
+    /// O(rows) of formatting on a path that already waits on the disk (flagged,
+    /// not hidden). Rows the encoder refuses are counted by the encoder; the
+    /// spill carries the rest. A batch with nothing left to write is reported
+    /// landed (nothing is left to lose).
+    fn spill_on_drain(&mut self, staged: &mut StagedBatch, fate: &'static str) -> bool {
+        let (spill_dir, feed, scratch) = (&self.spill_dir, self.feed, &mut self.cold_encode);
+        crate::off_worker::off_worker(|| {
+            scratch.clear();
+            let rows = staged.encode_into(feed, scratch);
+            let landed = rows == 0
+                || perform_tick_rescue(
+                    spill_dir,
+                    scratch.as_bytes(),
+                    feed,
+                    rows,
+                    SPILL_UNSYNCED_ON_DRAIN,
+                    fate,
+                );
+            scratch.clear();
+            landed
+        })
+    }
+
+    /// Hands the pending buffer to the writer thread without touching the
+    /// network.
+    ///
+    /// Uses `try_send`, never `send`: a blocking send would re-create the
+    /// exact coupling the split exists to remove, just one queue further out.
+    fn offload_flush(&mut self) -> OffloadOutcome {
+        let rows = self.pending;
+        let (min_seq, max_seq) = self.take_pending_range();
+        let batch = FlushBatch {
+            // PF-4: the staged rows move; the replacement allocates nothing.
+            staged: std::mem::take(&mut self.staged),
+            rows,
+            min_seq,
+            max_seq,
+            // Copied, not taken: on a full queue the rows come back and the
+            // flag stays with them; the Sent arm below clears it.
+            unbacked: self.pending_unbacked,
+        };
+        let Some(tx) = self.offload.as_ref() else {
+            // Unreachable — `flush` checks. Treated as the gone arm rather
+            // than silently succeeding, because "we sent it" when nothing was
+            // sent is the one report that must never be wrong.
+            self.staged = batch.staged;
+            self.restore_pending_range((batch.min_seq, batch.max_seq));
+            return OffloadOutcome::SinkGone(rows);
+        };
+        match tx.try_send(batch) {
+            Ok(()) => {
+                self.pending = 0;
+                self.retained_spans = 0;
+                // The batch carries the mark now; nothing pending is unbacked
+                // (review of G4-audit, 2026-10-11).
+                self.pending_unbacked = false;
+                crate::wal_applied_watermark::applied_watermark().note_ticks_handed_off();
+                self.flush_counters.offloaded.increment(1);
+                // Only NOW take a recycled spare: taking it before the send
+                // would drop it on the QueueFull arm, which puts the retained
+                // buffer back in place.
+                self.install_spare_buffer();
+                OffloadOutcome::Sent(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
+                // Backpressure, not loss. Put the rows BACK and keep
+                // appending — the next flush retries. This is the arm that
+                // makes the bounded queue safe: without it a full queue would
+                // either block the drain (the original defect) or drop rows
+                // (a worse one).
+                self.flush_counters.queue_full.increment(1);
+                let held = returned.staged.len();
+                self.staged = returned.staged;
+                self.retained_spans = self.retained_spans.saturating_add(1);
+                // TWO independent cuts, and the SPAN one is the reason this
+                // change is safe to ship at all.
+                //
+                // Span: commit WIDTH is the measured amplifier — 10% of a
+                // day's ticks carry an exchange timestamp over an hour behind
+                // arrival, so a wide commit reopens closed hourly partitions
+                // and rewrites them. Accumulating without this bound would have
+                // made the disk pressure this change exists to relieve WORSE.
+                //
+                // Rows (PF-4: was bytes): a belt-and-braces bound on a
+                // pathological append rate, kept well under the questdb-rs
+                // wedge — `MAX_PRODUCER_ROWS` is the 32 MiB text cut at the
+                // worst-case line (const-asserted in `tick_stage`).
+                // `>` and not `>=`: the constant names how many spans may be
+                // RETAINED, so the cut belongs on the span after them.
+                if self.retained_spans > MAX_RETAINED_FLUSH_SPANS || held >= MAX_PRODUCER_ROWS {
+                    self.flush_counters.width_capped.increment(1);
+                    self.retained_spans = 0;
+                    // Rescue rather than keep widening. Durable, counted, and
+                    // re-ingestable — the same tier a failed flush uses.
+                    let dropped = self.discard_pending();
+                    return OffloadOutcome::WidthCapped(dropped);
+                }
+                OffloadOutcome::QueueFull(rows)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                // The writer thread died. Rescue rather than drop, and say so.
+                self.staged = returned.staged;
+                self.restore_pending_range((returned.min_seq, returned.max_seq));
+                let dropped = self.discard_pending();
+                OffloadOutcome::SinkGone(dropped)
+            }
+        }
+    }
+
+    /// Replaces the just-emptied buffer with a recycled spare from the writer
+    /// thread, when one is waiting (2026-09-22, item 44g).
+    ///
+    /// Called only after a hand-off SUCCEEDED, when `self.staged` is the
+    /// zero-capacity batch the swap left behind (which never allocated).
+    /// Without this every batch regrew from zero — several reallocations per
+    /// flush on the drain task. `try_recv`, never `recv`. With no spare (or
+    /// one under [`TICK_STAGED_ROWS_PRESIZE`]) the batch is reserved to that
+    /// size and its pages touched here, on the flush arm (K6, PF-4), so the
+    /// next batch neither regrows nor page-faults inside the frames that
+    /// stage it.
+    ///
+    /// PF-4 (2026-11-06): a staged batch carries no encoder, so the old
+    /// "spare of another protocol is dropped" check is gone; every text this
+    /// writer's rows become is written with the writer's one encoder
+    /// (`encoder`, and the sink's and rescue thread's scratch built from it at
+    /// the split).
+    fn install_spare_buffer(&mut self) {
+        if let Some(spares) = self.spare_buffers.as_ref()
+            && let Ok(mut spare) = spares.try_recv()
+        {
+            spare.clear_rows();
+            self.staged = spare;
+        }
+        // K6 / PF-4: no spare (or a smaller one) means the next batch would
+        // regrow from zero inside the frames that stage it. Reserve and touch
+        // the pre-size here instead: one allocation on this flush arm, none
+        // per tick. A spare at least that big costs one compare.
+        // 2026-11-16: count the fresh reserve, so a ring wait can be traced
+        // to a spare-less hand-off on the drain.
+        if self.staged.reserve_presize() {
+            self.flush_counters.stage_presize_fresh.increment(1);
+            self.flush_counters.stage_presize_fresh_count = self
+                .flush_counters
+                .stage_presize_fresh_count
+                .saturating_add(1);
+        }
+    }
+
+    /// Rescue the buffered rows to the spill tier instead of losing them.
+    ///
+    /// # Why this hands off instead of writing (2026-08-28)
+    ///
+    /// This is reached from `try_offload`'s `WidthCapped` and `SinkGone` arms,
+    /// which run ON THE FRAME-DRAIN TASK. The write it used to perform inline
+    /// is not small: `create_dir_all`, a `read_dir` + per-entry `metadata()`
+    /// walk of the spill directory AND its quarantine subdirectory, a live
+    /// free-space probe, and then up to [`MAX_PRODUCER_BUFFER_BYTES`] —
+    /// 32 MiB — of file write. All of it on the same volume QuestDB is
+    /// stalling on.
+    ///
+    /// CORRECTED 2026-09-01 (adversarial review): this said "a live `statvfs`".
+    /// There was no `statvfs` anywhere in this workspace then — the probe,
+    /// [`crate::disk_health_watcher::probe_disk_free_bytes`], forked and
+    /// exec'd `df`, far more expensive than a syscall on a path that runs on
+    /// the frame-drain task. **CHANGED 2026-10-12 (deep audit DA-12):** the
+    /// probe is now one `statvfs` call, so the fork is gone from this arm; the
+    /// directory walk and the file write described above remain.
+    ///
+    /// And it fires at the worst possible instant BY CONSTRUCTION. The cut
+    /// that calls it only trips after the hand-off queue has been full for
+    /// `MAX_RETAINED_FLUSH_SPANS` consecutive flushes — that is, only when the
+    /// database is already not keeping up, which on this box means the disk is
+    /// already wedged. So the rescue did its single biggest write, on the
+    /// decoder thread, precisely when a write was slowest.
+    ///
+    /// That is the same coupling the 2026-08-25 tick split and the 2026-08-28
+    /// depth split were built to remove, one layer further in: a stalled drain
+    /// stops emptying the socket, the receive buffer fills, and Dhan — which
+    /// skips a slow consumer forward to "the latest available state" with no
+    /// sequence number — discards the intermediate ticks at THEIR side, where
+    /// no counter of ours can see them.
+    ///
+    /// So the buffer is now handed to a dedicated rescue thread by pointer.
+    /// The fallback is deliberately the OLD behaviour, never a drop: if the
+    /// rescue queue is full or its thread is gone, the write happens inline
+    /// exactly as before. A slow drain is bad; a lost tick is worse.
+    pub fn discard_pending(&mut self) -> usize {
+        let dropped = self.pending;
+        if dropped == 0 {
+            self.clear_staged_on_drain();
+            self.pending = 0;
+            return 0;
+        }
+
+        // Off-drain hand-off. O(1), no syscall, no allocation: the `Buffer` is
+        // MOVED, and the replacement is the same empty one `offload_flush`
+        // already installs on every successful hand-off.
+        // H4: older parked batches go to the thread first, so a freed slot is
+        // not taken by this newer one ahead of them.
+        self.retry_parked_rescue();
+        let range = self.take_pending_range();
+        let unbacked = std::mem::take(&mut self.pending_unbacked);
+        let mut rescue_unavailable = false;
+        if let Some(tx) = self.rescue.as_ref() {
+            // Z7 (2026-10-02): a queued batch is neither acked nor marked
+            // unapplied while the writer keeps acking LATER batches, so the
+            // PERSISTED watermark is held below it until the rescue thread
+            // has synced it (or failed and marked it). At most 8 CASes, no
+            // allocation, no lock; a full floor table marks the range
+            // unapplied instead (replay more).
+            let wm = crate::wal_applied_watermark::applied_watermark();
+            let floor = wm.hold_rescue_floor(
+                crate::wal_applied_watermark::AppliedSink::Ticks,
+                range.0,
+                range.1,
+            );
+            let batch = RescueBatch {
+                staged: std::mem::take(&mut self.staged),
+                rows: dropped,
+                min_seq: range.0,
+                max_seq: range.1,
+                unbacked,
+                floor,
+            };
+            match tx.try_send(batch) {
+                Ok(()) => {
+                    self.flush_counters.rescue_queued.increment(dropped as u64);
+                    // Counted like a writer hand-off, so a replay confirm waits
+                    // for the rescue thread too — a payload in THIS queue is
+                    // not yet in any file.
+                    wm.note_ticks_handed_off();
+                    self.pending = 0;
+                    self.install_spare_buffer();
+                    return dropped;
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    // H4 (2026-10-03): rows the WAL cannot defer (no capture
+                    // sequence, or a frame the WAL refused) would be written
+                    // to disk on the drain below. Park them in RAM instead
+                    // while the bound allows; the next flush retries. The
+                    // floor stays held, since the batch is still on its way.
+                    if (range.0 == 0 || unbacked) && self.park_rescue_fits(&returned) {
+                        self.park_rescue(returned);
+                        wm.note_ticks_handed_off();
+                        self.pending = 0;
+                        self.install_spare_buffer();
+                        return dropped;
+                    }
+                    // The rescue thread is behind. Take the buffer BACK and
+                    // write inline below — slower, but nothing is lost and
+                    // nothing is reported as lost.
+                    // The batch never reached the thread, so its floor is
+                    // retracted; the arms below mark or spill the range.
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
+                    self.staged = returned.staged;
+                    self.flush_counters.rescue_fallback_queue_full.increment(1);
+                    rescue_unavailable = true;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(returned)) => {
+                    if let Some(floor) = returned.floor {
+                        wm.release_rescue_floor(floor);
+                    }
+                    self.staged = returned.staged;
+                    self.flush_counters.rescue_fallback_thread_gone.increment(1);
+                    rescue_unavailable = true;
+                }
+            }
+        }
+
+        // 2026-09-26 audit fix PR3 — the drain never writes the spill file.
+        //
+        // Until this date a full rescue queue (or a gone rescue thread) fell
+        // back to `perform_tick_rescue` INLINE: a `statvfs` probe plus up to 32 MiB
+        // of file write on the frame-drain task, at exactly the moment the
+        // disk was slowest. Every row carrying a capture sequence is already
+        // in the capture-at-receipt WAL, so the rescue is handed to the WAL
+        // instead: the range is marked unapplied (the next replay re-offers
+        // it, and this boot will not archive it) and the buffer is dropped.
+        // O(1) apart from the bounded bucket marking; no syscall.
+        //
+        // Counted on the ALARMED `tv_ticks_dropped_total` as well as its own
+        // counter, because until the WAL replays them these rows are not in
+        // QuestDB — reporting less would be a false-OK. Rows WITHOUT a capture
+        // sequence (`range.0 == 0`) exist nowhere else, so they keep the
+        // inline spill: a slow drain is bad, a lost tick is worse.
+        //
+        // J1 (2026-10-26): "already in the WAL" was assumed, not checked. A
+        // record is queued for the WAL writer before it is written, and a
+        // writer with no segment or a failed `write_record` loses it with no
+        // shed bit set, so the rows were gone while the counters said
+        // "replayable". The deferral now needs the WAL to have flushed through
+        // `max_seq` and to have lost nothing at or above `min_seq`
+        // (`wal_frame_fate::rescue_may_defer_to_wal`, two relaxed loads);
+        // otherwise the rows take the inline spill below.
+        if rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked) {
+            // PF-4: a row an earlier encode of this batch refused (a failed
+            // synchronous flush) was already counted by the encoder; count the
+            // rest. Nothing is encoded here: the deferral writes no text.
+            let deferred = dropped.saturating_sub(self.staged.refused());
+            note_rescue_outcome_ticks(false, range, false);
+            note_ticks_not_landed(self.feed, deferred);
+            self.flush_counters
+                .append_dropped
+                .increment(deferred as u64);
+            self.flush_counters
+                .rescue_deferred_to_wal
+                .increment(deferred as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = self.feed.as_str(),
+                deferred = dropped,
+                min_seq = range.0,
+                max_seq = range.1,
+                source = RESCUE_DEFERRED_TO_WAL_SOURCE,
+                "tick flush failed and the rescue thread is busy — the rows were \
+                 handed to the write-ahead log for replay instead of being written \
+                 to disk on the tick task. They are NOT in QuestDB until the WAL \
+                 replays them."
+            );
+            self.clear_staged_on_drain();
+            self.pending = 0;
+            return dropped;
+        }
+
+        // Past the park's bound, a gone thread, or no rescue split at all:
+        // the drain's inline spill, NOT synced (see `spill_on_drain`). The
+        // batch is lent out and put back, so its capacity is kept.
+        let fate = crate::wal_applied_watermark::rescue_failure_fate(range.0, range.1, unbacked);
+        let mut staged = std::mem::take(&mut self.staged);
+        let landed = self.spill_on_drain(&mut staged, fate);
+        note_rescue_outcome_ticks(landed, range, false);
+        self.staged = staged;
+        self.clear_staged_on_drain();
         self.pending = 0;
         dropped
+    }
+}
+
+/// K4 (2026-10-26): reports `rows` that left the tick buffer without reaching
+/// QuestDB to the conservation ledger, at the same sites that increment
+/// `tv_ticks_dropped_total`. Only the Dhan writer reports. O(1).
+fn note_ticks_not_landed(feed: Feed, rows: usize) {
+    if feed == Feed::Dhan {
+        crate::tick_conservation_ledger::ledger().note_rows_not_landed(rows as u64);
+    }
+}
+
+/// A rescued payload is APPLIED from the WAL's point of view — the spill tier
+/// is durable and re-ingestable — and a failed rescue is the one arm where
+/// captured frames genuinely need the next replay.
+/// `in_order` is `true` ONLY on the writer thread, which completes batches in
+/// the order they were handed off. A rescue from the PRODUCER (inline
+/// fallback) or the rescue THREAD can land while earlier batches still sit in
+/// the writer's queue; acking its `max_seq` there would lift the watermark
+/// over rows that are in neither QuestDB nor a spill file — and a crash in
+/// that window (the 2026-09-02 OOM shape) would archive their segments
+/// unread next boot. Out of order, a landing acks nothing: those frames are
+/// re-replayed and collapse on DEDUP, which is the cheap direction.
+fn note_rescue_outcome_ticks(landed: bool, range: (u64, u64), in_order: bool) {
+    let wm = crate::wal_applied_watermark::applied_watermark();
+    if landed {
+        if in_order {
+            wm.note_ticks_acked(range.1);
+        }
+    } else {
+        wm.note_unapplied_range(range.0, range.1);
+        wm.note_unlanded();
+    }
+}
+
+/// The rescue write itself — the part that touches the disk.
+///
+/// Extracted 2026-08-28 so the SAME code serves both the dedicated rescue
+/// thread and the inline fallback in [`TickPersistenceWriter::discard_pending`].
+/// Two copies would have drifted, and the copy that drifted would have been the
+/// fallback — the one that only runs on the worst day.
+fn perform_tick_rescue(
+    spill_dir: &Path,
+    payload: &[u8],
+    feed: Feed,
+    dropped: usize,
+    sync: Option<SpillSyncFn>,
+    fate: &'static str,
+) -> bool {
+    let payload_len = payload.len();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    match spill_failed_ilp(spill_dir, payload, feed, now, sync) {
+        Ok(path) => {
+            // BOTH counters, and the alarmed one is not optional.
+            //
+            // `tv_ticks_dropped_total` is EMF-selected and carries the
+            // `dhan_ticks_dropped` alarm (`live-lane-alarms.tf`).
+            // `tv_ticks_spilled_total` carries NEITHER. Incrementing only the
+            // new name would have DIVERTED the common flush failure — the exact
+            // 2026-08-21 timeout — off the only pager that watches it, so the
+            // operator would have been told less than before the rescue
+            // existed. That is a false-OK (audit Rule 11), and a rescue that
+            // blinds the alarm is a worse outcome than the loss it prevents.
+            //
+            // The alarmed counter is also the SEMANTICALLY correct one here: it
+            // means "rows left the buffer without reaching QuestDB", which is
+            // TRUE of a rescued row — the file is on disk, the database does
+            // not have it. `spilled` is the strictly narrower fact "and it is
+            // recoverable", which is why it is a second increment rather than a
+            // replacement.
+            note_ticks_not_landed(feed, dropped);
+            metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            metrics::counter!("tv_ticks_spilled_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                rescued = dropped,
+                // §2.3x (2026-09-23): the pager filter excludes this source —
+                // the rows are on disk, so it is a degrade, not a loss.
+                source = RESCUED_TO_SPILL_SOURCE,
+                bytes = payload_len,
+                path = %path.display(),
+                "tick flush failed — the buffered rows were RESCUED to the tick \
+                 spill file named here, not lost. They are NOT in QuestDB yet. \
+                 Re-ingest is one command and is safe to repeat, because the \
+                 ticks dedup key carries capture_seq: \
+                 curl --data-binary @<path> http://<questdb>:9000/write"
+            );
+            true
+        }
+        Err(err) => {
+            // The rescue itself failed (disk full, cap reached, no
+            // permission). Fall back to the counted drop — a spill that
+            // cannot be written must never mask the loss.
+            note_ticks_not_landed(feed, dropped);
+            metrics::counter!("tv_ticks_dropped_total", "feed" => feed.as_str())
+                .increment(dropped as u64);
+            error!(
+                code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                feed = feed.as_str(),
+                dropped,
+                fate,
+                spill_error = %err,
+                "tick flush failed AND the spill rescue also failed — these ticks are in \
+                 neither QuestDB nor the spill. fate=deferred_to_wal_replay means the WAL \
+                 writer had already flushed their frames to the kernel, so the next \
+                 boot's replay re-inserts them unless the host crashes before the device \
+                 sync; fate=deferred_if_wal_flushes means they are re-inserted only if \
+                 the WAL writer flushes those frames (a rise in \
+                 tv_ws_frame_spill_unflushed_lost_total means some were not); fate=lost \
+                 means no write-ahead-log record backs them and they are gone."
+            );
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Off-drain RESCUE (2026-08-28)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the rescue thread.
+///
+/// TWO, and small on purpose. A rescue only happens when the flush queue has
+/// already been full for [`MAX_RETAINED_FLUSH_SPANS`] consecutive flushes, so
+/// this queue is not a buffer for a busy day — it is a place to put ONE
+/// oversized payload while the previous one is being written. Anything deeper
+/// would hold more rows in memory that exist nowhere else, which is the trade
+/// the whole rescue tier exists to avoid.
+pub const RESCUE_QUEUE_DEPTH: usize = 2;
+
+/// Rescue batches the drain may PARK in RAM when the rescue queue is full,
+/// instead of writing them to disk itself (H4, 2026-10-03).
+///
+/// Only rows the WAL cannot defer are parked (no capture sequence, or a frame
+/// the WAL refused); every other refused rescue is handed to the WAL as before.
+/// The trade, stated plainly: a parked batch exists only in this process
+/// until the rescue thread writes it, exactly like a batch in the queue
+/// above, so a CRASH loses it where the old inline write would have kept it.
+/// What the park buys is that a slow disk no longer stalls the drain, which is
+/// the stall that makes Dhan skip ticks at its own side, uncounted. Past
+/// either bound the drain writes inline exactly as before, counted on
+/// `tv_tick_rescue_inline_fallback_total`.
+pub const PARKED_RESCUE_MAX_BATCHES: usize = 8;
+// Deep audit DA-12 (2026-10-12): every WAL-backed batch queued, parked or
+// being written holds a rescue floor, so the floor table must cover them all
+// or the overflow is counted on `tv_wal_rescue_floor_full_total` in normal
+// operation (safe — the range replays — but not what the sizing claimed).
+const _: () = assert!(
+    // `<` rather than `+ 1 <=`: the one extra slot is the batch in flight.
+    RESCUE_QUEUE_DEPTH + PARKED_RESCUE_MAX_BATCHES
+        < crate::wal_applied_watermark::RESCUE_FLOOR_SLOTS,
+    "tick rescue queue + park + in-flight must fit the rescue floor table"
+);
+
+/// Row-SLOT bound on the park: four producer batches at their cut-over size
+/// (PF-4, 2026-11-06: the old 128 MiB TEXT bound, four producer buffers,
+/// restated in rows at the worst-case line; their text is still at most
+/// 4 × 32 MiB). ⚠ CORRECTED 2026-11-06 (review round 1): it is counted on
+/// each parked batch's CAPACITY, not its rows, since a parked batch holds its
+/// whole pre-touched allocation; 131,072 slots is eight pre-sized batches.
+/// Held only while the disk is slower than the drain.
+pub const PARKED_RESCUE_MAX_ROWS: usize = 4 * MAX_PRODUCER_ROWS;
+
+/// RAM the park may hold, in bytes: [`PARKED_RESCUE_MAX_ROWS`] staged row
+/// slots (PF-4: this was the 128 MiB of ILP text; the rows are now staged, so
+/// the bound is their RAM). 131,072 × 288 B = 36 MiB per sink, the real worst
+/// case since the park counts capacity (review round 1, 2026-11-06). ⚠ CHANGED
+/// 2026-11-17 (speed fix 6): a slot is a 96-byte staged row plus a 280-byte
+/// side row ([`STAGED_SLOT_BYTES`], both pre-touched), so the bound is
+/// 131,072 × 376 B = 47 MiB per sink, 11 MiB more than before. ⚠ CORRECTED
+/// 2026-11-17 (fix 6 review): a run of aux rows is one staged row, so an
+/// all-aux batch grows only its side rows; [`StagedBatch::capacity`] now
+/// reports the larger of the two stores, so such a batch is counted at its
+/// side rows' size and 47 MiB stays an upper bound (before the correction
+/// it read the rows alone and could hold about 84 MiB under it).
+pub const PARKED_RESCUE_MAX_BYTES: usize = PARKED_RESCUE_MAX_ROWS * STAGED_SLOT_BYTES;
+
+const _: () = assert!(
+    PARKED_RESCUE_MAX_ROWS * crate::tick_stage::MAX_ILP_LINE_BYTES <= 4 * MAX_PRODUCER_BUFFER_BYTES,
+    "the park's rows never encode to more text than the old 128 MiB bound"
+);
+
+/// Rows parked in RAM by the drain (H4). Not a loss counter: the matching
+/// `tv_tick_rescue_queued_total` increment comes when the park hands them on.
+pub const TICK_RESCUE_PARKED_COUNTER: &str = "tv_tick_rescue_parked_total";
+
+/// RAM the parked rescue batches hold right now, in bytes (H4). ⚠ CHANGED
+/// 2026-11-06 (PF-4): the parked rows are staged, not text, so this is their
+/// RAM (row slots, i.e. each batch's capacity, × [`STAGED_SLOT_BYTES`] since
+/// speed fix 6, 2026-11-17, was × the staged row size; review round 1
+/// corrected rows to capacity); before, it was their ILP text bytes.
+/// Same name; no alarm or filter reads it.
+pub const TICK_RESCUE_PARKED_BYTES_GAUGE: &str = "tv_tick_rescue_parked_bytes";
+
+/// Rows handed to the rescue thread rather than written on the drain.
+///
+/// NOT a loss counter. It says the rescue was queued; `tv_ticks_spilled_total`
+/// (incremented by the thread) says it landed. The gap between them is the
+/// window a crash would take, which is why the queue is two deep.
+pub const TICK_RESCUE_QUEUED_COUNTER: &str = "tv_tick_rescue_queued_total";
+
+/// Rescues that had to be written INLINE on the drain after all.
+///
+/// Non-zero means the drain took the stall this hand-off exists to remove —
+/// either the rescue thread was behind (`queue_full`) or it was gone
+/// (`thread_gone`). Not a loss: nothing is dropped on either arm.
+pub const TICK_RESCUE_INLINE_FALLBACK_COUNTER: &str = "tv_tick_rescue_inline_fallback_total";
+
+/// Rows a full rescue queue handed to the capture-at-receipt WAL rather than
+/// spilling inline on the drain (2026-09-26 audit fix PR3).
+pub const TICK_RESCUE_DEFERRED_TO_WAL_COUNTER: &str = "tv_tick_rescue_deferred_to_wal_total";
+
+/// `source` on the deferred-to-WAL ERROR line. Deliberately NOT the
+/// rescued-to-spill source the pager excludes: the rows are not on disk in
+/// any re-ingestable file until the WAL replays them.
+pub const RESCUE_DEFERRED_TO_WAL_SOURCE: &str = "rescue_deferred_to_wal";
+
+/// `tv_ticks_lost_total` source for parked rescue rows the shutdown could
+/// neither hand over nor write (audit K1). The same value the app's
+/// shutdown residue uses for the rescue thread's own abandoned rows.
+pub const SHUTDOWN_RESCUE_ABANDONED_SOURCE: &str = "rescue_abandoned";
+
+/// Total seconds the shutdown waits for the rescue thread to take the parked
+/// batches (audit K1). Fits inside the shutdown's offload grace (12 s) with
+/// room; past it the batches are written inline.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS: u64 = 2;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS`] as a `Duration`.
+pub const RESCUE_SHUTDOWN_HANDOFF_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(RESCUE_SHUTDOWN_HANDOFF_BUDGET_SECS);
+
+/// Milliseconds between hand-off attempts while the rescue queue is full.
+const RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS: u64 = 10;
+
+/// [`RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS`] as a `Duration`.
+const RESCUE_SHUTDOWN_HANDOFF_POLL: std::time::Duration =
+    std::time::Duration::from_millis(RESCUE_SHUTDOWN_HANDOFF_POLL_MILLIS);
+
+/// What [`hand_off_before`] did with one item.
+#[derive(Debug)]
+pub(crate) enum ShutdownHandOff<T> {
+    /// The thread's queue took it.
+    Sent,
+    /// The thread is gone; the item comes back.
+    Gone(T),
+    /// The queue stayed full until the deadline; the item comes back.
+    TimedOut(T),
+}
+
+/// Hands `item` to a bounded `std` channel, retrying while it is full, and
+/// gives it back at `deadline` (audit K1). Shutdown only: the wait is at most
+/// the time left to `deadline` plus one poll, never unbounded like `send`.
+pub(crate) fn hand_off_before<T>(
+    tx: &std::sync::mpsc::SyncSender<T>,
+    mut item: T,
+    deadline: std::time::Instant,
+) -> ShutdownHandOff<T> {
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return ShutdownHandOff::Sent,
+            Err(std::sync::mpsc::TrySendError::Disconnected(back)) => {
+                return ShutdownHandOff::Gone(back);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                if std::time::Instant::now() >= deadline {
+                    return ShutdownHandOff::TimedOut(back);
+                }
+                item = back;
+                // O(1) EXEMPT: shutdown only, bounded by `deadline`; never on the drain.
+                std::thread::sleep(RESCUE_SHUTDOWN_HANDOFF_POLL);
+            }
+        }
+    }
+}
+
+/// Rescue payloads abandoned because the rescue thread did not finish.
+///
+/// These rows were counted as rescued by the producer and never reached the
+/// spill file, so they are a REAL loss — the WAL-shutdown class, one tier out.
+pub const TICK_RESCUE_ABANDONED_COUNTER: &str = "tv_tick_rescue_abandoned_total";
+
+/// One oversized ILP payload on its way to the spill tier.
+///
+/// Carries the `Buffer` by move, so the hand-off costs a pointer write on the
+/// drain rather than a copy of up to [`MAX_PRODUCER_BUFFER_BYTES`].
+pub struct RescueBatch {
+    /// The rows, staged (PF-4); written as text by the rescue thread.
+    staged: StagedBatch,
+    rows: usize,
+    /// Lowest / highest `capture_seq` in this payload (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
+    /// This batch's hold on the persisted watermark (Z7); released by the
+    /// rescue thread once the write is synced or has failed and been marked.
+    /// An abandoned batch (shutdown) never releases it, so the final persist
+    /// keeps the range replayable.
+    floor: Option<crate::wal_applied_watermark::RescueFloor>,
+}
+
+impl RescueBatch {
+    /// Rows this payload carries — the number an abandoned batch loses.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Row slots this payload's batch holds (its capacity): the RAM it keeps
+    /// while parked, whatever its row count (review round 1, 2026-11-06).
+    fn slots(&self) -> usize {
+        self.staged.capacity()
+    }
+}
+
+/// The rescue thread's half: everything the write needs, and nothing else.
+///
+/// Deliberately owns no `Sender` and no `Buffer` — it cannot flush to QuestDB
+/// and it cannot be confused with [`TickWriterSink`]. Its only job is to turn
+/// a queued payload into a named file on disk.
+pub struct TickRescueSink {
+    spill_dir: PathBuf,
+    feed: Feed,
+    /// [`SPILL_SYNC_OFF_DRAIN`] in production; a test injects a failing sync.
+    spill_sync: Option<SpillSyncFn>,
+    /// Scratch the staged rows are written into before the spill (PF-4), in
+    /// the writer's encoder. Empty, with no allocation, until the first
+    /// rescue; a cell because the thread's `rescue` takes `&self`.
+    scratch: std::cell::RefCell<TickRowBuffer>,
+    /// The producer's spare lane (review round 1, 2026-11-06): a spent
+    /// batch is cleared here and handed back, so a QuestDB stall does not
+    /// make the drain reserve and pre-touch a fresh 4.5 MiB batch for every
+    /// rescue.
+    spare_return: Option<std::sync::mpsc::SyncSender<StagedBatch>>,
+}
+
+impl TickRescueSink {
+    /// Writes one queued payload to the spill tier.
+    ///
+    /// Identical code to the inline fallback — same counters, same coded
+    /// error, same one-command recovery text — because both call
+    /// [`perform_tick_rescue`]. An operator cannot tell which path ran, and
+    /// should not have to.
+    ///
+    /// PF-4 (2026-11-06): the batch holds staged rows, so this thread writes
+    /// their ILP text first (the unchanged write functions, the name tables
+    /// pinned on the drain). A row the encoder refuses is counted here, before
+    /// the floor below is released (owner decision 2026-11-06).
+    pub fn rescue(&self, batch: &RescueBatch) {
+        let mut scratch = self.scratch.borrow_mut();
+        scratch.clear();
+        let rows = batch.staged.encode_counted(self.feed, &mut scratch);
+        // Every row refused (each already counted): nothing left to spill.
+        let landed = rows == 0
+            || perform_tick_rescue(
+                &self.spill_dir,
+                scratch.as_bytes(),
+                self.feed,
+                rows,
+                self.spill_sync,
+                crate::wal_applied_watermark::rescue_failure_fate(
+                    batch.min_seq,
+                    batch.max_seq,
+                    batch.unbacked,
+                ),
+            );
+        scratch.clear();
+        drop(scratch);
+        note_rescue_outcome_ticks(landed, (batch.min_seq, batch.max_seq), false);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        // Released only now: the spill is synced (Z8a) or the range is marked
+        // unapplied, so the persisted watermark may pass the batch (Z7).
+        if let Some(floor) = batch.floor {
+            wm.release_rescue_floor(floor);
+        }
+        // The hand-off was counted when the producer queued this payload; the
+        // replay confirm waits for this completion like any writer batch.
+        wm.note_ticks_completed();
+    }
+
+    /// Hands a rescued payload's batch back to the producer for reuse
+    /// (review round 1, 2026-11-06). Call after [`Self::rescue`], on the
+    /// rescue thread.
+    ///
+    /// The batch is cleared HERE, so its name pins (and possibly the last
+    /// reference to a replaced name table) are dropped on this thread, never
+    /// on the drain. `try_send`, never a wait: a full lane, a gone producer or
+    /// a batch over [`MAX_PRODUCER_ROWS`] slots drops it here instead, still
+    /// off the drain. O(1) apart from that drop.
+    pub fn recycle(&self, batch: RescueBatch) {
+        let mut spent = batch.staged;
+        spent.clear();
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        if spent.capacity() > MAX_PRODUCER_ROWS {
+            return;
+        }
+        // Full or disconnected: dropped here, on this thread.
+        let _dropped_if_refused = spare_return.try_send(spent);
+    }
+}
+// ---------------------------------------------------------------------------
+// Off-drain flush (2026-08-25)
+// ---------------------------------------------------------------------------
+
+/// Depth of the hand-off queue between the drain and the writer thread.
+///
+/// FOUR, not "large". The queue is a shock absorber for a QuestDB hiccup that
+/// is SHORTER than the flush cadence, not a place to store data: every batch
+/// sitting in it is rows that exist only in this process's memory, so a deep
+/// queue converts a database stall into a bigger crash-loss window while
+/// making the operator's counters look calmer. At the 500 ms flush timer this
+/// absorbs ~2 s of stall, which is the class of blip the drain used to eat
+/// synchronously; anything longer SHOULD show up as backpressure, because it
+/// is one.
+pub const FLUSH_QUEUE_DEPTH: usize = 4;
+
+/// How much un-handed-off ILP text the PRODUCER may hold before it rescues.
+///
+/// When the queue is full the drain keeps its buffer and keeps appending —
+/// that is the whole point, the rows are not lost and not reported as lost.
+/// But "keep appending forever" is an unbounded memory path, and this file
+/// exists in a repo whose complexity table has now recorded five uncapped
+/// maps. So past this ceiling the producer stops accumulating and rescues to
+/// the spill tier, which is durable, counted, and re-ingestable — the same
+/// tier a failed flush uses.
+///
+/// This is the SECONDARY bound. [`MAX_RETAINED_FLUSH_SPANS`] is the primary
+/// one and cuts far earlier; this exists so a pathological append rate cannot
+/// reach the wedge below even inside two spans.
+///
+/// 32 MiB and not 64: the first draft used 64, and the const assertion below
+/// REFUSED TO COMPILE, which is the assertion doing its job. With a batch
+/// already in flight toward a client whose buffer wedges permanently at
+/// 100 MiB, a 64 MiB producer ceiling leaves no real headroom.
+pub const MAX_PRODUCER_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
+/// Bytes every tick row buffer is reserved with up front (plan item K6,
+/// 2026-10-26).
+///
+/// A row buffer used to start at zero capacity: the first batch of the
+/// process, and every batch whose flush found no spare waiting, regrew it by
+/// doubling, one reallocation each time the rows crossed a power of two. Each
+/// of those landed inside the frame whose append crossed it, so on the frame
+/// drain. MEASURED 2026-10-26 (`feed_drain` bench, 1,024 four-tick frames per
+/// buffer, this container): 11 reallocations per buffer, the last one a 1 MiB
+/// copy that took 0.27 to 0.35 ms inside one frame; 3 to 26 % of the frames at
+/// or above the p99 were one of them.
+///
+/// 2 MiB holds about 15,000 rows at the measured ~133 bytes a row, so a
+/// 500 ms flush at up to about 30,000 ticks a second never regrows. A busier
+/// batch still grows past it, by doubling, as before, and is then recycled
+/// at its larger size (`install_spare_buffer`). SPACE: one buffer in the
+/// producer, at most [`FLUSH_QUEUE_DEPTH`] queued and as many spares, so at
+/// most 9 × 2 MiB reserved; pages are committed only as rows are written.
+pub const TICK_ROW_BUFFER_PRESIZE_BYTES: usize = 2 * 1024 * 1024;
+
+const _: () = assert!(
+    TICK_ROW_BUFFER_PRESIZE_BYTES <= MAX_PRODUCER_BUFFER_BYTES,
+    "a pre-sized buffer must be one the spare lane will take back"
+);
+
+/// An empty row buffer for `encoder` (protocol version 1), with [`TICK_ROW_BUFFER_PRESIZE_BYTES`]
+/// reserved. One allocation, at construction or on a flush arm; never per
+/// tick.
+fn presized_row_buffer(encoder: TickIlpEncoder) -> TickRowBuffer {
+    let mut buffer = TickRowBuffer::new(encoder);
+    buffer.reserve(TICK_ROW_BUFFER_PRESIZE_BYTES);
+    buffer
+}
+
+/// The questdb-rs client buffer ceiling. Past it EVERY flush fails, permanently
+/// — a wedge, not a degrade, which is why the producer must cut well below it.
+///
+/// Named here rather than left implicit because the two sibling writers
+/// (`seal_writer_task.rs`, `shadow_candle_writer.rs`) both document this cliff
+/// in prose and neither asserts against it. A number that only exists in a
+/// comment is a number nothing checks.
+pub const QUESTDB_MAX_BUF_SIZE_BYTES: usize = 100 * 1024 * 1024;
+
+// The producer ceiling must leave real headroom under the wedge, or the
+// "rescue instead of accumulate" arm fires only after every flush is already
+// permanently failing — which would make the rescue path unreachable exactly
+// when it is needed.
+const _: () = assert!(
+    MAX_PRODUCER_BUFFER_BYTES * 2 <= QUESTDB_MAX_BUF_SIZE_BYTES,
+    "the producer ceiling must sit at or below half the questdb-rs max_buf_size wedge"
+);
+
+/// How many consecutive 500 ms flush spans the producer may RETAIN before it
+/// stops accumulating and spills.
+///
+/// # This is the condition the measurement made load-bearing
+///
+/// A design pass on 2026-08-25 flagged an own-goal that the obvious version of
+/// this change walks straight into: a decoupled writer batches more
+/// aggressively under pressure, so each commit spans a WIDER range of rows —
+/// and wider commits are exactly what the write amplification is made of. The
+/// same change is therefore beneficial or harmful depending on which amplifier
+/// is real, and the design bound the implementing PR to cap batch width "at
+/// today's 500 ms span" until that was measured.
+///
+/// It was then measured on the live box: `ticks` is `PARTITION BY HOUR` on the
+/// exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+/// `ts` more than an hour behind arrival** — legitimately, because for an
+/// illiquid strike the last trade genuinely was hours ago. So one commit in ten
+/// reopens an already-closed hourly partition and REWRITES it. Commit width is
+/// the amplifier. Unbounded accumulation would have made the disk problem this
+/// change exists to relieve measurably worse.
+///
+/// TWO, not one: the queue already absorbs `FLUSH_QUEUE_DEPTH` batches before
+/// the producer ever sees a full queue, so the honest absorption is that depth
+/// plus this, and a cap of one would spill on the first hiccup. Two keeps the
+/// widest possible commit to roughly three flush spans rather than the ~128
+/// that the byte ceiling alone would have permitted at a typical row size.
+pub const MAX_RETAINED_FLUSH_SPANS: u32 = 2;
+
+/// One handed-off ILP payload, in flight between the drain and the writer.
+///
+/// Deliberately opaque: the drain must not be able to inspect, re-order, or
+/// partially consume a batch, because the only correct thing to do with it is
+/// hand it to the network or rescue the whole thing to disk.
+pub struct FlushBatch {
+    /// The rows, staged (PF-4); written as text by the writer thread.
+    staged: StagedBatch,
+    rows: usize,
+    /// Lowest / highest `capture_seq` in this batch (`0` = unknown).
+    min_seq: u64,
+    max_seq: u64,
+    /// `true` when some row has no WAL record behind it (DB-8: decides the
+    /// `fate` a failed rescue reports).
+    unbacked: bool,
+}
+
+impl FlushBatch {
+    /// Rows this batch covers.
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the offload tests below.
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// `true` when some row has no WAL record behind it, so the batch cannot
+    /// be replayed if it is lost (plan item J2: the shutdown join counts such
+    /// rows as lost when it abandons the writer thread).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+
+    /// The batch's ILP text, exactly as the writer thread will write it for
+    /// `feed` (either encoder writes the same bytes). Read-only; lets a test
+    /// compare the rows two paths produced (plan item M5: a packet's
+    /// `tick_quotes` row must be byte-identical live and on replay).
+    ///
+    /// TESTS AND DIAGNOSTICS ONLY (PF-4, 2026-11-06): the batch holds staged
+    /// rows, so this writes a fresh copy of their text and allocates it. It
+    /// is `pub` because the app's tests call it across the crate boundary;
+    /// `pf4_encode_for_test_has_no_production_caller` pins that nothing in
+    /// production does. Counts nothing.
+    #[must_use]
+    pub fn encode_ilp_for_test(&self, feed: Feed) -> Vec<u8> {
+        self.staged.encode_readonly(feed, TickIlpEncoder::Library)
+    }
+
+    /// [`Self::encode_ilp_for_test`] in a chosen encoder, so a test can
+    /// write a batch exactly as a writer of THAT encoder would (the golden
+    /// test runs both). Tests only.
+    #[cfg(test)]
+    pub(crate) fn encode_ilp_with_for_test(&self, feed: Feed, encoder: TickIlpEncoder) -> Vec<u8> {
+        self.staged.encode_readonly(feed, encoder)
+    }
+}
+
+impl RescueBatch {
+    /// `true` when some row has no WAL record behind it (plan item J2, the
+    /// rescue twin of [`FlushBatch::has_unbacked_rows`]).
+    #[must_use]
+    // TEST-EXEMPT: accessor, exercised by the app's shutdown-residue tests.
+    pub const fn has_unbacked_rows(&self) -> bool {
+        self.unbacked
+    }
+}
+
+/// What happened to a batch the producer tried to hand off.
+///
+/// Three arms and not a `Result`, because the middle one is NOT a failure and
+/// must never be logged or counted as one: a full queue means the rows are
+/// still held, still pending, and will go out on the next flush. Collapsing it
+/// into `Err` is precisely how a backpressure signal becomes a false loss
+/// report.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OffloadOutcome {
+    /// Handed to the writer thread. The rows are no longer this side's.
+    Sent(usize),
+    /// The writer is behind. Rows RETAINED by the producer, nothing lost.
+    QueueFull(usize),
+    /// The writer stayed behind long enough that retaining further would
+    /// WIDEN the commit past [`MAX_RETAINED_FLUSH_SPANS`]. Rows rescued to the
+    /// spill tier rather than accumulated.
+    ///
+    /// Its own arm and not `SinkGone`, because the writer is alive and well —
+    /// reporting "the writer thread is gone" here would send an operator to
+    /// diagnose a thread that is running fine.
+    WidthCapped(usize),
+    /// The writer thread is gone. Rows rescued to the spill tier.
+    SinkGone(usize),
+}
+
+/// Flush-path counter handles for the PRODUCER half, resolved once per writer
+/// (2026-09-22, item 44g).
+///
+/// Same mechanism as [`OutOfWindowCounters`]: a `feed` label taken from a
+/// variable drops the `metrics!` macro to its allocating arm (a fresh label
+/// vector plus a registry probe per call). The hand-off counter fired on EVERY
+/// flush, on the drain task, so it paid that cost ~twice a second per feed for
+/// nothing. Names and labels are exactly the ones the call sites used before.
+#[derive(Debug, Clone)]
+struct TickFlushCounters {
+    offloaded: metrics::Counter,
+    queue_full: metrics::Counter,
+    width_capped: metrics::Counter,
+    rescue_queued: metrics::Counter,
+    rescue_fallback_queue_full: metrics::Counter,
+    rescue_fallback_thread_gone: metrics::Counter,
+    /// Rows parked in RAM by the drain (H4).
+    rescue_parked: metrics::Counter,
+    /// RAM the park holds right now (H4; PF-4: staged rows, was text bytes).
+    rescue_parked_bytes: metrics::Gauge,
+    /// `tv_ticks_dropped_total` on the ILP-append failure arm. Its seed stays
+    /// in [`register_drop_baseline`]; this is the same series, pre-resolved.
+    append_dropped: metrics::Counter,
+    /// Rows handed to the capture-at-receipt WAL instead of an inline spill
+    /// write on the drain (2026-09-26 audit fix PR3).
+    rescue_deferred_to_wal: metrics::Counter,
+    /// Append failures seen by this writer. Drives the power-of-two log
+    /// throttle only — every failure is still counted on `append_dropped`.
+    append_failures: u64,
+    /// Pushes past the staged batch's pre-size (PF-4): one reallocation
+    /// each, on the drain, cold. Expected to stay near zero.
+    stage_grow: metrics::Counter,
+    /// Batches handed off early because a ninth contract-name table arrived
+    /// inside them (PF-4). Expected to stay at zero.
+    stage_pin_cut: metrics::Counter,
+    /// Hand-offs that found no spare batch waiting (or a smaller one) and
+    /// reserved and touched a fresh pre-sized batch on the drain
+    /// (2026-11-16, `tv_tick_stage_presize_fresh_total`, local `/metrics`
+    /// only). One relaxed add on that branch only.
+    stage_presize_fresh: metrics::Counter,
+    /// The same count kept on the writer, so a test can read it without a
+    /// recorder.
+    stage_presize_fresh_count: u64,
+}
+
+impl TickFlushCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            offloaded: metrics::counter!("tv_tick_flush_offloaded_total", "feed" => feed),
+            queue_full: metrics::counter!("tv_tick_flush_queue_full_total", "feed" => feed),
+            width_capped: metrics::counter!("tv_tick_flush_width_capped_total", "feed" => feed),
+            rescue_queued: metrics::counter!(TICK_RESCUE_QUEUED_COUNTER, "feed" => feed),
+            rescue_fallback_queue_full: metrics::counter!(
+                TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "queue_full"
+            ),
+            rescue_fallback_thread_gone: metrics::counter!(
+                TICK_RESCUE_INLINE_FALLBACK_COUNTER,
+                "feed" => feed,
+                "reason" => "thread_gone"
+            ),
+            rescue_parked: metrics::counter!(TICK_RESCUE_PARKED_COUNTER, "feed" => feed),
+            rescue_parked_bytes: metrics::gauge!(TICK_RESCUE_PARKED_BYTES_GAUGE, "feed" => feed),
+            append_dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+            // Literal, not the const, so the shipped-metrics guard can see it.
+            rescue_deferred_to_wal: metrics::counter!(
+                "tv_tick_rescue_deferred_to_wal_total",
+                "feed" => feed
+            ),
+            append_failures: 0,
+            stage_grow: {
+                let c = metrics::counter!("tv_tick_stage_grow_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_pin_cut: {
+                let c = metrics::counter!("tv_tick_stage_pin_cut_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            // Registered at 0 when the writer is built (boot), so "never
+            // reserved fresh" reads 0 rather than absent.
+            stage_presize_fresh: {
+                let c = metrics::counter!("tv_tick_stage_presize_fresh_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+            stage_presize_fresh_count: 0,
+        }
+    }
+}
+
+/// Rescue-arm counter handles for the writer-thread half (item 44g). The
+/// `dropped == spilled` pair keeps its meaning: both are incremented together
+/// on a landed rescue, `dropped` alone on a failed one.
+#[derive(Debug, Clone)]
+struct TickSinkCounters {
+    dropped: metrics::Counter,
+    spilled: metrics::Counter,
+    /// Batches whose encoded text reached the 32 MiB ceiling and were
+    /// spilled instead of POSTed (PF-4). Expected to stay at zero.
+    encoded_over_ceiling: metrics::Counter,
+}
+
+impl TickSinkCounters {
+    fn new(feed: Feed) -> Self {
+        let feed = feed.as_str();
+        Self {
+            dropped: metrics::counter!("tv_ticks_dropped_total", "feed" => feed),
+            spilled: metrics::counter!("tv_ticks_spilled_total", "feed" => feed),
+            encoded_over_ceiling: {
+                let c = metrics::counter!("tv_tick_encoded_over_ceiling_total", "feed" => feed);
+                c.increment(0);
+                c
+            },
+        }
+    }
+}
+
+/// The network half of a split [`TickWriter`] — owns the ILP `Sender`.
+///
+/// Lives on its own OS thread. It never touches the aggregator, the ring, or
+/// anything the drain owns, which is the entire reason the split exists: a
+/// five-second ILP timeout now blocks a thread whose only job is waiting, not
+/// the thread that must keep emptying the socket.
+pub struct TickWriterSink {
+    sender: Option<TickIlpSender>,
+    feed: Feed,
+    spill_dir: PathBuf,
+    /// Return lane for spent batches — see [`TickWriterSink::return_spare_buffer`].
+    spare_return: Option<std::sync::mpsc::SyncSender<StagedBatch>>,
+    /// Rescue-arm counter handles, resolved once at the split (item 44g).
+    counters: TickSinkCounters,
+    /// The text each batch is written into before it is sent or spilled
+    /// (PF-4), in the writer's encoder, reserved once at the split.
+    encode_buf: TickRowBuffer,
+    /// The producer's live table gate, copied at the split (B1).
+    table_gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool,
+}
+
+impl TickWriterSink {
+    /// Writes one batch. Returns the rows that actually LANDED in QuestDB.
+    ///
+    /// Zero on any failure — the same contract `TickWriter::flush` has, and
+    /// for the same reason: the caller reports feed health from this number,
+    /// so a failed write must decay health rather than forge it.
+    ///
+    /// A failure rescues the payload to the spill tier through the identical
+    /// path `discard_pending` uses (same two counters, same coded error, same
+    /// one-command recovery), so an operator sees no difference between a
+    /// synchronous and an offloaded rescue.
+    pub fn write(&mut self, batch: &mut FlushBatch) -> usize {
+        let landed = self.write_inner(batch);
+        // The batch is DONE — landed or rescued — whatever the outcome. This
+        // is what the replay confirm waits on, and the watermark file is
+        // refreshed from here at most once a second, off the drain.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        wm.note_ticks_completed();
+        wm.persist_if_due_now();
+        // Item 45a: ticks are never shed, so this writer keeps the shed-depth
+        // marks persisted even while every depth write is shed.
+        crate::wal_deferred_depth::deferred_depth().persist_if_due_now();
+        // PR AA finding 2 recheck: the wall-clock step window, when it changed.
+        crate::wal_clock_step::persist_clock_step_log_if_dirty();
+        self.return_spare_buffer(batch);
+        landed
+    }
+
+    /// Hands the batch's spent buffer back to the producer for reuse
+    /// (2026-09-22, item 44g). Called by [`TickWriterSink::write`] once the
+    /// batch is done; `pub` only so the zero-allocation gate can drive the
+    /// return lane without a live QuestDB.
+    ///
+    /// Three refusals, each of which DROPS the buffer and never waits:
+    /// - capacity above [`MAX_PRODUCER_ROWS`] rows (PF-4: was
+    ///   [`MAX_PRODUCER_BUFFER_BYTES`] of text) — a burst-sized batch kept as
+    ///   a spare would pin that memory for the session;
+    /// - the return lane is full — the producer already has spares;
+    /// - the producer is gone — nobody to return to.
+    ///
+    /// The buffer is cleared before it leaves, so a spare can never carry a
+    /// row into the next batch.
+    pub fn return_spare_buffer(&self, batch: &mut FlushBatch) {
+        let Some(spare_return) = self.spare_return.as_ref() else {
+            return;
+        };
+        // `StagedBatch::new` does not allocate (its `Vec` starts empty).
+        let mut spent = std::mem::take(&mut batch.staged);
+        if spent.capacity() > MAX_PRODUCER_ROWS {
+            return;
+        }
+        // Clears the rows AND releases the name pins, here on the writer
+        // thread, never on the drain.
+        spent.clear();
+        // Full or disconnected: the buffer is dropped here, never waited on.
+        let _dropped_if_refused = spare_return.try_send(spent);
+    }
+
+    fn write_inner(&mut self, batch: &mut FlushBatch) -> usize {
+        if batch.rows == 0 {
+            return 0;
+        }
+        // PF-4 (2026-11-06): the batch is staged rows. Write their ILP text
+        // here, on this thread, with the unchanged write functions and the
+        // name tables pinned on the drain. A row the encoder refuses is
+        // counted here BEFORE this batch is acknowledged below (owner
+        // decision 2026-11-06); `rows` becomes the rows written.
+        self.encode_buf.clear();
+        // B1 review 2 (2026-11-13): the `ticks` rows and the
+        // `feed_aux_packets` rows are judged on their own tables; B1 review 3:
+        // so are the `tick_quotes` rows. Before, one gate covered them, so an
+        // auxiliary table that could not be keyed held every live tick out of
+        // QuestDB for the whole session. Each held table's rows are set aside
+        // to their OWN spill file, so a file the replay holds for that table
+        // never holds tick rows behind it. Three gate reads per batch.
+        let gated = self.sender.is_some();
+        let keyed = |gate: fn(&[GatedTable]) -> bool, table: GatedTable| !gated || gate(&[table]);
+        let main_keyed = keyed(self.table_gate, GatedTable::Ticks);
+        let held = [GatedTable::TickQuotes, GatedTable::FeedAuxPackets]
+            .map(|t| (t, !keyed(self.table_gate, t)));
+        batch.rows = if main_keyed && held.iter().any(|(_, h)| *h) {
+            for (table, is_held) in held {
+                if !is_held {
+                    continue;
+                }
+                crate::ilp_table_gate::note_live_batch_held(table.name());
+                self.encode_buf.clear();
+                let rows = batch
+                    .staged
+                    .encode_tables_into(self.feed, &mut self.encode_buf, |t| t == table);
+                self.set_aside_rows(batch, rows, table);
+            }
+            self.encode_buf.clear();
+            batch
+                .staged
+                .encode_tables_into(self.feed, &mut self.encode_buf, |t| {
+                    !held.iter().any(|(h, is_held)| *is_held && *h == t)
+                })
+        } else {
+            batch.staged.encode_into(self.feed, &mut self.encode_buf)
+        };
+        if batch.rows == 0 {
+            // Every row refused, each already counted and marked unapplied:
+            // the batch is done, exactly as an append failure on the drain was.
+            crate::wal_applied_watermark::applied_watermark().note_ticks_acked(batch.max_seq);
+            return 0;
+        }
+        if self.encode_buf.len() >= MAX_PRODUCER_BUFFER_BYTES {
+            // Over the text ceiling (only reachable if the row cut and the
+            // line bound were wrong): spilled, never POSTed toward the
+            // questdb-rs wedge.
+            self.counters.encoded_over_ceiling.increment(1);
+            self.rescue(batch, "encoded batch over the 32 MiB text ceiling");
+            return 0;
+        }
+        // B1 (2026-11-13): not into a table this process has not keyed.
+        if !main_keyed {
+            crate::ilp_table_gate::note_live_batch_held("ticks");
+            self.rescue(batch, "table not keyed yet (boot DDL refused)");
+            return 0;
+        }
+        let Some(sender) = self.sender.as_mut() else {
+            self.rescue(batch, "no ILP sender (QuestDB unreachable)");
+            return 0;
+        };
+        // 2026-09-03: a bounded retry, the shape `DepthWriter` has carried on
+        // its synchronous path since 2026-08-25. The TICK path has never had
+        // one — on either path — and the measured cost of that is the largest
+        // single loss signal in the session.
+        //
+        // MEASURED 2026-09-03: `HOT-PATH-02` fired **58,746 times**, every one
+        // reading `Could not flush buffer: ... io: Connection reset by peer
+        // (os error 104)`. Each rescued ~120 rows to the spill tier, so the
+        // great majority of the session's ticks are sitting in files on disk
+        // rather than in QuestDB — `SELECT count() FROM ticks WHERE ts IN
+        // today()` read 2,310,693 against roughly 82M ingested. Nothing was
+        // LOST; almost nothing was QUERYABLE.
+        //
+        // A reset is the transport class the buffer survives: the rows are
+        // still in `self.encode_buf` (which is exactly why `rescue` below can
+        // spill them), so a second attempt sends the same bytes.
+        //
+        // Retrying is idempotent BY CONSTRUCTION, which is what makes one
+        // attempt safe rather than merely cheap: `DEDUP_KEY_TICKS` carries
+        // `capture_seq`, unique per received frame. The rescue message three
+        // dozen lines below says so in the operator's own words — "safe to
+        // repeat, because the ticks dedup key carries capture_seq". If it is
+        // safe for the operator to re-send by hand, it is safe for us to
+        // re-send once automatically.
+        //
+        // Bounded at ONE, and gated on the first failure being FAST.
+        // `request_timeout` is 5,000 ms, so an unconditional retry makes the
+        // worst case ten seconds. This thread is not the drain — that is the
+        // whole point of the split — so a stall here does not fill the socket
+        // buffer directly. It fills the hand-off QUEUE instead, and a full
+        // queue makes the producer rescue rows the retry existed to save. A
+        // reset returns in microseconds; a timeout consumes the whole budget.
+        let started = std::time::Instant::now();
+        let first = sender.flush(&mut self.encode_buf);
+        let first_elapsed = started.elapsed();
+        let outcome = match first {
+            Ok(()) => Ok(()),
+            Err(err)
+                if err.is_retryable()
+                    && first_elapsed
+                        < crate::depth_persistence::DEPTH_FLUSH_RETRY_FAST_FAILURE_WINDOW =>
+            {
+                metrics::counter!(
+                    "tv_tick_flush_retries_total",
+                    "feed" => self.feed.as_str(),
+                )
+                .increment(1);
+                sender.flush(&mut self.encode_buf)
+            }
+            Err(err) => {
+                if err.is_retryable() {
+                    // Retryable in class but SLOW: not retried, and counted so
+                    // "the retry is not firing" is answerable without a guess.
+                    metrics::counter!(
+                        "tv_tick_flush_retries_skipped_total",
+                        "feed" => self.feed.as_str(),
+                    )
+                    .increment(1);
+                }
+                Err(err)
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                let landed = batch.rows;
+                batch.rows = 0;
+                self.encode_buf.clear();
+                // ACKED by QuestDB: every captured frame up to this sequence
+                // has its rows in the database.
+                crate::wal_applied_watermark::applied_watermark().note_ticks_acked(batch.max_seq);
+                landed
+            }
+            Err(err) => {
+                let why = format!("{err}"); // APPROVED: rescue arm after a flush already failed, never per row
+                self.rescue(batch, &why);
+                0
+            }
+        }
+    }
+
+    /// Sets the `table` rows of a batch aside to the spill while that table
+    /// alone is not keyed (B1 review 2, for `feed_aux_packets`; B1 review 3,
+    /// for `tick_quotes` too); `encode_buf` holds their text. The batch's
+    /// tick rows are posted after this. The rows go to the table's OWN file
+    /// ([`held_spill_prefix`]), never the tick rescue file: the spill replay
+    /// holds a file from its first row for a table not yet keyed, so a held
+    /// row in the tick file kept every tick rescued later that hour out of
+    /// QuestDB too (B1 review 3). On a spill failure the batch's frame range
+    /// is marked unapplied so the WAL replay re-reads it (the ticks it
+    /// re-folds land again, deduplicated by `capture_seq`). Counted as a
+    /// rescue (`tv_ticks_dropped_total` and `tv_ticks_spilled_total`); logged
+    /// once per process (`note_live_batch_held`), not per batch, since an
+    /// un-keyable table would set rows aside on every flush. Cold.
+    fn set_aside_rows(&mut self, batch: &FlushBatch, aux_rows: usize, table: GatedTable) {
+        if aux_rows == 0 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        let spec = IlpSpillSpec {
+            file_prefix: held_spill_prefix(table),
+            ..tick_spill_spec(&self.spill_dir, self.feed)
+        };
+        let spilled =
+            spill_failed_ilp_to(&spec, self.encode_buf.as_bytes(), now, SPILL_SYNC_OFF_DRAIN);
+        note_ticks_not_landed(self.feed, aux_rows);
+        self.counters.dropped.increment(aux_rows as u64);
+        match spilled {
+            Ok(path) => {
+                self.counters.spilled.increment(aux_rows as u64);
+                tracing::debug!(
+                    feed = self.feed.as_str(),
+                    rows = aux_rows,
+                    table = table.name(),
+                    path = %path.display(),
+                    "rows set aside to their own tick spill file (table not keyed)"
+                );
+            }
+            Err(err) => {
+                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = aux_rows,
+                    table = table.name(),
+                    reason = "table not keyed; spill failed",
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.max_seq,
+                        batch.unbacked,
+                    ),
+                    spill_error = %err,
+                    "rows could not be set aside to the spill while their table is not \
+                     keyed; their frames are marked for the WAL replay \
+                     (fate=lost means no write-ahead-log record backs them)"
+                );
+            }
+        }
+    }
+
+    /// Rescues a batch the network refused, exactly as `discard_pending` does.
+    fn rescue(&mut self, batch: &mut FlushBatch, why: &str) {
+        let rows = batch.rows;
+        if rows == 0 {
+            return;
+        }
+        let payload_len = self.encode_buf.as_bytes().len();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        match spill_failed_ilp(
+            &self.spill_dir,
+            self.encode_buf.as_bytes(),
+            self.feed,
+            now,
+            SPILL_SYNC_OFF_DRAIN,
+        ) {
+            Ok(path) => {
+                note_rescue_outcome_ticks(true, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
+                self.counters.dropped.increment(rows as u64);
+                self.counters.spilled.increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    rescued = rows,
+                    source = RESCUED_TO_SPILL_SOURCE,
+                    bytes = payload_len,
+                    reason = why,
+                    path = %path.display(),
+                    "offloaded tick flush failed — the rows were RESCUED to the tick \
+                     spill file named here, not lost. They are NOT in QuestDB yet. \
+                     Re-ingest is one command and is safe to repeat, because the \
+                     ticks dedup key carries capture_seq: \
+                     curl --data-binary @<path> http://<questdb>:9000/write"
+                );
+            }
+            Err(err) => {
+                note_rescue_outcome_ticks(false, (batch.min_seq, batch.max_seq), true);
+                note_ticks_not_landed(self.feed, rows);
+                self.counters.dropped.increment(rows as u64);
+                error!(
+                    code = ErrorCode::HotPath02WriterQueueDrop.code_str(),
+                    feed = self.feed.as_str(),
+                    dropped = rows,
+                    reason = why,
+                    fate = crate::wal_applied_watermark::rescue_failure_fate(
+                        batch.min_seq,
+                        batch.max_seq,
+                        batch.unbacked,
+                    ),
+                    min_seq = batch.min_seq,
+                    max_seq = batch.max_seq,
+                    spill_error = %err,
+                    "offloaded tick flush failed AND the spill rescue also failed — these \
+                     ticks are in neither QuestDB nor the spill. fate=deferred_to_wal_replay \
+                     means the WAL writer had already flushed their frames to the kernel, \
+                     so the next boot's replay re-inserts them unless the host crashes \
+                     before the device sync; fate=deferred_if_wal_flushes means they are \
+                     re-inserted only if the WAL writer flushes those frames (a rise in \
+                     tv_ws_frame_spill_unflushed_lost_total means some were not); \
+                     fate=lost means no write-ahead-log record backs them and they are gone."
+                );
+            }
+        }
+        self.encode_buf.clear();
+        batch.rows = 0;
     }
 }
 
@@ -836,6 +5468,215 @@ impl TickWriter {
 
 #[cfg(test)]
 mod tests {
+    use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
+    // ---- J1 (2026-10-26): the deferral needs the WAL to have the frames ----
+
+    /// The WAL flushed everything and lost nothing: deferral as before.
+    fn wal_has_it(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, u64::MAX, 0)
+    }
+
+    /// The WAL writer has flushed nothing yet.
+    fn wal_not_flushed(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(min_seq, max_seq, unbacked, 0, 0)
+    }
+
+    /// The WAL writer lost a record at the batch's oldest frame.
+    fn wal_lost_one(min_seq: u64, max_seq: u64, unbacked: bool) -> bool {
+        crate::wal_frame_fate::rescue_may_defer_to_wal_at(
+            min_seq,
+            max_seq,
+            unbacked,
+            u64::MAX,
+            min_seq,
+        )
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_has_not_flushed_the_rows() {
+        let dir = scratch_dir("j1-not-flushed");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_not_flushed);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // thread gone -> the fallback arms
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "unflushed WAL frames -> inline spill, not a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn j1_rescue_spills_inline_when_the_wal_lost_a_record_in_the_batch() {
+        let dir = scratch_dir("j1-lost");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_lost_one);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx);
+        w.append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let files = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            files, 1,
+            "a lost WAL record -> inline spill, never a deferral"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Production wiring: every constructor uses the real WAL check.
+    #[test]
+    fn j1_every_tick_constructor_wires_the_real_wal_defer_check() {
+        let source = include_str!("tick_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert_eq!(
+            prod.matches("wal_defer_check: crate::wal_frame_fate::rescue_may_defer_to_wal,")
+                .count(),
+            prod.matches("pending_unbacked: false,").count(),
+            "each constructor sets the real check"
+        );
+        assert!(
+            prod.contains(
+                "rescue_unavailable && (self.wal_defer_check)(range.0, range.1, unbacked)"
+            )
+        );
+    }
+
+    // ---- Audit DB-8 (2026-10-11): a failed rescue names its real fate ----
+
+    /// A row's sequence: frame base `b`, packet index `i`.
+    fn row_seq(b: u64, i: u64) -> u64 {
+        (b << crate::ws_frame_spill::PACKET_INDEX_BITS) | i
+    }
+
+    #[test]
+    fn test_rescue_failure_fate_flushed_backed_range_is_deferred() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        // The WAL flushed through frame 10; the batch ends at frame 10,
+        // packet 3 (same frame, later packet).
+        assert_eq!(
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(10, 3), false, row_seq(10, 0)),
+            "deferred_to_wal_replay"
+        );
+    }
+
+    /// Review of DB-8 (2026-10-11): a backed range the WAL writer has not
+    /// flushed yet is not promised back; the WAL can still lose it.
+    #[test]
+    fn test_rescue_failure_fate_unflushed_backed_range_is_conditional() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        assert_eq!(
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(11, 0), false, row_seq(10, 0)),
+            "deferred_if_wal_flushes"
+        );
+        assert_eq!(
+            rescue_failure_fate_at(row_seq(5, 0), row_seq(6, 0), false, 0),
+            "deferred_if_wal_flushes",
+            "nothing flushed yet"
+        );
+        // The production wrapper reads the live mark and agrees with the pure
+        // form for a range far above anything flushed in this process.
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(1, u64::MAX, false),
+            "deferred_if_wal_flushes"
+        );
+    }
+
+    #[test]
+    fn test_rescue_failure_fate_unsequenced_or_unbacked_is_lost() {
+        use crate::wal_applied_watermark::rescue_failure_fate_at;
+        for flushed in [0, u64::MAX] {
+            assert_eq!(rescue_failure_fate_at(0, 0, false, flushed), "lost");
+            assert_eq!(rescue_failure_fate_at(5, 5, true, flushed), "lost");
+            assert_eq!(rescue_failure_fate_at(0, 5, true, flushed), "lost");
+        }
+        assert_eq!(
+            crate::wal_applied_watermark::rescue_failure_fate(0, 0, false),
+            "lost"
+        );
+    }
+
+    /// Every failed-rescue line used to say the rows "are permanently lost and
+    /// nothing re-inserts them", which is false for a WAL-backed range.
+    #[test]
+    fn test_rescue_failure_log_no_longer_claims_nothing_re_inserts() {
+        let source = include_str!("tick_persistence.rs");
+        let prod = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("non-test half");
+        assert!(!prod.contains(concat!("nothing re-", "inserts them")));
+        assert!(!prod.contains(concat!("permanently ", "lost and nothing")));
+        assert!(
+            prod.contains(
+                "                    fate = crate::wal_applied_watermark::rescue_failure_fate(\n"
+            ),
+            "the writer-thread arm reports the fate"
+        );
+        assert!(
+            prod.contains("                fate,\n                spill_error = %err,"),
+            "the shared rescue arm reports the fate"
+        );
+    }
+
+    #[test]
+    fn test_rescue_batch_carries_unbacked() {
+        let dir = scratch_dir("db8-unbacked");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        // A freshly minted sequence has no WAL record behind it.
+        w.append_tick(&sample_tick()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(batch.unbacked, "a minted row is unbacked");
+        sink.rescue(&batch);
+        // A replayed sequence is WAL-backed.
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        assert!(!batch.unbacked, "a WAL-sequenced row is backed");
+        assert_eq!(batch.min_seq, 5);
+        sink.rescue(&batch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-26 audit fix PR1: the ILP append-failure arm is per TICK, so
+    /// its ERROR line must sit behind the power-of-two throttle while the
+    /// alarmed drop counter stays per tick.
+    #[test]
+    fn ilp_append_failure_log_is_throttled() {
+        let src = include_str!("tick_persistence.rs");
+        let arm = src
+            .split("source = \"ilp_append_failed\"")
+            .next()
+            .expect("arm present");
+        let tail = &arm[arm.len().saturating_sub(900)..];
+        assert!(
+            tail.contains("append_failures.is_power_of_two()"),
+            "the append-failure error! must be gated by the power-of-two throttle"
+        );
+        assert!(
+            tail.contains("append_dropped.increment(1)"),
+            "every failure must still be counted before the throttle"
+        );
+        assert!(!(0u64).is_power_of_two() && 1u64.is_power_of_two());
+    }
+
     use super::*;
     use std::path::PathBuf;
 
@@ -847,15 +5688,398 @@ mod tests {
             .to_path_buf()
     }
 
+    /// BITE TEST (2026-09-05) — a year-2052 LTT that reads as 14:13:20 IST.
+    ///
+    /// The session-window check is `(nanos / 1e9) % 86_400` — deliberately
+    /// date-blind, because the operator's rule is about the time of DAY. That
+    /// leaves a hole an adversarial sweep found: `exchange_timestamp` is a raw
+    /// `u32`, and `2_600_000_000` (year 2052) has seconds-of-day 51_200, i.e.
+    /// 14:13:20 — squarely inside 09:00-15:39.
+    ///
+    /// `row_timestamp_ist_nanos` has a band ceiling for exactly this, but its
+    /// out-of-band arm falls back to the RECEIPT, and with no receipt (a
+    /// pre-TVW3 WAL record, or one `plausible_receipt_nanos` mapped to 0) the
+    /// fallback is the out-of-band stamp itself. `ts` is the DESIGNATED
+    /// timestamp, so the row would open a year-2052 QuestDB partition that
+    /// retention and archival — both keyed on the trading day — can never
+    /// reach.
+    ///
+    /// Bite-proven: deleting the band block in `append_tick_with_seq` makes
+    /// this fail with `pending() == 1`.
+    #[test]
+    fn a_far_future_ltt_that_looks_in_window_is_refused_not_written() {
+        let mut tick = sample_tick();
+        tick.exchange_timestamp = 2_600_000_000; // year 2052
+        tick.received_at_nanos = 0; // no receipt => no fallback to rescue it
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("row must build"); // APPROVED: test
+        let secs_of_day = row.ts_ist_nanos.div_euclid(1_000_000_000) % 86_400;
+        assert_eq!(
+            secs_of_day, 51_200,
+            "the fixture must actually LOOK in-window (14:13:20 IST), or this \
+             test proves nothing about the hole it exists for"
+        );
+
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&tick, 1)
+            .expect("a refusal is Ok(()) -- never an Err, which would be counted as a loss");
+        // Re-blessed 2026-10-02 (item 45h): the refused tick is no longer
+        // dropped — it lands as ONE `feed_aux_packets` row stamped at receipt.
+        // `ticks` still gets nothing, which is what this test exists to pin.
+        assert_eq!(
+            w.aux_rows_appended(),
+            1,
+            "the refused tick is kept as an auxiliary row"
+        );
+        assert_eq!(w.pending(), 1, "the only pending row is the aux row");
+        assert!(
+            !w.buffer_utf8().lines().any(|l| l.starts_with("ticks,")),
+            "a year-2052 stamp must be REFUSED from `ticks` even though its \
+             seconds-of-day sit inside the session window"
+        );
+    }
+
+    /// Item 45h: a tick stamped after 15:40 IST (the post-close closing-price
+    /// broadcast) is refused by the `ticks` window gate and WRITTEN to
+    /// `feed_aux_packets` as `out_of_window_tick`, with its trade fields and
+    /// trade time kept and its designated timestamp at receipt.
+    #[test]
+    fn test_append_aux_a_post_close_tick_is_written_to_feed_aux_not_ticks() {
+        let mut tick = sample_tick();
+        // 15:45:00 IST on the fixture's day: 12:30:00 + 3h15m.
+        tick.exchange_timestamp += 3 * 3600 + 15 * 60;
+        tick.received_at_nanos += (3 * 3600 + 15 * 60) * 1_000_000_000;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&tick, 77).expect("refusal is Ok");
+        let buf = w.buffer_utf8();
+        assert!(!buf.lines().any(|l| l.starts_with("ticks,")), "{buf}");
+        let line = buf
+            .lines()
+            .find(|l| l.starts_with("feed_aux_packets,"))
+            .expect("the post-close tick must be written to feed_aux_packets");
+        assert!(line.contains(",kind=out_of_window_tick"), "{line}");
+        assert!(line.contains(",feed=dhan"), "{line}");
+        assert!(line.contains("ltp=23146.45"), "{line}");
+        assert!(line.contains("capture_seq=77i"), "{line}");
+        let receipt_ist =
+            tick.received_at_nanos + tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+        assert!(
+            line.ends_with(&format!(" {receipt_ist}")),
+            "designated ts must be the receipt in IST: {line}"
+        );
+        assert_eq!(w.aux_rows_appended(), 1);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// DA-12 (2026-10-12): a tick row that fails part-way (here at the
+    /// designated timestamp, the LAST step, so every column was already
+    /// written) is rewound, and the next tick appends cleanly. Before the
+    /// marker the half line stayed in the buffer and every later tick failed
+    /// at `table()` until a flush cleared it.
+    ///
+    /// Ported 2026-11-06 (PF-4, owner decision "count on writer"): the drain
+    /// stages the row and the ENCODER refuses it, on the thread that encodes.
+    /// The rewind is unchanged (the encoder writes each row inside a marker),
+    /// so exactly the two good rows are written, and the refused one is
+    /// counted there, once.
+    #[test]
+    fn test_append_row_failure_rewinds_so_the_next_tick_appends() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        let mut bad = sample_row();
+        bad.ts_ist_nanos = -1; // ILP refuses a negative designated timestamp
+        assert!(
+            w.append_row(&bad).is_ok(),
+            "staging cannot refuse; the encoder does"
+        );
+        assert!(w.buffer_utf8().is_empty(), "the half line was rewound");
+
+        w.append_row(&sample_row())
+            .expect("the next tick must append");
+        w.append_row(&sample_row()).expect("and the one after");
+        assert_eq!(w.pending(), 3, "the refused row is still staged");
+        let text = w.buffer_utf8();
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "exactly the two good rows: {text:?}"
+        );
+        assert!(text.lines().all(|l| l.starts_with("ticks,")));
+        let before = crate::tick_stage::encode_failures_so_far();
+        let mut out = TickRowBuffer::new(TickIlpEncoder::Library);
+        assert_eq!(w.staged.encode_into(Feed::Dhan, &mut out), 2);
+        assert!(crate::tick_stage::encode_failures_so_far() > before);
+        assert_eq!(w.staged.refused(), 1, "refused once, marked");
+        assert_eq!(out.as_bytes(), text.as_bytes());
+    }
+
+    /// DA-12: the same for a `feed_aux_packets` row sharing the buffer — a
+    /// failed aux row leaves earlier tick rows intact and later rows work.
+    /// Ported 2026-11-06 (PF-4) as above: refused at encode, not at append.
+    #[test]
+    fn test_append_aux_failure_rewinds_the_partial_row() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&sample_row()).expect("tick");
+        let mut bad = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        bad.ts_ist_nanos = -5;
+        assert!(
+            w.append_aux(&bad).is_ok(),
+            "staging cannot refuse; the encoder does"
+        );
+        let good = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&good).expect("the next aux row must append");
+        w.append_row(&sample_row()).expect("and a tick after it");
+        let text = w.buffer_utf8();
+        assert_eq!(text.lines().count(), 3, "tick, aux, tick: {text:?}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("ticks,"));
+        assert!(lines[1].starts_with("feed_aux_packets,"));
+        assert!(lines[2].starts_with("ticks,"));
+        assert_eq!(w.aux_rows_appended(), 2, "both aux rows were staged");
+        assert_eq!(w.pending(), 4);
+    }
+
+    /// DA-12: the pre-validated names and the unsanitised `feed` produce the
+    /// SAME bytes as the old checked path, column for column, on a row with
+    /// every optional column present. The reference below is the pre-DA-12
+    /// encoding written with plain `&str` names (validated by the library on
+    /// every call) and `sanitize_ilp_symbol` on both symbols.
+    #[test]
+    fn test_append_row_bytes_unchanged_after_prevalidated_names() {
+        let mut row = sample_row();
+        row.open = Some(101.25);
+        row.high = Some(102.5);
+        row.low = Some(99.75);
+        row.close = Some(100.0);
+        row.oi = Some(12_345);
+        row.oi_day_high = Some(13_000);
+        row.oi_day_low = Some(12_000);
+        row.avg_price = Some(100.55);
+        row.last_trade_qty = Some(75);
+        row.total_buy_qty = Some(1_000);
+        row.total_sell_qty = Some(2_000);
+        row.received_at_ist_nanos = Some(1_779_951_600_222_000_000);
+        row.payload_hash = Some(-7);
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+
+        let mut b = Buffer::new(ProtocolVersion::V1);
+        b.table(TICKS_TABLE)
+            .and_then(|b| b.symbol("segment", sanitize_ilp_symbol(row.segment).as_ref()))
+            .and_then(|b| b.symbol("feed", sanitize_ilp_symbol("dhan").as_ref()))
+            .expect("reference symbols");
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        if let Some(name) = labels.get(&(row.security_id, row.segment)) {
+            b.symbol("contract", sanitize_ilp_symbol(name).as_ref())
+                .expect("reference contract");
+        }
+        b.column_i64("security_id", row.security_id)
+            .and_then(|b| b.column_f64("ltp", row.ltp))
+            .and_then(|b| b.column_f64("open", 101.25))
+            .and_then(|b| b.column_f64("high", 102.5))
+            .and_then(|b| b.column_f64("low", 99.75))
+            .and_then(|b| b.column_f64("close", 100.0))
+            .and_then(|b| b.column_i64("volume", row.volume))
+            .and_then(|b| b.column_i64("oi", 12_345))
+            .and_then(|b| b.column_i64("oi_day_high", 13_000))
+            .and_then(|b| b.column_i64("oi_day_low", 12_000))
+            .and_then(|b| b.column_f64("avg_price", 100.55))
+            .and_then(|b| b.column_i64("last_trade_qty", 75))
+            .and_then(|b| b.column_i64("total_buy_qty", 1_000))
+            .and_then(|b| b.column_i64("total_sell_qty", 2_000))
+            .and_then(|b| {
+                b.column_ts(
+                    "received_at",
+                    TimestampNanos::new(1_779_951_600_222_000_000),
+                )
+            })
+            .and_then(|b| b.column_i64("payload_hash", -7))
+            .and_then(|b| b.column_i64("capture_seq", row.capture_seq))
+            .and_then(|b| b.at(TimestampNanos::new(row.ts_ist_nanos)))
+            .expect("reference row");
+        assert_eq!(
+            w.buffer_utf8(),
+            String::from_utf8(b.as_bytes().to_vec()).expect("utf8"),
+            "the pre-validated encoding must be byte-identical to the checked one"
+        );
+    }
+
+    /// DA-12: every feed label is already ILP-clean, which is what lets
+    /// `write_tick_line` skip the sanitiser for it (the compile-time block
+    /// proves the same; this pins the runtime view of it).
+    #[test]
+    fn test_closed_symbol_sets_need_no_sanitising() {
+        for feed in Feed::ALL {
+            assert_eq!(sanitize_ilp_symbol(feed.as_str()).as_ref(), feed.as_str());
+            assert!(tickvault_common::sanitize::ilp_symbol_is_clean(
+                feed.as_str()
+            ));
+        }
+        for code in 0..=u8::MAX {
+            let seg = segment_code_to_str(code);
+            assert_eq!(
+                sanitize_ilp_symbol(seg).as_ref(),
+                seg,
+                "segment code {code}"
+            );
+        }
+    }
+
+    /// `append_aux` counts the row as pending (so the size trigger and flush
+    /// see it) and widens the WAL sequence range like a tick.
+    #[test]
+    fn test_append_aux_counts_pending_and_appended() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        let row = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&row).expect("append");
+        w.append_aux(&row).expect("append");
+        assert_eq!(w.aux_rows_appended(), 2);
+        assert_eq!(w.pending(), 2);
+        assert_eq!(
+            w.buffer_utf8()
+                .lines()
+                .filter(|l| l.starts_with("feed_aux_packets,"))
+                .count(),
+            2
+        );
+    }
+
+    /// `aux_rows_appended` starts at zero and an in-window tick never moves it.
+    #[test]
+    fn test_aux_rows_appended_is_zero_for_an_in_window_tick() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(w.aux_rows_appended(), 0);
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        assert_eq!(w.aux_rows_appended(), 0);
+        assert_eq!(w.pending(), 1);
+    }
+
+    /// 2026-11-21: an in-window tick counts as one `ticks` row and no quote or
+    /// aux row; the day repair's verify gate compares the database with it.
+    #[test]
+    fn test_tick_rows_appended_counts_only_ticks_rows() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(w.tick_rows_appended(), 0);
+        w.append_tick_with_seq(&sample_tick(), 5).expect("append");
+        w.append_tick_with_seq(&sample_tick(), 6).expect("append");
+        assert_eq!(w.tick_rows_appended(), 2);
+        assert_eq!(w.quote_rows_appended(), 0);
+        assert_eq!(w.aux_rows_appended(), 0);
+    }
+
+    /// K4 (2026-10-26): an accepted Dhan `ticks` row is counted in the
+    /// conservation ledger under its IST day; a non-Dhan row and a refused row
+    /// are not. Each case uses its own day so parallel tests cannot interfere.
+    #[test]
+    fn test_k4_accepted_dhan_row_is_counted_in_the_conservation_ledger() {
+        use crate::tick_conservation_ledger::{TickConservationLedger, ledger};
+        let shifted = |days: u32| {
+            let mut t = sample_tick();
+            t.exchange_timestamp += days * 86_400;
+            t.received_at_nanos += i64::from(days) * 86_400 * 1_000_000_000;
+            t
+        };
+        let day_of = |t: &ParsedTick| {
+            let row = TickRow::from_parsed_tick(t, 7).expect("row"); // APPROVED: test
+            TickConservationLedger::ist_day_of(row.ts_ist_nanos)
+        };
+
+        let dhan_tick = shifted(1_001);
+        let mut dhan = TickWriter::for_test(Feed::Dhan);
+        dhan.append_tick_with_seq(&dhan_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&dhan_tick)), 1);
+
+        let other_tick = shifted(1_002); // a non-Dhan feed is not counted
+        let mut other = TickWriter::for_test(Feed::Truedata);
+        other.append_tick_with_seq(&other_tick, 7).expect("append");
+        assert_eq!(ledger().accepted_rows_on(day_of(&other_tick)), 0);
+
+        let mut refused = sample_tick();
+        refused.exchange_timestamp = 2_600_000_000; // year 2052, refused by the band
+        refused.received_at_nanos = 0;
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&refused, 7).expect("refusal is Ok");
+        assert_eq!(
+            ledger().accepted_rows_on(TickConservationLedger::ist_day_of(
+                2_600_000_000_i64 * 1_000_000_000
+            )),
+            0
+        );
+    }
+
+    /// Item 45h (a): the Full packet's day-high / day-low OI reach `ticks`;
+    /// a zero (Ticker / Quote packets, non-F&O) stays NULL, never `0`.
+    #[test]
+    fn test_ticks_carry_oi_day_high_and_low_and_null_them_when_zero() {
+        let mut tick = sample_tick();
+        tick.oi_day_high = 1_000_500;
+        tick.oi_day_low = 950_000;
+        let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
+        assert_eq!(row.oi_day_high, Some(1_000_500));
+        assert_eq!(row.oi_day_low, Some(950_000));
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(line.contains("oi_day_high=1000500i"), "{line}");
+        assert!(line.contains("oi_day_low=950000i"), "{line}");
+
+        let zero = TickRow::from_parsed_tick(&sample_tick(), 9).expect("row");
+        assert_eq!(zero.oi_day_high, None);
+        assert_eq!(zero.oi_day_low, None);
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&zero).expect("append");
+        assert!(!w.buffer_utf8().contains("oi_day_"));
+        // DEDUP key unchanged by the new columns.
+        assert_eq!(
+            DEDUP_KEY_TICKS,
+            "ts, security_id, segment, capture_seq, feed"
+        );
+    }
+
+    /// The fixture instant is INSIDE the 09:00-15:39 IST session window, and
+    /// that is load-bearing rather than cosmetic (2026-09-05).
+    ///
+    /// `append_tick_with_seq` now refuses any row whose `ts` or `received_at`
+    /// falls outside that window (the operator's data-side capture rule). The
+    /// fixture used to sit at 20:26:40 IST, so once the gate landed EVERY test
+    /// that appends a sample tick buffered zero rows and asserted against an
+    /// empty buffer.
+    ///
+    /// Both clocks are pinned deliberately, because they are derived
+    /// differently and only one of them is the exchange stamp:
+    ///   * `exchange_timestamp` is IST epoch SECONDS verbatim -> 12:30:00 IST.
+    ///   * `received_at_nanos` is UTC and has `IST_UTC_OFFSET_NANOS` ADDED by
+    ///     `from_parsed_tick`, so it is stamped 5h30m EARLIER to land on the
+    ///     same 12:30:00.111 IST instant.
+    /// Moving either one out of the window silently empties the buffer again.
     fn sample_tick() -> ParsedTick {
         ParsedTick {
             security_id: 13,
             exchange_segment_code: 0, // IDX_I
             last_traded_price: 23_146.45,
             last_trade_quantity: 50,
-            exchange_timestamp: 1_780_000_000,
-            received_at_nanos: 1_780_000_000_111_000_000,
-            average_traded_price: 23_145.10,
+            exchange_timestamp: 1_779_971_400,
+            received_at_nanos: 1_779_951_600_111_000_000,
+            average_traded_price: 23_145.1,
             volume: 1_234_567,
             total_sell_quantity: 9_000,
             total_buy_quantity: 10_000,
@@ -874,8 +6098,454 @@ mod tests {
         }
     }
 
+    /// 2026-08-21 — the NaN chain, closed at the source.
+    ///
+    /// `parse_quote_packet` is proven by its OWN test to propagate
+    /// `f32::NAN` into `day_open/high/low/close`, and IDX_I moved to Quote
+    /// mode on 2026-08-21, so this is a live wire shape and not a
+    /// hypothetical. The pre-fix `opt_price` gate was `(v != 0.0).then(..)`,
+    /// which NaN PASSES (NaN compares unequal to everything), and
+    /// `f32_to_f64_clean` returns non-finite unchanged — so a NaN reached
+    /// the ILP line, QuestDB rejected the whole batch, the rescued buffer
+    /// was spilled, and `tick_spill_replay` then retried a file it can never
+    /// accept FIRST in every round (files are sorted; this tier has no DLQ).
+    ///
+    /// BITE PROOF: delete the `is_finite` loop in `from_parsed_tick` and
+    /// this test fails — the row is built and `high` comes back `Some(NaN)`.
+    /// `spill_free_bytes` collapses the probe outcome to the one bit the
+    /// decision needs.
+    ///
+    /// Deliberately asserts a RANGE rather than a value: the number is
+    /// whatever the host has, and a test that pins a specific free-byte count
+    /// is a test that fails on a different machine. What must hold everywhere
+    /// is that a readable directory yields `Some`, and that the value is a
+    /// plausible byte count rather than a sentinel.
+    #[test]
+    fn test_spill_free_bytes_reads_a_real_directory() {
+        let dir = std::env::temp_dir();
+        let free = spill_free_bytes(&dir);
+        let Some(bytes) = free else {
+            // A probe failure on a real temp dir is itself worth failing on:
+            // it would mean every rescue past the soft rail refuses, which is
+            // the pre-fix behaviour wearing a different hat.
+            panic!("the system temp dir must be probeable; got None");
+        };
+        assert!(
+            bytes > 0,
+            "a mounted filesystem reporting zero free bytes would refuse every \
+             rescue — if this ever fires, check the probe, not the disk"
+        );
+        // A path that cannot exist must degrade to None, never to a number.
+        let missing = std::path::Path::new("/nonexistent-tv-spill-probe-target");
+        assert_eq!(
+            spill_free_bytes(missing),
+            None,
+            "an unreadable path must yield None so the classifier REFUSES — \
+             inventing a number here would license unbounded growth"
+        );
+    }
+
+    /// The rule itself, exhaustively, with no filesystem involved.
+    ///
+    /// This is the arm coverage the old shape could never have: a unit test
+    /// cannot manufacture a nearly-full disk, so before the decision was
+    /// separated out, the arm that protects the database was untestable and
+    /// Every arm of the per-write floor, including the two the live box can
+    /// only reach with a failed free-space probe.
+    #[test]
+    fn classify_spill_floor_covers_every_arm() {
+        use BlindWritePolicy::{FailClosed, FailOpen};
+        use SpillFloorVerdict as V;
+        for (free, payload, floor, blind, want) in [
+            // Known free space: identical for both policies.
+            (Some(100_u64), 1_u64, 10_u64, FailOpen, V::Allow),
+            (Some(100), 1, 10, FailClosed, V::Allow),
+            (Some(10), 1, 10, FailOpen, V::RefuseNoRoom),
+            (Some(10), 1, 10, FailClosed, V::RefuseNoRoom),
+            // Exactly enough is enough — the floor is inclusive.
+            (Some(11), 1, 10, FailClosed, V::Allow),
+            // Blind: the policies diverge, and that divergence is the fix.
+            (None, 1, 10, FailOpen, V::AllowProbeFailed),
+            (None, 1, 10, FailClosed, V::RefuseProbeFailed),
+            // A zero floor does NOT re-open a fail-closed tier when the probe
+            // is blind. The carve-out that used to allow this was removed on
+            // 2026-09-01: the policy is about BLINDNESS, not about the floor
+            // value, and `DepthWriter::for_test` (pub, floor 0) is reachable
+            // from a production `mem::replace` placeholder — so the carve-out
+            // was a live path back to blind writing for the one tier that
+            // must never take it.
+            (None, 1, 0, FailClosed, V::RefuseProbeFailed),
+            // Saturating: a payload near u64::MAX must refuse, never WRAP
+            // into a small `needed` that then reads as plenty of room.
+            (
+                Some(u64::MAX - 5),
+                u64::MAX,
+                10,
+                FailClosed,
+                V::RefuseNoRoom,
+            ),
+            // HONEST EDGE, asserted rather than hidden: at exactly u64::MAX
+            // free AND a u64::MAX payload, `needed` saturates to u64::MAX and
+            // the floor is swallowed, so this ALLOWS. It is unreachable — the
+            // payload is a Vec that must fit in RAM — and it is pinned here
+            // because the first draft of this test asserted the opposite and
+            // was wrong. Saturation is still the right choice: the failure it
+            // prevents is wrapping, which would allow a huge write on a nearly
+            // full disk. This edge allows a huge write on an infinite one.
+            (Some(u64::MAX), u64::MAX, 10, FailClosed, V::Allow),
+        ] {
+            assert_eq!(
+                classify_spill_floor(free, payload, floor, blind),
+                want,
+                "free={free:?} payload={payload} floor={floor} blind={blind:?}"
+            );
+        }
+    }
+
+    /// THE invariant, swept across the whole domain including the blind case.
+    ///
+    /// Depth is record-only; ticks are decision-critical. So at every possible
+    /// disk state, depth must refuse to spill AT LEAST as readily as ticks. A
+    /// state where depth writes while ticks are refused is the inversion the
+    /// two-reserve split exists to prevent.
+    ///
+    /// The 2026-09-01 sweep that found this bug found it in the `None` column,
+    /// which the existing arithmetic guard cannot reach: that guard compares
+    /// byte values, and probe failure carries no byte value at all. This test
+    /// drives BOTH tiers' complete decision — ceiling arm and floor — over
+    /// known AND unknown free space.
+    #[test]
+    fn depth_never_spills_while_ticks_are_refused_including_when_df_is_blind() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        fn tick_refuses(free: Option<u64>, dir: u64, ceiling: u64, payload: u64) -> bool {
+            if matches!(
+                classify_spill_ceiling(dir, ceiling, free, SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+                SpillCeilingVerdict::OverCeilingNoRoom
+                    | SpillCeilingVerdict::OverCeilingProbeFailed
+            ) {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(
+                    free,
+                    payload,
+                    SPILL_MIN_FREE_HEADROOM_BYTES,
+                    BlindWritePolicy::FailOpen,
+                ),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        }
+
+        fn depth_refuses(free: Option<u64>, dir: u64, cap: u64, payload: u64) -> bool {
+            if matches!(
+                classify_spill_ceiling(dir, cap, free, DEPTH_SPILL_FREE_RESERVE_BYTES),
+                SpillCeilingVerdict::OverCeilingNoRoom
+                    | SpillCeilingVerdict::OverCeilingProbeFailed
+            ) {
+                return true;
+            }
+            matches!(
+                classify_spill_floor(
+                    free,
+                    payload,
+                    DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                    BlindWritePolicy::FailClosed,
+                ),
+                SpillFloorVerdict::RefuseNoRoom | SpillFloorVerdict::RefuseProbeFailed
+            )
+        }
+
+        let frees = [
+            None,
+            Some(0),
+            Some(1),
+            Some(GIB),
+            Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES),
+            Some(SPILL_SOFT_CEILING_FREE_RESERVE_BYTES + 1),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES),
+            Some(DEPTH_SPILL_FREE_RESERVE_BYTES + 1),
+            Some(200 * GIB),
+        ];
+        // The directories are INDEPENDENT, which is exactly what made the bug
+        // reachable — so they are swept independently, both over and under
+        // their own rails.
+        let dirs = [0_u64, 5 * GIB, 10 * GIB];
+        let rails = [1_u64, 10 * GIB];
+        // Payload >= 1. A zero-byte spill is excluded deliberately: it writes
+        // nothing, so it cannot consume the room ticks need, and treating it
+        // as an inversion would be an assertion about a no-op.
+        let payloads = [1_u64, 4096, 32 * 1024 * 1024];
+
+        for free in frees {
+            for td in dirs {
+                for tc in rails {
+                    for dd in dirs {
+                        for dc in rails {
+                            // ASYMMETRIC payloads (2026-09-01, adversarial review).
+                            // The sweep used to bind ONE `p` to both tiers,
+                            // which asserts a weaker invariant than the one
+                            // that matters: the real requirement is that a
+                            // refused tick implies a refused depth write for
+                            // ANY depth payload, not only an equal-sized one.
+                            // Bounded in practice by the 32 MiB producer caps,
+                            // so the asymmetry is unreachable today — but a
+                            // future floor change would have passed the old
+                            // test while a real inversion existed.
+                            for tp in payloads {
+                                for dp in payloads {
+                                    if tick_refuses(free, td, tc, tp) {
+                                        assert!(
+                                            depth_refuses(free, dd, dc, dp),
+                                            "INVERSION: ticks refused but depth would write. \
+                                             free={free:?} tick_dir={td} tick_ceiling={tc} \
+                                             tick_payload={tp} depth_dir={dd} depth_cap={dc} \
+                                             depth_payload={dp}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The precise state that was broken, named so a regression is legible
+    /// rather than one failing row inside the sweep above.
+    #[test]
+    fn a_blind_probe_refuses_depth_even_while_its_own_directory_is_under_cap() {
+        // Depth's directory is well under its cap, so its ceiling arm is
+        // skipped entirely — this is the regime depth spends most of its life
+        // in, and before the fix it wrote blind here.
+        assert_eq!(
+            classify_spill_ceiling(
+                0,
+                10 * 1024 * 1024 * 1024,
+                None,
+                DEPTH_SPILL_FREE_RESERVE_BYTES
+            ),
+            SpillCeilingVerdict::UnderCeiling,
+            "precondition: depth's ceiling arm must be skipped for this to test the floor"
+        );
+        assert_eq!(
+            classify_spill_floor(
+                None,
+                4096,
+                DEPTH_SPILL_MIN_FREE_HEADROOM_BYTES,
+                BlindWritePolicy::FailClosed,
+            ),
+            SpillFloorVerdict::RefuseProbeFailed,
+            "depth must refuse when it cannot see the disk"
+        );
+        // The tick tier in the SAME state still writes — that asymmetry is the
+        // point, not an oversight.
+        assert_eq!(
+            classify_spill_floor(
+                None,
+                4096,
+                SPILL_MIN_FREE_HEADROOM_BYTES,
+                BlindWritePolicy::FailOpen,
+            ),
+            SpillFloorVerdict::AllowProbeFailed,
+            "ticks must keep writing: one broken df must not disable the \
+             decision-critical tier"
+        );
+    }
+
+    /// the arm that lost 243 million rows was the one pinned.
+    #[test]
+    fn test_classify_spill_ceiling_covers_every_arm() {
+        const R: u64 = SPILL_SOFT_CEILING_FREE_RESERVE_BYTES;
+        for (held, ceiling, free, want) in [
+            (0_u64, 1_u64, None, SpillCeilingVerdict::UnderCeiling),
+            (0, 1, Some(0), SpillCeilingVerdict::UnderCeiling),
+            (1, 1, None, SpillCeilingVerdict::OverCeilingProbeFailed),
+            (1, 1, Some(0), SpillCeilingVerdict::OverCeilingNoRoom),
+            (1, 1, Some(R), SpillCeilingVerdict::OverCeilingNoRoom),
+            (1, 1, Some(R + 1), SpillCeilingVerdict::OverCeilingWithRoom),
+            (
+                u64::MAX,
+                0,
+                Some(u64::MAX),
+                SpillCeilingVerdict::OverCeilingWithRoom,
+            ),
+        ] {
+            assert_eq!(
+                classify_spill_ceiling(held, ceiling, free, R),
+                want,
+                "held={held} ceiling={ceiling} free={free:?} reserve={R}"
+            );
+        }
+        // A ceiling of 0 means "always past the rail", so the decision is
+        // then entirely a free-space question. Stated because a future
+        // `tick_spill_max_bytes()` returning 0 on an unreadable volume must
+        // not become an accidental allow-everything.
+        assert_eq!(
+            classify_spill_ceiling(0, 0, None, R),
+            SpillCeilingVerdict::OverCeilingProbeFailed,
+            "a zero ceiling with an unreadable probe must REFUSE, not allow"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_ltp_is_refused_not_emitted_as_a_poison_ilp_row() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut tick = sample_tick();
+            tick.last_traded_price = value;
+            let err = TickRow::from_parsed_tick(&tick, 1)
+                .expect_err("a non-finite LTP MUST be refused, never built into a row");
+            assert_eq!(
+                err,
+                TickRowError::PriceNotFinite { field: "ltp" },
+                "the refusal must name the offending column"
+            );
+        }
+    }
+
+    /// 2026-10-01 reality check: a non-finite day open, high, low or close
+    /// used to refuse the WHOLE row, so a tick with a good LTP vanished from
+    /// `ticks` (and from every replay) while the candle fold still counted
+    /// it. The day OHLC are auxiliary columns: each bad one becomes NULL and
+    /// the tick is kept with its LTP, volume and every finite column intact.
+    #[test]
+    fn a_non_finite_day_ohlc_field_is_nulled_and_the_tick_is_kept() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for column in 0..4 {
+                let mut tick = sample_tick();
+                match column {
+                    0 => tick.day_open = value,
+                    1 => tick.day_high = value,
+                    2 => tick.day_low = value,
+                    _ => tick.day_close = value,
+                }
+                let good =
+                    TickRow::from_parsed_tick(&sample_tick(), 1).expect("the sample tick builds");
+                let row = TickRow::from_parsed_tick(&tick, 1)
+                    .expect("a bad day-OHLC field must not drop a tick whose LTP is good");
+                assert_eq!(row.ltp, good.ltp, "the LTP is kept");
+                assert_eq!(row.volume, good.volume, "the volume is kept");
+                let (bad, others) = match column {
+                    0 => (
+                        row.open,
+                        [
+                            (row.high, good.high),
+                            (row.low, good.low),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    1 => (
+                        row.high,
+                        [
+                            (row.open, good.open),
+                            (row.low, good.low),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    2 => (
+                        row.low,
+                        [
+                            (row.open, good.open),
+                            (row.high, good.high),
+                            (row.close, good.close),
+                        ],
+                    ),
+                    _ => (
+                        row.close,
+                        [
+                            (row.open, good.open),
+                            (row.high, good.high),
+                            (row.low, good.low),
+                        ],
+                    ),
+                };
+                assert!(
+                    bad.is_none(),
+                    "the non-finite column becomes NULL, never NaN/Inf"
+                );
+                for (got, want) in others {
+                    assert_eq!(got, want, "the finite day-OHLC columns are untouched");
+                }
+                assert_eq!(
+                    count_nonfinite_tick_floats(&row),
+                    0,
+                    "nothing non-finite reaches ILP"
+                );
+            }
+        }
+    }
+
+    /// The zero sentinel is NOT non-finite and must still be accepted — a
+    /// Ticker (16-byte) packet carries only LTP + LTT, so `0.0` legitimately
+    /// means "not carried" and becomes NULL. Refusing it would silently drop
+    /// every Ticker-mode instrument, which is strictly worse than the bug
+    /// being fixed.
+    #[test]
+    fn the_zero_not_carried_sentinel_is_still_accepted() {
+        let mut tick = sample_tick();
+        tick.day_open = 0.0;
+        tick.day_high = 0.0;
+        tick.day_low = 0.0;
+        tick.day_close = 0.0;
+        let row = TickRow::from_parsed_tick(&tick, 1)
+            .expect("0.0 is the documented not-carried sentinel, not a bad price");
+        assert!(row.open.is_none(), "0.0 must still become NULL");
+        assert!(row.high.is_none());
+        assert!(row.low.is_none());
+        assert!(row.close.is_none());
+    }
     fn sample_row() -> TickRow {
         TickRow::from_parsed_tick(&sample_tick(), 42).expect("sample tick must build")
+    }
+
+    /// 2026-09-26 audit fix PR2: the tick tripwire counts exactly the
+    /// non-finite float columns that are present; an absent optional column is
+    /// a deliberate NULL and is not counted.
+    #[test]
+    fn test_count_nonfinite_tick_floats_counts_present_nan_and_inf_only() {
+        let mut row = sample_row();
+        assert_eq!(
+            count_nonfinite_tick_floats(&row),
+            0,
+            "a parsed tick is finite"
+        );
+        row.ltp = f64::NAN;
+        row.open = Some(f64::INFINITY);
+        row.high = None;
+        row.low = Some(f64::NEG_INFINITY);
+        row.close = Some(1.0);
+        row.avg_price = None;
+        assert_eq!(count_nonfinite_tick_floats(&row), 3);
+        row.ltp = 10.0;
+        row.open = None;
+        row.low = None;
+        assert_eq!(count_nonfinite_tick_floats(&row), 0);
+    }
+
+    #[test]
+    fn append_row_runs_the_nonfinite_tripwire_before_the_ilp_append() {
+        // The first occurrence is the production fn: it precedes this module.
+        let src = include_str!("tick_persistence.rs");
+        let start = src
+            .find("pub(crate) fn append_row(&mut self, row: &TickRow)")
+            .expect("append_row must exist");
+        // Since DA-12 (2026-10-12) the columns were written by
+        // `write_tick_line`, called from `append_row` inside a marker; since
+        // PF-4 (2026-11-06) `append_row` STAGES the row and the text is
+        // written by the encoding thread. The count must run before the row
+        // leaves `append_row`, i.e. before the stage.
+        let body = &src[start..];
+        let tripwire = body
+            .find("count_nonfinite_tick_floats(row)")
+            .expect("append_row must count non-finite floats");
+        let first_write = body
+            .find("self.stage_extra(ExtraRow::Tick")
+            .expect("append_row stages the row");
+        assert!(
+            tripwire < first_write,
+            "the count runs before the line is written"
+        );
     }
 
     // ======================================================================
@@ -974,7 +6644,7 @@ mod tests {
         for i in 0..N {
             let mut tick = sample_tick();
             // Same instrument, same wall-clock SECOND for every tick.
-            tick.exchange_timestamp = 1_780_000_000;
+            tick.exchange_timestamp = 1_779_971_400;
             tick.last_traded_price = ltps[i % ltps.len()];
             tick.volume = 0; // index shape: value-identical rows
             let seq = next_capture_seq();
@@ -1021,7 +6691,7 @@ mod tests {
         let mut keys = Vec::new();
         for i in 0..8 {
             let mut tick = sample_tick();
-            tick.exchange_timestamp = 1_780_000_000;
+            tick.exchange_timestamp = 1_779_971_400;
             tick.last_traded_price = 23_100.0 + i as f32;
             let row = TickRow::from_parsed_tick(&tick, 7).expect("row");
             keys.push((
@@ -1174,7 +6844,7 @@ mod tests {
     /// (STORAGE-GAP-02, operator-spotted 2026-05-25).
     #[test]
     fn test_prices_widen_via_f32_to_f64_clean_not_raw_widening() {
-        for raw in [23_925.65_f32, 23_937.30, 10.20, 25_461.30] {
+        for raw in [23_925.65_f32, 23_937.3, 10.20, 25_461.3] {
             let mut tick = sample_tick();
             tick.last_traded_price = raw;
             tick.day_open = raw;
@@ -1238,9 +6908,11 @@ mod tests {
         assert!(line.contains("capture_seq=42i"), "capture_seq: {line}");
         assert!(line.contains("volume=1234567i"), "volume: {line}");
         assert!(line.contains("oi=987654i"), "oi: {line}");
+        // The raw LTT column was removed 2026-09-22 (operator directive):
+        // the trade time is carried by the designated `ts` alone.
         assert!(
-            line.contains("exchange_timestamp=1780000000i"),
-            "ltt: {line}"
+            !line.contains("exchange_timestamp"),
+            "the removed raw-LTT column must never be written: {line}"
         );
         // Symbols must precede all field columns (ILP requirement).
         let first_field = line.find(" security_id=").expect("field section");
@@ -1256,11 +6928,13 @@ mod tests {
     /// rather than a misleading `0`.
     #[test]
     fn test_ticker_shape_row_omits_absent_columns_as_null() {
-        let mut tick = ParsedTick::default();
-        tick.security_id = 25;
-        tick.exchange_segment_code = 0;
-        tick.last_traded_price = 51_234.55;
-        tick.exchange_timestamp = 1_780_000_000;
+        let tick = ParsedTick {
+            security_id: 25,
+            exchange_segment_code: 0,
+            last_traded_price: 51_234.55,
+            exchange_timestamp: 1_779_971_400,
+            ..ParsedTick::default()
+        };
         let row = TickRow::from_parsed_tick(&tick, 9).expect("row");
         assert_eq!(row.open, None);
         assert_eq!(row.high, None);
@@ -1447,11 +7121,7 @@ mod tests {
     /// a Groww observation of the same instrument-second-sequence are BOTH kept.
     #[test]
     fn test_feed_symbol_is_stamped_per_writer() {
-        for (feed, label) in [
-            (Feed::Dhan, "dhan"),
-            (Feed::Groww, "groww"),
-            (Feed::Truedata, "truedata"),
-        ] {
+        for (feed, label) in [(Feed::Dhan, "dhan"), (Feed::Truedata, "truedata")] {
             let mut w = TickWriter::for_test(feed);
             w.append_row(&sample_row()).expect("append");
             assert!(
@@ -1460,7 +7130,6 @@ mod tests {
             );
         }
         assert_eq!(TICK_FEED_DHAN, "dhan");
-        assert_eq!(TICK_FEED_GROWW, "groww");
         assert_eq!(TICK_FEED_TRUEDATA, "truedata");
     }
 
@@ -1496,6 +7165,95 @@ mod tests {
                 "live DDL lacks {col} {ty} — schema drift"
             );
         }
+    }
+
+    /// `ticks.contract` carries the option's name from the published table,
+    /// and is OMITTED (NULL) — never guessed — when the table does not know the
+    /// exact `(security_id, segment)`. Both arms, one test, under the publish
+    /// lock because the table is process-global.
+    #[test]
+    fn ticks_carry_the_contract_name_only_when_the_table_knows_it() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let row = sample_row();
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
+        m.insert(
+            (row.security_id, row.segment),
+            std::sync::Arc::<str>::from("NIFTY-25Sep2026-24500-CE"),
+        );
+        // Same id on a DIFFERENT segment must not lend its name (I-P1-11).
+        m.insert(
+            (row.security_id + 1, row.segment),
+            std::sync::Arc::<str>::from("OTHER-CONTRACT"),
+        );
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            line.contains(",contract=NIFTY-25Sep2026-24500-CE"),
+            "a known contract must carry its name: {line}"
+        );
+        let first_field = line.find(" security_id=").expect("field section");
+        assert!(
+            line.find(",contract=").expect("contract tag") < first_field,
+            "contract is a SYMBOL and must precede every column: {line}"
+        );
+
+        crate::candle_contract_labels::publish_candle_contract_labels(
+            crate::candle_contract_labels::CandleContractLabels::default(),
+        );
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_row(&row).expect("append");
+        let line = w.buffer_utf8();
+        assert!(
+            !line.contains("contract="),
+            "an unknown contract must be NULL, never a guess: {line}"
+        );
+    }
+
+    /// The operator's 2026-09-22 (THIRD) layout: `received_at` is the FIRST
+    /// column, `ts` the SECOND, and the raw-LTT `exchange_timestamp` column is
+    /// gone — pinned in BOTH the boot DDL and the init script, which must agree.
+    #[test]
+    fn ticks_lead_with_received_at_then_ts_and_carry_no_raw_ltt_column() {
+        let script = std::fs::read_to_string(workspace_root().join("scripts/questdb-init.sh"))
+            .expect("init script");
+        let live = script
+            .split("CREATE TABLE IF NOT EXISTS ticks ")
+            .nth(1)
+            .and_then(|s| s.split('\n').next())
+            .expect("live ticks CREATE")
+            .to_string();
+        for (label, ddl) in [("boot DDL", ticks_create_ddl()), ("init script", live)] {
+            let body = ddl.split('(').nth(1).expect("column list");
+            let cols: Vec<&str> = body
+                .split(',')
+                .map(|c| c.split_whitespace().next().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                cols.first(),
+                Some(&"received_at"),
+                "{label}: received_at must be first: {ddl}"
+            );
+            assert_eq!(
+                cols.get(1),
+                Some(&"ts"),
+                "{label}: ts must be second: {ddl}"
+            );
+            assert!(
+                !ddl.contains("exchange_timestamp"),
+                "{label}: the removed raw-LTT column is back: {ddl}"
+            );
+        }
+        assert!(
+            !TICKS_COLUMNS
+                .iter()
+                .any(|(c, _)| *c == "exchange_timestamp"),
+            "the self-heal must never re-add the removed column"
+        );
     }
 
     #[test]
@@ -1566,9 +7324,18 @@ mod tests {
     // Persistence helpers — mock QuestDB /exec (real code paths)
     // ======================================================================
 
-    const MOCK_HTTP_200: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
-    const MOCK_HTTP_500: &str =
-        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\n{\"error\":\"x\"}";
+    // `Connection: close` is load-bearing, not decoration. `ensure_ticks_table`
+    // drives TWENTY-TWO DDL statements through ONE `reqwest::Client` — 1 CREATE,
+    // one ADD COLUMN per entry in `TICKS_COLUMNS` (20) and the DEDUP ENABLE —
+    // and reqwest pools the
+    // socket between them. This mock answers, then DROPS the stream, so without
+    // the header reqwest can reuse a connection the mock has already closed and a
+    // later statement fails, flipping the verdict to false. It is the pattern
+    // every other mock responder in this workspace already carries
+    // (stats.rs, board.rs, quote.rs, notification/service.rs, ip_monitor.rs).
+    const MOCK_HTTP_200: &str =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    const MOCK_HTTP_500: &str = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"error\":\"x\"}";
 
     async fn spawn_mock_http(response: &'static str) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1600,19 +7367,25 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_ticks_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_ticks_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_ticks_table(&mock_cfg(port)).await,
+            "every statement accepted ⇒ the verdict is true"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_ticks_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_ticks_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_ticks_table(&mock_cfg(port)).await,
+            "a refused statement must surface as false so the boot retries"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_ticks_table_unreachable_degrades_without_panic() {
         // Port 1 is reserved and never listening — a real transport failure.
-        ensure_ticks_table(&mock_cfg(1)).await;
+        assert!(!ensure_ticks_table(&mock_cfg(1)).await);
     }
 
     #[tokio::test]
@@ -1625,4 +7398,2274 @@ mod tests {
             .expect("append must succeed without network");
         assert_eq!(w.pending(), 1);
     }
+
+    // -- tick ILP spill rescue (2026-08-21) ---------------------------------
+
+    /// Unique scratch dir per test — no `tempfile` dep (adding one needs
+    /// operator approval per CLAUDE.md's dependency rule).
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("tv-tick-spill-{tag}-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    // -----------------------------------------------------------------
+    // Off-drain flush (2026-08-25)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn offloaded_flush_hands_the_rows_off_and_does_not_touch_the_network() {
+        // The whole point: a flush on the drain side must complete without a
+        // network round trip. `for_test` has no sender at all, so if the
+        // offload branch were skipped this would take the "QuestDB
+        // unreachable" arm, rescue to disk, and return Err.
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.append_tick_with_seq(&sample_tick(), 2).expect("append");
+        let (mut producer, _sink, rx) = w.split_for_offload();
+        assert_eq!(producer.pending(), 2);
+
+        producer.flush().expect("offloaded flush must not error");
+
+        assert_eq!(
+            producer.pending(),
+            0,
+            "the rows left the producer once handed off"
+        );
+        let batch = rx.try_recv().expect("the batch must be on the queue");
+        assert_eq!(batch.rows(), 2, "the batch carries the row count verbatim");
+    }
+
+    #[test]
+    fn a_sent_batch_takes_the_unbacked_mark_with_it() {
+        // Review of G4-audit (2026-10-11): the mark was copied into the batch
+        // and never cleared, so after ONE unbacked frame every later batch
+        // read as unbacked and its rescue failure was reported as lost.
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, _sink, rx) = w.split_for_offload();
+        producer.mark_pending_unbacked();
+        producer.flush().expect("offloaded flush");
+        let first = rx.try_recv().expect("first batch");
+        assert!(first.unbacked, "the marked batch carries the mark");
+        assert!(
+            !producer.pending_unbacked(),
+            "the Sent arm clears the producer's mark"
+        );
+
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("offloaded flush");
+        let second = rx.try_recv().expect("second batch");
+        assert!(
+            !second.unbacked,
+            "a later, fully sequenced batch must read as backed"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_keeps_the_rows_and_never_reports_them_as_dropped() {
+        // The arm that makes a BOUNDED queue safe. A full queue is
+        // backpressure: the rows are still ours, still pending, and the next
+        // flush retries. If this ever reported Err — or cleared `pending` —
+        // the drain would either log a loss that did not happen or actually
+        // lose the rows.
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+
+        // Fill the queue to its depth, holding the receiver so nothing drains.
+        for i in 0..FLUSH_QUEUE_DEPTH {
+            producer.flush().expect("flush while the queue has room");
+            // Strictly increasing, as production's `next_capture_seq` is:
+            // reusing one value would exercise a shape the live writer never
+            // produces.
+            let seq = 2 + i64::try_from(i).expect("loop bound fits i64");
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+        }
+        assert_eq!(producer.pending(), 1);
+
+        producer
+            .flush()
+            .expect("a full queue is backpressure, never an error");
+
+        assert_eq!(
+            producer.pending(),
+            1,
+            "the row is RETAINED — it is still ours to flush next time"
+        );
+    }
+
+    #[test]
+    fn the_producer_stops_widening_the_batch_and_spills_instead() {
+        // THE condition the live measurement made load-bearing. `ticks` is
+        // PARTITION BY HOUR on the exchange last-trade time, and 10% of a
+        // day's ticks carry a ts over an hour behind arrival — so a wide
+        // commit reopens closed hourly partitions and rewrites them. A
+        // decoupled writer that accumulated without bound would have made the
+        // write amplification WORSE, which is the own-goal a design pass
+        // flagged before this was implemented.
+        //
+        // So: retaining is allowed, widening without limit is not.
+        let dir = scratch_dir("offload-width-cap");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, mut sink, _rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+
+        // Fill the queue so every later flush is refused.
+        for i in 0..FLUSH_QUEUE_DEPTH {
+            producer.flush().expect("flush while the queue has room");
+            let seq = 2 + i64::try_from(i).expect("loop bound fits i64");
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+        }
+
+        // Retained spans, up to the cap — rows KEPT and accumulating, nothing
+        // spilled. Accumulation is the point: these rows are still ours and
+        // still pending, which is what makes backpressure lossless.
+        for span in 0..MAX_RETAINED_FLUSH_SPANS {
+            let before = producer.pending();
+            producer.flush().expect("a full queue is backpressure");
+            assert_eq!(
+                producer.pending(),
+                before,
+                "span {span} must RETAIN its rows — a retained flush neither \
+                 sends nor discards"
+            );
+            let seq = 100 + i64::from(span);
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+        }
+        assert!(
+            producer.pending() > 1,
+            "retained spans accumulate — that is what makes backpressure lossless"
+        );
+
+        // One span past the cap: stop widening, spill instead.
+        let capped = producer.flush();
+
+        let msg = format!("{:#}", capped.expect_err("the width cap must report"));
+        assert!(
+            msg.contains("RESCUED to the spill tier"),
+            "the message must say the rows are SAFE and where they went; got: {msg}"
+        );
+        assert!(
+            !msg.contains("writer thread is gone"),
+            "the writer is alive — reporting it gone would send an operator to \
+             diagnose a healthy thread. Got: {msg}"
+        );
+        assert_eq!(
+            producer.pending(),
+            0,
+            "the buffer was handed to the spill tier, so it is no longer pending"
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("spill dir")
+                .filter_map(std::result::Result::ok)
+                .count()
+                >= 1,
+            "the rows must be DURABLE on disk — capping width may never mean \
+             dropping rows"
+        );
+    }
+
+    // ---- buffer recycling (2026-09-22, item 44g) -------------------------
+
+    /// A spent batch with a real, non-zero capacity, for the recycle tests.
+    /// PF-4: `capacity` is in staged ROWS (the batch holds rows, not text).
+    fn spent_batch(capacity: usize) -> FlushBatch {
+        FlushBatch {
+            staged: StagedBatch::with_capacity_for_test(capacity),
+            rows: 0,
+            min_seq: 0,
+            max_seq: 0,
+            unbacked: false,
+        }
+    }
+
+    #[test]
+    fn a_written_buffer_round_trips_back_to_the_producer_empty() {
+        let dir = scratch_dir("recycle-round-trip");
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir;
+        producer.flush().expect("hand off");
+
+        let mut batch = rx.try_recv().expect("batch queued");
+        let spent_capacity = batch.staged.capacity();
+        // The allocation itself, not its size: since K6 a fresh buffer is
+        // pre-sized too, so equal capacity alone would not prove reuse.
+        let spent_ptr = batch.staged.as_ptr_for_test();
+        assert!(spent_capacity > 0, "a batch that held a row has capacity");
+        // `write` rescues (no sender in for_test) and then returns the buffer.
+        let _landed = sink.write(&mut batch);
+
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("second hand-off");
+        assert_eq!(
+            producer.staged.capacity(),
+            spent_capacity,
+            "the next batch must reuse the spent buffer, not regrow from zero"
+        );
+        assert_eq!(
+            producer.staged.as_ptr_for_test(),
+            spent_ptr,
+            "the next batch must reuse the spent buffer's allocation"
+        );
+        assert!(
+            producer.staged.is_empty(),
+            "a recycled buffer must arrive EMPTY — a leftover row would be \
+             written twice"
+        );
+    }
+
+    #[test]
+    fn return_spare_buffer_drops_every_buffer_it_must_not_return() {
+        // (case, capacity, pre-fill the lane, drop the producer, expect spares)
+        let cases: [(&str, usize, bool, bool, usize); 4] = [
+            ("normal buffer is returned", 1024, false, false, 1),
+            (
+                "oversized buffer is never returned",
+                MAX_PRODUCER_ROWS + 1,
+                false,
+                false,
+                0,
+            ),
+            (
+                "full lane drops the spare",
+                1024,
+                true,
+                false,
+                FLUSH_QUEUE_DEPTH,
+            ),
+            ("gone producer drops the spare", 1024, false, true, 0),
+        ];
+        for (case, capacity, prefill, drop_producer, expect) in cases {
+            let (producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+            if prefill {
+                for _ in 0..FLUSH_QUEUE_DEPTH {
+                    sink.return_spare_buffer(&mut spent_batch(16));
+                }
+            }
+            let spares = if drop_producer {
+                drop(producer);
+                None
+            } else {
+                Some(producer)
+            };
+
+            let mut batch = spent_batch(capacity);
+            // Must return — never block — in every case.
+            sink.return_spare_buffer(&mut batch);
+
+            assert_eq!(
+                batch.staged.capacity(),
+                0,
+                "{case}: the spent buffer always leaves the batch"
+            );
+            if let Some(p) = spares {
+                let lane = p.spare_buffers.as_ref().expect("split opens the lane");
+                let mut got = 0;
+                while let Ok(spare) = lane.try_recv() {
+                    assert!(spare.is_empty(), "{case}: spares are empty");
+                    assert!(
+                        spare.capacity() <= MAX_PRODUCER_ROWS,
+                        "{case}: no spare may exceed the producer bound"
+                    );
+                    got += 1;
+                }
+                assert_eq!(got, expect, "{case}");
+            }
+        }
+    }
+
+    // Regression: 2026-10-26 (K6) — the row buffer started at zero capacity
+    // and regrew by doubling inside the frames that appended to it (up to a
+    // 1 MiB copy, 0.27–0.35 ms in one frame on the feed_drain bench).
+    //
+    // PF-4 (2026-11-06): the drain stages rows into a pre-sized, pre-touched
+    // batch; the same invariant now holds for it (no regrowth, no
+    // reallocation below the pre-size, a spare-less hand-off reserves the
+    // pre-size on the flush arm).
+    #[test]
+    fn test_regression_tick_row_buffer_is_presized_and_never_regrows_on_append() {
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        assert!(
+            w.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE,
+            "a new writer's staged batch is reserved up front"
+        );
+        let ptr = w.staged.as_ptr_for_test();
+        let cap = w.staged.capacity();
+        // Well under the pre-size: 2,000 rows.
+        for seq in 1..=2_000_i64 {
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        }
+        assert!(!w.staged.is_empty());
+        assert_eq!(w.staged.capacity(), cap, "no regrowth below the pre-size");
+        assert_eq!(w.staged.as_ptr_for_test(), ptr, "no reallocation");
+
+        // A hand-off that finds no spare waiting reserves the pre-size for
+        // the next batch on the flush arm, never leaving a zero batch.
+        let (mut producer, _sink, _rx) = w.split_for_offload();
+        producer.flush().expect("hand off");
+        assert!(producer.staged.is_empty());
+        assert!(
+            producer.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE,
+            "the batch after a spare-less hand-off starts pre-sized"
+        );
+    }
+
+    /// Ported 2026-11-06 (PF-4) from `a_spare_of_another_protocol_is_never_installed`.
+    /// A spare used to be an ILP buffer, so one of the wrong protocol had to
+    /// be refused. A staged batch carries no encoder, so the check moved to
+    /// where text is written: every scratch the writer's rows are encoded
+    /// into (the writer thread's, the rescue thread's, the drain's cold one)
+    /// is built in the writer's encoder, so a recycled spare can never make
+    /// the next batch speak another protocol.
+    #[test]
+    fn a_spare_of_another_protocol_is_never_installed() {
+        use crate::tick_ilp::TickRowBufferKind;
+        for (encoder, kind) in [
+            (
+                TickIlpEncoder::Library,
+                TickRowBufferKind::Library(ProtocolVersion::V1),
+            ),
+            (TickIlpEncoder::Own, TickRowBufferKind::Own),
+        ] {
+            let (mut producer, sink, _rx) =
+                TickWriter::for_test_with_encoder(Feed::Dhan, encoder).split_for_offload();
+            let (rescue, _rescue_rx) = producer.split_rescue_offload();
+            let mut spare = StagedBatch::with_capacity_for_test(4_096);
+            assert!(spare.capacity() >= 4_096);
+            spare.clear();
+            sink.spare_return
+                .as_ref()
+                .expect("split opens the lane")
+                .try_send(spare)
+                .expect("lane has room");
+            producer
+                .append_tick_with_seq(&sample_tick(), 1)
+                .expect("append");
+            producer.flush().expect("hand off");
+            assert_eq!(sink.encode_buf.kind(), kind, "{encoder:?}: writer scratch");
+            assert_eq!(
+                rescue.scratch.borrow().kind(),
+                kind,
+                "{encoder:?}: rescue scratch"
+            );
+            assert_eq!(
+                producer.cold_encode.kind(),
+                kind,
+                "{encoder:?}: cold scratch"
+            );
+            // The spare (4,096 rows) was installed, then reserved to the
+            // pre-size on the flush arm.
+            assert!(
+                producer.staged.capacity() >= crate::tick_stage::TICK_STAGED_ROWS_PRESIZE,
+                "{encoder:?}: the next batch starts pre-sized"
+            );
+        }
+    }
+
+    // Regression: 2026-11-16: a ring wait could not be traced to a
+    // spare-less hand-off, which reserves and touches a fresh 4.5 MiB batch
+    // on the drain. The fresh-reserve count moves only when no spare (of
+    // the pre-size) is waiting.
+    #[test]
+    fn test_regression_fresh_reserve_is_counted_only_when_no_spare_waits() {
+        let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        let start = producer.flush_counters.stage_presize_fresh_count;
+        // No spare waiting: the hand-off reserves fresh.
+        producer
+            .append_tick_with_seq(&sample_tick(), 1)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(
+            producer.flush_counters.stage_presize_fresh_count,
+            start + 1,
+            "no spare waited, so the hand-off reserved a fresh batch"
+        );
+        // A pre-sized spare waiting: the hand-off takes it, no reserve.
+        sink.return_spare_buffer(&mut spent_batch(
+            crate::tick_stage::TICK_STAGED_ROWS_PRESIZE,
+        ));
+        producer
+            .append_tick_with_seq(&sample_tick(), 2)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(
+            producer.flush_counters.stage_presize_fresh_count,
+            start + 1,
+            "a waiting pre-sized spare must not count as a fresh reserve"
+        );
+        // A spare smaller than the pre-size is grown, which is a reserve.
+        sink.return_spare_buffer(&mut spent_batch(512));
+        producer
+            .append_tick_with_seq(&sample_tick(), 3)
+            .expect("append");
+        producer.flush().expect("hand off");
+        assert_eq!(producer.flush_counters.stage_presize_fresh_count, start + 2);
+    }
+
+    #[test]
+    fn a_full_queue_does_not_swallow_a_waiting_spare() {
+        // The spare is taken only AFTER a successful hand-off. On the Full arm
+        // the retained buffer comes back into the producer; a spare taken
+        // earlier would have been silently dropped.
+        let (mut producer, sink, _rx) = TickWriter::for_test(Feed::Dhan).split_for_offload();
+        for i in 0..FLUSH_QUEUE_DEPTH {
+            let seq = 1 + i64::try_from(i).expect("loop bound fits i64");
+            producer
+                .append_tick_with_seq(&sample_tick(), seq)
+                .expect("append");
+            producer.flush().expect("fills the queue");
+        }
+        // Drain whatever spares the fills could have taken (none: lane empty).
+        sink.return_spare_buffer(&mut spent_batch(512));
+        producer
+            .append_tick_with_seq(&sample_tick(), 99)
+            .expect("append");
+        producer.flush().expect("backpressure is not a failure");
+        assert_eq!(producer.pending(), 1, "the row is retained");
+        let lane = producer.spare_buffers.as_ref().expect("lane");
+        assert!(
+            lane.try_recv().is_ok(),
+            "the spare must still be waiting — the Full arm must not take it"
+        );
+    }
+
+    #[test]
+    fn the_sink_reports_zero_rows_when_the_flush_fails() {
+        // The sink's row count is what feeds `record_ticks`. A failed write
+        // must return 0 so feed health DECAYS; returning the batch size would
+        // forge liveness during a database outage, which is the exact
+        // false-OK `flush_and_record`'s own docstring warns about.
+        let dir = scratch_dir("offload-sink-fail");
+        let mut w = TickWriter::for_test(Feed::Dhan);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+        producer.flush().expect("hand off");
+
+        let mut batch = rx.try_recv().expect("batch queued");
+        // The sink has no sender (for_test), so the write must fail.
+        let landed = sink.write(&mut batch);
+
+        assert_eq!(landed, 0, "a failed write lands zero rows");
+        let rescued: Vec<_> = std::fs::read_dir(&dir)
+            .expect("spill dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(
+            rescued.len(),
+            1,
+            "the payload was RESCUED to the spill tier, not dropped"
+        );
+    }
+
+    /// A local ILP endpoint that counts the requests it answers (B1).
+    fn counting_ilp_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 65_536];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        (port, hits)
+    }
+
+    /// Regression, B1 (2026-11-13): with its table not keyed, the live writer
+    /// thread must NOT post (QuestDB would create `ticks` in a shape that can
+    /// never take the DEDUP key); the batch is rescued to the spill instead.
+    /// The open-gate half proves the server would have been reached.
+    #[test]
+    fn test_regression_tick_sink_never_posts_into_an_unkeyed_table() {
+        for (gate_open, expect_hits) in [(false, 0_usize), (true, 1)] {
+            let dir = scratch_dir(if gate_open {
+                "b1-gate-open"
+            } else {
+                "b1-gate-shut"
+            });
+            let (port, hits) = counting_ilp_server();
+            let cfg = QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: port,
+                pg_port: 1,
+                ilp_port: 1,
+            };
+            let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+                if gate_open { |_| true } else { |_| false };
+            let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+            w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+            let (mut producer, mut sink, rx) = w.split_for_offload();
+            sink.spill_dir = dir.clone();
+            producer.flush().expect("hand off");
+            let mut batch = rx.try_recv().expect("batch queued");
+            let landed = sink.write(&mut batch);
+            let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), expect_hits);
+            if gate_open {
+                assert_eq!(landed, 1, "an open gate posts");
+            } else {
+                assert_eq!(landed, 0, "a shut gate lands nothing");
+                assert_eq!(spilled, 1, "the rows are rescued to the spill, not dropped");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Regression, B1 review 2 (2026-11-13): with `ticks` / `tick_quotes`
+    /// keyed and only `feed_aux_packets` not, the writer thread posts the
+    /// tick rows and sets ONLY the aux rows aside to the spill. Before, one
+    /// gate covered all three tables, so an auxiliary table that could not be
+    /// keyed held every live tick out of QuestDB for the whole session.
+    #[test]
+    fn test_regression_an_unkeyed_aux_table_does_not_hold_the_ticks() {
+        let dir = scratch_dir("b1-aux-only-shut");
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| !t.contains(&crate::ilp_table_gate::GatedTable::FeedAuxPackets);
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        let aux = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&aux).expect("append aux");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+        producer.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("batch queued");
+        let landed = sink.write(&mut batch);
+        assert_eq!(landed, 1, "the tick row is posted");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert_eq!(files.len(), 1, "the aux row is set aside, not dropped");
+        let text = std::fs::read_to_string(&files[0]).expect("spill text");
+        assert!(text.starts_with("feed_aux_packets"), "{text}");
+        assert!(!text.contains("\nticks") && !text.starts_with("ticks"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 3 (2026-11-13): with only `ticks` keyed, the
+    /// writer thread posts the tick row and sets the `tick_quotes` and the
+    /// `feed_aux_packets` rows aside, each to its OWN file. A tick batch
+    /// rescued later the same hour lands in the tick rescue file, which holds
+    /// no row of a table the replay is holding. Before, the quote rows held
+    /// the whole batch (one gate for `ticks` and `tick_quotes`) and the aux
+    /// rows went into `ticks-<feed>-<hour>.ilp`, so the replay held every
+    /// later rescued tick of that hour behind `feed_aux_packets`.
+    #[test]
+    fn test_regression_held_tables_are_set_aside_to_their_own_spill_files() {
+        let dir = scratch_dir("b1r3-held-files");
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let only_ticks: fn(&[GatedTable]) -> bool = |t| t == [GatedTable::Ticks];
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(only_ticks);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.append_tick_quote_with_seq(&sample_tick(), 2)
+            .expect("append quote");
+        let aux = AuxPacketRow::from_header(
+            AuxPacketKind::MarketStatus,
+            13,
+            0,
+            1_779_951_600_111_000_000,
+            1_779_951_600_111_000_000,
+        )
+        .expect("row");
+        w.append_aux(&aux).expect("append aux");
+        let (mut producer, mut sink, rx) = w.split_for_offload();
+        sink.spill_dir = dir.clone();
+        producer.flush().expect("hand off");
+        let mut batch = rx.try_recv().expect("batch queued");
+        assert_eq!(sink.write(&mut batch), 1, "the tick row is posted");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A later tick batch rescued the same hour (QuestDB refusing it here
+        // stands in for a stall): it goes to the tick rescue file.
+        producer
+            .append_tick_with_seq(&sample_tick(), 3)
+            .expect("append");
+        producer.flush().expect("hand off");
+        let mut later = rx.try_recv().expect("batch queued");
+        sink.sender = None;
+        assert_eq!(sink.write(&mut later), 0, "rescued");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        assert_eq!(names.len(), 3, "{names:?}");
+        for (name, table) in names
+            .iter()
+            .zip(["feed_aux_packets,", "tick_quotes,", "ticks,"])
+        {
+            let text = std::fs::read_to_string(dir.join(name)).expect("spill text");
+            assert!(!text.is_empty(), "{name}");
+            assert!(
+                text.lines().all(|l| l.starts_with(table)),
+                "{name} must hold only {table} rows: {text}"
+            );
+        }
+        assert!(names[0].starts_with("held-feed_aux_packets-dhan-"));
+        assert!(names[1].starts_with("held-tick_quotes-dhan-"));
+        assert!(names[2].starts_with("ticks-dhan-"));
+        for name in &names {
+            assert!(
+                crate::tick_spill_replay::spill_file_hour(&dir.join(name)).is_some(),
+                "the replay must still read the hour of {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression, B1 review 3 (2026-11-13): the ensure judges `ticks` and
+    /// `tick_quotes` on their own key statements. A stand-in that refuses
+    /// only the `tick_quotes` DEDUP (QuestDB created that table itself) must
+    /// leave `ticks` keyed. Before, one chained verdict left `ticks` unkeyed
+    /// too and every live tick of the session went to the spill.
+    #[tokio::test]
+    async fn test_regression_a_refused_tick_quotes_key_leaves_ticks_keyed() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8_192];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request);
+                let refuse = head.contains("tick_quotes") && head.contains("DEDUP");
+                let reply: &[u8] = if refuse {
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                };
+                let _ = stream.write_all(reply);
+            }
+        });
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let verdict = ensure_ticks_tables_verdict(&cfg).await;
+        assert!(!verdict.every_statement_accepted);
+        assert!(verdict.ticks.accepted, "ticks keyed on its own statements");
+        assert!(!verdict.ticks.refused_by_server);
+        assert!(!verdict.tick_quotes.accepted);
+        assert!(
+            verdict.tick_quotes.refused_by_server,
+            "only tick_quotes is probed for an auto-created shape"
+        );
+    }
+
+    /// The unsplit (synchronous) arm: a batch with no aux row is not held by
+    /// an unkeyed auxiliary table (B1 review 2).
+    #[test]
+    fn test_sync_flush_posts_ticks_while_only_the_aux_table_is_unkeyed() {
+        let (port, hits) = counting_ilp_server();
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let gate: fn(&[crate::ilp_table_gate::GatedTable]) -> bool =
+            |t| !t.contains(&crate::ilp_table_gate::GatedTable::FeedAuxPackets);
+        let mut w = TickWriter::new(&cfg, Feed::Dhan).with_table_gate_for_test(gate);
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        w.flush().expect("a ticks-only batch posts");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The drain must not write the rescue file itself.
+    ///
+    /// This is the defect the split exists to remove: `discard_pending` used to
+    /// do `create_dir_all`, a `read_dir` + per-entry `metadata()` walk of the
+    /// spill directory AND its quarantine subdirectory, a live free-space probe
+    /// (a forked `df` until 2026-10-12, one `statvfs` call since), and up to
+    /// 32 MiB of file write —
+    /// all on the frame-drain task, and all at the one moment the disk is
+    /// already wedged, because the cut that calls it only trips when the flush
+    /// queue has been full for several consecutive flushes.
+    #[test]
+    fn a_split_writer_hands_the_rescue_off_instead_of_writing_it() {
+        let dir = scratch_dir("rescue-handoff");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        assert_eq!(w.pending(), 1);
+
+        let rescued = w.discard_pending();
+
+        assert_eq!(rescued, 1, "the rows are accounted for either way");
+        assert_eq!(w.pending(), 0, "the producer must let go of them");
+        let batch = rx
+            .try_recv()
+            .expect("the payload must be on the rescue queue, not on disk");
+        assert_eq!(batch.rows(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) == 0,
+            "the drain must not have touched the spill directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Settles every queued and parked rescue batch through the sink, so the
+    /// watermark floors they hold are released for the other tests sharing
+    /// the process-wide floor table.
+    fn settle_rescues(
+        w: &mut TickWriter,
+        sink: &TickRescueSink,
+        rx: &std::sync::mpsc::Receiver<RescueBatch>,
+    ) {
+        loop {
+            while let Ok(batch) = rx.try_recv() {
+                sink.rescue(&batch);
+            }
+            if w.parked_rescue.is_empty() {
+                break;
+            }
+            let _ = w.flush();
+        }
+    }
+
+    /// A full rescue queue falls back to the OLD behaviour, never to a drop.
+    ///
+    /// The whole point of the fallback: a slow drain is bad, a lost tick is
+    /// worse. If this ever became a refusal, the change would have traded a
+    /// stall for exactly the loss it was built to prevent.
+    ///
+    /// Since 2026-09-26 (audit fix PR3) this holds for rows with NO
+    /// write-ahead-log backing (a minted sequence, as `append_tick` uses).
+    /// WAL-backed rows are deferred to the WAL instead — see
+    /// `full_rescue_queue_defers_to_wal_without_file_io`.
+    ///
+    /// H4 (2026-10-03): the drain first PARKS such a batch in RAM, up to
+    /// [`PARKED_RESCUE_MAX_BATCHES`]; only past that bound does it write inline.
+    #[test]
+    fn a_full_rescue_queue_writes_inline_rather_than_dropping() {
+        let dir = scratch_dir("rescue-full");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+
+        // Fill the queue, then the park, with nothing draining.
+        for _ in 0..RESCUE_QUEUE_DEPTH + PARKED_RESCUE_MAX_BATCHES {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "queue and park absorb the burst without a file write on the drain"
+        );
+        // The next one fits nowhere and must therefore land on disk.
+        w.append_tick(&sample_tick()).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+
+        let files = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert!(
+            files > 0,
+            "with the queue and the park full the rescue must have been written inline"
+        );
+        settle_rescues(&mut w, &sink, &rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: a parked batch reaches the rescue thread on the next flush once the
+    /// queue has room, even with nothing pending, and oldest first.
+    #[test]
+    fn test_regression_h4_a_parked_rescue_is_handed_on_by_the_next_flush() {
+        let dir = scratch_dir("h4-park-retry");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 2 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2, "two batches parked");
+        // The rescue thread takes what was queued.
+        let mut settled = Vec::new();
+        for _ in 0..RESCUE_QUEUE_DEPTH {
+            settled.push(rx.try_recv().expect("queued"));
+        }
+        w.flush()
+            .expect("nothing pending; the flush still retries the park");
+        assert!(
+            w.parked_rescue.is_empty(),
+            "the park emptied into the queue"
+        );
+        assert_eq!(w.parked_rescue_slots, 0);
+        settled.extend(rx.try_iter());
+        assert_eq!(
+            settled.len(),
+            RESCUE_QUEUE_DEPTH + 2,
+            "both parked batches were handed on"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0),
+            0,
+            "nothing was written on the drain"
+        );
+        for batch in &settled {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: shutdown hands every parked batch to the rescue thread before the
+    /// queue closes, so nothing parked is left behind.
+    #[test]
+    fn test_regression_h4_closing_the_rescue_queue_hands_on_the_park() {
+        let dir = scratch_dir("h4-park-close");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 1 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 1);
+        for _ in 0..RESCUE_QUEUE_DEPTH {
+            sink.rescue(&rx.try_recv().expect("queued"));
+        }
+        w.close_rescue_offload();
+        assert!(w.parked_rescue.is_empty());
+        let handed: Vec<_> = rx.try_iter().collect();
+        assert_eq!(handed.len(), 1, "the parked batch reached the thread");
+        for batch in &handed {
+            sink.rescue(batch);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: a parked batch whose rescue thread dies is written inline on the
+    /// next retry, never dropped.
+    #[test]
+    fn test_regression_h4_a_parked_rescue_survives_a_dead_rescue_thread() {
+        let dir = scratch_dir("h4-park-dead");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 1 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 1);
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        // The thread dies with the batch still parked.
+        drop(rx);
+        let _ = w.flush();
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "the parked rows must be on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: the shutdown hand-off never waits past its deadline.
+    #[test]
+    fn test_hand_off_before_sends_gives_back_on_gone_and_times_out_on_full() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert!(matches!(
+            hand_off_before(&tx, 1, far),
+            ShutdownHandOff::Sent
+        ));
+        // Full, receiver alive, never drained: the deadline gives it back.
+        let started = std::time::Instant::now();
+        let soon = started + std::time::Duration::from_millis(50);
+        match hand_off_before(&tx, 2, soon) {
+            ShutdownHandOff::TimedOut(back) => assert_eq!(back, 2),
+            other => panic!("expected a timeout, got {other:?}"), // APPROVED: test
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "bounded by the deadline plus one poll"
+        );
+        drop(rx);
+        match hand_off_before(&tx, 3, far) {
+            ShutdownHandOff::Gone(back) => assert_eq!(back, 3),
+            other => panic!("expected gone, got {other:?}"), // APPROVED: test
+        }
+    }
+
+    /// Audit K1: a rescue thread that is alive but never takes a batch (a
+    /// wedged disk) no longer holds the shutdown: the parked batches are
+    /// written inline once the budget passes. Before K1 this test hung on
+    /// the blocking `send`.
+    #[test]
+    fn test_regression_k1_shutdown_hand_off_has_a_deadline() {
+        let dir = scratch_dir("k1-park-deadline");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = w.split_rescue_offload();
+        for _ in 0..RESCUE_QUEUE_DEPTH + 2 {
+            w.append_tick(&sample_tick()).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert_eq!(w.parked_rescue.len(), 2, "two batches parked");
+        // `rx` stays alive and is never drained: the queue stays full.
+        let started = std::time::Instant::now();
+        w.close_rescue_offload();
+        let took = started.elapsed();
+        assert!(
+            took < RESCUE_SHUTDOWN_HANDOFF_BUDGET + std::time::Duration::from_secs(3),
+            "the close returned in {took:?}, within the budget"
+        );
+        assert!(w.parked_rescue.is_empty());
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "the parked rows were written inline, not dropped"
+        );
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: WAL-backed rows are never parked; the WAL defers them as before.
+    #[test]
+    fn test_regression_h4_wal_backed_rows_are_deferred_not_parked() {
+        let dir = scratch_dir("h4-park-backed");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
+        let (sink, rx) = w.split_rescue_offload();
+        for k in 0..RESCUE_QUEUE_DEPTH as i64 + 1 {
+            w.append_tick_with_seq(&sample_tick(), (1 << 20) + k)
+                .expect("append");
+            assert_eq!(w.discard_pending(), 1);
+        }
+        assert!(w.parked_rescue.is_empty(), "backed rows go to the WAL");
+        settle_rescues(&mut w, &sink, &rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// H4: the park stays within its byte bound, and the bound is the same
+    /// on the tick and depth writers. PF-4 (2026-11-06): the tick park holds
+    /// staged rows, so its bound is rows; the TEXT those rows can encode to is
+    /// still exactly the depth park's 128 MiB, and the RAM they hold is below it.
+    #[test]
+    fn the_rescue_park_is_bounded_like_the_depth_one() {
+        assert_eq!(
+            PARKED_RESCUE_MAX_BATCHES,
+            crate::depth_persistence::DEPTH_PARKED_RESCUE_MAX_BATCHES
+        );
+        assert_eq!(
+            PARKED_RESCUE_MAX_ROWS * crate::tick_stage::MAX_ILP_LINE_BYTES,
+            crate::depth_persistence::DEPTH_PARKED_RESCUE_MAX_BYTES,
+            "the parked rows' worst-case text equals the depth park's bound"
+        );
+        assert_eq!(
+            PARKED_RESCUE_MAX_BYTES,
+            PARKED_RESCUE_MAX_ROWS * crate::tick_stage::STAGED_SLOT_BYTES
+        );
+        assert!(PARKED_RESCUE_MAX_BYTES <= 128 * 1024 * 1024);
+    }
+
+    /// A writer that was never split behaves exactly as before.
+    #[test]
+    fn an_unsplit_writer_still_rescues_inline() {
+        let dir = scratch_dir("rescue-unsplit");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "no rescue channel means the old synchronous path, unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the rescue queue must leave the writer rescuing inline, not
+    /// refusing — the end-of-session rows still have to reach the spill tier.
+    #[test]
+    fn closing_the_rescue_queue_restores_the_inline_path() {
+        let dir = scratch_dir("rescue-closed");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, _rx) = w.split_rescue_offload();
+        w.close_rescue_offload();
+
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(
+            std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0) > 0,
+            "after close the rescue must still land on disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The queue is deliberately shallow: every payload in it is rows that
+    /// exist nowhere else, so depth here is a crash-loss window.
+    #[test]
+    fn the_rescue_queue_is_shallow_on_purpose() {
+        assert!(
+            RESCUE_QUEUE_DEPTH >= 1 && RESCUE_QUEUE_DEPTH <= 4,
+            "one payload in flight plus a slot to hand the next one over; \
+             deeper holds more rows that exist only in this process"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_was_never_split_behaves_exactly_as_before() {
+        // The offload is opt-in at ONE call site. Every other caller — and
+        // every existing test — must be untouched, so a writer that was never
+        // split still takes the synchronous no-sender arm and still rescues.
+        let dir = scratch_dir("offload-unsplit");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        w.append_tick_with_seq(&sample_tick(), 1).expect("append");
+
+        let err = w.flush().expect_err("no sender is still an error");
+
+        assert!(
+            format!("{err:#}").contains("no ILP sender"),
+            "unchanged message, got: {err:#}"
+        );
+        assert_eq!(w.pending(), 0, "the buffer was cleared by the rescue");
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .expect("spill dir")
+                .filter_map(std::result::Result::ok)
+                .count(),
+            1,
+            "the synchronous rescue tier still runs for an unsplit writer"
+        );
+    }
+
+    /// 2026-10-13 (top_volume spill plan item 1): the tick spill now runs
+    /// through the shared `spill_failed_ilp_to`, fed `tick_spill_spec`. This
+    /// pins that the spec is built from exactly the constants the tick-only
+    /// function used, so the tick tier's file name, ceiling, reserves, blind
+    /// policy and drain total are unchanged.
+    #[test]
+    fn test_spill_failed_ilp_to_with_tick_spill_spec_reproduces_the_old_file_name_and_reserve() {
+        let dir = scratch_dir("tick-spec");
+        let spec = tick_spill_spec(&dir, Feed::Dhan);
+        assert_eq!(spec.dir, dir.as_path());
+        assert_eq!(spec.file_prefix, "ticks");
+        assert_eq!(spec.feed, Feed::Dhan);
+        assert_eq!((spec.ceiling)(), tick_spill_max_bytes());
+        assert_eq!(
+            spec.ceiling_kind,
+            SpillCeilingKind::Soft {
+                reserve: SPILL_SOFT_CEILING_FREE_RESERVE_BYTES
+            }
+        );
+        assert_eq!(spec.free_reserve, SPILL_MIN_FREE_HEADROOM_BYTES);
+        assert_eq!(spec.blind, BlindWritePolicy::FailOpen);
+        assert_eq!(spec.tier, SpillTier::Tick);
+        assert!(
+            spec.drain_held
+                .is_some_and(|cache| std::ptr::eq(cache, &TICK_DRAIN_SPILL_HELD)),
+            "the tick spec must keep the drain's remembered folder total"
+        );
+
+        // The file name is the pre-2026-10-13 one: `ticks-<feed>-<unix hour>.ilp`.
+        let path = spill_failed_ilp(
+            &dir,
+            b"t\n",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("ticks-dhan-472222.ilp")
+        );
+        // The wrapper and the shared function with the tick spec are one
+        // path: both append to the same file.
+        let same = spill_failed_ilp_to(&spec, b"u\n", 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("spill through the shared function");
+        assert_eq!(same, path);
+        assert_eq!(std::fs::read(&path).expect("readable"), b"t\nu\n".to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_spill_tier_labels_are_the_counter_labels() {
+        // The labels double as `tv_spill_free_probe_blind_total{tier}` values,
+        // which the boot seed pre-registers by the same literals.
+        assert_eq!(SpillTier::Tick.label(), "tick");
+        // Counting with no recorder installed must not panic.
+        SpillTier::Tick.count_free_probe_blind();
+    }
+
+    #[test]
+    fn spill_failed_ilp_writes_the_payload_verbatim_so_it_can_be_replayed() {
+        // The whole point of storing ILP text rather than a bespoke format:
+        // the file IS a valid QuestDB /write body. If this ever stored a
+        // re-encoded shape, the documented one-command recovery would be a
+        // lie and nobody would find out until they needed it.
+        let dir = scratch_dir("verbatim");
+        let payload = b"ticks,feed=dhan,segment=IDX_I security_id=13i 1700000000000000000\n";
+        let path = spill_failed_ilp(
+            &dir,
+            payload,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill writes to a fresh dir");
+        let written = std::fs::read(&path).expect("spill file is readable");
+        assert_eq!(
+            written.as_slice(),
+            payload,
+            "the spill must be byte-identical to the ILP the flush would have sent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_appends_rather_than_truncating_a_second_failure() {
+        // Two failures in one hour land in the same file. Truncating would
+        // silently discard the first episode's rows while reporting both as
+        // rescued -- a false-OK inside the rescue itself.
+        let dir = scratch_dir("append");
+        let first = b"ticks first=1i 1700000000000000000\n";
+        let second = b"ticks second=2i 1700000000000000001\n";
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
+        assert_eq!(p1, p2, "same feed, same hour, same file");
+        let written = std::fs::read(&p1).expect("readable");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(second);
+        assert_eq!(written, expected, "both episodes survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit K1: a torn fragment (no final newline) left by a failed append
+    /// is ended before the next append, so the next row is not joined onto
+    /// it. Bite: drop the `file_ends_mid_line` guard and the file reads
+    /// `...torntrue second=...` on one line.
+    #[test]
+    fn test_regression_spill_append_ends_a_torn_fragment_first() {
+        let dir = scratch_dir("torn-fragment");
+        let first = b"ticks first=1i 1700000000000000000\n";
+        let p1 = spill_failed_ilp(&dir, first, Feed::Dhan, 1_700_000_000, SPILL_SYNC_OFF_DRAIN)
+            .expect("first spill");
+        // A failed partial write: a fragment with no newline.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&p1)
+                .expect("open"); // APPROVED: test
+            f.write_all(b"ticks torn").expect("fragment"); // APPROVED: test
+        }
+        let second = b"ticks second=2i 1700000000000000001\n";
+        let p2 = spill_failed_ilp(
+            &dir,
+            second,
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("second spill");
+        assert_eq!(p1, p2);
+        let written = std::fs::read(&p1).expect("readable");
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(b"ticks torn\n");
+        expected.extend_from_slice(second);
+        assert_eq!(written, expected, "the second row stays on its own line");
+        // A file that already ends in a newline gets no extra byte.
+        assert!(!file_ends_mid_line(&std::fs::File::open(&p1).expect("open")).expect("probe"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_separates_feeds_and_hours() {
+        // Bounded file count with a replayable granularity: an operator
+        // repairing a known-bad window must not have to re-ingest the day.
+        let dir = scratch_dir("split");
+        let a = spill_failed_ilp(
+            &dir,
+            b"a\n",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("a");
+        let b = spill_failed_ilp(
+            &dir,
+            b"b\n",
+            Feed::Dhan,
+            1_700_003_600,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("b");
+        assert_ne!(a, b, "a different hour is a different file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_dir_bytes_sums_only_files_and_survives_an_unreadable_dir() {
+        // Non-vacuity plus the fail-soft arm: failing to MEASURE the cap must
+        // not fail the rescue the cap protects, so a missing dir reads 0
+        // rather than propagating.
+        let dir = scratch_dir("bytes");
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            0,
+            "a dir that does not exist reads 0"
+        );
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
+        assert_eq!(spill_dir_bytes(&dir), 10, "exactly the bytes written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quarantined files count toward the spill ceiling.
+    ///
+    /// Before 2026-08-28 `spill_dir_bytes` was non-recursive and `quarantine/`
+    /// is a subdirectory, so files the replay set aside as permanently refused
+    /// counted toward NOTHING — not this ceiling and not any free-space check.
+    /// They grew without any bound at all, on the same volume that filled
+    /// completely on 2026-08-25 and WAL-suspended fifteen tables.
+    ///
+    /// They are not junk: a whole file is quarantined because ONE row is
+    /// malformed, and a recorded case had 1,292 good rows out of 1,293. So this
+    /// was real tick data silently consuming the disk.
+    #[test]
+    fn quarantined_bytes_count_toward_the_spill_ceiling() {
+        let dir = scratch_dir("quarantine-counts");
+        spill_failed_ilp(
+            &dir,
+            b"0123456789",
+            Feed::Dhan,
+            1_700_000_000,
+            SPILL_SYNC_OFF_DRAIN,
+        )
+        .expect("spill");
+        assert_eq!(spill_dir_bytes(&dir), 10, "baseline: the live spill file");
+
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("quarantine dir");
+        std::fs::write(q.join("refused-0001.ilp"), b"abcdefghijklmno").expect("quarantined file");
+
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            25,
+            "a quarantined file must count against the ceiling — uncounted, it \
+             grows without bound and consumes the volume instead, which is what \
+             took fifteen tables down on 2026-08-25"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The descent is exactly one level. A directory nested INSIDE quarantine is
+    /// not walked, so this can never become an unbounded filesystem sweep on a
+    /// path that runs before every rescue.
+    #[test]
+    fn the_spill_size_walk_descends_exactly_one_level() {
+        let dir = scratch_dir("quarantine-depth");
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        let deeper = q.join("nested");
+        std::fs::create_dir_all(&deeper).expect("nested dir");
+        std::fs::write(q.join("counted.ilp"), b"12345").expect("counted");
+        std::fs::write(deeper.join("ignored.ilp"), b"9999999999").expect("ignored");
+
+        assert_eq!(
+            spill_dir_bytes(&dir),
+            5,
+            "only the quarantine directory itself is walked; going deeper would \
+             make a pre-rescue sizing call an unbounded tree walk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_spill_ceiling_is_a_real_bound_that_scales_with_the_volume() {
+        // A rescue that can fill the root volume is not a rescue: QuestDB and
+        // the frame WAL share this disk. Past the ceiling the rows are dropped
+        // and counted -- an honest failure, never a hidden one.
+        //
+        // But the ceiling must also be big enough to actually rescue. The
+        // fixed 512 MiB it replaced was 0.26% of the 200 GB volume, and on
+        // 2026-08-25 it refused a boot-time rescue and 1,695,983 ticks were
+        // lost permanently in one event.
+        assert!(
+            TICK_SPILL_MIN_MAX_BYTES > 0,
+            "the floor must be a real bound"
+        );
+        let ceiling = tick_spill_max_bytes();
+        assert!(
+            ceiling >= TICK_SPILL_MIN_MAX_BYTES,
+            "the derived ceiling must never be SMALLER than the old fixed cap — \
+             this change exists to stop losing ticks, not to tighten the bound"
+        );
+        // Resolved once: the enforcement can never disagree with a logged value.
+        assert_eq!(ceiling, tick_spill_max_bytes(), "must be memoised");
+        // And it must stay a small fraction, whatever the disk.
+        assert!(
+            TICK_SPILL_VOLUME_FRACTION >= 16,
+            "the tier must never be able to threaten the database it rescues from"
+        );
+        assert_eq!(TICK_SPILL_DIR, "data/spill/ticks");
+    }
+
+    #[test]
+    fn discard_pending_on_an_empty_buffer_writes_no_spill_file() {
+        // Non-vacuity for the whole rescue: a healthy writer must never touch
+        // the spill path. Without this, a rescue that fired unconditionally
+        // would pass every test above while writing a file per flush.
+        let mut writer = TickWriter::for_test(Feed::Dhan);
+        assert_eq!(
+            writer.discard_pending(),
+            0,
+            "nothing pending, nothing rescued"
+        );
+    }
+
+    #[test]
+    fn discard_pending_rescues_real_rows_to_the_spill_instead_of_dropping_them() {
+        // The behaviour that actually matters, exercised through the REAL
+        // path rather than the helper. 1,377 unrepeatable ticks were dropped
+        // on 2026-08-21 by the code this replaces; this asserts they would
+        // now be on disk and replayable.
+        let dir = scratch_dir("rescue");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        writer
+            .append_tick(&sample_tick())
+            .expect("a tick buffers without a sender");
+        assert_eq!(writer.pending(), 1, "one row is pending");
+
+        let moved = writer.discard_pending();
+
+        assert_eq!(moved, 1, "the row left the buffer");
+        assert_eq!(writer.pending(), 0, "the buffer is cleared either way");
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("the rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one spill file");
+        let body = std::fs::read_to_string(files[0].path()).expect("readable");
+        assert!(
+            body.contains("ticks"),
+            "the spill holds the ILP row, not an empty file: {body}"
+        );
+        assert!(
+            !body.is_empty(),
+            "a zero-byte rescue would report success while losing the rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-26 audit fix PR3: with the rescue thread gone, rows that carry
+    /// a capture sequence are handed to the WAL and NO spill file is written
+    /// on the drain.
+    #[test]
+    fn full_rescue_queue_defers_to_wal_without_file_io() {
+        let dir = scratch_dir("defer-wal");
+        let mut writer = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx); // thread gone -> Disconnected on try_send
+        writer
+            .append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("buffers without a sender");
+        assert_eq!(writer.pending(), 1);
+
+        let moved = writer.discard_pending();
+
+        assert_eq!(moved, 1, "the row left the buffer");
+        assert_eq!(writer.pending(), 0);
+        let spilled = std::fs::read_dir(&dir)
+            .map(|d| d.filter_map(std::result::Result::ok).count())
+            .unwrap_or(0);
+        assert_eq!(spilled, 0, "the drain must not write a spill file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows WITHOUT a capture sequence exist nowhere else, so they keep the
+    /// inline spill even when the rescue thread is gone.
+    #[test]
+    fn deferred_rows_without_capture_seq_still_spill_inline() {
+        let dir = scratch_dir("defer-noseq");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx);
+        writer.append_tick(&sample_tick()).expect("buffers");
+
+        assert_eq!(writer.discard_pending(), 1);
+
+        let spilled = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            spilled, 1,
+            "no capture sequence -> inline spill, never a drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-10-02: rows from a frame the WAL REFUSED carry a real, non-zero
+    /// capture sequence yet exist in no WAL segment. Marked unbacked, they must
+    /// take the inline spill when the rescue thread is gone — never the
+    /// "deferred to the WAL" drop, whose replay can never come.
+    #[test]
+    fn mark_pending_unbacked_keeps_rows_in_the_inline_spill() {
+        let dir = scratch_dir("unbacked-inline");
+        let mut writer = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (_sink, rx) = writer.split_rescue_offload();
+        drop(rx); // thread gone -> Disconnected on try_send
+        writer
+            .append_tick_with_seq(&sample_tick(), 1 << 20)
+            .expect("buffers without a sender");
+        assert!(
+            !writer.pending_unbacked(),
+            "a WAL-shaped sequence alone reads as backed"
+        );
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+
+        assert_eq!(writer.discard_pending(), 1, "the row left the buffer");
+
+        let spilled = std::fs::read_dir(&dir)
+            .expect("the inline rescue created the dir")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(
+            spilled, 1,
+            "an unbacked row must be written inline, never dropped as WAL-backed"
+        );
+        assert!(
+            !writer.pending_unbacked(),
+            "discard_pending consumes the mark"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh writer reads as backed; the mark sets it and nothing but
+    /// `discard_pending` clears it.
+    #[test]
+    fn pending_unbacked_is_false_until_marked() {
+        let mut writer = TickWriter::for_test(Feed::Dhan);
+        assert!(!writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked());
+        writer.mark_pending_unbacked();
+        assert!(writer.pending_unbacked(), "marking twice is idempotent");
+    }
+
+    #[test]
+    fn deferred_to_wal_names_are_pinned() {
+        assert_eq!(
+            TICK_RESCUE_DEFERRED_TO_WAL_COUNTER,
+            "tv_tick_rescue_deferred_to_wal_total"
+        );
+        assert_eq!(RESCUE_DEFERRED_TO_WAL_SOURCE, "rescue_deferred_to_wal");
+        assert_ne!(RESCUE_DEFERRED_TO_WAL_SOURCE, RESCUED_TO_SPILL_SOURCE);
+    }
+
+    // -- never-traded sentinel timestamp (2026-08-21) -----------------------
+
+    /// Dhan's measured never-traded LTT sentinel: 1980-01-01, IST-epoch secs.
+    const SENTINEL_LTT: u32 = 315_532_800;
+
+    /// BITE TEST (2026-08-25) — the year-2106 partition.
+    ///
+    /// `exchange_timestamp` is a raw `u32` off the wire, so `0xFFFFFFFF` is
+    /// ~2106-02-07. The stamp had a FLOOR only, so that value passed straight
+    /// through and became the row's DESIGNATED timestamp — a far-future
+    /// QuestDB partition that retention and archival, which key on the trading
+    /// day, can never reach, while every `max(ts)` and range scan over `ticks`
+    /// silently includes it.
+    ///
+    /// Deleting the `<= MAX_PLAUSIBLE_EXCHANGE_TS_SECS` half of the guard makes
+    /// this fail.
+    #[test]
+    fn an_all_ones_exchange_timestamp_never_stamps_a_year_2106_partition() {
+        let received = 1_787_000_000_i64 * 1_000_000_000;
+        let stamped = row_timestamp_ist_nanos(u32::MAX, Some(received));
+        assert_eq!(
+            stamped, received,
+            "an out-of-band LTT must fall back to the receipt time, exactly as \
+             a below-floor one does"
+        );
+        // And the ceiling is a real edge, not a rounded-off approximation.
+        let max = tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS;
+        assert_eq!(
+            row_timestamp_ist_nanos(max, Some(received)),
+            i64::from(max) * 1_000_000_000,
+            "the last in-band second must still keep the exchange's own time"
+        );
+        assert_eq!(
+            row_timestamp_ist_nanos(max + 1, Some(received)),
+            received,
+            "one second past the ceiling must fall back"
+        );
+    }
+
+    /// BITE TEST (2026-08-25) — a NaN `average_traded_price` reaching ILP.
+    ///
+    /// The finiteness loop guarded five fields (the LTP alone since
+    /// 2026-10-01); `average_traded_price` was never in it. `NaN != 0.0` is
+    /// true, so it passed the "not carried" gate and went to the wire — the
+    /// exact batch-reject → spill → wedged-replay chain that
+    /// `TickRowError::PriceNotFinite` documents as closed.
+    #[test]
+    fn a_non_finite_average_traded_price_becomes_null_and_never_refuses_the_tick() {
+        let tick = tickvault_common::tick_types::ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 100.0,
+            exchange_timestamp: 1_787_000_000,
+            average_traded_price: f32::NAN,
+            ..Default::default()
+        };
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("a good LTP must still produce a row"); // APPROVED: test
+        assert_eq!(
+            row.avg_price, None,
+            "a non-finite optional price must be NULL, never NaN on the wire"
+        );
+        assert!(
+            (row.ltp - 100.0).abs() < f64::EPSILON,
+            "and the tick itself must survive — refusing it would lose a good \
+             LTP to protect an auxiliary column"
+        );
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_keeps_a_real_exchange_time_untouched() {
+        // Non-vacuity, and the one that protects every NORMAL row: a traded
+        // tick must keep the exchange's own time. If this ever returned the
+        // receipt time, every price in the database would be stamped with when
+        // WE saw it rather than when it TRADED -- silently, and for everything.
+        let ltt: u32 = 1_787_000_000;
+        assert_eq!(
+            row_timestamp_ist_nanos(ltt, Some(9_999_999_999_999_999)),
+            i64::from(ltt) * 1_000_000_000,
+            "a plausible LTT wins over the receipt time, always"
+        );
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_falls_back_for_the_1980_sentinel() {
+        // The measured case: 945,501 rows on 2026-08-21 carried this exact
+        // value, and 99.2% of them carried a real order book with it.
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(
+            row_timestamp_ist_nanos(SENTINEL_LTT, Some(received)),
+            received,
+            "a sentinel is not a time — the row takes its receipt time"
+        );
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_falls_back_for_a_literal_zero_ltt() {
+        // The other 7,282 rows. Both sentinel shapes must behave identically,
+        // or one of them silently keeps landing in 1970.
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(row_timestamp_ist_nanos(0, Some(received)), received);
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_keeps_the_sentinel_when_no_receipt_time_exists() {
+        // Fail-safe. With no real time available, a GUESS would be worse than a
+        // value that is visibly wrong: the row stays out of the live range and
+        // stays findable as an anomaly, exactly as it does today.
+        assert_eq!(
+            row_timestamp_ist_nanos(SENTINEL_LTT, None),
+            315_532_800_000_000_000
+        );
+        assert_eq!(row_timestamp_ist_nanos(0, None), 0);
+    }
+
+    #[test]
+    fn row_timestamp_ist_nanos_agrees_with_the_aggregators_own_floor() {
+        // The floor is SHARED with the aggregator rather than re-declared, so
+        // the candle refusal and the timestamp fallback can never disagree
+        // about what counts as a real time. Pinned at the exact boundary.
+        let floor = tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS;
+        let received = 1_787_300_000_000_000_000_i64;
+        assert_eq!(
+            row_timestamp_ist_nanos(floor, Some(received)),
+            i64::from(floor) * 1_000_000_000,
+            "exactly AT the floor is plausible and must be kept"
+        );
+        assert_eq!(
+            row_timestamp_ist_nanos(floor - 1, Some(received)),
+            received,
+            "one second below the floor is a sentinel"
+        );
+    }
+
+    #[test]
+    fn a_sentinel_row_is_stamped_at_receipt_and_keeps_its_order_book() {
+        // The whole reason these rows are kept rather than dropped: they carry
+        // a live book. This drives the REAL row builder and asserts the row is
+        // findable in the live time range. The raw sentinel column is gone
+        // (2026-09-22); "never traded" stays recoverable because the row's
+        // `ts` is EXACTLY its receipt instant, which a real whole-second trade
+        // time never is -- `WHERE ts = received_at` in SQL.
+        let mut tick = sample_tick();
+        tick.exchange_timestamp = SENTINEL_LTT;
+        tick.last_traded_price = 0.0;
+        tick.total_buy_quantity = 8_397_000;
+        tick.total_sell_quantity = 9_019_000;
+        tick.received_at_nanos = 1_787_300_000_123_456_789;
+
+        let row = TickRow::from_parsed_tick(&tick, 1).expect("a sentinel tick still builds a row");
+
+        assert_ne!(
+            row.ts_ist_nanos,
+            i64::from(SENTINEL_LTT) * 1_000_000_000,
+            "the row must no longer be stamped into the 1980 partition"
+        );
+        assert_eq!(
+            Some(row.ts_ist_nanos),
+            row.received_at_ist_nanos,
+            "a sentinel row's ts IS its receipt instant, which is what makes it \
+             recoverable in SQL without the removed raw-LTT column"
+        );
+        assert_ne!(
+            row.ts_ist_nanos % 1_000_000_000,
+            0,
+            "the receipt carries nanoseconds, so it can never be mistaken for a \
+             whole-second trade time"
+        );
+        assert_eq!(row.total_buy_qty, Some(8_397_000), "the book survives");
+        assert_eq!(row.total_sell_qty, Some(9_019_000), "the book survives");
+    }
+
+    #[test]
+    fn the_rescue_path_still_increments_the_alarmed_counter() {
+        // REGRESSION RATCHET (2026-08-21). The first version of the spill
+        // rescue incremented ONLY `tv_ticks_spilled_total`, which is neither
+        // EMF-selected nor alarmed, and thereby diverted the common flush
+        // failure off `dhan_ticks_dropped` — the only pager watching it. The
+        // rescue made the loss recoverable and simultaneously made it
+        // INVISIBLE, which is a strictly worse trade and the exact false-OK
+        // this repo forbids.
+        //
+        // Source-scan rather than a recorder assertion, deliberately: what
+        // must never regress is that the ALARMED NAME appears on the success
+        // arm. A behavioural test on a metrics recorder would still pass if
+        // someone renamed the counter to another unalarmed one.
+        let src = include_str!("tick_persistence.rs");
+        let ok_arm = src
+            .split("Ok(path) => {")
+            .nth(1)
+            .expect("the spill-success arm exists");
+        let arm_body = ok_arm
+            .split("Err(err) => {")
+            .next()
+            .expect("bounded by the failure arm");
+        assert!(
+            arm_body.contains("tv_ticks_dropped_total"),
+            "the ALARMED counter must fire on a rescue too — a rescued row is \
+             still absent from QuestDB, which is what dhan_ticks_dropped pages \
+             on. Removing it silently un-pages the flush failure."
+        );
+        assert!(
+            arm_body.contains("tv_ticks_spilled_total"),
+            "the recoverable-subset counter must also fire, or the operator \
+             cannot tell a rescued loss from a permanent one"
+        );
+    }
+
+    /// The ratchet this closes: quarantine grows, counts toward the ceiling,
+    /// and nothing ever removed from it — so it could permanently disable the
+    /// rescue tier for every future boot.
+    #[test]
+    fn quarantine_is_trimmed_to_its_share_of_the_spill_ceiling() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-prune-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+
+        // Budget = ceiling / 4. With a 400-byte ceiling that is 100 bytes.
+        let ceiling = 400u64;
+        for (i, name) in ["a.ilp", "b.ilp", "c.ilp", "d.ilp"].iter().enumerate() {
+            std::fs::write(q.join(name), vec![b'x'; 60]).expect("write");
+            // Distinct mtimes so "oldest first" is well-defined rather than
+            // filesystem-order luck — a prune that deletes in an arbitrary
+            // order would pass a byte-only assertion while destroying the
+            // newest file, which is the one an investigation is about.
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .expect("reopen");
+            f.set_modified(t).expect("set mtime");
+        }
+
+        let removed = prune_quarantine(&dir, ceiling, false);
+
+        assert!(
+            removed >= 3,
+            "240 bytes must be trimmed to 100, got {removed} removed"
+        );
+        assert!(
+            !q.join("a.ilp").exists(),
+            "the OLDEST file must go first — a quarantined file's recoverability decays, \
+             and the newest is the one an active investigation is about"
+        );
+        assert!(
+            q.join("d.ilp").exists(),
+            "the NEWEST quarantined file must survive the trim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Operator Quotes 27 + 28: with the copy gate on, a quarantined file over
+    /// the budget is deleted only when a verified cold copy is recorded; the
+    /// rest are kept even though the directory stays over budget.
+    #[test]
+    fn test_prune_quarantine_over_budget_keeps_files_without_a_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+        for (i, name) in ["a.ilp", "b.ilp", "c.ilp", "d.ilp"].iter().enumerate() {
+            std::fs::write(q.join(name), vec![b'x'; 60]).expect("write");
+            let t = std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000 + i as u64 * 60);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(q.join(name))
+                .expect("reopen");
+            f.set_modified(t).expect("set mtime");
+        }
+        // Only the second-oldest has a verified copy.
+        crate::raw_frame_upload::write_file_marker_for_test(&q.join("b.ilp"));
+
+        // Budget = 400 / 4 = 100 bytes against 240 on disk.
+        let removed = prune_quarantine(&dir, 400, true);
+
+        assert_eq!(removed, 1, "only the copied file may go");
+        assert!(!q.join("b.ilp").exists());
+        assert!(
+            !q.join(crate::raw_frame_upload::UPLOADED_SUBDIR)
+                .join("b.ilp")
+                .exists(),
+            "its marker goes with it"
+        );
+        for kept in ["a.ilp", "c.ilp", "d.ilp"] {
+            assert!(q.join(kept).exists(), "{kept} has no copy and must stay");
+        }
+        // The markers directory is never taken for a quarantined file.
+        assert!(q.join(crate::raw_frame_upload::UPLOADED_SUBDIR).is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_quarantine_inside_its_budget_is_never_touched() {
+        // The never-delete promise still holds for everything that fits. A
+        // prune that trimmed unconditionally would destroy recoverable lines
+        // for no reason — on 2026-08-25, 1,292 of 1,293 lines in a quarantined
+        // file were recoverable by hand.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-keep-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let q = dir.join(crate::tick_spill_replay::QUARANTINE_DIR);
+        std::fs::create_dir_all(&q).expect("temp quarantine");
+        std::fs::write(q.join("small.ilp"), b"tiny").expect("write");
+
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
+        assert!(q.join("small.ilp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_quarantine_directory_is_not_an_error() {
+        // Boot housekeeping must never fail a boot. Most sessions have no
+        // quarantine at all.
+        let dir = std::env::temp_dir().join(format!(
+            "tv-quarantine-absent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        assert_eq!(prune_quarantine(&dir, 4096, false), 0);
+    }
+
+    #[test]
+    fn quarantine_can_never_claim_the_majority_of_the_spill_budget() {
+        // Quarantine holds files QuestDB has ALREADY refused; the rest of the
+        // budget holds rows it would still accept. Letting the refused half
+        // win would trade recoverable-by-hand bytes for rows lost outright.
+        assert!(
+            QUARANTINE_BUDGET_FRACTION >= 2,
+            "a fraction below 2 lets quarantine take at least half the spill ceiling, \
+             starving the LIVE rescue path that keeps rows QuestDB would still accept"
+        );
+    }
+
+    /// Both `tier` label values must be seeded, not just one.
+    ///
+    /// The CloudWatch agent computes its delta PER LABEL SET, so seeding one
+    /// tier leaves the other exactly as blind as before — a partially-seeded
+    /// family is a partial blind spot wearing the appearance of a covered one.
+    /// This is the failure this repository already paid for on the depth loss
+    /// counters, which is why it is pinned rather than assumed.
+    #[test]
+    fn test_seed_spill_free_probe_blind_counters_seeds_both_tiers() {
+        // Runs clean with no recorder installed, and twice — boot may call it
+        // on a re-spawn path and a panic there would take the lane down for a
+        // metric.
+        seed_spill_free_probe_blind_counters();
+        seed_spill_free_probe_blind_counters();
+
+        // The property that actually matters is WHICH label values are seeded,
+        // and that cannot be read back from the metrics facade without a
+        // recorder. Pin it at the source instead.
+        let src = include_str!("tick_persistence.rs");
+        let body = src
+            // Needle assembled from parts on PURPOSE: spelled as one literal it
+            // reads as a `pub fn` DECLARATION to `pub-fn-test-guard.sh`, which
+            // greps source, and this test would then count itself as a second
+            // untested pub fn. Found by the guard blocking the push.
+            .split_once(concat!(
+                "pub ",
+                "fn ",
+                "seed_spill_free_probe_blind_counters()"
+            ))
+            .map(|(_, rest)| rest.split_once("\n}").map_or(rest, |(b, _)| b))
+            .unwrap_or_default();
+        for tier in ["\"tick\"", "\"depth\"", "\"seal\""] {
+            assert!(
+                body.contains(tier),
+                "the seeding function does not register the {tier} tier — the \
+                 agent seeds per LABEL SET, so that tier's first blind write \
+                 would be eaten as its baseline and never seen"
+            );
+        }
+        assert_eq!(
+            body.matches("increment(0)").count(),
+            3,
+            "expected exactly three seeded label sets (tick, depth, seal; top_volume removed 2026-10-22)"
+        );
+    }
+
+    #[test]
+    fn an_out_of_order_rescue_never_advances_the_watermark() {
+        // The global is shared across the test binary; use ranges far above
+        // anything another test acks so the assertion is about THIS call.
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let base = 1u64 << 62;
+        let before = wm.snapshot().hwm_ticks;
+        note_rescue_outcome_ticks(true, (base, base + 10), false);
+        assert_eq!(
+            wm.snapshot().hwm_ticks,
+            before,
+            "a producer-side or rescue-thread landing acks nothing"
+        );
+        let unlanded = wm.unlanded_total();
+        note_rescue_outcome_ticks(false, (base + 20, base + 30), false);
+        assert_eq!(wm.unlanded_total(), unlanded + 1);
+        assert!(wm.snapshot().range_has_unapplied(base + 25, base + 25));
+    }
+
+    /// A benign storm on one reason must not silence the rare one.
+    ///
+    /// This is the shape the shared `static SEEN` produced: depth carries a
+    /// measured 24x the tick row volume and refuses EVERY row outside
+    /// 09:00-15:39:59 IST, so the pre-open burst drove the process-wide
+    /// counter far past the next power of two, and the corrupt-frame reason --
+    /// whose only production surface is this log -- waited hundreds of
+    /// thousands of events for permission to speak.
+    #[test]
+    fn the_refusal_log_throttle_is_per_reason_not_process_wide() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+
+        // The ordinary pre-open storm, on the time-of-day reason.
+        for _ in 0..1_000 {
+            let _ = c.throttle_tick(0);
+        }
+
+        // The rare corrupt-frame reason has seen nothing, so its FIRST
+        // occurrence must be allowed to log. Under the shared static its count
+        // read 1_001 and it stayed silent until the 2_048th event.
+        assert_eq!(
+            c.throttle_tick(2),
+            Some(1),
+            "the corrupt-frame reason inherited the storm's count -- the \
+             throttle is shared again, and the one signal with no metric and \
+             no alarm is silenced by ordinary pre-open volume"
+        );
+        // The untouched middle reason is likewise unaffected.
+        assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    /// Two WRITERS must not share the throttle either.
+    ///
+    /// `market_depth` and `ticks` build separate instances with different
+    /// reason vocabularies; a process-wide static made the depth writer's
+    /// volume decide when the tick writer was allowed to speak.
+    #[test]
+    fn two_writers_do_not_share_the_refusal_log_throttle() {
+        let a = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        let b = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        for _ in 0..64 {
+            let _ = a.throttle_tick(0);
+        }
+        assert_eq!(
+            b.throttle_tick(0),
+            Some(1),
+            "the second writer inherited the first writer's count -- depth \
+             carries 24x the tick row volume, so a shared throttle lets the \
+             depth writer decide when the tick writer may speak"
+        );
+    }
+
+    /// An unrecognised reason is counted as the LAST arm, deliberately.
+    ///
+    /// Recorded as a test rather than left to the comment on
+    /// `TICK_OUT_OF_WINDOW_REASONS`, because it reads like a bug and was
+    /// nearly "fixed" on 2026-09-06: an unmatched string increments a handle
+    /// labelled with a reason that did not happen. That is a real cost, and it
+    /// is the deliberately chosen one -- index 2 is the most ALARMING reason in
+    /// both vocabularies (`ts_out_of_plausible_band` for ticks,
+    /// `arrival_out_of_plausible_band` for depth), so an unrecognised refusal
+    /// surfaces as a corrupt-frame signal rather than hiding inside an ordinary
+    /// pre-open count. Unreachable today (`is_noteworthy` gates out
+    /// `in_window`, and every other call site passes an element of the array
+    /// itself); this pins the direction for the day a fourth reason is added.
+    #[test]
+    fn an_unrecognised_reason_lands_on_the_most_alarming_arm() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        c.note("a_reason_this_writer_has_never_heard_of");
+        // Slot 2 advanced, so its next tick is 2; slots 0 and 1 did not, so
+        // theirs is still 1. Read through the decision function rather than
+        // the field, for the reason `throttle_tick` records.
+        assert_eq!(
+            c.throttle_tick(2),
+            Some(2),
+            "an unrecognised reason must fall to the most alarming arm, not the \
+             first one -- silently attributing a corrupt frame to an ordinary \
+             pre-open refusal is the failure this ordering exists to prevent"
+        );
+        assert_eq!(c.throttle_tick(0), Some(1));
+        assert_eq!(c.throttle_tick(1), Some(1));
+    }
+
+    /// Plan item 49e review fix: one array row of 200 refused levels moves
+    /// the counter by 200 but advances the log throttle once; zero does
+    /// nothing at all.
+    #[test]
+    fn test_note_n_advances_the_throttle_once_and_zero_is_a_no_op() {
+        let c = OutOfWindowCounters::new(
+            Feed::Dhan,
+            TICK_OUT_OF_WINDOW_COUNTER,
+            TICK_OUT_OF_WINDOW_REASONS,
+        );
+        let reason = TICK_OUT_OF_WINDOW_REASONS[0];
+        c.note_n(reason, 0);
+        c.note_n(reason, 200);
+        // Exactly one advance so far, so the next tick is 2. Had zero
+        // advanced it the next would be 3; had 200 advanced it 200 times,
+        // 201. Neither is a power of two.
+        assert_eq!(c.throttle_tick(0), Some(2));
+    }
+
+    // -- Z7 / Z8a (2026-10-02): queued-rescue floors and synced spills ------
+
+    /// Sequences far above anything another test in this binary acks, so the
+    /// shared global watermark answers about THIS test only.
+    fn z7_seq(k: u64) -> i64 {
+        i64::try_from((1u64 << 61) + (k << 40)).expect("fits")
+    }
+
+    #[test]
+    fn test_regression_tick_queued_rescue_holds_a_floor_until_the_rescue_thread_settles_it() {
+        let dir = scratch_dir("z7-floor");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let seq = z7_seq(1);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let sink_kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        assert!(
+            batch.floor.is_some(),
+            "a WAL-backed queued batch holds a floor"
+        );
+        assert!(wm.rescue_floor_is_held(sink_kind, seq as u64));
+        sink.rescue(&batch);
+        assert!(
+            !wm.rescue_floor_is_held(sink_kind, seq as u64),
+            "the rescue thread releases the floor once the spill is synced"
+        );
+        assert!(
+            !wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "a landed rescue marks nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_refused_rescue_hand_off_retracts_its_floor() {
+        let dir = scratch_dir("z7-refused");
+        let mut w = TickWriter::for_test(Feed::Dhan)
+            .with_spill_dir_for_test(dir.clone())
+            .with_wal_defer_check_for_test(wal_has_it);
+        let (_sink, rx) = w.split_rescue_offload();
+        drop(rx); // Disconnected
+        let seq = z7_seq(2);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64),
+            "a hand-off the thread never received must not leave a floor behind"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "the deferred-to-WAL arm marks the range itself"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_full_rescue_queue_retracts_the_refused_batch_floor() {
+        let dir = scratch_dir("z7-full");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (sink, rx) = w.split_rescue_offload();
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let kind = crate::wal_applied_watermark::AppliedSink::Ticks;
+        let mut queued = Vec::new();
+        for k in 0..RESCUE_QUEUE_DEPTH as u64 {
+            let seq = z7_seq(10 + k);
+            w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+            assert_eq!(w.discard_pending(), 1);
+            queued.push(seq as u64);
+        }
+        let refused = z7_seq(20);
+        w.append_tick_with_seq(&sample_tick(), refused)
+            .expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        assert!(!wm.rescue_floor_is_held(kind, refused as u64));
+        for seq in &queued {
+            assert!(
+                wm.rescue_floor_is_held(kind, *seq),
+                "queued batches still hold theirs"
+            );
+        }
+        while let Ok(batch) = rx.try_recv() {
+            sink.rescue(&batch);
+        }
+        for seq in &queued {
+            assert!(!wm.rescue_floor_is_held(kind, *seq));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_regression_tick_rescue_sink_reports_a_failed_sync_as_a_failed_rescue() {
+        let dir = scratch_dir("z8a-sync-fail");
+        let mut w = TickWriter::for_test(Feed::Dhan).with_spill_dir_for_test(dir.clone());
+        let (mut sink, rx) = w.split_rescue_offload();
+        sink.spill_sync = Some(|_| Err(std::io::Error::other("injected fdatasync failure")));
+        let seq = z7_seq(30);
+        w.append_tick_with_seq(&sample_tick(), seq).expect("append");
+        assert_eq!(w.discard_pending(), 1);
+        let batch = rx.try_recv().expect("queued");
+        let wm = crate::wal_applied_watermark::applied_watermark();
+        let unlanded = wm.unlanded_total();
+        sink.rescue(&batch);
+        assert!(
+            wm.unlanded_total() > unlanded,
+            "a spill that never reached the disk is counted as landing nowhere"
+        );
+        assert!(
+            wm.snapshot().range_has_unapplied(seq as u64, seq as u64),
+            "its range must replay from the WAL"
+        );
+        assert!(
+            !wm.rescue_floor_is_held(crate::wal_applied_watermark::AppliedSink::Ticks, seq as u64)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spill_failed_ilp_returns_err_when_the_sync_fails() {
+        let dir = scratch_dir("z8a-direct");
+        let failing: Option<SpillSyncFn> = Some(|_| Err(std::io::Error::other("injected")));
+        assert!(spill_failed_ilp(&dir, b"x\n", Feed::Dhan, 1_700_000_000, failing).is_err());
+        assert!(
+            spill_failed_ilp(
+                &dir,
+                b"y\n",
+                Feed::Dhan,
+                1_700_000_000,
+                SPILL_UNSYNCED_ON_DRAIN
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_spill_data_syncs_a_real_file() {
+        let dir = scratch_dir("z8a-sync-real");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = std::fs::File::create(dir.join("f")).expect("file");
+        sync_spill_data(&file).expect("fdatasync on a regular file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+#[cfg(test)]
+mod spill_held_bytes_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_drain_spill_reuses_a_fresh_listing_and_adds_bytes_written() {
+        let cache = SpillHeldBytesCache::new();
+        let dir = Path::new("/spill/ticks");
+        let scans = Cell::new(0_u32);
+        let scan = |_: &Path| {
+            scans.set(scans.get() + 1);
+            1_000
+        };
+        let t0 = Instant::now();
+        assert_eq!(cache.held(dir, t0, scan), 1_000);
+        cache.note_written(dir, 250);
+        // Fresh and the same folder: no second listing, the write is counted.
+        assert_eq!(cache.held(dir, t0 + Duration::from_secs(1), scan), 1_250);
+        assert_eq!(scans.get(), 1);
+        // Stale: lists again and forgets the running total.
+        assert_eq!(
+            cache.held(dir, t0 + SPILL_HELD_BYTES_CACHE_MAX_AGE, scan),
+            1_000
+        );
+        assert_eq!(scans.get(), 2);
+    }
+
+    #[test]
+    fn test_drain_spill_cache_never_serves_another_folder() {
+        let cache = SpillHeldBytesCache::new();
+        let t0 = Instant::now();
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 10), 10);
+        // A write to another folder does not move this folder's total.
+        cache.note_written(Path::new("/b"), 99);
+        assert_eq!(cache.held(Path::new("/b"), t0, |_| 20), 20);
+        assert_eq!(cache.held(Path::new("/a"), t0, |_| 30), 30);
+        // A clock that reads earlier than the listing never reuses it.
+        let earlier = t0.checked_sub(Duration::from_secs(1)).unwrap_or(t0);
+        if earlier < t0 {
+            assert_eq!(cache.held(Path::new("/a"), earlier, |_| 40), 40);
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "tick_row_identity_tests.rs"]
+mod tick_row_identity_tests;
+
+#[cfg(test)]
+#[path = "tick_stage_golden_tests.rs"]
+mod tick_stage_golden_tests;
+
+#[cfg(test)]
+#[path = "tick_stage_oracle_tests.rs"]
+mod tick_stage_oracle_tests;
+
+#[cfg(test)]
+#[path = "tick_test_writers.rs"]
+mod tick_test_writers;
+
+#[cfg(test)]
+#[path = "tick_stage_reuse_tests.rs"]
+mod tick_stage_reuse_tests;
+
+#[cfg(test)]
+#[path = "tick_questdb_down_chaos_tests.rs"]
+mod tick_questdb_down_chaos_tests;

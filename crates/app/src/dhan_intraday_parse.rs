@@ -119,10 +119,17 @@ fn timestamp_epoch_secs(v: &serde_json::Value) -> Option<i64> {
 /// non-zero length. Returns empty on malformed/empty. Pure — never panics.
 /// `timestamp` entries accept int OR finite ranged float per
 /// [`timestamp_epoch_secs`] (the 2026-07-15 Dhan wire drift).
+///
+/// **ADDED 2026-10-11 (audit INP-12):** also returns [`IntradayCellFaults`]:
+/// rows skipped for a bad price or timestamp cell, and volume cells read as 0.
+/// Before, both were absorbed with no count. A whole-body fault (non-JSON, a
+/// missing array, a length mismatch) returns no candles and zero faults;
+/// [`zero_candle_body_is_malformed`] classifies that case.
 #[must_use]
-pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
+pub fn parse_intraday_1m_candles(body: &str) -> (Vec<MinuteCandle>, IntradayCellFaults) {
+    let mut faults = IntradayCellFaults::default();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return Vec::new();
+        return (Vec::new(), faults);
     };
     let arr = |k: &str| v.get(k).and_then(|x| x.as_array());
     let (Some(open), Some(high), Some(low), Some(close), Some(vol), Some(ts)) = (
@@ -133,7 +140,7 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
         arr("volume"),
         arr("timestamp"),
     ) else {
-        return Vec::new();
+        return (Vec::new(), faults);
     };
     let n = ts.len();
     if n == 0
@@ -143,7 +150,7 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
         || close.len() != n
         || vol.len() != n
     {
-        return Vec::new();
+        return (Vec::new(), faults);
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -154,6 +161,7 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
             close[i].as_f64(),
             timestamp_epoch_secs(&ts[i]),
         ) else {
+            faults.skipped_rows = faults.skipped_rows.saturating_add(1);
             continue;
         };
         // 2026-08-10 (hostile review): the float fallback had NO range gate
@@ -175,6 +183,8 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
         // `.round()` rather than truncation matches `parse_spot_bars`, which
         // reads these rows back out of QuestDB — truncating here and rounding
         // there made a 19095.7 wire value differ by 1 across a cross-verify.
+        // A cell that is neither an integer nor an in-range finite float is
+        // read as 0 and COUNTED (audit INP-12). A real JSON 0 is not a fault.
         let volume = vol[i]
             .as_i64()
             .or_else(|| {
@@ -183,7 +193,10 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
                     .filter(|f| f.is_finite() && f.abs() < VOLUME_FLOAT_MAX_ABS)
                     .map(|f| f.round() as i64)
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                faults.coerced_volumes = faults.coerced_volumes.saturating_add(1);
+                0
+            });
         out.push(MinuteCandle {
             minute_ts_ist_nanos: intraday_utc_secs_to_ist_minute_nanos(t),
             open: o,
@@ -193,7 +206,19 @@ pub fn parse_intraday_1m_candles(body: &str) -> Vec<MinuteCandle> {
             volume,
         });
     }
-    out
+    (out, faults)
+}
+
+/// Per-row cell faults [`parse_intraday_1m_candles`] absorbed without failing
+/// the body. ADDED 2026-10-11 (audit INP-12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntradayCellFaults {
+    /// Rows skipped because an open, high, low, close or timestamp cell did
+    /// not parse.
+    pub skipped_rows: usize,
+    /// Volume cells that were neither an integer nor an in-range finite
+    /// float, read as 0.
+    pub coerced_volumes: usize,
 }
 
 /// H1 (audit 2026-07-20, Dim A): discriminate a ZERO-candle parse of a
@@ -271,7 +296,7 @@ mod tests {
     #[test]
     fn parse_intraday_1m_candles_happy_path() {
         let body = r#"{"open":[100.0,101.0],"high":[100.5,101.5],"low":[99.5,100.5],"close":[100.2,101.2],"volume":[10,20],"timestamp":[1780380120,1780380180]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].open, 100.0);
         assert_eq!(c[1].volume, 20);
@@ -284,10 +309,10 @@ mod tests {
 
     #[test]
     fn parse_intraday_1m_candles_rejects_length_mismatch_and_malformed() {
-        assert!(parse_intraday_1m_candles("not json").is_empty());
-        assert!(parse_intraday_1m_candles("{}").is_empty());
+        assert!(parse_intraday_1m_candles("not json").0.is_empty());
+        assert!(parse_intraday_1m_candles("{}").0.is_empty());
         let mismatch = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1,2]}"#;
-        assert!(parse_intraday_1m_candles(mismatch).is_empty());
+        assert!(parse_intraday_1m_candles(mismatch).0.is_empty());
     }
 
     /// H1 (audit 2026-07-20): the zero-candle discriminator — only the
@@ -299,7 +324,7 @@ mod tests {
     fn zero_candle_body_discriminates_malformed_vs_empty() {
         // Well-formed empty day: NOT malformed.
         let empty = r#"{"open":[],"high":[],"low":[],"close":[],"volume":[],"timestamp":[]}"#;
-        assert!(parse_intraday_1m_candles(empty).is_empty());
+        assert!(parse_intraday_1m_candles(empty).0.is_empty());
         assert!(!zero_candle_body_is_malformed(empty));
         // Garbage / wrong shape / missing arrays / length mismatch: malformed.
         assert!(zero_candle_body_is_malformed("not json"));
@@ -314,19 +339,19 @@ mod tests {
         // parses to zero candles AND classifies malformed — value drift,
         // never a benign empty.
         let value_drift = r#"{"open":[null],"high":[null],"low":[null],"close":[null],"volume":[null],"timestamp":[null]}"#;
-        assert!(parse_intraday_1m_candles(value_drift).is_empty());
+        assert!(parse_intraday_1m_candles(value_drift).0.is_empty());
         assert!(zero_candle_body_is_malformed(value_drift));
         // A HEALTHY body is out of the discriminator's domain (callers
         // consult it only on a zero-candle parse) — but it still answers
         // honestly: rows>0 ⇒ "not the well-formed-empty shape".
         let healthy = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1780380120]}"#;
-        assert_eq!(parse_intraday_1m_candles(healthy).len(), 1);
+        assert_eq!(parse_intraday_1m_candles(healthy).0.len(), 1);
     }
 
     #[test]
     fn parse_intraday_1m_candles_volume_as_float_truncates() {
         let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[12345.0],"timestamp":[1780380120]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].volume, 12345);
     }
@@ -338,7 +363,7 @@ mod tests {
     #[test]
     fn parse_intraday_1m_candles_float_scientific_timestamps_verbatim_wire() {
         let body = r#"{"open":[57643.75,57694.9],"high":[57751.65,57699.85],"low":[57616.95,57691.05],"close":[57695.15,57691.05],"volume":[4340422.0,19095.0],"timestamp":[1.7840871E9,1.78408716E9]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 2, "both float-timestamp candles parse");
         assert_eq!(
             c[0].minute_ts_ist_nanos,
@@ -362,8 +387,8 @@ mod tests {
     fn parse_intraday_1m_candles_int_and_float_timestamps_agree() {
         let int_body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1784087100]}"#;
         let float_body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1.7840871E9]}"#;
-        let i = parse_intraday_1m_candles(int_body);
-        let f = parse_intraday_1m_candles(float_body);
+        let i = parse_intraday_1m_candles(int_body).0;
+        let f = parse_intraday_1m_candles(float_body).0;
         assert_eq!(i.len(), 1);
         assert_eq!(f.len(), 1);
         assert_eq!(i[0].minute_ts_ist_nanos, f[0].minute_ts_ist_nanos);
@@ -376,7 +401,7 @@ mod tests {
     #[test]
     fn parse_intraday_1m_candles_float_timestamp_sanity_window() {
         let body = r#"{"open":[1.0,2.0,3.0,4.0],"high":[1.0,2.0,3.0,4.0],"low":[1.0,2.0,3.0,4.0],"close":[1.0,2.0,3.0,4.0],"volume":[1,2,3,4],"timestamp":[-1.7840871E9,0.0,5.0E9,1.7840871E9]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1, "only the in-range float survives");
         assert_eq!(c[0].open, 4.0, "the surviving candle is the 4th column");
         assert_eq!(
@@ -393,7 +418,7 @@ mod tests {
     #[test]
     fn parse_intraday_1m_candles_float_timestamp_overflow_yields_no_rows() {
         let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1e999]}"#;
-        assert!(parse_intraday_1m_candles(body).is_empty());
+        assert!(parse_intraday_1m_candles(body).0.is_empty());
     }
 
     /// A fractional float timestamp rounds to the nearest whole second
@@ -402,7 +427,7 @@ mod tests {
     #[test]
     fn parse_intraday_1m_candles_float_timestamp_fractional_rounds() {
         let body = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1784087099.9]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1);
         assert_eq!(
             c[0].minute_ts_ist_nanos,
@@ -419,7 +444,7 @@ mod tests {
         // operator message claiming the true volume was at least that.
         let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
                        "volume":[1.0e19],"timestamp":[1700000000]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1, "the row itself must still parse");
         assert_eq!(
             c[0].volume, 0,
@@ -445,7 +470,7 @@ mod tests {
         let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
                        "volume":[1e400],"timestamp":[1700000000]}"#;
         assert!(
-            parse_intraday_1m_candles(body).is_empty(),
+            parse_intraday_1m_candles(body).0.is_empty(),
             "an out-of-range float makes the WHOLE document unparseable, so the \
              existing malformed-body path handles it — not the volume guard"
         );
@@ -458,7 +483,7 @@ mod tests {
         // difference against the same wire value.
         let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
                        "volume":[19095.7],"timestamp":[1700000000]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].volume, 19096, "must round, matching parse_spot_bars");
     }
@@ -468,8 +493,50 @@ mod tests {
         // Non-vacuity: the guard must not have broken the normal path.
         let body = r#"{"open":[1.0],"high":[2.0],"low":[0.5],"close":[1.5],
                        "volume":[123456],"timestamp":[1700000000]}"#;
-        let c = parse_intraday_1m_candles(body);
+        let c = parse_intraday_1m_candles(body).0;
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].volume, 123_456);
+    }
+
+    #[test]
+    fn parse_intraday_counts_a_row_with_a_null_open_as_skipped() {
+        // Audit INP-12 (2026-10-11): a skipped row used to leave no trace.
+        let body = r#"{"open":[1.0,null,3.0],"high":[1.0,2.0,3.0],"low":[1.0,2.0,3.0],
+                       "close":[1.0,2.0,3.0],"volume":[1,2,3],
+                       "timestamp":[1780380120,1780380180,1780380240]}"#;
+        let (candles, faults) = parse_intraday_1m_candles(body);
+        assert_eq!(candles.len(), 2);
+        assert_eq!(
+            faults,
+            IntradayCellFaults {
+                skipped_rows: 1,
+                coerced_volumes: 0
+            }
+        );
+    }
+
+    #[test]
+    fn parse_intraday_counts_a_string_volume_as_coerced_and_not_a_zero_integer() {
+        let body = r#"{"open":[1.0,2.0,3.0],"high":[1.0,2.0,3.0],"low":[1.0,2.0,3.0],
+                       "close":[1.0,2.0,3.0],"volume":["12",0,5],
+                       "timestamp":[1780380120,1780380180,1780380240]}"#;
+        let (candles, faults) = parse_intraday_1m_candles(body);
+        assert_eq!(candles.len(), 3, "a coerced volume keeps its row");
+        assert_eq!(candles[0].volume, 0, "a string volume reads as 0");
+        assert_eq!(faults.coerced_volumes, 1, "a real integer 0 is not a fault");
+        assert_eq!(faults.skipped_rows, 0);
+    }
+
+    #[test]
+    fn parse_intraday_whole_body_faults_count_no_cells() {
+        assert_eq!(
+            parse_intraday_1m_candles("not json").1,
+            IntradayCellFaults::default()
+        );
+        let mismatch = r#"{"open":[1.0],"high":[1.0],"low":[1.0],"close":[1.0],"volume":[1],"timestamp":[1,2]}"#;
+        assert_eq!(
+            parse_intraday_1m_candles(mismatch).1,
+            IntradayCellFaults::default()
+        );
     }
 }

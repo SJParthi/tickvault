@@ -2,7 +2,7 @@
 //! coordinator-relayed directive 2026-07-15).
 //!
 //! Every restart used to pair a boot bubble with a `[MEDIUM] Shutdown
-//! initiated` page — even the daily EventBridge 17:30 IST auto-stop. This
+//! initiated` page — even the daily EventBridge 16:30 IST auto-stop. This
 //! classifier turns the already-known signal kind + runtime source + IST
 //! clock + trading calendar into a [`ShutdownClass`], so the routine stops
 //! render one quiet Low line while anything unexpected STAYS Medium and
@@ -20,20 +20,63 @@
 //! weekend/holiday runs (§7 Quote 5) killed mid-session by a budget
 //! killswitch or console stop. Now only the holiday-gate self-stop window
 //! (08:25–09:00 IST, non-trading days — the box auto-starts 08:30 and the
-//! gate stops it minutes later) and the weekday 17:25–17:45 stop-cron
-//! window are quiet; everything else stays Medium.
+//! gate stops it minutes later) and the weekday 16:25–16:45 stop-cron
+//! window (17:25–17:45 until 2026-10-22, plan item 64) are quiet; everything else stays Medium.
 //!
 //! Documented residual (plan Edge Cases): a genuine manual/budget stop
 //! DURING one of the two quiet windows renders quiet — bounded (the
 //! budget alarm pages independently; both windows sit outside the
 //! [09:15, 15:30) trading session).
+//!
+//! **⚠ CHANGED 2026-10-20 — the holiday window now ends 09:25, not 09:00.**
+//! The holiday gate (`holiday_gate.rs`) stops the box on a weekday NSE
+//! holiday at a boot inside 08:25 to 09:15 IST, and the app's SIGTERM
+//! arrives some time AFTER the gate's decision instant (the gate's own
+//! metadata and AWS calls, then EC2 delivering the shutdown). The quiet
+//! window therefore ends at the gate's window end plus
+//! [`HOLIDAY_GATE_STOP_LAG_SECS`], so every gate stop classifies as
+//! [`ShutdownClass::ScheduledStop`]; both windows START at the same 08:25
+//! (the gate reuses [`HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST`]).
+//! Residual, widened by 25 minutes: a manual or budget stop on a
+//! non-trading day between 08:25 and 09:25 IST renders quiet. The holiday
+//! window now runs 10 minutes past 09:15, so "both windows sit outside the
+//! trading session" above holds only because this arm needs a NON-trading
+//! day, on which no session runs.
+//! **⚠ CHANGED 2026-10-26 (audit PR L4):** the gate's window now ends at
+//! 09:00 (the capture start), so this quiet window ends at 09:10 (09:00 plus
+//! the 600 s lag); the residual above shrinks to 08:25 to 09:10 IST.
+
+use std::path::Path;
 
 use tickvault_core::notification::events::ShutdownClass;
+use tracing::warn;
 
-/// Start of the scheduled-stop IST window: 17:25:00 (the EventBridge stop
-/// cron fires 17:30 IST — `cron(0 12 ? * MON-FRI *)`, weekday-only and
-/// deliberately NOT holiday-aware; the wide window absorbs the documented
-/// EventBridge scheduler jitter).
+/// The scheduled daily stop: 16:30:00 IST (59,400 s). The EventBridge
+/// `daily_stop` rule fires `cron(0 11 ? * MON-FRI *)` (11:00 UTC), weekday-only
+/// and deliberately NOT holiday-aware. Pinned to that cron in `main.tf` by
+/// `test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron`.
+///
+/// **⚠ CHANGED 2026-10-22 (plan item 64, operator Quote 37: "startign 8.30 am
+/// till 4 pm or 4.30 pm woudl be fine"):** 17:30 → 16:30. This is now the ONE
+/// stop constant every app-side evening bound is derived from: the quiet
+/// window below, the cross-verification deadline and end bound, the
+/// start-watchdog `stop_check` instant and the evening attempt
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.15.12), the drain hold's
+/// earliest held stop and the evening-drain cross-verification clear time.
+/// The Quote 31 drain hold still keeps the box up past it while the day's
+/// data is not saved.
+pub const SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST: u32 = 16 * 3_600 + 30 * 60;
+
+/// How long before the stop the quiet window opens (EventBridge jitter).
+pub const SCHEDULED_STOP_WINDOW_LEAD_SECS: u32 = 300;
+
+/// How long after the stop the quiet window stays open: up to the
+/// start-watchdog `stop_check`, which fires `cron(15 11 ? * MON-FRI *)`.
+pub const SCHEDULED_STOP_WINDOW_TRAIL_SECS: u32 = 900;
+
+/// Start of the scheduled-stop IST window: 16:25:00, the stop less
+/// [`SCHEDULED_STOP_WINDOW_LEAD_SECS`] (the wide window absorbs the documented
+/// EventBridge scheduler jitter). Was 17:25:00 (`62_700`) until 2026-10-22.
 ///
 /// MOVED 2026-08-08 with operator Quote 14 ("make it as 8.30 till 5.30 pm").
 /// This window is COUPLED to the stop cron and moving one without the other is
@@ -43,10 +86,14 @@ use tickvault_core::notification::events::ShutdownClass;
 /// single trading evening for a completely normal scheduled stop. Same failure
 /// class as the boot-heartbeat/stop-verify coupling recorded in
 /// daily-universe-scope-expansion-2026-05-27.md §7.
-pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 62_700;
+pub const SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 =
+    SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST - SCHEDULED_STOP_WINDOW_LEAD_SECS;
 
-/// End (exclusive) of the scheduled-stop IST window: 17:45:00.
-pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 63_900;
+/// End (exclusive) of the scheduled-stop IST window: 16:45:00, the stop plus
+/// [`SCHEDULED_STOP_WINDOW_TRAIL_SECS`]. Was 17:45:00 (`63_900`) until
+/// 2026-10-22.
+pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
+    SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST + SCHEDULED_STOP_WINDOW_TRAIL_SECS;
 
 /// Start of the holiday-gate self-stop IST window: 08:25:00 (G5, fix
 /// round 2). The box auto-starts 08:30 IST on weekdays; on a non-trading
@@ -54,8 +101,61 @@ pub const SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 63_900;
 /// start-cron jitter on both sides.
 pub const HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST: u32 = 30_300;
 
-/// End (exclusive) of the holiday-gate self-stop IST window: 09:00:00.
-pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 32_400;
+/// How long after the holiday gate's decision instant the app's SIGTERM can
+/// arrive (2026-10-20): 300 s for everything the gate does after deciding
+/// (the `TimeoutStartSec=300` outer bound of `tickvault-holiday-gate.service`,
+/// which covers its metadata and AWS calls) plus 300 s for EC2 to deliver the
+/// shutdown to the guest and systemd to signal the app. The second half is
+/// **Assumed** (EC2 normally signals the guest within seconds); not measured.
+pub const HOLIDAY_GATE_STOP_LAG_SECS: u32 = 600;
+
+/// End (exclusive) of the holiday-gate self-stop IST window: 09:10:00
+/// (09:25:00 from 2026-10-20 until the gate's window end moved from 09:15 to
+/// 09:00 on 2026-10-26, audit PR L4).
+///
+/// **⚠ CHANGED 2026-10-20** — was 09:00:00 (`32_400`). It is now the holiday
+/// gate's own window end (09:15, see
+/// `holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST`) plus
+/// [`HOLIDAY_GATE_STOP_LAG_SECS`], so a gate stop decided at the last
+/// second of the gate's window still classifies quiet when the app's SIGTERM
+/// lands. Pinned by
+/// `test_classify_shutdown_at_the_holiday_gates_latest_stop_is_scheduled`.
+pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 =
+    crate::holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST + HOLIDAY_GATE_STOP_LAG_SECS;
+
+/// How long after a Muhurat session's end the start watchdog stops the box
+/// it started (2026-11-07): the Lambda's
+/// `muhurat_window::MUHURAT_BOX_STOP_TAIL_MINUTES` (60) in seconds. The app
+/// cannot import that crate, so the value is pinned to it by
+/// `test_muhurat_box_stop_tail_matches_the_start_watchdog`.
+pub const MUHURAT_BOX_STOP_TAIL_SECS: u32 = 3_600;
+
+/// How long after the Muhurat box-stop instant the app's SIGTERM can land
+/// (2026-11-07): the start watchdog's `muhurat_check` fires every 15 minutes,
+/// so its first after-window stop lands up to 15 minutes after the stop
+/// instant, a failed stop is retried 15 minutes later, and EC2 then has to
+/// deliver the shutdown (Assumed under 10 minutes, as for the holiday gate).
+pub const MUHURAT_STOP_WINDOW_TRAIL_SECS: u32 = 2_400;
+
+/// Whether `ist_secs_of_day` falls in the window in which the start watchdog
+/// stops a box after today's Muhurat session (2026-11-07): from session end
+/// plus [`MUHURAT_BOX_STOP_TAIL_SECS`] for [`MUHURAT_STOP_WINDOW_TRAIL_SECS`].
+/// `muhurat_session` is today's `(start, end)` in IST seconds of day, `None`
+/// on any day without a timed Muhurat session. A window that would cross
+/// midnight is not recognised (the stop then stays loud). O(1).
+///
+/// Owner, 2026-11-07: "I dont need any hallucination or illusion I just need
+/// the working guaranteed assurance solution". Before this, the planned stop
+/// after the Sunday 2026-11-08 session paged "Unexpected stop".
+#[must_use]
+pub fn in_muhurat_stop_window(muhurat_session: Option<(u32, u32)>, ist_secs_of_day: u32) -> bool {
+    let Some((_, end)) = muhurat_session else {
+        return false;
+    };
+    let start = end.saturating_add(MUHURAT_BOX_STOP_TAIL_SECS);
+    let stop = start.saturating_add(MUHURAT_STOP_WINDOW_TRAIL_SECS);
+    stop <= 86_400 && (start..stop).contains(&ist_secs_of_day)
+}
 
 /// Classify a graceful shutdown. Inputs are all in-process:
 ///
@@ -75,8 +175,8 @@ pub const HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST: u32 = 32_400;
 /// |----------|--------|--------------------------------------------|---------------|
 /// | ctrl_c   | any    | any                                        | OperatorStop  |
 /// | sigterm  | false  | any                                        | OperatorStop  |
-/// | sigterm  | true   | weekday ∧ 17:25–17:45 IST (any day)        | ScheduledStop |
-/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:00 IST          | ScheduledStop |
+/// | sigterm  | true   | weekday ∧ 16:25–16:45 IST (any day)        | ScheduledStop |
+/// | sigterm  | true   | !is_trading_day ∧ 08:25–09:10 IST          | ScheduledStop |
 /// | sigterm  | true   | otherwise (incl. Muhurat / manual weekend) | ExternalStop  |
 /// | anything else     | —                                          | ExternalStop  |
 #[must_use]
@@ -95,9 +195,9 @@ pub fn classify_shutdown(
                 // Local `make stop` / container stop.
                 return ShutdownClass::OperatorStop;
             }
-            // The daily EventBridge 17:30 IST stop (weekday-only cron,
+            // The daily EventBridge 16:30 IST stop (weekday-only cron,
             // NOT holiday-aware — it fires on weekday holidays too),
-            // inside the jitter-absorbing 17:25–17:45 window. Applies on
+            // inside the jitter-absorbing 16:25–16:45 window. Applies on
             // trading AND non-trading weekdays alike.
             if is_weekday
                 && (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
@@ -128,29 +228,478 @@ pub fn classify_shutdown(
     }
 }
 
+/// Planned-stop marker the deploy pipeline writes immediately BEFORE it
+/// restarts the app or stops a box it started (`deploy-aws.yml`,
+/// `dhan-rest-only-noise-lock-2026-07-14.md` §2.3x, 2026-09-23). Relative to
+/// the app's working directory (`/opt/tickvault` under systemd), so the same
+/// path resolves under `data/` on the box and in a local run.
+///
+/// Why it exists: every deploy restart sent SIGTERM outside the scheduled-stop
+/// quiet window, so [`classify_shutdown`] — correctly, from what it could
+/// see — paged "Unexpected stop" for a change the operator merged himself.
+/// Nothing in-process can tell a deploy SIGTERM from a manual one; the deploy
+/// has to say so, and this file is how it says so.
+pub const PLANNED_DEPLOY_MARKER_PATH: &str = "data/planned-restart.marker";
+
+/// Oldest marker still honoured. A deploy writes it and restarts within
+/// seconds; 15 minutes covers a slow SSM step while bounding how long a
+/// marker left by an aborted deploy could quiet a genuinely unexpected stop.
+pub const PLANNED_DEPLOY_MARKER_MAX_AGE_SECS: i64 = 900;
+
+/// A marker stamped in the "future" by at most this much is still honoured
+/// (the writer and the app read the same host clock, so any skew is tiny;
+/// anything larger is treated as garbage, i.e. loud).
+pub const PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS: i64 = 60;
+
+/// Is the marker body a fresh deploy stamp? The body is the writer's
+/// `date +%s` (epoch seconds). Pure: unparseable, stale, or implausibly
+/// future ⇒ `false`, i.e. the stop stays loud.
+#[must_use]
+pub fn planned_deploy_marker_is_fresh(contents: &str, now_epoch_secs: i64) -> bool {
+    let Ok(written) = contents.trim().parse::<i64>() else {
+        return false;
+    };
+    let age = now_epoch_secs.saturating_sub(written);
+    (-PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS..=PLANNED_DEPLOY_MARKER_MAX_AGE_SECS)
+        .contains(&age)
+}
+
+/// Read AND delete the planned-stop marker, returning whether it announced
+/// THIS stop. Consumed on every call — fresh or stale — so one deploy's
+/// announcement can never quiet a later stop.
+///
+/// Fail-loud direction throughout: an absent marker, an unreadable one, or
+/// one that cannot be deleted all return `false`. A marker that survives its
+/// own consumption would keep quieting stops until it aged out, so a failed
+/// delete is treated as "not announced" and logged.
+pub fn take_planned_deploy_marker(path: &Path, now_epoch_secs: i64) -> bool {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            warn!(
+                ?err,
+                path = %path.display(),
+                "planned-deploy marker unreadable — classifying the stop normally"
+            );
+            // Best effort: a marker we cannot read must not linger either.
+            if let Err(remove_err) = std::fs::remove_file(path) {
+                warn!(
+                    ?remove_err,
+                    path = %path.display(),
+                    "unreadable planned-deploy marker could not be removed"
+                );
+            }
+            return false;
+        }
+    };
+    if let Err(err) = std::fs::remove_file(path) {
+        warn!(
+            ?err,
+            path = %path.display(),
+            "planned-deploy marker could not be consumed — classifying the stop \
+             normally so a surviving marker cannot quiet a later stop"
+        );
+        return false;
+    }
+    planned_deploy_marker_is_fresh(&contents, now_epoch_secs)
+}
+
+/// [`classify_shutdown`] plus the deploy's announcement. A fresh marker turns
+/// an AWS SIGTERM into [`ShutdownClass::PlannedDeployRestart`]; every other
+/// input — Ctrl+C, a local stop, an unknown signal, no marker — classifies
+/// exactly as [`classify_shutdown`] does, so the marker can only ever quiet a
+/// stop the deploy positively announced.
+///
+/// `muhurat_session` (2026-11-07) is today's Muhurat session as IST seconds
+/// of day (`TradingCalendar::muhurat_session_secs`), `None` on every other
+/// day. An AWS SIGTERM inside [`in_muhurat_stop_window`] is the start
+/// watchdog's planned stop after that session and classifies as
+/// [`ShutdownClass::ScheduledStop`]; a stop at any other hour of a Muhurat
+/// date (the session itself included) stays loud.
+#[must_use]
+pub fn classify_shutdown_with_deploy_marker(
+    signal: &str,
+    is_aws: bool,
+    ist_secs_of_day: u32,
+    is_weekday: bool,
+    is_trading_day: bool,
+    planned_deploy_marker: bool,
+    muhurat_session: Option<(u32, u32)>,
+) -> ShutdownClass {
+    if planned_deploy_marker && is_aws && signal == "sigterm" {
+        return ShutdownClass::PlannedDeployRestart;
+    }
+    // Quote 31's evening drain: the app's own planned restart. Only the
+    // process itself produces this signal string.
+    if signal == "self_restart" {
+        return ShutdownClass::PlannedDeployRestart;
+    }
+    // Operator Quote 31 (2026-10-21): a box this process held after the
+    // close is stopped by a scheduled check once the hold ends, at any time
+    // up to 07:35 IST — not only in the 16:25–16:45 window. Without this
+    // every held evening would page "Unexpected stop".
+    if is_aws
+        && signal == "sigterm"
+        && crate::drain_hold::stop_follows_tonights_hold(ist_secs_of_day)
+    {
+        return ShutdownClass::ScheduledStop;
+    }
+    // 2026-11-07: the start watchdog stops the box it started for a Muhurat
+    // session one hour after the session ends. No marker announces it, and a
+    // Muhurat date is a weekend or a holiday, so neither quiet window below
+    // covers it.
+    if is_aws && signal == "sigterm" && in_muhurat_stop_window(muhurat_session, ist_secs_of_day) {
+        return ShutdownClass::ScheduledStop;
+    }
+    classify_shutdown(signal, is_aws, ist_secs_of_day, is_weekday, is_trading_day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 17:30:00 IST — the EventBridge stop cron's nominal fire instant.
-    const STOP_CRON_SECS: u32 = 17 * 3600 + 30 * 60;
+    /// A scratch path unique to one test, removed by the test itself.
+    fn scratch_marker(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("tv-planned-marker-{name}-{}", std::process::id()))
+    }
 
     #[test]
-    fn test_classify_shutdown_window_consts_are_1725_and_1745_ist() {
+    fn test_classify_shutdown_with_deploy_marker_table() {
+        const MID_SESSION: u32 = 11 * 3600;
+        // (signal, is_aws, secs, marker) -> class
+        let cases = [
+            // The fix: a deploy SIGTERM mid-day is no longer "Unexpected".
+            (
+                "sigterm",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::PlannedDeployRestart,
+            ),
+            // Without the marker the same stop stays loud (unchanged).
+            (
+                "sigterm",
+                true,
+                MID_SESSION,
+                false,
+                ShutdownClass::ExternalStop,
+            ),
+            // The evening drain's own restart is planned, with or without a
+            // marker.
+            (
+                "self_restart",
+                true,
+                20 * 3600,
+                false,
+                ShutdownClass::PlannedDeployRestart,
+            ),
+            // Out-of-hours stop of a box the deploy started.
+            (
+                "sigterm",
+                true,
+                20 * 3600,
+                true,
+                ShutdownClass::PlannedDeployRestart,
+            ),
+            // The marker never quiets a non-AWS or non-SIGTERM stop.
+            (
+                "sigterm",
+                false,
+                MID_SESSION,
+                true,
+                ShutdownClass::OperatorStop,
+            ),
+            (
+                "ctrl_c",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::OperatorStop,
+            ),
+            (
+                "sighup",
+                true,
+                MID_SESSION,
+                true,
+                ShutdownClass::ExternalStop,
+            ),
+            // No marker, scheduled window: still the ordinary quiet stop.
+            (
+                "sigterm",
+                true,
+                STOP_CRON_SECS,
+                false,
+                ShutdownClass::ScheduledStop,
+            ),
+        ];
+        for (signal, is_aws, secs, marker, expected) in cases {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(
+                    signal, is_aws, secs, true, true, marker, None
+                ),
+                expected,
+                "signal={signal} is_aws={is_aws} secs={secs} marker={marker}"
+            );
+        }
+    }
+
+    /// 2026-11-08 Diwali Muhurat: session 14:05-15:40 IST (config/base.toml).
+    const MUHURAT_2026: Option<(u32, u32)> = Some((14 * 3600 + 5 * 60, 15 * 3600 + 40 * 60));
+
+    /// Regression (2026-11-07): the start watchdog's stop after the Sunday
+    /// Muhurat session (16:40 IST, first `muhurat_check` fire 16:45) paged
+    /// "Unexpected stop". It is now a scheduled stop, on a Sunday that is not
+    /// a trading day, with no deploy marker and no drain hold.
+    #[test]
+    fn test_regression_muhurat_after_session_stop_is_scheduled() {
+        let box_stop = 16 * 3600 + 40 * 60;
+        for secs in [
+            box_stop,
+            16 * 3600 + 45 * 60,
+            17 * 3600,
+            box_stop + MUHURAT_STOP_WINDOW_TRAIL_SECS - 1,
+        ] {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(
+                    "sigterm",
+                    true,
+                    secs,
+                    false,
+                    false,
+                    false,
+                    MUHURAT_2026
+                ),
+                ShutdownClass::ScheduledStop,
+                "secs={secs}"
+            );
+        }
+    }
+
+    /// The Muhurat arm quiets only the after-session stop: a kill during the
+    /// session, before the box-stop instant, after the window, on a day with
+    /// no Muhurat session, a local stop and Ctrl+C all classify as before.
+    #[test]
+    fn test_muhurat_arm_quiets_only_the_after_session_window() {
+        let box_stop = 16 * 3600 + 40 * 60;
+        for secs in [
+            14 * 3600 + 30 * 60, // mid-session kill
+            15 * 3600 + 45 * 60, // after the session, before the box stop
+            box_stop - 1,
+            box_stop + MUHURAT_STOP_WINDOW_TRAIL_SECS,
+            20 * 3600,
+        ] {
+            assert_eq!(
+                classify_shutdown_with_deploy_marker(
+                    "sigterm",
+                    true,
+                    secs,
+                    false,
+                    false,
+                    false,
+                    MUHURAT_2026
+                ),
+                ShutdownClass::ExternalStop,
+                "secs={secs}"
+            );
+        }
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sigterm", true, box_stop, false, false, false, None
+            ),
+            ShutdownClass::ExternalStop
+        );
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sigterm",
+                false,
+                box_stop,
+                false,
+                false,
+                false,
+                MUHURAT_2026
+            ),
+            ShutdownClass::OperatorStop
+        );
+        assert_eq!(
+            classify_shutdown_with_deploy_marker(
+                "sighup",
+                true,
+                box_stop,
+                false,
+                false,
+                false,
+                MUHURAT_2026
+            ),
+            ShutdownClass::ExternalStop
+        );
+    }
+
+    #[test]
+    fn test_in_muhurat_stop_window_boundaries_and_midnight() {
+        let end = 15 * 3600 + 40 * 60;
+        let start = end + MUHURAT_BOX_STOP_TAIL_SECS;
+        assert!(in_muhurat_stop_window(Some((0, end)), start));
+        assert!(!in_muhurat_stop_window(Some((0, end)), start - 1));
+        assert!(!in_muhurat_stop_window(
+            Some((0, end)),
+            start + MUHURAT_STOP_WINDOW_TRAIL_SECS
+        ));
+        assert!(!in_muhurat_stop_window(None, start));
+        // A late session whose stop window crosses midnight is not
+        // recognised: the stop stays loud rather than quieting a wrong hour.
+        assert!(!in_muhurat_stop_window(
+            Some((0, 23 * 3600)),
+            23 * 3600 + 3600
+        ));
+        assert!(!in_muhurat_stop_window(Some((0, u32::MAX)), 0));
+    }
+
+    /// The tail and the 15-minute cadence must match what the start watchdog
+    /// actually does, or the quiet window and the real stop drift apart.
+    #[test]
+    fn test_muhurat_box_stop_tail_matches_the_start_watchdog() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let window = std::fs::read_to_string(root.join("crates/aws-lambdas/src/muhurat_window.rs"))
+            .expect("muhurat_window.rs readable");
+        assert!(
+            window.contains(&format!(
+                "pub const MUHURAT_BOX_STOP_TAIL_MINUTES: i64 = {};",
+                MUHURAT_BOX_STOP_TAIL_SECS / 60
+            )),
+            "MUHURAT_BOX_STOP_TAIL_SECS must equal the start watchdog's tail"
+        );
+        let tf =
+            std::fs::read_to_string(root.join("deploy/aws/terraform/start-watchdog-lambda.tf"))
+                .expect("start-watchdog-lambda.tf readable");
+        assert!(
+            tf.contains("\"cron(0/15 0-18 %d %d ? %s)\""),
+            "the muhurat_check cadence the trail is sized for is every 15 minutes"
+        );
+        assert!(MUHURAT_STOP_WINDOW_TRAIL_SECS >= 2 * 15 * 60);
+    }
+
+    /// main.rs must hand today's Muhurat session to the classifier.
+    #[test]
+    fn test_main_passes_todays_muhurat_session_to_the_classifier() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let main = std::fs::read_to_string(root.join("src/main.rs")).expect("main.rs readable");
+        let call = main
+            .find("shutdown_class::classify_shutdown_with_deploy_marker(")
+            .expect("main.rs classifies the stop");
+        let block = &main[call..(call + 600).min(main.len())];
+        assert!(
+            block.contains("trading_calendar.muhurat_session_secs(today_ist)"),
+            "main.rs must pass today's Muhurat session"
+        );
+    }
+
+    #[test]
+    fn test_planned_deploy_marker_is_fresh_boundaries() {
+        let now = 1_790_000_000_i64;
+        assert!(planned_deploy_marker_is_fresh(&now.to_string(), now));
+        assert!(planned_deploy_marker_is_fresh(&format!("{now}\n"), now));
+        let oldest = now - PLANNED_DEPLOY_MARKER_MAX_AGE_SECS;
+        assert!(planned_deploy_marker_is_fresh(&oldest.to_string(), now));
+        assert!(!planned_deploy_marker_is_fresh(
+            &(oldest - 1).to_string(),
+            now
+        ));
+        let future = now + PLANNED_DEPLOY_MARKER_MAX_FUTURE_SKEW_SECS;
+        assert!(planned_deploy_marker_is_fresh(&future.to_string(), now));
+        assert!(!planned_deploy_marker_is_fresh(
+            &(future + 1).to_string(),
+            now
+        ));
+        for garbage in [
+            "",
+            "   ",
+            "yesterday",
+            "12.5",
+            "-",
+            "9999999999999999999999",
+        ] {
+            assert!(
+                !planned_deploy_marker_is_fresh(garbage, now),
+                "garbage {garbage:?} must stay loud"
+            );
+        }
+    }
+
+    #[test]
+    fn test_take_planned_deploy_marker_consumes_fresh_and_stale() {
+        let now = 1_790_000_000_i64;
+
+        let fresh = scratch_marker("fresh");
+        std::fs::write(&fresh, now.to_string()).expect("write fresh marker");
+        assert!(take_planned_deploy_marker(&fresh, now));
+        assert!(!fresh.exists(), "a fresh marker must be consumed");
+        // Consumed ⇒ the next stop is NOT announced.
+        assert!(!take_planned_deploy_marker(&fresh, now));
+
+        let stale = scratch_marker("stale");
+        std::fs::write(&stale, (now - 3_600).to_string()).expect("write stale marker");
+        assert!(!take_planned_deploy_marker(&stale, now));
+        assert!(!stale.exists(), "a stale marker must be consumed too");
+
+        let absent = scratch_marker("absent");
+        assert!(!take_planned_deploy_marker(&absent, now));
+    }
+
+    #[test]
+    fn test_planned_deploy_marker_path_is_under_the_data_dir() {
+        assert_eq!(PLANNED_DEPLOY_MARKER_PATH, "data/planned-restart.marker");
+    }
+
+    /// 16:30:00 IST — the EventBridge stop cron's nominal fire instant.
+    const STOP_CRON_SECS: u32 = 16 * 3600 + 30 * 60;
+
+    #[test]
+    fn test_classify_shutdown_window_consts_are_1625_and_1645_ist() {
+        // 2026-10-22 (plan item 64, Quote 37): was 17:25 / 17:45.
+        assert_eq!(SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST, 59_400);
         assert_eq!(
             SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST,
-            17 * 3600 + 25 * 60
+            16 * 3600 + 25 * 60
         );
         assert_eq!(
             SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST,
-            17 * 3600 + 45 * 60
+            16 * 3600 + 45 * 60
         );
-        // The nominal 17:30 cron instant sits inside the window.
+        // The nominal 16:30 cron instant sits inside the window.
         assert!(
             (SCHEDULED_STOP_WINDOW_START_SECS_OF_DAY_IST
                 ..SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST)
                 .contains(&STOP_CRON_SECS)
         );
+    }
+
+    /// The one stop constant must match the `daily_stop` EventBridge cron in
+    /// `main.tf` (IST = UTC + 05:30), and the window's trailing edge must be
+    /// the start-watchdog `stop_check` cron (plan item 64, §12.15.12).
+    #[test]
+    fn test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let utc = SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST - 19_800;
+        let cron = format!("cron({} {} ? * MON-FRI *)", (utc % 3600) / 60, utc / 3600);
+        let main_tf = std::fs::read_to_string(root.join("deploy/aws/terraform/main.tf"))
+            .expect("main.tf readable");
+        assert!(main_tf.contains(&cron), "main.tf daily_stop must be {cron}");
+        assert_eq!(cron, "cron(0 11 ? * MON-FRI *)");
+        let check_utc = SCHEDULED_STOP_WINDOW_END_SECS_OF_DAY_IST - 19_800;
+        let check_cron = format!(
+            "cron({} {} ? * MON-FRI *)",
+            (check_utc % 3600) / 60,
+            check_utc / 3600
+        );
+        let watchdog_tf =
+            std::fs::read_to_string(root.join("deploy/aws/terraform/start-watchdog-lambda.tf"))
+                .expect("start-watchdog-lambda.tf readable");
+        assert!(
+            watchdog_tf.contains(&check_cron),
+            "the stop_check must be {check_cron}"
+        );
+        assert_eq!(check_cron, "cron(15 11 ? * MON-FRI *)");
     }
 
     #[test]
@@ -188,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_classify_shutdown_window_boundaries() {
-        // Inclusive start: 17:25:00 exactly is scheduled.
+        // Inclusive start: 16:25:00 exactly is scheduled.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -210,7 +759,7 @@ mod tests {
             ),
             ShutdownClass::ExternalStop
         );
-        // Exclusive end: 17:45:00 exactly is already outside — loud.
+        // Exclusive end: 16:45:00 exactly is already outside — loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -237,7 +786,9 @@ mod tests {
     #[test]
     fn test_classify_shutdown_holiday_gate_self_stop_window_only() {
         // G5 (fix round 2): the non-trading-day quiet arm is the EXPLICIT
-        // 08:25–09:00 IST holiday-gate self-stop window — never any-hour.
+        // holiday-gate self-stop window (08:25–09:10 IST since 2026-10-26,
+        // 08:25–09:25 from 2026-10-20,
+        // 08:25–09:00 before) — never any-hour.
         // Inside the window (weekday holiday auto-start morning): quiet.
         for secs in [
             HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST,
@@ -250,7 +801,7 @@ mod tests {
                 "secs={secs}"
             );
         }
-        // Boundaries: one second before 08:25 / at 09:00 exactly → loud.
+        // Boundaries: one second before 08:25 / at 09:10 exactly → loud.
         assert_eq!(
             classify_shutdown(
                 "sigterm",
@@ -280,12 +831,40 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0900_ist() {
+    fn test_classify_shutdown_holiday_gate_window_consts_are_0825_and_0910_ist() {
         assert_eq!(
             HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST,
             8 * 3600 + 25 * 60
         );
-        assert_eq!(HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST, 9 * 3600);
+        // 2026-10-20: was 09:00; then the gate's 09:15 end plus the 600 s lag.
+        // 2026-10-26 (audit PR L4): the gate ends at 09:00, so 09:10.
+        assert_eq!(HOLIDAY_GATE_STOP_LAG_SECS, 600);
+        assert_eq!(
+            HOLIDAY_GATE_STOP_WINDOW_END_SECS_OF_DAY_IST,
+            9 * 3600 + 10 * 60
+        );
+    }
+
+    /// 2026-10-20: every stop the holiday gate can issue classifies quiet.
+    /// The gate stops only on a weekday NSE holiday (weekday, not a trading
+    /// day) at a boot inside its window, and the app's SIGTERM lands at most
+    /// `HOLIDAY_GATE_STOP_LAG_SECS` after the gate decided.
+    #[test]
+    fn test_classify_shutdown_at_the_holiday_gates_latest_stop_is_scheduled() {
+        let gate_start = crate::holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST;
+        let gate_last = crate::holiday_gate::SCHEDULED_START_WINDOW_END_SECS_OF_DAY_IST - 1;
+        for decided in [gate_start, 8 * 3600 + 30 * 60, gate_last] {
+            for lag in [0, 1, HOLIDAY_GATE_STOP_LAG_SECS] {
+                assert_eq!(
+                    classify_shutdown("sigterm", true, decided + lag, true, false),
+                    ShutdownClass::ScheduledStop,
+                    "gate decided at {decided}, SIGTERM {lag} s later"
+                );
+            }
+        }
+        // Both windows start at the same instant: the gate reuses this
+        // module's constant.
+        assert_eq!(gate_start, HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST);
     }
 
     #[test]

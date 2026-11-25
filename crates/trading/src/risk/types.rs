@@ -15,6 +15,14 @@ pub enum RiskBreach {
     PositionSizeLimitExceeded,
     /// Manual halt triggered by operator.
     ManualHalt,
+    /// The per-instrument position map reached its hard ceiling.
+    ///
+    /// Added 2026-08-22. Unlike the two breaches above this one is not about
+    /// money -- it is about the engine no longer being able to promise that
+    /// what it tracks is what we hold. See
+    /// `RiskEngine::MAX_TRACKED_POSITIONS` for why the response is a halt
+    /// rather than a refusal.
+    PositionCapacityExhausted,
 }
 
 // ---------------------------------------------------------------------------

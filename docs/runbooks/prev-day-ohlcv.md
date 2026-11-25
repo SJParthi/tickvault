@@ -10,6 +10,7 @@
 > retained (forensic). Content below is historical.
 > **Code (historical):** `prev_day_ohlcv_boot.rs` (deleted).
 > **Sibling:** `docs/runbooks/cross-verify-1m.md` (the post-market twin).
+> **⚠ 2026-10-30:** the make target `prev-day-show` and the shell script behind it are DELETED (rust-only audit): the feature is retired and nothing writes new files. Open `data/prev-day/` directly, or query the kept `prev_day_ohlcv` table.
 
 ## TL;DR
 
@@ -17,7 +18,7 @@
 |---|---|
 | Pre-market historical fetch? | **Exists & runs at boot** — pulls yesterday's single daily candle (O/H/L/C/V + OI) per subscribed spot SID → `prev_day_ohlcv` table. |
 | Is it verified? | **Yes (new)** — after the fetch, a coverage check confirms how many of the ~243 SIDs got a valid candle; below 90% → degraded, zero → empty (no false-OK). |
-| Fastest way to see it? | `make prev-day-show` |
+| Fastest way to see it? | ~~`make prev-day-show`~~ (deleted 2026-10-30: open `data/prev-day/`) |
 
 ## What it does
 
@@ -43,7 +44,7 @@ unit-tested function) compares `fetched` against the universe size:
 
 | Surface | How |
 |---|---|
-| 📄 **CSV** | `make prev-day-show` (or open `data/prev-day/prev-day-coverage-YYYY-MM-DD.csv`) — columns: `expected, fetched, skipped, failed, coverage_pct, outcome` |
+| 📄 **CSV** | ~~`make prev-day-show`~~ (deleted 2026-10-30: open `data/prev-day/`) (or open `data/prev-day/prev-day-coverage-YYYY-MM-DD.csv`) — columns: `expected, fetched, skipped, failed, coverage_pct, outcome` |
 | 📊 **QuestDB** | `make questdb` → `SELECT count(*) FROM prev_day_ohlcv` (the actual candles) |
 | 📝 **Logs** | the `PROOF: prev-day OHLCV coverage OK` / `coverage DEGRADED` / `coverage EMPTY` line in `data/logs/errors.jsonl.*` |
 
@@ -51,7 +52,7 @@ unit-tested function) compares `fetched` against the universe size:
 
 - The fetch runs **once at boot** after successful auth. On a dev box with no
   live Dhan credentials it is skipped (logged), so there is no report — that is
-  correct, and `make prev-day-show` says so.
+  correct, and ~~`make prev-day-show`~~ (deleted 2026-10-30: open `data/prev-day/`) says so.
 - Coverage `empty` on a real boot means the REST fetch returned nothing for the
   whole universe — check Dhan Data-API health + the JWT.
 

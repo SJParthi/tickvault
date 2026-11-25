@@ -38,9 +38,14 @@ fn stress_risk_engine_100k_checks() {
 
     let elapsed = start.elapsed();
     assert_eq!(engine.total_checks(), 100_000);
+    // 5 s, not 1 s: this is a debug build on a shared CI runner. Measured
+    // 2026-10-05: ~0.45 s locally, 1.06 s on two tries on one runner (red
+    // with no risk-engine change). A per-check cost that grew with the
+    // 1,000 tracked positions would take minutes, so 5 s still catches the
+    // regression this test exists for.
     if !skip_perf_assertions() {
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(5),
             "100K risk checks took {elapsed:?} — too slow"
         );
     }

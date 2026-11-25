@@ -168,23 +168,24 @@ fn test_boot_03_error_code_round_trips() {
 }
 
 /// Item 7.3 — `enforce_clock_skew_at_boot` returns Unavailable
-/// (not ThresholdExceeded) when both probe paths fail before producing
-/// a sample. We can't drive a real `chronyc` from a unit test, so we
-/// use the QuestDB-fallback path with an unreachable QuestDB to assert
-/// the `Unavailable` branch surfaces the WARN-not-HALT path.
+/// (not ThresholdExceeded) when chronyc produces no sample. We cannot
+/// drive a real `chronyc` from a unit test; in a container without it the
+/// probe fails and the `Unavailable` branch surfaces the WARN-not-HALT path.
+/// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3):** this used to run the
+/// QuestDB `now()` fallback against an unreachable QuestDB. That fallback is
+/// removed (QuestDB shares this host's clock, so it measured nothing), and
+/// the functions no longer take a QuestDB config.
 #[tokio::test]
 async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
-    let cfg = unreachable_questdb_config();
     // chrony may or may not be installed in the test container — both
-    // outcomes are acceptable. What matters: when both probes fail we
-    // get Unavailable (NOT ThresholdExceeded). Boot proceeds with WARN.
+    // outcomes are acceptable. What matters: when the probe fails we get
+    // Unavailable (NOT ThresholdExceeded). Boot proceeds with WARN.
     let result =
-        tickvault_app::infra::enforce_clock_skew_at_boot(&cfg, CLOCK_SKEW_HALT_THRESHOLD_SECS)
-            .await;
+        tickvault_app::infra::enforce_clock_skew_at_boot(CLOCK_SKEW_HALT_THRESHOLD_SECS).await;
     if let Err(ClockSkewError::ThresholdExceeded { .. }) = result {
         panic!(
             "ThresholdExceeded must require a successful skew sample; \
-             unreachable QuestDB must yield Unavailable or Ok (chronyc)"
+             a failed chronyc probe must yield Unavailable"
         );
     }
 }
@@ -193,22 +194,25 @@ async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
 /// once at boot. Smoke test: returns either Ok(sample) or
 /// `Unavailable` against an unreachable QuestDB. Never panics.
 /// Named to satisfy the pub-fn-test-guard regex `test.*probe_clock_skew`.
+///
+/// ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): QuestDB plays no part any more;
+/// the probe reads `chronyc` only. Renamed from
+/// `test_probe_clock_skew_smoke_against_unreachable_questdb`.
 #[tokio::test]
-async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
-    let cfg = unreachable_questdb_config();
-    let result = tickvault_app::infra::probe_clock_skew(&cfg).await;
+async fn test_probe_clock_skew_smoke_chronyc_only() {
+    let result = tickvault_app::infra::probe_clock_skew().await;
     match result {
         Ok(sample) => {
             // chrony was reachable on the host — the sample is real.
             assert!(
-                sample.source == "chronyc" || sample.source == "questdb_now",
-                "sample.source must be one of chronyc / questdb_now, got {}",
+                sample.source == "chronyc",
+                "sample.source must be chronyc (the QuestDB fallback is removed, 2026-10-11), got {}",
                 sample.source
             );
             assert!(sample.skew_secs.is_finite());
         }
         Err(ClockSkewError::Unavailable { .. }) => {
-            // chronyc + unreachable QuestDB → Unavailable. Boot
+            // chronyc failed → Unavailable. Boot
             // proceeds with WARN per design.
         }
         Err(ClockSkewError::ThresholdExceeded { .. }) => {
@@ -217,6 +221,89 @@ async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
             );
         }
     }
+}
+
+/// 2026-08-26 — `spawn_clock_skew_poller` must SURVIVE a failing probe.
+///
+/// The defect this poller closes is a gauge frozen at its boot value. A
+/// poller that exits on the first failed probe re-creates that defect
+/// exactly, while looking wired in every source scan — so the property
+/// worth pinning is not "it probes" but "it is still probing after a
+/// probe fails".
+///
+/// Drives it on a 10ms interval (chronyc is absent in CI, so every probe fails), waits
+/// several intervals, and asserts the task has neither finished nor
+/// panicked. Named to satisfy the pub-fn-test-guard regex
+/// `test.*spawn_clock_skew_poller`.
+#[tokio::test]
+async fn test_spawn_clock_skew_poller_survives_a_failing_probe() {
+    let handle =
+        tickvault_app::infra::spawn_clock_skew_poller(std::time::Duration::from_millis(10));
+
+    // First tick is consumed immediately by the poller (deliberate: the
+    // boot gate has just sampled), so this covers several real probes.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    assert!(
+        !handle.is_finished(),
+        "the clock-skew poller exited. A poller that stops on a failed probe \
+         leaves tv_clock_skew_seconds frozen at its last value, which is the \
+         exact false-green it was written to end."
+    );
+    handle.abort();
+}
+
+/// The poller must be SUPERVISED, so the fix cannot silently revert to the
+/// bug it fixed.
+///
+/// The first version shipped hours earlier was a bare `tokio::spawn` of the
+/// poll loop. If that task died the gauge simply stopped being written — and
+/// because the Prometheus exporter has no idle timeout, it would go on
+/// rendering the last value on every scrape. A dense, healthy, frozen series:
+/// the exact false-green the poller exists to end, one level up.
+///
+/// Source-scan rather than behavioural, deliberately. Killing an inner task
+/// from outside is not something a test can do without a fault-injection
+/// hook, and adding one to production code to prove a property about
+/// production code is worse than reading the shape. The shape is what the
+/// house supervisors use (`disk_pressure_boot`, `ws_frame_spill`) and it is
+/// what a reviewer would look for.
+#[test]
+fn test_clock_skew_poller_is_supervised_not_bare_spawned() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/infra.rs"),
+    )
+    .expect("infra.rs must be readable"); // APPROVED: test
+
+    let body = src
+        .split("pub fn spawn_clock_skew_poller")
+        .nth(1)
+        .expect("spawn_clock_skew_poller must exist"); // APPROVED: test
+
+    for needle in [
+        // The outer supervisor awaits the inner handle...
+        "handle.await",
+        // ...counts the restart, so a flapping loop is visible...
+        "tv_clock_skew_poller_respawn_total",
+        // ...and backs off rather than spinning.
+        "CLOCK_SKEW_RESPAWN_BACKOFF_SECS",
+    ] {
+        assert!(
+            body.contains(needle),
+            "spawn_clock_skew_poller must SUPERVISE its loop (missing `{needle}`). A bare \
+             tokio::spawn means a dead task leaves tv_clock_skew_seconds frozen at its last \
+             value, and the exporter renders that forever — the same false-green the poller \
+             was written to end. Follow the house shape in disk_pressure_boot."
+        );
+    }
+
+    // A CLEAN return must be treated as a failure too: the inner loop cannot
+    // return on its own, so reaching that arm means something ended it.
+    assert!(
+        body.contains("exited cleanly"),
+        "the supervisor must respawn on a CLEAN return as well as a panic — the inner loop \
+         never returns on its own, so Ok(()) is a failure wearing a success type"
+    );
 }
 
 /// Item 7.3 — pure-function test for `ClockSkewSample::exceeds`. Drives

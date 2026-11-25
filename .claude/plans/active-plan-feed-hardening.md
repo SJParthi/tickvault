@@ -1,6 +1,184 @@
 # Implementation Plan: Feed Hardening — bound the limits, alarm the silence, automate the recovery
 
-**Status:** APPROVED
+## Item 3b continuation — Codex source integration, 2026-10-31
+
+### Design
+
+Connect the preserved #2144 reconciliation component to one live lane: one
+book/executor, main-feed dial and successful queued Extend paths, and the existing
+30-second silence sweep before its alarm filter. Pass owned state explicitly;
+do not add a global registry or per-tick bookkeeping. Keep
+`subscribe_reconcile_auto_resubscribe = false` by default. Queue acceptance records
+an expected subscription, not proof of a wire ACK or a received market packet.
+The default-false setting still installs the observer/book and retains command
+receivers; it disables automatic resend, not the observation cost. The cold sweep
+retains its vector, mutex and metrics work. No per-call latency guarantee follows.
+
+### Edge Cases
+
+Refused, truncated and closed acknowledgement paths must remove only the entries
+owned by that command's socket. A backup copy must not remove the primary entry.
+A later successful subscription may replace a closed primary sender; an existing
+live primary retains its original timestamp/round budget. Depth channels are not
+members of this main-feed book. Restart creates a fresh process-local book.
+
+### Failure Modes
+
+Failed queue sends record nothing. The existing bounded executor handles its own
+unsubscribe/subscribe outcomes; existing connection replay remains authoritative.
+No new socket is opened and no automatic resend is enabled by this integration.
+The 30-second sweep may briefly contend with cold attach bookkeeping under the
+book's mutex; no additional universe scan is introduced.
+
+### Test Plan
+
+- [x] Exercise sparse expected and untracked NeverTicked reports through the real sweep before alarm filtering.
+  - Files: `crates/app/src/dhan_feed_stack/subscribe_reconcile_tests.rs`
+  - Tests: `real_silence_sweep_observes_sparse_expected_reports_before_alarm_filtering`
+- [x] Exercise boot/dial and Extend registration, refusal/truncation/closed ACK
+      removal, backup ownership, closed-primary rebinding and depth exclusion.
+  - Files: `crates/app/src/dhan_feed_stack/subscribe_reconcile_tests.rs`, `crates/app/src/subscribe_reconcile.rs`
+  - Tests: `main_feed_commands_registers_without_a_topup_collector`, `a_refused_topup_is_removed_from_both_expected_sets`, `a_truncated_topup_removes_only_the_unheld_tail`, `a_closed_ack_removes_the_unconfirmed_offer`, `main_feed_commands_preserves_topup_room_and_excludes_depth`, `test_closed_primary_rebinds_without_refunding_daily_rounds`, `test_backup_refusal_keeps_the_primary_timestamp_and_expected_entry`
+- [ ] Run component, wiring, size, allocation and full applicable app/common
+      validation, normal native gates and independent source review.
+
+### Rollback
+
+Revert the wiring commit while retaining the preserved component history. The
+default-false resend switch remains unchanged; no live setting or deploy is part
+of this source continuation. Boot refusal and paging remain separate owner scope.
+
+### Observability
+
+Use the component's existing expected/missing/round counters and coded warnings.
+Tests distinguish expected queued work from confirmed held/wire/received data.
+No new alarm, metric export selection, latency guarantee or live proof is claimed.
+
+### Independent review correction — stale queued rounds
+
+The first wired snapshot is blocked by independent review: enqueue-time eligibility
+can become stale before the sequential executor reaches the round. Add a unique
+round reservation and originating IST day, validate ownership/membership and a
+fresh session gate after obtaining command-channel capacity but before every new
+unsubscribe, and cancel stale work without changing another reservation's budget.
+Refund only the matching current-day reservation. Rebinding or forgetting clears
+the prior reservation identity; day rollover clears it with the daily count.
+Once an unsubscribe may have happened, restoration remains mandatory even if the
+window closes. Tests must cover queue-to-forget, closed-owner rebind, window-close,
+same-day cancellation refund, and an old-day refund arriving after new ownership
+has reserved a new-day round. This is cold-path work only, with no timing claim.
+
+The v3 review closed that unsubscribe/refund race but found that a known-not-held
+reply could still cause a stale new subscription in phase three. Recheck that
+placement and every retry through the same capacity-first atomic enqueue gate;
+only removed or uncertain members bypass it for mandatory restoration. Cancel and
+refund only an unplaced matching reservation tail. Added controls cover a forget
+or close during the not-held ACK, a placement retry crossing close, and partial
+placement whose canceled tail alone is refunded. The restored component/wiring
+filter passed 62 tests with no failures; the manual wall-clock harness remains
+ignored. Six ordinary mutations detected the intended executed failures in the
+membership, session, not-held placement, restoration and refund contracts, then
+the original component was restored byte-for-byte. Pure configuration parsing
+passed three tests, host-limit logic 15, deployment lockstep eight and selected
+repository guards 20. Full lint, committed-head workspace, native gates and remote
+CI remain pending at this pre-commit checkpoint. Validation occurs before enqueue, not at the later
+socket write; delivering and first-packet evidence is the latest sweep's state.
+
+The unchanged full public-function scanner measured its existing 311 baseline.
+The test-count guard measured 15,598 source attributes, so its tracked floor is
+raised from 13,559 to 15,598 as that guard requests. This mechanical inventory is
+not an executed-test count or a code-coverage percentage; no scanner, exemption,
+coverage floor or deadline is relaxed.
+
+### Committed validation follow-up — channel helper naming
+
+Normal merge commit `dd5a9d0a` preserves both the green, unmerged #2158 prerequisite
+and the original #2144 history. Its first full run stopped after 6,665 passed,
+one failed and seven ignored tests. The unchanged `--no-fail-fast` diagnostic
+then completed all 460 harnesses: 15,504 passed, one failed and 34 ignored. The
+only failure was the shell guard's SSM sender inventory: its literal marker
+matched the private channel helper name `send_command_checked`, which performs
+bounded Tokio channel dispatch and acknowledgement waiting, with no SSM call.
+
+Rename that helper and its two callers to `dispatch_reconcile_checked` without
+changing its behavior, tests, constants or public declarations. The SSM scanner,
+actual sender inventory and every threshold remain unchanged. An independent
+source review verified inverse rename/formatting equivalence and the corrected
+marker inventory. Corrected-source focused guards, normal follow-up commit and
+fresh final-head workspace, lint, native push and CI results remain pending at
+this checkpoint; the failed committed-head runs remain part of the evidence.
+
+The unchanged full public-function scanner passed the corrected feed source in
+248 seconds under its existing standalone 300-second command; normal native
+publication still requires its unchanged 120-second limit. Compose the separately
+reviewed per-invocation crate-inventory optimization and its Git-isolated Rust
+fixtures before final validation. It retains the matching/verdict rules,
+baselines, wrapper deadlines and exemptions, adds no quality-state cache, and
+does not turn heuristic name matching into proof of behavioral coverage. Its
+integrated fixtures, repository guards and final native gates remain required.
+
+The exact scanner proposal passed all 14 integrated fixture tests, but the
+unchanged assertion-free ratchet counted ten helper-based bodies and failed at
+155 versus 145. Name their real asserting helper `assert_outcome` and update its
+call sites; preserve its assertions and every test body apart from that name.
+Do not change the ratchet, production hook, baseline or deadline. Retain the
+failed predecessor and rerun all 14 fixtures plus the actual ratchet before the
+normal follow-up commit.
+
+### Shared fixture follow-up — Rust child deadline
+
+Follow-up commit `fe3b9c0d` passed the targeted fixture/ratchet checks and normal
+commit gates. Its fresh full-workspace attempt was explicitly stopped during
+compilation (exit 143, zero test harnesses) after a sibling's actual full run
+rejected the fixture's external timeout executable under the unchanged spawn
+allowlist. That interruption is not a test result or a successful full run.
+
+Use the existing Tokio dependency for a private fixture helper that concurrently
+captures both output streams and waits for the direct child under the original
+ten-second deadline. Each stream fails explicitly above 1 MiB rather than
+truncating a verdict. On deadline/read failure, drop the pipe futures before
+attempting termination and wait; preserve the primary error and report cleanup
+failures. Reaping depends on OS scheduling, and arbitrary descendants are not
+terminated as a process group. Existing Git isolation and all fourteen original
+assertions remain; five added cases cover deadlines/reaping, pipe saturation,
+output limits and nonzero exit preservation. Production hook, allowlists,
+baselines, native deadlines, dependencies and feed behavior remain unchanged.
+
+Independent source reviews cleared this bounded scope. The corrected fixture
+passed 19 cases, the browser/toolchain guard 16 and assertion ratchet two. Two
+ordinary controls removed the deadline or capture cap and each failed its
+intended assertion after compiling; neither reached its independent outer
+deadline. The exact source was restored and all 19 fixture cases passed again.
+The complete common-crate `--tests --no-fail-fast` run then passed 1,804 tests,
+with zero failures and one ignored test across 90 harnesses, using one build job
+and one test thread. Scoped fixture Clippy also passed. These are pre-commit
+source results; a normal commit, fresh final-head workspace, all-target Clippy,
+native publication and exact-head CI remain required. No activation, live proof
+or latency result is inferred.
+## Coverage continuation CI resource mitigation — 2026-10-31
+
+The combined coverage continuation also carries the independently reviewed
+Coverage & Perf workflow correction prepared after draft #2171 head 8f failed
+instrumented app links with SIGBUS. The failure-time resource cause is unresolved;
+disk pressure is plausible, not measured, and this is an unproven mitigation.
+The baseline workflow is byte-identical to that reviewed head.
+
+Set dev/test debug data to zero only in the coverage job, retaining LLVM coverage
+instrumentation, optimization/debug-assertion behavior and overflow checking.
+Record final filesystem, inode, memory and target sizes in a separate always-run
+step; a successful diagnostic step cannot erase a failed coverage result. Remove
+only the redundant workspace flag from raw-profile cleanup and correct the retry
+comment for pinned llvm-cov 0.9.1. Keep the same coverage command, dedicated DHAT
+split, one retry, failure exits, 60-minute timeout, report path, coverage floors,
+required checks and security gates. The shell ceiling remains 293 lines.
+
+Validate the real shell-budget/coverage guards and normal native gates before
+publication. The next exact-head GitHub run must produce a nonempty report and
+pass unchanged floors before this mitigation is reported successful. Reduced
+backtrace detail is the explicit tradeoff. No #2171 rerun, production action or
+coverage skip/floor change is authorized or performed by this continuation.
+
+**Status:** IN_PROGRESS
 **Date:** 2026-08-10
 **Approved by:** Parthiban (operator) — "approve the plan", 2026-08-10 in-session, given in
 direct response to the 7-item list reproduced verbatim below as Items 1–7.
@@ -50,7 +228,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     the claim** instead. An unused dependency backing a documented guarantee is worse than
     no guarantee.
   - Files: `crates/app/src/main.rs`, `crates/app/Cargo.toml`
-  - Tests: `test_core_affinity_is_wired_or_absent` (source-scan ratchet — the dependency
+  - Tests: crates/common/tests/core_affinity_claim_guard.rs — the guard that replaced the planned single test, noted 2026-10-01 (source-scan ratchet — the dependency
     and a call site must co-exist, or neither may)
 
 - [ ] **Item 2 — Boot-time limit assertions (deploy + config, UNBLOCKED)**
@@ -65,16 +243,90 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/docker/docker-compose.yml`, `deploy/aws/terraform/user-data.sh.tftpl`,
     `deploy/systemd/tickvault.service`
   - Tests: `boot_limit_assertion_guard.rs`
+  - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT ticked.**
+    Verified already on main before this change: `LimitNOFILE=65536` in
+    `deploy/systemd/tickvault.service`; `vm.max_map_count = 1048576` and
+    `net.core.rmem_max = 67108864` (64 MiB since Quote 38, not the 128 MiB above)
+    in `deploy/aws/sysctl/99-tickvault-net.conf`; the QuestDB cap DERIVED from host
+    MemTotal on every deploy (`deploy-aws.yml` questdb-mem step, 40%, floor 1g) —
+    the trap above is closed. Added in PR #2144: `crates/app/src/host_limits.rs`
+    also reads `vm.max_map_count` and this process's soft open-file limit
+    (`/proc/self/limits`), and `crates/app/tests/host_limits_lockstep_guard.rs`
+    pins both to the deploy files (the ratchet this item names). **Still open:**
+    the check WARNS and does not refuse to start. The Failure Modes row below says
+    "warn for one release, then enforce"; enforcing is a boot-blocker the owner
+    decides.
+    **Scope clarification 2026-10-31:** this process reads its local `/proc`
+    settings. It cannot establish a QuestDB limit on a separate host.
 
 - [ ] **Item 3 — Empty-subscription + partial-subscribe detectors (scenario #75, #62)**
-  - At T+90s after subscribe, assert `frames_received > 0` **per instrument class**;
-    force-cycle the slot and page if a class is dead.
-  - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against first-seen.
-    Auto-resubscribe the delta on a spare slot, max 3 rounds, then page **with the list**.
-  - Files: `crates/core/src/websocket/pool_supervisor.rs`
-  - Tests: `subscribe_ack_reconciliation_guard.rs`
+  — **HALF DONE 2026-08-25.** Split below rather than ticked whole: the detection
+  half shipped, the auto-remediation half did not, and one tick on the parent
+  would claim both.
 
-- [ ] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
+  - [x] **3a — dead-instrument-CLASS detector (DONE 2026-08-25)**
+    - Folds a per-`ExchangeSegment` liveness tally into the silence sweep that
+      already runs every 30s — no second O(n) pass. A segment where every
+      non-sparse instrument is still never-ticked past its warmup window emits
+      `tv_dhan_feed_dead_instrument_class_total{segment}` + the
+      `tv_dhan_feed_dead_instrument_classes` gauge, edge-latched once per
+      episode.
+    - Catches the **2026-08-21 incident directly**: 119 NSE indices subscribed,
+      zero ticks all session, 8,868 tradeables flowing normally. The
+      per-instrument gauge read 119-of-~9,000 — under 1.5%, indistinguishable
+      from thin-instrument quiet — and nothing paged. A human found it.
+    - Files: `crates/app/src/dhan_feed_stack.rs`
+    - Tests: 9 in `dhan_feed_stack::tests` (7 unit on `ClassLiveness`, 1 tally
+      invariant, 1 end-to-end through the live sweep).
+    - **Log-sink-only.** No Telegram page: the Dhan alert family is fixed at
+      four items by `dhan-rest-only-noise-lock-2026-07-14.md` §2 and a fifth
+      needs a dated operator quote there FIRST. The counter and gauge are what
+      an alarm would later read.
+    - **Two findings recorded from bite-testing, both corrections to my own
+      claims:** (1) the `pending == 0` term in `is_dead` is REDUNDANT —
+      implied by `never == eligible` given the fold — so mutating it away
+      changes no verdict; kept for intent, with a test pinning the invariant
+      it rests on. (2) The healthy-class test does NOT guard the
+      `counts_toward_alarm()` denominator trap as its first comment claimed;
+      `a_single_ticking_instrument_keeps_its_class_alive` is the test that
+      actually bites on it. Both comments corrected.
+
+  - [ ] **3b — expected-vs-first-seen delta + auto-resubscribe (NOT DONE)**
+    - Maintain `expected: HashSet<(sid, segment)>`; at T+120s diff against
+      first-seen. Auto-resubscribe the delta on a spare slot, max 3 rounds,
+      then page **with the list**.
+    - **Deliberately deferred, not forgotten.** 3a is pure observation over an
+      existing sweep. This half CHANGES LIVE SUBSCRIBE BEHAVIOUR — it dials a
+      spare slot, so it interacts with the 16-connection budget, `plan_pool`'s
+      fail-closed whole-pool refusal, and the 09:12 pre-open deadline. That
+      deserves its own design pass and its own PR rather than riding along
+      with a detector.
+    - Files: `crates/core/src/websocket/pool_supervisor.rs`
+    - Tests: `subscribe_ack_reconciliation_guard.rs`
+    - **PROGRESS 2026-10-30 (owner: "fix resolve implement everything now"), NOT
+      ticked.** Built in PR #2144 as `crates/app/src/subscribe_reconcile.rs`
+      instead of `pool_supervisor.rs`: the delta is judged from the drain's
+      existing 30 s silence sweep (no per-tick work) and the resend is IN PLACE
+      through the existing `LiveSubscriptionCommand::Resubscribe` on the SAME
+      socket (unsubscribe, then subscribe), never a spare slot and never a redial
+      (owner instruction and scope lock 2026-10-02). This changes the plan text
+      above ("auto-resubscribe the delta on a spare slot"). Max 3 rounds per
+      instrument per IST day, 120 s apart per socket; continuous session only,
+      from 09:17; skipped when the socket or the whole feed delivers nothing.
+      Switch `[dhan_universe] subscribe_reconcile_auto_resubscribe`, default
+      false (count only). Counters local `/metrics` only; the exhausted list is a
+      coded `warn!`, NOT a page ("then page with the list" needs a dated quote in
+      the noise lock first). Tests: the module's own unit tests (no separate
+      `subscribe_ack_reconciliation_guard.rs`). **Still open:** the drain wiring
+      (`dhan_feed_stack.rs` is owned by another session; proposed in the PR
+      body), turning the switch on, and the page.
+      **Continuation 2026-10-31:** the source above now wires the existing raw
+      drain sweep and primary/Extend acknowledgement paths into the book, with
+      focused tests and independent source reviews. The default-false switch,
+      live shadow-session proof and paging policy remain separate; the parent
+      item is not complete, and broader publication gates are still pending.
+
+- [~] **Item 4 — Memory watchdog that ACTS + per-task heartbeats (#39, #57, #58)**
   - Restart at 80% memory, before the kernel's killer decides.
   - Every long-lived task emits a heartbeat; a supervisor respawns after 3 missed beats and
     counts `tv_task_respawn_total{task}`.
@@ -82,6 +334,21 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     path must be the process supervisor, not an unwind handler.
   - Files: `crates/storage/src/oom_monitor.rs`, `crates/app/src/main.rs`
   - Tests: `task_heartbeat_guard.rs`
+  - **PARTIAL 2026-10-30 (owner: "fix resolve implement everything now itself parallelly").**
+    Landed, both switches OFF by default: (a) `memory_watchdog.rs` — an action ladder on
+    the RESOURCE-02 ceiling (70% trim free heap pages outside the session, 80% trim in
+    session too + empty opt-in caches, 90% same + one log line), 5-point hysteresis,
+    `[memory_watchdog] mode = "off" | "shadow" | "act"`; it never drops a received frame and
+    never stops capture. (b) `task_heartbeat.rs` — heartbeats for the six long-lived tasks
+    the hot-path telemetry does not watch, published on the `tv-task-watch` thread; the
+    supervisors await through `await_watched`, which aborts a task that missed 3 beats only
+    when `[task_heartbeat] respawn_on_missed_beats = true` (else counted on
+    `tv_task_heartbeat_would_respawn_total`), counting `tv_task_respawn_total{task,reason}`.
+    Tests: `task_heartbeat::tests`, `memory_watchdog::tests`,
+    `crates/storage/tests/dhat_task_watch.rs`, `task_watch_boot::tests`.
+    **NOT done, needs the owner:** the "restart at 80%" rung. It conflicts with the same
+    day's "never stop capture"; a restart costs seconds of capture, so it is not built.
+    Turning either switch on, and any alarm on the new counters, are owner calls too.
 
 - [~] **Item 5 — Disk: automatic purge + raw ticks off the database (#33, #55)**
   - Raw ticks stream to compressed object storage, never bulk-ingested. At the modelled
@@ -91,7 +358,8 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `crates/storage/src/{disk_health_watcher,partition_archive,ws_frame_spill}.rs`
   - Tests: `disk_purge_guard.rs`
 
-- [ ] **Item 6 — Alarms for the silent error classes (terraform, UNBLOCKED)**
+- [x] **Item 6 — Alarms for the silent error classes (terraform, UNBLOCKED)**
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. Superseded by operator Quote 53 (2026-11-11, 'Cut alarms 93 -> ~30') and noise lock §2.21/§3 (no new Dhan page without a dated quote); alarms were removed per docs/audits/2026-11-alarm-review.md, not added. No ~49 new filters in deploy/aws/terraform/error-code
   - 168 error codes exist; **23** have alarms. Add metric filters for the ~49 log-only
     classes that can cost a trading day.
   - Files: `deploy/aws/terraform/error-code-alarms.tf`
@@ -103,7 +371,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Files: `deploy/aws/terraform/main.tf`, `crates/aws-lambdas/src/start_watchdog.rs`
   - Tests: `az_failover_guard.rs`
 
-- [ ] **Item 8 — Rebuild cross-verification: Dhan-only, NTM + NSE indices, and RETIRE the
+- [~] **Item 8 — Rebuild cross-verification: Dhan-only, NTM + NSE indices, and RETIRE the
   current post-market pass** — **QUEUED 2026-08-19 by operator directive** (verbatim, typos
   preserved): *"see as of now add this into the queue dude which is for cross verification
   enitlrey oen and only for ethe ntire ntm and entie idnices for dhan alone dude which is one
@@ -159,8 +427,33 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
   - Tests: digit-magnitude SQL literal guard; `compared == 0` ⇒ Blind classification;
     ISIN-join fail-closed + unresolved-named; a ratchet proving the OLD pass has no
     remaining scheduler call site (so the retirement cannot half-land)
+  - > **⚠ SUPERSEDED 2026-09-16 — the REPLACEMENT half is CANCELLED; the RETIREMENT half
+    > is absorbed into Item 43.** This item was queued 2026-08-19 to *replace* the
+    > post-market pass with a Dhan-only NTM + NSE-indices comparison. On 2026-09-16 the
+    > operator ordered the per-minute REST legs and the 15:41 accuracy check REMOVED
+    > ("Bro just remove per minute price falls and 3.41 pm accuracy check alone dude
+    > okay"), recorded verbatim in `no-rest-except-live-feed-2026-06-27.md` §12.10.0. The
+    > later directive governs, and it is not a narrowing of this one — it removes the
+    > mechanism this item planned to rebuild. **A rebuild is not authorized**: the
+    > replacement described here is itself a REST comparison against Dhan's own tape, so
+    > building it would re-add the exact call class the 2026-09-16 directive removes.
+    > Re-opening it needs its own fresh dated quote.
+    >
+    > **This item's own warning is now the permanent state, not a transitional one.** It
+    > says a non-zero `compared` is *"the single measurement that distinguishes 'the Dhan
+    > feed works' from 'the socket is open and silent'"* and that retiring the pass
+    > *"blinds that gate for exactly as long as the replacement is not running"*. Under
+    > Item 43 there IS no replacement, so the blinding is permanent. Recorded here because
+    > this item reached that conclusion independently four weeks earlier — the cost was
+    > known and is now accepted, not discovered.
+    >
+    > **What still stands from this item:** its trap list. The 2026-07-11 blind-since-birth
+    > lesson (nanosecond literals against a microsecond column, `compared=0` reported
+    > honestly while nobody read it) and the rule that `compared == 0` must classify Blind
+    > and never Ok remain the reference for any future comparator, in this repository or
+    > another. Item 43 removes the comparator; it does not retire the lesson.
 
-- [ ] **Item 9 — depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
+- [~] **Item 9 — (SUPERSEDED 2026-09-23/24, see Item 48) depth-200 = ATM CE/PE of the current expiry, NIFTY + BANKNIFTY only, with a
   HYSTERESIS re-subscribe policy** — **QUEUED 2026-08-19 by operator directive** (verbatim,
   typos preserved): *"see emanwhiel as of now for depth 200 always stick to atm ce pe of
   ciurrent expiry aloen for both nifty and banknifty dude okay? see how will yo ualways ensrue
@@ -179,7 +472,7 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
 
     | Policy | What it gets right | Why it is wrong on its own |
     |---|---|---|
-    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(25)` + `subscribe(23)` on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
+    | **Always re-subscribe on ATM change** | the book always describes the strike where liquidity actually is | every swap is `unsubscribe(24)` + `subscribe(23)` *(was written as 25; proven ignored live 2026-09-10 — see the scope lock)* on that socket, so the book has a HOLE at exactly the moment of a fast move — the moment the depth is most worth having. On a trending day this churns repeatedly and the day's series is a stitched sequence of fragments, not one book |
     | **Static from the 2nd minute to EOD** | one contiguous 200-level book per instrument, perfectly comparable all day, zero churn, zero gaps | a 2% index move leaves the "ATM" strike deep OTM by the close. Its book thins to almost nothing, so the back half of the day records depth for a strike nobody is trading — technically complete data about the wrong instrument |
     | **HYSTERESIS (recommended)** | keeps the book on a strike that stays meaningful, while swapping rarely enough that the series stays readable | needs two named constants and a dwell timer — which is work, not a config flip |
 
@@ -248,6 +541,313 @@ This plan converts hope into bounded, tested, alarmed guarantees. It does NOT pr
     `day_boundary_rearms_the_first_bucket_treatment`
   - Full design: ITEM 10 addendum below (C1–C8)
 
+- [x] **Item RESUB — unsubscribe and subscribe, not disconnect and reconnect (operator 2026-10-01: "now isntead of disconenct reocnenct follow the unsubscribe and siubscribe apporach ddue okay? see i neve rver want to have nay ticks loss zerot icks loss and zerod ata msisign dude okay?")**
+  - Depth-200 ranked rotation sends `LiveSubscriptionCommand::Swap` (code 25 then code 23 on
+    the live socket) instead of `RotateByRedial`; `RotateByRedial`,
+    `ConnEvent::RotationRequested` and `ReconnectReason::RankedRotation` are removed.
+  - A ghost contract is answered by re-sending code 25 for it on its socket
+    (`request_ghost_unsubscribe` / `take_ghost_unsubscribe`), never by a redial;
+    `ReconnectReason::GhostInstrument` and `ConnEvent::GhostInstrumentDetected` are removed.
+  - Files: `crates/app/src/depth_rebalance.rs`, `crates/app/src/dhan_feed_stack.rs`,
+    `crates/core/src/websocket/pool_supervisor.rs`,
+    `crates/app/tests/ghost_instrument_named_guard.rs`,
+    `docs/claude-rules-full/project/websocket-connection-scope-lock.md` (2026-10-01 section)
+  - Tests: `a_depth_200_swap_never_closes_the_socket`,
+    `a_ghost_unsubscribe_resends_code_25_and_never_redials`,
+    `a_ghost_unsubscribe_for_a_held_instrument_sends_nothing`,
+    `request_ghost_unsubscribe_arms_once_and_take_returns_the_instrument`,
+    `request_ghost_unsubscribe_is_refused_inside_the_cooldown_and_allowed_after_it`,
+    `ranked_rotation_sends_an_in_place_swap_not_a_redial`,
+    plus the existing swap tests (`a_swap_unsubscribes_before_it_subscribes`,
+    `a_swap_does_not_eat_the_frames_arriving_around_it`,
+    `a_swap_that_empties_the_socket_forces_a_redial`)
+  - Review fixes (three reviewers, 2026-10-01): the 805 breaker is checked again at the
+    connection for a queued swap and a pending ghost resend; a pending ghost request is never
+    overwritten and the take reads the pair before clearing the flag; a request the socket
+    holds again is refunded to the ceiling. Tests:
+    `an_805_refuses_a_queued_swap_and_a_pending_ghost_at_the_connection`,
+    `a_pending_ghost_unsubscribe_is_never_overwritten_and_is_taken_once`,
+    `a_racing_take_never_reads_a_torn_id_and_segment_pair`,
+    `refund_ghost_resend_returns_one_place_and_saturates_at_zero`
+  - Full design: ITEM RESUB addendum below
+
+- [x] ITEM UTC-HOLD — hold 2026-11-20 (and any auto-held day) out of the archiver, the Brutex export and the cross-check catch-up until a verified repair writes `.done` (daily-universe Quote 63, owner cards 2026-11-20)
+  - Files: crates/storage/src/held_days.rs (+ held_days_tests.rs; `HeldDays`, `.hold` / `.done` markers with CRC-32, `install_process_held_days`), crates/storage/src/partition_archive/held_day_filter.rs (`apply_held_days`, before the cross-verify hold, backlog and cap), crates/storage/src/partition_archive.rs (`run_archive_pass`, `worklist_sizes`, `ArchiveRunSummary::held_day`), crates/storage/src/partition_archive/daily_export.rs (`export_day` refuses, `StopReason::Held`), crates/app/src/brutex_export_boot.rs (skip before any attempt; `eligibility_day`, `visit_order_with_released`, `left_window_report_wanted`), crates/app/src/dhan_live_crossverify_boot.rs (`past_days_to_check` `is_held`), crates/app/src/daily_archive_boot.rs (install), crates/common/src/config.rs (`held_days` + validation), config/base.toml (`held_days = ["2026-11-20"]`)
+  - Tests: test_regression_held_day_skipped_by_all_three_paths (crates/app/tests/held_day_paths_guard.rs, with the source-scan guards), test_regression_held_day_export_eligibility_from_done (brutex_export_boot), test_regression_done_marker_releases_hold (held_days_tests), test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done (stub pass + export), test_partition_retention_held_days_default_parse_and_validate
+  - Hostile review fixes (2026-11-20, one commit): the archiver waits for the export of a released day (`.exported`, `HeldDays::archive_verdict`, `note_exported`, at most 8 days, kept after the entry is removed); `.hold` re-read per partition (`PartitionArchiver::held_since_pass_start`) and per exported table (`held_stop`, counted once); folder failures told apart (`damaged_marker_cause`, `read_day_marker_checked`, coded STORAGE-GAP-04 once); a bad `held_days` entry holds every day instead of stopping the boot (`held_days_config_unreadable`); a future-dated `.done` releases nothing (`today_ist`); `released_days` caps only `.done` files; late-released days checked once for DONE (`days_leaving_window_with_released`). Tests: test_regression_archive_verdict_note_exported_with_export_first_wait_for_the_export, test_regression_archive_holds_a_repaired_day_after_its_entry_is_removed, test_regression_future_dated_done_releases_nothing_with_today_and_today_ist, test_damaged_marker_cause_and_read_day_marker_checked_tell_folder_from_file, test_regression_held_days_config_unreadable_holds_every_day (held_days_tests), test_days_leaving_window_with_released_reports_a_late_done_day (brutex_export_boot), held_day_paths_held_skip_detector_bites and the export-first rows of test_regression_held_day_skipped_by_all_three_paths (guard), the export-first pass in test_regression_held_day_archive_pass_and_export_day_write_nothing_until_done, test_held_since_pass_start_counts_a_hold_written_mid_pass (stub), test_held_since_pass_start_runs_before_every_copy_in_the_pass_loop (held_day_filter)
+- [x] ITEM UTC-PAGE — DHAN-FEED-TIME-01 page (noise lock §2.24: prices outside the session after correction, or 10 minutes with no candle), one notice a day when the correction arms, auto-hold of a firing day
+  - Files: crates/app/src/dhan_feed_stack/feed_time_page.rs (`FeedTimeTally`, `FeedTimeEpisode`, `FeedTimePage`: latch and `.hold` written by the `tv-feed-time-latch` thread, never the drain), crates/app/src/dhan_feed_stack.rs (30 s silence arm, before its session gate), crates/app/src/dhan_feed_stack/ltt_feed.rs (per-frame and per-index-tick counts on the corrected time), crates/common/src/error_code.rs (DHAN-FEED-TIME-01, DHAN-LTT-01, DHAN-LTT-02), deploy/aws/terraform/error-code-alarms.tf (`dhan-feed-time-01`, ok_recovery false), docs/error-runbooks/dhan-feed-time-error-codes.md, .claude/triage/error-rules.yaml, crates/aws-lambdas/src/telegram_webhook.rs (phrase), notice via `install_ltt_notice` (CustomStatusUrgent, once a day, recorded in the record file)
+  - Tests: test_regression_2026_11_20_shape_pages_cause_a_on_the_second_scan, test_cause_b_needs_twenty_scans_with_frames_and_no_candle, test_cause_a_needs_twenty_ticks_half_bad_and_two_scans_in_a_row, test_outside_the_gate_never_fires_and_resets_streaks, test_a_restored_latch_never_pages_again_and_a_new_day_rearms, test_tally_judges_corrected_times_against_the_window_and_receipt, test_record_writer_thread_acks_intents_and_sends_one_notice_a_day
+- [x] ITEM UTC-FIX — correct Dhan trade time by exactly +19,800 s from a persisted, armed per-IST-day record (scope lock 2026-11-20)
+  - Files: crates/storage/src/ltt_correction.rs (+ ltt_correction_tests.rs; `LttTable`, `correction_verdict`, `corrected_ltt`, record lines with CRC-32, `load_record_dir`, `install_at_boot_from`, `spawn_record_writer`, `LttDetector`, `LttController`), crates/core/src/parser/dispatcher.rs (`apply_ltt_correction` on the Ticker, Quote and Full arms; `dispatch_frame_uncounted_unstamped`; `raw_last_trade_time`), crates/app/src/dhan_feed_stack/ltt_feed.rs (drain seams, `replay_held`), crates/app/src/dhan_feed_stack.rs (boot refold and catch-up holds, stop reason `ltt_day_held`), crates/app/src/main.rs (install at boot, boot summary, notice), crates/common/src/config.rs + config/base.toml (`[dhan_feed] ltt_utc_autocorrect = "act"`)
+  - Done tests: test_regression_2026_11_20_nifty_example_is_corrected_to_receipt_time, proptest_correction_obeys_every_guard, proptest_live_and_replay_agree_for_every_packet_or_the_day_is_held, test_live_and_replay_agree_on_a_fixed_flip_and_flip_back, test_controller_arms_from_one_past_every_dispatched_receipt, test_a_change_pending_at_ist_midnight_is_voided, test_the_detector_freezes_after_eight_entries_a_day, test_dispatcher_corrects_ticker_quote_and_full_only_while_armed (core/tests/ltt_correction_dispatch.rs), dhat_armed_ltt_correction_dispatch_is_zero_alloc (core/tests/dhat_ltt_correction.rs), test_regression_2026_11_20_the_live_drain_arms_after_a_durable_intent (app/tests/ltt_correction_drain.rs), bench dispatch_frame/ticker_ltt_armed
+  - Tests: correction property tests, live-vs-replay identity with crash injection, the named 2026-11-20 regressions, DHAT 0 blocks, dispatch_frame/ticker_ltt_armed bench
+  - Rules: scope lock 2026-11-20, daily-universe Quote 63, noise lock §2.24; design in the UTC addendum below
+- [x] ITEM UTC-SAFETY — trade-safety switch: while today's DHAN-FEED-TIME-01 alarm is on, the paper path opens no new entries; exits always pass (daily-universe §28.7, owner card "Yes, after this merges (Recommended)", 2026-11-21)
+  - Files: crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs, crates/app/src/daily_task_marker.rs (`marker_state`), crates/app/src/dhan_feed_stack/feed_time_page.rs, crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs, crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs, crates/app/src/live_fill_report/build.rs, crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs, CLAUDE.md
+  - Tests: trade_safety unit tests (same/next/earlier day, causes reset on a new day, chain day equals ist_day_number_now), chain entry refused with Decision+Reject rows and exit sent, held entry refused at fill, runtime backstop `refused:feed_time_alarm`, self-test skipped not failed, fire engages before the hand-off, marker Present/Unreadable/Absent at chain start, proptest against an oracle, dhat_live_fill with the switch set, trade_safety_wiring_guard (bite-tested)
+  - Rules: daily-universe §28.7; noise lock §2.24 (no second DHAN-FEED-TIME-01 error); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-SAFETY addendum below
+  - Built 2026-11-22 (owner: "go ahead with UTC-SAFETY after the repair dude"). A 5-reader site map and a 3-design judge panel corrected the addendum below in seven places, all applied: (a) the fail-closed seed runs where production starts (`live_fill::boot` on every outcome, and the drain's `restore_latch` at start and each day change), never in `LiveFillChain::new` or the replay; (b) gate D sits before the no-marks skip AND in the mark arm (which still prices the mark); (c) gate B's reason is in the report's worked-out set and carries the model price; (d) gate C is first in the Execute arm and sends the position report; (e) no line in main.rs or dhan_feed_stack.rs; (f) `entries_blocked` is serialize-only; (g) the switch is one packed word where the latest engage wins (a forward clock step cannot hide a later alarm), and gate C blocks on the decision day OR today. Gate A sits before the taint scan, so every blocked entry carries one reason. The edge `warn!` and gauge run on the order runtime's 1 s tick, never the drain.
+    - Files (as built): crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs, crates/app/src/daily_task_marker.rs (`MarkerState`, `marker_state_in`), crates/app/src/dhan_feed_stack/feed_time_page.rs, crates/app/src/live_fill/{chain.rs,chain_tests.rs,mod.rs}, crates/app/src/order_runtime.rs, crates/app/src/order_runtime_live_fill.rs, crates/app/src/live_fill_report/{build.rs,build_tests.rs} (+ golden report), crates/app/tests/{trade_safety_wiring_guard.rs,dhat_trade_safety.rs} (new), CLAUDE.md, docs/error-runbooks/dhan-feed-time-error-codes.md
+    - Tests (as built): trade_safety unit and proptests (test_blocked_on_same_day_only, test_same_day_causes_or, test_latest_engage_wins_after_forward_step, test_backward_step_limit_pinned, test_negative_day_noop, test_concurrent_engages_keep_both_causes, proptest_day_key_equals_chain_runtime_page_and_receipt_formulas, proptest_switch_against_oracle, test_seed_from_markers_in_present_unreadable_absent, test_seed_fails_closed_on_a_day_with_no_date, test_ensure_seeded_reads_once_per_day, test_edge_publisher_warns_once_per_edge), test_marker_state_in_present_absent_unreadable, test_daily_marker_exists_still_fail_open, test_fire_engages_before_error_and_hand_off_with_no_writer, test_restore_latch_seeds_switch_and_stays_fail_open, test_gate_a_entry_refused_decision_and_reject_rows, test_gate_a_exit_identical_to_switch_off, test_gate_a_ignores_yesterdays_block, test_gate_b_refuses_held_entry_before_any_mutation_and_held_exit_finishes, test_gate_c_refused_and_reports_position, test_gate_c_exit_placed, test_gate_c_blocks_on_stamp_day_or_now_day, test_gate_d_mark_arm_skips_after_arming, test_gate_d_not_counted_failed, test_feed_time_reject_is_worked_out_share, test_entries_blocked_counts_both_reasons_gate_a_skipped_gate_c_rejected, dhat_trade_safety_engage_and_check_zero_alloc, trade_safety_wiring_guard (5 rules, incl. gate order, the day-change seed and both gate-D skips). Bite-checked: with gates A, B, C, the fail-closed seed and the engage in `fire` broken, 7 unit tests and 2 guard rules failed.
+    - Not done, recorded: the offline replay never engages the switch, so its `--compare` differs from live on an alarm day; a `.hold` day does not block (owner decision, not asked).
+    - Merged 2026-11-22 as SJParthi/tickvault#2283 (86a371a27), All Green, together with the Quote 64 `url` 2.5.9 security fix.
+- [x] ITEM UTC-PERMANENT — Dhan Live LTT is UTC epoch from WAL receipt 2026-11-20 00:00 IST: always add exactly +19,800 s as a pure function of (raw, receipt), no armed record; the detector stays only as a reversion guard that pages (scope lock §"2026-11-21", noise lock §2.24-a; Dhan ticket #6684672; owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)", 2026-11-21)
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. 09bb3696a (#2276): crates/storage/src/ltt_correction.rs::utc_verdict + DHAN_LTT_UTC_FROM_RECEIPT_NANOS; tests proptest_pre_cutover_is_byte_identical, test_regression_2026_11_20_first_packet_corrected_without_warm_up, test_regression_2026_11_21_guard_watches_th
+  - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md and its stub, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md and its stub, .claude/rules/project/data-integrity.md, docs/dhan-ref/03-live-market-feed-websocket.md, docs/dhan-ref/08-annexure-enums.md, .claude/rules/dhan/live-market-feed.md, .claude/rules/dhan/annexure-enums.md, .claude/rules/project/historical-candles-cross-verify.md, docs/dhan-support/2026-11-20-ltt-sent-as-utc.md, docs/dhan-support/README.md (step 1, rules first); crates/storage/src/ltt_correction.rs (+ ltt_correction_tests.rs; `DHAN_LTT_UTC_FROM_RECEIPT_NANOS`, `corrected_ltt`, `utc_verdict`, refusal counters by reason, `install_at_boot*` a no-op, `LttController::observe` reversion guard), crates/app/src/dhan_feed_stack/ltt_feed.rs (no record writer, no notice), crates/core/src/parser/dispatcher.rs (comment, `tv_dhan_ltt_unstamped_total` on the unstamped path), crates/core/tests/ltt_correction_dispatch.rs, crates/app/tests/ltt_correction_drain.rs, crates/core/tests/dhat_ltt_correction.rs, the `dispatch_frame/ticker_ltt_armed` bench, .github/workflows/ci.yml test lists (step 2 and 3); CLAUDE.md `ltt_correction` / dispatcher / feed_time_page rows and docs/error-runbooks/dhan-feed-time-error-codes.md (step 4). ⚠ CORRECTED 2026-11-21 (review): this list said "Not touched: feed_time_page.rs" and named `crates/storage/tests/dhat_ltt_correction.rs`; both were wrong. Also changed: crates/app/src/dhan_feed_stack/feed_time_page.rs (`Cause::FormatReverted`, `hold_after_reversion_page`, retried hold hand-off, `feed_time_writer_missing`), crates/storage/tests/ltt_reversion_guard_muhurat_window.rs (new), crates/common/src/config.rs (docs), config/base.toml, deploy/aws/terraform/error-code-alarms.tf, crates/aws-lambdas/src/telegram_webhook.rs, .claude/triage/error-rules.yaml, crates/core/src/notification/events.rs (`CustomStatusUrgent` deleted), crates/core/tests/notification_variant_dispatch_guard.rs, crates/core/tests/adversarial_feed_frames_properties.rs, crates/common/tests/loss_counter_visibility_guard.rs, crates/app/tests/dhat_live_ingest_seam.rs. Not touched: trade_safety*.rs, live_fill/*, order_runtime*.rs, daily_task_marker.rs; main.rs and dhan_feed_stack.rs zero added lines
+  - Tests: proptest_pre_cutover_is_byte_identical, proptest_post_cutover_exact_or_refused, test_regression_2026_11_20_first_packet_corrected_without_warm_up, test_regression_print_two_days_old_corrected, test_regression_ist_epoch_fresh_print_stays_raw_counted_and_pages_once_per_segment_per_day, test_utc_verdict_never_pages, test_guard_off_never_pages, test_apply_ltt_correction_sits_in_all_three_dispatcher_arms (source scan, bite-tested), dhat_ltt_correction (0 blocks), test_regression_2026_11_21_guard_watches_the_published_muhurat_session, test_regression_reversion_page_follows_the_published_muhurat_session (bite-tested), test_regression_2026_11_21_a_reversion_page_holds_its_day_once, test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan, test_fire_is_never_called_with_the_reversion_cause
+  - Rules: scope lock §"2026-11-21", noise lock §2.24-a, data-integrity 2026-11-21 (SECOND); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-PERMANENT addendum below
+- [x] ITEM UTC-REPAIR — repair the held day 2026-11-20 once: copy its wrong partitions to the quarantine prefix and verify, drop them in QuestDB only, move its seal/spill/DLQ files aside, rebuild the day from its raw frames through the normal dispatcher (the UTC-PERMANENT rule corrects them, no record file), verify, then write `.done` (daily-universe Quote 63; owner cards 2026-11-21 recorded in the scratch design: "Approve, one-off (Recommended)", "Point Brutex at fixed copy (Recommended)", "Sunday 22 Nov (Recommended)")
+  - Unblocked 2026-11-21: the owner approved the one SSM element and the two-line workflow ("Approve, one-off (Recommended)"), recorded as rust-only lock §0.21. Review fixes the same day: live-mode fold (the 09:15 bars), raw-source pre-checks before any drop, exact per-table verify, paced close seals, app restarted on every exit.
+  - Files: crates/storage/src/partition_archive/quarantine_copy.rs (new; child of `partition_archive` so it reuses the private export, recount and verify functions; `QuarantineIo: ArchiveIo`), crates/storage/src/partition_archive.rs (mod line), crates/storage/src/day_repair_audit_persistence.rs (new; `day_repair_audit` table, DEDUP `(ts, repair_day, step, object, feed)`), crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs (`day_repair_audit` kept, never dropped), crates/storage/src/partition_archive/daily_export.rs (manifest leaves out pre-repair archiver copies of a released day: `superseded_by_repair`, schema version +1), crates/app/src/day_repair/mod.rs (new; `run_cli`, window, app-stopped, WAL-lock and deploy refusals, step driver), crates/app/src/day_repair/state.rs (new; progress file, CRC-32, fsync), crates/app/src/day_repair/rebuild.rs (new; past-day refold through `LiveIngest::ingest_tick_at` / `ingest_non_tick_at`), crates/app/src/day_repair/verify.rs (new; verify gate), crates/app/src/day_repair_ssm.rs (new; the one SSM literal), crates/app/src/bin/tv_day_repair_2026_11_20.rs (new; runner), crates/app/src/lib.rs, crates/app/src/main.rs (dispatch, ZERO net lines), .github/workflows/day-repair-2026-11-20.yml (new), crates/common/tests/shell_budget_guard.rs (rows), deploy/aws/terraform/main.tf (explicit Deny on `s3:DeleteObject`/`s3:DeleteObjectVersion` under `quarantine/*`, the live-fill-logs shape), CLAUDE.md rows, .claude/rules/project/aws-budget.md cost note
+  - Tests: test_allowlist_is_held_kinds_of_2026_11_20_only (never `market_depth*`, never another day), test_window_refuses_0800_to_1630_on_a_trading_day_and_after_2026_11_30, test_placement_absent_identical_different (the `.sha-` arm), test_quarantine_io_never_calls_s3_delete (HTTP stub), test_quarantine_writes_no_canonical_key_manifest_amend_or_archive_audit_row, test_day_repair_ssm_refuses_a_bad_sha_or_mode, test_progress_line_crc_round_trip_and_torn_line_refused, test_past_day_rebuild_matches_a_live_fold_bit_for_bit (fixture frames with a gap and the end-of-day seal), proptest_crash_and_resume_over_every_step, test_released_day_manifest_leaves_out_pre_repair_archiver_copies, test_brutex_done_present_refuses_apply, test_main_rs_dispatch_adds_no_line (size ratchet unchanged)
+  - Rules: daily-universe Quote 63 and its "Quote 63 tool" table (to be written with the §0.21 row); scope lock §"2026-11-21" (the correction); rust-only §0.21 (owner row needed); design: Design / Edge Cases / Failure Modes / Test Plan / Rollback / Observability in the UTC-REPAIR addendum below
+  - Second-verify fix (2026-11-22; owner: "go ahead with the fix dude"): the verify refused twice (run 44965373019: 13,616 dropped packets missing by number, 3,200 with an exact copy under another number; 36,183 repeat-kind rows missing). Thirteen agents (5 investigators, 8 refuters, none refuted) traced it to the rebuild being unable to replay the live run's HISTORY: (a) the Quote 61 repeat filter's gap epoch (sheds, not-landed rows, name publishes, restarts, refold passes) is almost constant offline, so it skipped repeats live wrote; (b) the backup-socket dedup in replay is socket-blind and runs in WAL order, so it kept the other copy (3,200), dropped `AcceptLate` packets and same-socket repeats live kept. Fix, rebuild-only (live path, `refold_wal_frames` and the strict gate untouched, `dhan_feed_stack.rs` zero lines): (a) every no-trade-today row live wrote is written again by number (repeat-kind `capture_seq` set from the original copies; the drain's filter decides the rest; `aux_repeat::always_write_filter` only as the fallback without a record; post-implementation review: the never-skip filter alone wrote millions of rows live had skipped); (b) `main_feed_backup::LiveKept`: for a contract in the day's backup publications, keep a packet live wrote (its `capture_seq` is in the ORIGINAL quarantine copies), drop one only when its byte-identical twin is one live wrote (per-segment pre-pass, two generations), else the replay dedup decides (a packet live captured but never landed is not lost); duplicates from a twin across a segment boundary are counted (`duplicates_written`). (c) A re-run re-exports REBUILT rows to `.sha-` keys at its drops, which the coverage would have read as live: a run after a rebuild started now pins the live day's keys first (`original` progress lines, one per partition, before it copies or drops anything; refuses if an older run already copied after the rebuild), and the coverage and the rebuild read only those.
+    - Files: crates/app/src/day_repair/{mod.rs,state.rs,rebuild.rs,coverage_run.rs}, crates/app/src/dhan_feed_stack/{day_rebuild.rs,aux_repeat.rs}, crates/app/src/main_feed_backup.rs, crates/storage/src/day_repair_coverage.rs
+    - Tests: test_past_day_refold_writes_every_wrong_day_repeat (bite: the drain filter skips), test_backup_copies_follow_the_numbers_live_wrote (bite: None keeps X), test_both_copies_are_rebuilt_when_live_wrote_both, test_a_packet_live_wrote_neither_copy_of_keeps_one_copy, test_a_twin_across_a_segment_boundary_is_written_twice_and_counted, test_begin_refuses_a_live_record_with_no_backup_set, test_live_kept_keeps_live_numbers_drops_only_twins_and_falls_back_otherwise, test_live_kept_twins_last_two_segments_and_counts_a_duplicate, proptest_live_kept_matches_live_for_backup_and_dedup_elsewhere, test_contracts_published_on_unions_only_that_ist_day, test_rerun_after_a_rebuild_reads_only_the_live_day, test_pin_helpers_parse_merge_and_bound_the_live_era, proptest_crash_and_resume_over_every_step (now with a re-run arm), test_run_coverage_reads_only_pinned_live_keys_after_a_rebuild (bite: unpinned demands [77]), test_run_coverage_refuses_an_unpinned_or_mispinned_partition, test_read_kept_seqs_keeps_only_the_filtered_contracts, test_read_kept_seqs_refuses_a_row_it_cannot_judge, test_read_kept_seqs_gz_reads_a_gzipped_copy, test_segment_code_of_maps_every_stored_name
+    - Post-implementation review (11 agents, 2026-11-22): fixed the 4 confirmed mediums (verify refuses a report older than the last drop, `report_older_than_last_drop`; exact repeat rows; the live-number reader skips rows with no usable contract instead of stopping; numbers read straight into the sets) and 4 lows (trimmed history refuses; `ist_day_number` tested and crate-private; the drop audit names the copy it checked; `test_the_box_state_of_2026_11_22_reruns_on_the_live_day_only`). Left, recorded: a same-socket identical repeat live never stored can be dropped for its stored twin (identical content); `duplicates_written` covers adjacent segments only; the reader allocates per CSV field (offline).
+    - Run order after merge with All Green: `apply` (pins, drops the first rebuild's partitions against their verified copies, rebuilds), then `verify`; then the cleanup PR (§0.21).
+  - DONE 2026-11-22: deploy of 2c975d5 (#2281), `dry` run 45004379797, `apply` run 45004826979, `verify` run 45007320978 passed: 58,373,077 removed packets checked, 0 missing by number (was 13,616), 0 repeat-kind rows not rebuilt (was 36,183), 0 of 12,401 repeat-kind contracts without a row, NIFTY 1m 385 bars 09:15 to 15:39, 0 candles before the open; `.done` written, the day released, the app started again. Cleanup PR deletes the §0.21 runner, element and workflow.
+
+---
+
+## ITEM UTC-SAFETY — DESIGN ADDENDUM (added 2026-11-21, owner card "Yes, after this merges (Recommended)")
+
+
+## Design (Item UTC-SAFETY)
+0. Rule file first (Blocker). Add §28.7 to docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, with a dated owner quote and REJECT rows, plus one bullet in the auto-loaded stub. §28.6 forbids changing what the chain decides. No code lands before this.
+1. New file `crates/app/src/trade_safety.rs`, registered in lib.rs:
+   - Two statics: `FEED_TIME_BLOCK_DAY: AtomicI64 = i64::MIN` and `FEED_TIME_BLOCK_CAUSES: AtomicU8` (cause A = 1, cause B = 2).
+   - `engage(day, cause_bit)`: `fetch_max(day, Release)` on the day. If the day moved forward, reset the cause bits to `cause_bit`; otherwise `fetch_or` the bit.
+   - `entries_blocked_on(day) -> Option<u8>`: one Acquire load and a compare.
+   - Cost: O(1), no lock, no allocation. Because the switch is keyed by IST day, it ends by itself at the day roll. It is not cleared at 16:00.
+2. Strict marker reader: add `daily_task_marker::marker_state(task, date) -> Present | Absent | Unreadable`. Leave `daily_marker_exists` unchanged.
+3. Writers. All run on the drain's 30 s arm, at most a few times a day, never per tick.
+   - `FeedTimePage::fire`: `engage(day, cause)` is the FIRST statement, before the `error!` and before the `try_send` to tv-feed-time-latch. A failed marker write or a refused hand-off then still blocks entries in this process. Add the field `trade_safety_engaged = true` to the existing `error!`.
+   - `start()` and `scan()`'s day-change branch: call `engage` for each restored bit.
+4. Readers. A request to exit always passes at every gate.
+   - Chain start (`live_fill::start_chain`, mod.rs, cold): read both `feed-time-page-a/-b` markers with `marker_state`. `Present` or `Unreadable` calls `engage(today, bit)`. This covers a chain that starts before the drain's `start()`.
+   - Gate A, `LiveFillChain::decide`, directly after chain.rs:1413: `if intent.kind != IntentKind::Exit && trade_safety::entries_blocked_on(self.day).is_some()`, then increment `counters.entries_blocked_feed_time`, call `refuse_unplaced(intent, Some(bar), REASON_FEED_TIME_ALARM)` and return. Add `pub const REASON_FEED_TIME_ALARM = "feed_time_alarm"` beside :101. This runs on the tv-live-fill thread, not the drain. The day comes from the wall clock, never from trade times.
+   - Gate B, `on_finished` → `Finished::Filled` (:1620): an entry that was already held when the alarm fired gets a seq-2 Reject for its quantity, the same shape as the Tainted arm.
+   - Gate C, `order_runtime_live_fill::execute` beside :466 (backstop): `!x.exit && blocked(ist_day_now)` → `reject("refused:feed_time_alarm")`. The `refused:` prefix makes the LF-7 report count it as rejected.
+   - Gate D, `start_self_test_entry` (order_runtime.rs:2141): skip the entry and log the outcome as `skipped_feed_time_alarm`. It must not count as a self-test failure. Assumed: check how that function reports its outcome.
+5. Unchanged: the OMS `dry_run` hardcode, the exit-order lockout, `[live_fill] enabled = false`, `select_engine` (still returns None), indicator/strategy, `LiveFillChain::new`'s signature, `LiveFillTap::offer`, and main.rs (zero lines added).
+
+## Edge Cases (Item UTC-SAFETY)
+- Cause A at 09:20, then cause B: the bits OR together and the day stays.
+- Alarm yesterday, entry today: the day differs, so the entry goes through.
+- Midnight while a drain hold keeps the process up: the switch clears at the roll.
+- Clock steps back a day: `fetch_max` never lowers the day, so an earlier day reads as not blocked.
+- Exit larger than the position: unchanged, `clamp_exit` handles it.
+- Muhurat day: the same IST-day key applies.
+- Alarm fires mid-fill: Gate B refuses the held entry, and Gate C catches an Execute already queued.
+- Marker torn, or folder unreadable at chain start: entries are blocked (fail closed). The drain's own `restore_latch` stays fail-open, as today.
+
+## Failure Modes (Item UTC-SAFETY)
+- The marker write fails in `fire`: entries are already blocked in RAM, so only a restart that day loses the block. Limit, accepted.
+- The latch thread fails to spawn: blocked anyway, because `engage` comes before the hand-off.
+- Engage delay: about 60 s for cause A, 10 min for cause B. Entries between the fault and the page go through.
+- Latent today: no engine runs in production.
+- REJECT traps:
+  - A second `error!` with DHAN-FEED-TIME-01 re-pages through error-code-alarms.tf:423 (§2.24). The new log must be `warn!`.
+  - Do not use `RiskEngine::trigger_halt`: it blocks exits, sends a Critical page, and is cleared at 16:00.
+  - A new `LiveFillChain::new` parameter breaks the replay isolation guard and the dhat callers.
+- Whether `.hold` days should block too needs an owner decision; not included.
+
+## Test Plan (Item UTC-SAFETY)
+- `trade_safety` unit tests: same day / next day / earlier day; `fetch_max` stays monotonic; cause bits reset on a new day; a test that `ist_day_number_now()` equals the chain's day formula.
+- Chain: an entry is refused with Decision and Reject rows plus the counter; an exit is sent; a held entry is refused in Filled.
+- `execute`: an entry gets `refused:feed_time_alarm`; an exit is placed. Self-test is skipped, not failed.
+- `feed_time_page`: `fire` engages before the hand-off, and still engages with the persist channel None; `start` with today's marker engages.
+- Chain start: `Present`, `Unreadable` and `Absent` markers, from a temp dir.
+- Proptest: random intents, days and engages against an oracle. No entry is sent on a blocked day, and exits match a run with the switch off.
+- DHAT: `dhat_live_fill` (C)/(D) re-run with the switch set; order-free steps stay at 0 blocks; a drain window around `fire` adds no allocation.
+- Guard `crates/app/tests/trade_safety_wiring_guard.rs`, a source scan, bite-tested:
+  - `engage` comes before `error!` in `fire`;
+  - gates A–D each sit inside `!Exit` / `!x.exit` and before their order build;
+  - the new log is never `error!`.
+
+## Rollback (Item UTC-SAFETY)
+Revert the PR. There is no table, config, Terraform or data change. The `live_order_events` Reject rows already written stay, as audit history.
+
+## Observability (Item UTC-SAFETY)
+- Every refusal writes Decision and Reject rows to `live_order_events`, reason `feed_time_alarm` or `refused:feed_time_alarm`.
+- Metrics, registered at 0 with handles resolved once in `CounterPublisher` (mod.rs), local `/metrics` only:
+  - counter `tv_live_fill_entries_blocked_feed_time_total`;
+  - gauge `tv_trade_safety_entries_blocked`, 0/1.
+- One coded `warn!` on the edge into blocked, `source = "trade_safety_entries_blocked"`, carrying the causes and the day.
+- Add `entries_blocked` to the LF-7 daily report.
+- No new page, alarm, filter or EMF name.
+- Docs: a CLAUDE.md O(1) table row for `trade_safety.rs`, and a dated note on the `feed_time_page` row.
+
+## Files (Item UTC-SAFETY)
+- docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md (§28.7)
+- .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md (stub bullet)
+- crates/app/src/trade_safety.rs (new), crates/app/src/lib.rs
+- crates/app/src/daily_task_marker.rs (`marker_state`)
+- crates/app/src/dhan_feed_stack/feed_time_page.rs
+- crates/app/src/live_fill/chain.rs, crates/app/src/live_fill/mod.rs
+- crates/app/src/order_runtime_live_fill.rs, crates/app/src/order_runtime.rs
+- crates/app/src/live_fill_report/build.rs (`entries_blocked` field)
+- crates/app/tests/trade_safety_wiring_guard.rs (new), crates/app/tests/dhat_live_fill.rs
+- CLAUDE.md
+
+---
+
+## ITEM UTC-PERMANENT — DESIGN ADDENDUM (added 2026-11-21, owner cards "Yes, always UTC (Recommended)" and "Before Monday if checks pass (Recommended)")
+
+Dhan support, ticket #6684672, 21 Nov 2026: the Live LTT changed from IST-based to UTC-based epoch effective 20 Nov 2026, before the market opened, as part of an API restructuring, and "UTC-based epoch is now the permanent format for all Live Market Feed timestamps". So the per-day armed record of ITEM UTC-FIX is no longer needed: the correction becomes a fixed rule by WAL receipt. Ships only on All Green before Mon 23 Nov 08:30 IST; otherwise ITEM UTC-FIX stays in place. The dormant record, arming and notice code (about 1,255 lines) is deleted in a follow-up PR.
+
+## Design (Item UTC-PERMANENT)
+- `crates/storage/src/ltt_correction.rs`: `pub const DHAN_LTT_UTC_FROM_RECEIPT_NANOS: i64 = 1_795_113_000_000_000_000;` (receipt 2026-11-19T18:30Z = 2026-11-20 00:00 IST). `corrected_ltt(raw, segment, receipt)` returns `raw` when `receipt` is before it (pre-cutover, `0` and negatives); otherwise `utc_verdict(raw, receipt)`, which returns the corrected value or `raw` and counts the refusal.
+- Kept guards: plausible receipt, the raw band (so `0` and out-of-band values stay raw), `checked_add(19_800)`, and the receipt + 5 s cap (the reversion firewall). Refusals are counted on relaxed `AtomicU64`s by reason (band, cap, receipt).
+- Removed guards: the previous-day-session limit and the unconfirmed-fresh-print limit. Dhan says every Live LTT is UTC, so a print two or more days old also needs +19,800 s.
+- Cost per packet: one `i64` compare before the cutover; after it about five compares, plus one relaxed add on the refused branch only. No `ArcSwap`, no allocation, no new dependency.
+- Boot: `install_at_boot*` becomes a no-op with one log line; `ACTIVE` stays false, so `any_receipt_day_held` returns false and replay is never held. A leftover `.rec` file is ignored, never deleted.
+- `crates/app/src/dhan_feed_stack/ltt_feed.rs`: the record writer and the daily notice are not started.
+- `crates/core/src/parser/dispatcher.rs`: `dispatch_frame_uncounted_unstamped` stays raw and also counts on `tv_dhan_ltt_unstamped_total` (local only).
+- Reversion guard: `LttController::observe` keeps `classify_vote` and `LttDetector`, on raw, live, WAL-stamped `IDX_I` / `NSE_EQ` prints only. A `Utc` verdict does nothing. The first `Normal` verdict per segment per IST day, with receipt at or after the cutover and inside 09:00–15:40 IST (Muhurat-aware), logs one coded `error!` with `code = DHAN-FEED-TIME-01`, `source = "dhan_time_format_reverted"`, broker named. The latch is two bools, cleared at the day roll. (2026-11-21 review: in `act` the page also auto-holds its day; `ControllerCounts::reversion_pages` and `last_reversion_day` are read by the drain's 30 s feed-time scan, which hands the day to the latch thread.) The guard never writes a record and never changes the correction.
+- `[dhan_feed] ltt_utc_autocorrect`: parsing unchanged (no `common` code edit); it governs only the guard (`off` = no detector, `shadow` = coded `warn!`, `act` = page and hold). Rolling the correction back is a code change behind a fresh dated quote.
+
+## Edge Cases (Item UTC-PERMANENT)
+- Pre-cutover receipts (old WAL replay, receipt `0`, v1/v2 records) are byte-identical to before.
+- 20 Nov first NIFTY packet at 08:31:22 IST: corrected, with no warm-up and no record.
+- A pre-open snapshot carrying yesterday's 15:29 trade, a Monday print of a Friday trade, an illiquid option two days old: all corrected.
+- Assumed: a trade from 19 Nov delivered after the cutover is also UTC-encoded. Verify on a 20 Nov raw frame for a contract whose last trade was 19 Nov before deploy.
+- Our clock more than 5 s behind: a fresh print is refused, stays raw (5.5 h early), routes to `tick_quotes`, and is counted.
+- A frame with no WAL receipt stamp: never corrected (as before).
+
+## Failure Modes (Item UTC-PERMANENT)
+- Dhan reverts to IST epoch: fresh prints exceed the cap and stay raw (correct IST) and are counted; the guard pages once per segment per day; every print more than about 5.5 h behind its receipt, any day, is shifted wrongly; in `act` the page auto-holds the day within 30 s (2026-11-21 review). (Was: "a manual `.hold`; auto-hold is a follow-up"; done in this PR after the review.)
+- A restart can page a second time that day (the latch is in RAM; Limitation).
+- 20 Nov WAL segments still waiting would replay corrected `ts` next to the wrong stored rows; DEDUP starts with `ts`, so both copies would survive. Order: copy, drop the 20 Nov partitions (Quote 63), then replay or rebuild.
+- Unknown: main-feed frames received between 19 Nov 15:40 and 20 Nov 08:31 IST would straddle the cutover. Check the WAL receipts read-only before deploy.
+- Not ready by Mon 23 Nov 08:30 IST: do not deploy; ITEM UTC-FIX re-arms each day after its votes (known, bounded).
+
+## Test Plan (Item UTC-PERMANENT)
+- `proptest_pre_cutover_is_byte_identical`: for every raw `u32`, every segment and every receipt in `[i64::MIN, cutover)`, output equals raw; `dispatch_frame` gives the same bytes as the unstamped path for generated Ticker/Quote/Full frames.
+- `proptest_post_cutover_exact_or_refused`: for receipt at or after the cutover, either output = raw + 19,800 and at most receipt + 5 s, or output = raw and exactly one refusal counter grew by 1.
+- Regressions: the 20 Nov first packet; a print two days old; an IST-epoch fresh print stays raw, is counted, and pages once per segment per day; a `Utc` verdict never pages; `off` never pages.
+- New source-scan guard: `apply_ltt_correction` sits in all three dispatcher arms (bite-tested).
+- Rewrite `crates/core/tests/ltt_correction_dispatch.rs`, `crates/app/tests/ltt_correction_drain.rs`, the `ltt_feed.rs` tests, `dhat_ltt_correction.rs` (0 blocks), the `dispatch_frame/ticker_ltt_armed` bench (same key, no `install_table`) and the `ci.yml` test lists. Arm, record and notice tests are marked dormant and deleted in the follow-up.
+- Run `cargo test -p tickvault-storage`, `-p tickvault-core`, `-p tickvault-app`, and `-p tickvault-common` for the rule-file guards.
+
+## Rollback (Item UTC-PERMANENT)
+Revert the PR. ITEM UTC-FIX in `act` mode then re-arms daily after its votes, a known, bounded failure. A day run under a wrong mode gets a `.hold`. No table, config schema, Terraform or data change.
+
+## Observability (Item UTC-PERMANENT)
+- Local refusal counters by reason (band, cap, receipt), and `tv_dhan_ltt_unstamped_total`; local `/metrics` only. Registered when the lane builds the guard (`with_ltt_correction` calls `publish_ltt_counters`, which resolves the four handles once; 0 at boot), then updated once a minute of live WAL-stamped receipts. They count DISPATCHES, so a WAL catch-up, the after-close depth pass or the offline replay counts a packet again; refusals counted during a boot replay show at the first live frame's minute publish. (Corrected 2026-11-21, review: this line said "registered at 0" before any code did.)
+- A reversion page in `act` auto-holds its day (feed-time scan → `tv-feed-time-latch` → `.hold`; noise lock §2.24-a, Quote 63).
+- The reversion page rides the existing `DHAN-FEED-TIME-01` alarm (filter matches the code and `ERROR`; no Terraform change).
+- The daily notice is retired (noise lock §2.24-a).
+- No new alarm, filter or EMF name.
+
+---
+
+## ITEM UTC-REPAIR — DESIGN ADDENDUM (added 2026-11-21, under daily-universe Quote 63)
+
+Status: DRAFT. Blocked until the owner's dated rust-only §0.21 row (the one SSM element and the two-line workflow) is in the rule file; a session may not write that approval itself. The correction itself needs no new record: this branch carries the UTC-PERMANENT rule, so `corrected_ltt` is a pure function of the raw time and the WAL receipt, and 20 Nov frames replayed through the normal dispatcher come out corrected (every segment, old prints included). The design's correction-record step and its options-tally question are dropped.
+
+## Design (Item UTC-REPAIR)
+- Records first: rust-only §0.21 (owner row, full file and stub), the "Quote 63 tool" table under Quote 63, and this item. Code only after all three.
+- Quarantine copy, `partition_archive/quarantine_copy.rs` (child module, so it reuses the private export functions):
+  - Day fixed at 2026-11-20, prefix fixed at `quarantine/2026-11-20-ltt-utc-shift/`.
+  - Allowlist: `held_days::table_is_held_kind(table)` and `partition_day(partition) == 2026-11-20`. Never `market_depth*`, cross-verify, SEBI or audit tables.
+  - Export: `wal_applied_gate`, then `export_ordered_csv` in slices.
+  - Placement: `S3Cold::head`, then `put_if_absent_path`. An identical object is reused; different bytes go to `.sha-<hex>` beside it. Never an overwrite.
+  - Check: `recount_rows`, `verify_archive`, and the stored SHA-256 equals the export's.
+  - Drop: `snapshot_gate::recheck_and_drop` with a `QuarantineIo: ArchiveIo`. `note_drop_intent` does nothing; `delete_own_upload` returns an error and never calls S3; `note_failure` only logs.
+  - Never called: `place_archive`, `note_archived_copy`, `record_failure`, `append_audit`. No canonical key, manifest, amend record or `partition_archive_audit` row. One `day_repair_audit` row per object instead.
+- Box subcommand `tickvault day-repair <dry|apply|verify> <sha>`, dispatched from `main.rs` with zero net lines:
+  - Working directory `/opt/tickvault`.
+  - `systemctl stop` and `mask` the app; refuse unless it then reads inactive or failed.
+  - Take `lock_wal_dir`; refuse on `Ok(None)`.
+  - Refuse 08:00–16:30 IST on a trading day (Muhurat dates included), after 2026-11-30 23:59 IST, and while a deploy workflow is queued or running (checked by the runner).
+  - Write `keep-alive-until` itself, so the curfew does not stop the box mid-run.
+  - `chown` everything it creates to the owner of `data/`.
+- Rebuild, `day_repair/rebuild.rs` (new module; `dhan_feed_stack.rs` is size-pinned and its live path stays unchanged). It reuses `LiveIngest::ingest_tick_at` / `ingest_non_tick_at` and the dispatcher, and fixes the past-day blockers itself:
+  - Fold watermark seeded to 2026-11-20 00:00 IST, never `Utc::now()`, or the candles come out empty.
+  - Hand-over as the replay CLI's `start()`: the 20 Nov boot instant from `ws_event_audit` (else 08:30), `set_replay_mode(true)`, `finish_replay(false)`.
+  - No inline-depth sink (depth rows are correct and kept) and no bound WAL.
+  - `SealWriterRunner` and the global seal sender installed.
+  - Contract names from `publish_contract_labels_at_boot` for 2026-11-20; refuse if another day's names were published.
+  - `load_replay_backup` called; `pace_until` set far ahead.
+  - One pass over the whole day by WAL receipt, so the aux repeat filter skips as it did live.
+  - End of day: `catch_up_seal_all` with a cutoff past 16:05 IST, then `force_seal_all`; never `withhold_open_buckets`.
+  - Frames: S3 `raw-frames/2026-11-20/` with every SHA sidecar checked, one segment at a time into a staging folder the tool created (its own copy is removed after the read); counted against the local WAL archive.
+- Brutex manifest (owner card "Point Brutex at fixed copy (Recommended)"), `daily_export.rs`:
+  - Unchanged: a wrong object already at a canonical key stays; the export's `place()` puts the corrected bytes at `.sha-<hex>` and the manifest names that key.
+  - New: on a day `HeldDays::verdict` reads `Released { done_on }`, an archiver copy of a held-kind table whose audit `ts` is before 00:00 IST of `done_on` is left out of `tables[].partitions` and listed under a new manifest field `superseded_by_repair` (table, partition, key, rows, sha256, copied_at). A copy whose key equals an object this export placed (byte-identical) is not superseded. Schema version +1. O(archived rows), once per export.
+  - If `_daily/2026-11-20/DONE` already exists, `dry` reports it and `apply` refuses: DONE is create-only (Quote 60) and a superseding marker is a Brutex contract change needing its own owner decision.
+- Runner and workflow: runner bin plus `day_repair_ssm.rs` (one element of at most 6 lines: fetch `deploys/<sha>/tickvault`, `exec day-repair <mode> <sha>`). Dispatch-only workflow, two `run:` lines; one dispatch chains `dry`, `apply`, `verify` and stops at the first failure.
+- Steps, each followed by a progress line (CRC-32, fsync) and a `day_repair_audit` row:
+  1. Enumerate partitions and files; offset fingerprint on 19, 20 and 21 Nov; frames per receipt day, locally and in `raw-frames/`; check for canonical 20 Nov objects and a DONE.
+  2. Copy and verify every partition and file.
+  3. Drop the partitions.
+  4. Rename the 20 Nov seal, spill and DLQ files into `data/held/2026-11-20/` (rename only).
+  5. Rebuild.
+  6. Verify.
+  7. Write `.done` (`write_day_marker`), then unmask the app (left stopped; the curfew stops the box).
+
+## Edge Cases (Item UTC-REPAIR)
+- Every `2026-11-20T*` hour of `ticks`, `tick_quotes`, `feed_aux_packets` and the `2026-11-20` partition of every `candles_*` table is dropped and rebuilt: the wrong rows carry different `ts` keys (or, for `tick_quotes`, the wrong membership), so an upsert cannot replace them. Correct OI and previous-close rows come back with identical keys.
+- Restarts on 20 Nov: every gap and restart is a replay gap, so bars across a downtime are withheld, as live did.
+- Prints the rule refuses (band, receipt + 5 s cap, receipt) keep the raw time and are counted in the report.
+- Hours from 21 Nov 00:00–07:00 IST: refused (none expected; the app stopped 20 Nov 16:26 IST).
+- A partition the archiver already copied and dropped on 20 Nov (wrong data at a canonical key): kept in S3, recreated by the rebuild, exported later to `.sha-`, and its old copy listed under `superseded_by_repair`.
+- A 20 Nov WAL segment still waiting for replay: refused (it would replay next to the rebuilt rows).
+- Old binary runs about 10 minutes on Monday 08:30 before the 08:31 deploy: no export (window shut), no archive leg before 15:40.
+
+## Failure Modes (Item UTC-REPAIR)
+- (2026-11-22) The backup history is unreadable or holds no 20 Nov publication: with publications missing, the rebuild cannot know which copy live kept; an unreadable or absent history stops the rebuild, no publication on the day judges every copy by the dedup (logged). A backup contract with no live-written number to judge by is an unfinished rebuild.
+- (2026-11-22) A twin across a segment boundary (X ends one segment, live's Y opens the next): both written, counted on `duplicates_written` in the report; no loss.
+- Crash at any step: the next run re-checks the step's result (S3, QuestDB, the disk), never the progress file alone. Copies are reused; a partition already gone counts as dropped only when its verified quarantine row exists; moves are re-checked; the rebuild replays the whole day and upserts onto itself.
+- A writer rescue, a new spill file or an unacked flush during the rebuild: not finished, no `.done`.
+- Accidental app start: refused by the WAL lock and the mask.
+- Disk short for one staged segment plus the after-close floor: stop, nothing dropped past that step.
+- Frames the WAL refused on 20 Nov cannot be rebuilt: counted in the report (owner default).
+
+## Test Plan (Item UTC-REPAIR)
+- Unit: allowlist, date and window guards, the three placement arms, progress line round trip.
+- HTTP stub: `delete_own_upload` never calls S3; the quarantine path writes no canonical key, manifest, amend or `partition_archive_audit` row.
+- SSM element refuses a bad sha or mode.
+- Past-day rebuild over fixture frames compared bit for bit with a live fold, including a gap and the end-of-day seal.
+- Crash-and-resume proptest over every step.
+- Manifest: a released day leaves out pre-repair archiver copies and lists them under `superseded_by_repair`; a DONE-present day refuses `apply`.
+- Guard rows: `SSM_SENDER_FILES`, `WORKFLOW_RUN_LINE_BUDGET`, `DAY_REPAIR_SSM_SHELL_SOURCES`; size ratchet for `main.rs` and `dhan_feed_stack.rs` unchanged.
+- Run `cargo test -p tickvault-storage`, `-p tickvault-app`, `-p tickvault-common`.
+
+## Rollback (Item UTC-REPAIR)
+- Before the drop: abort; nothing changed.
+- After the drop: the quarantine CSVs are the copy of record. A failed rebuild leaves the day held, the app masked, no `.done`; re-run, or re-import from quarantine.
+- The tool, workflow, SSM literal and budget rows are deleted in the next PR (`RETIRED_ONE_OFF_PATHS`, CLAUDE.md cells removed, ENDED notes). The manifest change stays.
+
+## Observability (Item UTC-REPAIR)
+- `day_repair_audit` rows (step, object, rows, bytes, sha256, outcome), coded log lines, a per-step job summary, a dry-run report of every object, and a final report with per-table counts and residue (refused prints, frames the WAL refused).
+- No new page, alarm, filter or EMF name.
+
+---
+
+## ITEM UTC — DESIGN ADDENDUM (added 2026-11-20, owner cards "Auto-detect daily", "Copy, delete, rebuild", "Yes, page me", "After correction", "Yes, one a day", "Yes, hold that day", "Deploy 8:31 AM Monday")
+
+On 2026-11-20 Dhan sent every Last Trade Time as UTC epoch (19,800 s early under the documented IST rule). The design is a correction in the core dispatcher from an armed per-day record, a hold that keeps a wrong day out of the archive and the export, an early page, and a one-off repair of 20 Nov.
+
+## Edge Cases (Item UTC)
+- Pre-open and connect snapshots carrying the previous day's trade time; illiquid contracts whose last trade is about 5 h 30 m old; a mid-day flip either way; Muhurat sessions; a restart with an open entry; frames with no WAL receipt stamp; `0` and out-of-band trade times.
+
+## Failure Modes (Item UTC)
+- A crash between the record write and the arm: the entry is neither armed nor voided, so replay holds that day (coded error), never a silent mismatch.
+- A wrong arm on a good day: prevented by at least 99% agreement across several distinct instruments and the receipt + 5 s cap; the switch can be set to `shadow` or `off`.
+- A held day never repaired: it stays on the box and in raw S3 and is never exported.
+
+## Test Plan (Item UTC)
+- Property tests for the correction and the detector; live vs replay identity with crash injection; the named 20 Nov regressions; the held-day paths guard; DHAT and the dispatch bench.
+
+## Rollback (Item UTC)
+- `[dhan_feed] ltt_utc_autocorrect = "off"`; removing a date from `held_days`; the page is one alarm entry.
+
+## Observability (Item UTC)
+- `tv_dhan_ltt_*` counters and gauges (local), `tv_partition_archive_skipped_total{reason="held_day"}`, coded `DHAN-LTT-01`/`02` logs, the `DHAN-FEED-TIME-01` page and the once-a-day notice.
 
 ---
 
@@ -335,6 +935,74 @@ memory killer is kernel-owned, and the 87th failure scenario is unknown by defin
 replay and no snapshot-on-subscribe, and measured reconnect windows of 7–11 s lose data at
 source. The honest guarantee is **capture-completeness of received frames**, never
 trade-completeness.
+
+---
+
+## ITEM RESUB — DESIGN ADDENDUM (added 2026-10-01): unsubscribe and subscribe, not disconnect and reconnect
+
+Operator quote and authority: `websocket-connection-scope-lock.md` "2026-10-01 — UNSUBSCRIBE
+AND SUBSCRIBE, NOT DISCONNECT AND RECONNECT" (recorded before any code).
+
+### R1. Audit — every deliberate close-and-redial (Verified in source, 2026-10-01)
+
+| Path | Sockets | In production | Disposition |
+|---|---|---|---|
+| `RotateByRedial` from `depth_rebalance::send_swap` | depth-200 | yes, every minute 09:16–15:40 | replaced by `Swap` |
+| Ghost redial (`request_ghost_redial` → `GhostInstrument`) | depth-20, depth-200 | yes, always on | replaced by a re-sent unsubscribe |
+| Probe Arm B (`ProbeClose`) | depth-200 | no, config-off diagnostic | unchanged |
+| Main feed | — | only `Extend` in place | unchanged |
+| Fault redials (dial/subscribe failed, vendor close, 807, idle/frame silence, emptied socket) | all | yes | unchanged: a broken socket cannot be repaired by a frame |
+
+### R2. Design
+
+- `send_swap` builds `LiveSubscriptionCommand::Swap { old, new, ack }`. The connection's
+  existing swap handler already sends the unsubscribe first, bounds both writes by
+  `SWAP_WIRE_BUDGET`, keeps reading frames while they are in flight, reverts the guard on a
+  refused unsubscribe, and redials only when the subscribe fails after a successful
+  unsubscribe (the socket would otherwise sit empty). The ack (`SwapOutcome`) is the same type
+  `RotateByRedial` used, so `reconcile_pending_swaps` is unchanged.
+- The ghost register keeps its cooldown (180 s), pool spacing (20 s) and session ceiling (8),
+  and now also stores WHICH contract ghosted (security id + segment code). The connection takes
+  it on its one-second tick into a local slot; the loop top sends code 25 for it through
+  `await_write` (bounded, reads while writing), and sends nothing if the guard holds that
+  contract.
+- The drain keeps skipping the request after an 805 (`rotation_halted()`), and `send_swap`
+  keeps refusing after an 805.
+
+## Edge Cases (Item RESUB)
+
+| Case | Handling |
+|---|---|
+| Subscribe during a burst | `await_write` polls `recv` during the write; pinned by `a_swap_does_not_eat_the_frames_arriving_around_it` |
+| Packets for the old contract after the unsubscribe | stored, counted as grace or ghost, never dropped |
+| depth-200 cap of one | unsubscribe before subscribe (`a_swap_unsubscribes_before_it_subscribes`) |
+| Subscribe fails after the unsubscribe | socket is empty, so it redials with the new contract (`a_swap_that_empties_the_socket_forces_a_redial`) |
+| Ghost for a contract the guard holds again | nothing sent (`a_ghost_unsubscribe_for_a_held_instrument_sends_nothing`) |
+| Ghost with an unknown segment code | refused at the register, counted |
+| Mid-day restart | the guard names the chosen contract; replay dials it |
+
+## Failure Modes (Item RESUB)
+
+| Failure | Effect | Detection |
+|---|---|---|
+| Dhan ignores 25 | old contract keeps streaming; rows stored; resend up to 8 times per socket | `ghost` / `ghost_unsubscribe` / `ghost_exhausted` on the depth counter, `unsubscribe_ignored` log |
+| Unsubscribe write times out | guard keeps `new`; swap reported not held | `depth_unsubscribe_timed_out` |
+| 805 | no more swaps or ghost resends this process | `rotation_halted` refusals |
+
+## Test Plan (Item RESUB)
+
+`cargo test -p tickvault-core` (pool_supervisor swap and ghost tests), `cargo test -p
+tickvault-app` (depth_rebalance steering tests, ghost guard), clippy with `-D warnings`.
+
+## Rollback (Item RESUB)
+
+Revert the commit: the redial path returns exactly as it was. No schema, config or alarm change.
+
+## Observability (Item RESUB)
+
+`tv_dhan_feed_depth_total{outcome="ghost_unsubscribe"|"ghost_exhausted"|"ghost"}`, the existing
+swap counters and `tv_dhan_ws_swap_wire_ms`, `depth_unsubscribe_sent` / `unsubscribe_ignored`
+log lines. `tv_dhan_ws_rotate_by_redial_total` is retired with the command (no alarm reads it).
 
 ---
 
@@ -630,3 +1298,7020 @@ proof); (b) that any bucket AFTER the first gains accuracy — none does, by des
 source and no field can return them; (d) whether Dhan's `day_high` includes the
 09:00–09:15 pre-open auction — Dhan does not document it, `docs/dhan-ref/` was searched,
 and both answers are handled correctly by construction (C3 rows 9–10).
+
+---
+
+## ITEM 11 — DESIGN ADDENDUM (added 2026-08-23, operator: "see now fix and resoleve and emreg and deploy evrythign dude okay?")
+
+Two findings from the 2026-08-23 workspace sweep. Both belong to this plan rather than
+a new one: the CPU claim is already in this plan's own "Believed vs Measured" table, and
+the price finding is the data-correctness layer this plan's audit enumerated. Neither is
+a live defect; both are latent, and both were left for the operator until this quote.
+
+### 11a — Worker threads are pinned to one machine; memory is not
+
+**Design.** `DEFAULT_TOKIO_WORKER_THREADS = 2` is a constant chosen for the r8g.xlarge's
+4-core partition. Nothing in the workspace reads the host's CPU allowance — no
+`/sys/fs/cgroup/cpu.max`, no `available_parallelism()`. Memory got the derive-from-host
+fix twice (`market_ram_store_boot` reads `/proc/meminfo` AND the cgroup limit and takes
+the min; the frame ring reads `/proc/meminfo` for 2%). CPU never did.
+
+Derive the default the same way: read the cgroup CPU quota, fall back to
+`available_parallelism()`, clamp to `[1, 4]`. **On the prod box this must still yield 2**
+— the systemd unit confines the process to a 2-core cpuset, so the quota reads 2 and the
+operator's Quote 17b value is preserved exactly. The env override stays the rip-cord.
+
+**Why it is not a Quote-17b reversal.** 17b authorized "an explicit tokio worker-thread
+count" as part of CPU isolation. Deriving from the cpuset that the isolation itself sets
+IMPLEMENTS that intent on any host, rather than hard-coding the answer for one host.
+
+### 11b — A price narrowed to f32 for a wire format that no longer exists
+
+**Design.** `MarkUpdate.price` is `f32`, documented as "f32 as delivered — the runtime
+widens for math". That premise is dead: the same struct's doc records the per-tick
+live-bridge source dying with #1581, and both remaining callers are REST legs delivering
+`f64` (`candle.close`; `leg.last_price`, parsed by `val_f64`). Both narrow with `as f32`
+at the call site. The far end, `update_market_price_in_segment`, takes `f64` — and its
+own doc says it "feeds `daily_loss_state`, which feeds the daily-loss auto-halt".
+
+So the chain is f64 → f32 → f64 on the kill-switch input, for no wire.
+
+Widen the field to `f64`, delete both casts, drop the now-pointless `f32_to_f64_clean`
+round trip, and correct two stale doc claims on the same struct (the "as delivered"
+premise, and a `security_id` doc still describing the removed Groww token space).
+
+**Honest magnitude.** NOT a live defect. The widening is currently done correctly
+(`f32_to_f64_clean`, not the banned `f64::from`), and every price that flows is below the
+cliff. The cliff is computable: f32's step is 0.0078 below 131,072 (finer than a paisa)
+and 0.0156 above it (coarser). Nothing forwards an equity mark today; the universe was
+just widened to ~24,600 instruments, and the next change that forwards one crosses that
+line with no error, no counter, and no comment saying the line exists.
+
+## Edge Cases (Item 11)
+
+- Unreadable `/proc` or cgroup → fall back to `available_parallelism()`, then to 2.
+  Never zero: `worker_threads(0)` panics the runtime at boot.
+- A 1-core container → clamps to 1, not 2 (today it would oversubscribe).
+- A host larger than the partition → clamps to 4, so a bigger box cannot silently
+  widen the runtime past what the CPU isolation intends.
+- f64→f64 mark path: values already flowing are unchanged bit-for-bit, because every
+  current price round-tripped losslessly through f32 anyway.
+
+## Failure Modes (Item 11)
+
+- Derivation returns a wrong-but-plausible number → the boot log names the source and
+  the resolved value, so it is readable rather than inferred.
+- The env override still wins, so any surprise is one restart from reversed.
+- Widening the price field cannot lose data: f64 is a superset of the f32 it replaces.
+
+## Test Plan (Item 11)
+
+- Unit tests for the CPU derivation: quota present, quota absent, unlimited, zero,
+  oversized, and the clamp boundaries.
+- Existing `order_runtime` mark tests continue to pass unchanged (they assert values,
+  not the type's width).
+- Full app-crate suite; `tv-guarantees` exit 0.
+
+## Rollback (Item 11)
+
+- 11a: set `TICKVAULT_TOKIO_WORKER_THREADS` in the systemd unit — config, no rebuild.
+- 11b: revert the commit; no schema, no wire, no persisted format is involved.
+
+## Observability (Item 11)
+
+- 11a: the existing boot log line reports the resolved worker count and now also its
+  source (cgroup / parallelism / fallback).
+- 11b: no new metric. The existing `tv_mark_forward_dropped_total` is unchanged.
+
+## Measured results (Item 11, recorded 2026-08-23 after implementation)
+
+Evidence, not claims — every line below is a real number from this tree.
+
+| What | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --workspace --no-deps -- -D warnings` (the CI gate) | clean |
+| `cargo test -p tickvault-app` | 83 suites, **0 failures** (1,367 lib + integration) |
+| `dhat_mark_forward_hot_arms_zero_allocation` | pass — the widened payload is still zero-alloc |
+| `order_gate/mark_forward_disarmed` | **2.49 ns** (budget 100 ns) |
+| `order_gate/mark_forward_armed_full` | **9.24 ns** (budget 100 ns) |
+| `order_gate/mark_forward_armed_accept` | **69.9 ns** (budget 100 ns) |
+
+**One test changed, and it is worth naming rather than burying.**
+`test_mark_update_is_copy_and_small` pinned `size_of::<MarkUpdate>() <= 16` and FAILED:
+`u64 + u8 + f64` pads to 24. That ratchet did its job — the widening has a real cost and
+it refused to let it pass unnoticed. The bound moved to 24 only after the cost was
+computed: the mark channel is bounded at `mark_channel_capacity` (default 8,192, config
+max 65,536), so 8 extra bytes per slot is **+64 KiB at the default, +512 KiB at the
+ceiling**, on a 32 GiB host. The contract the test exists to protect — a `Copy` payload
+passed by value with no heap behind it — is intact; only the byte count moved.
+
+**Deviation from the Test Plan above, stated plainly.** That plan predicted "existing
+`order_runtime` mark tests continue to pass unchanged". One did not. The prediction was
+wrong about a size assertion, and the record says so rather than being edited to match
+the outcome.
+
+**What Item 11 does NOT deliver (Rule 11).** 11a makes the runtime width follow the host
+instead of a constant; it does not measure whether 2, 3 or 4 workers is the right width
+for this workload — the first live session at scale is still that measurement, and the
+env override is still how it gets acted on. 11b removes a latent precision class above
+131,072; no price flowing today reaches it, so nothing observable changes.
+
+---
+
+## Item 12 — Close the gates that could pass while measuring nothing (2026-08-24 audit)
+
+**Authorization.** Operator, 2026-08-24, verbatim: *"fix and resolve evrything dude okay?"* —
+given in direct response to a message that enumerated the open findings of an 8-agent
+workspace audit as a ranked table. Same authorization shape §28.2/§28.3 of
+`daily-universe-scope-expansion-2026-05-27.md` already accept: a general go-ahead that
+selects work the preceding message listed. Added to THIS plan rather than a new file
+because the tree sits at exactly `PLAN_GATE_MAX_ACTIVE` (5) and a sixth `active-plan*.md`
+would BLOCK every `crates/*/src/**.rs` push (V7) — the same slot constraint this plan's
+own header records. Per `plan-enforcement.md` rule 5, items may be added to an approved
+plan during implementation.
+
+### Design
+
+The audit's highest-value finding was not a bug in trading logic — it was a **gate that
+reported success without measuring anything**, which is the false-OK class
+`audit-findings` Rule 11 forbids and the class this repository has already retired twice.
+Item 12 closes that class wherever the sweep found it, and adds the ratchets that stop it
+returning.
+
+- [x] **12a — `bench-gate.sh` fails closed on an empty comparison.** Two paths printed a
+  success line and exited 0 while enforcing ZERO of the 11 absolute latency budgets: an
+  empty Criterion tree, and benches whose ids had drifted away from their budget keys.
+  Both now exit 3 with a named cause. Exit 3 is distinct from 1 (absolute breach) and 2
+  (regression) so `bench.yml`'s baseline-ratchet condition (`gate_rc != '2'`) is
+  unchanged. **Bite-proven in both directions** — against the pre-fix script the two new
+  self-test cases return exit 0, against the fixed script exit 3, and all 7 pre-existing
+  cases pass unchanged in both runs. The sibling `coverage-gate.sh` was fixed against this
+  exact class on 2026-07-10 with a self-test; the fix had never been propagated.
+  *(Landed 905155c.)*
+
+- [x] **12b — Arm the clippy gate on test targets, with the measurement CI asked for.**
+  `ci.yml`'s clippy step carries a comment stating `--all-targets` is "deliberately
+  omitted... its true warning count is UNMEASURED. Arming it is separate work with its own
+  measurement". This item IS that work. Measured on this tree: 93 lints, all inside inline
+  `#[cfg(test)]` modules — `cargo clippy --workspace --no-deps -- -D warnings` (what CI
+  runs) is already clean, and the terminating error names `tickvault-app (lib test)`. Fix
+  the test-target lints, add `--all-targets`, and extend
+  `rust_only_guard.rs::ci_clippy_gate_stays_armed` to pin the new flag so it cannot be
+  dropped silently.
+
+- [x] **12c — Ratchet the dependency-graph interpreter class (scope hole EIGHT).**
+  `rust_only_guard.rs` scans `Cargo.lock` for native BUILD systems
+  (`KNOWN_NATIVE_BUILDERS`) and for nothing else. No test anywhere scans the graph for an
+  embedded scripting runtime, so `rhai = "1"` in a crate manifest plus a script carried as
+  an `include_str!` string would pass every existing guard green: no banned extension, no
+  shebang, no spawn literal, no invocation token. Verified absent today (pyo3, mlua, rlua,
+  rhai, deno_core, boa_engine, rquickjs, rustpython, v8, quickjs, duktape, wasmtime,
+  wasmer, neon — none in the lockfile). This is the eighth time the guard has been found
+  scoped to a surface rather than a question, which is the recurring shape its own §0.3
+  records.
+
+- [x] **12d — Back off the WAL no-segment retry arm.** `persist_record_resilient`'s
+  `open_segment_resilient` failure path emits one `error!` per record and retries
+  immediately. Its two siblings — the flush arm and the `write_record` arm — both sleep
+  `WAL_WRITER_IO_RETRY_BACKOFF` first. On a full disk at the ~5,000 frame/s envelope that
+  is ~5,000 open() syscalls and ~5,000 ERROR lines per second written to the disk that is
+  already full. Disk-full DOES page (`WS-SPILL-01` has a live metric-filter alarm, checked
+  in source), so this is amplification of a detected failure, not a silent one.
+
+- [x] **12e — Drop the stale `crates/frontend-wasm` workspace exclusion.** The path does
+  not exist and carries zero tracked files, so the entry excluded nothing while reading as
+  a live carve-out to anyone auditing the Rust-only boundary. `cargo metadata` resolves
+  identically without it.
+
+### Edge Cases
+
+Exit 3 must not collide with `bench.yml`'s baseline-save condition (`gate_rc != '2'`) — it
+does not, and a run that measured nothing should still save whatever Criterion produced
+rather than starve the cache (the deadlock the rc=1 comment already records). Arming
+`--all-targets` must not break the calibration harnesses that legitimately print: the
+`print_stdout` hit is handled at its site rather than by weakening the lint globally. The
+lockfile scan must fail closed on an unreadable `Cargo.lock` rather than passing vacuously
+— the exact defect 12a fixes elsewhere.
+
+### Failure Modes
+
+A future crate legitimately needing a sandboxed expression evaluator would trip 12c. That
+is the intended behaviour: it forces a dated decision instead of an accident. The list is
+a shrink-only allowlist in the established shape, so adding one is a visible diff.
+
+### Test Plan
+
+`bash scripts/bench-gate.selftest.sh` (9 cases, bite-proven both directions);
+`cargo clippy --workspace --all-targets -- -D warnings` exits 0;
+`cargo test -p tickvault-common --test rust_only_guard`;
+`cargo test -p tickvault-storage`;
+`cargo test --workspace` stays at 0 failures.
+
+### Rollback
+
+Every item is an independent revert. 12a/12d are localised to one function each; 12b is a
+flag on one CI line plus test-module edits with no production reach; 12c is an additive
+test; 12e is a manifest comment.
+
+### Observability
+
+12a and 12d change what an operator SEES on a failing run — a named cause instead of a
+success line, and a legible error rate instead of a flood. No new metric, no new alarm, no
+new `NotificationEvent`; the Dhan 4-item Telegram family is untouched.
+
+#### 12b outcome — MEASURED, PARTIALLY DONE, arming DEFERRED (2026-08-24)
+
+The measurement CI asked for is complete, and the auto-fixable half landed. The flag is
+NOT armed, because arming it today would make Build & Verify fail on the first PR.
+
+| | |
+|---|---|
+| Measured before any change | **93 lints, 102 error lines, exit 101**; all in inline `#[cfg(test)]` modules; the two hits resolving to production files were `note: the lint level is defined here`, i.e. the `#![deny(...)]` attribute lines |
+| Fixed | 70 `inconsistent_digit_grouping` + needless borrows + `while let` on an iterator + `assert_eq!(x, true)` — all semantically neutral, verified by a **pure-reorder / identical-literal** diff check and a full suite re-run |
+| Remaining | **13**, all pre-existing, none auto-fixable: 10 × `assertions_on_constants`, 1 × `field assignment outside of initializer`, 1 × `nonminimal_bool`, 1 × `unused mut` |
+| Locations | `common/src/ingest_shed.rs` ×4, `common/src/constants.rs` ×3, `common/src/broker_order_events.rs` ×3, `common/src/config.rs` ×2, `common/tests/core_affinity_claim_guard.rs` ×1 |
+| Fix shape | The 10 constant assertions want `const _: () = assert!(...)`, which this repo already uses (`constants.rs:3010`) and which is STRONGER — it moves the check from test-time to build-time. The `nonminimal_bool` one is `!(!a && b)`; simplifying it would make a deliberately-readable guard message harder to read, so it wants a justified `#[allow]`, not a rewrite. |
+
+Arming is therefore one small, self-contained follow-up: fix 13, flip the flag, restore the
+`--all-targets` assertion in `ci_clippy_gate_stays_armed`. Both were written and reverted in
+this session rather than shipped red — a gate that fails on arrival teaches people to
+bypass it.
+
+#### 12b outcome — ARMED for 5 of 8 crates (2026-10-30)
+
+Measured with `cargo clippy --workspace --all-targets --no-deps --keep-going` on origin/main `c309f59`.
+
+| | |
+|---|---|
+| Measured before any change | **276 findings (250 warnings + 26 errors)**, all in test code. The 2026-08-26 CI comment's 186 had grown back |
+| Fixed | **234**: 116 digit groupings (dates written `YYYYMMDD`, amounts regrouped in thousands, same digits), machine fixes from `clippy --fix`, and by hand: doc-list continuations, 24 constant assertions and 10 `await_holding_lock` given a narrow `// APPROVED:` allow, plus small rewrites (`contains_key`, merged branches, struct literals instead of field reassignment) |
+| Left | **42**, all in files other sessions were editing (never touched here): app 9 (`dhan_feed_stack.rs` 4, `dhan_feed_stack/` 2, `spot_price_store.rs` 3), core 17 (`parser/truedata_aux.rs` 13, `parser/truedata.rs` 2, `parser/depth.rs` 1, `pipeline/tick_gap_detector.rs` 1), trading 16 (`candles/multi_tf_aggregator.rs`) |
+| Gated | new `ci.yml` step: `cargo clippy -p tickvault-common -p tickvault-storage -p tickvault-api -p tickvault-aws-lambdas -p tickvault-logs-mcp --all-targets --no-deps -- -D warnings`, exit 0 on the branch; pinned by `rust_only_guard.rs::ci_clippy_gate_stays_armed` + `CLIPPY_ALL_TARGETS_CRATES` (grow-only, with the five names also written in the test as a floor); `make clippy-ci` (`scripts/clippy-local.sh`) runs both CI steps, pinned by `clippy_local_parity_guard.rs` |
+| Still open (why 12b stays unticked) | app, core and trading join the step once the 42 above are fixed by the owners of those files |
+
+#### 12b continuation — all eight crates locally verified, CI pending (2026-10-31)
+
+The Codex continuation preserves PR #2158's `2b6279bac` history and merges main
+`49dd25239` without rewriting it. The same main tree blocked the separately
+preserved depth PR #2149: `cargo clippy --locked --workspace --all-targets
+--keep-going -- -D warnings` reported **274 unique findings in 67 files**, all
+byte-identical to main. After integrating the preserved #2158 changes, the
+command reports exactly the previously deferred **42** (app 9, core 17,
+trading 16). No depth feature changes are included in this prerequisite.
+
+The continuation fixes those nine test-source files: named binary fixture
+fields, checked fixture lengths and record slices, explicit partial ordering
+that keeps NaN handling, equivalent ranges/loops/literals, and assertion
+messages in place of diagnostic-only printing. Three explicitly ignored
+calibration harnesses retain their sole result through function-scoped
+`print_stdout` allowances, as the item 12b edge-case design requires; no
+module-wide exception or new dependency is added. The preserved test-local
+constant-assertion and environment-lock exceptions remain subject to review.
+
+CI and `scripts/clippy-local.sh` now use one whole-workspace command with
+`--all-targets --no-deps -- -D warnings`. The grow-only floor includes all
+eight, and `clippy_all_targets_covers_every_workspace_member` checks Cargo's
+offline, locked member metadata, including globs and exclusions. The first
+guard run exposed an incorrect explicit-member assumption; that is repaired.
+The preserved second CI step also exceeded the existing workflow ceiling
+(294 run lines against 293), so the redundant libs-only pass is removed:
+one all-targets command covers both. The local script shrinks to **86 lines**
+and its ceiling follows it down; no budget is raised.
+
+Validation: workspace all-targets Clippy with warnings denied passed; the final
+Rust-only, Clippy-parity, shell-budget and source-size guards passed **67 tests**.
+The complete `cargo test --locked --workspace --no-fail-fast` rerun passed
+**15,433 tests, 0 failed, 33 existing ignored**, across 451 test binaries and
+8 doctest sections. Native commit/push gates and exact-head CI remain pending;
+this is local implementation verification, not a merged-PR claim.
+
+The first full run passed 15,432 tests and failed one unchanged logs-MCP fixture:
+it set invalid `AWS_DEFAULT_REGION` but inherited a higher-priority `AWS_REGION`.
+The existing test-local EnvGuard now clears that selector too, restoring it on
+drop under the same serialization lock. The focused test and the complete
+rerun pass with the host region still configured; production region selection
+is unchanged. The first-run failure is retained in the continuation evidence.
+
+The native commit hook's complete 113-file secret scan was clean in **42.235 s**
+but exceeded its old 30 s deadline. It now uses the same reviewed staged-count
+deadline as the depth continuation and the existing Claude gate (minimum 60 s,
+plus one second per eight staged files). File scope and blocking outcomes are
+unchanged. Historical plan references were also repaired: directory slashes,
+current test names, and the explicit top-volume retirement pointer. The
+unmodified main plan failed the same 17 reference checks; verification now
+passes with 174 ticked items and 31 still open, without changing the verifier.
+
+#### 12f — What the LIVE box says (2026-08-24 session, read from AWS)
+
+Source analysis cannot answer "is it working". These are live readings, and two of them
+overturn conclusions the source audit reached.
+
+| Reading | Value |
+|---|---|
+| Instance | `i-0c3fe906dad5492fc`, r8g.xlarge, ap-south-1b, stopped at time of read |
+| Peak memory | **12.7% of 32 GiB ≈ 4.1 GB** — retires the long-standing UNMEASURED memory flag |
+| Peak CPU | 46%, session average 13–23% |
+| Free spill disk | 208.8 GB |
+| WebSocket connections alive | **15** |
+| Ticks dropped / WAL frames dropped / seals dropped | **0 / 0 / 0** |
+| Candles sealed | **1,002,896** |
+| Depth rows | 2,883,880 |
+| Instruments never ticked | 0 (745 went silent later — normal for illiquid strikes) |
+| **Ticks REFUSED by the aggregator** | **49,112**, and a 120-episode sample shows **100% timestamp refusals** — `refused_price = 0`, `refused_slot_exhausted = 0` |
+| `AGGREGATOR-DROP-01` episodes | **713** in one session — roughly one every 30s, all day |
+
+**The refusal finding is the important one and it is new.** `MIN_PLAUSIBLE_EXCHANGE_TS_SECS`
+(1_600_000_000) refuses any tick whose exchange timestamp is below 2020-09-13, which is what
+a never-traded instrument's `LTT = 0` sentinel looks like. So ~49k packets per session are
+dropped before the fold and never become a candle.
+
+The persistence layer disagrees with the aggregator about the same packet:
+`row_timestamp_ist_nanos` deliberately falls back to the RECEIPT time for a sentinel LTT and
+stores the row, while the aggregator refuses it outright. **The tick is kept; the candle is
+not.** That is one packet, two policies, and it is a coherent explanation for OHLC gaps on
+illiquid instruments — which is exactly the symptom the operator reported independently.
+
+Also live-verified: **23 of the 76 EMF-declared metrics have never published a datapoint**,
+and two alarms (`tv-prod-ticks-lost-spill`, `tv-prod-wal-frames-not-recovered`) sit on
+metrics with no series — they read OK because nothing has ever arrived, not because
+something was checked. `mem_used_percent` publishes under CWAgent with an `InstanceId`
+dimension; `tv_process_rss_bytes` does not publish at all.
+
+---
+
+## ⚠ MERGE NOTE 2026-08-25 — TWO different sections were both numbered "Item 12"
+
+`main` and the feed-hardening branch each appended an **Item 12** on
+consecutive days, to different work. Both are kept, in date order, and
+NEITHER is renumbered — the body text inside each block cross-references its
+own item numbers, so renumbering the headings alone would leave every one of
+those references pointing at the wrong section, which is worse than the
+collision it would fix.
+
+| Which | Dated | Subject | Where |
+|---|---|---|---|
+| **Item 12 (gates)** | 2026-08-24 | "Close the gates that could pass while measuring nothing" — 12b arming deferred, 12f live-box readings | the block ABOVE this note |
+| **ITEM 12 (disk/O(1))** | 2026-08-25 | the ~25× write-amplification finding, the zero-timestamp false tick-loss page, and the O(1) track that continues into ITEMs 13–16 | the block BELOW this note |
+
+**Reading rule:** inside each block, "Item 12" means THAT block's Item 12.
+ITEMs 13, 14, 15 and 16 are unambiguous — they exist only in the lower block
+and continue from ITEM 12 (disk/O(1)).
+
+---
+## ITEM 12 — DESIGN ADDENDUM (added 2026-08-25, operator: "yes fix and resolve evrythgi. see what the fuk is this bro when we have only 200 GB but how come this is comign around thsi much dude still i cant beleieve bro liek 4 tb how bro how can we resolve this dude?")
+
+Two findings from the 2026-08-24 live-AWS sweep. Both are LIVE defects on the running
+lane, not latent ones, which is what separates this item from Item 11.
+
+### The measurement that opened it (Verified, live CloudWatch, session 2026-08-24)
+
+| Reading | Value |
+|---|---|
+| `VolumeWriteBytes`, 03:00–12:00 UTC | **4,744 GB** |
+| `VolumeReadBytes`, same window | 672 GB |
+| Sustained throughput 09:30–15:30 IST | **495–500 MB/s** against a 500 MiB/s ceiling |
+| Write latency, pre-open → mid-session | **0.86 ms → 2.30 ms** (2.7x) |
+| `VolumeQueueLength` at market open | **7.3 avg**, 8.5 max |
+| CPU over the same window | **13–27%** |
+
+The disk is pinned at exactly its provisioned ceiling for the whole session while the CPU
+idles. **This is not an O(1) problem and no hot-path work can fix it** — the decode path is
+O(1), zero-alloc and DHAT-gated, and it is not the bottleneck. Recorded explicitly because
+the operator asked for the O(1) guarantee in the same breath as the slowness, and the
+honest answer is that the guarantee holds AND is irrelevant to this symptom.
+
+### 12a — Commit cadence, not data volume, is producing the traffic
+
+**Design.** `FLUSH_INTERVAL_MILLIS = 500` (`dhan_feed_stack.rs`) commits **7,200 times per
+hour** into `PARTITION BY HOUR` tables that carry DEDUP UPSERT KEYS and grow to several GB
+within the hour. QuestDB's per-commit rewrite cost scales with the **partition size**, not
+with the batch size, so committing 10x more often costs ~10x the disk traffic for byte-identical
+data. Measured real data is ~60-80 GB/session (depth 5.3 GB/hr measured 2026-08-18, ticks
+~2.5 GB/day, plus candles) against 4,744 GB written — a ~60-80x amplification.
+
+Raise `FLUSH_INTERVAL_MILLIS` 500 -> 5,000 and re-measure. Expected ~10x traffic reduction,
+to ~470 GB/session (~20 MB/s average), which is far inside the existing 500 MiB/s ceiling.
+
+**Why this cannot lose a tick.** Capture-at-receipt is the durability floor and it runs
+BEFORE the fold and before any ILP flush (`dhan_feed_stack.rs`: "Capture-at-receipt is the
+durability floor"). The WAL already holds the frame when the flush timer fires, so batching
+changes only how long a row waits before becoming visible in QuestDB — never whether it was
+captured. Per operator Quote 4 (2026-07-24, RAM-first absolute) no strategy, indicator or
+risk path may read from the DB at all, so added DB visibility latency cannot reach a
+trading decision by construction.
+
+**Buffer bound.** questdb-rs enforces a 100 MiB `max_buf_size` and exceeding it wedges every
+subsequent flush permanently (recorded at `seal_writer_task.rs` and `shadow_candle_writer.rs`).
+At the measured ~3.6 MB/s of real depth rows a 5 s batch is ~18 MB, ~18% of the cap. The
+implementation MUST assert the chosen interval against a measured worst-case row rate and
+fail closed rather than approach the cap.
+
+**HYPOTHESIS, not yet measured — stated as such.** The amplification MECHANISM above is
+derived from the constants and the QuestDB commit model, not from a controlled experiment;
+the box was stopped when this was written, so no live A/B was possible. The verification is
+named and cheap: `VolumeWriteBytes` for the identical 03:00-12:00 window, one session before
+and one session after the change, same universe size. If the traffic does not fall ~10x the
+hypothesis is WRONG and the DEDUP-merge path is the next suspect, not the flush cadence.
+
+### 12b — A zero timestamp is charged as tick loss and pages the operator
+
+**Design.** `MultiTfAggregator::consume` refuses any tick whose `exchange_timestamp` falls
+outside `[MIN_PLAUSIBLE_EXCHANGE_TS_SECS, MAX_PLAUSIBLE_EXCHANGE_TS_SECS]` (2020-09-13 ..
+2050-01-01) and counts it as `refused_timestamp`, which feeds `AGGREGATOR-DROP-01` — a
+PAGING code whose text reads "These ticks were NOT folded into any candle and NOT written."
+Measured 2026-08-24: **17,931 refusals in one session**, 14,775 of them in the first hour,
+then a steady ~400-580/hour; `refused_price` and `refused_slot_exhausted` were both ZERO.
+
+The inconsistency is that the sibling case is already handled the opposite way: `p == 0.0`
+is classified `untraded_sentinel` — a benign "this instrument has not traded" marker, not a
+drop. A zero LTT is the same statement from the same packet, and `ws_lag_ms` already treats
+a sub-plausible stamp as "a zero or garbage stamp" rather than corruption.
+
+Split the single refusal into two: an explicit `ltt == 0` untraded sentinel (counted,
+NOT charged as a drop, NOT paged) and a genuinely out-of-range stamp (kept as a hard
+refusal, still paged, since that is the hostile-packet case the absolute bound was written
+for — see the watermark-poisoning finding recorded at that constant).
+
+**The gap that must be closed FIRST, before either branch is written.** The aggregator today
+records only a COUNT, never the offending value, so nothing in the repository proves the
+refused stamps are zero. That is an assumption and it is labelled one. Item 12b therefore
+lands the observability half first — a throttled record of the actual refused value (min /
+max / one sample, power-of-two throttled, zero-alloc) — and the classification half only
+after a live session has SHOWN what the values are. Shipping the split on the assumption
+would be exactly the false-OK this plan exists to prevent: if the stamps are not zero, a
+benign-sentinel branch would silently swallow real corruption.
+
+### What Item 12 deliberately does NOT do
+
+- **No EBS throughput raise.** 500 -> 1000 MiB/s (+$20/mo) would hide the amplification
+  rather than remove it, and 12a is expected to put traffic ~10x under the existing ceiling.
+  It also requires a fresh dated operator quote under the daily-universe lock §7 Rule 3,
+  which this quote is not: the operator asked how to RESOLVE the 4 TB, not to buy more pipe.
+  If 12a's measurement shows the traffic still at the ceiling, the raise returns as its own
+  quoted decision with the measured number behind it.
+- **No DEDUP key change.** `capture_seq` in the `ticks` and `market_depth` keys is what makes
+  WAL replay idempotent; removing it to cheapen the merge would trade a measured slowness for
+  duplicate rows after any crash recovery. If 12a proves insufficient, the correct next step
+  is a cheaper idempotence mechanism, designed on its own — never dropping the key.
+- **No retention/window change.** `depth_hot_days = 1` and `intraday_hot_days = 1` are already
+  at their floors and are not implicated: this is write TRAFFIC, not stored volume.
+
+### ITEM 12 — CORRECTION (2026-08-25, same day, BEFORE any code was written)
+
+Four parallel adversarial agents were run against 12a on the operator's instruction
+("I dont need any hallucination or illusion... Try to attack evrythign"). **They killed
+it.** The correction is recorded here rather than by editing 12a, per house convention,
+because the ERROR is the durable lesson: 12a named a mechanism correctly and then blamed
+the wrong constant, and had it shipped it would have changed nothing while being reported
+as a fix.
+
+**12a's named fix is WRONG (Verified, two agents independently).** `FLUSH_ROW_THRESHOLD
+= 1_000` (`dhan_feed_stack.rs:3282`) is evaluated PER FRAME at `:2840`, BEFORE the timer
+arm at `:2905`. The size and time triggers cross at 2,000 ticks/s; the envelope is
+~5,000/s (12,500 at open). So the timer contributes ~0 flushes at open, and raising
+`FLUSH_INTERVAL_MILLIS` 500 -> 5000 would move tick commits from ~5/s to ~5/s. The
+constant's own doc comment already said so ("combined with the 500 ms time trigger it
+caps depth at ~5 flushes/second") and 12a did not read it. **No flush-interval change is
+authorized by this item.**
+
+**The real data volume was also understated.** Inline 5-level depth (`DEPTH_KIND_5`) is
+LIVE and unconditional at the production boot site (`dhan_feed_stack.rs:6332`,
+`.with_inline_depth`), emitting up to 10 rows per Full-mode tick (`:3649`, `:3717`,
+`:3735`) — ~50,000 d5 rows/s ON TOP of the measured 21,300 dedicated depth rows/s. At
+72 B/row that is ~190 GB/session logical, not the 60-80 GB 12a assumed. True
+amplification is therefore ~25x, not ~60-80x. Still large; smaller than claimed.
+
+**Two surviving candidate causes, both O(partition rewrite), neither fixed by 12a:**
+
+- **Candidate A — the candle path has NO batch valve at all.** `SEAL_DRAIN_INTERVAL_MS
+  = 100` (`seal_writer_loop.rs:74`) is a bare timer; `drain_once`
+  (`seal_writer_task.rs:122-235`) short-circuits only on an EMPTY ring and otherwise
+  flushes unconditionally — there is no row-count threshold anywhere on this path, unlike
+  ticks and depth. One flush carries rows for every timeframe table touched that cycle,
+  and `tf_index.rs` enumerates **24** candle tables. Up to ~864,000 table-commits/hour.
+  Worse, `candles_*` are `PARTITION BY DAY` (`shadow_persistence.rs:228`) while ticks and
+  depth were deliberately given `PARTITION BY HOUR` for volume — so the highest-commit
+  path in the system runs against partitions with 24x the merge surface.
+- **Candidate B — `ticks.ts` is out-of-order by hours, structurally.**
+  `tick_persistence.rs:428` stamps the row with `row_timestamp_ist_nanos(
+  tick.exchange_timestamp, ..)` — the exchange LAST-TRADE time, not receipt. For a
+  thin option at 11:00 whose last trade was 09:47, the row lands in an already-CLOSED
+  hourly partition, forcing a reopen and merge-rewrite. `market_depth` stamps
+  `received_at` (`:3685`) and is in-order. So on this reading depth is the VOLUME and
+  ticks is the AMPLIFICATION.
+
+**Uncounted writers on the same root volume** (none of which 12a accounted for):
+QuestDB's own WAL (every byte at least twice), the `ws_frame_spill` raw-frame WAL
+(~26 GB/session, `BufWriter`, no fsync), Loki (30-day retention), `errors.jsonl`, and the
+`tv-questdb-data` docker named volume which lives on root.
+
+**NOT ESTABLISHED and not to be asserted:** QuestDB 9.3.5's exact WAL+DEDUP apply cost.
+No agent could source it from this repository and none invented it. Every statement above
+about rewrite cost scaling with partition size is INFERRED from the columnar-rewrite model
+and is labelled as such.
+
+### ITEM 12 — THE THREE DECISIVE EXPERIMENTS (all require the box; none can run from a dev container)
+
+Ordered cheapest-first. Each is one measurement that discriminates between live candidates.
+No code fix may be proposed under Item 12 until at least E1 or E2 has returned.
+
+- **E1 (settles Candidate B, zero risk, read-only):**
+  `SELECT count() FROM ticks WHERE ts < dateadd('h', -1, received_at)`. A non-trivial
+  count proves ticks are landing in closed partitions and the designated timestamp — not
+  any flush constant — is the amplifier.
+- **E2 (settles Candidate A, one constant, one session):** raise `SEAL_DRAIN_INTERVAL_MS`
+  100 -> 2000 for a single session and compare EBS `VolumeWriteBytes` over the identical
+  03:00-12:00 UTC window. Commit count falls 20x; row count is unchanged. If writes fall
+  roughly proportionally, commit amplification is confirmed and the fix is a row-count
+  valve plus HOUR partitioning on `candles_*`. If writes barely move, the candle path is
+  exonerated.
+- **E3 (settles 12b, read-only, minutes):** the raw frames of every refused tick are
+  already on disk — capture-at-receipt WALs the frame BEFORE parse
+  (`dhan_feed_stack.rs:1149`, `ws_frame_spill`, `data/spill/`). Decode one segment and
+  read the actual LTT values and their `security_id`s. This ends the guessing entirely.
+
+### ITEM 12b — SUPERSEDING FINDINGS (the refusal is worse than 12b described)
+
+- **Most likely cause: `IDX_I` index packets, newly arriving.** `IDX_I_FEED_MODE =
+  FeedMode::Quote` (`connection.rs:506`) landed 2026-08-21; the same file records that
+  BEFORE that flip indices produced ZERO packets and `never_ticked` equalled the index
+  count exactly. The measurement is 2026-08-24 — three days later. An index has no trades,
+  so "last TRADE time" is meaningless for it while LTP is a real number: precisely the
+  price-sane / timestamp-insane shape that reaches this gate. **Unknown:** nothing in the
+  repo states Dhan's LTT for `IDX_I`, and `docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md`
+  asked Dhan exactly this and NO ANSWER IS RECORDED. 119 indices also do not obviously
+  produce 17,931 refusals, so the cause may be only partly this.
+- **A refused instrument is INVISIBLE, not merely undercounted.** The gap detector
+  observes at `:1188`, BEFORE `consume_tick` at `:1203`, unconditionally. So an instrument
+  whose every tick is refused gets no candle and no `ticks` row, and is simultaneously NOT
+  silent to `scan_silence` / RISK-GAP-03 — it reads as healthy. It is indistinguishable
+  from an instrument that simply never traded. This is a false-OK of the exact class the
+  charter forbids and it is LIVE today.
+- **The `reason` label never reaches CloudWatch.** EMF dimensions are `[["host"]]`
+  (`cloudwatch-agent.json:23`), so `tv_aggregator_tick_refused_total{reason}` is summed
+  across reasons and the operator cannot separate a timestamp refusal from a price or
+  slot-exhaustion refusal at all.
+- **The page the operator receives describes a different failure.** The alarm firing on
+  `AGGREGATOR-DROP-01` (`error-code-alarms.tf:244`) carries a description about
+  SEAL-drop, not tick refusal — so the runbook text does not match the event.
+- **A legitimately tradeable tick can be refused.** The order is
+  `price -> untraded_sentinel(p==0.0) -> timestamp -> session`, so a tick with a REAL
+  price and a bad stamp is refused whole and never reaches the sentinel escape hatch.
+
+### ITEM 12b — SECURITY REVIEW RESULT (2026-08-25): the sentinel must NOT be write-through
+
+An adversarial security pass found a defect in 12b as drafted. Recorded before any code.
+
+**The trap.** 12b reasoned by analogy to `untraded_sentinel` (`p == 0.0`). That analogy is
+WRONG in the one way that matters. Verified at `dhan_feed_stack.rs:1305-1367`: a
+`hard_refusal` (today's `refused_timestamp`) returns at `:1333` BEFORE
+`append_tick_with_seq` at `:1337`, so no row is written; a `candle_only_refusal` (which is
+where `untraded_sentinel` sits) DOES write the tick row, stamped
+`ts = exchange_timestamp * 1e9`.
+
+So routing an `ltt == 0` sentinel the same way as the price sentinel would persist rows
+with **`ts = 0`, i.e. 1970-01-01**. For the price sentinel the corrupt field is the VALUE
+and the timestamp is sound; here the corrupt field IS the timestamp. The file's own comment
+(`:1296-1304`) already calls writing a garbage designated timestamp "worse than losing it".
+
+**And it would be unbounded.** Every `ltt == 0` packet carries a distinct `capture_seq`, so
+the DEDUP key never collapses them: a corrupt or hostile zero-LTT stream would grow a single
+1970 partition without limit — while being UNPAGED, because the whole point of the change is
+to stop it paging. That is a strictly worse outcome than the current behaviour, arrived at
+while trying to fix it.
+
+**Binding correction.** The `ltt == 0` case must become a FOURTH category: counted, benign,
+NOT paged, and still **row-refused** — never a copy of `untraded_sentinel`'s write-through
+path. A PR that routes it write-through is a REJECT.
+
+**Other findings from the same pass (all Verified):**
+- `multi_tf_aggregator.rs` is OUTSIDE the frozen area (`FROZEN_DIRS` = `indicator/`,
+  `strategy/` only, per `operator_boundary_indicator_strategy_guard.rs:36-37,49`). **No §28
+  lift is required** for Item 12 — good, because a §28 lift would need its own dated quote.
+- No attack path to the watermark IF and ONLY IF the split is scoped to `ltt == 0` exactly:
+  `0` can never exceed `watermark_secs`, and the ~2106 poisoning vector lives at the MAX
+  bound, which stays untouched. Any widening of the MIN bound instead of an exact-zero case
+  WOULD reopen it.
+- `test_watermark_cannot_be_poisoned_by_an_all_ones_timestamp`
+  (`multi_tf_aggregator.rs:1368-1402`) asserts `ts == 0` must be `refused_timestamp`. It
+  must be EDITED, never gutted: `0xFFFFFFFF`, `MAX+1` and `1` must all remain refused.
+- `ConsumeStats::folded()` (`:173-190`) must gain the new field — required for correctness,
+  not a weakening.
+- The observability half must EXTEND the existing throttled 30s delta report
+  (`dhan_feed_stack.rs:2977-3009`). It must NOT add a per-tick log line (flood at ~18k
+  events/session) and MUST NOT add a per-instrument metric label (the cardinality ban:
+  per-instrument CloudWatch series were priced at ~$1,369/mo against a budget whose
+  automatic action stops the trading box).
+- Change (A), the batching/commit-rate work, is LOW risk: capture-at-receipt precedes the
+  fold and flush, and flush failure is DEDUP-idempotent via spill + WAL replay. Larger
+  batches widen only the VISIBILITY-latency window, never the loss window. No secret flows
+  through an ILP buffer.
+
+## ITEM 13 — THE O(1) DEFECT, AND WHAT MONEY CANNOT BUY (2026-08-25, operator: "i just need always O(1) dude i dotn need any slowness ddue irrespective of any situaitons" + "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure to achieve alwyas O(1)")
+
+Five parallel adversarial agents were run on the operator's instruction to attack
+everything. Budget authorization to $150/mo is recorded as Quote 19 in
+`daily-universe-scope-expansion-2026-05-27.md`. **It is deliberately unspent — see 13d.**
+
+### 13a — THE defect: the ILP flush runs ON the drain task (Verified, CRITICAL)
+
+`flush_and_record` (`dhan_feed_stack.rs:2564-2578`) is a **synchronous blocking
+ILP-over-HTTP round trip** executed inside `block_in_place` (`:2524`) **on the frame-drain
+task** — the same `tokio::select!` loop (`:2705`) that carries frame ingest, the 5 s
+catch-up seal and the 30 s silence scan.
+
+So while a flush is in flight, **no frames are drained**. That is the causal chain from a
+saturated disk to LOST TICKS, and it is the reason the operator sees "slowness" that no
+amount of hot-path O(1) work can remove:
+
+    disk saturated -> flush RTT grows -> drain stalls -> ring/socket buffer fills
+      -> Dhan skips a slow consumer forward to "latest available state"
+      -> intermediate ticks are dropped VENDOR-SIDE, with no sequence number to detect it
+
+**This is the single highest-value fix in this plan and it costs nothing.** Decoupling the
+flush from the drain (own task + bounded channel) removes the coupling entirely. Until it
+is decoupled, no O(1) guarantee can honestly be given for the END-TO-END path, however
+O(1) the decode is.
+
+### 13b — Flush RATE is the axis, and the tick threshold was never re-sized (Verified, HIGH)
+
+`FLUSH_ROW_THRESHOLD = 1_000` (`:3282`) is evaluated per frame. Measured emission is
+~1.44 rows/sec per continuously-ticking instrument (derived in 13c), so:
+
+| Instruments | rows/sec | flushes/sec @1,000 | drain blocked @5 ms RTT |
+|---|---|---|---|
+| 8,315 (today) | ~11,900 | ~12 | ~6% |
+| 24,600 (authorized) | ~35,300 | ~35 | ~18% |
+
+`DEPTH_FLUSH_ROW_THRESHOLD` was raised 10x to 10,000 for exactly this reason, and its own
+comment says so verbatim: *"Payload is the wrong axis here; FLUSH RATE is"* (`:3285-3306`).
+The TICK threshold sat at 1,000 through that reasoning and through the 21 -> 24 TF append.
+Raising it is the cheap mitigation; 13a is the real fix.
+
+### 13c — A hostile finding, CORRECTED before it was acted on (Verified)
+
+An agent reported the row rate as **3.39/sec/instrument** (28,200 today, 83,400 at target,
+42% drain blocked), computed as the harmonic sum over all sixteen second-scale frames
+S1..S15 + S30. **That is wrong by 2.4x**, and acting on it would have justified far more
+drastic surgery than the system needs.
+
+`TfIndex::is_operator_requested()` (`tf_index.rs:388`) gates ROW EMISSION to the operator's
+**thirteen** frames (S1 S5 S10 S15 S30 + M1 M2 M3 M5 M15 M30 M60 + D1), with three live
+production call sites (`dhan_feed_stack.rs:1227`, `:1424`, `:1679`). The eleven unrequested
+frames (S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14) fold but never emit. True rate is
+1 + 0.2 + 0.1 + 0.0667 + 0.0333 + minute frames = **~1.44 rows/sec**.
+
+**And this closes off a comfortable answer.** That gate has been live since 2026-08-18
+(#1768), so it was ALREADY ACTIVE during the 2026-08-24 session that wrote 4,744 GB. The
+row rate therefore does NOT explain the amplification, and no further timeframe trimming
+will. Recorded because the agent's number was plausible, alarming, and would have sent the
+next session cutting capability the operator explicitly paid for.
+
+### 13d — Why the $150 authorization is NOT being spent yet
+
+Quote 19 authorizes up to $150/mo (live: $48.87 actual, $61.51 forecast, $130 limit — the
+widest margin this account has had). The EBS raise 500 -> 1000 MiB/s is +$20/mo and fits.
+It is held anyway, on three grounds:
+
+1. **It does not deliver the thing asked for.** The requirement is O(1) with no slowness.
+   13a is a *coupling* defect: a faster disk shortens the stall, it does not remove the
+   drain from the flush's critical path. The $0 fix is the one that gives the guarantee.
+2. **~25x amplification is still unexplained** (13c removed the row-count explanation).
+   Doubling throughput against a 25x inefficiency buys one doubling and leaves the defect;
+   at 24,600 instruments the same wall returns.
+3. **The newest prime suspect is a config value, not a capacity one:**
+   `QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16777216` (16 MiB) in
+   `deploy/docker/docker-compose.yml`, across 24 tables x ~17 columns. If page granularity
+   is the amplifier the fix is an env var at $0. Also newly noted from the same file:
+   `QDB_CAIRO_O3_MAX_LAG = 60000000` (60 s) — a tick whose last-trade time is 90 minutes
+   stale falls FAR outside that window and forces a hard partition merge, which strengthens
+   the out-of-order candidate rather than the commit-rate one.
+
+The raise is taken the moment a measurement shows traffic still at the ceiling after the
+amplification fix — with a number behind it, not a guess.
+
+### 13e — Scale cliffs found by the same pass (recorded, not yet fixed)
+
+- **HIGH — ring-full drops are unrecoverable within the session.** `pool_supervisor.rs:127-160`:
+  a full ring counts and DROPS the frame. It is in the WAL, but `dhan_feed_stack.rs:1007-1021`
+  states the re-fold path needs a LIVE ring, so recovery is *"the next boot re-folds them"*.
+  A mid-session backpressure episode is therefore silent tick loss until tomorrow.
+- **HIGH — the measured `catch_up_seal_all` cost is the EMPTY case.** `multi_tf_aggregator.rs:1676-1679`
+  measures "none seals"; the 9.67 ms figure is pure traversal. At a minute boundary with
+  24,600 slots the sweep must EMIT, and each emission runs the absorption chain. The
+  recorded number does not bound the real one. Unknown.
+- **MEDIUM — subscribe dispatch is unpaced.** 24,600/100 = 246 messages sent back-to-back
+  (`connection.rs:794-850`, no delay). Dhan's subscribe rate limit is Unknown; a throttled
+  subscribe produces no error, only absence — and the 09:12 readiness deadline would miss
+  silently.
+- **LOW — memory is fine.** `AggregatorCell` 6.2 KB x 24,600 = 153 MB; seal ring 86 MB;
+  all per-instrument maps cap fail-closed at 25,000. 32 GiB holds it comfortably.
+- **No locks on the drain hot path** — single-owner `&mut`, verified.
+
+### 13f — The honest O(1) verdict (audited stage by stage)
+
+**Per PACKET the path IS O(1) and effectively zero-allocation, and it is PROVEN, not
+claimed:** fixed-offset `from_le_bytes` decode, one O(1)-average composite-key lookup, 24
+scalar folds, one bounded `try_send`, one ILP append — with `dhat_allocation.rs`,
+`dhat_multi_tf_fold.rs` (exactly 0 allocations over 10,000 folds), `dhat_ws_lag.rs` and
+`dhat_ws_reader_zero_alloc.rs` gating every PR. No banned pattern appears on the per-tick
+path.
+
+**Three stages break strict O(1) and must never be described otherwise:**
+1. **The ILP flush** — O(rows) AND blocking AND on the drain task (13a). The real defect.
+2. **Slot allocation** on an instrument's first tick — a `Vec` growth step is O(n) and
+   unbounded; mitigated by boot pre-sizing, not eliminated.
+3. **Seal-refusal escalation** (`:4192`) — writes to disk INLINE on the tick thread when
+   the seal channel is full.
+
+**Per FRAME it is not O(1)** either: `drain_main_feed_frame` walks every stacked packet,
+bounded only by `MAX_PACKETS_PER_FRAME = 70,000`.
+
+**Correction to CLAUDE.md, found by this audit:** the codebase map credits this path with a
+`papaya` concurrent-map lookup. There is **zero `papaya` on the live tick path** —
+`multi_tf_aggregator.rs:348` is a plain `HashMap<CompositeKey, u32>` into a dense `Vec`
+index. Still O(1) average; the claim was wrong about the type, exactly as the
+`instrument_registry` row in that same table was wrong in 2026-08-07.
+
+## ITEM 14 — DECOUPLING THE FLUSH: design, conditions, and why it must NOT ship first (2026-08-25)
+
+Item 13a named the flush-on-drain coupling as THE O(1) defect. A design pass and a hostile
+pass were run in parallel on the fix. They agree on the conditions and disagree on the
+verdict, and the disagreement is the useful part: **the hostile pass found an own-goal that
+means this fix must not land before the amplification is diagnosed.**
+
+### 14a — What the design pass settled (Verified)
+
+Reuse the proven seal-writer shape (`seal_writer_runner.rs` / `_loop.rs` / `_task.rs`), do
+not invent one:
+
+| Element | Decision |
+|---|---|
+| What crosses the boundary | an already-built ILP `Buffer`, **one send per FLUSH**, never per tick — so the per-tick DHAT zero-alloc guarantee is untouched |
+| Channel | bounded `mpsc<TickBatch>`, capacity **DERIVED** (`TICK_SPILL_MAX_BYTES / max_batch_bytes`), never a literal — the `SEAL_MPSC_CAPACITY` lesson, where a 200k literal silently force-dropped 400k seals nightly |
+| Buffer reuse | writer returns emptied buffers on a second bounded channel; steady state allocates nothing |
+| Full-channel policy | **SPILL**, reusing the tick spill that ALREADY exists (`tick_persistence.rs:636` `spill_failed_ilp` writes `Buffer::as_bytes()` verbatim, 512 MiB cap at `:606`, replayed by `tick_spill_replay.rs:359`). Blocking reinstates the defect; dropping violates never-lose-a-tick |
+| Shutdown | preserve the `:2883-2906` order, then drop the sender as EOS and `await` the writer under `timeout(2 x request_timeout)` = 10 s so the 17:30 stop cannot hang; the writer's final act is to spill its tail |
+| Placement | `crates/storage/src/tick_writer_runner.rs` + `tick_writer_loop.rs`; wiring in `dhan_feed_stack.rs` |
+
+**`capture_seq` is already safe and needs no change** (Verified, and this was the biggest
+worry): it is derived from the WAL frame sequence (`ws_frame_spill::packet_capture_seq` ->
+`capture_seq_from_frame_seq`, `dhan_feed_stack.rs:1149,1172,1337`), NOT minted at flush. So
+it is replay-stable and wholly independent of when the flush happens. One writer + one FIFO
+channel preserves batch order, and because the DEDUP key carries `capture_seq` a spilled
+batch replayed later collapses idempotently instead of duplicating.
+
+### 14b — The hostile pass: two corrections and one own-goal
+
+1. **The premise was half right, and the code's own comment is stale self-justification.**
+   `block_in_place` migrates OTHER tasks off the worker and spins a replacement, so the WS
+   read loops are NOT stalled today — only the drain loop itself is. The comment at `:2500`
+   claiming "on a 2-worker host that is HALF the runtime" overstates it. The real defect is
+   **unbounded REPETITION** of 5 s-timeout flushes on a 500 ms timer (~100% occupancy), not
+   any single flush. One stall is survivable: the ring holds 65,536 frames, ~13 s at 5,000
+   fps.
+2. **Today's blocking flush IS backpressure.** It is ugly, but it self-throttles and nothing
+   downstream is silently dropped. Remove it without a correct overflow policy and the drain
+   runs free while the writer falls behind — and the seal analogue this design mirrors,
+   `escalate_refused_seal` (`:4192`), is documented verbatim as *"a synchronous disk append
+   on the fold path"*. Escalating to a synchronous append **on the same saturated EBS volume
+   that caused the backlog** would swap one blocking path for another and add a queue. That
+   is the shell game, and it is avoided only because ticks already have a spill tier.
+3. **THE OWN-GOAL (HIGH, Assumed, unmeasured):** a decoupled writer batches more
+   aggressively, so each commit spans a WIDER `ts` range, which **increases O3 merge work**
+   — the very write amplification Item 12 is trying to remove. Nothing in the repo measures
+   this.
+
+### 14c — Therefore: Item 14 does NOT ship before Item 12's measurement
+
+This is the binding sequencing decision of this plan, and it is deliberate:
+
+**The amplification cause must be identified FIRST.** If the amplifier turns out to be
+commit WIDTH (out-of-order `ts` into closed partitions, strengthened by
+`QDB_CAIRO_O3_MAX_LAG = 60 s`), then wider batches make it worse and the decoupling must
+ship WITH a batch-width cap. If the amplifier is page granularity
+(`QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE = 16 MiB`) or commit COUNT, wider batches help.
+**The same change is beneficial or harmful depending on a fact nobody has measured.**
+Shipping it blind against a saturated disk is the gamble the operator explicitly forbade.
+
+### 14d — Conditions, binding on the implementing PR
+
+- **C1** The overflow policy is SPILL to the existing tick spill tier — never a silent drop,
+  never a blocking append introduced on the fold path.
+- **C2** The drain ships fully-formed, pre-stamped rows; the writer NEVER mints
+  `capture_seq`. (Already true — must not regress.)
+- **C3** `feed_health.record_ticks` and `LAST_TICK_AGE_GAUGE` move to the **writer**, not
+  the drain. **This is rule-gated, not stylistic:** `dhan-rest-only-noise-lock` §2.3b-i
+  chose the age GAUGE over the counter deliberately, and `no_ticks_alarm_gauge_guard.rs`
+  pins it. Stamping at hand-off would silently redefine the only dead-lane alarm from
+  "rows persisted" to "rows decoded" — forging liveness for rows a crash would take. The
+  guard re-bless and a dated §2.3b edit land in the SAME PR.
+- **C4** Shutdown awaits writer completion under a bounded grace; batch width is capped at
+  today's 500 ms span until 14b(3) is measured; `max_buf_size` headroom is const-asserted.
+- **C5** The questdb-rs `max_buf_size` = 100 MiB wedge (`seal_writer_task.rs:229`,
+  `shadow_candle_writer.rs:359`) is reached in ~28 s of stall at the 24,600-instrument rate,
+  and decoupling makes it EASIER to reach because nothing throttles the producer. A
+  size-based cut must fire well before it.
+
+### 14e — An infrastructure blocker on the observability half (Verified)
+
+The design calls for `tv_dhan_tick_writer_queue_depth` / `_high_water` / `_full_total` /
+`_flush_seconds`. **No new EMF metric name can ship**: `user-data.sh.tftpl` renders at
+exactly its 15,872-byte budget with **ZERO free** (measured, `dhan-rest-only-noise-lock`
+§2.3d-ii). Until the boot-path restructure that section describes, backpressure visibility
+must go via the metric-filter/log route (the §2.3d-i precedent), or the queue grows unseen
+— which for a backpressure queue is the worst possible blind spot.
+
+## ITEM 15 — MEASURED HOST TELEMETRY, and two corrections to my own earlier claims (2026-08-25)
+
+Operator challenged the depth of the audit: *"how did you check the entire memory as how much GB
+it is used and did you query from db and did you start the instance"*. He was right — memory had
+NOT been measured. It has now. Two things I previously reported are **WRONG** and are corrected
+here rather than quietly amended.
+
+### 15a — CORRECTION: the CPU is NOT idle. I read the wrong meter.
+
+Items 12-14 repeatedly state "CPU idles at 13-27%" and build the argument
+"this is I/O-bound, not CPU-bound" on it. That number is `AWS/EC2 CPUUtilization` — the
+HYPERVISOR view averaged across all 4 vCPUs. The in-guest CloudWatch agent, same window,
+same 300 s period, `CWAgent cpu_usage_active{cpu=cpu-total}`:
+
+| 2026-08-24 UTC | AWS/EC2 (hypervisor) | CWAgent (in-guest) |
+|---|---|---|
+| 04:00 | 40.9% | **66.7%** |
+| 04:30 | 23.4% | **67.7%** |
+| 04:45 | 19.9% | **69.7%** |
+| 04:55 | 21.1% | **67.9%** |
+
+The app and QuestDB are confined to a **2-core cpuset of 4 vCPUs** (`docker-compose.yml`
+`cpuset: "2,3"`, plus the systemd confinement), so the hypervisor average roughly halves the
+number the workload actually experiences. **Real sustained CPU is ~67%, not 13-27%.**
+
+This does not overturn the disk finding — the volume is still pinned at its 500 MiB/s ceiling —
+but it DOES overturn the framing. The box is near-saturated on **both** CPU and disk, and any
+claim of the form "there is CPU headroom, so the fix is X" must be re-derived. Recorded loudly
+because this repository's own O(1) table has twice recorded a stale number manufacturing a false
+finding, and this is the same class committed by me, in this plan, three times.
+
+### 15b — THE FINDING NOBODY HAD MEASURED: the disk reaches 80% every session
+
+`CWAgent disk_used_percent{path=/, device=nvme0n1p1, fstype=xfs}`, 2026-08-24:
+
+| IST | Used | % of 200 GB |
+|---|---|---|
+| 08:30 (boot) | 9 GB | 4.5% |
+| 11:30 | 82 GB | 41.1% |
+| 14:00 | 136 GB | 68.0% |
+| **15:00** | **160 GB** | **80.1%** |
+| 16:00 (post-retention) | 146 GB | 72.8% |
+| 20:00 | 160 GB | 79.9% |
+
+**~151 GB consumed in ONE nine-hour session**, with `depth_hot_days = 1` and
+`intraday_hot_days = 1` already at their FLOOR — there is no retention lever left to pull.
+
+At the authorized 24,600 instruments (~3x today's 8,315) this projects to **~450 GB against a
+200 GB volume**, i.e. **ENOSPC mid-session**. That is not a capacity inconvenience: on ENOSPC the
+`ws_frame_spill` append fails, `WalRingSink::accept` returns `WalDropped`, and **the frame is
+gone BEFORE the ring and BEFORE parse** — the durable floor is the first thing a full disk
+removes. Unrecoverable tick loss, which is precisely what the whole architecture exists to
+prevent.
+
+This also cross-checks the amplification: 4,744 GB written against ~151 GB retained is **~31x**,
+consistent with the ~25x derived independently in Item 13.
+
+### 15c — Memory is genuinely fine, and that is the answer to the operator's question
+
+| Measure | Value | Source |
+|---|---|---|
+| Host memory used | **3.00-4.07 GiB of 32 GiB (9.4-12.7%)** | `CWAgent mem_used_percent{InstanceId}` |
+| App process RSS | **0.31 GB** flat all session | `Tickvault/Prod tv_process_rss_bytes` |
+| Projected live structures at 24,600 | ~527 MB | space audit, Item 15e |
+
+Memory is NOT a constraint and is not close to being one. The r8g.xlarge's 32 GiB was bought for
+the 13-timeframe requirement and is barely touched.
+
+**Method note worth keeping:** the first query returned NOTHING and looked like "the CW agent
+publishes no host metrics" — a false finding I nearly reported. CloudWatch
+`get-metric-statistics` requires an EXACT dimension match; querying without `--dimensions` looks
+for a zero-dimension metric that does not exist. The metrics were there all along.
+
+### 15d — Observability: the operator cannot see 80% of what the system measures
+
+| Measure | Count | Source |
+|---|---|---|
+| `tv_*` metric names with a production producer | **373** | source scan |
+| Present in the CloudWatch EMF selector | **76** | `cloudwatch-agent.json` + `user-data.sh.tftpl`, byte-identical (lockstep holds) |
+| **Never reach the operator** | **~297 (80%)** | difference |
+
+Invisible today: universe health (`tv_dhan_universe_*`, `tv_dhan_live_universe_instruments`), the
+15:31 cross-verify outcome, indicator poisoning/slot exhaustion, order-budget refusals, load-shed
+transitions, seal rescue pressure. All are on the box's own `:9090/metrics` and nowhere else —
+and no new EMF name can ship until the `user-data.sh.tftpl` zero-byte-budget restructure.
+
+**EIGHT permanently-green dead monitors** — alarms or dashboard widgets whose metric has NO
+producer anywhere in `crates/*/src/`: `tv_order_fill_lag_seconds`, `tv_orders_placed_delta_total`,
+`tv_seal_writer_drain_dropped_total`, `tv_dlq_ticks_total`, `tv_spill_dropped_total`,
+`tv_websocket_pool_all_dead`, `tv_websocket_failed_connections_count`,
+`tv_aggregator_seals_emitted_total` (the live name is `tv_dhan_feed_seals_emitted_total` — a
+rename that orphaned its alarm). Every one reads as health.
+
+**~29 selected metrics carry a label whose distinction EMF destroys** (dimensions are
+`[["host"]]`, so labels are summed away). `tv_dhan_feed_drain_frames_total` merges TEN outcomes —
+folded, unparseable, write_failed, depth_unconsumed, truncated — into one number. The alarm fires
+and can never say why.
+
+### 15e — Two more space/storage findings from the same pass
+
+- **The SIXTH omission in the CLAUDE.md non-O(1) table: `oms/engine.rs:191 order_no_aliases`.**
+  `HashMap<String, String>`, `with_capacity(64)` (a PRE-SIZE, not a bound), inserted per broker
+  `order_no` on every re-index, cleared only by `reset_daily`. `MAX_TRACKED_ORDERS = 25_000`
+  counts `self.orders.len()` ONLY and never consults the alias map. **It was created by the very
+  2026-08-22 repair that added that cap**, and the table's row lists only
+  `{orders, super_orders, verify_states}`. Live in paper mode. Sixth time, same pattern: the
+  newest per-entity map is the one with no row.
+- **Depth has NO flush-failure rescue tier.** `ticks` gained a spill rescue after losing 1,377
+  ticks on 2026-08-21; `market_depth` did not — its own comment says *"These levels are gone from
+  the table"* (`depth_persistence.rs:584`). At 250 x 40 rows/s a single ILP timeout drops ~10k
+  rows. The raw frames survive in the WAL, but **nothing re-folds depth from them**.
+- **`candles_<tf>` DEDUP is `ts, security_id, segment, feed` with NO source discriminator**
+  (`shadow_persistence.rs:114`). Two writers stamping `feed='dhan'` silently upsert over each
+  other; this ALREADY happened (live lane vs `rest_candle_fold`), and the only thing preventing
+  it today is `enabled = false` in config — a config accident, not a key.
+
+### 15f — Still NOT done, stated plainly
+
+The instance has NOT been started and the database has NOT been queried. Every number above is
+CloudWatch or source. The DB questions — rows per table, whether `ticks.ts` is out of order,
+whether the refused ticks are the indices — remain open and are answered in one command by
+`scripts/diagnose-write-amplification.sh` once the box is up (08:30 IST, or on operator request).
+
+---
+
+## Item 16 — the cross-verify was blind to the last 10 minutes of every session (FIXED)
+
+- [x] **16a — `SESSION_CLOSE_SECS_OF_DAY_IST` derived from the canonical constant, not restated**
+  - Files: `crates/app/src/dhan_live_crossverify.rs`
+  - Tests: `secs_of_day_and_is_in_session_boundaries_are_half_open`,
+    `deterministic_run_ts_nanos_is_one_minute_past_the_close_regardless_of_fire_time`
+- [x] **16b — the fire time moved in lockstep with the window end**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: N/A — the 15:31 schedule and its tests were deleted with the 15:41 check on 2026-09-16 (Item 43; noted 2026-10-01). Were: `test_crossverify_schedule_lands_on_1531_ist_and_never_double_fires`,
+    `test_crossverify_day_origin_covers_the_entire_session_not_just_the_first_45_minutes`
+
+### What was wrong
+
+`dhan_live_crossverify.rs` carried its OWN `SESSION_CLOSE_SECS_OF_DAY_IST = 15*3600 + 30*60`
+— a **private duplicate** of the session end. On 2026-08-07 NSE added the 15:30–15:40 closing
+session and six production sites moved `55_800 → 56_400` with a dated comment
+(`constants.rs`, `rest_candle_fold.rs`, `tf_consistency_boot.rs`, `feed_scoreboard_boot.rs`,
+`trading_pipeline.rs`, `day_ohlc_orchestrator.rs`). This file kept its own copy and drifted for
+**eighteen days**.
+
+### What it cost — and what it did NOT cost
+
+It did **not** produce false findings, and that is why nobody saw it. `is_in_session` gated
+BOTH sides of the join, so the window stayed symmetric and every verdict it printed was
+honest. What it produced was a **blind spot**: ten minutes of every session — specifically
+the closing-auction window the NSE migration exists for — were structurally unverifiable by
+the one check `websocket-connection-scope-lock.md` calls *"the ONLY ground truth the revived
+Dhan feed has"*.
+
+It also mis-aimed the tail amnesty. `is_tail_minute` derives from this constant, so it
+excused 15:28–15:29 while the genuinely-unsealed tail had moved to 15:38–15:39 — meaning the
+two minutes that legitimately are unsealed at run time were being counted as **real loss**,
+and two minutes that were fine were being excused.
+
+### Why the two halves had to move together
+
+The window end (`dhan_live_crossverify.rs`) and the fire time
+(`dhan_feed_stack::XVERIFY_RUN_AT_SECS_OF_DAY_IST`) are **coupled**. Widening the window to
+15:40 while still firing at 15:31 would have turned a silent blind spot into a flood of false
+`MissingLive` findings — comparing nine minutes that have not happened yet. Both moved in one
+change: close 15:30 → 15:40, fire 15:31 → 15:41.
+
+### The guarantee that this cannot drift a seventh time
+
+Three `const _: () = assert!(...)` lockstep guards — the close tracks
+`TICK_PERSIST_END_SECS_OF_DAY_IST`, the window is non-empty, and the run stamp is strictly
+after the close. **Bite-proven 2026-08-25:** restoring the `15 * 3600 + 30 * 60` literal fails
+the build with `error[E0080]: evaluation panicked: the cross-verify session close must track
+the canonical persistence end`. The four ratchets that pinned the old values were re-blessed
+to the corrected ones **and rewritten to DERIVE** — `375` is now
+`(close − open) / 60` and the tail minutes are `close − 60` / `close − 120`, so the next
+session-hours change moves them automatically instead of failing four tests.
+
+### Honest envelope
+
+This restores the ability to VERIFY the CAS window. It does **not** prove the feed captures it
+— that is what a non-zero `compared` covering 15:30–15:39 will show on the first session after
+this lands, and nothing before then. Defects #1 (the 200,000-row live-side truncation), #3
+(every target labelled `instrument: "INDEX"`), #4 (no `[dhan_live_crossverify]` config section)
+and #5 (silent inline-depth drops) are untouched by this item and remain open.
+
+---
+
+## Item 17 — three live defects found by parallel adversarial review (FIXED)
+
+- [x] **17a — `append_inline_depth` dropped depth rows in silence, four ways**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `every_inline_depth_drop_is_counted_never_silent` (bite-proven)
+- [x] **17b — the paper book's sid ceiling manufactured a permanent false divergence**
+  - Files: `crates/app/src/order_runtime.rs`
+  - Tests: `a_full_tripwire_never_manufactures_a_mirror_divergence` (bite-proven)
+- [x] **17c — the comparator's arming log told the operator a fire time it no longer uses**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+
+### 17a — depth loss with no counter and no log
+
+The dedicated depth drain counts every refusal. The INLINE d5 twin, written four days
+later, did not. Four arms dropped data silently: an unmappable segment (**10 rows**), an
+id above `i64::MAX` (**10 rows**), an implausible price (1 row), and a failed ILP append
+(1 row, because the `is_ok()` check had no `else` — the arm the dedicated drain does have).
+
+The sharp part is not the loss, it is the **false assurance**. `DEPTH_COUNTER`'s own doc
+states `refused` covers *"parse error, unmappable segment code, truncated frame tail, or an
+ILP append failure"* — so an operator auditing `tv_dhan_feed_depth_total{outcome="refused"}`
+would conclude d5 losses were visible when they were not. The counter documented coverage
+the code never delivered.
+
+**Reachable today, not latent:** the depth writer exists, the boot site wires
+`with_inline_depth` unconditionally, and with the main feed in Full mode every code-8
+packet reaches these arms on every tick.
+
+Fixed with the EXISTING counter — no new metric name, which matters because
+`user-data.sh.tftpl` has **zero free bytes** against its budget. No new pager either: the
+Dhan noise lock makes a new Telegram page a REJECT without a dated operator quote.
+
+### 17b — a cap that manufactured the signal it was meant to bound
+
+The 2026-08-22 per-sid ceiling gated the MIRROR insert while `risk.record_fill` stayed
+unconditional — deliberately unconditional, because refusing a fill would hide a leg we
+actually hold. So past the ceiling risk held a position and the mirror had no key, and
+`local_reconcile` reads a missing mirror key as `0`. The result: a **permanent
+self-inflicted divergence**, firing OMS-GAP-02 on every reconcile cycle for the rest of the
+day, and raising a floor that would mask a genuinely lost fill.
+
+It also broke the invariant the file states in its own type doc — *"mirror + risk are
+mutated together in `apply_fill`"* — which is the property leg 1 depends on for meaning.
+
+**The mirror needs no bound of its own.** It gains a key only where risk gains one, so it is
+bounded transitively at `MAX_TRACKED_POSITIONS + in-flight`, and risk halts with
+`PositionCapacityExhausted` at the ceiling, which stops the inflow. `can_admit_sid` now
+counts the TRIPWIRE alone; it used to take `max(tripwire, mirror)`, which — with the mirror
+free to grow — would have let the mirror's size refuse tripwire slots the tripwire had room
+for. Two maps, two growth axes, two bounds: conflating them is the mistake `oms/engine.rs`
+already had to revert once this week.
+
+Honest residual, unchanged: past the tripwire ceiling a new sid's fill still flows, with no
+I-P1-11 cross-segment check for that id today. Counted, logged, and narrower coverage —
+never a dropped fill.
+
+### 17c — a stale time in an operator-facing field
+
+The arming line carried a hardcoded `run_at_ist = "15:31"` that survived the Item 16 CAS
+correction by three constants. It now derives. A literal in an operator-facing field is the
+same class as a literal in a comparison window; it just fails more quietly, by telling the
+operator a time the code no longer uses.
+
+### What the parallel review REFUTED, recorded because it was my proposal
+
+A hostile pass was run against my own proposed cross-verify scaling fix and killed four of
+its five parts: a bounded `max_targets` breaks the "verify exactly what you captured"
+doctrine and the test that enforces it; a `security_id IN (...)` filter re-admits the
+I-P1-11 cross-product and is not expressible for a 24,600-id list in a GET query; refusing
+on truncation is a REGRESSION because `Degraded` is excluded from `is_measured()`, so the
+keep-better guard would leave a stale prior day's verdict standing; and excluding
+REST-absent instruments would have MASKED the highest-value finding the comparator can
+produce — a wrong or stale `security_id`. None of it shipped. The remaining cross-verify
+defects (target scaling, `missing_rest` conflation at the verdict line, live-read pagination,
+and the shared Data-API limiter bypass) are recorded in Item 18 and are NOT fixed here.
+
+---
+
+## Item 18 — four more live defects from the parallel permutation sweep (FIXED)
+
+- [x] **18a — a poison timestamp on an untraded tick stamped a year-2106 partition**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/storage/src/tick_persistence.rs`
+  - Tests: `an_untraded_sentinel_with_a_poison_timestamp_is_refused_outright`,
+    `an_all_ones_exchange_timestamp_never_stamps_a_year_2106_partition` (both bite-proven)
+- [x] **18b — a NaN `average_traded_price` reached ILP**
+  - Files: `crates/storage/src/tick_persistence.rs`
+  - Tests: `a_non_finite_average_traded_price_becomes_null_and_never_refuses_the_tick` (bite-proven)
+- [x] **18c — the cross-verify labelled every target `INDEX`: a partial-denominator vacuous pass**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: N/A — deleted with the 15:41 check on 2026-09-16 (Item 43; noted 2026-10-01). Was `an_equity_is_never_targeted_as_an_index_and_fno_is_never_guessed` (bite-proven)
+- [x] **18d — an out-of-range target id was coerced to security_id 0**
+  - Folded into 18c; same function, same test.
+
+### 18a — one malformed packet, a partition nothing can reach
+
+`exchange_timestamp` is a raw `u32` off the wire, so `0xFFFFFFFF` is ~2106-02-07. Two
+independent gates should have caught it and neither did:
+
+* The aggregator's band check sat **below** the `p == 0.0` untraded-sentinel return. A packet
+  with LTP 0 and a poison LTT returned early, so `refused_timestamp` stayed false. The drain
+  classifies `untraded_sentinel` as a **candle-only** refusal — the row is still written.
+* `row_timestamp_ist_nanos` had a **floor and no ceiling**, so the poison value became the
+  row's DESIGNATED timestamp.
+
+`ticks.ts` is the designated timestamp, so such a row lands in a far-future partition that
+retention and archival — both keyed on the trading day — can never reach, while every
+`max(ts)` and range scan over `ticks` silently includes it. The drain's own comment claims a
+timestamp "beyond a 30-year band" refuses the whole tick; that claim was false on this path.
+
+Fixed at both layers: the band check moved above every early return that can still produce a
+persisted row, and the stamp gained the ceiling. The second is defence in depth on purpose —
+the band belongs where the stamp is MADE, so a future writer cannot reintroduce the hole by
+calling the helper directly.
+
+### 18b — the gate that documented itself as closed
+
+The finiteness loop covers five fields. `average_traded_price` is a **sixth** caller of the
+same `opt_price` closure and was never in it. `NaN != 0.0` is true, and both
+`f32_to_f64_clean` and `round_to_2dp` pass non-finite straight through — so a NaN went to the
+wire. The parser proves Dhan sends it: `parser::quote` has its own
+`average_traded_price.is_nan()` assertion.
+
+The consequence is exactly the chain `TickRowError::PriceNotFinite` documents as **closed**:
+QuestDB rejects the whole batch, `discard_pending` clears up to 1,000 good rows, the rescued
+buffer spills, and the replay tier wedges behind a file it can never accept.
+
+A non-finite OPTIONAL price now becomes NULL and is counted, rather than refusing the row the
+way the five mandatory prices do. Refusing here would discard a tick whose LTP is perfectly
+good — losing a tick to protect an auxiliary column is the wrong trade.
+
+### 18c — the vacuous pass the zero-denominator guard cannot see
+
+`crossverify_targets` stamped the literal `"INDEX"` on every target, and that string goes
+verbatim into the Dhan REST intraday body. The live universe is ~119 indices plus ~750 NSE_EQ
+constituents, so roughly **86% of every run's fetches asked for a stock as though it were an
+index**. Those return no candles, land in `rest_failures`, and are never compared — while the
+run can still report **Clean** on the handful of correctly-labelled indices.
+
+The module's `minutes_compared > 0` guard cannot catch this: the denominator is **partial**,
+not zero. And the function's own doc comment says the lane "can never verify a different
+universe than it captured" — true of the id set, false of the instrument type, and the type
+is what decides whether a fetch returns anything at all.
+
+F&O is deliberately **not guessed**. `(security_id, segment)` is all the subscribe set
+carries, and `NSE_FNO` could be `FUTIDX`, `OPTIDX`, `FUTSTK` or `OPTSTK`. An unverifiable
+target is counted (`tv_dhan_xverify_targets_unverifiable_total`) and named in a `warn!`, not
+fetched with a wrong label — because a wrong label is worse than an absent one: it fetches
+nothing while looking like a fetch that failed.
+
+### Still NOT fixed, recorded rather than half-done
+
+* **`tv_dhan_feed_depth_total` has no alarm and no dashboard widget.** Item 17a made the d5
+  refusals countable; nothing in CloudWatch reads the counter, so the fix is half-delivered.
+  Seven more EMF-shipped metrics are in the same state.
+* **`dhan_live_crossverify.rs` emits ZERO metrics**, and `DHAN-LIVE-XVERIFY-01` is not among
+  the codes in `error-code-alarms.tf`. The lane's only ground truth reaches CloudWatch through
+  no metric and no alarm.
+* **The cross-verify target list still cannot be fetched in one run** (~870 sequential REST
+  fetches against a 240 s budget). Pagination of the live read and wiring the leg to the
+  shared Data-API limiter are both open.
+* **`missing_rest` is still counted as divergence** at the verdict line, contradicting the
+  module's own header.
+* **The aggregator's resident space is 2x every figure recorded in the repo** — `AggregatorCell`
+  holds TWO `[LiveCandleState; TF_COUNT]` arrays, so 24,600 instruments is ~152 MB, not the
+  42/77 MB the host-sizing arguments are built on. Not a defect; an understated claim.
+* **"Entire current day in RAM" is arithmetically impossible for the second-scale timeframes.**
+  See Item 19.
+
+---
+
+## Item 19 — the operator's RAM requirement, measured against the host
+
+**Not a defect. A contradiction between two stated requirements, with the arithmetic.**
+
+The requirement is the entire current day's **ticks + seconds + minutes** always resident.
+Measured against `spot_bar_store.rs::total_bars_per_day_all_tfs` and `LiveCandleState`'s real
+128-byte width, at the authorized 24,600 instruments:
+
+| Layer | Arithmetic | Resident |
+|---|---|---|
+| Minute-scale bars, whole day | 831 bars x 48 B x 24,600 | **~981 MB — fits** |
+| Second-scale bars, whole day | 77,422 bars x 48 B x 24,600 | **~87 GiB — impossible** |
+| Raw ticks, whole day | 25–80 M x ~90 B | 2.3–7.2 GB — not implemented at all |
+
+The host is 32 GiB with QuestDB taking 8–16 GiB. Second-scale residency is **~2.7x the entire
+machine** and ~5x the free budget. The store resolves this today with a single `continue` that
+skips `is_second_scale()` timeframes — load-bearing, not a placeholder, and currently silent.
+
+So O(1) SPACE and full-day second-scale residency cannot both hold. This is an operator
+decision, not an executor one, and the honest options are: keep seconds as a rolling window
+(what the code does today), retain seconds for a bounded instrument subset, or move to a host
+where the arithmetic closes. Recorded here so the next session decides deliberately rather
+than discovering it at the OOM.
+
+---
+
+## Item 20 — RAM residency: MEASURED, and three of my own numbers were wrong
+
+**Status:** measured 2026-08-25 08:40 IST against the live box
+(`i-0c3fe906dad5492fc`) over the **full 2026-08-24 session** — read-only
+QuestDB queries via SSM. Supersedes every RAM figure this repo has carried.
+
+The operator's instruction was explicit: *"Then without a real proof don't
+tell me tgese dude okay"*. The 12 GB / 42 GB / 175 GB figures were all
+unproven. These are readings.
+
+### What one full session actually contains (2026-08-24, Monday)
+
+| Term | Measured | Instruments |
+|---|---:|---:|
+| Ticks | 64,349,753 | 18,097 |
+| Peak ticks in ONE second | **92,131** | — |
+| Second bars (1s/5s/10s/15s/30s) | 22,336,216 | 10,199 |
+| Minute+ bars (1m..1d) | 3,154,318 | 10,199 |
+| Depth rows d5 | 601,944,729 | 21,374 |
+| Depth rows d20 | 745,434,920 | 248 |
+| Depth rows d200 | 183,272,000 | 9 |
+| **Depth rows total** | **1,530,651,649** | — |
+
+### Three corrections to my own earlier claims
+
+1. **"11 unrequested second-scale timeframes are 58% of the bars."** FALSE.
+   Measured: `candles_2s,3s,4s,6s..9s,11s..14s` all wrote **ZERO rows**. Only
+   the five frames the operator asked for are populated. The module header
+   already said so — capacity-1 placeholders, 768 B/slot — and I did not read
+   it before claiming otherwise. There is nothing to remove.
+2. **"32 B per tick."** FALSE — that was in my own measurement script's
+   header, unproven. `size_of::<ParsedTick>()` is **112 bytes**, measured. A
+   32 B compact record is a DESIGN TARGET that does not exist in this
+   codebase. Every figure below uses 112.
+3. **Depth is 24x the tick volume**, not a rounding term. 1.53 billion rows
+   against 64 million. At the depth table's 72 B/row that is ~110 GB/day,
+   which is the write-amplification source Item 15 was hunting.
+
+### The answer to the operator's question
+
+`RamBar` = 48 B (test-pinned, `spot_bar_store.rs:678`). `ParsedTick` = 112 B
+(measured). Latest-book widths: d5 168 B, d20 648 B, d200 6,400 B.
+
+| What you hold | At today's 18,097 | Scaled to 24,600 |
+|---|---:|---:|
+| Ticks | 7.21 GB | 9.81 GB |
+| All bars | 1.22 GB | 1.66 GB |
+| Depth — CURRENT book only | 0.004 GB | 0.004 GB |
+| **Subtotal (decision path)** | **8.4 GB** | **11.5 GB** |
+| Depth — full-day HISTORY | 25.1 GB | 28.9 GB |
+| **Total with depth history** | **33.6 GB** | **40.4 GB** |
+
+Host is 32 GiB = 34.4 GB, and QuestDB wants 8-16 GB of it.
+
+**So: everything the operator asked for FITS — ticks, all seconds, all
+minutes, and the live book for every instrument — at ~11.5 GB.** What does
+NOT fit is retaining every historical depth SNAPSHOT in RAM, which is 28.9 GB
+on its own and is not what an entry/exit decision reads.
+
+### Scaling honesty
+
+24,600/18,097 = 1.36x on ticks and bars; 24,600/21,374 = 1.15x on depth.
+Stated as an assumption and an UPPER bound: today's set is indices and cash
+stocks, which tick MORE than the option strikes that would make up the
+remainder. Note depth already covers 21,374 instruments — MORE than the
+18,097 that ticked, because a book can quote without trading.
+
+### NOT claimed
+
+The 92,131-tick peak second is measured but not attributed — it may be an
+open burst or a boot replay, and which one changes the ring sizing argument.
+Not measured: RSS of the running process, which is the only number that
+proves the arithmetic above against reality.
+
+### The finding that matters more than the arithmetic
+
+The RAM store is **allocated at boot and has no live writer.**
+
+- `dhan_feed_stack.rs` — the live lane — contains **zero** references to
+  `SpotBarStore` or `append_sealed` (grep, whole file).
+- The only production `append_sealed` call site in the workspace is
+  `rest_candle_fold.rs:1514`, and `config/base.toml [rest_candle_fold]
+  enabled = false`.
+- `market_ram_store_boot::install_market_ram_stores` runs at boot
+  (`main.rs:3141`) and `spawn_ram_store_stats_task` publishes residency
+  gauges for a store nothing fills.
+
+So the live path today is tick -> fold -> ILP -> QuestDB. Nothing lands in
+RAM for a decision to read. The arithmetic above proves the budget is
+comfortable; it does **not** prove the capability exists. Wiring the live
+seal into `append_sealed` is a real change with its own design, not a flag.
+
+---
+
+## Item 21 — Write amplification: ROOT CAUSE MEASURED on the live box
+
+**Status:** measured 2026-08-25 ~08:55 IST, live box, read-only. Item 15 asked
+what causes ~31x write amplification. This answers it, and the answer is a
+schema decision, not a tuning knob.
+
+### Live readings (Verified)
+
+| Reading | Value |
+|---|---|
+| Root filesystem | **171 GB / 200 GB = 86%** (was 80.1% on 2026-08-24) |
+| QuestDB `db` dir | **139 GB** |
+| `ticks` partitions | **199** |
+| `market_depth` partitions | 28 |
+| WAL backlog — `market_depth` | **8,061 txns behind** (seq 209,312 / writer 201,251) |
+| WAL backlog — every other table | < 1,500, mostly < 900 |
+| Suspended WAL tables | **none** |
+| App RSS, 69 min uptime | **1.62 GB** of 31.5 GB host |
+| Deployed SHA | `6bfa4246` = `origin/main` exactly |
+
+### The mechanism (Verified in source + data)
+
+1. `ticks` is `TIMESTAMP(ts) PARTITION BY HOUR WAL`
+   (`tick_persistence.rs:486-506`).
+2. `ts` is the exchange **last-TRADE time**, not receive time.
+3. **6,433,267 ticks on 2026-08-24 — 10.0% of the day's 64.3M — have `ts`
+   more than one hour behind `received_at`.**
+4. Those are not late packets. For an illiquid option the last trade
+   genuinely WAS hours ago, so the packet is correct and its designated
+   timestamp is old.
+5. But the designated timestamp decides the PARTITION. So one commit in ten
+   reopens an already-closed hourly partition and rewrites it.
+
+That is the amplification: 4,744 GB written against ~151 GB retained. It is
+not a QuestDB misconfiguration and not the page-size setting — it is
+append-vs-rewrite, caused by choosing business time as the designated
+timestamp on a feed whose business time runs hours behind arrival.
+
+### What this rules OUT
+
+- **Not the indices.** `IDX_I` ticked 7,946,506 rows on 2026-08-24
+  (NSE_FNO 45.3M, NSE_EQ 11.7M). The hypothesis that the refusals were
+  indices is FALSE.
+- **Not a stuck writer.** Zero suspended WAL tables.
+- **Not memory.** 4.6 GB used of 31.5 GB; the app holds 1.62 GB.
+
+### The one live backlog worth watching
+
+`market_depth` is 8,061 WAL transactions behind while every other table is
+under 1,500. Depth is 1.53 billion rows/day (Item 20) against 64 million
+ticks — 24x — and its writer is the only one losing ground.
+
+### Independent confirmation of Item 20's no-live-writer finding
+
+App RSS is 1.62 GB after 69 minutes. If the RAM bar store were being filled
+by the live lane, RSS would already be climbing toward the multi-GB figures
+Item 20 computes. It is not, because nothing writes it.
+
+### NOT claimed
+
+The 31x figure itself is from Item 15's earlier reading, not re-measured
+here. Whether moving the designated timestamp to `received_at` is the right
+fix is a DESIGN decision with real consequences — it changes what range
+scans mean and interacts with the DEDUP key `(ts, security_id, segment,
+capture_seq, feed)`. Recorded as the measured cause, not as an authorized
+change.
+
+---
+
+## Item 22 — QUEUED REQUIREMENT: the full day resident in RAM, at full subscription
+
+**Operator, 2026-08-25 (verbatim, typos preserved):** *"see always ensure to
+maximsie 25 k instruemnts with full mdoe for dpeth 5 and 250 isntuments for
+depoth 20 and 5 isntuents for dpeth 200 and order websocket udpate conenctiosn
+ticks alwys so all tehs eof the ucrrent daya shdou lbe alwuas in ram also
+ensure woth rela time lvie rpoven gauarneted assure dsoltuion dud eokay?"*
+
+### Half of this is already true — measured live 09:48 IST 2026-08-25
+
+| Requirement | Live now | Verdict |
+|---|---:|---|
+| 16 WebSocket connections | 15 market-data + 1 order-update | **MET, exact** |
+| Full mode + depth-5, target 25,000 | 21,498 | 86% — gap is master resolution, not connectivity |
+| depth-20, target 250 | 248 | **MET** |
+| depth-200, target 5 | 5 | **MET, exact** |
+| Order-update channel | connected | **MET** |
+
+### The half that is NOT true, and it is the whole ask
+
+**Nothing writes the RAM store.** Verified: `dhan_feed_stack.rs` contains ZERO
+references to `SpotBarStore` or `append_sealed`; the only production
+`append_sealed` call site in the workspace is `rest_candle_fold.rs:1514`, and
+`config/base.toml [rest_candle_fold] enabled = false`. Boot installs the store
+(`main.rs:3141`) and publishes residency gauges for something nothing fills.
+
+Independent confirmation: app RSS was **1.62 GB** after 69 minutes of uptime.
+If the store were filling, RSS would already be climbing.
+
+So today the path is tick -> fold -> ILP -> QuestDB, and a decision has nothing
+in RAM to read.
+
+### The budget, measured not estimated (2026-08-24 full session)
+
+Widths from source: `RamBar` = 48 B (test-pinned, `spot_bar_store.rs:678`);
+`ParsedTick` = **112 B** (compiled and printed, NOT the 32 B an earlier note
+assumed).
+
+| Term | At today's 18,097 | Scaled to 24,600 |
+|---|---:|---:|
+| 64,349,753 ticks | 7.21 GB | 9.81 GB |
+| 22,336,216 second bars + 3,154,318 minute+ bars | 1.22 GB | 1.66 GB |
+| Live book, every instrument (d5 168 B / d20 648 B / d200 6,400 B) | 0.004 GB | 0.004 GB |
+| **TOTAL** | **8.4 GB** | **11.5 GB** |
+
+Host is 32 GiB = 34.4 GB; QuestDB wants 8-16 GB. **It fits, with room.**
+
+What does NOT fit is retaining every historical depth SNAPSHOT — 1,530,651,649
+rows/session = 25.1 GB today, 28.9 GB scaled. A decision reads the CURRENT
+book, not the 60 million books before it. Current books cost 4 MB.
+
+### What the work actually is
+
+1. Wire the live lane's sealed bars into `SpotBarStore::append_sealed` — the
+   store, the ring shape and the eviction already exist and are tested; what is
+   missing is the call.
+2. Decide tick residency. The store holds BARS. Holding 64.3M raw ticks needs
+   its own structure, and at 112 B/tick a compact record is worth designing —
+   the 32 B figure quoted earlier in this plan was never measured and is
+   withdrawn.
+3. `spot_bar_store.rs:131` SKIPS second-scale timeframes (`if
+   tf.is_second_scale() { continue; }`). The operator's five second frames
+   (1s/5s/10s/15s/30s) are exactly what that skip excludes. This is
+   load-bearing and currently unstated at the call site.
+4. Keep the current book per instrument — cheap (4 MB) and the only depth term
+   a decision needs.
+
+### Proof obligation before this can be called done
+
+Not "the arithmetic fits". The live gauge `tv_process_rss_bytes` must be shown
+climbing to and holding near the projected figure across a full session, and a
+read from the store must be shown returning the current day's bars. Until an
+RSS reading exists at scale, every number above is arithmetic — correct
+arithmetic, from measured inputs, but not a running system.
+
+---
+
+## Item 13 — the archive worklist starved the heaviest table (2026-08-25)
+
+**Status: DONE.** Found by tracing why the prod volume kept filling after the
+spill-ceiling fix in #1804 landed.
+
+- [x] **Fair-share the per-run archive budget across tables**
+  - Files: `crates/storage/src/partition_archive.rs`
+  - Tests: `fair_share_tests::the_heaviest_table_is_not_starved_by_an_older_backlog`,
+    `each_table_is_still_processed_oldest_first`,
+    `a_zero_cap_means_no_cap_and_keeps_every_item`,
+    `a_cap_smaller_than_the_table_count_still_reaches_more_than_one_table`,
+    `the_output_is_deterministic_across_runs`,
+    `an_empty_worklist_is_empty_and_does_not_hang`
+- [x] **Count list failures in the cycle summary** (a silently unswept table
+      was indistinguishable from a healthy one)
+  - Files: `crates/storage/src/partition_archive.rs`
+- [x] **Resurrect a test that had never run**
+  - Files: `crates/app/src/dhan_depth_universe.rs`
+
+### What was measured, not inferred
+
+| fact | value | source |
+|---|---|---|
+| `market_depth` share of QuestDB | 174 GB of 196 GB | `du` on the box |
+| its partition size | ~17 GB per HOUR | `du` per partition |
+| its archive attempts in 12 h | **0** | CloudWatch, untruncated |
+| `ticks` archive attempts, same window | 87 | same |
+| `ticks` eligible partitions | 185, oldest `2026-07-30` | QuestDB `table_partitions()` |
+| `market_depth` eligible partitions | 4, oldest `2026-08-24` | same |
+| `max_partitions_per_run` | 200 | `config/base.toml` |
+
+### The defect
+
+`archive_and_drop_old_partitions` sorted the whole worklist by partition name —
+a global date order across every table — then truncated to the per-run cap.
+Older-backlog tables therefore consume the entire budget before a newer-backlog
+table gets a single slot. With stuck `2026-06-02` candle partitions at the head
+(they fail `s3_conflict` every run and are re-listed the next one) plus 185
+`ticks` entries, the 200 slots were spent before `market_depth` was reached.
+Deterministic, every run: the one table that could relieve disk pressure was the
+one table guaranteed never to be archived.
+
+### Honest envelope
+
+- Fair-sharing makes `market_depth` reachable. It does **not** make the archiver
+  keep up: ~8 partitions/day at ~17 GB is ~136 GB/day to gzip, upload and
+  SHA-256 verify. Whether one session's budget clears one session's production
+  is UNMEASURED and is the next question.
+- The `s3_conflict` partitions still never converge. They no longer block other
+  tables, but they still fail every run.
+- Depth volume itself (~110 GB/day into a 300 GB volume) is a capacity decision,
+  not an executor's.
+
+### A test flaw the bite-proof caught
+
+The first version of the headline test used 185 + 4 = 189 entries against a cap
+of 200, so nothing was truncated and it passed under the OLD algorithm too —
+i.e. it proved nothing. The reproduction now includes the June candle partitions
+that pushed prod over the cap, and asserts `worklist.len() > 200` so it can
+never silently become vacuous again. Bite-proven both directions: reverted, it
+fails with `market_depth scheduled: 0`.
+
+---
+
+## Item 14 — the pre-open readiness alarm pages on every restart (2026-08-25)
+
+**Status: DONE.** Found by reading why `tv-prod-preopen-ready-late` was in ALARM
+and armed, hours after the eight #1809 alarms finally applied.
+
+### What the live log actually said
+
+```
+09:08:04  attempts: 57  ready_at 32884  deadline 33120  met_deadline: TRUE
+12:37:58  attempts:  1  ready_at 45478  deadline 33120  met_deadline: false
+16:17:30  attempts:  1  ready_at 58650  deadline 33120  met_deadline: false
+17:33:59  attempts:  1  ready_at 63239  deadline 33120  met_deadline: false
+18:17:30  attempts:  1  ready_at 65850  deadline 33120  met_deadline: false
+19:21:34  attempts:  1  ready_at 69694  deadline 33120  met_deadline: false
+```
+
+The morning MET the deadline with four minutes to spare. The five `false` rows
+are restarts on a busy deploy afternoon; `ready_at_ist_secs` is simply "now".
+
+### The defect
+
+`met_deadline = ready_at <= PREOPEN_READY_DEADLINE_IST_SECS` asked "did this
+attach finish before 09:12?" of EVERY attach, including ones that had not begun
+until the afternoon. A restart cannot pass a test whose pass condition is a time
+already in the past, so the verdict was decided by the wall clock rather than by
+anything about the lane. Each restart fired `WS-GAP-02` and drove the alarm —
+ungated by design — into ALARM.
+
+The alarm's own comment reasoned that "on a restart day the LATEST attach is the
+one that matters". True of a 10:30 re-attach; false of a 19:21 one. The missing
+distinction is not WHEN the attach finished but whether it was ever racing the
+open, and only the START second carries that.
+
+- [x] **Gate the deadline verdict on whether the attach was racing the open**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `contract_attach_tests::the_preopen_deadline_does_not_apply_to_a_mid_session_restart`,
+    `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`,
+    `the_mid_session_arm_does_not_emit_the_field_the_alarm_filters_on`
+
+### Why no terraform change
+
+The CloudWatch filter is anchored on `{ $.fields.ready_at_ist_secs = * }`. The
+mid-session arm reports its completion second as `attached_at_ist_secs`
+instead, so it produces no datapoint at all. The alarm's threshold, statistic
+and `notBreaching` semantics are untouched, and the gauge is skipped on that
+arm for the reason its own doc already gives for the give-up paths: there is no
+readiness second, and publishing the wall clock as one reads as a permanently
+missed deadline.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix (15-row + 7-row). Rows that
+move for this item: **monitoring** (an armed alarm stops firing on normal
+operation), **logging** (the mid-session arm gets its own line and field),
+**alerting** (`WS-GAP-02` no longer fires on a restart), **scenarios**
+(restart-after-deadline is now a covered case), **extreme check** (three tests,
+all bite-proven). No hot-path, schema, DEDUP-key, or WebSocket-count change, so
+the 7-row resilience matrix is unmoved.
+
+### Honest envelope
+
+- This removes a FALSE page. It does not make any attach faster, and a genuinely
+  late pre-open still fires exactly as before — pinned by
+  `an_attach_that_begins_before_the_deadline_is_still_judged_if_it_overruns`.
+- Keyed on the attach START, so an attach beginning at 09:11 and finishing at
+  09:20 is still judged. Excusing that would hollow the alarm out from the other
+  side while fixing the false pages.
+- UNVERIFIED-LIVE: the fix is proven in tests and by source scan against the
+  real filter pattern; that the alarm actually stays quiet across tomorrow's
+  restarts is measured tomorrow, not claimed here.
+
+---
+
+## Item 15 — the silence detector was blind to 96% of the universe (2026-08-25)
+
+**Status: DONE.** Found while verifying that the 2026-08-21 IDX_I Quote-mode fix
+had worked. It had (`never_ticked: 0`, vs 119 the day before) — but the same log
+lines carried the real finding.
+
+### Measured
+
+```
+08:31:09  refused: 1,276,658  tracked: 865
+12:37:47  refused: 1,211,764  tracked: 865
+```
+
+865 is exactly the spot universe. Today's subscribed set was **23,044**
+(868 spot + 22,176 contracts).
+
+### The defect
+
+`LiveIngest::new(writer, capacity)` uses one number for two things with
+opposite semantics: a SOFT pre-size for the fold, and a HARD cap for the
+detector (`TickGapDetector::with_capacity` — "Never grows; never reallocates").
+The boot site computes `capacity` from the main-feed set BEFORE any socket
+opens, which is the spot universe; the ~22,000 contracts attach minutes later
+via `run_contract_attach`. Every contract tick was then refused a slot.
+
+Consequence, in the detector's own words: `scan_silence`'s `silent` and
+`never_ticked` counts "describe only the instruments it still tracks, while
+reading exactly as though they describe all of them". A contract that was
+silently never subscribed could not be reported by anything.
+
+- [x] **Size the detector at the authorized ceiling, not the boot-time count**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `tests::the_detector_outlives_the_boot_time_universe_when_given_the_ceiling`,
+    `a_detector_at_its_ceiling_still_refuses_and_still_counts`,
+    `the_production_boot_site_sizes_the_detector_at_the_authorized_ceiling`
+
+### Why the ceiling and not a bigger boot-time count
+
+The ceiling does not depend on WHEN the universe is counted, so this cannot
+silently re-break the next time instruments are added after boot — which is
+exactly how it broke the first time. Cost: ~2 MB of slots plus its index,
+against a 32 GiB host.
+
+### Guarantee matrix
+
+Carried by reference from this plan's shared matrix. Rows that move:
+**monitoring** (silence detection now covers the whole subscribed set),
+**scenarios** (grow-after-boot is a covered case), **extreme check** (three
+tests, bite-proven). Fail-closed behaviour at the ceiling is explicitly
+preserved and pinned — a tracked instrument is still never evicted.
+
+### Honest envelope
+
+- This makes the detector ABLE to see contracts. It does not prove any
+  contract is actually ticking, and it adds no alarm: the refusal gauge is not
+  EMF-selected (user-data byte budget), so the coded log line remains the only
+  operator surface.
+- It does not address loss UPSTREAM at the vendor: Dhan publishes no sequence
+  number and skips a slow consumer forward, so ticks discarded on their side
+  are invisible to every counter we own. The 15:31 cross-verification remains
+  the only ground truth for that class.
+
+---
+
+> **MERGE NOTE 2026-08-25 (second occurrence).** Two items were appended to
+> this file in parallel and the numbering collided again — main's silence-detector
+> item is numbered 15 while the audit-findings item below is numbered 23. Both
+> are kept verbatim; neither is renumbered, for the same reason the 2026-08-25
+> note above the two "Item 12" sections gives: a plan file is an audit trail,
+> and renumbering a landed item breaks every reference to it. Read them by
+> title, not by number.
+
+## ITEM 23 — The nine audit findings, fixed (2026-08-25, operator: "fix and resolve evrythignd dude okay? meanhwiel ensure to pull the latest merged changes and only then do ti dude okay? i mean fix and resolve all of them dude okay?")
+
+The 2026-08-25 five-agent audit produced nine verified findings. This item
+closes all nine. Seven of them were the SAME defect: a table, a constant or a
+comment that was declared, given a schema or a doc, and never wired to
+anything — invisible precisely because it looks finished.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 01 | The 15:41 cross-verify — the feed's only proof of correctness — was logged and discarded. Both writers and the DDL had ZERO callers, and a comment claimed the opposite | WIRED + comment retracted |
+| 02 | `instrument_lifecycle_audit`, the 5-year regulatory chain, had no writer | WIRED |
+| 03 | The disk alert was a fixed 10 GiB justified as "~10% of the 100 GB volume"; the volume is 300 GB | DERIVED from the measured volume |
+| 04 | 22,996 of 25,000 slots used; overflow refuses the WHOLE subscription | HEADROOM WARNING added |
+| 05 | Fourteen tables stopped applying rows on 2026-08-25 and the alarm stayed silent | LAG DETECTOR + BLIND SENTINEL |
+| 06 | 305 of 381 metrics never leave the box; blocked at 0 free user-data bytes | 2,515 BYTES FREED |
+| 07 | Array indexing was not lint-blocked on the packet-decode path | DENIED, 23 reviewed allows |
+| 08 | `MAX_DAILY_UNIVERSE_SIZE` had zero production readers | READ, with a drift warning |
+| 09 | The reset command destroys the SEBI tables with no export | EXPORT-OR-ABORT added |
+
+## Design (Item 23)
+
+Each fix is the smallest change that makes the declared thing true, and every
+one is pinned by a test that fails the build if it is undone.
+
+**01** — `CrossverifyDeps` gains the ILP write config; `persist_xverify_report`
+writes findings + a daily row after every run, INCLUDING vacuous ones ("we
+could not measure today" is a fact about the feed). `ensure_dhan_live_crossverify_tables`
+is called at boot beside the ticks/depth DDL, so ILP cannot auto-create either
+table without its DEDUP key.
+
+**02** — `KnownInstrument` carries the full prior `LifecycleState`, not just a
+boolean. `classify_lifecycle_transition` is a NEW classifier rather than a
+reuse of `lifecycle_reconciler::classify_transition`, deliberately: that one
+answers "is the row present in today's CSV?", and the Dhan master keeps expired
+contracts IN the file with a past expiry date — so the reconciler returns
+`None` for the single most common transition in the product.
+
+**03** — `spill_disk_free_critical_threshold(total)` = `max(10 GiB, total/10)`.
+The floor means the threshold can only move UP relative to today.
+
+**04/08** — `report_universe_headroom` warns below 10% free and cross-checks
+the caller's capacity against `MAX_DAILY_UNIVERSE_SIZE`, which had no reader.
+
+**05** — `WalLagTracker` flags tables whose apply lag is above a floor AND
+non-decreasing for five consecutive polls. Growth, not magnitude: this repo has
+never measured a normal session's peak lag, and guessing an absolute number is
+the failure being corrected. Separately, five consecutive probe failures set
+the suspended-tables gauge to −1 instead of leaving a stale `0` standing.
+
+**06** — user-data writes a minimal host-only agent config and copies
+`deploy/aws/cloudwatch-agent.json` into place after the Step 5 clone. One copy
+cannot drift from itself, and the lockstep guard inverts to pin the new shape.
+
+**07** — `deny(clippy::indexing_slicing)` on the nine Dhan parser modules,
+`cfg_attr(not(test))` like the existing unwrap/expect bans. 23 reviewed allows.
+
+**09** — Both destructive actions export the four SEBI tables to a directory
+outside the volume before touching it, and ABORT if a table exists and cannot
+be exported.
+
+## Edge Cases (Item 23)
+
+- Vacuous/blind cross-verify run → still persisted, stamped from the run, not `now()`.
+- No findings → daily row still written, no fabricated timestamp.
+- Rerun of either writer → UPSERTs, because both DEDUP keys carry the run stamp.
+- Unchanged instrument → NO audit row (else the chain becomes a 150,000-row daily snapshot).
+- `Delisted` → never auto-audited; it is an operator-set terminal state.
+- Small dev disk → keeps the 10 GiB floor; degenerate `total = 0` cannot disarm the alarm.
+- Busy-but-healthy table with oscillating lag → never pages (asserted with ten oscillating samples).
+- Missing `writerTxn`/`sequencerTxn` → no lag verdict, never a fabricated zero.
+- QuestDB unreachable during a reset → export skipped LOUDLY and the reset proceeds; it is also the remedy for a wedged QuestDB.
+- Clone fails → host metrics still flow from the fallback config.
+
+## Failure Modes (Item 23)
+
+| If this breaks | Consequence | Bound |
+|---|---|---|
+| xverify persist fails | today's comparison exists only in the log | pages via the alarmed `xverify_failed` label |
+| lifecycle audit write fails | today's history missing; STATE unaffected | logged + counted, never fails the state write |
+| lag detector threshold wrong | false pages, or a missed stall | edge-latched; growth-based, so a catching-up table clears it |
+| blind sentinel wrong | gauge reads −1 while healthy | one successful probe clears it |
+| SEBI export wrong | a reset destroys regulatory data | ABORTS rather than proceeding |
+| CW agent copy fails | app metrics absent | host metrics still flow; two WARNING lines say which |
+
+## Test Plan (Item 23)
+
+`derived_threshold_scales_with_the_volume` (5 cases + monotonicity) ·
+`growing_lag_fires_on_a_stuck_table_and_stays_quiet_on_a_busy_one` (the
+2026-08-25 shape replayed, plus ten healthy oscillations) ·
+`a_recovered_table_can_page_again_on_a_second_episode` ·
+`the_blind_gauge_sentinel_can_never_collide_with_a_real_reading` ·
+`the_daily_row_carries_every_comparison_total` (distinct values per field so a
+transposition cannot pass) · `the_cross_verification_findings_are_actually_persisted` ·
+`the_audit_chain_records_every_state_change_and_nothing_else` ·
+`a_delisted_instrument_is_never_audited_automatically` ·
+`the_documented_universe_ceiling_is_actually_read_and_matches_its_derivation` ·
+`destructive_actions_export_the_sebi_tables_before_destroying_the_volume`
+(asserts ORDER, not just presence) · `user_data_carries_no_second_copy_of_the_selector` ·
+`the_deployed_agent_config_is_the_repo_file_and_has_no_second_copy`.
+The indexing deny is bite-proven: removing one allow produces 8 errors.
+
+## Rollback (Item 23)
+
+Every change is additive or a guard inversion; `git revert` restores the prior
+behaviour with no schema migration. The two new tables are `CREATE TABLE IF NOT
+EXISTS` and are never read by anything else, so leaving them behind costs
+nothing. The user-data change is the only one that touches the boot path: the
+fallback config means a revert is never required to keep host metrics flowing.
+
+## Observability (Item 23)
+
+New: `tv_dhan_feed_xverify_rows_total`, `tv_dhan_feed_xverify_persist_errors_total`,
+`tv_instrument_lifecycle_audit_rows_total` — all local-only, deliberately NOT
+EMF-selected. Each already pages through an existing log filter, and a metric
+shipped with nothing watching it is the paid-for-and-unwatched shape these
+alarms were added to end. One new CloudWatch alarm,
+`tv-<env>-wal-suspension-probe-blind`, on a gauge that is already selected:
+~$0.10/mo, no new metric name, no user-data byte.
+
+### Per-Item Guarantee Matrix (Item 23)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 12 new tests across 5 crates; audit coverage: two tables that
+had no writer now have one; performance: no hot-path change (the indexing deny
+generates identical code); security: no new external surface, the SEBI export
+writes locally with no credentials; O(1): the lag tracker is O(tables) on a
+60s timer over ~30 rows, the threshold derivation is O(1), the audit builder is
+O(rows) with one hash lookup each — all cold path.
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage. NOT claimed: that the WAL-suspension silence of 2026-08-25 is now
+explained — the recorded txn evidence is consistent with the lag path and the
+blind-probe path, and the day cannot be replayed, so BOTH are fixed rather than
+one being declared the cause. NOT claimed: that the lag threshold is calibrated
+— no normal-session baseline exists, which is why the signal is growth and not
+magnitude; the first session with real lag data is what validates it. NOT
+claimed: that the user-data restructure is live-verified — no instance has
+booted with it, and the fallback exists precisely because that is unproven.
+
+
+---
+
+## Item 24 — the ILP flush leaves the frame-drain task (2026-08-25)
+
+- [x] `TickWriter::split_for_offload` — producer keeps the buffer and the row
+      accounting; a new `TickWriterSink` takes the ILP `Sender`
+  - Files: `crates/storage/src/tick_persistence.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `offloaded_flush_hands_the_rows_off_and_does_not_touch_the_network`,
+    `a_full_queue_keeps_the_rows_and_never_reports_them_as_dropped`,
+    `the_sink_reports_zero_rows_when_the_flush_fails`,
+    `a_writer_that_was_never_split_behaves_exactly_as_before`,
+    `an_offloaded_flush_never_touches_the_network_from_the_drain`,
+    `the_writer_thread_is_joined_at_shutdown_so_the_tail_batch_lands`,
+    `test_drain_never_flushes_bare_on_the_async_worker` (re-blessed, 3 bites)
+
+### Design
+
+`TickWriter::flush` is a synchronous ILP-over-HTTP round trip with a 5 s
+timeout, and it ran ON the frame-drain task. `blocking_flush`/`block_in_place`
+bounded the damage to the RUNTIME — the other tasks keep their workers — but
+did nothing for the drain itself, and the drain is the only consumer of the
+frame ring. So a slow database stopped the fold, the socket receive buffer
+filled, and Dhan — whose published behaviour is to skip a slow consumer forward
+to "the latest available state", with no sequence number — discarded the
+intermediate ticks at THEIR side. That loss is invisible to every counter we
+own, and no amount of provisioned disk throughput removes it, because the
+coupling is structural rather than a matter of speed.
+
+The writer is now split across a bounded `sync_channel` (`FLUSH_QUEUE_DEPTH`
+= 4) with a named OS thread `tv-tick-writer` on the far side. The drain's flush
+becomes a `try_send`.
+
+### Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Queue full | `OffloadOutcome::QueueFull` — rows RETAINED and still pending, `Ok(())` returned, next flush retries. Counted by `tv_tick_flush_queue_full_total`. Never reported as loss, because none happened. |
+| Queue full past `MAX_PRODUCER_BUFFER_BYTES` (64 MiB) | Stops accumulating and rescues through the existing `discard_pending` path — durable, counted, re-ingestable. Bounds the memory an hour-long stall can consume. |
+| Writer thread gone | Rescue + `Err`, never a silent success. |
+| Writer never split | Byte-for-byte the previous synchronous behaviour, pinned by its own test. |
+| Shutdown | `shutdown_offload_writer` closes the queue and JOINS, after the tail flush. |
+
+### Failure Modes
+
+The tail flush was the sharp one: it hands the last batch to the queue, so
+without a join the process could exit with that batch in flight — re-creating,
+one queue further out, exactly the loss the tail flush exists to prevent. The
+join handle therefore lives inside `LiveIngest`, where the drain that owns the
+tail flush can reach it, and a source-scan assertion pins the call.
+
+Spawn failure is non-fatal and non-silent: the lane falls back to the
+synchronous path with a coded error. Degraded beats refusing to boot.
+
+### Test Plan
+
+132 test binaries green across `tickvault-storage` + `tickvault-app` with
+`--no-fail-fast`, zero failures. The structural guard was bite-proven three
+ways — a bare blocking flush, a never-wired boot site, and a removed shutdown
+join each turn it red, and each restores green.
+
+### Rollback
+
+Delete the `spawn_offload_writer` call at the boot site. Everything else is
+inert: `flush` branches on `offload.is_some()`, which is `None` on every
+constructor.
+
+### Observability
+
+New: `tv_tick_flush_offloaded_total`, `tv_tick_flush_queue_full_total` — local
+exporter only, deliberately NOT EMF-selected and NOT alarmed. **The loss path
+they sit on is already alarmed**: a stall long enough to matter crosses the
+producer ceiling and increments `tv_ticks_dropped_total`, which carries
+`tv-<env>-ticks-dropped`, plus `tv_ticks_spilled_total` and the coded
+`HOT-PATH-02` error. A transient full queue is backpressure, not loss, and
+paging on it would train the operator to ignore the counter that means loss.
+No new rule row is needed because no new page is added.
+
+### Per-Item Guarantee Matrix (Item 24)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +
+7-row). Coverage: 6 new tests + 1 re-blessed guard, bite-proven 3 ways. Zero
+tick-drop path added — the queue-full arm is the proof, and it retains rows.
+O(1): the hand-off is one `try_send` and one `mem::replace`; no allocation is
+added to the per-tick path (the replacement `Buffer` is minted once per FLUSH,
+at 500 ms cadence, not per row).
+
+**Honest envelope:** 100% inside the tested envelope, with ratcheted regression
+coverage: the drain's flush no longer performs network I/O, a full queue
+retains rows rather than blocking or dropping, and the session tail is joined
+before exit. **NOT claimed:** that this removes tick loss — it removes ONE
+mechanism (drain stall → socket backpressure → vendor-side skip-forward), and
+the vendor's skip-forward remains undetectable to us because the India feed
+carries no sequence number. **NOT claimed:** that it is measured live — no
+instance has run it; the ~25× write amplification that makes the disk saturate
+in the first place is untouched and is the next item. **NOT claimed:** clippy
+clean locally — the component is not installed in this container; CI's Build &
+Verify is the check.
+
+### Item 24 — compliance with Item 14d's five binding conditions
+
+Item 14 recorded this design on 2026-08-25 and bound the implementing PR to
+five conditions. Audited one by one rather than asserted:
+
+| | Condition | Status |
+|---|---|---|
+| **C1** | Overflow SPILLS, never a silent drop, never a blocking append on the fold path | **PASS** — `try_send`, never `send`; every cut routes through the existing rescue tier |
+| **C2** | The drain ships pre-stamped rows; the writer never mints `capture_seq` | **PASS** — `FlushBatch` carries a finished `Buffer`; the sink only calls `sender.flush()` |
+| **C3** | `record_ticks` and `LAST_TICK_AGE_GAUGE` move to the writer | **PASS, by construction** — `record_ticks` is on the thread, and the gauge is *derived* from `feed_health.last_tick_age_secs`, so it follows the registry the writer stamps. `no_ticks_alarm_gauge_guard.rs` passes unchanged, so no re-bless and no dated §2.3b edit are needed — the alarm still means "rows persisted" |
+| **C4** | Bounded shutdown grace; batch width capped; `max_buf_size` headroom const-asserted | **PASS — and this was the one the first draft FAILED** |
+| **C5** | A size cut must fire well before the 100 MiB questdb-rs wedge | **PASS** — `MAX_PRODUCER_BUFFER_BYTES` is const-asserted at ≤ half of `QUESTDB_MAX_BUF_SIZE_BYTES` |
+
+**C4 is worth writing out, because the first draft of Item 24 shipped without
+it and would have made the disk problem worse.** Item 14's hostile pass had
+flagged the own-goal: a decoupled writer accumulates under pressure, so each
+commit spans a wider row range — and wider commits are what the amplification
+is made of. It bound the implementation to cap width *until 14b(3) was
+measured*. Item 15/f638bb66 then measured it: `ticks` is `PARTITION BY HOUR` on
+the exchange last-TRADE time, and **10.0% of one day's 64.3M ticks carried a
+`ts` more than an hour behind arrival**, so one commit in ten reopens a closed
+hourly partition and rewrites it. **Commit width is the amplifier**, which is
+the branch of 14b(3) that makes the cap mandatory rather than optional.
+
+Three fixes followed:
+
+1. `MAX_RETAINED_FLUSH_SPANS = 2` — the producer may retain across two flush
+   spans, then stops widening and spills. Enforced on the retain path, not
+   merely declared, and pinned by the structural guard.
+2. `OFFLOAD_SHUTDOWN_GRACE = 30 s` — `JoinHandle::join` has no timeout, so a
+   writer wedged on a hung socket would have hung the box's shutdown. Worse,
+   on a host whose auto-stop is a cost control, than losing the tail batch.
+3. `MAX_PRODUCER_BUFFER_BYTES` 64 MiB → **32 MiB**. The const assertion
+   *refused to compile* at 64 — the assertion doing its job, on the first
+   number I picked.
+
+`OffloadOutcome::WidthCapped` is a distinct arm from `SinkGone` because the
+writer is alive and well during a width cut; reporting "the writer thread is
+gone" would send an operator to diagnose a healthy thread.
+
+**14e** (no new EMF metric name may ship — `user-data.sh.tftpl` at zero free
+bytes) is honoured: all three new counters are local-exporter only. The loss
+path they sit on already pages through `tv_ticks_dropped_total`.
+
+---
+
+## Item 25 — three dead loss-signals on the durable floor (2026-08-26)
+
+- [x] **25a — `init_metrics` moved above STAGE-C so cached counter handles are real**
+  - Files: `crates/app/src/main.rs`
+  - Tests: `crates/app/tests/metrics_recorder_install_order_guard.rs` (5)
+- [x] **25b — the channel-FULL drop arm carries `code = WS-SPILL-02`**
+  - Files: `crates/storage/src/ws_frame_spill.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (2 of 7)
+- [x] **25c — depth spill ceiling derived from the volume, not a literal**
+  - Files: `crates/storage/src/depth_persistence.rs`
+  - Tests: `crates/storage/tests/durable_floor_signal_guard.rs` (5 of 7)
+
+### Design
+
+The frame WAL is the durable floor, and the design believes it has four
+independent detectors on it. Live measurement on prod 2026-08-26 found **one**
+working, by accident.
+
+| # | Signal | State found | Cause |
+|---|---|---|---|
+| 1 | `tv_ws_frame_spill_drop_critical` → `durable-floor-breach` leg | **dead** | handle cached pre-recorder |
+| 2 | `tv_ticks_lost_total` → dedicated alarm | **dead** | same |
+| 3 | `error!` on channel-FULL → `{ $.code = "WS-SPILL-02" }` | **never matched** | no `code` field on that arm |
+| 4 | `tv_dhan_ws_wal_dropped_total` | alive | a *different* module keeps its own mirror |
+
+**25a.** `metrics::counter!` resolved before a recorder is installed returns
+`Counter { inner: None }`; `increment` is `if let Some(..)`, so it is a no-op
+forever. `SpillDropCounters::new` **caches** those handles (deliberately — the
+drop path must not allocate) and ran inside `WsFrameSpill::new` at `main.rs:913`,
+35 lines above `init_metrics` at `:948`. Verified live: both series absent from
+`/metrics` entirely while neighbours registered post-install rendered at 0.
+
+This is the SECOND occurrence in this file — the 2026-07-14 PR-C3 note records
+the same loss for `tv_ws_frame_wal_replay_total`, repaired by moving the
+*increment*. That fixes one instance and leaves the ordering hazard, which is
+why it recurred. Moving the *install* retires the class.
+
+**25b.** The `Disconnected` arm has always carried the code; the `Full` arm has
+not. FULL is the arm production reaches — it is what a writer stalled behind a
+saturated disk produces — so the un-pageable arm was the likely one.
+
+**25c.** `DEPTH_SPILL_MAX_BYTES` is a literal whose own doc cites a volume "86%
+full … ~28 GB free". Measured 2026-08-26: **300 GB, 255 GB free**. The premise
+expired and the number could not follow it.
+
+| tier | ceiling | sized by | rows/s | outage covered |
+|---|---|---|---|---|
+| tick | ~9.4 GB | volume ÷ 32 | 2,706 | **~5.2 h** |
+| depth | 512 MiB | a literal | 51,000 | **~75 s** |
+
+19× the volume, 250× less coverage. The tick tier became host-derived on
+2026-08-21 for exactly this reason; depth was not moved with it. Same fraction,
+same `OnceLock`, floor retained so it can never shrink.
+
+### Edge Cases
+
+- Unmeasurable volume → falls back to the 512 MiB floor with a coded warn, never
+  silently (mirrors the tick tier).
+- Small volume → `.max(DEPTH_SPILL_MAX_BYTES)` guarantees the derived ceiling is
+  never *below* what the literal already allowed.
+- `OnceLock` → the `df` probe runs at most once, on the cold failure path, so the
+  enforced number and the number a log line quotes can never disagree.
+- Comment-stripping in the ordering guard: the fix ships with prose naming both
+  symbols; a scanner that matched comments would pass a genuinely broken file.
+  Pinned by a self-test.
+
+### Failure Modes
+
+- 25a moves `init_metrics` ahead of the fail-closed WAL halt. Metrics init does
+  not depend on the WAL, and a boot that halts having installed a recorder is
+  strictly more observable than one that halts without.
+- 25c raises a ceiling on a shared volume. Bounded at 1/32, leaving 96.8% for
+  QuestDB and the frame WAL — the same share the tick tier already takes, and the
+  original "a rescue must not become the incident" reasoning is preserved.
+
+### Test Plan
+
+12 new tests, all green. **Bite-proven by reverting each fix:**
+
+| Revert | Result |
+|---|---|
+| `code =` removed from the Full arm | **2 FAILED** (`channel_full_drop_carries…`, `both_drop_arms_are_coded…`) |
+| `init_metrics` moved back below STAGE-C | **3 FAILED**; the 2 scanner self-tests correctly stayed green |
+
+Scoped suites (`testing-scope.md`): `tickvault-app` **1,797 passed / 0 failed**,
+`tickvault-storage` **0 failed**. `cargo fmt --check` clean. Clippy runs in CI
+(not installed on this toolchain).
+
+### Rollback
+
+Three independent, self-contained reverts; no schema, config, terraform or wire
+change. Reverting 25c restores the 512 MiB literal exactly.
+
+### Observability
+
+No new metric name and no new EMF selector entry — honouring Item 14e
+(`user-data.sh.tftpl` at zero free bytes). This item makes **existing** signals
+work rather than adding more: two counters that never emitted now emit, and one
+`error!` becomes matchable by the filter that was already deployed for it.
+
+### Honest envelope
+
+Fixes DETECTION, not loss. The 75-second depth cliff becomes ~23 minutes on
+today's volume; it does not become infinite, and past the ceiling depth rows are
+still dropped — counted and paged, as before. Nothing here addresses the disk
+saturation (~94:1 amplification) that makes a stall likely in the first place.
+
+---
+
+## Item 26 — depth-200 disconnects itself ~265×/session (2026-08-26)
+
+- [x] **26 — client-originated keepalive ping on the one endpoint Dhan never pings**
+  - Files: `crates/core/src/websocket/pool_budget.rs`, `connection.rs`, `pool_supervisor.rs`
+  - Tests: `crates/core/tests/depth200_client_keepalive_guard.rs` (8)
+
+### Design
+
+Measured, prod, market open, 2026-08-26:
+
+| endpoint | connects | disconnects |
+|---|---|---|
+| main_feed (×5) | 5 | **0** |
+| order_update | 1 | **0** |
+| depth_20 (×5) | 15 | 10 (2 Dhan RST clusters) |
+| **depth_200 (×5)** | 265 | **265 — all self-inflicted, `idle_secs: 27`** |
+
+`tv_dhan_ws_control_frames_total{kind="ping"}`: main_feed **3,460**, depth_20
+**12,110**, depth_200 — **series absent entirely**. The counter is created
+lazily on first ping, so an absent series means depth-200 received **no control
+frame at all** in a whole session. `docs/dhan-ref/full-market-depth.md:107`
+claims it pings every 10 s. That claim is false for this endpoint.
+
+`IdleWatchdog`'s header states its purpose: *"this timer is not merely 'is the
+server quiet?' — it is also, and mostly, **'have WE stopped draining?'**"*. It
+can only mean that because Dhan pings, our library auto-pongs **only while the
+read loop polls**, and arriving traffic therefore proves we are draining. With
+no server ping there is nothing to pong, so on depth-200 the only activity is
+market data — and the watchdog silently degrades into **a liquidity detector**.
+Its five instruments are FINNIFTY / MIDCPNIFTY / NIFTY options, which
+legitimately go 27+ s without a book update. Three of the five cycled 19 times
+each and then stopped dead at **09:14:45**; nothing was fixed at 09:15, the
+market opened.
+
+The fix restores the intended semantics rather than muting the symptom: we send
+a Ping every 10 s, Dhan pongs, and **the pong arrives only if the socket is
+alive AND our read loop is draining** — exactly the question the watchdog was
+built to ask. Merely widening the timeout would leave it measuring liquidity.
+
+The receiving half already existed: the 2026-08-19 repair routes
+`Message::Pong` → `SocketEvent::KeepAlive` → `ConnEvent::KeepAliveReceived` →
+`record_activity`. This change only supplies something to receive.
+
+### Edge Cases
+
+- Sited on the **existing 1 s idle ticker**, not a new timer: a second
+  `select!` arm would be a second way to hold this task away from `recv`, and
+  catching a reader that stopped polling is the watchdog's entire job.
+- `last_client_ping` seeded to **now**, so a freshly-dialled socket does not
+  ping while its subscribe is still in flight.
+- Monotonic `Instant`, never wall time — an NTP step must not conjure or
+  suppress a keepalive.
+- Const-asserted: ≥2 pings fit inside the 27 s idle window (one lost ping or
+  pong cannot expire a healthy socket), 2 intervals fit inside Dhan's
+  documented 40 s client-silence close, and the interval is never below the
+  tick that drives it.
+
+### Failure Modes
+
+- **Dhan does not answer pings on this endpoint** → nothing changes; the
+  watchdog keeps governing at 27 s exactly as today. `let _ =` at the call site
+  makes that explicit: escalating a failed keepalive would turn "no pong here"
+  into a disconnect, which is worse than the behaviour being fixed.
+- **Someone resets the watchdog on SEND instead of on the pong** → the watchdog
+  is silently disabled (we would always look active because we always ping).
+  Pinned by a bite-proven test.
+
+### Test Plan
+
+8 tests, all green. **Bite-proven**: adding `record_activity` at the send site
+fails `the_watchdog_reset_stays_on_the_received_pong_not_on_the_send` and
+nothing else — the guard catches precisely the dangerous edit.
+
+`cargo test -p tickvault-core` → **0 failed** (lib alone: 2,343 passed).
+
+### Rollback
+
+Single revert. The trait method is required rather than defaulted deliberately
+— a default returning `Ok(())` would let a transport claim keepalive support it
+does not have, and that failure would look exactly like a healthy socket.
+
+### Observability
+
+`tv_dhan_ws_client_keepalive_ping_total{endpoint,outcome}` — local exporter
+only, **no EMF selector entry** (`user-data.sh.tftpl` at zero free bytes,
+Item 14e). It exists so the fix can be VERIFIED on the box, not so it can page.
+
+### Honest envelope
+
+**Whether Dhan answers pings on depth-200 is UNVERIFIED** — we have never let a
+socket run past 27 s to find out, and no vendor doc covers it. The change is
+fail-safe in both directions, but it must NOT be claimed to work until measured.
+The verification is two live readings on the next session: `…client_keepalive_ping_total{outcome="sent"}`
+climbing, and `tv_dhan_ws_control_frames_total{kind="pong",endpoint="depth_200"}`
+**coming into existence for the first time**. If the second series stays absent,
+Dhan does not pong here and the next lever is the watchdog threshold.
+
+This also removes the need to answer that question defensively: a 10 s client
+ping means we are never silent, so Dhan's 40 s client-silence close cannot be
+reached regardless of whether it would have applied.
+
+---
+
+## Item 27 — a stale last-trade time fabricates candles on closed days (2026-08-26)
+
+- [x] **27a — stale-trading-day gate: candle-only refusal, row kept**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (6)
+- [x] **27b — delete the provably-unreachable duplicate timestamp-band check**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`
+
+### Design
+
+Dhan sends the **last trade time**. A contract that last traded days ago is
+snapshotted NOW carrying a timestamp from THEN. Measured across all 20.5M rows
+of one live session: mean `received_at - ts` **~5 hours**, max **34 days**.
+
+The candle-window gate tested `exchange_timestamp % 86_400` — seconds of day
+only, with no notion of WHICH day — against `[09:15:00, 15:40:00)`. A stale
+trade time of *yesterday 15:39:41* is 56,381 s, **inside** that window, so it
+passed as "in session" and opened a bucket dated on a day that had closed.
+
+Verified live, 2026-08-26:
+
+| Evidence | Value |
+|---|---|
+| `candles_1m` bars on past dates | **8,898** |
+| Distinct instruments | **8,898** |
+| Oldest | `2026-07-23T09:39` |
+| QuestDB volume created | **08:59:50 the same morning** |
+
+A database that was empty at 08:59:50 cannot contain July history. Those bars
+were written that day.
+
+Worse than the fabricated rows: with a bucket already open on the stale date,
+today's real 09:15 tick takes the CONTINUE path rather than the OPEN path, so
+**the day-open arm never fires** — across all 24 timeframes.
+
+The watermark is the right reference and needs no clock threaded in: it advances
+only on price-sane, band-checked ticks, and the advance is `>` so a stale tick
+can never move it. Ordered ABOVE the seconds-of-day gate on the same reasoning
+the timestamp band was hoisted above the price gate — a tick bad in both ways is
+attributed to the more actionable cause.
+
+**27b:** a second, byte-identical timestamp-band check stood ~30 lines below the
+first and was provably unreachable (the first returns on the same condition) — a
+merge artifact from the two 2026-08-25 hardening fixes. Deleted: dead code that
+reads as a live safety check invites reasoning about a guard that never runs.
+
+### Edge Cases
+
+- **Same-day earlier ticks still fold.** Only a whole-DAY regression is refused.
+  Intraday out-of-order arrival is normal (different instruments trade at
+  different times) and must not be swept up. Pinned by a negative test.
+- **First tick after boot is never refused.** Watermark starts at 0, so nothing
+  can be older — the same cold-start trap the band check's own comment records
+  having been written and caught once already.
+- Integer division on IST epoch seconds gives the IST day directly;
+  `exchange_timestamp` is already IST, so no offset arithmetic (`data-integrity.md`:
+  "NEVER ADD +5:30 TO ts").
+
+### Failure Modes
+
+- If the watermark could regress, the gate would disarm itself. It cannot (`>`),
+  and that is pinned by its own test rather than assumed.
+- A stale tick from an instrument whose slot does not yet exist is refused before
+  `slot_index`, so a stale-only instrument cannot burn one of the 25,000 slots.
+
+### Test Plan
+
+6 behavioural tests. **Bite-proven**: deleting the gate fails exactly the 4
+tests that assert it, while the 2 negative controls (same-day-earlier,
+first-tick) stay green — proving they are not vacuously asserting "everything is
+refused".
+
+`cargo test -p tickvault-trading --lib` → **1,633 passed / 0 failed**. fmt and
+banned-pattern scan clean.
+
+The exhaustive `ConsumeStats` destructure in
+`test_every_refusal_field_makes_folded_false` refused to compile until the new
+field was wired into `folded()` — the mechanical guard working exactly as its
+own doc says it should.
+
+### Rollback
+
+Single revert of each item; 27a and 27b are independent.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="stale_trading_day"}` — a new label on
+an EXISTING series, so no new metric name and no EMF selector entry (Item 14e:
+`user-data.sh.tftpl` at zero free bytes). The neighbouring doc comment saying the
+label carries "THREE distinct values" was corrected to FOUR in the same change.
+
+### Honest envelope
+
+This stops NEW fabricated bars. It does **not** remove the 8,898 already in
+`candles_1m` — deleting rows is an operator decision, and they are trivially
+identifiable (`ts < today`). It also does not change what `ticks.ts` means: the
+row still carries the true trade time, which is correct and is what
+`data-integrity.md` requires.
+
+**Residual, stated rather than discovered:** the gate is watermark-relative, so
+the window before the session's first in-session tick has no reference to
+compare against. In practice pre-open ticks are already refused by the
+seconds-of-day gate, so the exposure is narrow — but it is not zero, and closing
+it fully would require threading the wall-clock date into `consume_tick`, which
+changes two public signatures and every call site.
+
+---
+
+## Item 28 — 825,783 ticks a session discarded with no row at all (2026-08-26)
+
+- [x] **28 — `exchange_timestamp == 0` is the vendor's sentinel, not corruption**
+  - Files: `crates/trading/src/candles/multi_tf_aggregator.rs`, `fold_counters.rs`,
+    `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/trading/tests/stale_trading_day_gate_guard.rs` (+3, now 9)
+
+### Design
+
+Measured live: `tv_dhan_feed_ingest_refused_total{reason="timestamp"}` =
+**825,783** in one session — **4.0% of every tick decoded** — still climbing
+when read. The drain classes a timestamp refusal as a HARD refusal, returning
+before `append_tick_with_seq`, so every one was discarded **with no row at
+all**. Not a missing candle: no record the instrument was even seen.
+
+The 2026-08-20 fix had already made this exact call correctly for the PRICE
+sentinel, and its reasoning applies verbatim: *"discarding the ROW loses the
+ability to tell 'did not trade' from 'did not capture', and costs the packet's
+open interest and bid/ask with it."* An instrument that has never traded has no
+last price **and** no last trade time — the two sentinels co-occur — but the
+timestamp check ran first and hard-refused, silently defeating that fix for
+precisely the instruments it was written for.
+
+### The compatibility that makes this safe
+
+Two adversarial regressions (2026-08-09 security review, 2026-08-25 bite test)
+require that a row must **never** be written under a garbage designated
+timestamp. This does not reverse them; it satisfies them **by construction**.
+
+`row_timestamp_ist_nanos` substitutes the receipt time for an out-of-band LTT —
+but only when the caller has one (`(tick.received_at_nanos != 0).then_some(..)`),
+falling back to the raw value otherwise. So the fold keeps the row on exactly
+`ts == 0 && received_at_nanos != 0`: precisely the condition under which the
+writer can stamp it safely. Without that second clause a kept ts=0 row would
+land in a **1970** partition — the same unreachable-partition defect as
+year-2106, from the other end of the number line.
+
+The persistence layer had already anticipated this case. Its own comment calls
+the fallback *"the fallback designated timestamp for a row whose LTT is the
+vendor's never-traded sentinel"* — but the fold refused those rows before they
+could reach it, so that path was unreachable. The two layers now agree.
+
+**Both existing adversarial tests pass UNCHANGED** (their fixtures leave
+`received_at_nanos` at 0, so they exercise the still-hard-refusal arm). Nothing
+was re-blessed to make this land.
+
+### Edge Cases
+
+- Only EXACTLY zero is the sentinel. `0xFFFFFFFF` (~year 2106), `1`, and any
+  other out-of-band value stay hard refusals — pinned by a test that walks all
+  four.
+- The refusal happens BEFORE `slot_index`, so an instrument that only ever sends
+  the sentinel cannot burn one of the 25,000 slots.
+
+### Failure Modes
+
+- If a future caller stops setting `received_at_nanos`, the fold silently
+  reverts to hard-refusing — degraded, not wrong, and in the safe direction.
+- If someone drops the receipt-time clause, `a_zero_timestamp_without_a_receipt_time_is_still_refused_outright`
+  fails.
+
+### Test Plan
+
+3 new tests (9 in the file). `cargo test -p tickvault-trading --lib` →
+**1,633 passed / 0 failed**, including both adversarial regressions untouched.
+fmt + banned-pattern clean.
+
+### Rollback
+
+Single revert; independent of Items 27a/27b.
+
+### Observability
+
+`tv_aggregator_tick_refused_total{reason="untraded_timestamp"}` — a fifth label
+on an EXISTING series, so no new metric name and no EMF entry (Item 14e).
+
+**This is also the measurement that settles the remaining Assumed.** The claim
+that the 825,783 are zeros is inferred, not proven — the refused rows were never
+written, so no query could confirm it. From the next session the split label
+answers it directly: whatever share lands under `untraded_timestamp` is the
+sentinel, and whatever stays under `timestamp` is genuine corruption worth its
+own investigation.
+
+### Honest envelope
+
+Recovers the ROW, not the candle — a zero timestamp can never produce a bar, and
+should not. What comes back is the record that the instrument was seen, plus its
+open interest and bid/ask, and the ability to distinguish "did not trade" from
+"did not capture". If the 825,783 turn out NOT to be zeros, this change is inert
+and the split counter says so on day one.
+
+---
+
+## Item 29 — `/api/feeds/health` reports a working feed as DOWN, every day (2026-08-26)
+
+- [x] **29 — wire `set_connected` from the socket-count choke point**
+  - Files: `crates/app/src/dhan_feed_stack.rs`
+  - Tests: `crates/app/tests/sp5_dhan_feed_health_wiring_guard.rs` (+1, SP5.2)
+
+### Design
+
+`FeedHealthRegistry::set_connected` had **zero production call sites** — every
+reference in the workspace sat in a test module. The field initialises `false`,
+and `feed_health::classify` tests `if !i.connected` **before** the tick-age
+branch, so the verdict was `Down, "enabled but disconnected — reconnecting"`
+unconditionally.
+
+Captured on prod at one instant, 2026-08-26:
+
+```text
+/health            overall=healthy, websocket={connected, "15 connections"}
+/api/feeds/health  dhan verdict=DOWN connected=false
+                   ticks_total=17,265,688  last_tick_age=1s
+:9091              tv_dhan_ws_alive_connections 15
+                   tv_dhan_feed_stack_up 1
+```
+
+The same JSON object declared the feed down while reporting 17.2 million ticks
+and a one-second-old tick. `/board`, `/dashboard` and `/feeds` all render that
+row, so the operator's at-a-glance surface cried wolf every trading day,
+permanently — the inverse of a false-OK and no less corrosive, because a status
+that is always red is read as decoration.
+
+**This is the THIRD half of one defect**, and the pattern is the finding:
+`set_dhan_lane_running` was fixed 2026-08-14 (*"a status line that cannot vary
+is not a status line"*), `record_ticks` on 2026-08-18 (*"it answered a benign
+Unknown for a corpse"*). Each fix documented the shape and left the next sibling
+in place. `sp5_dhan_feed_health_wiring_guard.rs:42` even named this one and said
+it *"MUST be re-pinned in the PR that wires them"* — this is that PR.
+
+Sited inside `publish_alive_connections` rather than beside
+`set_dhan_lane_running`: that function is **both edges** of
+`AliveConnectionGuard`, so it tracks real socket transitions instead of a coarse
+lane-level flag, and its own doc already claims the single-owner property
+(*"one function owns the health push, so there is no second path to drift"*).
+
+### Edge Cases
+
+- The registry is installed **before** the arming `publish_alive_connections`
+  call. Install after it and the arming transition is silently dropped; on a
+  lane that dials once and stays up, the next socket event is the 17:30
+  shutdown. Ordering is pinned by the test.
+- `OnceLock` mirroring `HEALTH_REPORTER` rather than a new `params` field,
+  because the push site is a free function reached from a `Drop` impl —
+  threading an `Arc` there would need either a guard field or a second push
+  site, and a second site can drift.
+
+### Failure Modes
+
+- A second push site would let the two disagree; the test asserts **exactly
+  one**.
+- Shutdown drives `alive` to 0 and the row correctly goes `false`.
+
+### Test Plan
+
+SP5.2 added to the guard that predicted this gap. **Bite-proven**: removing the
+push fails it and nothing else.
+
+`cargo test -p tickvault-app` → **0 failed** (lib alone 1,404 passed).
+
+**Self-inflicted break, caught and fixed:** the first draft of the fix comment
+contained the literal `#[cfg(test)]`, and 20 source-scan tests split this file
+on that marker to isolate its production half — so my comment truncated their
+view and they failed. Reworded to "a test-only module". The tests were right; a
+comment is part of the file those scans read.
+
+### Rollback
+
+Single revert.
+
+### Observability
+
+No new metric, no new alarm, no EMF entry. It makes an EXISTING operator surface
+tell the truth.
+
+### Honest envelope
+
+Fixes the `connected` dimension only. The sibling `freshness` gap named in the
+same guard doc — a CONNECTED-but-silent feed reading healthy — is separately
+covered by the 30 s silence scan (`RISK-GAP-03`), which has paged since
+2026-08-15. What this does NOT do is make `/health` itself see silence: it
+consults neither tick flow nor the feed registry, so 15 alive sockets receiving
+nothing still reads `healthy` there. The two surfaces had opposite defects and
+only one is fixed here.
+
+---
+
+## Item 30 — the offload left a 5-second blocking HTTP call on the drain
+
+### Design
+
+`flush_and_record` early-returns `ingest.flush()` **bare** when the tick writer
+has been offloaded, on a comment reading *"the flush is a bounded-queue hand-off
+with no network in it, so there is nothing to move off-worker"*.
+
+That is true of the tick writer and false of the callee. `LiveIngest::flush`
+flushes the inline-depth sink FIRST and unconditionally, above its own
+`pending_rows == 0` early return — its body says so and explains why — and
+`DepthIngest::flush` is a blocking ILP-over-HTTP round trip bounded by the
+conf-pinned `request_timeout=5000`.
+
+So the offload, landed on 2026-08-25 precisely to get blocking HTTP off the
+drain task, left blocking HTTP on the drain task, on the **only path production
+takes**: the boot site calls `spawn_offload_writer` and `with_inline_depth` on
+the same builder chain, so both halves are live on every real run and this early
+return was reached on every flush.
+
+**Fix:** wrap it. `return blocking_flush(|| ingest.flush());`
+
+Wrapped unconditionally rather than gated on "is there depth pending": a gate
+needs a second accessor kept in step with what `LiveIngest::flush` actually
+does, and keeping those two pieces of knowledge in separate places is what
+produced this bug. The cost of being wrong the cheap way is one worker swap at
+~5 flushes/sec; the cost of being wrong the other way is a 5-second worker pin.
+
+### Edge cases
+
+- **Current-thread runtime** — `block_in_place` panics there, which is why
+  `blocking_flush` guards on `runtime_flavor()`. This module's drain tests are
+  bare `#[tokio::test]`. Unchanged by this item; the helper already handled it.
+- **Depth buffer empty** — the wrap still happens. Deliberate, see above.
+- **Non-offloaded fallback** — already wrapped; untouched.
+- **Flush failure** — unchanged. `LiveIngest::flush` counts and logs the
+  inline-depth failure and does not propagate it, so the tick flush is never
+  skipped because the depth writer had a bad moment.
+
+### Failure modes
+
+The mechanism is the one `blocking_flush`'s own docs describe, and it is not
+"the flush is slow": a stalled QuestDB pins a tokio worker for up to 5 s; on a
+low-worker host that is a large fraction of the runtime; the WS read loops
+sharing that worker stop pumping pongs and the socket is dropped; the drain
+stops draining and the ring fills. A third-party database stall becomes tick
+loss plus a disconnect.
+
+### Test plan
+
+Two tests, and the split is the point.
+
+1. `test_drain_never_flushes_bare_on_the_async_worker` (source scan) — the
+   `offloaded` count is inverted from 1 to **0**, and a new assertion requires
+   `return blocking_flush(|| ingest.flush());` to still EXIST so that deleting
+   the offload branch entirely also fails. The `wrapped` equality moves 1 → 2:
+   both arms of the one helper now wrap. Bite-proven — restoring the bare
+   return fails it by name.
+2. `the_offloaded_path_still_flushes_the_inline_depth_sink` (behavioural, NEW) —
+   builds an offloaded `LiveIngest` with an inline-depth sink holding 10 rows
+   and zero tick rows, flushes, and asserts the depth sink's `dropped_rows`
+   reached 10. `DepthWriter::for_test` has no sender, so a discard is proof the
+   flush was attempted.
+
+   Bite-proven by moving the inline-depth flush BELOW the `pending_rows == 0`
+   early return: **every source scan still passed and only this test failed.**
+   That is the whole reason it exists — the defect was in a *claim about
+   behaviour*, and a text match cannot check a claim.
+
+### Rollback
+
+Revert the one-line wrap plus the two guard edits. The bare form is what
+shipped before; reverting restores a known (bad) state, not an unknown one.
+
+### Observability
+
+None added, deliberately. There is no metric that distinguishes "the drain is
+blocked in HTTP" from "the drain has nothing to do" — both look like an idle
+task. The existing signals already cover the consequences: ring-full refusals,
+`tv_ticks_dropped_total`, the WAL drop counter revived in Item 25, and the
+depth flush-failure counter. Adding a fourth that fires only in the same
+window would be noise.
+
+### Honest envelope
+
+Removes ONE blocking call from ONE task. It does not make the flush faster, does
+not reduce the ~94:1 write amplification, and does not stop QuestDB stalling —
+it stops a QuestDB stall from also costing ticks and a socket. `flush_depth`
+(the dedicated depth pools) was already wrapped and is unchanged.
+
+**The reusable lesson, recorded because it outlives the fix:** the source-scan
+guard DID hold the line it was built to hold, and was then walked around by an
+exception written in good faith from an incomplete reading of the callee. A
+guard is only as strong as the claim its exception rests on, and this one rested
+on a claim nobody re-derived from `LiveIngest::flush`.
+
+---
+
+## Item 31 — the drain's own backlog was measured 5,000 times a second and thrown away
+
+### Design
+
+`run_frame_drain` derives `queued_nanos` — how long a frame sat in the ring
+before the fold reached it — on EVERY frame, uses it once to back-date
+`received_at_nanos`, and drops it.
+
+That number is the lane's best leading indicator and nothing has ever read it.
+Every other ring signal is a post-mortem count: `tv_dhan_ws_ring_full_total`
+and `tv_dhan_ws_frame_refused_total` move only once frames have already been
+turned away. Dwell rises while there is still headroom.
+
+**Fix:** `record_ring_dwell(queued_nanos)` keeps the maximum in a module
+`AtomicI64`; `publish_fold_depth` drains it to
+`tv_dhan_feed_ring_dwell_max_ms` on the existing periodic path. EMF-selected
+(80 names now, +$0.30/mo, priced in the count ratchet) and charted.
+
+**Rejected alternative — shipping `tv_dhan_ws_lag_ms` instead.** That measures
+the same axis from the vendor's side, and two things rule it out. It is an
+EXPLICIT exclusion in `EMF-METRIC-SELECTOR-NOTES.md` ("latency histograms …
+answer 'how much', not 'what broke'"), and a histogram ships ~12 bucket series
+per dimension — so the per-connection form the 2026-08-14 noise-lock
+authorization priced at $4.80/mo is closer to an order of magnitude more. That
+discrepancy is recorded rather than spent silently. Dhan's delivery lag is also
+not ours to fix; our own backlog is.
+
+### Edge cases
+
+- **Quiet window, no frames** — publishes 0, not the previous window's value.
+  Carrying it forward would make an idle lane look identical to a stalled one.
+- **Zero dwell** (the healthy steady state) — recordable, and must not displace
+  a real sample. Pinned.
+- **Clock steps** — none possible: `frame.received_at.elapsed()` is monotonic.
+- **`i64` overflow** — `try_from(...).unwrap_or(i64::MAX)` was already there.
+
+### Failure modes
+
+Two, and both are invisible in the code's shape, which is why the tests are
+behavioural rather than source scans:
+
+1. **Last-value-wins instead of max.** One 8-second stall followed by three
+   1 ms frames would publish 2 ms — the signal says "fine" at the exact moment
+   the drain has stopped. Bite-proven: `fetch_max` → `store` fails two tests.
+2. **Sticky maximum.** A stall from hours ago keeps the chart red forever, and
+   a permanently-red chart costs more than not publishing. Bite-proven:
+   `swap(0)` → `load` fails two tests.
+
+### Test plan
+
+`crates/app/tests/ring_dwell_gauge_guard.rs`, 6 tests: worst-sample-survives,
+reset-on-read, quiet-window-zero, unit direction (ns→ms, not the reverse — the
+error that would read as a 17-day stall and look plausible because "big number,
+bad situation" is self-consistent), zeros-do-not-poison, and one source check
+that the recorder is wired into the drain and the gauge is actually SET —
+which earns its place because the defect being fixed IS "computed and never
+published", so an arithmetic-only suite would pass on the broken code.
+
+Serialised behind an explicit mutex, not `--test-threads=1`: the latter is a
+property of how the suite is invoked, not one anything can rely on.
+
+### Rollback
+
+Delete the two helper calls and the selector/dashboard entries. The lane
+behaves exactly as before — nothing reads this value.
+
+### Observability
+
+The point of the item. `tv_dhan_feed_ring_dwell_max_ms`, EMF-selected, charted
+as "How far behind the drain is (worst frame wait, ms)", `stat = Maximum`.
+
+**Deliberately UNALARMED.** No threshold is defensible yet: the value has never
+been observed, because it has never been published. Picking a number now
+invents it and then trains the operator to ignore the alarm built on it. Chart
+first; threshold when the chart has a baseline.
+
+### Honest envelope
+
+Publishes a number that already existed. It does not make the drain faster, does
+not enlarge the ring, and does not prevent a stall — it makes one visible before
+it costs ticks instead of after. Cost on the hot path is one uncontended atomic
+`fetch_max` per frame (single writer, `Relaxed`), no allocation and no registry
+lookup; the gauge write is on the existing periodic path, never per frame.
+
+---
+
+## Item 32 — the deaf socket: one connection stops delivering and nothing notices
+
+### Design
+
+A socket that keeps answering pings but stops delivering data is invisible to
+every mechanism the lane has, and each miss is structural rather than an
+oversight:
+
+| Mechanism | Why it cannot see this |
+|---|---|
+| Idle watchdog (27 s) | governs SILENCE on the wire; a ponging socket is not silent |
+| Reconnect family (`reconnect_total`, `dial_failed_total`, `subscribe_failed_total`) | stays flat — the defining property of a deaf socket is that **nothing about it is retrying**. This is why "alarm the reconnect counters", the recommendation on record, cannot work |
+| Lane `tv_dhan_feed_last_tick_age_secs` | reads ~1 s throughout: fifteen of sixteen sockets are fine |
+| `tv_dhan_ws_alive_connections` | counts sockets DIALED, not sockets DELIVERING |
+
+**Fix:** a fixed `[AtomicI64; MAX_TOTAL_DHAN_CONNECTIONS]` of last-delivery
+millis, stamped per frame that actually produced output, published as ONE gauge
+`tv_dhan_ws_worst_conn_tick_age_secs` = the worst age across connections that
+have ever delivered.
+
+**One series, not sixteen.** Per-connection is ~$4.80/mo by the 2026-08-14
+noise-lock figure to answer a yes/no question; the worst-age form answers it
+with identical detection power for ~$0.30/mo. Per-connection attribution stays
+on `/metrics`, which is where a human triaging looks. Charted BESIDE the lane
+gauge, because the difference between them is the diagnosis: both low = healthy,
+this one climbing alone = one deaf socket, both climbing = the whole feed.
+
+### Edge cases
+
+- **Never-ticked slot** — reads `0` and is SKIPPED, not treated as infinitely
+  stale. An unused slot would peg the gauge at "broken" forever, and a
+  legitimately quiet depth-200 subscription on one illiquid contract is not a
+  fault. That case already has `tv_dhan_feed_instruments_never_ticked` +
+  RISK-GAP-03.
+- **No connection has ticked at all** — publishes `-1`, never `0`. Zero would
+  read as "every socket ticked this instant" — the most reassuring value
+  available — at the moment we know least.
+- **Clock steps backwards** (NTP) — `saturating_sub(...).max(0)`, so it reads 0
+  age rather than wrapping into a huge one at the moment logs are hardest to
+  read.
+- **Out-of-range connection index** — dropped. Writing the wrong slot would
+  report the wrong socket healthy, which is worse than not writing.
+- **Frames that arrive but produce nothing** — do NOT stamp. A socket returning
+  unparseable frames is not delivering market data, and stamping on arrival
+  would report it healthy: the exact false-OK this detector removes.
+
+### Failure modes
+
+1. **Min instead of max** — reports the most recent tick anywhere, i.e. perfect
+   health with a socket dead. Bite-proven: `w.max(age)` → `w.min(age)` fails 2
+   tests.
+2. **Depth stamp forgotten** — ten of sixteen sockets read never-ticked, are
+   excluded, and the gauge looks healthy *because* of the exclusion rule that
+   exists to prevent false-OKs. Bite-proven: deleting it fails the wiring test.
+
+### Test plan
+
+`crates/app/tests/deaf_socket_gauge_guard.rs`, 6 tests, all behavioural except
+one wiring scan: one-deaf-among-healthy, all-healthy-reads-zero, recovery
+lets it fall, backwards clock clamps, out-of-range dropped, and both stamp
+sites + the publish are wired. Fixed `NOW_MS`, so nothing depends on the wall
+clock.
+
+### Rollback
+
+Delete the static, the two stamp calls, the publish, the selector entry and the
+widget. Nothing else reads any of them.
+
+### Observability
+
+`tv_dhan_ws_worst_conn_tick_age_secs`, EMF-selected (81 names, +$0.30/mo,
+priced in the count ratchet), charted as "Deaf socket check" against the lane
+gauge for contrast.
+
+**NOT alarmed — and this one is a deliberate deferral, not a missing baseline.**
+A threshold is defensible here (600 s, matching the lane-level no-ticks alarm —
+the same question scoped to one socket). What stops it is money: the maximal
+month already projects above the line where an AWS budget action STOPS the
+trading box. Adding a pager is a spending decision the operator takes knowingly,
+not one an executor slips in. Charted now so the signal exists the moment he
+says yes.
+
+### Honest envelope
+
+Makes a deaf socket VISIBLE; does not detect it automatically, because nothing
+pages on it yet. Detection latency is the 30 s scan cadence plus whatever
+threshold is eventually set. It cannot distinguish "the socket is deaf" from
+"every instrument on this socket genuinely stopped trading" — an operator reads
+it against the lane gauge and the never-ticked count, which is why they share a
+screen. Hot-path cost is one relaxed atomic store per productive frame.
+
+---
+
+## Item 33 — `late_count` counts data loss and had zero production readers
+
+### Design
+
+`ConsumeStats.late_count` is the number of timeframes that DISCARDED a tick as
+too late to place (`ConsumeOutcome::DiscardLate`). A discarded tick means the
+bar it should have contributed to is missing a trade — a wrong bar.
+
+It was computed for all 24 timeframes on every tick and **read by nothing**.
+Every production consumer reads `sealed_count` and `amended_count`, and
+`IngestOutcome::Folded` carries only those two, so the value existed inside one
+function call and died there.
+
+**Fix:** increment `tv_candle_tick_discarded_late_total` at the discard arm,
+through the pre-resolved `fold_counters()` handle.
+
+**Its own metric name, not a `reason` label on
+`tv_aggregator_tick_refused_total`.** That family means "the whole tick was
+refused and NOTHING was folded" — a different and stronger statement. A tick
+counted here DID fold into other timeframes; merging them would make both
+numbers unreadable.
+
+### Edge cases
+
+- **Per (tick, timeframe), not per tick** — one tick can be placeable in the
+  1-day bar and hopeless for the 1-second one. Collapsing to a per-tick number
+  would hide which frames are losing data.
+- **Interaction with Item 27** — the stale-trading-day gate now refuses
+  previous-day ticks BEFORE the timeframe loop, so what reaches this arm is
+  today's ticks that are late for a given frame: a smaller, more interesting
+  population than it would have been last week.
+
+### Failure modes
+
+The counter increments inside the 24-timeframe loop on the per-tick path. A
+bare `metrics::counter!` there costs a sharded-registry lookup 24× per tick —
+the exact defect `fold_counters.rs` was created to remove. Pinned: the test
+asserts the handle is used AND that no bare macro appears in the arm.
+
+### Test plan
+
+`the_late_discard_is_counted_and_not_merely_tallied_into_a_dropped_struct` in
+`stale_trading_day_gate_guard.rs`. Bite-proven — deleting the increment fails
+it and nothing else. `dhat_multi_tf_fold` re-run: still zero allocations.
+
+Two scanner defects were fixed in writing it, both of the kind this session has
+been correcting elsewhere:
+
+1. `split("#[cfg(test)]").next()` truncated ~500 lines ABOVE the arm, because
+   this file carries test-only helpers inside production code. Split at the
+   test MODULE boundary instead.
+2. A fixed byte window missed the increment once a comment was added — the same
+   proximity brittleness rewritten out of two guards earlier today. Replaced
+   with brace matching on the arm's actual block, which is the real boundary.
+
+### Rollback
+
+Delete the increment and the handle. Nothing else reads either.
+
+### Observability
+
+`tv_candle_tick_discarded_late_total` on `/metrics`.
+
+**Deliberately NOT EMF-selected.** Two names were added to the selector today
+(+$0.60/mo) and the maximal month already projects above the AWS budget
+action line. This one is a DATA-QUALITY signal rather than an outage signal —
+it says bars may be incomplete, not that the feed is down — so it is the
+right one to leave on `/metrics` when something has to be. Shipping it is a
+one-line change plus a priced count bump whenever the operator wants it.
+
+### Honest envelope
+
+Makes the loss COUNTABLE, not smaller. It does not recover a discarded tick and
+does not change which ticks are discarded — the amend/discard boundary is
+untouched. Nothing pages on it, so it is only visible to someone already
+looking at `/metrics`.
+
+---
+
+## Item 34 — we shipped the ring's denominator and withheld its numerator
+
+### Design
+
+The frame ring is bounded twice: by frame COUNT (65,536) and by BYTES
+(`RingByteBudget`). `tv_dhan_feed_ring_max_bytes` — the CAPACITY — has been
+EMF-selected since 2026-08-15. The OCCUPANCY was not published at all:
+`RingByteBudget::resident()` existed with call sites only in its own unit
+tests, the fifth instance in this lane of code that exists, is tested, and is
+never invoked.
+
+**Fix:** `tv_dhan_feed_ring_resident_pct` — worst of the two pools —
+published on the same 30 s tick as the dwell and deaf-socket gauges. Per-pool
+detail goes to an UNSELECTED name, so `/metrics` keeps the attribution and
+CloudWatch pays for one series.
+
+**Percent, not bytes.** The two budgets are sized 3:1, so raw bytes are not
+comparable between them and a raw gauge would be dominated by whichever pool
+is larger regardless of which is in trouble.
+
+**It pairs with the dwell gauge, and the pair is the diagnosis:**
+
+| dwell | fill | reading |
+|---|---|---|
+| flat | flat | healthy |
+| up | up | the drain cannot keep up |
+| flat | up | large frames, not a slow drain |
+| up | flat | slow drain on small frames |
+
+Neither number says that alone, which is why they are charted side by side.
+
+### Edge cases
+
+- **Zero capacity** — returns 0.0 rather than dividing. Unreachable in
+  production (both caps derive from a non-zero host figure), but a NaN on a
+  gauge is silently unchartable, and "the chart went blank" is worse than "the
+  chart read zero": blank looks like the app died and sends an operator to
+  diagnose the wrong thing mid-incident.
+- **Over capacity** — clamps to 100. `RingByteBudget` uses a CAS loop
+  specifically so `resident` cannot exceed `cap`, so this should be
+  unreachable; a gauge reading 340% would look like a unit bug and be
+  dismissed at the exact moment the ring is in trouble.
+- **Both pools idle** — reads 0, which is correct and not a stale value.
+
+### Failure modes
+
+**Reporting the average instead of the worst.** With main-feed at 1% and depth
+at 95% the average reads 48% — healthy-looking — while one pool is about to
+refuse frames. Bite-proven: `main_pct.max(depth_pct)` → `(a+b)/2.0` fails the
+wiring test.
+
+### Test plan
+
+`crates/app/tests/ring_fill_gauge_guard.rs`, 5 tests: empty/full/quarter, zero
+capacity is finite and zero, over-capacity clamps, worst-of-two surfaces, and
+the publish reads the LIVE budgets (publishing `cap()` as occupancy would give
+a permanently-100% chart that reads as a crisis and is a bug).
+
+### Rollback
+
+Delete the const, the helper, the three gauge writes, the selector entry and
+the widget.
+
+### Observability
+
+`tv_dhan_feed_ring_resident_pct` EMF-selected (82 names, +$0.30/mo) and charted
+as "Ring fill (% of byte budget, worst pool)" beside the dwell chart.
+`tv_dhan_feed_ring_resident_pct_by_pool{pool}` on `/metrics`, unselected.
+
+**NOT alarmed.** The ring already pages on the after-the-fact case
+(`tv_dhan_ws_ring_full_total`, `tv_dhan_ws_ring_bytes_full_total`), so the loss
+is covered today; this is its leading edge, and a leading-edge threshold needs
+a baseline that does not exist yet.
+
+**THREE names added today (~$0.90/mo) and that is the stopping point.** The
+maximal month already projects above the line where an AWS budget action stops
+the trading box. Everything else found today stays on `/metrics`.
+
+### Honest envelope
+
+Publishes a number that already existed, on a path that already ran. It does
+not enlarge the ring, speed the drain, or prevent a refusal. Sampling is the
+30 s tick, so a sub-30-second fill spike is invisible — the after-the-fact
+counters remain the only signal for that, and they page.
+
+---
+
+## Item 35 — the cross-verification runs 94% blind and cannot say why
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+The 15:41 IST comparator against Dhan's own REST tape is, by this repository's
+own doctrine, the **only ground truth the revived feed has** — the India feed
+carries no sequence number and no snapshot-on-subscribe, so packet loss is
+undetectable at the protocol level and nothing inside our pipeline can prove a
+tick never arrived.
+
+Read from the live box, two consecutive sessions:
+
+| session | targets | `rest_failures` | actually compared | diverged | typical gap |
+|---|---:|---:|---:|---:|---:|
+| 2026-08-24 | 864 | **814** | ~50 | 61 | 35 paise |
+| 2026-08-25 | 865 | **815** | ~50 | 23 | 25 paise |
+
+**94% of the only ground truth fails every day.** Where it does compare, we
+agree with Dhan closely — 25 paise on prices in the thousands. The comparison
+is not failing; it is barely running.
+
+And the reason was **unknowable from the box**. `fetch_rest_side_for_target`
+has always built a precise reason string for every failure mode; its only
+caller matched `Err(_)`, counted `rest_failures += 1`, and dropped it. A count
+without a cause is a symptom that cannot be treated, and it had gone untreated
+for at least two sessions.
+
+Two changes:
+
+1. **Typed failure kinds** (`XverifyFetchFailureKind`, a closed 7-variant set:
+   `no_candles`, `rate_limited`, `http_4xx`, `http_5xx`, `timeout`,
+   `transport`, `other`), tallied per run into a fixed-width
+   `RestFailureBreakdown` and logged on the same line as the verdict, plus a
+   bounded 3-entry sample of real messages. HTTP status is classified from the
+   REAL `StatusCode` via a pure, directly-tested `classify_http_status` — never
+   a substring scan of a rendered message.
+2. **Pacing.** The loop issued ~865 requests back-to-back with no pacing at all
+   against a documented 5-per-second vendor budget, while both sibling REST
+   legs have gone through the shared self-tuning limiter since 2026-07-14. This
+   leg was the odd one out. A new `fetch_rest_side_paced` wrapper acquires the
+   shared limiter and feeds the self-tuner on a real 429.
+
+### Edge cases
+
+- **429 is a client error**, so a naive `is_client_error()` branch first would
+  swallow it into `http_4xx` and hide the one reason that is directly
+  actionable. Order is asserted, and the test states why.
+- **`no_candles` is ambiguous by construction** — a wrong instrument label and
+  a genuinely untraded instrument produce the identical 2xx-with-no-candle
+  response. The count is what separates them: 815 of 865 is not 865 untraded
+  instruments. Documented at the variant rather than papered over.
+- **Empty breakdown** renders `none`, so a clean run stays short.
+- **Zero-count kinds are omitted**, dominant kind first, so one line answers
+  "why" at a glance.
+
+### Failure modes
+
+**Pacing could push the run past its 600 s budget.** At the limiter's 3 rps
+that is ~288 s of pacing floor for 865 targets, inside the budget; the loop
+already breaks on budget with `budget_elapsed = true`, which is honest rather
+than silent. Watched, not assumed.
+
+**The two changes could confound each other** — they do not. The breakdown
+labels the outcome that actually occurred, so if tomorrow reports
+`rate_limited=0` then pacing was never the cause and the dominant label names
+the real one.
+
+### Test plan
+
+5 tests in `dhan_live_crossverify.rs`: distinct stable labels; a real 429
+classifies as `rate_limited` and not as a generic 4xx; the breakdown total
+always equals the failure count; the summary leads with the dominant reason and
+omits zeroes; and the regression pin that the loop tallies the reason, never
+discards it, and goes through the paced wrapper.
+
+**Bite-proven both directions:** reverting the paced call fails the pin;
+deleting the tally line fails the pin.
+
+The pin scans the **production half only** — `include_str!` reads this file
+including its own tests, whose assertion strings contain the banned pattern, so
+the first run failed on itself. The test-module marker is assembled from
+fragments rather than written whole, because spelling it out put a second copy
+in the file and split the source in the wrong place — the second run failed on
+that. Both are recorded at the test: a self-scanning guard fails OPEN, and this
+one would have passed while reading nothing.
+
+### Rollback
+
+Revert to `Err(_) => rest_failures += 1` and drop the wrapper. That restores a
+comparator that reports 94% blindness without a cause.
+
+### Observability
+
+**No new metric name, no new EMF selector entry, no cost.** The breakdown rides
+the existing `cross-verification finished` line as `rest_failure_reasons`, plus
+one `warn!` carrying the reasons and a 3-entry sample. Deliberate: EMF folds
+labels to `{host}` by summing, so a labelled counter would surface only the
+total — which the log already carries — while costing ~$0.30/mo, and the
+maximal month already projects above the line where a budget action stops the
+trading box.
+
+### Honest envelope
+
+This makes the blindness **explainable**, not smaller. Tomorrow's run names the
+dominant cause; fixing that cause is the next change, not this one. Pacing is
+hygiene on a documented budget, **not a claimed cure** — whether rate limiting
+is what blinded the comparator is exactly what the breakdown answers.
+
+Nothing here improves agreement with Dhan. Where the comparison does run we
+already agree to ~25 paise; the problem was never the matching, it was the
+coverage.
+
+---
+
+## Item 36 — volume was never compared, and the operator asked about volume
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, this morning, verbatim (typos preserved):
+
+> "precisley meanwhiel exactlt at 3.40 pm you need to pull the entiree 850 or
+> 860 spots entikeey rgith dude that too one an donly for one mintue alone
+> especiallu to do the cross verification rigth dude **whetehr our entire
+> system ophlc vlolume is entilrey amtchign for evrythginr ight dude**"
+
+He asked whether OHLC **and volume** match. Checked in source: `PaiseBar::fields()`
+returns exactly four entries — open, high, low, close. **Volume was never compared.**
+It rode along on every finding row as `live_volume` / `rest_volume` and no
+divergence was ever raised on it, so "does our volume agree with the exchange's?"
+had no answer anywhere in the system.
+
+That gap is not academic. A live volume defect measured 2026-08-24 had the
+intraday frames at **~9.2× the day bar**, with 6,088 instruments disagreeing with
+their own minute sums. The one comparison that could have caught it was not
+looking.
+
+**Volume is reported as a CAPTURE PERCENTAGE, not a pass/fail.** Our live feed is
+a conflated ~1/sec sample; the vendor's REST tape is the full record. Under-capture
+is STRUCTURAL and expected, so a strict equality check would flag nearly every cell
+and drown the price signal beside it. Four figures: cells with a usable volume,
+exact matches, the median capture, the 5th percentile, and the worst single cell.
+
+It deliberately does not feed `cells_diverged` or the outcome. A threshold needs a
+baseline and no baseline exists — this measurement is what creates one. Identical
+discipline to the price side, which quantifies its noise rather than asserting a
+limit.
+
+**Also in this item: the match rate is now computed, not left as homework.**
+`minutes_compared` and `cells_diverged` were both already on the verdict line, so
+the rate was always derivable with one multiplication — and nobody did it, for two
+sessions, while the run sat at 0.09% coverage. A number that needs arithmetic
+before it means anything is a number that gets skipped.
+
+### Edge cases
+
+- **The vendor reports zero volume for a minute.** Skipped, not scored 0%. Their
+  volume is the denominator; a zero one means they saw no trades, which says
+  nothing about our capture, and counting it would drag the median toward "we
+  missed everything" when the truth is "there was nothing to miss."
+- **Over-capture (above 100%) is reported, never clamped.** Reading above the
+  vendor's own tape cannot happen honestly — it is the signature of the
+  double-counting defect measured on 2026-08-24. Clamping would erase the only
+  evidence of it.
+- **Integer arithmetic throughout.** A float ratio would be the one place in this
+  module comparing by epsilon, which its own header forbids.
+
+### Failure modes
+
+**A volume gap misread as a price divergence.** Pinned: prices agreeing exactly
+while volume differs 1-vs-9,999 must leave `cells_diverged` at zero and the
+verdict a pass.
+
+**The bad tail hidden by the median.** Caught by a test that FAILED as first
+written. `percentile` here is linear-rank, so at n=20 the 5th percentile lands on
+the second-smallest value and one catastrophic minute never reaches it. That
+failure is what added `volume_capture_min_pct` — p05 describes the distribution,
+the minimum describes the worst thing that actually happened. The price side
+reports `max` for the same reason; volume's bad direction is simply down.
+
+### Test plan
+
+6 tests: volume is compared at all; a volume disagreement never becomes a price
+divergence and never flips the verdict; a vendor-untraded minute is skipped rather
+than scored zero; a perfect capture reads 100 including its tail; the median hides
+one bad cell in twenty and the minimum does not; over-capture survives to the
+report at 920%.
+
+### Rollback
+
+Delete the four fields, the loop block, and the log fields. That restores a
+comparison that checks four of five columns and never says so.
+
+### Observability
+
+**No new metric name, no selector entry, no cost.** Five fields on the existing
+verdict line.
+
+### Honest envelope
+
+This MEASURES volume agreement; it does not enforce it. No threshold is set,
+because none can be honest before a baseline exists — tomorrow's run produces the
+first one. It also cannot separate "we missed trades" from "the vendor's tape
+disagrees with itself", and it inherits the coverage limit of Item 35: measuring
+volume across 295 price-minutes says very little until that number grows.
+
+### Rider — the FIFTH fixed-window guard
+
+`the_cross_verify_verdict_is_logged_as_fields_not_a_debug_dump` scanned a FIXED
+2,000 bytes back from its marker. Adding five fields to the emit made the list
+outgrow the window and the guard failed — not because a field was missing, but
+because the code got longer. It failed CLOSED (blocking a correct change), which
+is the better direction, but the shape is the same one corrected four times
+already in this branch. It now walks back to the enclosing macro opening, which is
+a real boundary and cannot drift. Bite-proven: deleting the field it pins fails it.
+
+---
+
+## Item 37 — a fixed sweep order starved the tail of the universe forever
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"ensure to pull evrythign using incrmental or decrmental
+aprpoach ddude okay?"*
+
+The fetch loop walked its target list in FIXED order and `break`s on a hard
+wall-clock budget. Fixed order plus truncation is not "we reach fewer
+instruments" — it is **"we never reach the tail"**, identically, every day,
+while the report shows a respectable coverage percentage and nothing says
+which instruments were skipped.
+
+Today's pacing change (Item 35) is what makes it bite. Measured:
+
+| limiter rate | per-answer | 868 targets need | vs 600 s budget |
+|---|---|---:|---|
+| 4 rps | 0.2 s | 391 s | covers all |
+| 3 rps | 0.4 s | 637 s | **truncates ~6%** |
+| 2 rps | 0.4 s | 781 s | **truncates ~23%** |
+
+At the limiter's floor a specific 23% of the universe would go permanently
+unverified — in the one check that exists to prove nothing was lost.
+
+**The fix is a rotating start, and it is deliberately STATELESS.** A persisted
+cursor resumes exactly and is also a file to lose, corrupt, or have differ
+between a laptop and the box — a new failure mode inside the only loss
+detector. The trading date is state everyone already agrees on.
+
+**The stride is the guarantee.** Consecutive runs cover `[k·s, k·s + c)`;
+their union is the whole list exactly when `c >= s`. At `s = ceil(n/3)` any run
+reaching a third closes the universe in three days, and the measured worst case
+(77%) closes it in two.
+
+### Edge cases
+
+- **Empty target list** — returns 0 rather than dividing by zero. A wrong start
+  is survivable; a panic in the only loss detector takes the day's
+  verification with it.
+- **`n = 1`** — `max(1)` keeps the stride positive.
+- **Year boundary** — days-from-epoch, not day-of-year. Day-of-year snaps to 0
+  every January and re-starves whatever December was working through.
+- **A 25,000 universe** — the day number (~739,000) is reduced modulo `n`
+  BEFORE multiplying by the stride, so the product cannot overflow a 32-bit
+  `usize`.
+
+### Failure modes
+
+**The off-by-one a test caught.** `n / 3` rounds DOWN: at n=868 the stride is
+289, three of which is 867 — leaving exactly one index that three strides never
+reach, starved forever. `div_ceil` closes it. That is the same defect this
+rotation exists to kill, one index wide instead of two hundred.
+
+**Rotation that is not a permutation.** If the wrap skipped or repeated an
+index, an un-truncated run would compare one instrument twice and another
+never. Pinned for n ∈ {1, 2, 7, 868}.
+
+### Test plan
+
+7 tests: empty list does not divide by zero; consecutive days differ; three
+days at exactly one-third coverage reach everything; the measured 77% closes in
+two days; a full sweep is a permutation; a year boundary does not reset;
+a 25,000 universe does not overflow.
+
+**Bite-proven:** pinning the start back to 0 fails **5** of them.
+
+### Rollback
+
+Delete `rotation_start` and iterate `targets` directly. That restores a sweep
+that starves the same tail every day.
+
+### Observability
+
+**No new metric name and no cost.** The coverage fraction the guarantee depends
+on already rides the verdict line as `targets` and the compared count.
+
+### Honest envelope
+
+This converts permanent starvation into eventual coverage. It does **not** make
+any single day complete — a truncated run still leaves that day's tail
+unverified, and only the next runs close it. The three-day guarantee holds only
+while coverage stays above a third; if it falls below, the rotation no longer
+covers everything, and the reported fraction is what would show it. Nothing
+here reduces the 815 fetch failures — that is Item 35's diagnosis, due
+tomorrow.
+
+---
+
+## Item 38 — the vendor's own tape was fetched, judged, and thrown away
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Operator, verbatim: *"see to save this also you need a separte tabel right
+becuase onl yfrom there ou can do the cross evrificationa dn even stroe the
+hisotircla data right even for manaul verificaiton also right dude am ii rght
+dude okay?"*
+
+He is right, and checking confirmed it. `fetch_rest_side_for_target` pulls the
+exchange's own minute candles, `compare_day` judges them, and the bars are
+**dropped**. Only the cells that DISAGREED survive, on the cell-audit table.
+Three consequences, all of which he named:
+
+1. **No manual verification.** "What did Dhan say for this instrument at
+   09:16?" is unanswerable unless that minute happened to diverge.
+2. **No re-verification without re-fetching.** Re-running the comparison means
+   ~868 more requests against a rate-limited vendor budget — so in practice it
+   was never re-run.
+3. **No other analysis.** The vendor's own record did not exist on disk in any
+   form.
+
+Storing the pull turns the comparison into a pure function over two stored
+tables: fetch once, compare as often as you like, offline.
+
+**⚠ The trap that forced a NEW table.** `rest_spot_1m` already exists with
+exactly the right shape — and its DEDUP key is
+`(ts, security_id, exchange_segment, feed)`, which **omits its own `source`
+column**. Writing this 868-instrument sweep there would have silently
+overwritten the per-minute leg's index rows, with no error anywhere. That is
+the third silent-overwrite risk found today. The new table carries `source`
+**in the key from its first line**, so the same collision cannot be introduced
+later by a second writer.
+
+### Edge cases
+
+- **The designated timestamp is the MINUTE, not the run time.** A run-level
+  stamp would file every candle of the day under one instant and make "what
+  was the 09:16 price" unanswerable — the exact question the table was added
+  for.
+- **`fetched_at` is stamped PER TARGET.** The loop runs up to ten minutes; one
+  run-level stamp would claim the last instrument was fetched at the same
+  instant as the first, destroying the only number that says how stale the
+  vendor's record was when read.
+- **`fetched_at` uses the existing IST helper**, not a second clock. The
+  offset rule is already applied there, and a private copy is how the
+  timestamp class that started this whole session gets re-created.
+- **`instrument` is stored verbatim.** A vendor "no candles" answer is
+  identical for a mislabelled instrument and a genuinely untraded one; without
+  the label there is nothing to check against the master afterwards.
+- **Memory.** The bars already exist in memory — carrying them out is a move,
+  not a copy. At full coverage the tape is ~333,000 rows ≈ 37 MB, and today's
+  coverage makes it far smaller.
+
+### Failure modes
+
+**A future "simplification" pointing this writer at the sibling table** —
+pinned by a test asserting the table names differ, with the collision spelled
+out at the assertion.
+
+**A half-registered table.** A table whose CREATE lands without a DEDUP ENABLE
+auto-creates on first write with **no dedup at all** — a silent duplicate-row
+window. The DDL test now checks per table (one CREATE, one DEDUP ENABLE, one
+ALTER per declared column) rather than one total, so a half-registered table
+fails loudly instead of sliding under a sum that still adds up.
+
+**Silent reversion to fetch-and-discard** — pinned by a source scan of the
+persist function.
+
+### Test plan
+
+7 storage tests: `source` is in the key; `security_id` is paired with
+`segment` and `feed` is in-key; the designated timestamp is the minute; the
+asked-with label survives; the DDL is registered with dedup enabled; two
+identical rows produce byte-identical wire output; the table is not the
+sibling table.
+
+2 app wiring tests: the tape is persisted and partial writes counted; the
+stamp is taken inside the fetch loop, before the rows that carry it.
+
+**Bite-proven:** dropping `source` from the key fails 2; disabling the persist
+call fails 2.
+
+### Rollback
+
+Delete the table constants, DDL, writer method, the `rest_tape` field, and the
+persist loop. That restores a comparison whose raw input exists nowhere.
+
+### Observability
+
+**No new metric name and no cost.** Tape rows count into the existing persist
+counter; partial tape writes ride the existing partial-write error line.
+
+### Honest envelope
+
+This stores what we fetched. It does **not** increase what we fetch — the
+tape is exactly as complete as the run that produced it, so at today's 0.09%
+coverage the stored tape is equally sparse. It also stores only the VENDOR
+side; our own candles already live in the live tables, and joining them is the
+reader's job.
+
+**Retention — the gap this envelope named, now closed (2026-08-26, same
+day).** The first draft of this section said "no archival policy is registered
+for it here, so it grows with the hot window like its siblings", and
+`partition_retention_coverage_guard` failed the build on exactly that: a new
+storage table constant with no retention decision. `dhan_rest_1m_tape` is now
+in `DAY_PARTITIONED_TABLES`, swept by the same detach→archive pass as
+`dhan_live_crossverify_cell_audit` and `dhan_live_crossverify_daily`.
+
+It is registered with its real volume rather than the word "trivial", because
+it is not: the cell table is bounded by DIVERGENCES and is normally near-empty,
+this one is bounded by INSTRUMENTS. One rotation third (~290 of ~865 spots) ×
+375 session minutes ≈ **108K rows/day** at full success, ~30 MB/day at the
+measured ~272 B/row, so **~2.7 GB across the 90-day hot window** — the largest
+per-day writer in that list. At today's measured 50-successful-fetches ceiling
+it is ~19K rows/day, so the number will GROW as the fetch failures are fixed,
+which is the opposite of the usual direction and worth stating before it
+surprises someone.
+
+---
+
+## Item 39 — the whole day's cross-verification was discarded, and 99% of it was never data
+
+**Status:** DONE (2026-08-26)
+
+### Design
+
+Found by reading the live logs rather than waiting for tomorrow's run.
+
+Today's 15:41 IST run **failed to persist at all**:
+
+> `dhan_live_crossverify ILP flush failed — 764003 pending row(s) discarded`
+> `Buffer size of 207965278 exceeds maximum configured allowed size of 104857600`
+
+**The entire day's comparison was lost** — in the one check that exists to
+prove nothing else was.
+
+**Why 764,003 rows.** The verdict line carries `instruments: 8144` beside
+`targets: 865`. The live universe holds every option and future contract; the
+REST leg fetches ~865 spots. `compare_day` built its key set from live ∪ rest
+with **no scope filter**, so every minute of the ~7,279 never-requested
+instruments was recorded as `missing_rest` — *"the vendor is missing this"* —
+for data nobody asked the vendor for.
+
+**757,273 of 764,003 findings (99.1%) were that.**
+
+Two fixes, deliberately independent:
+
+1. **The scope filter** (root cause). `compare_day_in_scope` takes the set the
+   run actually requested; a live instrument outside it produces no findings
+   and is not counted in the reported universe.
+2. **Batched flushing** (floor). 20,000 rows per flush — not a round number:
+   the breached buffer averaged ~272 bytes/row, so a batch lands near 5 MB
+   against a 100 MB ceiling. A future legitimately-large day now loses at most
+   one batch instead of everything.
+
+Two mechanisms because *"the row count can never grow again"* is precisely the
+assumption that produced the ceiling breach.
+
+### Edge cases
+
+- **An empty scope disables the filter**, so every existing caller and test
+  means exactly what it did before.
+- **The scope key pairs `security_id` with `segment`** (I-P1-11). The same
+  numeric id in another segment is a different instrument; matching on the id
+  alone would admit one we never asked for and re-create the defect one
+  instrument at a time.
+- **A requested instrument the vendor did not serve is STILL `missing_rest`.**
+  The filter must not silence the signal it sits beside — that is the one case
+  the category exists to report.
+- **The skip happens BEFORE the instrument count.** Counting it would report a
+  universe far larger than the one verified, which is how `8,144 instruments`
+  sat in the verdict beside 865 targets and read as coverage.
+
+### Failure modes
+
+**The filter hiding real loss** — pinned by the asked-for-and-not-served test.
+
+**A silent regression to the unscoped comparison** — bite-proven: removing the
+filter fails 5 tests.
+
+### Test plan
+
+6 tests: a never-requested instrument produces no findings; it is not counted
+in the universe; a requested-but-unserved one still reports missing; an empty
+scope filters nothing; the key pairs id with segment; and the measured prod
+shape (200 live, 3 targeted) collapses to 3 findings rather than 200.
+
+### Rider — my own guard fired twice, correctly
+
+The single-test-marker guard written this morning caught the helper placement
+**twice**: once for a test-only attribute in production code, and once for a
+comment that merely NAMED that attribute. Both times it was right. That is the
+third instance today of a source scanner unable to tell quoting from doing, and
+the helper now lives inside the test module with nothing spelling the attribute
+out.
+
+### Rollback
+
+Pass an empty scope set and drop the batch flush. That restores a comparison
+that reports 99% noise and loses the day when it grows.
+
+### Observability
+
+**No new metric name and no cost.** `batch_errors` rides the existing
+partial-write error line.
+
+### Honest envelope
+
+This makes the day's comparison **persistable and its findings meaningful**. It
+does **not** improve coverage: the same ~50 instruments still succeed. It does
+not reduce the 815 fetch failures. And it changes what `missing_rest` MEANS —
+historical rows carry the old, inflated definition, so any trend across
+2026-08-26 is a definition change, not a signal.
+
+## Item 25 — the two percentage columns exist on every candle and have never held a value (2026-08-26)
+
+**Operator instruction (2026-08-26, verbatim, typos preserved):**
+
+> "i believe pre open percetage cjmaeh and percnetahe change both of them not
+> needed for ticks dude it is oen and only need for seocnds an dminutes dude
+> okay? see emanwhiel hwow ill you ensure that evn seconds level also will
+> hodl thes eprecise ohlcv and even minute laso ohlcv dude okay? can you lsit
+> i tour dud eoaky?"
+
+He is narrowing an earlier request: the percentage change and the pre-open
+percentage change belong on the **seconds and minutes frames**, not on the raw
+tick table. That is exactly where the columns already are — and that is what
+makes the finding below worth an item rather than a shrug.
+
+### The finding (MEASURED live, not inferred)
+
+`candles_<tf>` has carried `open_pct`, `open_gap_pct`, `change_pct` and
+`close_pct_from_prev_day` since the Wave-5 seal-column work. Read live on the
+production box, 26 Aug 2026, market session only:
+
+| Frame | Bars stored today | With `open_pct` ≠ 0 | With `open_gap_pct` ≠ 0 |
+|---|---:|---:|---:|
+| `candles_1s` | 9,038,254 | **0** | **0** |
+| `candles_5s` | 4,236,485 | **0** | **0** |
+| `candles_15s` | 2,399,970 | **0** | **0** |
+| `candles_1m` | 1,065,763 | **0** | **0** |
+| `candles_3m` | 520,649 | **0** | **0** |
+| `candles_15m` | 148,183 | **0** | **0** |
+
+17.4 million bars, six frames, not one value. The cause is not a plumbing gap
+and not a schema gap — both were verified present:
+
+- **The baselines are live.** `prev_day_close` and `session_open` are
+  refreshed from the exchange fields on every fold in `fold_into_bucket`,
+  last-non-zero-wins. In the minute sampled, all **189,396** ticks carried
+  both.
+- **The write path is intact.** `ShadowSealRow::from_buffered_seal` copies
+  `state.open_pct` / `state.open_gap_pct` / `state.close_pct_from_prev_day`
+  verbatim into the ILP row, and the columns exist in the DDL.
+- **The arithmetic was never written.** `open_bucket` initialises all three to
+  `0.0`, and a workspace scan finds **no other production assignment to any of
+  them**. The doc comments on `LiveCandleState` say "Stamped at seal time";
+  nothing stamps.
+
+This is the false-OK class: a column that exists, is documented, flows through
+the writer, and is always zero reads to a consumer as "this instrument has not
+moved", not as "this was never computed".
+
+### Design
+
+One pure method on `LiveCandleState`, called at every point a bar leaves the
+aggregator:
+
+```
+stamp_seal_percentages():
+    close_pct_from_prev_day = pct(close,        prev_day_close)
+    open_pct                = pct(close,        session_open)
+    open_gap_pct            = pct(session_open, prev_day_close)
+```
+
+where `pct(value, baseline)` returns `0.0` unless `baseline` is finite and
+strictly positive **and** `value` is finite, and returns `0.0` again if the
+quotient is not finite. Zero is the existing "not computable" sentinel for
+these columns and stays so — a bar whose baseline never arrived is
+indistinguishable from one that has not moved, and inventing any other value
+would be worse.
+
+`volume_pct_from_prev_day` and `oi_pct_from_prev_day` are deliberately NOT
+stamped: their columns were dropped from the candle DDL (operator decision
+2026-05-28 — spot instruments have no OI and indices have no volume), so
+computing them would produce fields nothing reads.
+
+**`change_pct` is not a fourth number.** `ShadowSealRow` already sets it equal
+to `close_pct_from_prev_day`; that stays, and this item does not add a
+separate meaning for it.
+
+### The emission sites — all four, and why a helper is not enough
+
+A bar leaves `AggregatorCell` at four points, and the fourth is the one a
+careless fix would miss:
+
+| # | Site | Why it must stamp |
+|---|---|---|
+| 1 | `consume_tick`, intraday bucket crossing (`ConsumeOutcome::Sealed`) | the ordinary path — most bars |
+| 2 | `force_seal` | the IST-midnight / shutdown drain |
+| 3 | `catch_up_seal` | the watermark sweep, which seals illiquid instruments on time |
+| 4 | `consume_tick`, late refold (`ConsumeOutcome::AmendedLate`) | **the bar's `close` CHANGED.** A percentage stamped before the amend is stale for the row that is actually persisted |
+
+Site 4 is the reason this is not a one-line change. A late tick re-writes
+`close` on an already-emitted bar and the amended state is re-persisted; a
+percentage computed at the original seal would then disagree with the `close`
+sitting beside it in the same row.
+
+### Edge Cases
+
+| Case | Behaviour |
+|---|---|
+| Pre-open, no exchange baseline yet | `session_open` / `prev_day_close` are `0.0`; both percentages stamp `0.0`. Unchanged from today. |
+| Baseline arrives mid-session (indices — the first several ticks carry no open) | last-non-zero-wins already handles it; every bar sealed after arrival stamps correctly. Bars sealed before it keep `0.0`, honestly. |
+| `close` is a subnormal or non-finite value | the ingest gates upstream already refuse those; the `is_finite` test here is belt-and-braces and returns `0.0`. |
+| Baseline is negative or non-finite | refused — `0.0`. A negative baseline would flip the sign of every percentage silently. |
+| Quotient overflows to infinity | refused — `0.0`. Reachable only from a subnormal baseline that passed the positivity test. |
+| A late refold changes `close` | site 4 re-stamps from the amended `close`. |
+| Day boundary | `force_seal` clears the day-scoped state as it already does; the next day's first bar stamps `0.0` until its baseline arrives. |
+
+### Failure Modes
+
+| If this breaks | Blast radius |
+|---|---|
+| The stamp is wrong | a wrong percentage in a column that is zero today — strictly no worse than the status quo, and visible immediately in any query |
+| A fifth emission site is added later without stamping | that path silently ships zeros again. **This is the real risk**, and it is what the guard test below exists for. |
+| The stamp panics | it cannot: no indexing, no unwrap, no division without a positivity test |
+
+### Test Plan
+
+Unit tests on `LiveCandleState::stamp_seal_percentages` (pure, no I/O):
+
+- a normal bar stamps all three correctly against hand-computed values
+- the live NIFTY numbers from today used as a fixture
+  (open 24,341.95 · prev close 24,334.55 · close 24,273.15 →
+  intraday −0.28%, gap +0.03%)
+- zero / negative / non-finite / subnormal baseline each stamps `0.0`
+- non-finite `close` stamps `0.0`
+- an unchanged price stamps exactly `0.0`, not a rounding artefact
+
+Aggregator tests, one per emission site:
+
+- an intraday crossing seal carries non-zero percentages
+- `force_seal` carries them
+- `catch_up_seal` carries them
+- a late refold that moves `close` re-stamps to match the amended `close`
+
+Guard test (the durable half):
+
+- a source scan asserting every `ConsumeOutcome::Sealed` / `AmendedLate`
+  construction and every `mem::replace` seal in `aggregator_cell.rs` is
+  preceded by a stamp — so a fifth path added next month fails the build
+  instead of shipping zeros
+
+### Rollback
+
+Revert the commit. The columns return to `0.0`, which is the state they have
+been in since they were created — no migration, no schema change, no data to
+undo. Nothing downstream reads them today, so nothing breaks in either
+direction.
+
+### Observability
+
+No new metric, no new alarm, no cost. The evidence is the columns themselves:
+the same live query in the table above returns non-zero on the first session
+after deploy. That query is the acceptance test, and it is cheap enough to
+re-run any day.
+
+### Guarantee matrix
+
+Per `.claude/rules/project/per-wave-guarantee-matrix.md` — the 15-row and
+7-row matrices apply to this item as written there. Rows specific to it:
+zero-alloc (three float divisions on existing struct fields, no allocation, no
+new hot-path branch on the tick path — the stamp runs once per SEAL, not once
+per tick); O(1) (constant work per bar); uniqueness/dedup unchanged (no key
+column touched); recovery unchanged (the seal ring, spill and DLQ carry the
+same struct they always did).
+
+
+### Item 25 — CORRECTION (2026-08-26, same day, operator-caught)
+
+I labelled the two columns the wrong way round in the plan above, the
+artifact, and the chat summary. He caught it verbatim:
+
+> "what eprcenatge change shdou l chekc with rpevd ay close right dude ami i
+> rght dude? but for only for pre open 9.15 am open prcoe comapred with evry
+> minute or seocdn closed rpcoe ddue am i irght dude what the fukis this dude
+> okay? i believe you are wong wiht clauclting theis percnetga change and rpe
+> open eprncetage dud eokay?"
+
+| Column | Question | What I called it | **What it actually is** |
+|---|---|---|---|
+| `close_pct_from_prev_day` | close vs yesterday's close | "the day change" | **percentage change** |
+| `open_pct` | close vs today's 09:15 open | "percentage change" | **pre-open percentage change** |
+| `open_gap_pct` | 09:15 open vs yesterday's close | "pre-open percentage" | the overnight **gap** |
+
+**He is right and the reasoning is his own, stated three times today:** the
+09:15 open IS the pre-open call-auction equilibrium price
+(*"the finalised pre open 9.12 close price as 9.15 am open price"*). So
+"pre-open percentage change" means *how far this bar has moved from the
+pre-open-determined open* — `open_pct`. And "percentage change" unqualified
+means change on the previous close, which is the market convention every
+screen in India uses.
+
+**No arithmetic changes.** All three columns were already being stamped by
+this item, and all three formulas were already correct; only my NAMES for
+them were wrong. What changed is the documentation, the test labels, and —
+importantly — the default the movers ranking must use: **rank by
+`close_pct_from_prev_day`**, the percentage change, not by `open_pct`.
+
+That last consequence is why this correction was worth chasing rather than
+quietly amending: a gainers list ranked on the wrong column produces a
+plausible, completely different list, and nothing about it would look wrong.
+
+---
+
+# WAVE 9 — the 2026-09-01 audit: the fifteenth socket, the folded refusal, and the unseeded pager
+
+**Status of this wave:** IN_PROGRESS (the plan file's own Status stays IN_PROGRESS).
+**Date:** 2026-09-01
+**Authorised by:** Parthiban, 2026-09-01, verbatim: *"Fix everything I never ever wanted to
+face any websocket disconnect or reconnect and there shouldn't be any tick loss no db
+pressure no memory ram pressure nowhere our entire 16 websocket connections shoudl never
+ever be dropped or lost at any point of time especially starting. 9 am till 3.49 pm per
+current day should never ever be stopped or lost dude okay?"*
+
+## Why this wave exists
+
+A live read of the Monday 2026-08-31 session (CloudWatch, `Tickvault/Prod`, 115 metrics)
+plus a four-agent source sweep. Session facts, all MEASURED:
+
+| Fact | Value |
+|---|---|
+| Ticks ingested | 83,932,875 (week high) |
+| **Permanently lost** | **0** — `tv_ticks_lost_total`=0, `wal_dropped`=0, dropped==spilled exactly |
+| Refused by DB, rescued to disk | 11,362,297 (13.5%, 37x Friday) |
+| QuestDB apply lag | 18 -> **80,217**, monotonic, never recovered |
+| Alive connections | **14**, held min=max=14 for 8 hours |
+| Reconnects / dial failures | 47 / 46, **all inside one 5-minute window at 08:50 IST** |
+
+Four things the audit CORRECTED rather than found (recorded because this repo's history
+says stale findings manufacture false work):
+
+- "Six dead dashboard widgets" — **FALSE**. Those greps are removal comments
+  (`dashboard.tf:97,105,112`); the widgets were retired 2026-07-15/17.
+- "Dead alarm `order_fill_lag_high`" — **FALSE**. Deliberately dormant,
+  `actions_enabled=false` (`order-side-alarms.tf:282`), guard-pinned.
+- "87 invisible loss counters" — **OVERSTATED**. `loss_counter_visibility_guard.rs:477`
+  already enforces shipped-or-logged. They lack a *chartable series*, not visibility.
+- CLAUDE.md's "spot store projects ~34.9 GB" — **STALE**. `config/base.toml:930` sets
+  `spot_days = 1`, not 35, so the projection is 721 MB, and the store commits **zero**
+  bytes today (`[rest_candle_fold] enabled = false`, no writer).
+
+## Design
+
+**Item 9.1 — the fifteenth socket (the operator's stated #1).**
+`tv_dhan_ws_alive_connections` peaked at 14. Two independent causes:
+(a) the gauge's ceiling is **15, not 16** — the order-update socket is spawned by
+`dhan_rest_stack.rs` and `AliveConnectionGuard::acquire` refuses non-market-data endpoints
+(`dhan_feed_stack.rs:7993`), so 16 was never countable here;
+(b) the 5th depth-200 socket (the day's biggest mover) is genuinely lost every session.
+Depth attaches PRE-OPEN (~08:50, driven toward the 09:12 readiness deadline). At that
+moment `fetch_movers` finds `candles_1m` empty (the aggregator folds from 09:15) AND its
+pre-open tick fallback empty (capture starts 09:00), so `top_mover_pick` returns `None`
+(`dhan_feed_stack.rs:7268`). Its `None` arm states *"The retry loop asks again"* — but
+`depth_done = true` latches unconditionally at `:7615`, `outstanding_halves` (`:6823`)
+never returns the depth half again, and the selection block short-circuits to
+`DepthSelection::default()` (`:7183`). **A comment asserting a retry the code prevents.**
+Fix: a separate `depth200_fifth_done` latch so the depth half stays outstanding for the
+fifth socket ONLY, re-attempting the pick on the existing 60 s loop once a ranking exists
+(from ~09:00 via ticks, ~09:16 via candles), and dialing just that one instrument on a
+later loop iteration. Depth-20 and the four ATM depth-200 sockets are never re-planned.
+
+**Item 9.2 — the folded refusal counter.** `dhan_feed_stack.rs:2052` folds FIVE distinct
+reasons into `reason="out_of_session"`, and the 30 s read-out at `:4289-4311` deliberately
+skips that field entirely. Suppression is CORRECT for true `out_of_session` (ticks outside
+[09:00,15:40) are normal daily) and WRONG for the other four — `stale_trading_day` has a
+recorded 8,898 fabricated bars (`:1969-1974`) and `out_of_band_timestamp` measured
+2,008,916/session (`multi_tf_aggregator.rs:717`). Fix: split the single counter field into
+five, widen `refusals()`, and add the two real-signal reasons to the EXISTING
+AGGREGATOR-DROP-01 line and its emit condition. **No new metric name, no new EMF entry,
+$0/mo** — which matters because the maximal month is ~$123.88 against a $125 cap and a
+$117 auto-stop line, leaving ~3 names of headroom.
+
+**Item 9.3 — the unseeded pager.** `tv_telegram_dropped_total` is created lazily in error
+arms only, so an unregistered counter publishes no series and the FIRST episode is
+invisible — making the documented alarm threshold of 3 behave as 4. Fix: seed all three
+reason labels at `main.rs:1245` beside the existing seeds. Log-filter metric, **$0**.
+
+**Item 9.4 — the boot-only gauge that reads as live.** `tv_dhan_feed_stack_connections`
+is written once at bring-up (`:8651`) and never moves; it reads 1.0 while 14 sockets are
+alive. Its own doc admits it, but it is EMF-shipped, so an operator reads a live count.
+Fix: publish it on every dial and every park.
+
+## NOT taken in this wave, deliberately
+
+- **`ticks.ts` -> receipt clock.** This is the measured root cause of the DB pressure:
+  `ticks` is `PARTITION BY HOUR` on exchange last-TRADE time and **10.0% of one day's
+  64.3M ticks carried a ts more than an hour behind arrival**, so one commit in ten
+  reopens a closed hourly partition and rewrites it (`tick_persistence.rs:1954`, measured
+  live). Changing it is the single biggest lever AND changes `ts` semantics for every
+  consumer — the cross-verify window and `partition_archive` both key on it. It needs
+  `scripts/diagnose-write-amplification.sh` run on the box first. Specified, not shipped.
+- **`QDB_CAIRO_O3_MAX_LAG` 60000000 -> 300000.** An agent proposed this as its #2 lever,
+  claiming the unit is milliseconds (16.7 h). **REJECTED.** The comment block above it
+  states every value there was *"VERIFIED against the running container on 2026-08-18 via
+  SHOW PARAMETERS"*; QuestDB's `cairo.o3.max.lag` is microseconds (default 600000000 =
+  10 min), so 60000000 = 60 s exactly as documented. Applying it would have set a
+  0.3-second merge window. Recorded so nobody re-proposes it.
+- **Gating the live lane's first dial on 09:00.** It would kill most of the 46 dial
+  failures (they are pre-open TCP-RSTs — `market_hours_gate.rs:5-10` documents Dhan
+  RSTing idle pre-open connections) but would cost the 09:00-09:15 pre-open candles the
+  2026-08-28 operator directive requires. A 25 ms/slot stagger on the FIRST dial is the
+  safe half and is deferred to its own wave with its own measurement.
+
+## Edge Cases
+
+- Fifth socket never fills because the whole session is genuinely flat: the socket goes
+  unused and that is HONEST — the retry must stop at 15:30, not spin.
+- `pool.admit` must refuse a sixth depth-200 socket even if the retry misfires.
+- The retry must NOT re-plan depth-20 or the four ATM sockets (they are already subscribed;
+  re-dialing would drop live books).
+- Seeding a counter with `.increment(0)` must happen AFTER the metrics recorder is
+  installed, or it resolves to a no-op recorder (same rationale as the existing seeds).
+- Splitting the refusal field must not change the emitted metric label — the EMF processor
+  folds label values, so the single `out_of_session` series must stay byte-identical.
+
+## Failure Modes
+
+- Retry loop dials a sixth socket -> Dhan error 805 -> `ParkReason::PoolOverflow`, permanent.
+  Guarded by the `DEPTH_200_MAX_SOCKETS` check plus `pool.admit`.
+- A late fifth-socket dial races the 15:30 attach hard stop (`:7094`) -> bounded by the
+  same stop.
+- Un-suppressing two reasons makes the 30 s line fire on a day where they are legitimately
+  non-zero -> it is a log line, not a page; no alarm is added.
+
+## Test Plan
+
+- `outstanding_halves` gains a fifth-socket case: depth_done=true + fifth_done=false must
+  still return the depth half. Pure function, unit-testable.
+- A test that the fifth-socket retry stops at 15:30 and after first success.
+- A test that the five split refusal fields sum to the previous single field.
+- A test that the AGGREGATOR-DROP-01 emit condition fires on stale_trading_day > 0 and does
+  NOT fire on true out_of_session alone.
+- A test that all three telegram reason labels are seeded at boot.
+- Guard re-bless: any source-scan guard pinning the touched lines.
+
+## Rollback
+
+Every item is additive and independently revertable. 9.1 is one boolean; reverting restores
+today's 14-socket behaviour. 9.2/9.3 are counters and log fields with no metric-name change,
+so no terraform, no EMF count move, no cost change. 9.4 is one gauge publish.
+
+## Observability
+
+No new EMF metric name and no new alarm in this wave — deliberate, given ~3 names of budget
+headroom. 9.2 adds fields to an existing coded line (`AGGREGATOR-DROP-01`), which a
+CloudWatch metric filter can later extract as a numeric value at $0.10/mo if a page is
+wanted (the §2.3e precedent). 9.1 makes the fifth socket visible through the already-shipped
+`tv_dhan_ws_alive_connections`. 9.4 repairs an already-shipped gauge.
+
+### ⚠ Item 9.1 CORRECTED 2026-09-01, before any code was written
+
+The design above says the fix is *"re-attempting the pick on the existing 60 s loop"*.
+**That loop does not exist to retry on.** `dhan_feed_stack.rs:7758` RETURNS from the
+attach task once `contracts_done && depth_done` and the top-up window is closed — and it
+returns while handing `depth_commands` BY MOVE to the per-minute rebalance machinery
+(`:7770-7775`), because holding them any longer closes those channels. So there is no
+surviving loop iteration in which a late fifth-socket dial could run.
+
+That makes item 9.1 an ARCHITECTURAL change, not a latch flip. The three available shapes,
+none of them small:
+
+| Shape | Cost |
+|---|---|
+| Keep the attach task alive past both halves to chase the fifth | Changes the single success-return, and delays the `depth_commands` hand-off that makes the ATM machinery live |
+| Delay the depth dial until a ranking exists (~09:00 ticks / ~09:16 candles) | Forfeits pre-open depth, which the 2026-08-28 directive requires |
+| Give the fifth socket to the rebalance machinery | That machinery tops up EXISTING sockets; it does not hold `pool` and cannot dial |
+
+**One genuine de-risking finding, recorded for whoever takes this:** the fear in the
+comment at `:7212` — that dialing the fifth later is unsafe — is smaller than it reads.
+`PoolSupervisor::admit` (`pool_supervisor.rs:2367`) delegates to `budget.try_open`, which
+is STATEFUL per endpoint, so a later dial cannot over-open: it either returns the next
+slot (index 4, exactly `DEPTH_200_TOP_MOVER_SOCKET`) or refuses with `PoolBudgetRefusal`,
+which the existing `Err` arm already handles. Over-dialing into Dhan error 805 is
+therefore structurally impossible. And `build_feed_stack_plan(&mut pool, now, &[], &[],
+&[fifth])` plans ONLY that socket, because `plan_pool` returns early on an empty set
+(`:717`) — depth-20 and the four ATM sockets cannot be re-planned by accident.
+
+**NOT IMPLEMENTED in this wave, deliberately.** It touches the live connection path in an
+environment where neither Dhan nor QuestDB is reachable, so it cannot be validated here,
+and a wrong move parks a socket permanently — the exact failure the operator is asking to
+prevent. It is specified above and should land as its own PR with box validation.
+
+**Also corrected:** the 16-vs-15 half is NOT a defect. `AliveConnectionGuard::acquire`
+refuses non-market-data endpoints (`:7993`), and the order-update socket is spawned by
+`dhan_rest_stack.rs`, so `tv_dhan_ws_alive_connections` has a structural ceiling of 15 and
+"16" was never countable on this gauge. A full house is **15 on this gauge plus the
+order-update socket**, not 16. The honest fix is to document the ceiling or count the
+sixteenth — not to hunt a socket that was never in this gauge's scope.
+
+## Item 23 — the second-sweep open findings (2026-09-02, operator: "go ahead and fix the remaining open findings dude okay?" + "Once fixed finished and resolved merge and deploy it also dude okay?")
+
+**Status:** IN_PROGRESS. Authority: the operator's 2026-09-02 instructions, given in direct
+response to the Second Sweep Ledger (artifact 849f0cca) which listed fourteen open findings
+with a cost or decision attached to each. That is the §28.2-shape general go-ahead selecting
+an enumerated list. Recorded here BEFORE the code, per the design-first wall.
+
+> **Incident note (2026-09-02 03:52 UTC):** a first implementation pass of every item below
+> was completed by six parallel agents and lost UNCOMMITTED when the remote container was
+> reclaimed during a ~90-minute idle wait on a usage limit. This second pass commits each
+> item as it lands. Recorded so the cost is visible, not hidden.
+
+### Design (Item 23)
+- **F1 depth frames on replay:** WAL record gains an endpoint byte (`TVW4`), the boot replay
+  routes depth-socket frames to the depth writer instead of counting them and moving on.
+  `TVW1..3` records replay exactly as today (endpoint = main feed, the only writer they ever had).
+- **F2/F3/F12 loss signals:** deferred replay segments (once per boot), active-segment pressure
+  prunes and replay `lost` outcomes each gain a coded `error!` under the ALREADY-FILTERED
+  WS-SPILL-01 code with a distinguishing `source` field — $0, no new EMF name, no new alarm.
+- **F4 805 sibling kill:** the redial waits (bounded) for the peer's Close reply before dialing
+  again, so a half-open socket is not counted by the vendor as a sixth connection. The vendor
+  premise stays Assumed and is stated at the site.
+- **F6/F7 alive + frame watchdog:** alive is published on the connected edge; a frame-age
+  watchdog on the feed lane redials a socket that pongs but delivers nothing.
+- **F8 swap ack:** the `ExtendOutcome` acknowledgement shape from Item 22's round is applied to
+  `Swap` so `held` advances on apply, not on queue.
+- **F9/F10:** a dropped `ws_event_audit` row and a persistently failing disk-pressure probe
+  each become an edge-latched coded `error!` under an existing filtered code (HOT-PATH-02 /
+  STORAGE-GAP-05).
+- **F5 memory ceiling:** systemd `MemoryHigh=15G` + `OOMScoreAdjust=-900` on the app unit
+  (never `MemoryMax` — a hard kill is the failure being avoided), RESOURCE-02 resolves the
+  unit's own cgroup and prefers `memory.high` when `memory.max` is unlimited, and a log-filter
+  alarm on RESOURCE-02 (+$0.10/mo, the one new alarm — dated row §2.3p in the noise lock).
+- **F13:** the publisher-less 40 MB tick broadcast is removed.
+- **F14:** the guard holes named on the ledger are closed in `rust_only_guard.rs`.
+- **NOT taken:** F11 (mid-session retention floors) is an operator decision that conflicts
+  with the standing "never delete a tick" instruction; recorded, not changed.
+
+### Edge Cases (Item 23)
+Mixed-version WAL directories (TVW3 + TVW4 segments in one replay); a Close reply that never
+arrives (bounded wait, then redial); a swap ack whose receiver dropped; RESOURCE-02 on a box
+with no cgroup limit (falls back to memory.high, then MemTotal); a prune that deletes a
+segment the replay was about to read.
+
+### Failure Modes (Item 23)
+Every new signal is fail-loud, never fail-open: an unreadable endpoint byte replays as main
+feed (never dropped); a swap ack that is lost un-marks the belief (re-offer is dedup-safe).
+
+### Test Plan (Item 23)
+Scoped `cargo test -p` per crate for every changed function; format round-trips for TVW4
+against TVW3 fixtures; bite-proofs recorded in the commit messages.
+
+### Rollback (Item 23)
+Each finding is its own commit; TVW4 readers accept TVW3 so a rollback of the writer loses
+nothing already on disk.
+
+### Observability (Item 23)
+No new EMF names. One new alarm (RESOURCE-02 log filter). Everything else rides existing
+filtered codes with a `source` field.
+
+## Item 24 — a restart must never replay frames it already applied (2026-09-05, operator: "Make this clean and make it to work" after "Yes wipe")
+
+**Status: IMPLEMENTED on branch `claude/rust-o1-aws-audit-im57xo`; awaiting the PR.**
+Authorization: the operator's "Do everything whatever you want go ahead fully" and
+"Make this clean and make it to work" (2026-09-05, in direct response to the Sept 3/4
+forensics that named the restart-replay as the cause and the replay-watermark as the fix).
+Rule-file record: `daily-universe-scope-expansion-2026-05-27.md` Quote 21 lists this exact
+follow-up ("the replay-watermark code fix (a restart must not replay already-applied
+segments)") as the work Monday's wipe does NOT cover.
+
+- [x] **24a — `crates/storage/src/wal_applied_watermark.rs`**: a 2 KiB CRC-checked
+  `applied.tvaw` beside the segments holding `hwm_ticks`/`hwm_depth` (highest `capture_seq`
+  ACKED by QuestDB or DURABLY RESCUED, per sink) plus a fixed 128-slot bucket table of
+  captured-but-unapplied sequences (4.6-minute buckets). RAM = atomics; persisted tmp+rename
+  at most once a second from the sink threads and at shutdown. Every failure direction is
+  "replay more".
+- [x] **24b — producers**: `TickWriter`/`DepthWriter` track the pending `capture_seq` range;
+  `FlushBatch`/`RescueBatch` (and depth twins) carry it; the sinks ack on landed OR rescued,
+  mark the range unapplied on a failed rescue; `RingFull` sheds in `pool_supervisor` and a
+  failed ILP append mark the frame unapplied; the synchronous flush arms ack too.
+- [x] **24c — consumer**: `replay_all_with_report_guarded` archives a segment UNREAD when its
+  range `[first_seq, next.first_seq − 1]` is below the slack-adjusted watermark for BOTH sinks
+  and overlaps no unapplied bucket; the boundary/last segment is read and filtered per frame
+  (`replay_segment_filtered`). `capture_seq` derivation untouched → DEDUP idempotency
+  unchanged.
+- [x] **24d — open-segment exclusion**: the writer's currently-open segment is registered
+  (`OPEN_SEGMENTS`, per directory) and never listed by `wal_segments_in`, so a catch-up round
+  can no longer stage — and confirm can no longer archive — the file the writer is still
+  appending to (found by reading, 2026-09-04).
+- [x] **24e — fences on the PRODUCTION entry points only** (`replay_all_fenced`,
+  `replay_all_with_report_fenced`): a disk floor (`min(40 GiB, volume/8)`) and a per-boot
+  frame cap (3,000,000). `replay_all` / `replay_all_with_report` stay unfenced for the
+  sixty-odd fixtures that drive them; a small-disk dev host would otherwise refuse every test.
+- [x] **24f — confirm only after ACK**: both lane confirm sites wait (≤30 s, polled) for the
+  writer threads' handed-off == completed counters before `confirm_replayed`; on timeout the
+  catch-up ENDS and the segments stay staged. The stale "segments were already archived"
+  sentence in `report_unfolded_wal_frames` is corrected (boot stopped confirming on the lane's
+  behalf on 2026-08-28).
+- [x] **24g — reset after a full drain**: when the catch-up's last pass finds nothing left
+  (no frames, no deferrals, no disk/cap/memory stop) the unapplied map is cleared and
+  persisted.
+- [ ] **24h — live verification (first restart on the new build)**:
+  `tv_wal_replay_skipped_segments_total > 0`, `tv_wal_replay_recovered_total ≈ 0` after a
+  clean session, `tv_spill_dir_free_bytes` flat across the restart.
+
+### Design (Item 24)
+See the module header of `wal_applied_watermark.rs`. Segment-level skip needs the whole
+range under the LOWER of the two watermarks (a main-feed frame feeds both sinks) unless the
+lane runs without a depth sink (`mark_depth_untracked`). One second of reorder slack;
+frames inside it are re-replayed and DEDUP-collapsed. Bucket-table wrap sets `overflowed`
+→ no skipping until the next full drain clears it.
+
+### Edge Cases (Item 24)
+v1/v2 records (`frame_seq == 0`) are never skipped; a watermark ahead of the wall clock by
+more than a day is rejected; a segment whose successor starts inside an unapplied bucket is
+read (conservative bound); a `replaying/` leftover from a boot that died before confirm is
+skipped straight to `archive/` if fully acked; a failed disk probe is fail-open like the
+memory guard; `TV_WAL_APPLIED_SKIP=0` or deleting `applied.tvaw` restores full replay.
+
+### Failure Modes (Item 24)
+Persist failure → counter + warn, RAM kept, next boot replays more. Sink never acks → hwm
+frozen → no skips. Ack-wait timeout → coded WS-SPILL-01 `source=replay_ack_wait_timeout`,
+no confirm, drain ends. Disk floor / frame cap → coded WS-SPILL-01 `source=replay_disk_floor`
+/ `replay_frame_cap`, nothing moved. WAL-suspended silent ACKs still advance the watermark
+(unchanged exposure; `wal_suspension_watcher` owns it).
+
+### Test Plan (Item 24)
+`wal_applied_watermark` unit tests (roundtrip + crc, persist/load, buckets, overflow, cadence,
+drained-wait); `ws_frame_spill` tests: `a_second_boot_after_a_clean_session_replays_zero_frames`
+(bite-proof), unapplied-window, lower-watermark, slack, v1, open-segment exclusion, disk floor,
+frame cap, header probe, floor arithmetic. Existing WAL chaos/guard suites unchanged and green.
+
+### Rollback (Item 24)
+Kill switch `TV_WAL_APPLIED_SKIP=0`; deleting `applied.tvaw`; an older binary ignores the
+file. No schema, DEDUP-key or WAL record-format change. Skipped segments are ARCHIVED, not
+deleted (3-day retention), so manual replay remains possible.
+
+### Observability (Item 24)
+Counters (pre-registered at 0 on the first fenced pass): `tv_wal_replay_skipped_segments_total`,
+`_skipped_frames_total`, `_skipped_bytes_total`, `_disk_floor_stops_total`,
+`_frame_cap_stops_total`, `_ack_wait_timeouts_total`, `tv_wal_applied_watermark_invalid_total`,
+`tv_wal_applied_watermark_persist_failed_total` (paired with a `warn!`). No new EMF names and
+no new alarm in this change: every refusal rides the already-filtered WS-SPILL-01 code with a
+`source` field. The boot `info!` "WAL replay complete" now carries skipped segments/frames/bytes
+and `watermark_present`.
+
+---
+
+## Item 40 — the timeout that did not bound the readers (2026-09-07)
+
+**Numbered 40 because 25, 23, 24 and 12 have each been used twice already in this file
+(see the "TWO different sections were both numbered Item 12" merge note above). 39 was the
+highest unused number; this takes 40 so nothing collides a fifth time.**
+
+**Status: IMPLEMENTED, awaiting the PR.**
+Authorization: the operator's standing "Bro fix and resolve everything dude okay?"
+(2026-09-06), given in direct response to a message that ENUMERATED this finding among the
+second-sweep open items, and the standing "fix resolve merge deploy … until it gets merged
+and deployed don't stop". Same authorization shape as Item 23 above.
+
+**⚠ Sequencing honesty (Rule 11, no false-OK).** The code for this item was written and
+committed BEFORE this plan section existed — the design-first wall caught it at the push
+and this section is the response. The wall did its job; recording the design after the code
+is a real deviation from its intent and is stated here rather than papered over. What is
+NOT a deviation: the fix ships with its design, its edge cases, its failure modes and its
+bite-proofs in the same PR, which is what the wall exists to guarantee arrives.
+
+### Why (the defect, verified in source)
+
+`crates/tickvault-logs-mcp/src/tools.rs::run_with_timeout` enforced its timeout against the
+CHILD and not against the READERS. On the success path it called `join()` on both reader
+threads with no bound; on the timeout path it leaked them entirely.
+
+`read_to_end` returns at EOF, and EOF arrives when EVERY holder of the pipe's write end
+closes it — **not** when the child exits. A child that backgrounds anything (`&`, `nohup`,
+`docker compose up -d`, which this repository's own SessionStart hook runs) leaves a
+GRANDCHILD holding the inherited pipe. EOF never comes, `join()` never returns, and the MCP
+server hangs inside the one function whose entire purpose is a timeout.
+
+This is the same class as the accept loop bounded in #1883 (Item 15 of the second-sweep
+list): a blocking call with nothing to notice a deadline with. That one was in `storage`
+and therefore inside an existing plan's crate set; this one is in `tickvault-logs-mcp`,
+which **no active plan has ever referenced** — which is why the wall fired.
+
+It matters because CLAUDE.md's AUTOMATION-FIRST RULE orders every session to reach for the
+`mcp__tickvault-logs__*` tools BEFORE grepping by hand. A hang here does not degrade
+observability, it removes it, at exactly the moment a session is trying to answer "is
+anything broken?".
+
+## Plan Items
+
+- [x] **40a — `spawn_bounded_pipe_reader`** replaces the `read_to_end` closure: fills a
+  shared `Arc<Mutex<Vec<u8>>>` in 8 KiB chunks and signals completion on a
+  `sync_channel(1)`, so the parent can wait with a deadline instead of a `join()`.
+- [x] **40b — `collect_bounded_stream`** takes what has arrived by a deadline and reports
+  whether the stream actually ended.
+- [x] **40c — `PROC_CAPTURE_MAX_BYTES` (8 MiB)** caps ONE stream. `read_to_end` had no
+  ceiling, so a looping child could grow the parent heap without limit — the unbounded
+  growth this repository bans everywhere else.
+- [x] **40d — `PROC_CAPTURE_TRUNCATED_NOTICE`** appended to stderr when a reader did not
+  finish, because the failure is silent by construction otherwise.
+- [x] **40e — the timeout path reaps too**, under its own shared deadline, instead of
+  leaking both reader threads.
+
+### Design (Item 40)
+
+The drain deadline is **SHARED across both streams**, not one budget each. A grandchild
+inherits stdout AND stderr, so a per-stream budget doubles the worst case. The first draft
+did exactly that and its own regression test caught it, failing at the harness bound; the
+reasoning is recorded at `collect_bounded_stream`.
+
+The completion signal is a `sync_channel(1)`, never an unbounded `channel()`: exactly one
+message is ever sent, so capacity 1 can never block and can never grow. The pre-commit
+banned-pattern scanner caught the first draft using the unbounded form — recorded because
+the gate found a real thing, not a formality.
+
+Five seconds for the drain because the child is already gone by that point: the pipes
+either drain immediately or a grandchild is holding them, and no amount of further waiting
+distinguishes the two.
+
+### Edge Cases (Item 40)
+
+A missing pipe (`None`) completes immediately rather than blocking. A read ERROR ends the
+capture exactly as EOF does — looping on a failing pipe is the busy-wait version of the
+hang being bounded. A poisoned buffer lock means the parent panicked, so the reader stops
+and lets the parent's own unwind be the report. At the byte ceiling the reader stops and
+`checked_sub` cannot underflow.
+
+### Failure Modes (Item 40)
+
+At the cap the reader drops its end of the pipe, so a child that keeps writing takes an
+EPIPE and usually dies. That death is **REPORTED** — the exit code reaches the caller — and
+is the better half of the trade against an unbounded parent heap; stated at the constant.
+A reader that misses the drain budget yields a partial stream PLUS the truncation notice,
+never a silent short read.
+
+### Test Plan (Item 40)
+
+Five tests, each running the call on a helper thread behind a bounded channel so a
+regression FAILS at the harness bound rather than hanging the suite:
+`a_grandchild_holding_the_pipe_cannot_park_the_reader_join` (`sh -c "sleep 15 & echo
+held-open"`, 10 s bound), `an_ordinary_command_still_captures_both_streams_and_says_nothing_extra`,
+`a_failing_command_reports_its_exit_code`, `spawn_bounded_pipe_reader_stops_at_the_capture_ceiling`,
+`spawn_bounded_pipe_reader_completes_on_a_missing_pipe`.
+
+Bite-proven in both directions, each mutation restored afterward: `recv_timeout` → unbounded
+`recv()` fails the grandchild test at 10 s; dropping the truncation notice fails the stderr
+assertion; `PROC_CAPTURE_MAX_BYTES` → `usize::MAX` fails the ceiling test; restored, 84 passed.
+
+### Rollback (Item 40)
+
+Single-file, single-function revert. No schema, no DEDUP key, no wire format, no config, no
+constant consumed outside this module. The MCP tool surface is unchanged.
+
+### Observability (Item 40)
+
+No new metric and no new alarm, deliberately: the signal is the truncation notice in the
+caller's own stderr, which reaches the operator through the same tool result that carries
+the output. A counter here would be a series nobody reads, which this repository has already
+recorded as its own failure class.
+
+### Honest envelope (Item 40)
+
+100% inside the tested envelope, with bite-proven regression coverage: a grandchild holding
+the pipe can no longer park the parent, and a partial capture says so in its own output.
+**NOT claimed:** that a parked grandchild is impossible — it is not; the grandchild still
+holds the pipe and still runs. What changed is that the parent no longer waits on it
+forever. **NOT claimed:** that this bounds every blocking call in the MCP server; it bounds
+`run_with_timeout`'s readers, which is the one this defect is in.
+
+---
+
+## Item 41 — Read spot prices from RAM, not from QuestDB
+
+**Status:** IMPLEMENTED 2026-09-08. Deploy deferred to the 15:46 IST post-close
+window (market-hours guard + the Quote 21 REJECT on in-session restarts).
+
+### Design
+
+Locating at-the-money needs one number per underlying: today's spot level. The
+contract and depth selectors obtained it with a QuestDB round trip
+(`SELECT security_id, segment, ltp FROM ticks ... LATEST ON ts PARTITION BY
+security_id, segment`). That is not O(1), it is blind to database lag, and it
+breaks the charter's RAM-first rule (rule 2 of the eleven always-on rules) on a
+path that decides what the lane subscribes.
+
+`SpotPriceStore` (`crates/app/src/spot_price_store.rs`) is a
+`papaya::HashMap<(SecurityId, ExchangeSegment), AtomicI64>` holding today's
+latest traded price in paise. The drain writes it on the tick path through
+`&self`; the contract and depth attach tasks read it through `&self` from their
+own tasks. No lock on either side.
+
+`load_contract_universe` and `load_depth_candidates` now take the store and
+overlay it OVER the QuestDB result, RAM winning. Both sources, because neither
+alone is sufficient: RAM cannot see a price from before this process booted (a
+mid-session restart would lose an illiquid stock that traded at 09:20 and not
+since), and QuestDB cannot see the last N minutes while its apply lag runs.
+
+`rupees_to_paise` is shared by both paths so the conversion cannot drift.
+
+### The measurement that motivated it (2026-09-08, live)
+
+| IST | ingest ticks / 5 min | `priced_underlyings` | `stock_options` |
+|---|---:|---:|---:|
+| 09:15 (open) | 103,887 | 0 | 0 |
+| 09:30 | 106,124 | 0 | 0 |
+| 09:44:11 | 102,902 | 118 (indices only) | 0 |
+| **09:45:14** | 104,801 | **861** | **20,224** |
+
+`tv_questdb_wal_apply_lag_max`: 11,503 at 09:00 → 27,089 at 09:55, climbing.
+
+Thirty minutes of the session with 0 of 20,224 stock options and no
+stock-option depth, while the process held every price it needed in memory.
+
+### Edge cases
+
+- **Only spot segments are admitted** (`IdxI`, `NseEquity`, `BseEquity`). A
+  derivative's price is its premium, not the underlying's level; admitting one
+  would centre that stock's whole ladder on the wrong number.
+- **A segment byte the enum cannot name** is refused — the filter is one
+  binding pattern over `from_byte`, so both conditions must hold.
+- **Non-finite, zero, negative, or past-2^53 prices** are refused before they
+  can place a ladder; zero would put at-the-money at the bottom of every ladder.
+- **The same numeric id in two segments** is two instruments (I-P1-11).
+- **Cap** at `MAX_TRACKED_INSTRUMENTS = 25_000`: a NEW instrument past it is
+  refused with a counter and a coded error; a TRACKED one is never evicted.
+- **Mid-session restart**: RAM starts empty, QuestDB carries the morning, the
+  overlay covers both.
+
+### Failure modes
+
+- **The store and the reader end up being different stores.** Silent, and the
+  exact shape of the outage this fixes — the drain fills one, the reader
+  queries an empty one, the universe sits at zero and nothing says so.
+  Verified this passes every behavioural test, which is why
+  `the_attach_tasks_read_the_drains_own_spot_store` exists as a source guard.
+- **A contract segment enters the filter.** Silent and plausible: ~50 strikes
+  centred on a premium. Pinned by
+  `only_the_three_spot_variants_may_price_an_underlying`.
+- **QuestDB unavailable**: RAM still answers. This is the improvement.
+- **Both empty**: the universe reports `no_spot_rows`, as it already did.
+
+### Test plan
+
+New, all in-tree: 11 in `spot_price_store`, 5 in
+`dhan_feed_stack::frame_walk_accounting_tests`, 1 source-identity guard.
+Full app suite 1,977 passed / 0 failed / 2 ignored.
+
+Bite-proven, each mutation applied and reverted:
+
+| mutation | test that failed |
+|---|---|
+| filter widened to admit every segment | `a_derivative_tick_never_prices_an_underlying` |
+| `record_spot_price` made a no-op | `record_spot_price_lands_a_decoded_tick_where_the_attach_tasks_read_it` |
+| reader constructs its own store | `the_attach_tasks_read_the_drains_own_spot_store` |
+| boot constructs a fresh store | `the_attach_tasks_read_the_drains_own_spot_store` |
+| `NseFno` added to the filter | `only_the_three_spot_variants_may_price_an_underlying` |
+| guard's own anchor broken | the guard fails loud rather than grading a wrong slice |
+
+The last one is recorded because the first version of that guard anchored on a
+fragment `cargo fmt` reflowed; the slice silently widened to the whole file and
+failed on correct code. A guard that cannot find its target must say so.
+
+### Rollback
+
+Config-free and reversible by revert. The store is additive; removing the
+overlay restores the QuestDB-only behaviour exactly, because the database query
+is unchanged and still runs.
+
+### Observability
+
+- `tv_spot_price_store_tracked` (gauge, published from the READ side — what the
+  consumer could see, not what the writer believes it stored)
+- `tv_spot_price_store_refused_total`, `tv_spot_price_store_rejected_value_total`
+- `spot_from_ram` and `spot_from_questdb` on the `contract universe resolved`
+  line: without them a healthy RAM path and a healthy database path are
+  indistinguishable, so a silently-unfed store reads exactly like a working one
+  for as long as the database keeps up.
+
+**Not EMF-selected.** Three names would be ~$0.90/mo against a September
+forecast of $142.24 and an automatic `STOP_EC2_INSTANCES` line at $135.00 —
+already $7.24 over. Per the standing rule this needs a lever, not a cost note,
+and no lever is taken here. The signals are local and on the log line; shipping
+them to CloudWatch is a separate operator decision.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the store
+is O(1) average on both sides and bounded fail-closed at 25,000; the drain arm
+admits exactly three spot segments and is pinned in source; the reader and the
+writer are proven to be the same store by a guard that bites in both
+directions.
+
+**NOT claimed:** that this fixes the QuestDB WAL apply lag. It is untouched and
+still growing (11,503 → 27,089 across 2026-09-08); it remains task #21.
+**NOT claimed:** that the 30-minute wait is now zero. RAM answers as soon as the
+first spot tick is decoded, which is seconds after the open rather than thirty
+minutes — but nothing here has run against a live open, so that is what the
+code must do, not what the box has reported. The first session after deploy is
+the measurement, and `spot_from_ram` on the resolved line is where it reads.
+
+### Per-item guarantee matrix
+
+Carried by reference to `.claude/rules/project/per-wave-guarantee-matrix.md`
+(15-row + 7-row). Rows exercised by this item: code coverage (17 new tests),
+testing coverage (unit + concurrency + source-guard), code checks (fmt, clippy
+`-D warnings -W clippy::perf`, banned-pattern, pub-fn-test, data-integrity,
+plan-gate all clean), performance (O(1) per tick, allocation-free after first
+write; the O(n) snapshot is flagged not relabelled), monitoring/logging (above),
+functionalities (every new pub fn has a call site and a test), extreme check
+(six bite-proofs, all reverted). Resilience rows: no new tick-drop path — the
+arm records and never gates the fold; no ring, spill or DLQ change; O(1)
+uniqueness on the I-P1-11 composite key.
+
+---
+
+## ITEM 23 — the 2026-09-10 open-item sweep (operator: "then fix and resolve evryhtign enitlrey dude okay?")
+
+**Operator authorization (2026-09-10, typed directly in-session — preserve EXACTLY, typos
+included):**
+
+> "then fix and resolve evryhtign enitlrey dude okay? See meanwhile what ahppend to thsi ent volume i need the precise real calcualtion dude okay?"
+
+Given in DIRECT response to a message that ENUMERATED the nine open findings recorded in
+PR #1904's own "Open findings from the sweep — recorded, NOT fixed here" table plus the
+open draft PR #1901. That is the §28.2/§28.3 authorization shape this repository already
+accepts: a general go-ahead answering an enumerated ask selects the enumerated work.
+
+**Slot note.** `plan-gate.sh` V7 blocks every `crates/*/src/**.rs` push when more than
+`PLAN_GATE_MAX_ACTIVE` (5) `active-plan*.md` files exist, and the tree is at exactly 5.
+This item is therefore an ADDENDUM to this plan — which is `IN_PROGRESS`, carries all six
+required sections, and already references `crates/core`, `crates/app`, `crates/common` and
+`crates/storage` — rather than a sixth plan file. Count stays at 5; the gate passes.
+
+### Design
+
+Three investigations were run as parallel read-only agents (per
+`operator-charter-forever.md` §E). Two findings were CONFIRMED with a correction to their
+own numbers, one was REFUTED outright, and one refuted the *reason* a fix had never been
+attempted. Each row below carries the evidence, not the claim.
+
+| # | Finding | Verdict | Ships here |
+|---|---|---|---|
+| A | 804 parks a socket with no recovery | CONFIRMED — and its stated CAUSE is REFUTED | **yes** |
+| B | Control-plane sends await on the socket reader task | CONFIRMED, budget corrected 10 s → 8 s | **no — see "Deferred"** |
+| C | Dead-class report has no post-bell grace | CONFIRMED | **yes** |
+| D | Quote 21 "replay watermark NOT built" | CONFIRMED stale, in the ALARMING direction | **yes** |
+| E | 7,000/day vs 100,000/day rate limit | **REFUTED — no contradiction exists** | **yes (strike the row)** |
+| F | PR #1901 duplicated `#[test]` | CONFIRMED — and CI structurally cannot see it | **guard only** |
+
+#### A — 804: spend the one-shot respawn that is already built and unreachable
+
+Verified in `crates/core/src/websocket/pool_supervisor.rs`: `classify_disconnect` maps
+`InstrumentsExceedLimit` into the same arm as 806/808/810 (`:517-543`); that arm calls
+`park(ParkReason::FatalDisconnect)` (`:1247-1256`); `allows_one_respawn()` returns `false`
+for all three (`:863-871`); and `take_ghost_redial` is consulted only while
+`action == SupervisorAction::Continue` (`:4683-4686`), which a parked socket has left. Worse
+than "cannot reach": a park returns `ConnectionExit::Parked` (`:3621`), the connection loop
+RETURNS, and the spawned task at `dhan_feed_stack.rs:10493-10543` only logs and drops the
+alive-guard. **Nothing re-spawns it.** `PoolSupervisor::retire` (`:3365`) has zero production
+callers, so the budget slot is never released either.
+
+**The REFUTED half is what unblocks this.** `allows_one_respawn`'s own docblock (`:843-849`)
+and `test_no_park_reason_is_respawn_eligible_and_each_one_says_why` (`:6390-6392`) justify
+the refusal by asserting a redial "replays an identical over-limit set", so 804 would recur
+deterministically. **That is wrong about the mechanism.** Every guard mutation is cap-guarded
+fail-closed — `try_new` (`:1799-1813`), `try_extend` (`:1932-1953`), `try_swap`'s
+already-held check (`:2124-2140`) — so OUR retained set can never exceed
+`max_instruments_per_connection` by construction. A 804 therefore comes from the VENDOR's
+per-connection count exceeding ours (an ignored unsubscribe leaving Dhan holding N+1 where a
+depth-200 cap is 1, `pool_budget.rs:152-153`), and a FRESH connection starts vendor-side at
+zero.
+
+That last clause is this design's one **Assumed** premise and is stated rather than hidden:
+the vendor's per-connection accounting is not provable from this tree. It is, however, the
+same premise the existing `mark_lost` + replay design already relies on for every transient
+redial, so it is not a new bet.
+
+**The change:** split 804 out of the credential class into
+`DisconnectClass::SubscriptionRejected` + `ParkReason::SubscriptionRejected` with
+`allows_one_respawn() == true`. Nothing else moves — `park()` already routes an eligible
+reason through `schedule_redial` (`:1576`), so the respawn inherits the backoff ladder, the
+per-slot stagger, the ±375 ms jitter and the 6-per-300 s flap floor. A SECOND 804 finds
+`respawn_used == true` and parks permanently.
+
+**Bound: exactly one extra dial per socket per process lifetime**, on the existing ladder —
+1–16 dials in a whole session, orders of magnitude below the ghost-redial ceiling of 8 per
+socket already shipped (`:741-749`).
+
+**No set trim, deliberately.** The set is already ≤ cap; trimming would silently drop a
+contract we are authorized to carry, converting a recoverable socket into a permanently
+short one. What changes between the two attempts is the vendor's count, not ours.
+
+#### C — dead-class grace, DERIVED from the sibling rather than invented
+
+Verified: the sibling per-instrument silence page waits `SILENCE_SCANS_BEFORE_ALERT = 2`
+(`dhan_feed_stack.rs:4782`) for the reason stated at `:4776-4781` — *"One scan is not
+evidence: a scan landing in the shadow of a reconnect, or during the first seconds after a
+subscribe batch, sees instruments that are legitimately not ticking YET."* The dead-class
+report has no counter at all and fires on the first rising edge (`:3300-3308`). The exposure
+is real because `ClassLiveness::is_dead` (`:4508-4512`) requires `never == eligible`, which
+is exactly true at 09:15:00.x before the first print.
+
+`DEAD_CLASS_SCANS_BEFORE_REPORT` is **derived** from `SILENCE_SCANS_BEFORE_ALERT`, not
+restated as a second literal `2`, so two legs on the same 30-second arm cannot drift apart.
+The per-class counter array is cleared by `stand_down_dead_class_report` alongside the latch
+— without that, a pre-open sweep's count leaks into the bell and re-creates the bug the
+stand-down exists to prevent. The GAUGE stays level-triggered every sweep; only the log line
+and the counter wait.
+
+#### D and E — the two doc claims, and why only one of them was real
+
+D is stale in the ALARMING direction, which is the expensive one: `wal_applied_watermark.rs`
+landed in `6b7e5d7` (2026-09-05) and is production-WIRED — not merely present — consumed by
+the STAGE-C boot replay and the catch-up drain, with both sinks advancing it on ack. A
+session trusting the rule file opens work to build something that shipped five days ago,
+which is the `day_ohlc_tracker` (2026-08-12) failure class exactly.
+
+**E is REFUTED and the row is struck rather than fixed.** The premise was that the uploaded
+vendor pack says *Data APIs 7,000/day* against the rule files' 100,000/day. It does not:
+the pack says **Order** 7,000/day and **Data** 100,000/day
+(`docs/broker-ref-upload-2026-07-15/dhan/01-introduction.md:71`), agreeing with
+`docs/dhan-ref/01-introduction-and-rate-limits.md:51` and `08-annexure-enums.md:318`. The
+code agrees too (`OrderBudget::MAX_PER_DAY = 7_000`, orders). The transposition exists only
+on the live portal and is ALREADY adjudicated in-repo at
+`docs/dhan-ref/verification-2026-07-13.md:64,106-115`. No reconciliation work is
+outstanding. Recorded because a refuted finding is a result, and leaving it on the list
+would send the next session to re-derive it.
+
+#### F — PR #1901: a guard, not a cross-branch push
+
+Verified at `b89f272`: `crates/app/src/contract_underlying_map.rs:1131` and `:1132` are two
+consecutive `#[test]` lines both attached to the fn at `:1133`, while
+`pre_register_contract_underlying_counters_never_panics_without_a_recorder()` at `:1225` has
+**no attribute** and therefore never runs. It is not a name shadow and not a renamed
+copy-paste — it is an insertion that stole an attribute from the test below it.
+
+**Why nothing caught it:** `ci.yml:255` runs `cargo clippy --workspace --no-deps` —
+libs+bins, NOT `--all-targets` — so `#[cfg(test)]` code is never linted and both the
+`duplicate_macro_attributes` warning and the `dead_code` warning on the orphaned fn are
+structurally invisible to CI.
+
+This branch does **not** push to `claude/pensive-heisenberg-u2by0j`. It ships the workspace
+guard instead, so the ratchet catches #1901 on its next rebase and every future recurrence
+in any crate. Fixing the PR itself stays with the PR.
+
+### Deferred — B, with the reason stated rather than implied
+
+B is CONFIRMED: `drain` (`pool_supervisor.rs:3891`) takes `socket: &mut S` and executes its
+command block (`:3973`) BEFORE the `select!` whose only read arm is `socket.recv()`
+(`:4513-4515`); there is one `drain` call site (`:3714`) and no sibling task, so every send
+genuinely holds `recv()`. Worst case per iteration ≈ **8 s** unread — 5 s attach
+(`TOPUP_WIRE_BUDGET`, `:2290`), 2 s swap (`SWAP_WIRE_BUDGET` ×2, `:4186`/`:4228`), 1 s ping —
+against Dhan's 40 s silent close.
+
+One of the finding's own numbers is CORRECTED: item #5 claims the ping is bounded by 10 s.
+It is bounded by `PING_SEND_TIMEOUT = 1 s` (`connection.rs:331`, used at `:1505`), split out
+of the shared 10 s bound for exactly this reason (`:300-329`) and already pinned at
+`:1830-1859`. The ping is LOW, not MED.
+
+The fix is `futures_util::StreamExt::split` so a send and a read can be in flight at once,
+with the `SubscribeGuard` moving to the sender task — because `try_extend` / `try_swap` /
+`undo_swap` are all mutated inside those arms (`:4184-4205`), and leaving the guard on the
+reader while the wire moves would split one invariant across two tasks and break the revert
+asymmetry the 2026-09-09 work established (a REFUSED unsubscribe reverts, a TIMED-OUT one
+must not).
+
+**It is not shipped tonight, and the reason is the mandate itself.** The change alters
+`DhanFeedSocket`'s trait signature (`:3427`) from `&mut self` to `&self` on every send, so
+every fake in the test suite changes with it; it introduces a task whose lifetime must be
+bounded to the drain's or a send can outlive its socket; and it sits directly on the only
+path that captures ticks. A botched socket refactor is a larger tick-loss risk than the 8 s
+window it closes, and it deserves its own PR with its own adversarial pass rather than a
+place at the end of a five-fix sweep. The design above is complete enough to execute from.
+
+**One thing that makes the deferral safe to state:** the ack semantics were checked and are
+SAFE — no caller awaits an ack. `dhan_feed_stack.rs:8613`, `depth20_track.rs:582` and
+`depth_rebalance.rs:1072` all use `try_recv()` inside `retain_mut`, and
+`depth20_track.rs:466-467` documents that an unanswered ack is deliberately KEPT for the
+next minute. So a later ack changes nothing, and the deferral costs no correctness.
+
+### Edge Cases (Item 23)
+
+- **A:** a second 804 on the same socket in one process — must park permanently
+  (`respawn_used`). A 804 on a socket that has already spent its respawn on a transient
+  disconnect — same, parks. 805/806/808/810 must still park on the FIRST event.
+- **C:** a class that reads dead, then alive, then dead — the counter must reset on the
+  alive sweep, so the second dead run starts from one. A sweep landing exactly at
+  09:15:00.x — must not report. A pre-open sweep incrementing a count that then leaks past
+  the bell — prevented by clearing the array in the stand-down.
+- **D:** the correction must not retire the OTHER two Monday follow-ups named on the same
+  line (the no-in-session-deploy rule, the depth write-volume decision); both still stand.
+- **F:** the guard must not fire on a helper fn inside `mod tests` that legitimately carries
+  no `#[test]`.
+
+### Failure Modes (Item 23)
+
+- **A, worst case:** the Assumed premise is wrong and a fresh connection inherits the
+  vendor's count. Then one extra dial per socket per process earns a second 804 and parks —
+  the same end state as today, reached one bounded dial later. It cannot storm: the budget
+  is one, and the ladder still applies.
+- **C:** a genuinely dead class is reported ~30 s later than today. That is the trade, and it
+  is the same trade the sibling page already makes.
+- **F:** the guard is a source scan, so a sufficiently unusual formatting of `#[test]` could
+  evade it. Bounded by pinning the scan's own behaviour in a self-test.
+
+### Test Plan (Item 23)
+
+**A — re-bless with dated notes (both would fail, and both encode the refuted reasoning):**
+`test_no_park_reason_is_respawn_eligible_and_each_one_says_why` (`:6385`),
+`test_classify_disconnect_804_is_fatal_not_an_infinite_retry` (`:5315`). Stale-but-passing
+prose to correct: the `allows_one_respawn` docblock (`:843-852`), the "registers nothing at
+all" comment (`:3213-3221`), and the `ParkReason::ALL` length assertions (`:5179`,
+`:5361-5365`).
+**A — new:** one 804 → `SleepThenDial` not `Park`; a second 804 → `Park` with `connects == 2`
+end-to-end against the fake transport; the respawn goes through the ladder (`delay_ms > 0`,
+jitter present); 805/806/808/810 still park on the first event; `ParkReason::ALL.len() == 4`
+with unique labels.
+**A — verified unaffected by reading:** `test_supervisor_fatal_disconnect_parks` (`:5765`),
+`test_supervisor_805_parks_permanently` (`:5726`),
+`test_run_connection_parks_on_805_without_ever_redialing` (`:8961`),
+`test_a_parked_socket_stays_parked_through_every_event` (`:6487`).
+
+**C:** `the_dead_class_report_waits_the_same_scans_as_the_silence_page` — asserts the
+constant is DERIVED and drives `report_dead_classes` twice to prove one sweep does not emit
+and two do; `leaving_the_session_clears_the_dead_class_scan_counters`, extending the existing
+`leaving_the_session_clears_the_dead_class_latch` (`:23720`).
+
+**D:** a crossref assertion that both occurrences of the stale claim sit within N lines of
+the dated correction marker, so the annotation cannot be dropped while the module stays
+wired. The wiring itself is already pinned by `wal_applied_watermark_wiring_guard.rs`
+(15 tests).
+
+**F:** `every_test_fn_carries_exactly_one_test_attribute` — no two consecutive `#[test]`
+lines, and every non-helper `fn` inside a `mod tests` preceded by exactly one; plus a
+self-test pinning the scanner's own behaviour in both directions.
+
+### Rollback (Item 23)
+
+Each fix is its own commit and reverts independently. **A** reverts to the current
+park-forever behaviour by moving `InstrumentsExceedLimit` back into the `Fatal` arm — one
+match arm. **C** reverts by deleting the counter array and its gate — the report returns to
+first-edge firing. **D**, **E** and **F** are docs and a test; reverting costs nothing. No
+schema, no config, no DDL, no metric name changes, so nothing needs a deploy-order
+consideration.
+
+### Observability (Item 23)
+
+**No new metric name and no new alarm** — deliberate, and the budget is why. The September
+forecast read live on 2026-09-06 is **$142.24** against the AWS 90% `STOP_EC2_INSTANCES`
+line at **$135.00**, so `dhan-rest-only-noise-lock-2026-07-14.md` §2.3n's standing rule
+("the next addition of any size must come with a LEVER, not just a cost note") binds and this
+sweep brings no lever. What A adds is a new label VALUE on the EXISTING respawn counter,
+which costs nothing: the EMF selector folds label values into one summed per-host series.
+C removes log lines rather than adding them.
+
+### Honest envelope (Item 23)
+
+100% inside the tested envelope, with ratcheted regression coverage: the 804 respawn is
+bounded at exactly one extra dial per socket per process on the existing backoff ladder, and
+a second 804 parks permanently; the dead-class grace defers a verdict by one detector cycle
+and never weakens it; the two doc corrections are annotations, not rewrites. **NOT claimed:**
+that the 804 respawn will SUCCEED — its premise, that a fresh connection starts at zero
+vendor-side, is Assumed and unprovable from this tree, and if it is wrong the socket parks
+one bounded dial later than it does today; that the dead-class report is now free of false
+positives, since the first in-session sweep can still land before any option prints and the
+grace only makes that require two such sweeps; that the reader-task stall (B) is fixed — it
+is designed, deferred, and still costs up to 8 s of unread socket per drain iteration; or
+that any of this addresses vendor-side skip-forward loss, which carries no sequence number
+to detect.
+
+---
+
+## ITEM 24 — net volume was bar DIRECTION, not net volume (2026-09-10)
+
+**Operator, verbatim (typos preserved):**
+
+> "then fix and resolve evryhtign enitlrey dude okay? See meanwhile what ahppend to thsi ent volume i need the precise real calcualtion dude okay?"
+
+> "i celalry told you to fix and reoslve evrythign includign net voluem dude okay? Provide this as the detailed extreme easy understandble comparison dude okay? i mean automated easy table level comapriosn view where even any humans can udnerstand where it shoudl attarct even millions of custoimers dude"
+
+### The defect
+
+`LiveCandleState::net_volume()` derived a sign at SEAL time by comparing the
+bar's close against the previous bar's close, and applied it to the WHOLE
+bar's volume. It was documented honestly as "the quantity a broker chart plots
+as Net Volume". It is not that — it is bar DIRECTION × bar VOLUME.
+
+A bar that sells 1,000 into the bid and buys 400 on the offer, and closes one
+tick up, reported **+1,400**. The honest answer is **−600**. Wrong magnitude
+AND wrong sign, and wrong precisely when a bar's flow disagrees with its close
+— which is the case a net-volume reader consults the column to find.
+
+### Design
+
+Classic tick rule, evaluated ONCE per tick above the 24-timeframe loop:
+
+| This tick vs previous tick | Attribution |
+|---|---|
+| price **higher** | buy-initiated: `+delta` |
+| price **lower** | sell-initiated: `−delta` |
+| price **unchanged** | carries the previous direction (the zero-tick rule) |
+
+`delta` is `cumulative_volume − slot.last_cumulative` — the previous ACCEPTED
+tick's day-cumulative — which is the same quantity the fold uses for `volume`
+at a bucket rollover. That identity is what makes `|net| ≤ gross` hold rather
+than merely be hoped for.
+
+The zero-tick carry is per INSTRUMENT (`slot.last_tick_sign: i8`, 25 KB fleet-
+wide), not per timeframe: all 24 frames see one tick sequence, so 24 copies
+would only be able to drift.
+
+### Edge Cases
+
+| Case | Answer | Why |
+|---|---|---|
+| First tick for an instrument | unclassified (`0`) | `last_ltp` is `NaN`; `NaN` fails BOTH `>` and `<`, so an unguarded compare lands on the zero-tick arm and attributes the whole delta to a carry |
+| Flat tick, no carry yet | `0` | no side has revealed itself; guessing propagates to every following flat tick |
+| `delta == 0` | `0` | nothing traded — the common case for a repeated snapshot |
+| `price == 0.0` | `0` | the feed's absent-price sentinel, never a real price |
+| `u64` delta past `i64::MAX` | saturates | `-(u64 as i64)` wraps POSITIVE, recording a sell as a buy |
+| Unchanged decimal-clean price | equal | both sides come from `f32_to_f64_clean`; a widening `as f64` makes `10.20` read as an UPTICK on the majority of ticks |
+| Day boundary (`force_seal_all`) | carry cleared | yesterday's direction is not evidence about today |
+| Late tick (`fold_late_hlc`) | not accumulated | that path amends h/l/c and never volume; a net that grew while its gross did not would break the invariant on a row already written |
+
+### Failure Modes
+
+1. **The fabricated zero.** A bar rebuilt from a source that does not carry the
+   accumulator would report `Some(0)` — "perfectly balanced" — about a bar
+   nobody classified. Closed by `net_volume_classified: bool`, which costs
+   ZERO bytes (it lands in existing padding; measured `size_of` is 136 with and
+   without). The 128-byte disk-spill record is byte-full, so a replayed bar
+   persists NULL and says so.
+2. **A future caller on a non-classifying entry point.** The parameter is
+   `Option<i64>`, so "cannot classify" is representable rather than
+   indistinguishable from "balanced", and a `None` tick poisons the bucket's
+   flag. Pinned by a shrink-only caller budget.
+3. **Net exceeding gross.** Clamped in `net_volume()` on top of the fold's own
+   arithmetic; a row saying "traded 1,000 lots of which 5,000 were buys" would
+   read as a real market condition.
+
+### Test Plan
+
+`multi_tf_aggregator`: the wrong-sign case end-to-end, the zero-tick carry, a
+flat tick with no carry, the invariant over 40 alternating ticks × 24 frames,
+the first-tick refusal, the classifier's seven refusals, saturation, the
+decimal-clean comparison, and the day-boundary reset.
+`live_candle_state`: the three refusals, a balanced bar as a REAL `Some(0)`,
+the clamp, and the two size pins.
+`aggregator_cell`: the non-classifying entry reports NULL; the caller budget.
+`seal_spill`: a replayed record reports NULL, never a balanced zero.
+
+### Rollback
+
+Config-free and self-contained: revert the commit. The `net_volume` column
+already existed and is written by the same site, so no DDL, no migration and
+no on-disk format changed. Rows written before the revert keep whatever value
+they were written with — as they would under any change to this column.
+
+### Observability
+
+No new metric and no new alarm — deliberately. The September forecast is
+$142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line (read live
+2026-09-06), so a new EMF name needs a lever, not a cost note. The RAM cost is
+recorded in `aws-budget.md` under "RAM NOTE 2026-09-10": +8 B on
+`LiveCandleState` = ~10 MB on the aggregator table and ~4.8 MB on the seal
+ring, ~15 MB total, 0.046% of the 32 GiB host. Both compile-time budget
+asserts FIRED on this change and were raised deliberately with the arithmetic
+stated at each site.
+
+### Honest envelope
+
+This is **INFERRED** aggressor side, and no surface may relabel it. Dhan
+publishes no trade tape and no buy/sell flag; a Quote or Full packet is a
+periodic snapshot carrying a day-cumulative, so "volume since the previous
+tick" is itself an aggregate of every trade in that interval, signed as a
+unit. Where trades on both sides fall inside one snapshot interval they are
+attributed together. `total_buy_qty` / `total_sell_qty` cannot help — those are
+RESTING orders, and the fold already says nothing downstream may treat their
+difference as an imbalance of trades.
+
+The honest claim is **"tick-rule net volume"**, never "actual buy volume minus
+actual sell volume".
+
+NOT delivered: the accumulator does not survive a disk spill (format bump plus
+a mixed-stride reader — outstanding, recorded at the site).
+
+### ITEM 24a — the arithmetic was fixed and four DOCS still taught the old rule (2026-09-10, post-merge)
+
+Item 24 shipped in PR #1905. A follow-up sweep asked the narrower question the
+merge did not: *does anything still DESCRIBE `net_volume` by the retired
+definition?* Four sites did, all in `storage`, all downstream of the crate whose
+arithmetic changed:
+
+| Site | What it still said |
+|---|---|
+| `shadow_persistence.rs` — the comment above the DDL that **CREATES** the column | "the bar's volume signed by whether it closed above or below the bar before it … NULL when there is no previous bar to compare against" |
+| `shadow_seal_columns.rs` — the doc on the `net_volume: Option<i64>` **field** | "positive when the bar closed above the previous bar, negative when below" + "costs no per-instrument RAM" |
+| `shadow_candle_writer.rs` — the comment justifying the **NULL** | "NULL is the honest value for 'there was no previous bar to compare against'" |
+| `candle_pct_column_guard.rs` — the section header pinning that NULL | same phrase |
+
+**Both halves were wrong, and the second half is the one that would mislead an
+operator reading the table.** The sign is now flow, not direction — but also
+`None` no longer means "the day's first bar". `net_volume_classified` is set at
+bar-open from `signed_tick_volume.is_some()`, so a first-of-day bar WITH ticks
+is classified and reports a real value. `None` now means **this process did not
+classify the bar**: a disk-spill replay, a REST-folded bar, a zero-tick bar, or
+a zero-volume bar. That is a data-PROVENANCE fact. Reading a NULL as "start of
+day" would mislabel every spill-replayed row in `candles_<tf>`.
+
+**Why the merge missed them.** PR #1905 corrected the CONVERSION site in
+`shadow_seal_columns.rs` (~line 204) and left the field doc thirty lines above
+it untouched. The comment being edited got fixed; the doc a reader lands on from
+the type did not. Same file, same screen.
+
+Annotated in place with dated `⚠ CORRECTED` blocks rather than rewritten, per
+the house convention that the trail is the point.
+
+**Verified:** `candle_pct_column_guard` 12/12 green (it strips comments via
+`code_only`, so it could never have caught this — stated plainly rather than
+implied); `tickvault-storage --lib` 1,303 green; `cargo fmt --all --check`
+clean. A tree-wide sweep for the retired phrasing now returns only text inside
+explicit correction blocks.
+
+**NOT changed:** no arithmetic, no schema, no DDL statement, no test assertion.
+Comments and docs only. `ticks` is untouched and correctly has no `net_volume`
+column — a tick is one observation, net volume is a bar aggregate; its
+`total_buy_qty`/`total_sell_qty` are RESTING book totals and are already
+labelled as such.
+
+**STILL NOT delivered** (unchanged from Item 24): the accumulator does not
+survive a disk spill, so a replayed bar persists NULL. That needs a spill
+format bump plus a mixed-stride reader.
+
+---
+
+## Item 22 — the net-volume column: four defects, found by reading the live tape (2026-09-11)
+
+**Operator authorization (2026-09-11, typed directly in-session, in DIRECT
+response to an enumerated four-row table):** *"Go ahead fix all of these dude
+okay?"* — the §28.2/§28.3 shape this repository already accepts: a general
+go-ahead answering an ENUMERATED ask selects the enumerated work. Follow-up the
+same session: *"Especially cover all kinds of extreme permuations combiantions
+of excpeitons errors situations conditions bugs scenarios ideas etc etc etc
+inclduign out of box also"*.
+
+**How they were found:** the operator compared `candles_5s.net_volume` for
+NIFTY SEP FUT (security 68407) against the Net Volume indicator on Dhan's own
+chart and asked why they disagree. Reconciling our stored bar against the raw
+`ticks` rows — on the live box, mid-session — proved our arithmetic exactly
+right and surfaced four separate defects on the way.
+
+### Design
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | A cumulative-volume drop was ALWAYS read as a stale packet. A `u32` wrap (`ParsedTick.volume` is `u32`) or a day rollover in a long-lived process therefore froze `last_cumulative` at the high-water mark FOREVER — every later `saturating_sub` yields 0, so every bar reports `volume 0` / `net_volume` NULL for the rest of the session, silently, while `tick_count` keeps rising. | Separate the two by MAGNITUDE. A drop ≥ `CUMULATIVE_RESTART_DROP_FLOOR` (2^31) is a RESTART → re-anchor the baseline and count `tv_aggregator_cumulative_reanchored_total`. A smaller drop keeps the existing refusal. |
+| 2 | `adopt_exchange_day_extremes` — the path that gives the day's first bar the exchange's official open/high/low — was gated on `last_sealed[ord].is_uninitialised() && is_days_first_session_bucket(..)`. The 2026-08-28 grid move to 09:00 made those two MUTUALLY EXCLUSIVE for any instrument that ticks in the pre-open: it seals a bucket before 09:15, so `last_sealed` is initialised by the time the market-open bucket opens. The path had been dead for two weeks. | Drop the `is_uninitialised()` conjunct. `is_days_first_session_bucket` is already the precise predicate and is self-limiting per day. The 09:15 anchor is UNCHANGED. |
+| 3 | A stale packet's delta was correctly neutralised, but its PRICE was still adopted into `slot.last_ltp` — the tick rule's entire input for the NEXT packet. `102 → [stale 105] → 103` classified the 103 as a DOWNTICK and latched `carry = -1`, inverting that tick and every flat tick after it. | Gate the `last_ltp` adoption on `!is_stale_packet`, and skip classification for a stale packet (contributing `Some(0)` — it traded nothing new). |
+| 4 | `classify_tick_volume` returned a bare `i64` and answered `0` to FOUR different questions; the call site wrapped every one in `Some(..)`. `net_volume_classified` was therefore `true` on every live bar and the fold's own `None` arm was unreachable. A bar whose volume was entirely unclassifiable published `Some(0)` — "perfectly balanced" — about flow nobody measured. | Return `Option<i64>`. `Some(0)` = nothing traded (duplicates land here). `None` = real volume, unreadable side. Pass through un-rewrapped. |
+
+### Edge Cases
+
+Duplicate packets (this feed delivers them routinely — MEASURED: near-every
+tick of security 68407 arrives twice, ms apart, with identical ts/ltp/volume)
+produce `delta == 0` and must classify `Some(0)`, never `None` — otherwise one
+duplicate NULLs an otherwise complete bar. A stale packet likewise contributes
+`Some(0)`. The opening bar of an instrument, whose first tick has no previous
+price, is now legitimately `None`.
+
+### Failure Modes
+
+Fix 1 costs exactly one tick's delta at a restart (the wrapping tick's true
+delta spans the wrap and is unrecoverable from a truncated counter) and keeps
+the instrument alive for the rest of the session — against the previous
+behaviour of losing every remaining bar. Fix 4 makes the day's first
+volume-bearing bar per instrument read NULL where it previously read a
+fabricated number; that is ~1 bar per instrument per day and it is the honest
+answer.
+
+### Test Plan
+
+`cargo test -p tickvault-trading --lib` → **1,743 passed, 0 failed, 2 ignored**.
+New test `a_balanced_tick_and_an_unclassifiable_tick_are_different_answers`
+pins the distinction as its own assertion so a refactor cannot collapse it.
+`classify_tick_volume_refuses_every_input_it_cannot_read` rewritten to assert
+`Some(0)` vs `None` per arm. One pre-existing test
+(`a_flat_tick_with_no_carry_yet_…`) asserted `Some(0)` for a bar that traded
+600 units of unknown direction with the rationale *"this is a real reading"* —
+that rationale WAS the defect written down as a test; it now asserts `None` and
+is renamed.
+
+### Rollback
+
+Four independent edits in two files, each revertable alone. No schema change,
+no new metric name shipped to CloudWatch, no alarm, no config flag.
+
+### Observability
+
+One NEW counter, `tv_aggregator_cumulative_reanchored_total`, on the local
+`/metrics` exporter ONLY. Deliberately **not** EMF-selected and **not**
+alarmed: an EMF name is ~$0.30/mo against a September forecast of $166.35 with
+the automatic `STOP_EC2_INSTANCES` line at $135.00, and §2.3n of
+`dhan-rest-only-noise-lock-2026-07-14.md` requires a LEVER, not a cost note,
+for the next addition. Recorded as an operator decision, not taken here.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the
+classifier's every arm is pinned, the balanced-vs-unknown distinction has its
+own test, and the full trading-crate suite is green. **NOT claimed:** that
+`net_volume` is now precise. It is the tick rule — an INFERENCE — and Dhan's
+feed carries no aggressor flag and no trade-by-trade tape (zero hits for
+aggressor/trade-side/tape across all 21 vendor reference docs). MEASURED
+2026-09-11: we receive ~2 snapshots per exchange second, and a single snapshot
+carried 191 lots against a largest-single-trade of 1 lot — roughly 191 separate
+trades bundled into one up-or-down decision. **NOT claimed:** that our bars can
+match the vendor chart's bars — theirs are cut on exchange time, ours on the
+receipt clock (measured lag p50 1.38 s, p99 46.37 s), and their indicator signs
+the WHOLE bar by its direction while ours signs each snapshot. They are
+different quantities, not two estimates of one. **NOT claimed:** clippy — the
+`clippy` component is not installed in this container; CI runs it.
+
+### Per-Item Guarantee Matrix
+
+Carries the 15-row + 7-row matrix of
+`.claude/rules/project/per-wave-guarantee-matrix.md` by cross-reference.
+Rows materially exercised here: code coverage (3 tests added/rewritten),
+testing coverage (unit + edge + regression-against-the-real-2026-09-11-shape),
+code checks (fmt clean, banned-pattern clean), functionalities covering (the
+one changed pub-crate fn has tests and its single production call site),
+bug fixing (four live defects), extreme check (the new distinction test is the
+ratchet). Hot-path rows: zero allocation unchanged, O(1) per tick unchanged —
+the classifier is still three compares and one negate, and the new restart
+check is one subtract and one compare on an arm that already existed.
+
+---
+
+## Item 42 — the depth WAL backlog: measured to a spiral, and the first fix is one config line (2026-09-11)
+
+**Status:** ROOT-CAUSED LIVE 2026-09-11 15:27 IST, mid-session, read-only.
+Authority: the operator's 2026-09-11 instruction *"fix this db backlog issue
+dude"*, then *"go ahead write the plan and fix it dude"*, given in direct
+response to a message that enumerated three candidate fixes and said a plan
+had to come first. That is the §28.2/§28.3 authorization shape this repository
+already accepts — a general go-ahead answering an ENUMERATED ask selects the
+enumerated work.
+
+### The question the operator actually asked
+
+*"is this the probelm with iops or ebs or data trasfer dude what coudl be the
+issue dude thats my main quesiton"* — and the answer, measured, is **none of
+those three**.
+
+| Resource | Provisioned | Peak used | Verdict |
+|---|---:|---:|---|
+| IOPS | 6,000 | 1,025 | **17% — not the limit** |
+| Throughput | 500 MB/s | 152 MB/s | **30% — not the limit** |
+| CPU | 4 vCPU | 37.7% idle | **not the limit** |
+| QuestDB RAM | 12 GiB | 4.17 GiB | **not the limit** |
+| Disk free | 600 GB | 464 GB free (23% used) | **not the limit** |
+| **iowait** | — | **59.66%** | **THE SYMPTOM** |
+| **Device util** | — | **93.2%**, queue 7.43 | **THE SYMPTOM** |
+| **READS on a write-only workload** | — | **78 MB/s** | **THE CAUSE — the database is rewriting, not appending** |
+
+So no instance upgrade, no IOPS raise, no throughput raise and no r8gd helps.
+A bigger pipe does not fix a database that is reading 78 MB/s in order to
+rewrite partitions it already wrote.
+
+### The measurement that settles it (live, 2026-09-11 15:27 IST)
+
+| Counter | Value |
+|---|---:|
+| `tv_dhan_feed_depth_total{outcome="rows"}` | 773,624,120 |
+| `tv_depth_rows_dropped_total{feed="dhan"}` | **228,215,136** |
+| `tv_depth_rows_spilled_total{feed="dhan"}` | **228,215,136** — identical, so ZERO loss |
+| **Share of depth rows that took the spill path** | **29.5%** |
+| `tv_tick_spill_replayed_bytes_total` | **47,053,504,733 (47 GB replayed today)** |
+| `tv_ticks_dropped_total` / `tv_ticks_spilled_total` | 9,632,844 / 9,632,844 (14% of 69,350,927 ticks) |
+| `tv_questdb_wal_apply_lag_max` | **55,060** |
+| `data/spill/depth/depth-dhan-496977.ilp` (current hour) | **1,932,125,394 bytes, still growing at 15:26:53** |
+| Previous hours' depth spill files | **0 bytes** — the drain empties each one |
+
+**Nearly a third of every depth row this session was written twice**: once
+into a flush that timed out, then again from disk, at least 300 seconds later,
+carrying its ORIGINAL timestamp.
+
+### The spiral, each step measured or cited
+
+1. Depth ILP flush carries `request_timeout = 5000` ms
+   (`depth_persistence.rs:512,520`, `ILP_REQUEST_TIMEOUT_SECS = 5`).
+2. The device sits at 93.2% utilisation, so a flush sometimes exceeds 5 s.
+3. The client gives up and RESCUES the batch to `data/spill/depth/` —
+   **228,215,136 rows, 29.5% of the session.**
+4. `run_replay_loop` re-POSTs those bytes **verbatim** every
+   `REPLAY_INTERVAL_SECS = 300` (`tick_spill_replay.rs:1034`). The filter
+   `retain_lines_in_open_window` copies lines byte-for-byte
+   (`:394`) — it FILTERS, it never re-stamps. The window test is
+   seconds-of-day, not staleness (`session_window.rs:253-276`), so a row up to
+   a full session old is admitted.
+5. **`QDB_CAIRO_O3_MAX_LAG` is `60000000` µs = 60 seconds**
+   (`docker-compose.yml:259`). Every replayed row is therefore **at minimum 5×
+   and potentially 400× outside the out-of-order merge window**, so QuestDB
+   cannot absorb it in memory and must rewrite the partition.
+6. Partition rewrites are the 78 MB/s of reads and the 93.2% util — which
+   makes the next flush more likely to exceed 5 s. **Back to step 2.**
+
+Observed partition splits of the 11:00 hour: 11:37:53, 11:43:06, 11:44:42,
+11:49:12, 11:54:33 — inter-split gaps of **313 s, 96 s, 270 s, 321 s**. Three
+of four cluster on 300 s = `REPLAY_INTERVAL_SECS`. Correlation, n=4, stated as
+such.
+
+**A feedback term nobody had written down:** `request_timeout` is a
+CLIENT-side timeout. The rescue log asserts the rows are "NOT in QuestDB yet",
+but on a device at 93.2% util the server may well have committed the batch —
+so part of that 47 GB of replay is re-writing rows that already exist, paying
+the full 8-column dedup comparison AND an O3 merge for no new data.
+
+### What was REFUTED — including my own first hypothesis
+
+| Hypothesis | Verdict | Why |
+|---|---|---|
+| IOPS / EBS / throughput / instance size | **REFUTED** | 17% / 30% / 37.7% idle — measured above |
+| `market_depth` has 974 rows per timestamp vs `ticks` 44, so dedup width is the cause | **REFUTED as sufficient** | 974 is the arithmetic shadow of `received_at_nanos` being computed ONCE PER FRAME (`dhan_feed_stack.rs:7037`). At a ~16 KB TCP read, d5 (10 rows/pkt), d20 (20) and d200 (200) each independently land on ~974. It carries no information. And `ticks` has a far WORSE out-of-order profile — ~10% of a session's rows arrive more than an hour late BY DESIGN, because `ticks.ts` is the exchange last-trade time (`tick_persistence.rs:1584`, `partition_archive.rs:436-442`) — yet `ticks` lag is 880 against depth's 55,060. A 63:1 ratio in the wrong direction. |
+| Cross-socket frame reordering on the shared mpsc | **REFUTED as material** | Real (`pool_supervisor.rs:3111` stamps before `:3191` sends, 16 tasks into one ring) but millisecond-scale — ~60,000× INSIDE the 60 s window |
+| Regression of the 2026-08-28 two-ILP-buffer bug | **REFUTED** | Fixed and build-guarded (`dhan_feed_stack.rs:14484-14512`) |
+| 16 MiB `WRITER_DATA_APPEND_PAGE_SIZE` amplification | **Unknown** | Would hit `ticks` equally; explains neither the reads nor the splits |
+
+### THE FIX — ranked, and only the first one ships here
+
+**Fix 1 (SHIPPING): `QDB_CAIRO_O3_MAX_LAG` 60 s → 600 s.**
+
+One line in `deploy/docker/docker-compose.yml`. Zero code. Reversible by a
+revert. It attacks step 5 directly: at 600 s the replayed rows land INSIDE the
+merge window and are absorbed in memory instead of forcing a partition
+rewrite.
+
+- **600 is not invented** — it is QuestDB's own documented default
+  (`600000000` µs). We are currently at **one tenth** of the vendor default,
+  and the comment justifying that (`"O3 max lag: 60s. Tighter out-of-order
+  merge window."`) carries no measurement.
+- **Memory is bounded independently** by `QDB_CAIRO_MAX_UNCOMMITTED_ROWS =
+  2000000` (`:257`), which caps the lag buffer in ROWS regardless of the time
+  window. QuestDB is using 4.17 of 12 GiB, so there is 8 GiB of headroom.
+- **It covers the whole replay cadence with margin**: 300 s interval + round
+  duration, inside 600 s.
+- Nothing in `crates/` pins this value (verified: `grep -rn "QDB_CAIRO"
+  crates/ --include=*.rs` returns nothing), so it needs no lockstep edit.
+
+**Fix 2 (DEFERRED, needs its own measurement): depth `ILP_REQUEST_TIMEOUT_SECS`
+5 → 15.** Attacks step 3 — stops 29.5% of rows entering the spill path at all.
+A 5-second client timeout against a device at 93.2% util is asking the rescue
+tier to handle a SLOW database when it exists for a DEAD one. Safe in
+principle now that the depth writer is off the drain task
+(`split_for_offload`, 2026-08-28), so a longer flush no longer stalls the fold.
+**Deferred because it is coupled**: `SHUTDOWN_GRACE_MARGIN_SECS` is DERIVED
+from `ILP_REQUEST_TIMEOUT_SECS` behind a compile-time assert
+(`main.rs:4137-4143`), and `DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS = 30` would
+have to rise in lockstep (15 + 15 + 12 = 42, so a budget near 50, still far
+inside systemd's `TimeoutStopSec=120`). That is a change to shutdown
+semantics and deserves to land after Fix 1 has been measured, not beside it.
+
+**Fix 3 (REJECTED AS DESIGNED — recorded so it is not re-proposed): gate the
+depth spill replay to outside market hours.** This was my own leading
+candidate and the adversarial pass killed it:
+
+- **It would risk the exact incident of 2026-09-01.** Nothing else ever empties
+  `data/spill/depth/` — `prune_spill_files_at` filters on `extension == "bin"`
+  and is non-recursive (`seal_spill.rs:920-1015`), and depth spill is `.ilp` in
+  a subdirectory. The drain's truncate is the only thing that empties it. At
+  the measured ~1.9 GB per hour, a gated session accumulates **~14 GB** against
+  a cap of ~18.75 GB (`depth_persistence.rs:613,654`) and a per-write free
+  floor of 16 GiB. `depth_persistence.rs:778-784` records what happens next,
+  verbatim: *"MEASURED IN PRODUCTION 2026-09-01: this exact arm fired 48 times
+  … and 238,615,500 depth rows were permanently discarded."*
+- **The unconditional boot round has it backwards.** `RESUME_OFFSETS` is
+  process-local (`tick_spill_replay.rs:292-300`), so a mid-session restart
+  re-POSTs the entire accumulated backlog from byte 0 — the very O3 storm the
+  gate exists to prevent, concentrated into one event. The repository records
+  **seven restarts on 2026-09-03**, two inside market hours.
+- The one fear that turned out to be unfounded: a deferred replay is NOT
+  refused by its own window filter. `line_is_positively_out_of_window` judges
+  the LINE's timestamp, never the wall clock — zero wall-clock reads on that
+  path.
+
+### Design
+
+Change `QDB_CAIRO_O3_MAX_LAG` from `"60000000"` to `"600000000"` in
+`deploy/docker/docker-compose.yml`, replacing the unmeasured "tighter is
+better" comment with the measured reasoning and the revert instruction.
+
+### Edge Cases
+
+- **Replay round longer than 600 s** — the row falls outside the window again
+  and behaves exactly as it does today. Strictly no worse.
+- **A restart mid-session** replays the whole backlog; rows older than 600 s
+  still force rewrites. Fix 1 narrows the problem, it does not remove it.
+- **Memory** — bounded by `MAX_UNCOMMITTED_ROWS = 2000000`, not by the time
+  window; 8 GiB of QuestDB headroom measured.
+- **A quiet table** (low row rate) holds its lag buffer longer before
+  committing. Acceptable: apply lag on those tables is already ~0.
+- **Weekend / holiday** — no feed, no writes, no effect.
+
+### Failure Modes
+
+- **QuestDB RSS grows past 12 GiB** → container `mem_limit` kills it →
+  `tv_questdb_wal_suspended_tables` and the QuestDB health poller fire. Revert
+  the one line. Bounded by `MAX_UNCOMMITTED_ROWS` in the first place.
+- **No improvement** → apply lag stays ~55,000. Then the cause is Fix 2's
+  timeout or the 16 MiB page granularity, and Fix 1 has cost nothing and is
+  reverted.
+- **Improvement that masks the spill rate** → 29.5% of rows still take the
+  spill path; Fix 2 remains necessary. Fix 1 treats the O3 cost, not the
+  spill cause. Stated plainly.
+
+### Test Plan
+
+- No Rust code changes, so no unit test can cover this. Stated rather than
+  faked.
+- `cargo test -p tickvault-storage` and `-p tickvault-app` must stay green
+  (nothing references the constant).
+- **The real test is the next session**, and it is pre-specified so it cannot
+  be rationalised afterwards:
+  `tv_questdb_wal_apply_lag_max`, `tv_depth_rows_spilled_total`, EBS
+  `VolumeReadBytes`, and the partition-split cadence, compared against today's
+  55,060 / 228,215,136 / 78 MB/s / ~300 s.
+
+### Rollback
+
+`git revert` the one-line change and redeploy, or set the env var back on the
+box. QuestDB reads it at container start; no data migration, no schema change,
+no code path altered.
+
+### Observability
+
+No new metric and no new alarm — deliberately, and this is a cost decision
+rather than an oversight. Every signal needed to judge this change already
+ships: `tv_questdb_wal_apply_lag_max` (alarmed),
+`tv_depth_rows_spilled_total` / `_dropped_total` (both seeded and shipped),
+`tv_tick_spill_replayed_bytes_total`, and CloudWatch's own `VolumeReadBytes`.
+The September forecast is $142.24 against a $135.00 automatic
+`STOP_EC2_INSTANCES` line, so a new EMF name (~$0.30/mo) would need a lever
+per the standing rule, and none is needed here.
+
+### What this does NOT claim
+
+- It does not stop rows spilling. 29.5% still take that path until Fix 2.
+- It does not make the disk faster.
+- It is not measured — it is a targeted config change against a measured
+  mechanism, and the next session is the verdict. Nothing here may be reported
+  as fixed until `tv_questdb_wal_apply_lag_max` says so.
+
+---
+
+### Item 42 — CORRECTION BLOCK, 2026-09-11 (same day, hours later)
+
+Three claims in the block above are WRONG. Recorded as corrections rather than
+edited in place, per the house convention, because in every case the reasoning
+that produced the wrong claim is the reusable part.
+
+#### Correction 1 — the spill CAUSE is queue saturation, not ILP timeouts
+
+Item 42 attributes the 29.2% spill rate to flushes hitting the 5,000 ms
+`request_timeout`. The counters that separate the two causes were then read on
+the box and they refute it:
+
+| counter | value |
+|---|---:|
+| `tv_depth_flush_retries_skipped_total` (genuine timeouts) | **13** |
+| `tv_depth_flush_queue_full_total` | **68,838** |
+| `tv_depth_flush_width_capped_total` (the rescues) | **22,488** |
+| `tv_depth_flush_offloaded_total` | 107,778 |
+
+It is `DEPTH_FLUSH_QUEUE_DEPTH = 4` saturating, not the timeout firing.
+
+**This kills Fix 2 of Item 42 outright.** Raising the ILP `request_timeout`
+5 s → 15 s was ranked as the deeper fix and deferred only because
+`SHUTDOWN_GRACE_MARGIN_SECS` is derived from it behind a compile-time assert.
+It is now REFUTED on its own merits: the timeout fires 13 times a session, so
+raising it changes nothing. The coupling was never the real blocker.
+
+**Independently, the premise was also false.** questdb-rs applies
+`request_min_throughput` (default 102,400 B/s) which EXTENDS the effective
+deadline by `bytes / min_throughput`. A 10,000-row depth batch already gets
+~20.6 s, not 5 s. Two independent refutations of the same fix.
+
+#### Correction 2 — the shipped Fix 1 is INERT, and the sentence that says why was written as a reassurance
+
+The shipped comment reads: *"Memory does not grow with the window:
+`QDB_CAIRO_MAX_UNCOMMITTED_ROWS` above caps the lag buffer in ROWS."* True —
+and it is exactly why `o3MaxLag = 600s` cannot take effect.
+
+QuestDB commits on whichever limit binds first. Verified live, all 26 tables:
+`o3MaxLag = 60000000000`, `maxUncommittedRows = 2000000`.
+
+For a 600 s window to be reached the rate must stay below
+`2,000,000 / 600 = 3,333 rows/s`. Measured: **793,936,720 depth rows over
+~26,280 s = ~30,200 rows/s**, so the row cap fires at **~66 s — about 9×
+sooner**. The setting is correct in direction and currently cannot move a
+number.
+
+**A limitation written down as a reassurance, in the same commit that shipped
+the change it undermines.** That is the `day_ohlc_tracker` failure shape, in
+my own comment, hours old.
+
+**The missing half, deliberately NOT shipped:** `QDB_CAIRO_MAX_UNCOMMITTED_ROWS`
+is SERVER-WIDE across all 26 tables. Raising it 10× buys ~1.4 GB of QuestDB
+working set for `market_depth` alone (20M × 72 B) against a 12 GiB limit
+measured at 4.17 GiB, plus whatever the other 25 tables take. The surgical form
+is per-table `ALTER TABLE market_depth SET PARAM maxUncommittedRows = …` in the
+boot DDL — and `grep -rn "SET PARAM" crates/` returns **zero**, so that is a new
+mechanism with its own guard test and self-heal path, not a line edit. It lands
+measured, not at pace, and not on a Friday evening against a production
+database whose failure mode is a data-availability event.
+
+#### Correction 3 — the disk WAS saturated; the published "not the limit" is withdrawn
+
+Item 42 and the published diagnosis both state that throughput peaked at
+152 MB/s against 500 MB/s provisioned and was therefore not the limit.
+Re-measured across the whole day (`AWS/EBS VolumeWriteBytes`, 300 s periods,
+`vol-0c6ab6e593e39d8c8`, 600 GB / 6000 IOPS / 500 MB/s):
+
+| window (UTC) | write throughput |
+|---|---:|
+| 03:55 – 05:15 | **498.9 → 524.6 MB/s, continuously for 85 minutes** |
+| 05:20 – 05:25 | 342.7 → 154.8 MB/s |
+| 05:25 – 07:25 | ~130–155 MB/s |
+| 07:25 – 10:35 | ~65–130 MB/s |
+| **total, 02:55 – 10:45** | **5,020.2 GB = 5.02 TB** |
+
+The 152 MB/s figure was the **post-saturation plateau**, not the peak. The
+volume was pinned at and slightly above its provisioned ceiling for 85 minutes.
+
+**Against ~80 GB of logical rows (793,936,720 depth × 72 B + 71,076,745 ticks ×
+144 B + candles), 5.02 TB is ~63× write amplification.**
+
+**The CONCLUSION of Item 42 survives and is strengthened:** a wider pipe buys
+nothing when 98% of what goes through it is the same data re-written. But the
+sentence "nothing was saturated" was false, and it was the headline of the
+published page.
+
+#### What this leaves
+
+| | |
+|---|---|
+| Shipped | `o3MaxLag` 60 s → 600 s — correct direction, currently inert |
+| Required next | raise the row cap for `market_depth` only, per-table, in boot DDL (new mechanism) |
+| Refuted | raising the ILP `request_timeout` (13 timeouts all session; and `request_min_throughput` already extends it) |
+| Candidate, unproven | deeper `DEPTH_FLUSH_QUEUE_DEPTH` — cheap in memory now that replay batches are size-capped, but this morning's saturation was sustained for 85 minutes, not bursty, so a deeper queue would fill too |
+| Rejected | gating replay to outside market hours — nothing else drains `data/spill/depth`, so it risks the measured 2026-09-01 loss of 238,615,500 rows |
+
+**Nothing may be reported as fixed until these move:** backlog 55,060 → ;
+depth rows re-written 228,215,136 → ; disk reads 78 MB/s → ; total bytes
+written 5.02 TB → .
+
+---
+
+## ITEM 43 — DESIGN ADDENDUM (added 2026-09-16, operator: "Bro just remove per minute price falls and 3.41 pm accuracy check alone dude okay", reaffirmed "So once everything is entirely fi ed and resolved then this will be merged and deployed right dude")
+
+- [x] **Item 43 — Remove the per-minute Dhan REST market-data legs and the 15:41 cross-verification**
+
+**Slot note.** The tree is at exactly 5 `active-plan*.md` files, and `plan-gate.sh` V7
+BLOCKS every `crates/*/src/**.rs` push at 6. This item is therefore added INSIDE this
+plan rather than as a sixth file — the same resolution shape this plan's own header
+records for 2026-08-10, and the same convention Items 5, 10, 11 and 12 follow. Adding a
+sixth file would block every other session's implementation pushes too.
+
+**Authorization and full manifest:** `no-rest-except-live-feed-2026-06-27.md` §12.10
+(the narrowing, and the verification-floor decision), §12.10.7 and §12.10.8 (the
+measured manifest, every row read at the cited line). This addendum is the DESIGN; that
+file is the CONTRACT and its REJECT lists bind.
+
+**Supersedes Item 8** of this plan — see the annotation at Item 8. Its replacement half
+is cancelled; a rebuilt comparator is not authorized.
+
+### Design
+
+Remove two things and nothing else:
+
+1. **The per-minute market-data trio** — `charts/intraday` (spot-1m), `optionchain`,
+   `expirylist`. `CadenceExecutor` declares exactly these three methods
+   (`cadence/executor.rs:291,298,309`), so the scheduler becomes unreachable and the
+   whole cadence tree, `dhan_cadence_executor.rs`, `cadence_escalation.rs`,
+   `cadence_boot.rs`, `spot_1m_rest_boot.rs` and `option_chain_1m_boot.rs` go with it
+   (~19,700 lines of `src/`).
+2. **The 15:41 cross-verification** — `dhan_live_crossverify.rs`,
+   `dhan_live_crossverify_persistence.rs`, `spawn_daily_crossverify`,
+   `install_crossverify_deps`, `run_cross_verification`, `persist_xverify_report`, and
+   **the boot floor that gates on it** (`dhan_feed_stack.rs:12290-12307`).
+
+KEPT, per §12.1 and §12.10.1: auth REST (the socket URL embeds the JWT), the
+instrument-identity REST (a `ParsedTick` carries no symbol, strike, expiry, leg or lot
+size), the order-side surface, and the DEAD class (`ip_verifier`, `ip_monitor`, two
+constants) which "alone" puts out of scope.
+
+The tables and their history are RETAINED. Only the writers go.
+
+### Edge Cases
+
+| Case | Handling |
+|---|---|
+| The boot floor gates on a removed component | Delete floor and comparator together. The binding is used exactly ONCE after `:12290` (`let _crossverify = crossverify;` at `:12307`, never read again), so nothing downstream is stranded. The other five floors — including the WAL floor at `:12314` — are UNTOUCHED. |
+| Floor 2's refusal message names the cross-verification (`:12263-12264`) | Re-word, do not just delete the block around it. |
+| Depth's chain fallback | `load_depth_universe` (`dhan_depth_universe.rs:1244`) is the `None` fallback at `dhan_feed_stack.rs:10161`. Primary is the master artifact (`load_depth_candidates:1090`), confirmed. The fallback would return empty forever, so the branch is deleted with the leg — a fallback that can only return empty is a dead monitor written in code. |
+| `SPOT1M-02` looks like it dies but SURVIVES | Its emit sites include `option_contract_1m_rest_persistence.rs:208,250,318,331`, outside the set. Deleting the variant breaks a surviving module. `SPOT1M-01` and `CHAIN-02` DO die entirely — their "surviving" sites are in `cadence_escalation.rs`, itself in the set. |
+| `SPOT_1M_REST_INDICES` is named for REST but is the live-universe fallback | KEPT. Two `const _: () = assert!(...)` pins in `constants.rs` fail the build on deletion, and `hardcoded_index_universe()` is the real consumer. |
+| Table constants vs retention lists | `partition_retention_coverage_guard` fails in BOTH directions — a constant without a retention entry, and an entry without a constant. They move in the same commit or not at all. |
+
+### Failure Modes
+
+| Mode | Why it is the dangerous one | Mitigation |
+|---|---|---|
+| **`mark_forward` orphaned silently** | `main.rs:2422` is the ONLY consumer of the forwarder binding. Deleting the spawn leaves it alive in `async_main`'s frame, so the channel never closes, `order_runtime.rs:1366`'s "no live mark producer" arm cannot fire, and the paper book runs on a frozen mark with `evaluate_daily_loss_halt` deciding on a stale price. `[cadence] enabled = false` IS loud; the code deletion is silent. | Explicitly drop the binding where the spawn was, so the EXISTING warn fires. Wiring a new producer is out of scope. |
+| **`market-hours-liveness-missing` pages forever** | All three producers of `tv_rest_1m_fire_heartbeat` are in the set, and it is `treat_missing_data = "breaching"`, gate-armed as the FIRST `ALARM_NAMES` entry. | Re-point `metric_name` to `tv_dhan_feed_last_tick_age_secs` (dense, already EMF-selected, published on the 30 s silence timer). `period = 60` and `evaluation_periods = 5` UNCHANGED — this is the only 60-second-period alarm in the gated set and its ~5-minute detection is the point. |
+| **Five surviving readers on frozen tables**, four of them silent | `market_ram_store_boot:435`, `rest_candle_fold:1246,1260`, `tf_consistency_boot:858`, `feed_scoreboard_boot:2444` (+ literal `rest_fetch_audit` at `:2431`), `dhan_depth_universe:828`. | Remove or explicitly record each as inert in the same change. Also the operator console's DEFAULT query (`operator_control_console.html:202`) and the SSM diag SQL. |
+| Dead monitors | 4 metric-filter alarms + 3 `ws-gap-03-xverify-*` alarms + 12 EMF selector entries + 12 dashboard widgets lose producers. `error_code_paging_filter_drift_guard` fails a filter whose code has zero emit sites. | Retire all in the same change. `cloudwatch_app_alarms_wiring.rs:2882,2894` pins an EXACT ws-gap-03 count; `alarm_phrase_coverage_guard` pins the phrase map. |
+| DDL orphaned for retained tables | Every `ensure_*` caller for the retained tables is inside the set. | Re-home one caller per retained table, or a future wipe leaves readers erroring on "table does not exist" instead of returning empty. |
+
+### Test Plan
+
+- `cargo check --workspace` then `cargo test -p` for each touched crate — common, core, storage, app, api, aws-lambdas. `crates/common` changes escalate to `--workspace` per `testing-scope.md`.
+- Re-bless or delete, in the same commit, every guard in the failure classes §12.10.8 and the guard map enumerate: source-scan guards asserting a deleted literal; the EMF selector lockstep and `emf_selector_producer_guard`; `partition_retention_coverage_guard`; `error_code_rule_file_crossref` and `error_code_paging_filter_drift_guard`; `runbook_cross_link_guard` (cited repo paths must resolve); `cloudwatch_app_alarms_wiring` (exact alarm counts); `claude_md_codebase_map_guard` (no table cell may name a deleted file).
+- NEW ratchets this item must add, or the removal can half-land:
+  1. the mark forwarder is explicitly dropped where the cadence spawn was (bite-proven: restore the binding un-dropped and the guard fails);
+  2. the liveness alarm reads `tv_dhan_feed_last_tick_age_secs` with `period = 60` and `evaluation_periods = 5` AND keeps its gate membership;
+  3. zero production call sites remain for `spawn_daily_crossverify` / `install_crossverify_deps` / `CadenceExecutor`;
+  4. the WAL floor and the other four floors still exist in `run_dhan_feed_stack`.
+- Verification that the lane still DIALS: the removal's whole risk is the boot floor, so a test must prove `run_dhan_feed_stack` reaches planning with no crossverify in the tree.
+
+### Rollback
+
+`git revert` of the single squashed commit restores every file, every alarm and every
+guard together — which is why this lands as ONE commit rather than a sequence. The
+config half is independently reversible without a code change: `[cadence] enabled =
+false` already stands the legs down today, so a pre-deploy rollback is a config flip,
+and a post-deploy rollback is the revert plus a redeploy. Nothing in this item is a
+one-way door: no table is dropped, no row is deleted, no schema is migrated.
+
+### Observability
+
+- **Net alarm change:** −7 (4 error-code filters + 3 xverify) and 1 re-pointed. No new
+  alarm and no new EMF name, so **$0.00/mo** — which matters: the September forecast is
+  $142.24 against a $135.00 automatic `STOP_EC2_INSTANCES` line, and §2.3n of the noise
+  lock requires a LEVER for any addition. This item only removes.
+- **What is LOST, stated plainly (§12.10.4):** after this there is ZERO mechanism
+  anywhere in the workspace comparing captured market data against any external record.
+  The India feed has no sequence number and no snapshot-on-subscribe, so nothing else can
+  answer "are the numbers right" — only "did the machinery run". `dhan-no-ticks-flowing`,
+  the `dropped == spilled` equality, `tv_aggregator_tick_refused_total` and the ghost
+  counter all answer the second question only and must never be quoted as answering the
+  first. **No claim that the feed is verified may be made after this lands.**
+- Recorded because it inverts an assumption: the cross-verification's own four metrics
+  and its `DHAN-LIVE-XVERIFY-01` code were in no EMF selector and no alarm. The only
+  ground truth the lane had was never itself monitored.
+
+### Honest envelope
+
+100% inside the tested envelope, with ratcheted regression coverage: the removal is
+mechanical, every deleted symbol's call sites were enumerated at file:line before any
+edit, and the four new ratchets above fail the build if the removal half-lands. **NOT
+claimed:** that the feed still has any external verification — it does not, by design,
+and that is this item's stated cost rather than an oversight. **NOT claimed:** that a
+green build proves the lane still dials — the boot floor is the risk, and the dial test
+is what proves it. **NOT claimed:** any measured post-deploy result; the first session
+after deploy is the measurement, and `dhan-no-ticks-flowing` staying green through an
+open is what would show the lane survived the floor's removal.
+
+## ITEM 44 — DESIGN ADDENDUM (added 2026-09-22): fast-lane silent-loss closures
+
+Authority: `websocket-connection-scope-lock.md` "2026-09-22 (FOURTH)" (operator quote recorded there). Crates: `crates/app` (dhan_feed_stack.rs), `crates/core` (websocket/pool_supervisor.rs), `crates/storage` (fresh_start_reset.rs, ws_frame_spill.rs, top_volume_rank_persistence.rs, tick_persistence.rs, depth_persistence.rs).
+
+- [x] 44a — in-session catch-up budget (dhan_feed_stack.rs)
+- [x] 44b — unknown packet skip validated by the next header (dhan_feed_stack.rs drain)
+- [x] 44c — fresh-start reset renames rather than drops post-first-boot rows; DROP VIEW IF EXISTS (fresh_start_reset.rs)
+- [x] 44d — WAL age prune respects the applied watermark; byte prune counts unapplied deletions (ws_frame_spill.rs)
+- [x] 44e — top_volume per-row append moves to the writer thread (top_volume_rank_persistence.rs + dhan_feed_stack.rs)
+- [x] 44f — socket reader never waits on swap wire writes (pool_supervisor.rs)
+- [x] 44g — flush-path counters pre-resolved; ILP buffers recycled (tick_persistence.rs, depth_persistence.rs)
+- [x] 44h — spot and index rows carry a contract name (dhan_contract_universe.rs, candle_contract_labels.rs, main.rs) — scope lock "2026-09-22 (FIFTH)"
+- [x] 44i — market_depth gains a contract SYMBOL, resolved once per packet (depth_persistence.rs) — scope lock "2026-09-22 (FIFTH)"
+
+### Design
+
+Each fix is local to its file and keeps the existing data flow except 44e and 44f. 44a makes `WAL_CATCHUP_BUDGET_SECS` clock-aware: full budget outside [09:00, 15:40) IST, a short in-session budget otherwise; leftover segments stay `*.wal`. 44b only skips when `message_length >= 8`, fits in the frame, and the header at the new offset carries a known code with an in-range length; else the current abandon path. 44c records the build's first-boot instant in a marker; a reset table whose newest row is at or after that instant is renamed `<name>_pre_reset_<yyyymmdd>` instead of dropped. 44d threads the applied watermark into the age prune only. 44e sends the ranked rows (a bounded, pre-sized batch) to the existing writer thread, which does the ILP append and flush. 44f splits the WebSocket stream so wire writes run on a writer task and report outcomes on a oneshot; the reader loop keeps polling `recv()`. 44g resolves `metrics::Counter` handles at construction and returns flushed buffers to the producer over a bounded channel.
+
+### Edge Cases
+
+Restart exactly at 09:00:00 / 15:40:00 (window boundaries are half-open); a backlog larger than one round in session; an unknown code whose length stamp is 0, < 8, past the frame end, or lands on another unknown code; two consecutive unknown packets; reset with a table that is empty, missing, a view, or holds only pre-boot rows; marker file absent or unreadable (fail closed: rename, never drop); prune when the watermark file is missing (treat every segment as unapplied for the age prune); a swap outcome arriving after the socket reconnected (generation check); buffer return channel full (drop the spare, allocate next time — never block).
+
+### Failure Modes
+
+A too-short in-session budget leaves more backlog for the next boot (bounded, recoverable, counted). A wrongly-trusted length stamp would fabricate packets — prevented by requiring a clean next header, and counted separately. A rename that fails leaves the table untouched and the reset id unwritten, so it retries. The byte prune on a full disk still deletes unapplied frames, counted and logged. The writer thread dying stops top_volume rows, as today; the drain never blocks on it. A writer task panic in 44f aborts (release `panic = "abort"`), as any task panic does today.
+
+### Test Plan
+
+Unit + proptest per item: 44a pure budget function over every minute of the day; 44b walk over synthetic frames with every stamp permutation (0, 1..7, exact, overrun, next-unknown, next-known); 44c pure decision function over (row-age, marker state, object kind); 44d prune decision over (age, watermark, byte cap) permutations; 44e source guard that the drain no longer calls `append_row` plus a channel round-trip test; 44f a mock sink that blocks for 2 s while frames keep arriving; 44g DHAT count on the flush path. Existing suites for storage/app/core must stay green.
+
+### Rollback
+
+Each item is one commit on PR 1928 and reverts independently. 44c's renamed tables are ordinary QuestDB tables and can be dropped by hand once inspected.
+
+### Observability
+
+Local `/metrics` counters plus coded log lines only (no EMF name, no alarm — see the scope-lock entry's budget note): `tv_dhan_wal_catchup_in_session_total`, `tv_dhan_feed_unknown_packet_skipped_total`, `tv_fresh_start_reset_renamed_total`, `tv_wal_pruned_unapplied_total`, and the existing swap wire histograms.
+
+## ITEM 21 — BUDGET ADDENDUM (added 2026-09-23, operator: "see as of now for this month alone accept this billing but from next mponth onwards try to keep it within 150 usd and monitor track cpature evruthign entirley dude okay?")
+
+**Why it belongs in a feed-hardening plan:** a mid-month budget kill stops the box AND disables the 08:30 start rule for the rest of the month. That is the largest tick-loss event this system can have. September's forecast is $188.45 against a $150 kill line, so the hourly guard is expected to stop capture around 24–25 Sep.
+
+- [x] Rule files first: `daily-universe-scope-expansion-2026-05-27.md` Quote 23 + `aws-budget.md` ruling.
+- [x] Four lockstep sites 150 → 225: `deploy/aws/terraform/budget.tf`, `deploy/aws/terraform/budget-guards.tf`, `crates/aws-lambdas/src/budget_digest.rs`, `crates/aws-lambdas/src/hard_stop_guard.rs`.
+- [x] `hard_stop_guard::effective_budget_kill_usd` clamps every UTC billing month except 2026-09 to `STANDING_BUDGET_KILL_USD` = 150; wired into the breach check, the ping decision and the ping text.
+- [x] Daily digest shows the effective ceiling for its month.
+- Historical tests (2026-09-23): `effective_ceiling_*` unit tests in `hard_stop_guard.rs`; `budget_ceiling_lockstep_guard.rs` gained `standing_cap_is_150_and_the_allowance_is_one_month` (name corrected 2026-10-01) and recorded both $150 and $225 in the rule files.
+- Tests: standing_cap_is_75_from_november_and_each_allowance_is_one_month (current successor after the later November ruling; the historical $150/$225 decision above is preserved, not re-applied).
+
+**Rollback:** revert the commit; the four sites go back to $150 and the clamp disappears. **Observability:** unchanged surfaces — the running ping and the daily digest now print the effective ceiling. **Failure mode:** if the 1-Oct revert PR never lands, the code clamp still holds October at $150; the native AWS actions would stay at percentages of $225 until it does.
+
+## ITEM 22 — ARCHIVE ADDENDUM (added 2026-09-23, operator: "See what happened to this s3 move")
+
+**Measured on the box 2026-09-23:** the daily archive pass reported `table_list_failed` on 6 of 6 attempts every day since at least 09-20 and never latched, firing STORAGE-GAP-04 daily. 19 of the 48 swept tables do not exist (retired REST legs, retired candle frames, renamed tables) and QuestDB's "table does not exist" was counted as a list failure.
+
+- [x] `crates/storage/src/partition_archive.rs`: `PartitionListing { Eligible, TableAbsent }` + `is_table_absent_response` (needs the JSON `"error"` key AND the phrase); `ArchiveRunSummary.tables_absent`; a real list failure on an existing table is now `warn!` and still counts in `tables_list_failed`.
+- [x] `crates/app/src/daily_archive_boot.rs`: logs `tables_absent`; doc records that absent tables never block the latch.
+- Tests: `a_missing_table_reads_as_absent_not_failed`, `other_errors_are_never_read_as_absence`, `the_phrase_without_an_error_envelope_is_not_absence`, `partition_listing_variants_are_distinct`, `absent_tables_latch_the_day_but_a_real_list_failure_does_not`.
+
+**Rollback:** revert the commit; absent tables count as failures again and the day stays unlatched (the pre-fix behaviour, loud but harmless to data). **Observability:** `tables_absent` on the pass-complete line; STORAGE-GAP-04 unchanged. **Failure mode:** if QuestDB rewords the error, absent tables fall back to failures — the loud direction, never a false latch. **NOT fixed:** the 09-21 hours 12–15 and all of 09-22 were dropped by the operator-authorized fresh-start reset before any archive ran; that market data is gone and is not SEBI data.
+
+## ITEM 45 — DESIGN ADDENDUM (added 2026-09-29): ZERO LOSS — nothing received is ever missed or deleted
+
+**Operator (2026-09-29, verbatim):** "what the fuck nothign shdou lneevr ever be missed or removed or deleted see clealry ntoe bro i always need all the data and all the ticks dude okay? neevr ever anythign shodul be fucking missed dude okay?" — then, on the seven-step plan: "yes approve all steps, go ahead and check the server".
+
+**Approved by:** Parthiban (operator), 2026-09-29, in-session. Rule-file-first: `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` Quote 27 + 28 and `docs/claude-rules-full/project/websocket-connection-scope-lock.md` "2026-09-29 — ZERO LOSS". **Open:** the two auto-loaded summary stubs (`.claude/rules/project/daily-universe-scope-expansion-2026-05-27.md`, `.claude/rules/project/aws-budget.md` cost note) still need the matching lines; the session's tooling refused self-edits of `.claude/rules/`, so the operator lands them.
+
+**Measured 2026-09-29 on the live box (read-only SSM + CloudWatch + S3):**
+- 08:31 boot; 08:32–08:38 the WAL catch-up drain flooded QuestDB (HOT-PATH-02, WS-SPILL-01/02, ticks-dropped, persistence-loss, wal-apply-lag pages) before any socket dialled.
+- By 10:08 IST: `shed_inline` 5,792,427 · depth `dropped` 694,040 · `refused` 272,090 · `tv_questdb_wal_apply_lag_max` 32,019 · `ws_wal` 27 GB · `spill` 40 GB · disk 41% used of 600 GB.
+- Raw capture 25.0 GB for the 2026-09-28 session; gzip-1 ratio 0.46.
+- The CloudWatch agent's `errors-jsonl` pipe froze at 08:32:31 IST after a ~9.5 MB error burst (the app kept writing: 13,581 lines, `tv_log_lines_dropped_total{sink="errors_jsonl"}` = 0). Restarted with operator OK at 10:12 IST; events flow again.
+- 2026-09-28 cross-verification: `diverged` (864 instruments, 307,669 minutes; option check 25,534 of 65,799 minutes missing live). S3 holds only 2026-09-25 09:00–14:59 (earlier days deleted under Quotes 24/26; the 15:00 hour of 09-25 is unexplained).
+
+Crates: `crates/app` (dhan_feed_stack.rs, main.rs, disk_pressure_boot.rs), `crates/storage` (ws_frame_spill.rs, wal_applied_watermark.rs, partition_archive.rs, seal_spill.rs, tick_persistence.rs, depth_persistence.rs, fresh_start_reset.rs, shadow_persistence.rs), `crates/common` (ingest_shed.rs, constants.rs), `crates/aws-lambdas` (none planned), `deploy/aws/terraform` (main.tf lifecycle, IAM, alarms), `deploy/aws/cloudwatch-agent.json`.
+
+One PR at a time, in this order (each item is its own PR unless noted):
+
+- [x] 45a — **A shed is a deferral, replayed after close, depth only.** (Implemented 2026-09-29: `crates/storage/src/wal_deferred_depth.rs`, `crates/app/src/dhan_feed_stack/deferred_depth_pass.rs`, prune gating in `ws_frame_spill.rs`, shed sites in `dhan_feed_stack.rs`; review fixes: rejected marks file adopts overflow, listing errors never read as "gone", hard disk floor at 5% free takes pinned segments last and counts each as a coded loss, applied segments pruned before unapplied, fsync before rename; zero-alloc gate `dhat_deferred_depth_note_shed`.) (Corrected 2026-09-29 before any code: the first draft called `note_unapplied` at both shed sites. That marks a whole ~4.6-minute bucket (`UNAPPLIED_BUCKET_SHIFT` = 38) as unapplied, so a session-long shed would mark the whole 25 GB day and the next boot would re-fold ticks, candles and depth for all of it — the exact 2026-09-29 morning flood, every day.) Design: the shed sites record the shed frame's bucket in a SEPARATE deferred-depth mark set (not the unapplied table), which only keeps those segments from the age and byte prunes. An after-close pass inside the running process (15:45–17:15 IST, paced by apply lag, stopping before the 17:30 stop) re-reads only those segments and writes ONLY the shed component (inline depth for `shed_inline`, dedicated depth for `shed_dedicated`); ticks and candles are not re-folded. A segment leaves the mark set only after its depth rows are acked. Anything not finished by 17:15 stays marked for the next day's after-close pass (and is in S3 under 45e). Tests: `shed_inline_records_a_deferred_depth_mark`, `deferred_mark_keeps_the_segment_from_both_prunes`, `after_close_pass_writes_depth_only`, `after_close_pass_stops_before_the_stop_time`, `deferred_mark_clears_only_after_ack`.
+- [x] 45b — **The byte prune never deletes unapplied data.** (Implemented 2026-10-01: `ws_frame_spill.rs` `segment_prune_decision` gains `DeleteForBytes` / `RefuseForBytes { unknown }`; the byte pass and the 45a below-floor pass delete only APPLIED segments; refusals counted on `tv_wal_prune_refused_unapplied_total{state=unapplied|unknown}` (replacing `tv_wal_pruned_unapplied_total`) and reported in ONE coded WS-SPILL-01 line per pass (`source=wal_prune_refused_unapplied`, per-segment names at debug, so a backlog cannot burst the error log). Unknown is refused as well as unapplied: not proven to have a second copy. The old pressure line no longer pages, because what the byte pass deletes is now always a copy of data the database holds. Honest limit: with no usable watermark the byte pass deletes nothing in the active directory; the shed, the disk ladder and the free-space alarm carry the disk. Extra test: `byte_prune_below_the_floor_still_refuses_an_unapplied_pinned_segment`.) `ws_frame_spill.rs` byte pass refuses an unapplied segment (counted `tv_wal_prune_refused_unapplied_total`, coded ERROR) instead of deleting it; disk protection falls back to the shed (45a) and the existing pressure ladder. Tests: `byte_prune_refuses_an_unapplied_segment`, `byte_prune_still_deletes_applied_and_uploaded_segments`.
+- [x] 45c — **Brake the boot replay.** The catch-up drain pauses between rounds while `publish_wal_apply_lag_growing` reports growth (bounded wait, then stop and leave the rest on disk), and caps its budget so it stops by 08:58 IST. (Implemented 2026-10-01: `dhan_feed_stack.rs` `wal_catchup_lag_step` (Proceed / Pause / Stop, pure, O(1)) runs before every round; a pause polls every `WAL_CATCHUP_LAG_PAUSE_POLL_SECS` (5 s) for at most `WAL_CATCHUP_LAG_PAUSE_MAX_SECS` (180 s, two watcher release polls plus one) and spends the drain's own clock, so it never extends the dark window; a stand-down is one `warn!` (`source=wal_catchup_apply_lag_stop`), `stop_reason=apply_lag`, counter `tv_wal_catchup_lag_pause_total` (local only). `wal_catchup_budget_secs` clamps a pre-open boot to `WAL_CATCHUP_PREOPEN_STOP_SECS_OF_DAY_IST` (08:58), never below the in-session budget. Honest limit: the watcher needs five growing polls (~5 min) before it reports, and a fresh process reads zero until then, so the pause bites on a lane restart or a long drain, not on the first minutes of a cold boot; the 08:58 clamp bites always.) Tests: `test_wal_catchup_lag_step_covers_every_permutation`, `catchup_lag_step_never_runs_a_round_while_lag_grows`, `a_preopen_drain_ends_by_0858_or_within_the_in_session_budget`, `the_catchup_loop_consults_the_lag_step_before_each_round`.
+- [ ] 45c2 — **Replay deferrals are not live loss.** Split out of 45c on 2026-10-01 because it changes alarm metric math and EMF dimensions, which the noise lock governs. Loss counters gain `origin=live|replay`; the `ticks-dropped` / `market-data-persistence-loss` filters and WS-SPILL-02 alarm exclude `replay_*` deferral sources. Tests: `replay_deferral_is_not_counted_as_live_loss`.
+- [x] 45d — **Error-log burst.** Coalesce repeated identical coded ERROR lines per (code, source) at most once per second (the three-lines-per-failed-flush pattern produced ~8,000 lines in 8 minutes). (Implemented 2026-10-01: `crates/app/src/log_coalescer.rs` `ErrorCoalescer`, a `tracing` `Filter` on the `errors.jsonl` layer only (`main.rs`), keyed on (call site, `code`, `source`), O(1) and zero-alloc over 256 packed atomic slots; suppressed lines counted on `tv_log_lines_coalesced_total{sink}`; `app.log` and `errors.log` keep every line. Every flat coded alarm is threshold 1 per 5 min, so paging is unchanged. Honest limit: the repeat count is on the counter, not on the next line, because a `tracing` filter cannot add a field and an event emitted inside the subscriber is dropped.) Tests: `same_key_same_second_is_coalesced_and_the_next_second_admits`, `distinct_keys_in_one_slot_are_both_admitted`, `every_distinct_key_is_admitted_at_least_once_per_second`, `a_back_to_back_repeat_is_never_admitted`, `test_key_of_coalesces_a_coded_burst_and_passes_uncoded_lines`, `test_fnv1a_matches_the_published_64_bit_vectors`, `the_errors_jsonl_layer_is_coalesced_in_main`.
+- [ ] 45d2 — **Uploader frozen.** Split out of 45d on 2026-10-01 because it adds an EMF name and an alarm, which the noise lock governs. Ship `tv_log_lines_dropped_total` to CloudWatch; alarm when `errors.jsonl` file growth on the box is non-zero while the stream ingests nothing (uploader frozen). Tests: terraform guard for the new alarm.
+- [x] 45e — **Raw frames to S3 before any delete.** A cold-path uploader compresses each sealed WAL segment (gzip, as `partition_archive.rs` already does), uploads to `s3://tv-prod-cold/raw-frames/<date>/<segment>.wal.gz` with a no-overwrite put and SHA-256, verifies size, and writes a local `.uploaded` marker; both prune passes require the marker. Runs after close and on disk pressure, never on the drain. IAM: `s3:PutObject` on that prefix only. Tests: marker gating in both prune passes; upload verify refuses a size mismatch.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. 2fabc2e7b (#2004): crates/storage/src/raw_frame_upload.rs (raw-frames/<IST date>/<segment>.gz, UPLOADED_SUBDIR marker, run_pass), prune gate in crates/storage/src/ws_frame_spill.rs (size_refused_not_uploaded, tv_wal_prune_refused_not_uploaded_total); later har
+- [x] 45f — **S3 keeps everything.** (Implemented 2026-10-01: `deploy/aws/terraform/main.tf` `aws_s3_bucket_versioning.tv_cold` Enabled, expiration removed, noncurrent versions tiered not expired, `raw-frames-deep-archive` rule; guards `test_terraform_tv_cold_lifecycle_never_expires_and_tiers_down` and `test_terraform_tv_cold_versioning_is_enabled` in `crates/common/tests/aws_infra_wiring.rs`, both bite-proven by re-adding a `noncurrent_version_expiration` and `Suspended`.) `deploy/aws/terraform/main.tf`: remove `expiration { days = 1825 }`; add Deep Archive transition for `raw-frames/` after 30 days; enable `aws_s3_bucket_versioning`. Guard test pins no `expiration` and versioning `Enabled`.
+- [x] 45g — **No delete without a copy (spill, quarantine, boot drops).** Seal spill age prune, tick quarantine prune, fresh-start reset and retired-table sweeps export to S3 (verified) before deleting, or refuse. Tests per path. *(Ticked 2026-10-11: landed in PR #2004; fresh_start_reset.rs renames tables with rows aside, retired sweeps drop only proven-empty tables.)*
+- [x] 45h — **Persist what is received but never saved.** OI packets, market-status packets, `oi_day_high`/`oi_day_low`, out-of-window ticks and prior-day connect snapshots are written (new columns / a `feed`-tagged table, `feed` in the DEDUP key), outside the candle fold. Tests: one per packet class; DEDUP meta-guard. *(Ticked 2026-10-11: landed in PR #2004 as feed_aux_persistence.rs, recorded as R3-6.)*
+- [x] 45i — **Depth array rows** (separate designed project): scratch-table test on QuestDB 9.3.5 first (DOUBLE[] + DEDUP), then a binary-safe spill format, then the switch. Not started until the test result is recorded here. *(Ticked 2026-10-11: scratch-table result recorded 2026-10-06 below; shipped as 49e in PR #2037 and PR #2043.)*
+
+### Design
+
+The principle is one sentence: **the raw frame is the record; every later stage may be late but may not be the only copy.** 45a–45b turn the two existing loss exits into deferrals using the applied-watermark mechanism that already exists (`note_unapplied`). 45c–45d stop the pressure that triggers them in the first place and fix the blind alarm. 45e–45g put a verified S3 copy under every delete. 45h stores the packet classes the parser already decodes and throws away. 45i is the only change that reduces QuestDB load by an order of magnitude without dropping anything.
+
+### Edge Cases
+
+A shed that lasts a whole session (every inline-depth frame unapplied → the whole day's segments kept: bounded by disk, which 45e relieves by uploading); a boot with no QuestDB lag signal yet (pacing treats "unknown" as "not growing" for at most one round); a segment half-uploaded when the box stops (no marker → kept, retried next pass); an S3 PUT that succeeds but the verify read fails (no marker, retry); versioning with the existing Quote 24/26 manifests (history only, no further deletes authorized); a restart inside 09:00–15:40 (in-session budget stays short, as 44a); a coalesced error line that hides a different `source` (key includes `source`).
+
+### Failure Modes
+
+S3 unreachable for a day: segments stay local (never deleted), disk fills faster, the existing disk ladder sheds — which is now a deferral — and the disk alarm pages; the hard floor is a full volume, which suspends QuestDB and is paged. The uploader dying: counted, alarmed, prunes blocked. Pacing too strict: backlog grows and is paged by the existing WAL-backlog alarm. A wrong `origin` label: the alarm would under-page replay loss — prevented by labelling at the single writer entry point, tested.
+
+### Test Plan
+
+Unit + proptest per item as listed; DHAT stays green on the drain (45a adds one atomic store per shed frame, no allocation); storage/app/common suites green; terraform guards for 45c/45d/45f; each PR runs the full CI (All Green). Bite-proof each new guard by reverting the change locally and watching it fail.
+
+### Rollback
+
+Each item is one PR and reverts independently. 45a/45b reverting restores today's loss behaviour (loud via existing counters). 45f reverting re-adds expiry — but versioning cannot be turned off, only suspended; stated so the revert is a conscious choice.
+
+### Observability
+
+New: `tv_wal_prune_refused_unapplied_total`, `tv_dhan_feed_depth_total{outcome="shed_deferred"}`, `tv_raw_frame_upload_total{outcome}`, `tv_raw_frame_upload_bytes_total`, `origin` label on loss counters, the uploader-frozen alarm, `tv_log_lines_dropped_total` in CloudWatch. Each new CloudWatch metric is costed in the PR that adds it.
+
+### Per-Item Guarantee Matrix (Item 45)
+
+Cross-references `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row); each implementing PR carries both matrices in its body. Resilience row "Zero ticks lost" is the point of this item: every received frame is either in QuestDB, in the local WAL, or in S3 with a verified checksum — never in none of them. Honest envelope: bounded by S3 availability and local disk; beyond both, QuestDB suspends and pages, and nothing is deleted to make room.
+
+## ITEM 46 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): the daily 1-minute cross-verification reports false divergence
+
+Measured on the 2026-09-28 run (outcome `diverged`, 864 instruments, 307,669 minutes): volume matched exactly in only 42% of minutes, and 25,534 option minutes read as "missing". Read-only production queries showed most of it is the checker, not the feed.
+
+- [x] 46a — **Compare the size of our volume.** (Implemented: `dhan_live_crossverify::compare_day_in_scope`.) `candles_<tf>.volume` is gross volume carrying the bar's direction in its sign (`shadow_seal_columns::from_buffered_seal`, 2026-09-18 directive). `dhan_live_crossverify::compare_day` compared it signed against Dhan's unsigned volume, so every sell-side bar read as a mismatch. Compare `abs(live)` in both `volume_exact` and the capture percentage. Tests: `test_compare_day_volume_compares_magnitude_of_signed_live_volume`.
+- [x] 46b — **A no-trade minute is not divergence.** (Implemented: `compare_day_in_scope`, `INDEX_SEGMENT`.) Dhan prints a flat bar with volume 0 for a minute nothing traded; our fold prints nothing. `real = cells_diverged > 0 || missing_live > 0` counted those. Now `real` counts only `missing_live_traded` for non-index instruments; an `IDX_I` missing minute (indices carry no volume and tick every second) still counts. The zero-volume count stays reported. Tests: `test_compare_day_zero_volume_missing_minute_is_not_divergence`, `test_compare_day_missing_index_minute_is_still_divergence`.
+- [x] 46c — **09:15 carries pre-open volume.** (Implemented: `compare_day_in_scope`, `session_open_minute`.) Our 09:15 bar includes the pre-open auction volume; Dhan's does not. The 09:15 minute is excluded from the volume measurement (OHLC still compared). Tests: `test_compare_day_session_open_minute_is_excluded_from_volume_measure`.
+
+### Design
+Three local changes inside `compare_day`, O(1) per compared minute, no new state beyond two counters.
+### Edge Cases
+Index with volume 0 on both sides; a missing traded minute; a sell-side bar with negative volume equal in size; 09:15 bar; `i64::MIN` volume (`unsigned_abs`).
+### Failure Modes
+A real loss hidden: guarded by keeping every missing minute counted and reported, and by keeping index minutes strict.
+### Test Plan
+The five tests named above, plus the module's existing suite.
+### Rollback
+Revert the commit; the persisted tables are unchanged.
+### Observability
+Existing `dhan_live_crossverify_daily` columns; `missing_live_zero_volume` already persisted.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 47 — DESIGN ADDENDUM (added 2026-09-29, operator: "fix and reosleve vrythignn dude okay?"): a gapped WAL replay rebuilt partial candles that overwrote full ones
+
+Measured on production (read-only): on 2026-09-28 the 1-minute candles of ~696 NSE_EQ stocks at 11:02 summed to -43,032,622 (neighbours ±1-3 million). Security 2885: `candles_1s` 11:02:48 held -733,406 in ONE tick; the stored `candles_1m` 11:02 bar held 13 ticks, open latency 49 s, volume -734,559, while the 1-second bars inside that minute held ~70 ticks. Root cause (read in code, restart confirmed in the logs at 23:44 IST): the boot refold (`dhan_feed_stack::refold_wal_frames`) folds only the UNAPPLIED frames. Segments and frames the applied watermark skipped leave gaps, and the fold carried each instrument's volume baseline across a gap: the first tick after it took the whole skipped span's volume. The rebuilt partial bars then UPSERTed over the complete live rows (candles DEDUP key `ts, security_id, segment, feed`).
+
+- [x] 47a — **The replay says where its gaps are.** `ws_frame_spill::ReplayedFrame` gains `after_gap`: `true` for the first frame of a pass, the first kept frame after a skipped segment, and the first kept frame after frames dropped as already applied. Tests: `test_replay_marks_after_gap_on_first_frame_and_after_skipped_frames`. Impl: `ws_frame_spill.rs` — `ReplayedFrame::after_gap`, `SegmentRead::trailing_gap`, `replay_all_with_report_guarded`.
+- [x] 47b — **No volume across a gap.** `MultiTfAggregator::mark_replay_gap` un-seeds every slot's volume baseline and tick-rule carry and marks every open bucket partial. O(slots), boot/refold path only. Tests: `test_regression_wal_refold_gap_dumps_skipped_volume_into_one_partial_bar`. Impl: `multi_tf_aggregator.rs::mark_replay_gap` + `replay_gap_rebase_pending` → `AggregatorCell::rebase_open_buckets`.
+- [x] 47c — **A partial replay bar never overwrites a full one.** Per slot, two `u16` bitmasks (one bit per timeframe) record whether the open and the last-sealed bucket are partial. While `set_replay_mode(true)` is on, a partial bar's seal or late amendment is suppressed and counted (`tv_candle_refold_partial_suppressed_total`); complete bars between gaps are still emitted. Live mode is unchanged. Tests: `test_mark_replay_gap_complete_bucket_after_gap_is_still_emitted`, `test_mark_replay_gap_live_mode_still_emits_partial_bars`, `test_set_replay_mode_suppresses_amendment_of_a_partial_bar`. Impl: `multi_tf_aggregator.rs::{set_replay_mode, InstrumentSlot::take_open_partial}`, `fold_counters.rs::refold_partial_suppressed`.
+- [x] 47d — **The refold applies it.** `refold_wal_frames(ingest, frames, gaps)` takes the gap indexes, calls `mark_replay_gap` at each, runs the fold in replay mode, and re-seeds once more at the end so the first live tick after boot cannot take the downtime's volume either. Boot and catch-up both pass the gaps. Tests: `test_refold_wal_frames_with_gaps_marks_each_gap`. Impl: `dhan_feed_stack.rs::refold_wal_frames`, `DhanFeedStackParams::wal_replay_gaps`, `main.rs` gap collection.
+
+- [x] 47e — **Review round 1 fixes (2026-09-29, three reviewers).** (1) `mark_replay_gap` is O(1): an epoch bump applied lazily per slot (`InstrumentSlot::sync_replay_gap`), so many gaps cannot cost gaps × slots. (2) Only a skipped MAIN-FEED frame is a gap; a dropped depth frame hides no tick. (3) The replay ends ONCE, at the hand-over before the live drain (`MultiTfAggregator::finish_replay` via `LiveIngest::finish_wal_replay`), which taints every bucket still open and partial so it cannot seal later in live mode over a complete stored bar. (4) After a gap the chain breaks only for a frame with no open bucket (`AggregatorCell::rebase_open_buckets_after_gap`), so the next longer bucket keeps its rolling tick. (5) A catch-up round that follows a clean one does not start on a false gap (`WalReplayBatch::{leading_gap, trailing_gap}`). Tests: `test_mark_replay_gap_repeated_marks_collapse_into_one`, `test_mark_replay_gap_reaches_a_slot_through_the_seal_sweep`, `test_replay_dropped_depth_frame_is_not_a_gap`, `test_finish_replay_taints_open_partial_buckets_only`, `test_mark_replay_gap_next_longer_bucket_keeps_its_rolling_tick`, `test_rebase_open_buckets_after_gap_breaks_the_chain_only_where_nothing_is_open`, `test_finish_wal_replay_runs_once_between_the_catch_up_and_the_drain`.
+
+- [x] 47f — **Review round 2 fixes (2026-09-29, five parallel attackers).** (1) A post-gap tick that lands in the SAME open bucket keeps the whole span's volume (exact by the cumulative) instead of re-basing it away; that bucket stays partial because its high/low miss the skipped ticks (`AggregatorCell::rebase_open_buckets_after_gap(cum, fold_secs)`). (2) A gap also marks the last SEALED bar partial, so a replayed late tick cannot re-emit it without skipped amendments. (3) The close seal judges an amended last-sealed bar by its sealed bits (`force_seal_all`). (4) `finish_replay(ended_on_gap)` taints EVERY open bucket when the replay ended with frames after its last one skipped or unread; `ended_on_gap` comes from the boot pass through every catch-up round (`DhanFeedStackParams::wal_replay_trailing_gap`, `catchup_prev_trailing_gap`, `!catchup_drained`). (5) A jump in capture time over `WAL_REPLAY_CAPTURE_GAP_NANOS` (30 s) between consecutive main-feed frames is a gap, in both WAL readers and across the boot/catch-up boundary (`capture_jump_is_gap`, `wal_replay_last_fold_seq`). (6) Only a live-feed main-feed frame is a gap when dropped (`frame_feeds_the_candle_fold`; TrueData shares the endpoint byte). (7) Applied segments past a budget stop are archived only once a pass gets past them, so the next pass still sees their gap (`pending_skips`). (8) A gap flagged on the last non-live frame of a round carries to the next round. (9) The hand-over logs tainted buckets and suppressed bars. (10) DHAT phase (d) gates the replay branches: 0 allocations. Tests: `test_mark_replay_gap_suppresses_a_late_amendment_of_a_bar_sealed_before_it`, `test_finish_replay_same_bucket_live_tick_keeps_the_downtime_volume`, `test_finish_replay_ended_on_gap_taints_every_open_bucket`, `test_force_seal_all_judges_an_amended_last_sealed_bar_by_its_sealed_bits`, `test_replay_skipped_segment_past_a_budget_stop_is_kept_for_the_next_pass`, `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`, `dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries` phase (d); each fails without its fix.
+
+- [x] 47g — **Review round 3 fixes (2026-09-29, two attackers).** (1) The baseline stays SEEDED across a gap, so the stale-packet and counter-restart checks still run on the first post-gap tick; the gap tick's own delta is discarded instead (`gap_now`), and a restart inside the gap uses the restart's own full re-base. (2) A partial bar whose bucket ENDED before this process began capturing is never written, in any mode: the first packet after a subscribe carries the last trade time, which could otherwise overwrite a stored bar with a one-tick, zero-volume fragment — on every mid-session restart, replay or not (`MultiTfAggregator::set_live_capture_start`, set in `LiveIngest::finish_wal_replay`). A new slot's first buckets are marked partial in every mode for this. (3) A same-bucket frame across a gap marks its net unclassified. (4) A replay that ended on a gap taints every last-sealed bar. (5) An empty final catch-up pass still reports a trailing gap. (6) Skipped leftovers in `replaying/` past a stop go back to the live dir. (7) Process boundaries are detected on RECEIPT time, only across segment boundaries, over 5 s (`process_boundary_is_gap`, `ReplayedFrame::first_in_segment`); frame sequences understated downtime and a 30 s in-segment threshold could misfire in session. Tests: `test_mark_replay_gap_stale_first_packet_does_not_count_twice`, `test_mark_replay_gap_counter_restart_inside_the_gap_is_detected`, `test_set_live_capture_start_suppresses_a_fragment_of_an_old_bucket`, `test_finish_replay_ended_on_gap_blocks_amending_the_last_sealed_bar`, `test_replay_skipped_leftover_in_replaying_past_a_stop_is_restored`, `test_replay_marks_the_first_frame_of_each_segment`, `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`; each bite-checked.
+
+- [x] 47h — **Review round 4 fixes (2026-09-29, two attackers).** (1) The hand-over gap is applied EAGERLY in `finish_replay`: a complete bucket open at hand-over keeps its bits, so the live "ended before capture" rule no longer suppresses the last bars a clean replay rebuilt in full after a crash (both attackers found this). (2) Any tick that rolls a bucket while a gap is pending opens it partial (`next_bucket_partial`), and the same-bucket exemption requires the last COUNTED tick to lie inside that bucket (`rebase_open_buckets_after_gap(.., last_counted_secs)`), so a stale packet that rolls a bucket cannot pull the previous bucket's skipped tail into the next. (3) A record with no known receipt does not reset the process-boundary comparison. (4) A failed return of a skipped leftover logs. (5) Stale docs corrected; the capture-start rule's limits documented. Tests: `test_mark_replay_gap_stale_packet_rolling_a_bucket_opens_it_partial`, the hand-over test now sets a production-like capture start, `test_rebase_open_buckets_after_gap_breaks_the_chain_only_where_nothing_is_open` (new case); each bite-checked.
+
+- [x] 47i — **Review round 5 (2026-09-29): a whole-feature attacker plus a randomized contract test.** New property `replay_contract_property`: fold a random stretch once in full (live) and once with random frames missing (gapped replay) and require every bar the replay EMITS to equal the live bar in volume, open, high, low, close, net and classification; passed 20,000 cases per run after the fixes below, and fails when the original defect is re-introduced. Fixes: (1) **post-gap settling** (`InstrumentSlot::replay_settling`): from the tick that resolves a gap, and for a new slot, until a later tick has both raised the cumulative and left the tick rule with a direction, a tick that ADDS volume marks the buckets it lands in partial; a zero-volume tick marks nothing, so indices lose no bars. This closes the null-net-over-signed-net overwrite and the usual form of a packet stale against the skipped span. (2) An open bucket that rolls on the post-gap tick first settles its unattributed carry. **Honest limit, bounded by a second property** (`test_replay_with_stale_packets_overcounts_at_most_the_largest_regression`): a packet stale against a skipped span that the replay never saw cannot always be recognised; an emitted bar can then exceed the live bar by at most the largest backward step of the cumulative (measured on the box: 130 shares).
+
+- [x] 47j — **Review round 6 (2026-09-29): a whole-feature attacker plus a MIXED-stream randomized property** (two instruments, repeated quotes, late ticks, random missing frames; `test_replay_with_gaps_mixed_stream_emits_only_live_identical_bars`). The attacker reported no CRITICAL or HIGH finding; the property found two real defects, both fixed. (1) **A late tick inside a skipped frame could amend a bar the replay had already emitted.** During replay a sealed bar is now HELD (`InstrumentSlot::replay_held`, one bit per timeframe) instead of emitted, and released — emitted if still complete, counted if a gap marked it — when the next bucket of that timeframe seals, when a catch-up sweep would seal it, or at hand-over (`finish_replay(ended_on_gap, on_seal)`, routed through `route_catch_up_seal` / `LiveIngest::apply_seal_tally`). Live mode never holds. (2) **A tick skipped just before a late tick could leave a minute the replay thought complete.** The first tick after a gap now sets a per-slot gap FRONTIER (`replay_gap_frontier`: its receipt time in IST plus `REPLAY_FRONTIER_SKEW_SECS` = 5, never earlier than its own trade time); every open bucket starting at or before the frontier is marked partial, and the frontier clears once the fold is `MAX_BUCKET_SECS` past it. Pinned by `test_regression_skipped_tick_before_a_late_tick_leaves_its_minute_partial`, which fails with frontier marking disabled (bite-checked). New accessors `AggregatorCell::{would_seal, would_catch_up_seal, open_bucket_start}`. DHAT phase (d) still zero allocations. Heavy runs: 20,000 cases × 3 runs of all three properties green. **Honest limit, extended:** in the stale-against-a-skipped-span case the net volume and close may also differ from live, not only the volume; and a box clock that runs behind the exchange by more than 5 s can hold back the first 1/3/5-second bars after a restart (never a wrong bar, only a missing one, counted).
+
+- [x] 47k — **Review round 7 (2026-09-29): three reviewers in parallel (hostile logic, hot-path, storage/app wiring) plus the CI coverage gate.** Fixes: (1) **late ticks across the live catch-up seal (HIGH, hostile reviewer).** Live closes a quiet bucket by its periodic catch-up seal once the watermark is `CATCHUP_LATENESS_MARGIN_SECS` past its end; a tick for it arriving later amends the closed bar and carries its volume into the next bucket, while a replay (which runs no such sweep) folds it into the still-open bucket. During a replay, a tick landing in an open bucket that ended the margin before `max(watermark, receipt)` now marks that bucket and the next one partial (`InstrumentSlot::replay_next_partial`, consumed at the roll; after the hand-over it taints instead), and the last sealed bar too for a tick older than the open bucket. The app passes its margin through `MultiTfAggregator::set_catch_up_margin_secs`; `DEFAULT_CATCH_UP_MARGIN_SECS` = 240. Pinned by `test_regression_late_tick_after_a_live_catch_up_leaves_both_minutes_partial` (watermark pushed by another instrument, and the tick's own receipt), bite-checked. (2) **The gap frontier pass could run in live mode for up to an hour (hot-path reviewer):** gated on replay mode and cleared by `finish_replay`; the CLAUDE.md row that already claimed "only during replay" is corrected. Test `test_finish_replay_clears_the_gap_frontier`. (3) **A counter restart that resolves a gap now sets the frontier** (`test_counter_restart_after_a_gap_sets_the_gap_frontier`, bite-checked after the first version passed vacuously). (4) **An unconfirmed boot pass:** catch-up round 0 re-reads its frames, so it now starts after a gap (`boot_refold_confirmed`; `test_catch_up_round_zero_is_a_gap_when_the_boot_pass_was_not_confirmed`). (5) **Vacuous tests repaired:** the main property gains a lower bound (with nothing dropped, every live bar past the post-start settling and the frontier must be rebuilt; bite-checked against a replay that suppresses everything); four unit tests that counted only per-tick callbacks, which read 0 in both arms once replay held its seals, now count at the hand-over and carry controls; `the_catchup_drain_counts_what_it_does_not_fold` scanned its own test module and passed on a stale needle, now production-only. (6) **Coverage (CI red: trading 96.87% < 96.9%):** tests for the held-bar release in `force_seal_all` and the catch-up sweep, and for `finish_replay` with no replay. (7) A skipped staged segment that cannot be returned to the live dir is now a coded error on the restore-failure counter, like the deferred-segment restore. **Honest limits added:** a process that dies between a catch-up round's archive and the hand-over loses the bars still held (stored rows stand); a process restart under 5 s is not flagged as a gap (a false gap only suppresses, a missed one lets at most those seconds' volume into one bar).
+
+- [x] 47l — **Review round 8 (2026-09-29): hot-path reviewer and hostile logic reviewer.** Fixes: (1) **HIGH — a repeated quote (same trade, new open interest or buy/sell totals) took the repeat-quote early return before the late-tick check**, so during a replay it refreshed quote fields on an open bucket live may already have closed by catch-up; the repeat path now marks such a bucket partial (not the next one: a repeat adds no volume). Pinned by `test_regression_repeat_quote_after_a_live_catch_up_leaves_its_minute_partial`, bite-checked. (2) The late-tick check moved out of the per-timeframe fold loop, so live mode pays one branch per tick, not one per timeframe (hot-path reviewer); CLAUDE.md row wording corrected. Shared eligibility helper `InstrumentSlot::open_bucket_may_be_closed_live`. (3) A late tick's next-bucket mark is cleared at the hand-over (`finish_replay`) instead of tainting the first live bar, which no previous process ever stored, so the taint could only discard a bar that existed nowhere else. (4) The late-tick bound gets the same 5 s clock-skew allowance as the gap frontier. (5) **Randomized tests strengthened:** the mixed-stream property now draws late ticks up to 900 s behind (the late-tick rule could never fire before); the lower bound moved into `rebuilt_after_settling` and runs on every case of a new property `test_replay_with_nothing_dropped_rebuilds_every_settled_bar` (it ran on ~2% of cases before); its model of when post-gap settling ends was corrected on the property's first counterexample (a direction is learned only from a price change on a volume-adding tick). Bite-checked against a replay that suppresses everything. 20,000 cases × 2 runs green.
+
+- [x] 47m — **Review round 9 (2026-09-29): hostile logic reviewer.** Fix: **HIGH — the bar holding 09:15 came out two ways for the same ticks.** Rolling from a pre-open bucket (the grid starts at 09:00) into the bucket holding the market open ignored the official day open and disarmed it, while opening that bucket from an empty slot (after the catch-up sweep had sealed the pre-open bar) stamped it. Which path ran depended only on sweep timing, so live was not deterministic and a WAL replay (no sweep) rebuilt a different opening bar than live stored. The roll in `AggregatorCell::consume_tick` now applies the empty-slot rule (use the official open on the bucket containing 09:15, disarm once used or once past that bucket). This changes live behaviour too: a roll into the 09:15 bucket now opens at the official day open. Pinned by `test_regression_roll_and_empty_open_stamp_the_same_day_open` (M1 and M5), bite-checked. Verified: trading lib 1,841 passed, trading integration 30 suites passed, 0 failed (DHAT fold included); app lib 2,336 passed; CI clippy clean; banned/pub-fn gates clean. **Not fixed, recorded:** (MEDIUM, not reproduced) a future-dated frame the replay skips could raise live's watermark beyond what the replay sees, so the late-tick rule would not mark a bucket live closed early; (LOW) session high/low attribution beyond the 5 s skew; the first live bar after a replay spanning downtime publishes net as NULL (by design).
+
+- [x] 47n — **Review round 10 (2026-09-29): hostile reviewer on the round-9 opening-bar fix — no CRITICAL or HIGH.** The reviewer ran five tick sequences on all ten timeframes, once as rolls and once with a catch-up sweep before every tick, and compared every candle whole: identical on this head, 28 divergences on the parent. Follow-ups done: the regression test `test_regression_roll_and_empty_open_stamp_the_same_day_open` now covers every timeframe, compares the whole candle and adds an official open arriving on the second tick (bite-checked); two stale comments corrected with dated notes (the withheld-day-open residual, and "no timeframe has a 09:00 bucket"). **Recorded, not fixed (older than plan 47, same in live and replay):** (MEDIUM) a single-tick 09:15 bar misses the session high/low whenever the instrument traded pre-open, because the open path passes `first_bucket_of_day = false` while the in-bucket path adopts them on later ticks; (LOW) nothing re-arms the day open inside a running process except `force_seal`, so the cell relies on the daily restart.
+
+- [x] 47o — **Review round 11 (2026-09-29): hostile whole-feature reviewer and hot-path reviewer.** (1) **CRITICAL — the hand-over taint never cleared** (reproduced by the reviewer with a test): round 8 removed the line in `roll_replay_bits` that cleared `replay_taint_open` together with the late-tick taint it shared, so after a restart every later live bar of a tainted timeframe was suppressed for the rest of the process (M3 to M60 for most instruments; every timeframe when the replay ended on a gap). The clear is restored; pinned by `test_regression_hand_over_taint_suppresses_only_the_bucket_open_at_the_hand_over` (three hours of live ticks after a tainted hand-over, both `ended_on_gap` values), which fails without the fix. **Why nothing caught it:** the randomized properties compare only bars emitted DURING the replay, and the hand-over test checked only an untainted timeframe; the follow-up item below extends the property past the hand-over. (2) Hot path: the repeat-quote late check is now one branch per repeat in live mode instead of one per timeframe (a mask collects the refreshed buckets), and the held-bar test samples one flag per tick; the CLAUDE.md row, which claimed live mode paid nothing, is corrected to say it pays one flag test per timeframe. (3) Checked and left: `staged_gaps` in the catch-up drain is not pre-sized (cold, exempt, grows only on a gap). (4) LOW, recorded: a held bar that a later gap marks partial and a late tick amends is counted twice as suppressed (counter only; no wrong bar). Verified: trading lib 1,842 and 30 integration suites (DHAT fold included), app lib 2,336; CI clippy, fmt, banned/pub-fn gates and the CLAUDE.md map guard clean.
+
+- [x] 47p — **Randomized test past the hand-over (2026-09-29, follow-up to round 11).** Every earlier property stopped at `finish_replay`, which is how the round-11 taint leak passed all of them. New property `test_live_bars_after_a_replay_hand_over_are_all_written` (helper `fold_restart`): a random head is replayed with random drops, the replay hands over, and a random live tail of up to 160 ticks (up to hours) follows; every bucket opening after the hand-over's reach must be written with the same volume, open, high, low and close as a process that never restarted. The reach is the first live tick, which re-seeds by design (a restart always has downtime); the property's first counterexample was that modelling error, not a code defect. The buy/sell split is not compared: a restarted process may not know the tick-rule direction yet, and no stored bar exists for those buckets. Bite-checked: with the round-11 clear removed it fails at once. Heavy runs: all six replay properties at 20,000 cases x 3 runs green (release).
+
+- [x] 47q — **CI red on DHAT Zero-Alloc (2026-09-29), caused by this plan's phase (d).** On CI, attempt 1 of `dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries` measured a cross-thread phantom (900 B / 4 blocks); the retry helper re-ran the workload on the SAME aggregator, whose clock phase (d) had left at ~15:25, so every re-run tick was hours late, nothing sealed, and the phase (b) vacuity assert failed. The retry that exists to absorb phantoms could never pass. Each attempt now uses its own pre-warmed aggregator (built outside the measured region). Proven both ways: an allocation injected on attempt 1 only is absorbed (attempt 2 clean), and one injected on every attempt still fails the zero-alloc assert.
+
+- [x] 47r — **Review round 12 (2026-09-29): a hand-over leak reviewer and a mixed-stream randomized attacker.** (1) **MEDIUM, reproduced by the reviewer — live settling dropped a bucket the hand-over kept.** A clean hand-over keeps the complete buckets still open (round 4: after a crash they exist nowhere else), but post-hand-over settling marked every open bucket partial on the first live tick that added volume, and a kept bucket that ended before the capture start was then suppressed on roll — so it survived or not depending on the next ticks' delivery lag. New per-slot mask `InstrumentSlot::replay_handover_kept` (set in `finish_replay` to the untainted open buckets, cleared when the bucket rolls); settling marks every bucket except those. Live mode already accepts the settling uncertainty for every bucket it opens itself; this makes the kept one consistent. Pinned by `test_regression_live_settling_does_not_drop_a_bucket_the_hand_over_kept` (M5, M10 and M1, capture-start rule vs none), which fails without the fix. Cost: one AND-NOT while settling; 2 bytes per slot. The reviewer checked every other replay field for leaks into live mode and found none (held bars, frontier, next-bucket mark, gap epoch, taints, day boundary, live-created slots, capture start unset or in the future). Verified: trading lib 1,844 and 30 integration suites (DHAT included); six replay properties at 20,000 cases green; app lib 2,336; CI clippy, fmt and banned gate clean.
+
+- [x] 47s — **The future-dated question (round 9 MEDIUM, closed 2026-09-30): the live catch-up cutoff is capped at the wall clock.** The candle clock is the vendor trade stamp and only a stamp on a future DAY is refused, so one trade stamped minutes ahead on the same day moved `watermark - CATCHUP_LATENESS_MARGIN_SECS` ahead and the live catch-up seal closed every quiet instrument's buckets before their real trades arrived (a live defect in its own right), and a WAL replay that skipped that frame could not see those early closes. `LiveIngest::catch_up_cutoff` now uses `min(watermark, wall)`, where wall is the arrival instant of the latest folded frame, refreshed by the 1 s top-volume timer with a real clock reading (the same reading the top-volume close clock is already capped at); with no reading yet it follows the watermark as before. Consequence for the replay: live can then never seal past the wall clock, and the replay's late-tick bound (receipt + `REPLAY_FRONTIER_SKEW_SECS`) is at or above it whatever frames were skipped. Pinned by `test_regression_a_future_stamped_tick_cannot_close_buckets_early` (control: 7 bars sealed early with no wall reading; with it, none), which fails without the fix. O(1): one compare per 5 s sweep. Verified: app lib 2,337 passed; CI clippy, fmt and banned gate clean. The app integration suites were not run locally (the disk allowance cannot hold their binaries); CI runs them. The mixed-stream restart property from round 12 was not completed (the agent hit a rate limit) and stays open.
+
+- [x] 47t — **Review round 13 (2026-09-30): a read-only hostile reviewer on the wall-clock cap, plus the mixed-stream restart property (running).** The reviewer found no CRITICAL or HIGH: the new cutoff can never be later than the old one, so nothing seals earlier than before. **MEDIUM, fixed:** the catch-up timer fires as soon as the drain starts, before any live frame or snapshot timer has stored a wall reading, so the first sweep after every boot still followed the replay's watermark; a future-stamped trade inside the replayed frames could close buckets early once per boot. `finish_wal_replay` now stores its own clock reading as the first cap. Pinned by `test_finish_wal_replay_caps_the_first_catch_up_sweep_at_the_wall_clock` (a replay watermark 10,000 s ahead; the cutoff after the hand-over lies inside the wall-clock window), which fails without the fix. The field doc no longer overstates the refresh (under a frame backlog the biased select starves the snapshot timers and the reading is the latest frame's arrival, still our clock). Checked and clean per the reviewer: every wall writer is our own clock in IST; replay and catch-up frames never reach the drain's poll; the shutdown path still seals every open bucket through `force_seal_all`; a box clock behind the exchange only delays sealing. Recorded LOW: an NTP forward step over 5 s combined with a replay gap can still exceed the replay's clock-skew allowance (pre-existing, not introduced here). Verified: app lib 2,338 passed; clippy, fmt, banned gate clean.
+
+- [x] 47u — **Review round 13, the mixed-stream restart property (2026-09-30).** The reviewer agent was lost to a container restart before it reported; its temporary property, its six saved counterexamples and an experimental one-line patch were left on disk and triaged here. (1) **Real defect, fixed — a re-sent trade left the gap pending and the next real trade lost its volume.** Dhan re-sends the last trade on every order-book change, so after a gap (above all the hand-over after a restart) the first packet is often a repeat of the last COUNTED trade. The repeat path returned early and left the gap pending; the next real trade then took the gap tick's role and its delta was discarded (0 shares instead of 10 in the pinned case). The repeat now resolves the gap itself: it carries the same cumulative, which proves nothing traded in between, so the gap tick's other duties (re-base, net marked unknown, settling) have nothing to guard. The reviewer's experiment (disqualifying repeats while a gap is pending) was rejected: it folded the re-send as a trade (an extra `tick_count`) and cleared the net classification of a bar that had lost nothing. Pinned by `test_regression_a_resent_trade_resolves_the_gap_without_losing_the_next_trade` (continuous, after a restart, and after a gap inside the replay; all three must match), which fails without the fix. O(1). (2) **Modelling error, not adopted:** the property's remaining counterexample needs an instrument whose only pre-restart trade is in a skipped frame and whose first live trades are stamped over 240 s late; the continuous and restarted runs then start from different histories and attribute one late trade's volume to different buckets, all after the capture start, where no stored bar exists to overwrite. Its rule "every bucket after the reach equals the continuous run" is stricter than the contract whenever late trades precede the reach, so the mixed-stream restart property stays open as a design question rather than being checked in weakened. Verified: trading lib 1,845 and 30 integration suites (DHAT included); six replay properties at 20,000 cases; clippy, fmt, banned gate clean.
+
+- [x] 47v — **Review round 14 (2026-09-30): a hostile reviewer on 47s, 47t and 47u.** Nothing serious in the wall-clock cap (the reading can step back a few ms between a timer and a frame, which only lowers the cap, the safe direction). **HIGH in 47u, reproduced:** the re-send cleared the pending gap without settling, but the gap had also reset the tick-rule direction, so the next trade at an unchanged price had no sign and the replay wrote its minute with an unclassified net over the stored, classified one (`(10, false)` over `(10, true)`). **MEDIUM in 47u, reproduced:** a STALE copy exactly equal to the last pre-gap state is indistinguishable from a true re-send, so the next trade could carry a skipped span into a bucket that was not partial. Fix: the re-send that clears a pending gap now also sets `replay_settling`, exactly as a gap tick does. In a replay the next trade's bucket is then withheld, as before 47u; in live mode after a restart partial marks matter only before the capture start, so 47u's volume fix stands. Pinned by `test_regression_a_resent_trade_still_settles_an_unsigned_next_trade` (the reviewer's sequence; fails without the settle) and the 47u test, whose inside-the-replay case now expects the minute withheld. **Honest limit, live mode only:** after a restart, a stale packet exactly equal to the old process's last state, followed by a real trade, lets that trade carry the downtime's volume into a post-restart bar that no process stored; before 47u that trade's own volume was always discarded instead. Verified: trading lib 1,846 and 30 integration suites (DHAT included); six replay properties at 20,000 cases; clippy, fmt, banned gate clean.
+
+- [x] 47w — **Review round 15 (2026-09-30): a whole-feature hostile reviewer with a randomized differential (4 x 40,000 replay cases, 0 contract failures; ~7.9M of 16.3M live bars emitted, so not vacuous).** No defect in 47u/47v. (1) **MEDIUM, reproduced (61 of 20,000 randomized restarts) — a late first live trade poured the downtime into a kept bucket.** After a clean hand-over the same-bucket gap rule kept the whole skipped span in the bucket the first live trade landed in; when that trade was late, the downtime trades after the bucket's end landed there too, written as complete (225 shares against a true 33). The deeper cause: a bucket that ended after the previous process's last frame but before this one began listening had its tail in the downtime, which nobody captured, yet round 12 kept it as complete — so round 12's "does not depend on delivery order" held only by accident. Two changes: (a) `finish_replay` taints such a bucket (end > `replay_last_frame_secs` - skew and end <= capture start); `replay_last_frame_secs` is the latest replayed frame's receipt (trade second if none), tracked in the replay-only branch. Kept are only buckets that ended while the previous process still captured (round 4's real case) and those still open at the capture start. (b) `AggregatorCell::rebase_open_buckets_after_gap` takes the span's end (the capture start in live mode, unbounded in replay) and returns the same-bucket buckets that ended before it; the caller marks them partial and drops them from the kept mask. Tests: `test_regression_a_late_first_live_trade_cannot_pour_the_downtime_into_a_kept_minute` (two variants: a downtime-overlapping minute, and a complete kept minute where only the span bound guards it; the latter fails with the bound removed), and `test_regression_live_settling_does_not_drop_a_bucket_the_hand_over_kept` rewritten to the rule (late and on-time live orders give the same result; downtime buckets withheld; the bucket open at the capture start and a quiet instrument's finished minute kept; fails with the downtime taint removed, in the on-time order). The round-4 test now adds another instrument's frame after its minute ends, the fact that makes that minute complete. (2) **MEDIUM, recorded as an honest limit (Assumed):** a stale packet exactly equal to the previous process's last trade, arriving first after a restart, lets the next trade carry the whole downtime (3,990 against 10 in the reviewer's case). It needs Dhan to send pre-crash state on a NEW connection, whose first packet is the current snapshot; the measured stale packets are seconds old within one connection. (3) LOW: a late re-send with no receipt clock; unreachable (such frames are never replayed). Verified: trading lib 1,847 and 30 integration suites (DHAT included); six replay properties at 20,000 cases; app lib 2,338; workspace clippy, fmt, banned and pub-fn gates, CLAUDE.md map guard clean.
+
+- [x] 47x — **Review round 16 (2026-09-30): a hostile reviewer on 47w.** (1) **MEDIUM, reproduced — the capture start is read before the sockets are dialled.** `finish_wal_replay` reads the wall clock before the drain is spawned and `dial_planned_connections` runs, so the downtime really ends a dial-and-subscribe later; a bucket ending in that window passed the span bound and the downtime rule, and round 15's overcount came back (225 against 33). After a replay hand-over the capture start is now PROVISIONAL (`capture_start_provisional`): the first live tick with a receipt moves it to that receipt and re-applies the downtime rule once to the buckets still kept (`MultiTfAggregator::confirm_capture_start`, O(slots × `TF_COUNT`) once per hand-over; live mode otherwise pays one bool test per tick). Pinned by `test_regression_the_first_live_receipt_confirms_the_capture_start`, which fails with the confirmation off. (2) **LOW-MEDIUM, reproduced — the previous process's last frame ignored refused frames.** `replay_last_frame_secs` moved only on ticks that passed every gate, so post-close (and zero-price, slot-exhausted) frames did not count, and a crash after 15:40 withheld the day's last bars of every instrument. It now reads every replayed frame's receipt at the top of `consume_tick`, before any gate. Pinned by `test_regression_post_close_frames_show_the_previous_process_was_still_capturing`, which fails with the tracking moved back. **Recorded (LOW):** a receipt-less (pre-TVW3) WAL frame with a same-day future stamp can still raise the last-frame value through the trade-second fallback; box-clock skew beyond the 5 s margin moves both edges (chrony-bounded); depth frames are not seen by the fold, so the last frame can only read early (the safe direction). Verified by the reviewer: the returned mask matches `replay_tf_bit`; a process that never replays is unchanged. Verified here: trading lib 1,849 and 30 integration suites (DHAT included); six replay properties at 20,000 cases; app lib 2,338; workspace clippy, fmt, banned and pub-fn gates, CLAUDE.md map guard clean.
+
+- [x] 47y — **Review round 17 (2026-09-30): a hostile reviewer on 47x.** (1) **MEDIUM, reproduced — the capture start was confirmed process-wide.** The first live tick of ANY instrument confirmed it for all, but instruments on a socket that listened later (other main-feed sockets, the contract pass) had a longer downtime; round 16's overcount returned for them (225 against 33). Each instrument now also confirms at its own first live receipt: `InstrumentSlot::{handover_listen_pending, handover_listen_secs}` set at the hand-over, and on the instrument's first live tick with a receipt the downtime rule is re-applied to its kept buckets and its gap span is bounded by `max(capture start, own receipt)`. The rule lives in one place, `InstrumentSlot::taint_kept_ended_in_downtime`, used by the hand-over, the process-wide confirmation and the per-instrument one. O(`TF_COUNT`) once per instrument; live mode otherwise pays one more bool test per tick. Pinned by `test_regression_the_first_live_receipt_confirms_the_capture_start` (new variant: another instrument's frame arrives first), which fails with the per-instrument confirmation off. The top-of-function comment now says two bool tests, as the reviewer counted. **Recorded (LOW):** a first receipt stepped backwards clears the process-wide flag without moving the start (the per-instrument one still applies); a far-future first receipt (box clock fault) has no upper bound and suppresses partial live bars ending before it; a quiet instrument on a later socket that never ticks again keeps a bucket ending in its own dial window. Verified by the reviewer: nothing seals a kept bucket before the recheck; the recheck cannot taint a new bucket (every roll clears the kept bit); a process that never replays is unchanged. Verified here: trading lib 1,849 and 30 integration suites (DHAT included); six replay properties at 20,000 cases; app lib 2,338; workspace clippy, fmt, banned gate clean.
+- [x] 47z — **Review round 18 (2026-09-30): a randomized restart differential (truth run vs crash + WAL replay + per-socket listen times, 60,000 cases).** No bar ever carried MORE volume than the uninterrupted run. Three undercounts, each reproduced: (1) **the downtime rule allowed a 5 s skew**, so a kept bucket that ended 40 s before the crash, whose 90 s-late trade was delivered in the downtime, was written short; it now allows the live catch-up margin (`catch_up_margin_secs.max(REPLAY_FRONTIER_SKEW_SECS)`, 240 s) at the hand-over, the process-wide confirmation, the per-instrument confirmation and the sweeps. (2) **A sweep could seal a kept bucket before the instrument confirmed its own listening time**: `InstrumentSlot::hold_unconfirmed_kept` withholds it at `catch_up_seal_slots` and `force_seal_all` when it ended within the margin of the last replayed frame. (3) **Seal decisions used the process-wide capture start**, so a sub-minute bucket that ended before the instrument's own socket listened was written from a subscribe re-send; every `ended_before_capture` call now reads `InstrumentSlot::capture_from` = `max(capture start, own first receipt)`. All O(1) per seal. Pinned by `test_regression_restart_edges_withhold_what_the_downtime_touched` (three scenarios, each failing with its fix removed) and by the reviewer's differential checked in as `crates/trading/tests/restart_differential.rs` with four invariants (no over-count; a bucket ended by the crash identical or absent; every other written bar identical bar the first live trade's bucket; a bucket missing after the socket listened holds that trade or ended by the instrument's first receipt). It fails in 2.4 s on the pre-fix aggregator and passes 20,000 cases (8.4 million bars) on the fix. **Recorded limits (surveyed, 20,000 cases):** the first live trade's bucket misses its own delta (4,408 bars; same as a fresh boot's first bucket); a bucket that ended by the instrument's first live receipt is withheld (4,121 bars; the socket's real listen time is not observable) — both never wrong, the second counted. Three existing tests moved so the previous process captured 240 s past their "complete" buckets. Verified here: trading lib 1,850 and every integration suite (DHAT included); six replay properties at 20,000 cases; app lib 2,338; workspace clippy (CI form) and trading all-targets clippy on the changed files, fmt, banned and pub-fn gates clean.
+- [x] 47za — **Review round 19 (2026-09-30): a hostile reviewer on 47z.** (1) **HIGH, reproduced — a bucket that BEGAN in the downtime was written wrong, and the 47z differential hid it** by exempting the bar that holds the first live trade. The reviewer's case: minute [900, 960), crash +900, trades at +902 (105) and +903 (99) lost, first live trade +911; written `v0 o=h=l=100.2` against the uninterrupted `v60 h105 l99`; a normal-restart probe wrote ~800 such bars for 200 stocks. Fixed: in live mode a bar is withheld when its bucket STARTED at or before the instrument's capture start (`started_before_capture`, was `ended_before_capture`) and it is partial, or the hand-over did not keep it complete (`roll_replay_bits`; the verdict rides the sealed partial bit so a late amendment is refused too). The tightened differential then found three more, each fixed: a still-open kept INDEX minute that missed a downtime low (a kept bucket is now withheld at the instrument's first live packet when it ended less than the margin before the last replayed frame OR is still open — `InstrumentSlot::taint_kept_at_risk`); a live-opened, non-partial minute that began before the capture start (the rule above); an instrument the replay never saw, on a late socket (`capture_is_mid_session`: after a mid-session boot its own first receipt is its capture start; a pre-market boot is unchanged). (2) **MEDIUM — the 240 s margin withheld complete bars.** When the instrument's first live packet is the last replayed trade itself (same last-trade time, price and cumulative — Dhan re-sends it on every order-book change), nothing traded in the downtime: its kept bars stay, the hand-over gap is cleared, the tick-rule direction is restored (`handover_tick_sign`) and the capture-start rule no longer applies to it (`downtime_clear`). The hand-over itself no longer taints; the per-instrument confirmation (on its first live tick, with or without a receipt) and the sweep hold decide, and the process-wide confirmation is O(1). An instrument that did trade in the downtime still loses those bars — the rule is sound, the proof is not available. (3) LOW — net mismatches were all written unclassified; the differential now requires a classified net to match and checks stored rows against a simulated previous process. Pinned by `test_regression_a_bucket_that_began_in_the_downtime_is_withheld` (five scenarios) and `test_a_pre_market_boot_still_writes_every_first_bar`; seven bite checks, each rule failing its scenario when removed. Three older tests restated for the stricter rule (the first live tick's bucket and a half-hour that began two seconds before the capture start are withheld; every later bucket still written). Survey, 20,000 restarts: wrong bars 32,761 (round 18) → 0; bars withheld after the crash 500,029 → 731,410 and ended-by-crash bars never written 323,204 → 377,378, the rise being the bars that used to be written wrong. Verified here: trading lib 1,852 and every integration suite (DHAT included); six replay properties and the differential at 20,000 cases; app lib 2,338; workspace clippy (CI form), fmt.
+- [x] 47zb — **Review round 20 (2026-09-30): a hostile reviewer on 47za.** (1) **HIGH, reproduced — the round-19 "nothing traded" proof was unsound.** A STALE copy of the last replayed trade is indistinguishable from a true re-send; taking it as proof cleared the gap and the capture-start rule, and the minute [900, 960) was written `o=h=l 100.3` against the uninterrupted `h105 l99`. The proof path (`downtime_clear`, `handover_tick_sign`) is REMOVED. In live mode a repeat no longer resolves the hand-over gap (`consume_tick` repeat branch: replay only); the instrument confirms at the packet that ENDS its gap (`gap_now` or a counter restart), and every kept bucket at risk is withheld there. Extending the randomized differential to send STALE re-sends then found two more: that packet (or the one that seeds a slot first seen after a mid-session boot) may be a stale copy, so the next trade's delta carried the downtime into a bar written as complete (an OVER-count), and its price gave the next trade a direction. Fixed: `prev_price_untrusted` — the first later trade that adds volume reads no direction from that price, and every bar it lands in is withheld (sealed taint before the fold, open taint after it). (2) **MEDIUM — a boot or first frame just after 09:00 withheld every instrument's first bars.** `earliest_trade_secs_of_day`: a capture that began before the segment's earliest trade of the day missed nothing (`PRE_OPEN_EARLIEST_TRADE_SECS_OF_DAY_IST` = 09:07:00 for equity and F&O, the 09:00 session open for indices and everything else, since nothing here shows what an index publishes in the pre-open); `started_before_capture` and `capture_is_mid_session` both apply it. (3) LOW — exactly 09:00:00 now withholds nothing. (4) LOW — `force_seal_all` clears a pending hand-over wait, `prev_price_untrusted` and the provisional capture start, so a quiet instrument's first bars the next day are written. Pinned by `test_regression_a_stale_first_packet_cannot_carry_the_downtime` (three scenarios), `test_the_day_close_ends_a_hand_over_wait`, the widened `test_a_pre_market_boot_still_writes_every_first_bar` (08:55, 09:00:00, 09:05, a replay whose first frame confirms at 09:00:02, and a mid-session boot), the round-19 scenario 5 rewritten as the stale copy, and the round-13 and round-11 tests restated (the first volume trade's bucket is withheld after a restart; every later bucket still written). Six bite checks, each rule failing its test when removed. The differential now generates stale re-sends and bounds a withheld bucket by the gap-ending packet and the first volume trade after it; it fails on the round-19 aggregator in 0.24 s and passes 20,000 cases on this one. Cost, 20,000 restarts: bars withheld after the crash 731,410 → 859,426 of 13.3 million (the random test restarts far more often than production). Verified here: trading lib 1,854 and every integration suite (DHAT included); six replay properties and the differential at 20,000 cases; app lib 2,338.
+- [x] 47zc — **Review round 21 (2026-09-30): a hostile reviewer on 47zb. No CRITICAL, no over-count.** (1) **MEDIUM (risk) — the 09:07 bound is WITHDRAWN.** The repo records that pre-open packets carrying prices but no volume reach the fold from 09:00 (the day-open note in `aggregator_cell`, the archived 09:00–09:08 pre-open buffer), so a boot at 09:05 could write a first bar without them (reproduced under that assumption; QuestDB unreachable to measure). Every segment uses the 09:00 candle session open again; `earliest_trade_secs_of_day` and its constant are removed. A boot at 09:00:00 or earlier withholds nothing; a later one withholds the first bars that began before each instrument was confirmed. (2) **MEDIUM — the first-volume taint landed on unrelated bars.** When that trade was late and a catch-up seal had already closed its bucket, it amended or was discarded and opened nothing, and the all-timeframe taint was applied to the next bucket a normal trade opened. Now only the timeframes whose OPEN bucket holds it are tainted (`landed_open`, one register OR per timeframe). (3) **MEDIUM — exact bars withheld after a provably fresh gap packet.** `handover_first_receipt_secs` records the instrument's first live receipt of any packet (a repeat included); a gap-ending packet that traded more than the 5 s skew after it cannot be a stale copy, so the next trade is trusted. (4) LOW — duplicate bindings in the unit property `fold_restart` removed (no lib-test warnings left). The differential now generates delivery lags beyond the 240 s margin (round 21 needed them), accepts a stored row rewritten with its own content, and checks only "no over-count" for a bucket holding a trade delivered more than the margin late after the crash — the recorded envelope limit (the live path itself takes such a trade as a late amendment; production's measured maximum lag is 199 s). Pinned by `test_regression_exact_bars_after_a_restart_are_written` (both reproductions: the bars are written, with the same volume and prices) and the pre-market test restated (09:05 and a 09:00:02 confirmation withhold the first bars). Three bite checks. Verified here: trading lib 1,855 and every integration suite (DHAT included); six replay properties and the differential at 20,000 cases; app lib 2,338.
+- [x] 47zd — **Review round 22 (2026-09-30): a hostile reviewer on 47zc.** (1) **HIGH, reproduced — the round-21 `landed_open` narrowing re-opened an over-count.** When the first trade that adds volume after an untrusted gap packet is late (its bucket already sealed by the catch-up), its volume is CARRIED (`carry_unattributed`) and settles into the bucket its timeframe has open, or opens next, when that bucket seals. That bucket holds the downtime volume; round 21 called it "unrelated" and stopped tainting it, and the reviewer's case wrote it at volume 90 against a true 20. Reverted: every timeframe's open bucket is tainted again (`replay_taint_open = REPLAY_ALL_TF_MASK`), and the per-timeframe `landed_open` OR is gone from the hot path. The round-21 case 1 is restated as "withheld or exact" (its gap packet is not provably fresh), and the reviewer's shape is pinned as case 3 of `test_regression_exact_bars_after_a_restart_are_written` (a stale copy of a downtime trade as the gap packet, the next trade 300 s late): it writes 20 against a true 15 with the taint removed. (2) MEDIUM — the differential's beyond-margin exemption skipped invariants 2–4 on 37% of post-crash buckets; lags over 240 s are now about 1 event in 500 and the exemption covers only buckets whose late trade arrived after the margin past the bucket's end: 0.97% of 140,005 post-crash buckets over 512 cases, 0 failures. Its invariant 4 now also allows the bucket a late first-volume trade's carry settles into: from that trade's bucket to the bucket of the first later packet whose own bucket the catch-up cannot yet have sealed (two harness misses of that path fixed on the way: a re-delivered copy, and a later packet that was itself late). (3) LOW — the honest limit reads "any trade received after the crash more than the margin after its bucket ended" (a live-received one is refused as an amendment of a bar that began before the capture start). (4) LOW — CLAUDE.md row: the round-21 "unrelated bucket" claim corrected and the live-mode per-tick cost stated in full. Verified sound by the reviewer: the trusted-gap-packet proof (under the existing 5 s skew assumption), pre-market and normal live paths unchanged, DHAT green, the invariant-2 relaxation, the 09:00 restatement. Verified here: trading lib 1,855 and every integration suite (DHAT included); six replay properties and the differential at 20,000 cases; app lib 2,338.
+- [x] 47ze — **Review round 23 (2026-09-30): a hostile reviewer on 47zd; carried in a follow-up PR (the owner chose to merge plan 47 first).** (1) **HIGH, reproduced — a second late downtime trade still over-counted.** `prev_price_untrusted` cleared on the first packet that added volume; that packet can itself be a downtime trade delivered late and out of order, below a downtime trade nobody received, so the next trade's delta carried the lost trade (written 15 against a true 10, classified). The flag now stays set for every volume-adding packet that traded no later than `handover_listen_secs` plus the 5 s skew and clears on the first one that traded later, which is still withheld. Pinned as case 4 of `test_regression_exact_bars_after_a_restart_are_written` (bite-checked: 15 against 10 without the fix; the trade after it written exactly). (2) **Found by the differential once it delivered out of order — the replay analogue:** a stale packet re-seeding after a replay gap gave the next trade a false direction, carried into a stored bar rewritten at net -5 against a true +5. Each replay gap, and a re-send that resolves one, now sets `prev_price_untrusted`, cleared on the first volume-adding trade after the gap frontier; replay settling withholds those bars and now ends on the first trade whose delta and direction both come from trusted packets (that trade is written). `test_mark_replay_gap_stale_first_packet_does_not_count_twice` is restated: the minute holding the clearing trade is withheld and the next minute is checked exact; the `fold_restart` reach model follows the new live rule. The same applies to a slot first seeded after a replay gap (a bar written at 42 against a true 17: its seed was older than a skipped packet) and to a counter restart that resolves a gap; the `rebuilt_after_settling` model follows. (3) **Live, found by the out-of-order generator — a late amendment of a pre-capture bar:** a late downtime packet with an unchanged cumulative (a stock with no new volume) amended a stored bar the uninterrupted run had refused, because it had seen a newer packet the restart lost. Live mode no longer re-emits an amendment of a bar that began before the instrument's capture start; the stored row stands. All three bite: each saved seed fails with its fix disabled. Present on the plan-47 head too (reproduced there). (4) MEDIUM — the differential's invariant-4 allowance extends past the last untrusted trade's bucket only when that trade was late. (5) LOW — the beyond-margin exemption boundary is `>=`. (6) LOW — CLAUDE.md row: the "no bar ever carries more volume" claim corrected. The generator reorders a stock packet only when the next trade adds volume (a stock packet with an equal cumulative is the same trade, at the same price). The differential now delivers 1 stock event in 15 out of order (index packets are not reordered: recorded as a limit, since a late out-of-order index packet's fate depends on packets lost in the downtime; reproduced on the plan-47 head as well).
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/tests/restart_differential.rs, CLAUDE.md
+  - Tests: test_regression_exact_bars_after_a_restart_are_written, a_restart_never_writes_a_wrong_bar
+- [x] 47zf — **Review round 24 (2026-09-30): six independent auditors on the deployed main (03107f858); the four candle-fold findings and two low findings fixed in a follow-up PR.** (1) **HIGH, reproduced — the day-close seal forgot each instrument's own capture start.** `force_seal_all` cleared `handover_listen_secs` and `handover_listen_pending` BEFORE judging each instrument's open bars, so `capture_from` fell back to the process-wide start: an instrument whose hand-over gap ended on its only later trade (15:37) had all ten timeframes written at volume 0 against a true 20. The resets now run after every bar is judged. (2) **MEDIUM, same cause — the day-close seal switched off `hold_unconfirmed_kept`:** an instrument with no live packet after a 15:20 crash had its hour written at 40 against a true 80 (a 15:21 downtime trade). Fixed by the same move. (3) **MEDIUM — a boot just before 09:00 with an empty WAL never confirmed its capture start:** the capture start is read before the sockets are dialled, so an 08:59:58 boot whose first packet came at 09:00:40 wrote the 09:00 minute with one price against a true 1000/1010/995 range. A boot less than `PRE_OPEN_DIAL_WINDOW_SECS` (300 s) before 09:00 now counts as mid-session, so each instrument's first receipt after 09:00 is its capture start; a first receipt at or before 09:00:00 missed nothing and withholds nothing. The scheduled 08:30 boot and its 08:45 backup are outside the window. `test_a_pre_market_boot_still_writes_every_first_bar` restated: a 09:00:00 boot now withholds, like the replay confirmed at 09:00:02. (4) **LOW — a `u32` wrap of the vendor cumulative was treated as a counter restart:** the minute holding it was written at 5 against 16 and the next at 0 against 7, and a packet from before the wrap delivered after it was counted as about 4.29 billion units forward. `unwrap_u32_cumulative` widens the cumulative onto the monotonic `u64` axis (bits above 32 count the wraps), so a wrap counts forward exactly and a pre-wrap straggler is refused as stale; any other large drop is still a counter restart. (5) LOW (auditor D) — the DHAT fold test's phase (d) now sets a mid-session capture start, so the post-restart live paths run under the allocation gate, and a phase (e) covers the day-close seal and a wrap; the `TF_COUNT` is 9 comments in the app are corrected (10). (6) LOW (auditor A) — `error_code_paging_filter_drift_guard` sliced 800 bytes back into an en dash and panicked; the window start now moves forward to a character boundary. The restart differential now ends 35% of runs with the day-close seal (it never reached it before), and with the round-24 fix disabled it finds the day-close defect on its own (seed saved). Every fix bites: each new test fails with its fix disabled. **Review round 25 (a hostile reviewer on the 47zf diff):** (a) MEDIUM, reproduced — a first receipt in the open's own second (09:00:00.600) could have missed a packet of that second (.100), and this box's clock can run behind the exchange's, so the round-24 "a first receipt at or before 09:00:00 missed nothing" test wrote the 09:00 minute with open 1001 against a true 1000 (8 bars; 7 with the clock 2 s behind). That test is removed: at a boot counted as mid-session, the per-instrument capture start is now the latest of its first receipt, its own trade second and 09:00:01. (b) LOW, reproduced — a day rollover in a process that never ran the day-close seal read as a wrap (161 written against 10); `unwrap_u32_cumulative` now takes `same_day_seeded`, false on a later IST day, so that stays a counter restart. (c) LOW — the DHAT phase (e) asserts the wrap minute's volume (10); the differential's model keeps a 64-bit cumulative and 20% of runs start stocks 300 units below `u32::MAX`, so it covers the wrap and, with the wrap fix disabled, finds that defect on its own (seed saved). (d) LOW, recorded as a limit — a boot less than five minutes before 09:00 withholds each instrument's first bars whenever it first trades that day, not only near the open (counted; never written wrong).
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/tests/restart_differential.rs, crates/trading/tests/dhat_multi_tf_fold.rs, crates/app/src/dhan_feed_stack.rs, crates/common/tests/error_code_paging_filter_drift_guard.rs, CLAUDE.md
+  - Tests: test_regression_day_close_keeps_each_instruments_capture_start, test_regression_day_close_withholds_an_unconfirmed_kept_bucket, test_regression_boot_just_before_the_open_withholds_what_it_missed, test_regression_a_u32_wrap_counts_forward_exactly, test_unwrap_u32_cumulative_cases, needle_window_never_slices_inside_a_multi_byte_character, dhat_consume_tick_zero_alloc_in_bucket_and_across_boundaries, a_restart_never_writes_a_wrong_bar
+
+### Design
+Gaps are carried as a list of frame indexes beside the existing frame list, so the frame tuple every caller and test uses is unchanged. The fold's per-tick cost is one bool read and, only on a seal, two bit operations. `mark_replay_gap` is O(slots) and runs at most once per gap on the boot path.
+### Edge Cases
+A gap before the first frame; two adjacent gaps; a bucket opened by the seeding tick; a catch-up or close seal of a partial bucket; a late amendment of a partial sealed bar; a slot first created during replay; live mode after the refold.
+### Failure Modes
+Undercount, never overcount: after a gap the first bucket loses the seeding tick's own volume and is not written during replay. For a mid-session crash, a bucket that only the refold saw has no candle row (its ticks are in `ticks`); counted, never silent.
+### Test Plan
+The tests named in 47a–47d, plus the aggregator, storage replay and refold suites.
+### Rollback
+Revert the commit. No schema change.
+### Observability
+`tv_candle_refold_partial_suppressed_total` (seeded at 0) and the refold's info line reporting gaps and suppressed bars.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+---
+
+## ITEM 48 — DESIGN ADDENDUM (added 2026-10-01, operator: "check the recent commits requirments discussions which have been missign and not completed elt us try to fix evrythign ddue okay?"): close the September follow-ups that were promised and never done
+
+**Slot note.** The tree is at exactly 5 `active-plan*.md` files, so this item is
+added INSIDE this plan, as Items 43–47 were.
+
+A survey of every commit, PR, issue and plan file from 2026-09-01 to 2026-10-01
+found work that a commit or PR body promised as "its own change" or "a
+follow-up" and that never landed. This item closes the small, verified ones in
+one pull request. The larger open work (ITEM 45b–45i, 12b, the telemetry
+library upgrade) stays under its own items.
+
+- [x] 48a — **Login-failure alerts named the removed minute pulls.** Families 3 and 4 said "the Dhan spot-1m and option-chain pulls will stop"; those pulls were removed on 2026-09-16 (commit 53ea4b6: "follow-up, not fixed here"). They now name the live price feed. Rule first: `dhan-rest-only-noise-lock-2026-07-14.md` §2.4 "2026-10-01".
+  - Files: crates/core/src/notification/events.rs, crates/core/src/auth/mid_session_watchdog.rs, crates/aws-lambdas/src/telegram_webhook.rs, crates/trading/tests/safety_layer.rs, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: test_regression_login_alerts_never_name_the_removed_minute_pulls, test_auth_failed_includes_reason, test_broker_scoped_alarm_phrases_carry_dhan_tag
+- [x] 48b — **The permanent-login-error check read loose words.** `is_permanent_auth_error` scanned the whole rendered reason with unanchored `contains` (commit b2553a1: "NOT fixed here … its own change"). Our RESILIENCE-03 refusal is now matched only at the reason's start (a server body can no longer forge it, SEC-R1-3), a transport failure (`MINT_SEND_LEG_WRAPPER`, reqwest text) is never permanent, and "blocked" / "suspended" / "disabled" match whole words only. Review round 1 (2026-10-01): the account words were still read inside any HTTP error body, so a firewall page saying "Request blocked" on a 503 ended the retries; now only a `status:error` body or a 4xx other than 429 is read, and a body that parsed as nothing is transient (`test_regression_server_error_page_never_reads_as_permanent`, `test_is_client_refusal_status_cases`).
+  - Files: crates/core/src/auth/token_manager.rs
+  - Tests: test_regression_planted_resilience03_in_a_server_body_is_not_permanent, test_regression_transport_failure_is_never_permanent_whatever_its_words, test_regression_account_words_match_whole_words_only, test_contains_word_cases, test_resilience03_is_permanent_auth_error
+- [x] 48c — **plan-verify.sh passed every plan without reading it.** It read only `active-plan.md`, a name no plan uses (commit e1a1584: "Closing that is its own change"). It now checks every `active-plan*.md` (or the files named), checks only ticked items' tests and files, fails a VERIFIED plan with open items, and has a self-test in CI's Repo Guards job. Review round 1 (2026-10-01): it also reads `Tests:` written inline on the item line (a name there passes if an identifier starts with it), `[X]`, and a Status with a trailing note; this found one more stale name (47f, renamed to `test_frame_feeds_the_candle_fold_and_process_boundary_is_gap`).
+  - Files: .claude/hooks/plan-verify.sh, .claude/hooks/plan-verify.selftest.sh, .github/workflows/ci.yml
+  - Tests: N/A — shell self-test `plan-verify.selftest.sh`, 10 scenarios, bite-proven against the old script (6 of 10 fail there)
+- [x] 48d — **Dead config sections removed.** `[spot_1m_rest]`, `[option_chain_1m]` and `[cadence]` had no reader since 2026-09-16; base.toml called deleting them "the open §12.11 row". Removed with them: the config structs, their `AppConfig` fields and validators, four constants (`CADENCE_SPOT_WINDOW_MS`, `CADENCE_SPOT_WINDOW_CAP_CEILING`, `CADENCE_CHAIN_MIN_SPACING_FLOOR_MS`, `SPOT_1M_REST_FIRE_DELAY_MS`) and the 12 tests that only tested those types, so the test count drops by 12 on purpose. There is no `deny_unknown_fields`, so an older config file still loads. Left in place: `[dhan_data_api]`, which no longer limits anything; removing it is a follow-up.
+  - Files: crates/common/src/config.rs, config/base.toml, crates/common/src/constants.rs, crates/common/tests/config_key_has_a_reader_guard.rs
+  - Tests: existing common config suite
+- [x] 48e — **Plan state matched to the code.** Item 43 ticked (landed 2026-09-16; the 15:41 check was restored on purpose 2026-09-24, §12.15). Items 8 and 9 marked superseded (`[~]`): Item 8 by Item 43, Item 9 by the 2026-09-23/24 ruling that depth-200 is stock options only. Four ticked items' test names corrected (two deleted with the 15:41 check, one renamed to a guard file, one misspelt). Order-surface C1 and D1 ticked (both live: `order_observability.rs` writes `order_audit`; the 15:25 watchdog is spawned process-wide). With 48c this plan now passes `plan-verify.sh` with every ticked item's tests and files found.
+  - Files: .claude/plans/active-plan-feed-hardening.md, .claude/plans/active-plan-dhan-order-surface.md
+  - Tests: N/A — plan text
+- [x] 48f — **Rule summaries carried the 2026-09-29 zero-loss quotes.** Commit dc3abb2 left the two auto-loaded stubs "for the operator"; they now summarise Quote 27 + 28 (including that Quotes 21–26 are spent) and the scope lock's "2026-09-29 — ZERO LOSS" section with its REJECT rows. The full daily-universe rule says the raw-frame cost is "Recorded in `aws-budget.md`"; it was not, and now is (COST NOTE 2026-09-29, marked not yet spent and Assumed).
+  - Files: .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/websocket-connection-scope-lock.md, .claude/rules/project/aws-budget.md
+  - Tests: N/A — rule text
+- [x] 48g — **CLAUDE.md's `atm_pair_for` row was stale about reachability.** Depth-20 became a static day set on 2026-09-24; the 5-million-row-visit loop is now test-only. Dated correction added; the live path is O(2 × 3 × candidates) at the depth attach.
+  - Files: CLAUDE.md
+  - Tests: N/A — documentation
+
+### Design
+Each sub-item is the smallest change that makes the named promise true. No behaviour changes except 48b (classification of a failed login) and 48a (alert words). 48b narrows "permanent" only: a reason that was transient stays transient.
+### Edge Cases
+48b: the reason may or may not carry the "Dhan authentication failed: " Display prefix (`reason_core` strips it); RESILIENCE-03 inside a server body; "unblocked"; upper case. 48c: a plan with no Status; Tests lists holding prose, file names, `path::name` and parenthesised notes with commas.
+### Failure Modes
+48b: a real account block arriving inside a transport error would now retry instead of failing fast. Reqwest's transport text never carries Dhan's account verdict, so this cannot happen; a block arriving as an HTTP response or a 200 error body is still permanent. 48c: the script is a manual tool and no push gate calls it, so a false failure blocks nothing.
+### Test Plan
+Named per sub-item above; `cargo test -p tickvault-core`, `-p tickvault-aws-lambdas`, `-p tickvault-common`, the trading `safety_layer` suite, and the plan-verify self-test.
+### Rollback
+Revert the commit. No schema, no data, no infrastructure change.
+### Observability
+No new metric. 48a changes only the text of existing pages.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM CANDLE-0915 — DESIGN ADDENDUM (added 2026-10-05, operator: "only startin g 9.15 am timestamps aloen only shodul be considered rigth dude ... yesterday close vs only today's startign 9.15 am")
+
+- [x] Sign the 09:15 bucket of every timeframe against the previous day's close (`aggregator_cell.rs::bucket_sign_baseline`), and start candles at 09:15 (`tf_index.rs::CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = 33_300; `top_volume_snapshot.rs::SNAPSHOT_GRID_ANCHOR_SECS_OF_DAY_IST` = 33_300)
+  - Files: crates/trading/src/candles/aggregator_cell.rs, crates/trading/src/candles/tf_index.rs, crates/trading/src/candles/multi_tf_aggregator.rs, crates/app/tests/top_volume_removed_guard.rs, crates/app/src/dhan_feed_stack.rs (comment), crates/storage/src/shadow_candle_writer.rs (comments)
+  - History: `crates/app/src/top_volume_snapshot.rs` and its grid constant above were retired by item 62 on 2026-10-22; the removal guard is the current evidence. This reference repair does not restore that module.
+  - Tests: test_regression_the_0915_bar_is_signed_against_yesterdays_close, only_the_market_open_bucket_uses_yesterdays_close, equity_pre_open_match_proof_age_decides, s04_pre_open_stamp_is_refused_by_the_fold
+
+## Design (Item CANDLE-0915)
+
+One constant moves (09:00 → 09:15); the existing `out_of_session` gate in `MultiTfAggregator::consume_tick` then refuses pre-open ticks for the fold only. The 09:15 bucket's sign baseline reads the packet's previous-day close (`bucket_sign_baseline`), O(1), no allocation. Raw tick and WAL paths are untouched.
+
+## Edge Cases (Item CANDLE-0915)
+
+No previous close on the 09:15 packet keeps the same-day baseline; a boot at or after 09:15 is mid-session as before; the auction quantity rides in the first trade's cumulative and is seeded (missing, never poured into 09:15); the top-volume grid instants are unchanged because every cadence divides 900 s.
+
+## Failure Modes (Item CANDLE-0915)
+
+A wrong constant would seal pre-open bars again (pinned by the tf_index pin test) or refuse 09:15 ticks (pinned by the gate test, OPEN accepted). The shadow writer's window check stays as defence in depth.
+
+## Test Plan (Item CANDLE-0915)
+
+`cargo test -p tickvault-trading` (all, including the restart differential and both first-trade attack suites), `cargo test -p tickvault-app`, `cargo test -p tickvault-storage --lib shadow`.
+
+## Rollback (Item CANDLE-0915)
+
+Revert the PR: the constant returns to 32_400 and the 09:15 baseline to the same-day previous bar. Stored rows are not rewritten either way.
+
+## Observability (Item CANDLE-0915)
+
+Pre-open ticks reach `IngestOutcome::WrittenOutOfSession` (row written, no bar), already counted; the 15:41 cross-verify compares our 09:15 bar against the vendor's.
+
+## ITEM 49 — Depth backlog and feed-delay figures (2026-10-05)
+
+Approved by Parthiban 2026-10-05 ("go woith your recomemndation dude", answering the depth decision card whose recommended option was Both). Finding (Verified, read-only AWS): the r8g.xlarge disk burst balance runs out about 10:00 IST, after which the box is capped at 156 MB/s; `market_depth` was 54,093 WAL transactions behind with no row of the day visible, and the depth spill drain was replaying 7–14 GB from the 08:30 boot onward.
+
+- [x] 49a — **Socket page listed 26 sockets, so depth-20 and depth-200 appeared twice.** `connection_deliveries` and its gauges now cover the primary account's 16 slots only (`pool_budget::slot_owner`).
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: connection_deliveries_report_only_the_primary_accounts_sixteen_slots
+- [x] 49b — **Per-socket delay counted out-of-session ticks.** A contract not traded today carries an earlier day's trade time on every book change; about 6.0 million such ticks read as option sockets delivering most packets over 60 s. Only an accepted new trade is now a sample; the rest count on `tv_dhan_ws_lag_excluded_total{reason="not_a_trade"}`.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/tests/drain_loss_series_seeding_guard.rs
+  - Tests: test_record_ws_lag_not_a_trade_excluded_only_an_accepted_trade_is_a_lag_sample, the_ws_lag_exclusion_family_is_seeded_on_every_label_set
+- [x] 49c — **Depth spill replay held 08:00–15:40 IST.** The depth directory's drain skips its round inside that window (counted on `tv_depth_spill_replay_held_total`) and drains after the close; the tick directory is unchanged and the quarantine trim still runs. A deferral, never a drop: the spill keeps accepting past its soft cap while the volume has room, and the raw frames are in the WAL.
+  - Files: crates/storage/src/tick_spill_replay.rs
+  - Tests: test_depth_replay_held_at_covers_08_00_to_the_close_only, test_replay_policy_for_dir_holds_only_the_depth_directory
+- [x] 49d — **One `market_depth` row per packet with level arrays.** Not started: the scope lock allows array rows only after a QuestDB scratch-table test, and this session has no QuestDB to run one against. *(Ticked 2026-10-11: superseded by that test result and shipped as 49e, PR #2037 and PR #2043.)*
+
+### Design
+49a and 49b change only what is measured or shown. 49c is a time-of-day gate on the depth drain loop, O(1) per 300 s round.
+### Edge Cases
+49c: a round at exactly 08:00 holds and at exactly 15:40 drains; a holiday run holds until 15:40 too (time of day only). 49b: a repeat stays on `ltt_not_advanced`; a replayed WAL frame still never feeds the worst-delay gauge.
+### Failure Modes
+49c: if the after-close window is too short to drain a day's depth spill, the backlog carries to the next evening; the spill stays bounded by the free-space reserve, past which depth rescues are refused as before. 49b: after a mid-day restart the first packet per instrument still adds one sample.
+### Test Plan
+`cargo test -p tickvault-app --lib` (ws_lag, connection_deliver, not_a_trade), `--test drain_loss_series_seeding_guard`; `cargo test -p tickvault-storage --lib tick_spill_replay`.
+### Rollback
+Revert the commits. No schema, data or infrastructure change.
+### Observability
+New counter `tv_depth_spill_replay_held_total`; new label `reason="not_a_trade"` on an already-shipped counter (one more CloudWatch series, about $0.30 a month, Assumed).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 50 — Fast-lane follow-ups (2026-10-06)
+
+Approved by Parthiban 2026-10-06 ("Go ahead with whatever you want dude"; "See do everything whatever is recommended dude okay?"). Found by the 2026-10-06 fast-lane attack (read-only review of the socket read path, the frame ring and the drain).
+
+- [x] 50a — **The silence page stopped re-arming once far strikes never ticked.** The arm counted never-ticked contracts as silent, so the episode never ended and a contract going quiet later never paged. It now pages on contracts that went quiet (`silent − never`) and reports never-ticked ones once per session (`silence_scan_pending`). Rule row: noise lock §2.11.
+  - Files: crates/app/src/dhan_feed_stack.rs, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: a_contract_going_quiet_mid_session_pages_although_far_strikes_never_ticked, silence_scan_pending_truth_table
+- [x] 50b — **`tv_doctor` read metrics from port 9090; the exporter listens on 9091** (`config/base.toml` `metrics_port`). Every metrics check reported unreachable.
+  - Files: crates/app/src/bin/tv_doctor.rs
+  - Tests: default_metrics_url_uses_the_configured_exporter_port
+- [x] 50c — **Two Dhan reference docs still said our depth unsubscribe sends code 24.** Annotated with the code sent (25, `FEED_UNSUBSCRIBE_TWENTY_DEPTH`), the 2026-09-12 probe and Dhan's 2026-09-30 reply. Docs only.
+  - Files: docs/dhan-ref/04-full-market-depth-websocket.md, docs/dhan-ref/08-annexure-enums.md
+  - Tests: (docs only)
+- [x] 50d — **Audit H2, second half: the weekly mutation sweep could never finish.** The workflow's own header puts a full sweep at ~18 hours, and the job was capped at 60 minutes, so after the 2026-10-04 baseline fix every weekly run would still be killed at the cap. The scheduled and dispatched sweep now runs as 8 shards (`--shard k/8`) with up to 350 minutes each; a push run mutates only the changed lines (`--in-diff`) within 60 minutes. The repository is public, so the runner minutes are free (Verified: visibility public).
+  - Files: .github/workflows/mutation.yml, crates/common/tests/github_workflow_guard.rs
+  - Tests: mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in, mutation_push_run_mutates_only_the_changed_lines
+
+### Design
+50a is a pure function over two counts and one session latch, called on the 30 s silence arm: O(1), no allocation. The O(n) scan itself is unchanged. 50b changes one constant. 50c is docs. 50d is CI only: a matrix of 8 shards on schedule and dispatch, one job on push.
+### Edge Cases
+50a: every silent contract never ticked (reported once, then quiet until it ticks and goes quiet again); never-ticked count falling while others go quiet (pages on the went-quiet count); the market-hours gate resets the session latch; a backwards clock step still cannot clear the cooldown (existing test).
+### Failure Modes
+50a: a truly dead class still reports through the dead-class path (unchanged). If the never-ticked count rises mid-session after the once-per-session report, it is not reported again until the next session; the gauge `tv_dhan_feed_instruments_never_ticked` still shows it.
+50d: the ~18 h sweep figure is the header's estimate (Assumed); if one shard still exceeds 350 minutes it is cancelled and the run is red, never green. A push touching only non-source lines leaves `--in-diff` with nothing to mutate; cargo-mutants then tests no mutant and the results file still carries its summary (Assumed; a missing or empty file fails the run loudly, as before).
+### Test Plan
+`cargo test -p tickvault-app --lib silence` (19 passed locally on this branch); `cargo test -p tickvault-app --bin tv_doctor`; `cargo test -p tickvault-common --test github_workflow_guard mutation` (2 passed; bite-checked by restoring the flat 60-minute cap); CI full suite. 50d is proven only by the next Monday sweep.
+### Rollback
+Revert the commits. No schema, data, alarm or infrastructure change.
+### Observability
+No new metric or alarm. `RISK-GAP-03` can fire again within a session, at most once per 30 minutes (§2.11).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 49d / 45i — Depth array rows: scratch-table test RESULT (2026-10-06)
+
+The scope lock (2026-09-29) allows `market_depth` array rows only after a
+QuestDB scratch-table test. The test ran on 2026-10-06 against a LOCAL
+QuestDB 9.3.5 (the official `questdb-9.3.5-rt-linux-x86-64` release, sha256
+`83fb995f175716628c58564426be9f055c35ea218ad3d399e2ceb3e7ec7be028`), the same
+version as production. It did NOT run on the production box: AWS is
+read-only for these sessions. Harness: a throwaway Rust program on
+`questdb-rs =6.1.0` (the pinned client), outside the repository.
+
+Two scratch tables with the production column set and DEDUP shape:
+`md_scalar` (one row per level, ILP v1, the current layout) and `md_array`
+(one row per packet, `price` / `quantity` / `orders` as `DOUBLE[]`, a
+`levels` count, DEDUP key without `level`, ILP v2). The same depth-200
+packets went to both: 50 instruments, bid and ask, mostly 200 levels, about
+5% partial books, about 1% empty books.
+
+| Check | Result | Label |
+|---|---|---|
+| `CREATE TABLE … DOUBLE[] … WAL DEDUP UPSERT KEYS(…)` and `ADD COLUMN IF NOT EXISTS … DOUBLE[]` | accepted | Verified |
+| Every level read back, element by element (`a.price[s.level]`), 963,191 levels | 963,191 exact on price, quantity and orders | Verified |
+| Per-packet level count and sums | 4,948 of 4,948 packets with levels match | Verified |
+| Replay of the identical 5,000 packets (both tables) | row counts unchanged (DEDUP holds) | Verified |
+| Several packets in one second, distinct `capture_seq` | all kept | Verified |
+| Empty book (0 levels) | stored as one row with empty arrays; today's layout stores nothing for it | Verified |
+| NaN element (refused price) | reads back null in its own slot; positions stay aligned | Verified |
+| Disk bytes written by QuestDB (`/proc/<pid>/io write_bytes`), 5,000 packets | 1,041 MB per-level vs 94 MB arrays (11x) | Verified |
+| Same, 50,000 packets (9.64 M levels) | 10.68 GB vs 0.79 GB (13.5x) | Verified |
+| ILP bytes sent, 50,000 packets | 1.84 GB vs 0.24 GB (7.6x) | Verified |
+| Wall time to write and apply, 50,000 packets | 34 s vs 10 s | Verified (local disk, not the r8g.xlarge EBS) |
+| Table size on disk after both runs | 1,050 MB vs 641 MB | Verified (includes 16 MB preallocated files) |
+| Same test, depth-20 (200,000 packets, 3,856,888 levels) | 4.65 GB vs 0.37 GB written (12.6x); 1,207 vs 96 B per level | Verified |
+| Same test, inline 5-level depth (800,000 packets, 3,855,713 levels) | 4.30 GB vs 1.54 GB written (2.8x); 1,115 vs 400 B per level, about 1.9 KB fixed per row | Verified |
+| Level counts in both layouts, every run | identical | Verified |
+| The same ratio on the production EBS volume | not measured | Assumed |
+
+Projected day at the 2026-08-24 row counts (Assumed): depth writes about 1,774 GB per session today against about 340 GB as arrays (5.2x), roughly 74 MB/s against 14 MB/s over the session. The cap that ran out at 10:00 IST on 2026-10-05 is the r8g.xlarge instance EBS bandwidth (about 156 MB/s baseline, Assumed from AWS docs), not the gp3 volume, so faster volume settings do not lift it.
+
+### What the switch has to change (found by tracing every reader and writer)
+
+- No production SQL reads `market_depth` columns. The 15:41 depth-held pass
+  reads the in-memory subscription view. Archive exports use `SELECT *`.
+- **Column types cannot change in place**, so the switch writes a NEW table
+  and the old `market_depth` keeps its rows (never deleted; retention as
+  today).
+- **ILP v2 is required** (arrays do not exist in v1); v2 also writes f64 as
+  binary.
+- **Blocker for a naive switch: the depth spill tier is newline-delimited ILP
+  text.** `tick_spill_replay` chunks, bisects and window-filters on `\n` and
+  reads the timestamp after the last space. Binary v2 bytes contain both, so
+  a spilled v2 batch would be cut apart on replay.
+- Row builders: `drain_depth_frame` (d20/d200), `append_inline_depth` (d5),
+  the boot WAL refold and the after-close deferred depth pass all go through
+  them, so they move together.
+- Guards that pin the schema, DEDUP key, row width and DHAT budgets move in
+  the same PR.
+
+### First-draft recommendation (WITHDRAWN 2026-10-06 — see the attack results below)
+
+Replace the depth ILP spill with the existing deferral: when a depth flush
+fails, mark its `capture_seq` range in `DeferredDepth` (as a shed frame is
+marked today) instead of writing ILP bytes to `data/spill/depth`. The raw
+frames are already in the WAL, pinned by the mark, and the after-close pass
+rewrites them. That removes the text-only spill from the depth path instead
+of inventing a binary spill format. Risk: depth rows lost to a failed flush
+become visible after 15:45 rather than within the session.
+
+### Attack results on the design (2026-10-06, six experiments on the scratch QuestDB plus code review)
+
+Arrays: conditional GO. Spill replacement as first drafted: NO-GO.
+
+| Severity | Finding | Fix required in the switch |
+|---|---|---|
+| CRITICAL | Rows from frames the WAL refused (`!frame.wal_backed`) have no segment to re-read; dropping the ILP spill loses them | Keep a durable tier for unbacked rows, length-framed (v2 bytes contain `\n` and spaces, so the text spill and `tick_spill_replay` line splitting cannot carry them) |
+| CRITICAL | A deferral mark reaches disk at most once a second and `persist_now` swallows errors; a crash after the rescue floor is released lets the watermark pass the batch, the segment reads applied and is pruned | Persist and fsync the mark, check the result, only then release the floor; on failure use `note_unapplied_range` |
+| HIGH | A failed batch spans many buckets and mixes inline and dedicated rows; marking the whole range can collide and set `overflowed` | Track the exact buckets and kinds per batch |
+| HIGH | A writer that sends a row without the three arrays sets them to NULL (seen: a v1 row with the same key wiped a book) | One writer on a pinned v2 sender, guard test; the old spill replayer never points at the new table |
+| HIGH | With no version pinned the client negotiates ILP v3 and a v2 buffer fails at flush; auto mode also calls `/settings` at construction | Pin `protocol_version=2`, test it |
+| HIGH | `DEPTH_FLUSH_ROW_THRESHOLD` counts rows; 10,000 array rows ≈ 48 MB, above `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) | Flush by bytes (8–16 MiB) and restate the queue-bytes bound |
+| MEDIUM | `/exp` exports arrays as quoted text; `/imp` refuses DOUBLE[]; `cast(text as double[])` returns NULL when the text has a `null` token | A restore step that rewrites null to NaN |
+| MEDIUM | One row inserted out of order into a 40,000-row hour partition rewrote 187 MiB | The after-close pass writes whole buckets in time order |
+| MEDIUM | Marks from before the switch would be rewritten into the new table | Route rewrites by date |
+
+Each refused level stays in its slot as NaN (reads back null; positions stay aligned), never a skipped element, so no level, side or packet is dropped.
+
+### Proposed sequence (one PR at a time)
+
+1. Length-framed binary spill tier for depth rows plus its replay (no switch yet; test with v1 rows first).
+2. New table `market_depth` successor with DOUBLE[] columns, pinned v2 sender, byte-based flush, behind `[depth] array_rows = false` (default OFF).
+3. Builders (d20, d200, inline d5 as one bid+ask row each), refold and after-close pass routed by date.
+4. Turn on after one session on the scratch table in prod (operator step), then keep the old table's rows (never deleted; retention as today).
+
+## ITEM 49e — Step 1: length-framed depth spill tier (2026-10-09)
+
+- [x] Framed spill writer and replay for depth rows — Files: crates/storage/src/depth_spill_frame.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/tick_spill_replay.rs, crates/storage/src/ws_frame_spill.rs, crates/storage/src/lib.rs — Tests: test_replay_posts_each_record_whole_and_truncates_a_closed_file, test_concurrent_appends_never_interleave_records, the_spill_file_is_framed_and_drained_by_the_framed_replay
+
+### Design
+
+`spill_failed_depth_ilp` writes `depth-{feed}-{hour}.dspl` instead of `.ilp`. Each record is a 16-byte header (magic `TVDS`, version, 3 zero bytes, payload length u32 LE, CRC-32 of header bytes 4..12 plus the payload) followed by the payload. Version 1 is ILP text, cut at line boundaries into records of at most `REPLAY_MAX_CHUNK_BYTES`; version 2 (binary ILP, step 2) is one record. Appends take one process-wide lock so the writer thread, the rescue thread and the drain's inline fallback never interleave a record. The replay runs on the existing replay loop after the text replay, only when that round had no failure and outside the depth hold window: oldest file first, one POST per whole record, resume offsets in memory, closed files truncated (never deleted) once read, the live file never truncated. Old `.ilp` depth files still drain through the text replay.
+
+### Edge Cases
+
+A torn tail on the live file waits for the writer; on a closed file it is set aside. Garbage between records is skipped by scanning for the next valid header and set aside. A record past 64 MiB, a non-zero reserved byte, an unknown version or a CRC mismatch reads as corrupt. A file that grows while being read is not truncated. An empty payload writes nothing.
+
+### Failure Modes
+
+A transient POST failure (5xx, 408, 429, connect error) stops the round and keeps the offset. A permanent refusal sets the record aside in quarantine: a v1 record is bisected to the refused lines (`.rejected-lines`), a v2 record is kept whole (`.rejected-records`). Corrupt bytes go to `.corrupt-bytes`. Nothing is deleted; quarantine counts toward the spill cap as before.
+
+### Test Plan
+
+11 unit tests in `depth_spill_frame` (round trip v1/v2, large v1 cut into whole-line records, header refusal, torn and CRC reads, replay posts each record and truncates a closed file, live torn tail waits, corrupt-bytes resync, closed torn tail quarantined, refused v2 kept whole, v1 line isolation, concurrent appends never interleave, text replay never sees `.dspl`). The depth persistence tests read the spill through the framed reader.
+
+### Rollback
+
+Revert the PR. `.dspl` files left on disk are not read by the old binary, so drain them first (the replay loop does this within one round once QuestDB is up) or keep them for step 2.
+
+### Observability
+
+`tv_depth_framed_spill_set_aside_total{reason=refused|corrupt|torn_tail}` counts set-aside events; replay outcomes add to the existing `SpillReplayOutcome` counters; every set-aside logs `TICK-SPILL-01` at error level with the file and byte range.
+
+## ITEM 49e-2 — Step 2: array-row writer for `market_depth_book` (2026-10-09)
+
+- [x] Array-row table DDL, pinned ILP v2 writer, byte-based flush check, v2-safe spill — Files: crates/storage/src/depth_persistence.rs — Tests: test_market_depth_book_create_ddl_holds_three_double_arrays, test_market_depth_book_ensure_statements_never_drop_and_end_on_the_dedup_key, test_new_book_builds_a_v2_book_writer_with_no_questdb, test_book_dedup_key_is_the_level_key_without_level, test_depth_layout_protocol_number_pins_v1_and_v2_in_the_conf, test_append_book_row_writes_a_200_level_side_as_one_row, test_a_refused_level_travels_as_nan_in_its_slot, test_an_empty_book_is_one_row_with_empty_arrays, test_unequal_or_oversized_arrays_are_refused_with_nothing_written, test_each_writer_refuses_the_other_layout, test_an_out_of_window_book_row_is_refused_like_a_level_row, test_book_flush_due_by_pending_bytes_never_for_a_level_writer, test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte
+
+Why now: on 2026-10-09 QuestDB was about 204,000 depth transactions behind and the tick, candle and auxiliary tables were falling behind with it (CloudWatch, read-only). Array rows are the measured lever (49d: 11x to 13.5x fewer bytes written for depth-200 and depth-20). This step adds the writer only; nothing writes the new table until step 3, so production behaviour is unchanged.
+
+### Design
+
+New table `market_depth_book`: one row per book side per packet, `price` / `quantity` / `orders` as `DOUBLE[]`, `levels` LONG, same symbols, `contract`, `capture_seq` and `ts` as `market_depth`, `PARTITION BY HOUR WAL`. DEDUP key `ts, security_id, segment, depth_kind, side, capture_seq, feed` (the level key without `level`). `DepthWriter` gains a fixed `DepthLayout` (`Levels` or `Book`); `DepthWriter::new_book` builds a sender whose conf pins `protocol_version=2` (never negotiated). `append_book_row(&DepthBookRow)` borrows three caller-owned slices, refuses the same out-of-window rows as `append_row` (shared `depth_arrival_window_refusal`), and writes one ILP v2 line. Each writer refuses the other layout's rows. `book_flush_due` is true once the buffer holds `DEPTH_BOOK_FLUSH_BYTES` (8 MiB; four queued batches stay within 32 MiB). The spill path now passes the buffer's protocol to the framed spill (`spill_version_of`), so a v2 batch is one version-2 record rather than text cut at newlines. The DDL is not run at boot yet: step 3 runs it behind `[depth] array_rows = false`, together with the retention and archive registration of the new table.
+
+### Edge Cases
+
+Zero levels (empty book): one row with empty arrays, as the scratch test stored it. A refused level is `NaN` in its slot, positions aligned, never skipped. Unequal slice lengths or more than 200 levels: an error, nothing written, frame marked unapplied. A level row on a book writer (or the reverse): an error, nothing written. Out-of-window stamps: refused and counted under the existing reasons. A disconnected book writer still buffers in v2.
+
+### Failure Modes
+
+A wrong-layout or malformed row marks its frame unapplied, so a replay re-offers it (errs toward more replay). A v2 batch that fails to flush goes through the existing rescue, park and WAL-deferral tiers unchanged; only the spill record version differs. If QuestDB refused the arrays (it did not on 9.3.5 in the scratch test), step 3's flush would fail and the batch would spill as a version-2 record. Not reachable in production until step 3.
+
+### Test Plan
+
+`cargo test -p tickvault-storage --lib` (1,847 passed, 1 ignored, 2026-10-09). The 11 tests above. Bite: forcing version 1 inside `spill_failed_depth_ilp` fails `test_a_v2_batch_spills_as_one_whole_record_and_reads_back_byte_for_byte`. `cargo clippy -p tickvault-storage --no-deps -- -D warnings` clean. A DHAT gate for the book append lands with step 3, when the drain calls it per packet.
+
+### Rollback
+
+Revert the commit. No table is created, no config, data or infrastructure changes; the level writer's behaviour and spill format are unchanged (version 1 for its v1 buffers).
+
+### Observability
+
+No new metric, alarm or page in this step. A book writer reuses the existing depth counters (rows dropped, spilled, out-of-window refusals). Step 3 adds the table to the boot DDL report and to the retention and archive sets.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 49e-3 — Step 3: the drain writes `market_depth_book` behind a setting (2026-10-09)
+
+- [x] Setting, start instant, boot DDL, retention and archive registration, drain routing to array rows — Files: crates/common/src/config.rs, config/base.toml, crates/app/src/depth_book_since.rs, crates/app/src/lib.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/main.rs, crates/app/tests/dhat_live_ingest_seam.rs, crates/storage/src/depth_persistence.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/partition_manager.rs, crates/storage/src/partition_archive.rs, crates/storage/tests/session_window_gate_guard.rs, crates/storage/tests/table_schema_lockstep_guard.rs, crates/storage/tests/error_level_meta_guard.rs — Tests: the_book_row_writer_uses_the_same_window_check, test_depth_storage_config_array_rows_is_off_by_default_and_when_absent, test_depth_storage_config_ships_off_in_base_toml, test_resolve_depth_book_since_is_none_when_array_rows_are_off, test_resolve_records_the_first_instant_once_and_keeps_it, test_turning_off_removes_the_instant_so_a_new_period_starts, test_a_damaged_file_is_replaced_by_this_boots_instant, test_an_unwritable_folder_still_applies_the_instant_to_this_process, test_resolve_depth_book_since_off_touches_nothing, test_drain_depth_frame_writes_a_depth20_side_as_one_book_row, test_a_refused_level_is_nan_in_its_slot_and_counted_refused, test_a_depth200_book_row_carries_the_packet_row_count_and_an_empty_packet_writes_nothing, test_a_frame_received_before_the_switch_goes_to_the_level_table, test_writes_book_is_false_with_array_rows_off, test_flush_due_is_bytes_for_book_rows_and_rows_for_level_rows, test_mark_pending_unbacked_for_marks_the_writer_that_takes_the_frame, test_mark_all_pending_unbacked_marks_both_writers, test_for_test_book_routes_from_its_instant_and_pending_book_bytes_starts_empty, test_depth_flush_due_follows_the_inline_sink, test_ensure_market_depth_book_table_reports_false_when_questdb_is_unreachable, test_append_inline_depth_book_writes_one_bid_and_one_ask_row_with_clean_prices, test_append_inline_depth_before_the_switch_writes_ten_level_rows, test_buffer_bytes_returns_the_binary_book_line_buffer_utf8_cannot_show, market_depth_book_is_swept_on_the_depth_window_like_market_depth, test_hour_partitioned_list_is_ticks_depth_and_top_volume, every_inline_depth_drop_is_counted_never_silent, full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick, test_a_live_frame_stamped_before_the_switch_still_goes_to_the_book, test_a_stored_instant_later_than_this_boot_is_re_recorded_as_now, test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on, test_note_n_advances_the_throttle_once_and_zero_is_a_no_op, test_append_book_row_writes_a_200_level_side_as_one_row
+
+Why: the step 2 writer existed but nothing called it. QuestDB was about 204,000 depth transactions behind on 2026-10-09 (CloudWatch, read-only); array rows are the measured lever (49d: 11x to 13.5x fewer bytes). This step ships OFF, so production behaviour is unchanged until the setting is turned on.
+
+### Design
+
+`[depth_storage] array_rows` (default false, `#[serde(default)]`; step 2 called it `[depth] array_rows`). On a lane start with it on, `depth_book_since::resolve_depth_book_since` returns the UTC receipt instant from which frames go to `market_depth_book`: read from `data/state/depth_book_since` if present, else this boot's instant, written once (temp file, `sync_all`, rename, folder sync, off the worker). With it off the file is removed, so a later turn-on starts a new period. `DepthIngest` then holds the book writer as its primary writer and a second, synchronous level writer (`BookMode::levels`) for frames received BEFORE the instant (boot WAL catch-up and the after-close pass replay frames an earlier process captured, whose first copy went to `market_depth`), so one packet never lands in both tables. Routing is decided once per frame (`writes_book`). Per depth-20/200 packet the drain fills three pre-sized `[f64; 200]` scratch arrays (allocated once with the sink) and writes one book row; a refused level is NaN in all three arrays at its slot; levels past 200 and implausible prices are counted refused. The inline five-level book in a Full packet becomes two book rows (bid, ask) with prices through `f32_to_f64_clean`. `rows` keeps counting LEVELS stored, so existing counters keep their unit. Flush: `flush_due()` is the 8 MiB byte check for book rows and the 10,000-row check for level rows; `DepthIngest::flush` flushes the older-frame writer only when it holds rows. `market_depth_book` is created by the Dhan lane at its start, only with the setting on, and the array-row writer is armed only when QuestDB accepted every statement; on a refusal the process keeps writing `market_depth` with a coded `error!` (the boot DDL is unchanged, so a refused array-type create can never fail the boot with the setting off). It is HOUR-partitioned and swept and archived on the depth window like `market_depth` (a missing table reads as nothing to do). The after-close pass takes the same instant.
+
+**Review fixes (3-reviewer pass, 2026-10-09).** (1) HIGH: the book writer's `pending` now counts LEVELS (a side with no levels counts one), so the flush, rescue, spill, dropped and shutdown counters read the same unit whichever table is written; before, a failed flush of 2,000 depth-200 sides moved "dropped" by 2,000 while 400,000 levels were lost. The out-of-window counter likewise moves by the row's level count (`OutOfWindowCounters::note_n`). (2) MEDIUM: a frame this process took off a socket (`connection_index != u8::MAX`) always goes to the array rows when they are on, whatever the clock reads; only replayed frames route by receipt time. So a backward clock step cannot send live frames to the synchronous older-frame writer whose flush runs on the drain. (3) MEDIUM: a stored instant later than the boot (a clock that ran ahead, a damaged file) is re-recorded as the boot's own, with a `warn!`. (4) LOW: the book line is written inside a buffer marker and rewound on an error, so a half-written line cannot fail later rows. (5) LOW: the production-path test no longer removes a real state file. Kept as limits: a side with no levels (depth-200 empty book side) writes no row in either layout, the frame stays in the WAL; turning the setting OFF lets on-period frames replayed later land in `market_depth` (documented in `depth_book_since.rs`); the depth-20/200 socket drains still have no DHAT gate of their own.
+
+### Edge Cases
+
+A zero-level packet writes nothing (same as the level path; step 2's empty-row shape is not used by the drain). A frame received exactly at the instant goes to the book table. A damaged or non-positive instant file is replaced by this boot's instant. An unwritable state folder still applies the instant to this process. A frame the WAL refused marks the writer that takes it unbacked, book or level. Settings off: the code path is the old one with one `Option` check per frame.
+
+### Failure Modes
+
+If the instant cannot be saved, the next boot records a later one, so this process's frames replayed after that go to `market_depth` (both copies exist then, one per table; nothing is lost). A wall clock stepped back across the first-on boot can send a few earlier frames to the new table. After off then on, frames from the first period replayed later go to `market_depth`. Turn the setting on at a pre-market boot. A failed book-row append counts its levels refused (ratchet `every_inline_depth_drop_is_counted_never_silent`). A failed book flush goes through the existing rescue, park, WAL-deferral and version-2 spill tiers (step 2). The older-frame writer is synchronous; it holds rows only during the boot catch-up or the after-close pass, never in steady state.
+
+### Test Plan
+
+`cargo test -p tickvault-app -p tickvault-storage -p tickvault-common --lib` (2,554 + 1,852 + 1,042 passed, 2026-10-09), plus `partition_retention_coverage_guard`, `ensure_ddl_boot_wiring_guard` and `dhat_live_ingest_seam` (7 passed). DHAT: 18 blocks over 10,000 Full packets and 20,000 book rows, ceiling 500 (the level gate measures 19). The depth-20/200 socket drains share `append_book_slots` with that path but have no DHAT gate of their own (private, as before this change). Three storage guards that failed on step 2 in CI are fixed here: the session-window guard now reads the shared `depth_arrival_window_refusal` (and a new test pins `append_book_row` to it); the schema lockstep guard reads `DOUBLE[]` as an array type instead of letting `quantity DOUBLE[]` overwrite `quantity LONG` from the level table in the same file; the start-instant save warning is a reviewed warn site. Review fixes add five tests (listed above); bites below. `cargo test -p tickvault-storage --tests` and `-p tickvault-app --tests` pass. Bites: skipping the NaN marking fails `test_a_refused_level_is_nan_in_its_slot_and_counted_refused`; routing every frame to the book fails both before-the-switch tests.
+
+### Rollback
+
+Leave the setting off (the default), or turn it off: the next boot removes the instant and writes `market_depth` only. Rows already in `market_depth_book` stay and age out on the depth window. Reverting the commit is also safe; the empty table is harmless.
+
+### Observability
+
+No new metric, alarm or page. Book rows use the existing depth counters (rows stored, refused, dropped, spilled), counted in levels. The boot logs whether array rows are on and the instant in use (`info!`), and a `warn!` when the instant cannot be saved or removed. Not done here, recorded as follow-ups: the fresh-start reset list and the operator console's archive list do not name `market_depth_book` yet.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 49e-4 — Step 4: array rows turned on in production (2026-10-10)
+
+- [x] `[depth_storage] array_rows = true` in `config/production.toml` (base.toml stays false) — Files: config/production.toml — Tests: test_depth_storage_config_ships_off_in_base_toml, test_resolve_records_the_first_instant_once_and_keeps_it
+
+Why: the operator's 2026-10-09 instruction for PR #2043, "ships OFF; after deploy, turn it on through automation before market open". #2043 merged at `5964162` with All Green and went live with the setting off in the deploy of `55831e2` (2026-10-10, 00:28 UTC). This config change deploys on merge (the deploy workflow watches `config/**`), so the first boot with it on is an off-market boot before Monday 12 Oct's open, which records the start instant. The scope-lock condition (a recorded QuestDB scratch-table test) is met by ITEM 49d / 45i (2026-10-06).
+
+Rollback: set `array_rows = false` and redeploy; the next boot removes the instant and writes `market_depth` only. Rows already in `market_depth_book` stay and age out on the depth window.
+
+Observability: the boot logs whether array rows are on and the instant in use. Check after the first boot: `SELECT count(*) FROM market_depth_book WHERE ts IN today()` grows during the session, and the depth apply lag on `tv_questdb_wal_apply_lag_max` falls against 2026-10-09.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+
+## ITEM 49e-5 — A non-trading-day boot does not wait for the instrument list (2026-10-10)
+
+- [x] `await_mapping_artifact` takes the trading-day verdict and returns at once on a non-trading day (outcome `non_trading_day`)
+  - Files: crates/app/src/dhan_live_universe.rs, crates/app/src/main.rs, crates/app/tests/universe_boot_race_guard.rs
+  - Tests: test_regression_await_mapping_artifact_does_not_wait_on_a_non_trading_day, every_wait_outcome_is_counted
+
+**Why (Verified, CloudWatch `/tickvault/prod/app` and deploy-aws run 38014245945):** the 07:24 IST deploy on Saturday 10 Oct
+logged "waiting for the daily rider before subscribing", sat in `activating (start)` for 12 minutes, missed the deploy's
+750 s readiness gate, and was reported FAILED (auto-stop and a page) for a healthy binary. The 06:09 IST deploy the same
+morning took the `producer_too_far` arm and was ready in under a minute. The wait only exists so a trading session does not
+start on 4 instruments; with no session today nothing reads the list.
+
+**Edge Cases:** a trading day is unchanged (the new arm needs `!trading_day`); an artifact already on disk still returns
+`already_present` first; a disabled rider still returns `rider_disabled` first.
+
+**Failure Modes:** a calendar that wrongly reads a trading day as a holiday would skip the wait on that day; the resolve
+then takes its existing, loudly logged fallback (newest earlier list), the same as a timed-out wait.
+
+**Rollback:** revert the PR; the wait returns to its earlier behaviour.
+
+**Observability:** `tv_dhan_live_universe_mapping_wait_total{outcome="non_trading_day"}` plus one `info!` line.
+
+**Not fixed (Limitation):** a deploy on a TRADING day between 07:10 and the rider's build hour still waits up to
+`MAPPING_WAIT_MAX_STALL_SECS` (3,600 s), longer than the deploy's 750 s gate; `the_deploy_readiness_gate_outlasts_the_boot_wait_budget`
+compares the gate with `MAPPING_WAIT_DEADLINE_SECS` (600 s), not that stall.
+
+Guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row) — boot path only, no hot-path,
+table, alarm or WebSocket change.
+
+## ITEM 51 — Dhan 15:41 cross-verification hardening (2026-10-06)
+
+Approved by Parthiban 2026-10-06: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?", answering the recommended cross-verification hardening list (five findings: the day marker, the read that runs too early, missing minutes that never page, a day with no run at all, and targets fixed at boot). Rule authority: `no-rest-except-live-feed-2026-06-27.md` §12.15.7 onward and the noise lock §2.5 notes, each dated and recorded before its code. Ten serial PRs, one sub-item each. Findings Verified by reading `origin/main` at `60bdfd97a`; cargo was not run for the findings.
+
+- [x] 51a — **The day marker is written atomically, read strictly, kept 400 days, and never written when audit rows were lost.** tmp + fsync + rename + folder fsync returning `io::Result<MarkerDurability>`; the reader needs the exact `delivered_date_ist=<date>` line; crossverify markers keep 400 days; a discarded or refused audit row fails the attempt (`audit_rows_lost`); a failed marker write fails the attempt (`marker_not_written`) and the next attempt is marker-only; daily-archive latch held in process; tf marker failure logged coded.
+  - Files: crates/app/src/daily_task_marker.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/daily_archive_boot.rs, crates/app/src/tf_consistency_boot.rs, crates/app/src/main.rs, crates/app/tests/tf_consistency_wiring_guard.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
+  - Tests: test_write_marker_is_atomic_leaves_no_tmp_and_complete_contents, test_write_marker_overwrites_a_stale_tmp_left_by_a_crash, test_write_marker_returns_err_on_unwritable_base, test_write_marker_returns_err_when_rename_target_is_a_directory, test_marker_exists_rejects_empty_torn_or_wrong_date_marker, test_marker_exists_accepts_the_legacy_marker_format, test_marker_exists_reads_at_most_4kib, test_sweep_removes_stale_same_task_tmp_only, test_keep_days_parameter_controls_the_sweep_horizon, test_write_marker_orders_sync_rename_dirsync, test_crossverify_marker_keep_is_short_and_keep_exceeds_every_gated_hold_lookback, test_persist_verdict_any_lost_row_is_a_failed_attempt, test_persist_report_into_counts_rows_discarded_not_batches, test_persist_rows_counter_counts_only_flushed_rows, test_next_attempt_kind_after_marker_failure_is_marker_only, test_marker_only_attempt_never_reruns_the_check, test_marker_write_needs_a_complete_run, test_marker_not_written_final_failure_pages_on_existing_xverify_failed, test_latch_marker_failure_still_latches_in_process, test_pass_marker_write_failure_is_logged_coded
+- [x] 51b — **Attempt time bounds: every attempt ends before the 17:25 scheduled-stop window.** Each attempt runs under `tokio::time::timeout` with an end bound of 17:23 (62,580 s), the retry interval moves 900 → 760 s so four worst-case attempts still fit (56,460 + 960 + 3 × 1,720 = 62,580), and a late attempt runs with a shrunk budget instead of past the stop. The last attempt is decided once, before it starts (`attempt_is_last`, from start + `attempt_max_secs`), and a marker-only attempt uses the same rule; the day loop is `drive_day`, with the clock, the day check and the attempt injected. A late attempt below 120 s is skipped (`xverify_attempt_skipped_no_time`); a manual evening boot at or after 17:50 runs once, unshrunk. The option pass runs under its own timeout (`timed_out` label). The timeout cannot cut the synchronous audit persist after the last `.await`, so the persist stops itself at the timeout's own instant: before each row it checks that a flush of the buffer would end by then in the ILP client's worst case (`DhanLiveXverifyAuditWriter::flush_worst_case`: 5 s + bytes at 102,400 B/s, both now written into the writer's conf), and otherwise abandons what is left (`DhanLiveXverifyAuditWriter::abandon_pending`, counted on the local-only `tv_dhan_live_xverify_audit_rows_abandoned_total` and `tv_dhan_xverify_persist_deadline_stops_total{pass}`, never on a §2.10 loss-group counter, which would page `audit-rows-lost` per attempt) and fails `not_persisted` (`xverify_persist_stopped_at_deadline`); the option persist does the same (`xverify_options_persist_stopped_at_deadline`); the marker is not written past the deadline. A day whose only attempt in this process is skipped for time is reported at once and then retried ONCE at 17:50 (`XVERIFY_EVENING_START_SECS_OF_DAY_IST`: the 17:45 start-watchdog `stop_check` plus 300 s, the 17:45 pinned to its terraform cron) if the process is still up: a box started by hand after 17:30 or a weekend special session no longer loses the day, and the attempt never starts on a weekday box launched before 17:30, which the `stop_check` (keep-alive ignored) or the hourly curfew stops during the wait. The day is paged once across processes through a same-day paged marker (`dhan_live_crossverify_paged`): a skipped day pages `xverify_failed` (`reason = "skipped_no_time"`) unless the marker shows a page already went out (then `xverify_day_not_attempted`), and a later final failure while it exists logs `xverify_already_paged_today` instead of paging again; a skip after a real failure still pages that failure.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
+  - Tests: test_deadline_and_last_end_derive_from_the_scheduled_stop_window, test_default_run_budget_mirror_matches_the_config_default, test_worst_case_day_fits_every_attempt_before_the_last_end, test_retry_delay_secs_bounds, test_option_pass_fits_bounds_on_last_end, test_attempt_budget_secs_shrinks_then_refuses, test_attempt_budget_secs_every_second_of_the_day, is_last_is_decided_once_from_start_plus_attempt_max, proptest_is_last_never_strands_a_retry, test_drive_day_every_start_second_ends_by_the_last_end, test_drive_day_worst_case_hangs_end_exactly_at_the_last_end, test_drive_day_marker_only_attempt_as_the_last, test_drive_day_late_start_shrinks_or_skips, test_drive_day_day_change_stops_retrying, test_bounded_attempt_keeps_a_result_finished_synchronously_past_the_limit, test_bounded_attempt_times_out_as_incomplete_at_the_limit, test_every_attempt_start_consults_attempt_budget_secs_and_is_wrapped_in_timeout, test_time_bound_sources_are_coded_and_match_no_alarm_filter, test_run_day_retries_through_the_pure_bound, test_every_xverify_alarm_source_has_a_live_error_emit, test_persist_report_into_writes_nothing_past_the_deadline, test_persist_report_into_stops_at_the_first_flush_that_cannot_end_by_the_deadline, test_persist_report_into_never_acts_without_room_before_the_deadline, test_persist_option_findings_into_stops_at_the_deadline, test_drive_day_skip_reports_at_once_then_retries_once_after_the_stop_check, test_evening_start_follows_the_start_watchdog_stop_check_and_curfew, test_report_final_failure_pages_unless_today_was_already_paged, test_skipped_day_pages_unless_paged_and_the_paged_marker_is_wired, test_marker_write_needs_a_complete_run, abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded, test_flush_worst_case_is_timeout_plus_bytes_at_min_throughput, ilp_conf_targets_the_configured_questdb_http_port, test_persist_report_into_stops_on_the_bytes_term_of_the_worst_case, test_marker_step_refuses_the_marker_past_the_deadline, test_drive_day_evening_attempt_survives_a_wall_clock_stepped_back, test_drive_day_evening_attempt_with_a_huge_budget_does_not_panic, test_option_pass_refuses_a_changed_day, test_runbook_skip_rows_agree_with_the_evening_attempt
+- [x] 51c — **Verdict and late window: a degraded run no longer hides a real divergence, and the excused end-of-day window is derived, not a literal.** The tail excuse comes from the seal constants (`LATE_SEAL_WINDOW_MINUTES` = (`CATCHUP_LATENESS_MARGIN_SECS` + `LAST_FOLDED_TRADE_SLACK_SECS`) / 60 rounded up, five minutes; the 60 s slack is how far before the close the newest folded trade stamp may stop, Assumed, since the cutoff follows the watermark and not the read time; `TAIL_UNSEALED_MINUTES` deleted), and outside the excused window a failed vendor fetch can only add `missing_rest`. The verdict is `decide_outcome` over `VerdictInputs { rest_incomplete, missing: MissingJudgeable, late: LateWindowPolicy }`: a price difference or a judged missing traded/index minute is `diverged` whatever else happened; a failed fetch or spent budget, a truncated live read (`missing_live_unjudged`), a REST hole or an excused late minute (`late_excused`) holds the day at `partial`, never `clean`; the vacuous outcomes are unchanged. Production judges with `Excuse { sealed_through_secs_of_day: None }` until 51d. Daily table gains `late_excused`, `missing_live_unjudged`, `missing_judgeable` (ALTER self-heal, DEDUP unchanged); `tail_unsealed` kept and written 0. Rule §12.15.9 first; its Honest limits name the other inputs that fake a judged missing live minute until 51d (a sealed bar not yet readable at the read, a live row skipped as malformed). Review fix: every attempt stamps one `attempt_at` reading on its daily row and every cell, and `run_complete` on the daily row (ALTER self-heal, not in any DEDUP key), so a same-day retry that reads differently (`diverged` then `partial`) leaves rows a reader can order; §12.15.9 and runbook §4 say how to pick the final row. *(2026-10-10 review, rebuilt from the handoff patch on main: the documented reader rule is "any `diverged` attempt wins, otherwise the newest" (amended in the fourth round below), so a retry whose fetch of the divergent target fails cannot hide it; the persistence module header documents `attempt_at` and `run_complete`. Third round: a late-window gap BEFORE the same instrument's later live bar is judged, never excused, since that bar's tick closed the bucket; the runbook's findings query leaves out zero-volume non-index minutes, which are never real. Fourth round: the day also reads `diverged` when any real spot cell exists (a persist can stop after flushing cells and before its daily row); the findings query leaves out the option pass's `NSE_FNO` cells, which have their own query; `is_real_divergence` no longer counts `missing_rest`; stale docs (session close 15:40, the old tail helper) corrected. Fifth round: the rule and runbook name the one case the reader rule cannot see, an attempt whose persist stopped before its first flush.)*
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md
+  - Tests: a_failed_fetch_no_longer_hides_a_real_divergence, a_rest_incomplete_run_with_no_finding_is_partial_never_clean, a_truncated_live_read_never_judges_missing_minutes_but_still_flags_price_divergence, late_seal_window_minutes_is_derived_from_the_catch_up_margin, late_window_covers_every_unsealed_bucket_only_when_the_last_trade_is_within_the_slack, is_late_window_minute_with_known_sealed_through_excuses_only_buckets_ending_after_it, is_late_window_minute_with_none_excuses_the_last_window, strict_policy_counts_a_missing_1539_traded_minute_as_real_diverged, missing_live_late_counts_traded_and_index_minutes_only, excuse_downgrades_clean_to_partial_only_when_late_excused_gt_zero_never_upgrades_degraded_or_diverged, the_late_window_reaches_neither_half_of_the_traded_split_under_excuse, decide_outcome_matches_the_oracle_on_every_permutation, compare_day_in_scope_every_piece_under_every_input, a_sealed_through_value_at_every_minute_of_the_last_10, verdict_inputs_for_run_maps_every_observation, daily_row_carries_the_late_and_unjudged_counts, summary_line_names_minutes_not_yet_judged, proptest_verdict_is_never_clean_when_anything_is_incomplete_excused_or_unjudged, compare_day_degraded_downgrades_clean_to_partial_never_up, late_excused_and_unjudged_columns_self_heal_and_dedup_keys_unchanged, a_live_bar_unreadable_at_the_read_is_judged_missing_and_diverged_until_51d, attempt_at_and_run_complete_self_heal_reach_the_wire_and_stay_out_of_dedup, test_every_persisted_row_carries_one_attempt_stamp_and_the_run_complete_flag, daily_row_carries_every_count_and_the_applied_tolerance, the_documented_reader_never_lets_a_later_attempt_hide_a_diverged_one, a_late_gap_before_the_instruments_own_later_live_bar_is_never_excused
+- [x] 51d — **Readiness before the read: the seal sweep, the seal writer and QuestDB have caught up to the close.** A static `CATCHUP_PROGRESS` publishes each completed sweep's floor cutoff (an overrun never raises it); the seal writer's drained sample and today's staged spill files are checked; `fetch_wal_tables` moves to `wal_suspension_watcher` with a new `wal_applied_through`. Earlier attempts retry before any vendor call; the last attempt proceeds with the late minutes unjudged and never pages on them. Any `sealed_through_secs_of_day` it passes is clamped to the session (51c round-4 review: a `t` before the open would excuse every late-window candidate). *(Done: the first read is no earlier than `LIVE_FINAL_SECS_OF_DAY_IST` (15:44:05); `wait_live_final` runs beside the token wait under the same 300 s bound and checks three barriers in order (drained strictly after the reference sweep, no spill file for today staged or parked, `candles_1m` `writerTxn` at or past a `sequencerTxn` snapshot); `decide_read` is the pure table in §12.15.10; a strict read with no seal progress that finds late minutes missing keeps only the vendor tape and retries; `excuse_after` clamps the floor into `[close − LATE_SEAL_WINDOW_MINUTES, close]`; the option pass reads with the spot attempt's readiness and is skipped when not ready. Rule §12.15.10, noise lock §2.5 51d note, runbook §5.)*
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_feed_stack.rs, crates/storage/src/wal_suspension_watcher.rs, crates/storage/src/partition_archive.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, crates/storage/src/seal_spill.rs, crates/storage/src/seal_writer_loop.rs, crates/storage/src/seal_writer_task.rs, crates/storage/src/seal_writer_runner.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, docs/error-runbooks/dhan-live-crossverify-error-codes.md, CLAUDE.md
+  - Tests: test_catch_up_progress_is_published_once_per_completed_sweep_with_its_floor, test_catch_up_progress_pack_round_trips_and_clamps, test_catch_up_progress_publish_is_off_the_per_tick_path, test_classify_completeness_table, test_classify_durability_drain_must_be_strictly_after_the_reference, test_decide_read_is_total_and_matches_its_table, test_every_attempt_failure_label_is_distinct, test_option_pass_read_table, test_readiness_day_converts_the_fold_and_utc_clocks, test_readiness_sources_are_warnings_with_no_alarm_filter, test_run_once_joins_both_waits_and_retries_before_the_read, test_run_once_late_check_keeps_only_the_tape_and_retries, test_run_option_pass_skips_when_not_ready_and_reads_with_the_policy, test_tape_only_persist_writes_no_findings_and_no_daily_row, test_wait_live_final_frozen_floor_and_unapplied_wal_at_the_deadline, test_wait_live_final_is_bounded_by_its_deadline, test_wait_live_final_rearms_when_the_floor_moves, test_wait_live_final_returns_at_once_when_final_and_applied, test_wait_live_final_sleeps_until_the_live_final_instant, test_wait_live_final_waits_for_staged_spill_files, excuse_after_clamps_the_sealed_through_into_the_late_window, live_final_secs_is_derived_from_close_margin_and_sweep_interval, test_fetch_wal_tables_is_shared_and_fails_closed_on_a_skipped_row, test_wal_applied_through_reads_the_writer_against_a_target, test_staged_spill_records_for_day_counts_only_that_days_record_files, test_last_seal_drained_unix_secs_is_released_and_none_until_drained, test_parked_replay_files_counts_every_park_and_unpark
+- [x] 51e — **Targets at fire, measured in shadow.** The live main-feed spot set is published to a dated per-day file (min-merged, like `depth-held-today.json`), the 15:41 run reads that day's own record, and coverage in planned instrument-minutes is persisted on the daily row without changing any verdict.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. On origin/main via #2187 (43f03f14c, the Codex consolidation): crates/app/src/xverify_day_record.rs::record_spot_subscribed, called from dhan_live_crossverify_boot.rs:2043; covered_instrument_minutes / planned coverage on the daily row in crates/app/src/dhan_l
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_universe.rs, crates/storage/src/dhan_live_crossverify_persistence.rs
+  - Tests: named in that PR (a widen at 15:29 does not read as full coverage; a restart keeps the earlier subscribe second)
+- [x] 51f — **Coverage enforced: a run that did not cover the subscribed universe does not release the S3 hold.** A post-compare Clean-to-Partial downgrade (never touching Diverged) and a refusal on the four-index fallback day, which pages as a deliberate second page naming the upstream alarm.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c): dhan_live_crossverify_boot.rs reasons CoverageShort => "coverage_short", FallbackUniverse => "fallback_universe" (lines 613-615); full-coverage check dhan_live_crossverify.rs:1856; rule §12.15.14 and noise-lock §2.5 2026-10-30 note.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (a fallback day writes no marker; Diverged is never downgraded)
+- [x] 51g — **Catch-up and supervisor: a day with no run is found and run.** The past-day catch-up runs whatever today's marker says, days at their last chance first; the final-page state is a persisted marker; a supervisor reports at 17:24 only if the worker never reported.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c): dhan_live_crossverify_boot.rs::past_days_to_check (1538, called at 1685), supervisor_should_page (1601), run_supervisor spawned at 1772 with NotReported => "worker_never_reported"; rule §12.15.15. Supervisor time is now 16:24 (Quote 37 shift
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/main.rs
+  - Tests: named in that PR (an afternoon boot catches up an unmarked earlier day; the supervisor fires only without a worker report)
+- [x] 51h — **Missing minutes judged and stored in shadow.** Missing minutes are judged only when the seal pipeline is drained and QuestDB has settled; unjudged misses are stored as their own cell kind; a persisted `missing_minutes_would_page` shadow records what a page would have said. No page change. *(Done 2026-10-11: judging after the drain and the unjudged cell kind landed with 51d and 51c; this PR adds the shadow column and `would_page_on_missing_minutes` (a judged run with a missing traded minute, or an index missing `WOULD_PAGE_MIN_INDEX_RUN_MINUTES` (2) consecutive moving minutes). Rule §12.15.11.)*
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/storage/src/dhan_live_crossverify_persistence.rs, docs/claude-rules-full/project/no-rest-except-live-feed-2026-06-27.md, .claude/rules/project/no-rest-except-live-feed-2026-06-27.md, crates/app/src/dhan_live_crossverify_boot.rs
+  - Tests: would_page_on_missing_minutes_table, missing_minutes_would_page_is_false_on_an_unjudged_or_not_ready_run, missing_minutes_would_page_follows_traded_minutes_and_moving_index_runs, missing_minutes_would_page_self_heals_reaches_the_wire_and_stays_out_of_dedup
+- [ ] 51i — **No-run and hold-override alarms, with the legacy-marker source split.** Markers kept since `CROSSVERIFY_MARKERS_KEPT_SINCE` are trusted for the override page; earlier days log on a separate unalarmed source, so the swept-marker residual cannot page. A new dated noise-lock section (the next free §2.x number; §2.11 is taken by the fast-lane PR) and a §2.5 note first.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, crates/storage/src/partition_archive.rs, deploy/aws/terraform/error-code-alarms.tf, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (a pre-cutoff day never reaches the alarmed source)
+- [ ] 51j — **The missing-minutes page.** Wired only after a measured shadow baseline from 51h; a new dated noise-lock section (the next free §2.x number) first.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs, deploy/aws/terraform/error-code-alarms.tf, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md
+  - Tests: named in that PR (index pages need a run of two or more moving minutes)
+
+### Design
+51a (this PR, cold paths only). `daily_task_marker::write_marker_in(base, task, date, keep_days) -> io::Result<MarkerDurability>`: note whether the folder exists, create it, write `<task>-<date>.marker.tmp` (create + truncate, so a crash leftover is overwritten), `sync_all`, `rename` to the final name, then open and `sync_all` the folder (and its parent if it was just created). A failure up to the rename is `Err`; a folder-sync failure after it is `Ok(RenamedNotDirSynced)`. The reader reads at most 4 KiB and needs the exact `delivered_date_ist=<date>` line. The sweep takes `keep_days` and also removes stale same-task temp files. `write_daily_marker` (unit return) is removed; callers use `try_write_daily_marker` (7 days) or `try_write_daily_marker_keeping`. In the cross-verification task, `persist_report_into` counts rows discarded and rows flushed per flush; `persist_verdict` turns any lost row into `AuditRowsLost`; `classify_attempt` takes that verdict; `record_day` is the only marker write and maps a write error to `MarkerNotWritten`; `next_attempt_kind` makes the attempt after `MarkerNotWritten` marker-only. `CROSSVERIFY_MARKER_KEEP_DAYS = 400`, compile-time asserted above 90 + `MAX_CROSSVERIFY_HOLD_DAYS`, with a boot check (`crossverify_marker_keep_is_short`) over the gated configured hot windows. The daily archive latches the day in process before it writes its marker. 51b–51j: each PR's design is recorded in its own rule section (§12.15.8 onward) before its code; the outlines are in the sub-items above.
+### Edge Cases
+51a: a temp file left by a crash (overwritten); a directory squatting on the final path (rename fails, `Err`); a file squatting on the folder path (`Err`); an empty, torn, wrong-date or over-4-KiB marker (reads absent); the legacy two-line marker (reads present); a folder sync that fails after the rename (written, coded warn); a marker write that fails on the last attempt (pages `xverify_failed`, reason `marker_not_written`); a marker-only retry near 17:14 that no longer fits (refused by the unchanged fit check, then paged); a day with zero findings and zero tape rows (only the daily row must land). 51b: an attempt starting at every second from 15:41 to 17:23; one to four failing attempts that hang to their timeout, fail at once, or alternate; a marker-only attempt as the last; a configured budget below 120 s (runs unshrunk); a room below 120 s (skipped, never called); a persist still running at the timeout (it stops itself at the same instant: a deadline already passed, one reached between rows, every clock and deadline in a proptest); a skip with no earlier attempt in the process (reported at once: paged unless today was already paged, then retried once at 17:50) and after a real failure (paged with that failure); the 17:50 attempt that also cannot start (ends `skipped_no_time`, waits once); the day changing during the evening wait; a start inside the 17:25–17:50 span (skipped, then the 17:50 attempt), including 17:45–17:50 while the start-watchdog `stop_check` may be stopping the box, and after it (runs once, unshrunk); the `stop_check` or `curfew_check` cron moving without the pinned constants (test fails); a final failure on a day already paged (warn, no second page); a deliberate persist stop (never on a §2.10 loss-group counter, checked against every terraform file); a clock reading of a day or more (refused); the day changing during a retry sleep. 51c–51j: listed in each PR.
+### Failure Modes
+51a: a stricter reader turns a legacy torn marker into an absent one, so today's check re-runs once (DEDUP-idempotent) and a past day takes the hold-ceiling override; the archive may re-sweep once and the timeframe check may re-send one card — all fail open. `audit_rows_lost` triggers a full retry and a vendor re-fetch, the same load as the existing `not_persisted` retry. A refusal that repeats on every attempt leaves the day unmarked until the hold ceiling. A host crash can lose a marker whose grandparent folder was just created; that only re-runs or holds the day. Markers the old 7-day sweep already deleted are not recovered (residual handled by 51i's source split). 51b: a slow but healthy day (slow token or QuestDB) is now cut at the attempt limit and left unmarked where it used to overrun, so more days can end at the hold ceiling; deciding the last attempt from the latest end gives a first attempt after 16:38:20 no retry; the persist stops itself at the attempt's deadline on worst-case flush timing, so on a slow but healthy QuestDB near the deadline it can stop early and the attempt fails `not_persisted` where it might have finished (safe direction: no marker, rows recomputable); the marker write itself is not bounded on a stalled disk; a skipped day is paged at the skip unless the paged marker shows a page went out today, and the marker records that the page was emitted, not read (a page lost in CloudWatch or SNS still counts as sent); a process killed by a scheduled stop during the evening wait has already reported the day: on a weekday that is every box launched before 17:30, because the 17:45 start-watchdog `stop_check` ignores keep-alive and the hourly `curfew_check` (17:35) stops a box without it, so such a day is not re-checked and takes the S3 hold ceiling (a box started by hand after 17:30 is re-checked); that the `stop_check`'s stop lands within the 300 s margin is Assumed, and a box both stops failed on, without keep-alive, meets the next curfew at 18:35 IST (the cron minute 5 is UTC), after the 17:50 attempt's default worst-case end of 18:06, so only a budget running past 18:35 can be cut (safe direction, no marker); a lost marker write lets a later failure page again (loud).
+### Test Plan
+51a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-app --lib` with filters `daily_task_marker`, `dhan_live_crossverify_boot`, `daily_archive_boot`, `tf_consistency_boot`, plus `--test tf_consistency_wiring_guard`; clippy `-D warnings` on the app lib; a bite check on one new test. 51b: `cargo test -p tickvault-app --lib dhan_live_crossverify_boot` (paused-clock drive_day sweeps every start second), the common guards `error_code_rule_file_crossref`, `error_code_tag_guard`, `claude_md_codebase_map_guard`, `assertion_free_test_ratchet`; clippy and fmt; bite checks with the 17:30 bound, an end-time last decision, no budget shrink, and the 17:45 evening start restored, plus the start-watchdog stop_check and curfew crons moved. Because 51b also changes `crates/storage/src/dhan_live_crossverify_persistence.rs`: `CARGO_INCREMENTAL=0 cargo test -p tickvault-storage --lib dhan_live_crossverify_persistence` (`abandon_pending_returns_the_dropped_count_clears_and_never_counts_as_discarded`, `test_flush_worst_case_is_timeout_plus_bytes_at_min_throughput`, `ilp_conf_targets_the_configured_questdb_http_port`). 51c–51j: scoped tests named in each PR, plus the existing `test_every_xverify_alarm_source_has_a_live_error_emit`.
+### Rollback
+51a: revert the commits. The marker file format is unchanged, so markers written by either build read in the other (the old reader only checks that the file exists). No schema, table, alarm or infrastructure change. 51b: revert the commits; no data, schema, alarm or infrastructure change, and the 900 s interval and 17:30 bound come back with them. 51c–51j: each PR reverts on its own; 51i and 51j carry terraform that reverts with them.
+### Observability
+51a: no new metric name, alarm, filter or page. `xverify_failed` gains `reason` values `marker_not_written` and `audit_rows_lost`; new unalarmed `warn!` sources `xverify_attempt_marker_write_failed`, `xverify_marker_dir_sync_failed`, `xverify_marker_keep_short`, `daily_archive_latch_marker_failed`, `tf_marker_write_failed`, all coded. `tv_dhan_feed_xverify_rows_total` now counts only rows the database ACKed for the spot check; the §12.15.6 option pass still adds every row of a pass whose final flush landed, a discarded chunk included. Discards still count on `tv_dhan_live_xverify_audit_rows_discarded_total` (§2.10 `audit_rows` group). Runbook rows in `docs/error-runbooks/dhan-live-crossverify-error-codes.md` §2. 51b: no new metric name, alarm, filter or page; new unalarmed coded `warn!` sources `xverify_attempt_timed_out`, `xverify_attempt_skipped_no_time`, `xverify_options_timed_out`, `xverify_persist_stopped_at_deadline`, `xverify_options_persist_stopped_at_deadline`, `xverify_day_not_attempted`; a persist stopped at the deadline counts only on the new local-only `tv_dhan_xverify_persist_deadline_stops_total{pass}` and `tv_dhan_live_xverify_audit_rows_abandoned_total` (no EMF name, filter or alarm), never on the §2.10 `audit_rows` members `tv_dhan_feed_xverify_persist_errors_total` and `tv_dhan_live_xverify_audit_rows_discarded_total`; `xverify_failed` gains `reason = "skipped_no_time"` (the existing alarm, noise lock §2.5 51b-review note) and pages once per day across processes; new coded `warn!` sources `xverify_already_paged_today`, `xverify_paged_marker_write_failed`; option-pass outcome label `timed_out` on the existing local counter; runbook §3. 51c–51j: listed in each PR.
+
+Per-item guarantee matrix: see .claude/rules/project/per-wave-guarantee-matrix.md (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 52 — Live-socket fast lane (2026-10-06)
+
+Approved 2026-10-06 by the owner: "Go ahead with whatever you want dude" and "See do everything whatever is recommended dude okay?" (relayed to the implementing session by the coordinator's workflow; Risk: confirm against the owner thread before merge). Fifteen serial PRs from the fast-lane specs; each PR ticks its own sub-item and appends its own paragraph to each section below. No new plan file (five active plans; a sixth trips plan-gate V7).
+
+- [x] 52a — **805 probe attribution (PR 1).** A close with no code fails a running probe or release window only on the probed socket, or when another socket's drop is corroborated as an eviction (another of our sockets, not the closer and not a same-burst member, began a dial in the last 20 s), or when a dropped sibling is not back within 120 s. Before, any sibling blip after an 805 burned one of the 3 main-feed (6 depth) probes, never refunded (Verified in source at 60bdfd97a).
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/proptest-regressions/websocket/pool_supervisor.txt, crates/core/src/websocket/connection.rs, crates/common/src/ws_event_types.rs, docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md, CLAUDE.md
+  - Tests: test_probe_survives_one_sibling_blip_that_heals, test_probed_socket_bare_reset_still_fails, test_sibling_drop_right_after_probe_dial_fails_at_once, test_two_separate_blips_in_one_window_do_not_fail, test_flapping_sibling_is_not_cascade_evidence, test_cascade_after_burst_fails, test_simultaneous_burst_is_one_event, test_evictee_close_processed_before_evictor_dial_completes, test_unhealed_sibling_fails_at_its_own_deadline, test_pass_deferral_is_capped, test_suspect_that_parks_for_non_805_is_dropped, test_watched_idle_redial_fails_window, test_blip_then_805_fails_once_as_805, test_805_then_blip_no_double_fail, test_blip_on_watched_and_805_single_failure, test_depth_window_attribution, test_depth_window_deferred_keeps_main_waiting, test_out_of_range_slot_fails_closed, test_recent_dial_mask_on_local_table, test_record_dial_begin_ignores_out_of_range_slot, test_overflow_attribution_constants_are_locked, proptest_attribution_rules, test_overflow_attribution_call_sites_are_wired, test_overflow_episode_region_never_allocates, test_scope_lock_records_the_overflow_probe_attribution, test_deferral_cap_covers_every_note_and_its_settle, test_heal_inside_its_own_deadline_passes_after_the_settle, test_drop_during_a_deferral_keeps_its_own_deadline, test_overflow_close_route_table, test_bare_reset_glue_attributes_a_stamped_dial, test_suspect_and_park_gates_reach_the_episode, test_watched_coded_close_restarts_its_watch_once, test_watched_808_parks_and_fails_the_window, test_coded_sibling_close_is_noted_and_must_heal, test_coded_close_joins_the_burst_so_its_redial_never_corroborates, test_every_note_has_plain_words_and_no_step_does, test_watched_coded_close_joins_the_burst_so_its_redial_never_corroborates, test_watched_teardown_restarts_the_watch_once_and_never_passes_while_down, test_window_max_is_derived_and_only_bites_after_a_restart, test_window_is_bounded_from_its_grant_across_a_watch_restart, test_a_window_that_settles_at_its_bound_still_passes, proptest_window_bound_holds_from_the_grant_across_restarts, test_dial_failure_proves_no_accept_only_for_a_refusal, test_a_refused_dial_loop_never_corroborates_a_sibling_close, test_a_timed_out_dial_still_corroborates_a_sibling_close, test_the_dial_failed_arm_feeds_the_eviction_stamp, test_dial_failure_label_separates_a_refused_upgrade, test_depth_frame_silence_holds_the_pass_until_the_watched_socket_redials, test_no_sibling_is_noted_past_the_grant_cutoff_after_a_restart, test_a_note_just_inside_the_grant_cutoff_is_honoured_by_the_bound, test_attribution_generator_reaches_the_probed_socket_down, test_a_failed_window_whose_socket_left_never_recovers_silently, test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked, test_high_slot_closers_follow_the_same_attribution_rules, test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks, test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence, test_a_failed_probe_that_leaves_for_good_reaches_the_episode_through_its_repark, test_a_heal_past_its_deadline_fails_without_waiting_for_a_poll
+  - Review fixes (same PR, 2026-10-06): (1) the pass-deferral cap now covers each note's own deadline and settle time (notes stop at a cutoff, the window fails on a later drop); (2) the shell glue (dial stamp, close read, suspect and park gates) is factored into pure functions the tests drive; (3) a close with a code other than 805 now reaches the episodes: the probed socket's first such close restarts its watch, a second or a non-805 park fails the window, and a sibling's is noted.
+  - Review round 3 (same PR, 2026-10-06): (4) the probed socket's own coded close joins the 2 s burst, so its immediate redial never corroborates a sibling's no-code close from the same incident; (5) a teardown this process starts on the probed socket (`SubscribeFailed`, or main-feed `FrameSilenceElapsed`) counts like its coded close (one shared watch restart, a second fails), so a window can no longer pass on the old first frame while the probed socket is down.
+  - Review round 4 (same PR, 2026-10-06): (6) the window is bounded from its GRANT, not only from its latest first frame: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = 740 s (120 first-frame deadline + 380 deferral cap + 120 first-frame deadline + 120 watch for the one restart), kept in `granted_at`, which a watch restart never resets; before, a restart late in a deferral bought a second one and a window could hold the process-wide turn about 1,000 s; (7) a dial refused at the upgrade (non-101, new transport label `upgrade_refused`, was `connect`) or that never left the process drops its dial stamp, so a refused-dial loop no longer corroborates an unrelated sibling close; a timeout keeps it.
+  - Review round 5 (same PR, 2026-10-06): (8) the probed DEPTH socket torn down for frame silence is marked down (`watched_down`) without failing the window or restarting its watch; the window cannot pass until it completes a dial again plus the 20 s settle time (before, it kept its first frame and a deferred window could pass while it was not connected); (9) every dial is stamped again immediately before `connect()`, after the shutdown, re-park and dual-instance-lock gates, so BeginDial-to-accept no longer depends on no gate waiting (not reachable today: the lock flag never returns to true in one process).
+  - Review round 6 (same PR, 2026-10-06; added to this plan in round 9, the round-6 commit did not touch it): (9a) after a watch restart a sibling could still be noted ("the test is not failed for this") as late as about 860 s from the grant, where the 740 s bound then failed the window inside that note's own heal deadline or settle; no sibling is now noted later than `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` = 600 s from the GRANT (740 − 120 − 20, which a restart never resets), and a later drop fails the window at once as `failed_deferral_exhausted`; (9b) `proptest_attribution_rules` gained ops for the probed socket's own redial (`on_watched_redialling`) and completed dial (`on_dialled`) with a weighted op mix, and a seeded coverage test proves the generator reaches `watched_down` on a running window and passes such a window. Tests: test_no_sibling_is_noted_past_the_grant_cutoff_after_a_restart, test_a_note_just_inside_the_grant_cutoff_is_honoured_by_the_bound, test_attribution_generator_reaches_the_probed_socket_down (bite-checked in round 6: without the grant cutoff, or with `watched_down` removed from the pass gate, they fail).
+  - Review round 7 (same PR, 2026-10-06): (10) a failed window whose socket left for good (a non-805 park ends its task, so it never re-parks) no longer lets the next wait end the episode as a silent `Recovered` with nothing parked, which re-permitted the main-feed widen with no probe ever passed: `OverflowEpisode::failed_since_pass` is set by every failed window and cleared only by a pass, and while it is set the episode stays `Waiting` (widen refused) until a later 805 park is probed and passes; the depth-only 805 with no window ever failed still ends silently; (11) `proptest_attribution_rules` now also checks the other direction (every no-code close inside a window gets the outcome its rule asks for, and a poll fails the window exactly when a noted sibling is past its heal deadline), and an example drives closers at global index 8 and up. Tests: test_a_failed_window_whose_socket_left_never_recovers_silently, test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked, test_high_slot_closers_follow_the_same_attribution_rules (bite-checked: each fails with its rule removed or limited to slots below 8).
+  - Review round 8 (same PR, 2026-10-06): (12) between a failed main-feed window and the failed socket's re-park (it takes the re-park request on its next tick or its next dial) nothing of the main feed was parked, so `holds_turn` read false and any other socket's poll let the depth episode grant first, inverting the main-first order; a failed window now marks its socket `reparking_mask`, which holds the turn like a parked slot until it re-parks, leaves (a non-805 park or shutdown that reaches the episodes), or `OVERFLOW_PROBE_REPARK_HOLD_SECS` (120 s) pass; the probed socket parking for a non-805 reason (it never re-parks) holds nothing; (13) a dial refused at the upgrade (or that never left the process) stored 0 into the slot's dial stamp, which also erased an EARLIER attempt by that slot that timed out and that Dhan may have accepted late, so an eviction inside that attempt's 20 s read as an uncorroborated blip (toward a pass); BeginDial now keeps the previous stamp (`OVERFLOW_DIAL_PRIOR_MS`, one load and one store), the connect re-stamp (`overflow_note_dial_connect`) does not move it, and a refusal falls back to it; (14) the CLAUDE.md `OVERFLOW_EPISODES` row was annotated for rounds 7 and 8. Tests: test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks, test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence (bite-checked: each fails with its fix reverted).
+  - Review round 9 (same PR, 2026-10-06; low-severity review pass): (15) `OVERFLOW_PROBE_WINDOW_MAX_SECS` gains `OVERFLOW_PROBE_POLL_SLACK_SECS` (3 s, one one-second poll for each of the three poll-stamped instants: the first frame, the cap failure, the restart's first frame), so it is 743 s; the grant note cutoff stays 600 s (743 − 3 − 120 − 20); a late poll no longer fails a restarted window whose socket stayed up for its whole watch; (16) a noted sibling's dial at or past its own 120 s heal deadline fails the window (`failed_sibling_unhealed`) instead of healing, so the deadline holds at the heal instant and not only at the next poll (it erred toward a pass); (17) a failed probe whose re-park request is still pending reaches the episodes on any non-805 park or shutdown (`left_reaches_episode` reads `OVERFLOW_REPARK`): after its one watch restart, an 808 failed the window first and the park then reached nothing, so the dead socket held the main feed's turn for the whole 120 s hold; (18) the held state after a failed window (nothing parked, no pass since) is reported once as `held_after_failed_window` (coded `warn!`, existing counter, edge-latched by `held_reported`, re-armed by a park or a pass); (19) `OVERFLOW_WATCHED_FIRST_FRAME` names the slot (`AtomicU8`), so a stale report from the previous window's socket cannot stamp the next one; (20) docs: the `OVERFLOW_EPISODES` comment lists every lock site, the DialSucceeded arm says two loads, the deferral-cap comment states that the probed depth socket's frame-silence redial can still reach the cap, and this plan gains rounds 6 to 9 in every section, with dated corrections to the Design lines that state a 240 s cap and a refused dial storing 0. Tests: test_a_window_that_settles_at_its_bound_still_passes (rewritten on a reachable one-second-poll timeline), test_a_failed_probe_that_leaves_for_good_reaches_the_episode_through_its_repark, test_a_heal_past_its_deadline_fails_without_waiting_for_a_poll, test_a_failed_window_whose_socket_left_never_recovers_silently (now expects the one held report); each bite-checked (no slack, no re-park clause, no deadline check at the heal, no held branch: each fails).
+  - Review round 10 (same PR, 2026-10-06): (21) round 9's (15) is WITHDRAWN. Raising `OVERFLOW_PROBE_WINDOW_MAX_SECS` needs a fresh dated owner quote under the scope lock's round-4 REJECT row, and round 9 recorded none while rewriting that row in the same change. The bound is 740 s again, `OVERFLOW_PROBE_POLL_SLACK_SECS` is removed, the grant note cutoff stays 600 s (740 − 120 − 20), and the round-4 row stands unchanged. The late-poll case is an honest limit (errs toward fail, burns one probe), pinned by `test_a_late_poll_can_fail_a_restarted_window_at_its_bound`; the on-time case still passes at the bound (`test_a_window_that_settles_at_its_bound_still_passes`). Files: `crates/core/src/websocket/pool_supervisor.rs`, the scope lock full file (Review round 10) and stub, CLAUDE.md row.
+- [ ] 52b — log-drop filter (spec fl-log-drop, PR 2).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [x] 52c — reader-memory measurement (spec fl-reader-memory, PR 3).
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c) added crates/core/tests/dhat_ws_reader_memory.rs (header says 'Plan item 52c, 2026-10-30') with dhat_reader_memory_ratchet and reader_memory_report. Loopback ws:// only; TLS and the live network are not measured.
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [x] 52d — **808 refresh-once (spec fl-808, PRs 4 and 5 merged into one).** A first 808 no longer parks the socket for the session: it triggers ONE shared token refresh and a redial on the 807 delay rule (5 s floor, damped ladder, stagger), reason `auth_rejected`. The slot parks (`FatalDisconnect`, no 804 respawn) only when the dial that got 808 presented the token generation an earlier refresh in the same episode produced, or 3 refreshes failed outright, or 300 s passed without a fresh token (counted from the episode start or the last refresh that produced one, whatever generation was verified), after at most one more refresh attempt past the bound, or more than 4 refreshes that produced a fresh token fell inside 300 s on that slot (a deferred or failed refresh is not counted there; the window spans episodes). 806 and 810 stay fatal; 805 and `ROTATION_HALTED` unchanged; nothing on the per-frame path changes. Authority: scope lock "2026-10-06 — 808 REFRESHES THE TOKEN ONCE BEFORE IT PARKS" and noise-lock §2.12 (owner 2026-10-06 and 2026-10-10 quotes recorded there). Before: one 808 parked the slot for the day (Verified in source at 4525ffe86, `classify_disconnect` Fatal arm).
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/src/websocket/types.rs, crates/core/src/auth/token_manager.rs, crates/app/src/dhan_feed_stack.rs, crates/common/src/error_code.rs, deploy/aws/terraform/live-lane-alarms.tf, docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/gap-enforcement.md
+  - Tests: test_classify_disconnect_808_is_auth_rejected_and_806_810_stay_fatal, test_first_808_refreshes_then_dials_with_the_token_floor, test_second_808_presenting_the_verified_generation_parks, test_808_with_a_new_generation_after_verification_is_a_new_strike, test_808_hard_failures_are_bounded, test_808_mint_cooldown_deferrals_do_not_count_but_the_episode_is_time_bounded, test_stacked_data_then_808_does_not_clear_the_episode, test_808_after_a_proven_healthy_session_starts_a_new_episode, test_non_808_close_after_frames_clears_the_episode, test_808_episode_is_cleared_by_an_805_park_and_probe_release, test_808_refresh_ceiling_per_window, test_807_and_809_ignore_note_token_refresh_and_never_park, test_808_never_sets_rotation_halted_or_engages_the_overflow_episode, test_token_refresh_request_carries_the_verified_generation_only_on_an_808_redial, test_sixteen_sockets_rejected_808_together_fan_out_above_the_floor, test_run_connection_808_refreshes_once_then_parks_when_the_fresh_token_is_rejected, test_run_connection_808_then_healthy_redial_keeps_running, test_run_connection_stacked_808_frame_parks_on_the_second_fresh_rejection, prop_808_refreshes_are_bounded_and_nothing_dials_after_a_park, refresh_arm_reports_the_outcome_before_begin_dial, token_floor_delay_is_shared_by_807_and_808, the_frame_path_does_not_touch_the_auth_reject_episode, stale_credential_refresh_renews_against_the_dialled_generation, test_is_deferred_renewal_failure_truth_table, test_stale_renewal_failure_is_reused_within_the_window, test_808_deferrals_at_real_cadence_park_only_at_the_episode_bound, test_808_reused_failure_is_not_a_second_hard_strike, test_808_deferrals_after_one_fresh_token_park_300_s_after_it, test_808_after_a_long_outage_refreshes_once_more_then_parks, test_808_alternating_with_failed_dials_parks_by_the_second_808_past_300_s, test_808_deferrals_at_the_returned_delays_park_within_one_cycle_of_300_s, prop_808_parks_300_s_after_the_last_fresh_token_once_a_refresh_ran, test_stale_renewal_deferral_is_reused_within_the_window, test_force_renewal_unless_replaced_pages_family_3_once_per_token
+- [x] 52e — merged into 52d: the final fl-808 spec ships as ONE PR, including the stale `dhan-socket-parked` description (see 52d).
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. The box says it was folded into 52d, which is ticked [x]. The 808 refresh-once logic and the updated dhan-socket-parked description (noise lock §2.12) shipped there. No separate work is left.
+  - Files: see 52d
+  - Tests: see 52d
+- [x] 52f — boot telemetry spawn and boot code (PR 6).
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c): ErrorCode::HotPath04TelemetryNotStarted (crates/common/src/error_code.rs:179), logged at crates/app/src/main.rs:2310 when the telemetry thread fails to start, pinned by crates/app/tests/hot_path_telemetry_boot_wiring_guard.rs. The paging-dec
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [x] 52g — data-silent detection, main feed and depth-20, shadow mode (spec fl-data-silent, PR 7). Per-kind frame-silence thresholds, fault redials only (scope lock "2026-10-10 — PER-KIND FRAME-SILENCE THRESHOLDS"; noise lock §2.13). Shipped in ONE PR with 52h (the spec is one unit; the override that named it "52e" collided with the 808 item, so this PR fills 52g and 52h instead of adding a duplicate letter).
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/tests/dhat_frame_silence_activity.rs, CLAUDE.md, crates/common/src/config.rs, config/base.toml, crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs, docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md, docs/claude-rules-full/project/dhan-rest-only-noise-lock-2026-07-14.md, .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, CLAUDE.md
+  - Tests: silence_redial_basis_truth_table, live_siblings_counts_same_kind_other_slots_within_10s_only, main_feed_confirmed_redial_at_60s_with_two_live_siblings_in_act_mode, shadow_mode_counts_once_per_episode_and_never_redials, escalation_bounds_snapshot_then_deaf_loop, confirmed_redial_spacing_is_pool_wide_per_kind, below_the_instrument_floor_falls_back_to_300s, an_engaged_overflow_episode_or_a_halted_rotation_suppresses_every_fast_path, confirmed_window_open_at_boundaries, frame_activity_published_at_most_once_per_second, proptest_gaps_below_the_confirmed_threshold_never_redial, dhat_frame_silence_activity
+- [x] 52h — data-silent detection, depth-200 backstop and cross-feed check (spec fl-data-silent, PR 8). Same PR as 52g.
+  - Files: crates/core/src/websocket/pool_supervisor.rs, crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: depth200_is_not_redialled_by_time_before_the_900s_backstop, data_silence_request_is_dropped_when_the_dial_generation_moved, a_taken_data_silence_request_after_805_is_refused_with_path_data_silence, depth200_held_round_trips_and_never_returns_a_torn_id, publish_depth200_held_is_called_at_every_held_set_change, last_trade_millis_moves_only_on_a_volume_increase, depth200_cross_feed_requests_when_trade_leads_by_30s_after_90s_silence, a_depth_shed_never_triggers_a_cross_feed_redial
+- [ ] 52i — live-proof gate (spec fl-live-proof, PR 9).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52j — socket receive-buffer measurement (PR 10).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52k — EMF selection change (PR 11).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52l — data-silent Act flip, gated on the shadow week (PR 12).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52m — live-proof page, after its decision card (spec fl-live-proof, PR 13).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52n — live-proof EMF names, after its decision card (spec fl-live-proof, PR 14).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+- [ ] 52o — WAL replay log (spec fl-wal-replay-log, PR 15).
+  - Files: filled in by its PR
+  - Tests: filled in by its PR
+
+### Design
+52a: `OverflowEpisode` (pure, `Copy`, no heap) gains a per-slot suspect mask, a per-slot close stamp, a 2 s burst mask and a settle instant. `on_bare_reset(slot, recent_dials, now)` fails at once for the probed slot, for an out-of-range slot (fail closed) and when `recent_dials & !closer & !burst` is non-zero; otherwise it notes the slot. A sibling heals at its own `DialSucceeded`; `poll` fails a suspect older than 120 s, holds a pass while any suspect or settle time remains, and fails a window still unsettled 120 s after its watch would have ended. `recent_dials` comes from a static `[AtomicU64; 32]` of per-slot BeginDial instants (one Release store per dial), scanned O(32) only on a no-code close while an episode is engaged. The probed socket's idle watchdog fails its window. Verified: the change is confined to cold supervisor arms; the frame path is untouched.
+52a review fixes: notes are taken only until `OVERFLOW_PROBE_NOTE_CUTOFF_SECS` (watch + heal deadline = 240 s after the first frame); the deferral cap `OVERFLOW_PROBE_DEFERRAL_CAP_SECS` (cutoff + heal deadline + settle = 380 s) covers every note taken in time, so it is a fail-closed safety net with its own label. `overflow_close_route` routes a close (805, no code, other code, ignore); `on_coded_close` restarts the probed socket's watch once (clears its published first-frame flag) and notes a sibling; a sibling's coded close also joins the 2 s burst (`join_burst`, shared with `on_bare_reset`), so a coded closer's immediate redial never corroborates a no-code close from the same incident (Verified by test, bite-checked: without the join the test fails); `on_left` fails the window when the probed socket parks for a reason other than 805 or shutdown. The shell calls `stamp_dial_begin`, `bare_reset_recent_dials`, `published_suspect_mask`, `suspect_bit_in` and `left_reaches_episode`, the same functions the glue tests drive on local tables.
+52a review round 3: `on_coded_close` and the new `on_watched_torn_down` share `watched_went_down`, which joins the burst before restarting the watch (or fails on a second event). The state machine calls `overflow_episode_note_watched_torn_down` (same two-load gate as the idle hook) from the `SubscribeFailed` arm and, after the Live gate, from the `FrameSilenceElapsed` arm for the main feed only. Cold arms only; the frame path is untouched (Verified by `test_overflow_attribution_call_sites_are_wired`).
+52a review round 4: `OverflowEpisode` gains `granted_at` (set in `start_watch`, cleared on pass and fail, untouched by `watched_went_down`); `poll` reads `window_overrun` (O(1)) and fails `failed_deferral_exhausted` once the grant is `OVERFLOW_PROBE_WINDOW_MAX_SECS` (740 s, derived: 120 + 380 + 120 + 120) old, unless that poll passes the window, so the true bound is 740 s from the grant plus one one-second poll; with no restart a window still ends by 500 s. `connection.rs::dial_failure_label` maps `tungstenite::Error::Http` (any non-101 answer, Verified in tungstenite 0.29 `handshake/client.rs`) to `upgrade_refused`; the connection task's DialFailed arm passes the reason to `overflow_note_dial_failed`, which clears `OVERFLOW_DIAL_BEGIN_MS[slot]` (one Release store of 0) for `upgrade_refused`, `no_token`, `tls_config`, `bad_url` and keeps it for `timeout` and `connect`. The supervisor's backoff still never reads the reason.
+52a review round 5: `OverflowEpisode` gains `watched_down` (cleared with the attribution state; read by `unsettled`). The `FrameSilenceElapsed` arm calls `overflow_episode_note_watched_redialling` for a non-main-feed socket (two-load gate, then `on_watched_redialling`); `overflow_episode_note_dial_succeeded` also takes the lock for the socket under watch and runs `OverflowEpisodes::on_dialled` (`on_watched_dialled`, which clears the mark and sets the settle time, then `on_sibling_dialled`). The shell's Dial arm stores `overflow_note_dial_begin` again between the permit gate and `socket.connect()`. Cold arms only; the frame path is untouched.
+52a review round 6: `past_note_cutoff` also reads `granted_at`: past `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` (600 s from the grant) a sibling close fails the window instead of being noted. One compare per sibling close, O(1).
+52a review round 7: `OverflowEpisode::failed_since_pass` (one bool) is set by `fail` and cleared only by a pass; while it is set, a wait that finds nothing parked keeps the episode `Waiting` instead of `Recovered`.
+52a review round 8: `OverflowEpisode` gains `reparking_mask` (a `u32`) and `reparking_until`: `fail` marks the failed slot (unless the episode ends for the session), `holds_turn` reads `parked_mask | reparking_mask`, and the mark clears at the slot's park, when it leaves, or `OVERFLOW_PROBE_REPARK_HOLD_SECS` (120 s) after the failure. BeginDial keeps the slot's previous stamp in `OVERFLOW_DIAL_PRIOR_MS` (one load and two stores per BeginDial; `stamp_dial_attempt`), the pre-connect re-stamp (`overflow_note_dial_connect`) does not move it, and a refused dial restores it (`note_dial_failed_in`).
+52a review round 9: `OVERFLOW_PROBE_WINDOW_MAX_SECS` = 743 s (adds `OVERFLOW_PROBE_POLL_SLACK_SECS` = 3 × `IDLE_POLL_INTERVAL`); `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` = 743 − 3 − 120 − 20 = 600 s. `on_sibling_dialled` checks the sibling's `suspect_since` against the heal deadline before healing (one compare). `left_reaches_episode` takes the `OVERFLOW_REPARK` register and lets a slot with a pending re-park through for any reason (one more Acquire load per non-805 park). `OverflowEpisode` gains `held_reported` (one bool): the Waiting poll that finds nothing parked with `failed_since_pass` set reports `held_after_failed_window` once; `on_parked` and a pass clear it. `OVERFLOW_WATCHED_FIRST_FRAME` becomes an `AtomicU8` holding the reporting slot (`u8::MAX` = none), and `overflow_episode_poll` stamps only when it equals `eps.watched()`.
+**⚠ CORRECTED 2026-10-06 (review round 9) — two lines above state bounds the code no longer has.** (1) The first 52a paragraph says `poll` "fails a window still unsettled 120 s after its watch would have ended": that is the first draft's 240 s cap, withdrawn in the review-fix round. The cap is `OVERFLOW_PROBE_DEFERRAL_CAP_SECS` = 380 s from the LATEST first frame (cutoff 240 + heal 120 + settle 20), and the window is also bounded at `OVERFLOW_PROBE_WINDOW_MAX_SECS` from the grant (740 s in round 4, 743 s since round 9). (2) The round-4 paragraph says `overflow_note_dial_failed` "clears `OVERFLOW_DIAL_BEGIN_MS[slot]` (one Release store of 0)": since round 8 a refused dial (`upgrade_refused`, `no_token`, `tls_config`, `bad_url`) puts back the stamp kept at its BeginDial (`OVERFLOW_DIAL_PRIOR_MS`), which can be non-zero, so an earlier timed-out attempt keeps its eviction evidence. Left in place per house convention; this note supersedes both.
+**⚠ CORRECTED 2026-10-06 (review round 10) — the 743 s figure two lines above is WITHDRAWN.** `OVERFLOW_PROBE_WINDOW_MAX_SECS` = 740 s (no poll slack; `OVERFLOW_PROBE_POLL_SLACK_SECS` no longer exists) and `OVERFLOW_PROBE_GRANT_NOTE_CUTOFF_SECS` = 740 − 120 − 20 = 600 s. Raising the bound needs a fresh dated owner quote under the scope lock's round-4 REJECT row; round 9 recorded none.
+52d (808): `DisconnectClass::AuthRejected` (808 only); the arm starts an `AuthRejectEpisode` (`Copy`: start instant, hard-failure count, verified generation, last-progress instant), checks the per-window ring (`[Option<Instant>; 4]` plus a `u8` cursor), the hard-failure cap and the bound of 300 s since the last progress (episode start or last fresh token), else returns `RefreshTokenThenDial` with `token_floor_delay` (shared with 807/809). The shell asks `token_refresh_request()` (skip if the dialled generation is already verified), runs the closure (`FnMut(TokenRefreshRequest) -> Future<Output = TokenRefreshReport>`), and feeds `note_token_refresh`, which parks when the presented generation is the verified one and on `Fresh` moves the last-progress instant and records the refresh in the ring (only a refresh that produced a new generation is charged to the ceiling; review round 1 moved the write there from the arm, where every deferral was charged and parked a slot after about 20 s). The episode ends in `enter_backoff` for a non-808 reason after frames, in the arm after `MIN_HEALTHY_SESSION_MS` of health, and in `park()`. The production closure renews through `force_renewal_unless_replaced(dialled)` and reports `Fresh` only when `renew_generation()` moved; `is_deferred_renewal_failure` separates cooldown and lock refusals and a reused result; a failed or deferred renewal result is shared for 10 s (`RENEW_FAILURE_REUSE_MS`), its reason stored through `capture_rest_error_body`, and a reuse hit is reported with `RENEW_FAILURE_REUSED_REASON_PREFIX` so it classifies as Deferred (one real failure is one strike). O(1) and allocation-free on the disconnect and refresh paths; the frame arm is unchanged.
+52g/52h (2026-10-10): per-kind frame-silence thresholds, fault redials only. `pool_supervisor.rs` keeps `FRAME_SILENCE_REDIAL_SECS` (300 s) as the UNCONFIRMED fallback for the main feed and depth-20 and adds a pure `silence_redial_basis` (Unconfirmed / SiblingConfirmed / CrossFeed / Backstop): main 60 s and depth-20 90 s when at least `MIN_LIVE_SIBLINGS` (2) other sockets of the same kind delivered within 10 s (`live_siblings`, an O(32) scan over a cache-line-padded `SLOT_LAST_FRAME_WALL_MS` register the read task writes at most once a second), only inside 09:15–15:15 IST (`FrameSilenceGate::confirmed_window_open_at`), only with no overflow episode and no 805, above an instrument floor, with a per-kind pool-wide 15 s spacing CAS and per-socket escalation (every silence redial adds a strike that doubles the next fast threshold, reset after 900 s with no silence redial). Depth-200 gets a 900 s backstop instead of 300 s, plus a cross-feed check in the drain's 30 s silence arm (`LiveIngest::check_depth200_cross_feed`): the held contract (`DEPTH200_HELD`, published at every held-set change) traded on the main feed (`TickGapDetector::last_trade_millis`) at least 30 s after the socket's last read-task frame and 90 s have passed, so the drain requests a redial tagged with the dial generation (`request_data_silence_redial` / `take_data_silence_redial`), taken on the connection's one-second idle arm and refused after an 805; the check runs only inside 09:15–15:15 IST, a cooldown or still-pending refusal leaves the silent stretch open for the next scan, and a socket in backoff clears its held register. `[dhan_universe] frame_silence_fast_path` (Off / Shadow / Act, default Shadow) gates every fast path; shadow counts only.
+### Edge Cases
+52a: two separate blips in one window (each heals, no foreign dial in 20 s: pass); a flapping sibling (its own dial never corroborates its own close); a burst of closes within 2 s (one event; members' redials do not corroborate each other); the evicted socket's close processed before the evicting dial completes (BeginDial, not DialSucceeded, is the stamp); a blip then an 805, an 805 then a blip, and both on the watched socket (exactly one failure, one repark); slot 40 (fails closed); a depth window deferred while main sockets wait (main never grants: one window process-wide). Assumed: Dhan evicts at accept time, within the 15 s dial timeout of our dial.
+52a review fixes: a sibling healing inside its own deadline at F+225 passes at F+245 (the old F+240 cap failed it); a sibling dropping at F+215 while the pass is deferred keeps its own deadline (F+335); a note 1 ms before the cutoff healed 1 ms before its deadline still passes before the cap; the probed socket closing with 807 (watch restarts, needs a fresh first frame), twice (fails), with 808 (restart, then the park fails it), and with no fresh frame in time (fails as no frame), in Probing and Resuming; a sibling closing with a code (noted, must heal); a shutdown park of the probed socket (does not fail).
+52a review round 3: 800 on the probed socket then a sibling bare reset 375 ms later with the probed socket's dial stamped (noted, not failed); the reverse order and a third close inside the burst (noted); the same outside the burst (fails, corroborated); a teardown after the first frame and a poll past the OLD watch end (no pass), then no fresh frame in time (fails as no frame); a teardown then a coded close (fails); a sibling's teardown and no window running (no effect).
+52a review round 4: grant, first frame at +119 s, a deferral to +494 s, an 807 there, a fresh first frame at +613 s and a new deferral (fails at +740 s; ran to about +993 s before); a restart at +499 s whose watch ends at +739 s (passes, even on the poll at the bound); a depth-20 slot refused every 10 s, then a sibling close 5 s after its last refusal (noted, not corroborated); a dial that times out or fails with `connect`, then a sibling close 20 s after its BeginDial (corroborated); `no_token` / `tls_config` / `bad_url` (stamp dropped); slot 40 (ignored).
+52a review round 5: depth probe first frame F, sibling noted at F+200, probe frame silence at F+300, sibling healed at F+310: no pass at F+330; with no dial, `failed_deferral_exhausted` at F+380; with a dial at F+340, a pass at F+360 and not before; a sibling's or an idle episode's redialling note is ignored.
+52a review round 6: a note at G+599 after a restart heals at the last instant of its deadline and the window passes before the bound; notes at G+600, G+601 and G+689 (still inside the post-restart 240 s cutoff) fail at once.
+52a review round 7: the probed socket is the only one parked and parks for 808 in its window; a failed release whose socket left; a failure by no first frame whose socket never re-parks; a depth-only 805 with no window ever failed (still ends silently); closers at global index 8 and up.
+52a review round 8: a main window fails in another socket's step and depth's wait has run out (no depth grant until the re-park, the leave or the 120 s hold); a refused retry after a timed-out dial (the timeout's stamp is kept).
+52a review round 9: a restarted window whose fresh first frame is stamped by a late poll (G+621.5) and whose watch ends at G+741.5 (passes; failed at G+740.5 before); a noted sibling whose dial completes 0 ms, 500 ms and 5 s past its deadline with no poll in between (fails), and 1 ms inside it (heals); the probed socket's 807 (restart) then 808 (fails the window in the close's step), then its park for 808, 804 or shutdown (each reaches the episodes and gives the turn up at once); the held state reported once, then silent, re-armed by a park.
+52a review round 10 (2026-10-06): CORRECTED — with the bound back at 740 s that late-stamp case (first frame stamped at G+621.5) FAILS at G+740.5; it is a recorded honest limit, not a pass.
+52d (808): a stacked `[data][808]` frame (the episode survives, since frames never clear it); a sibling installing a newer token between refreshes (a new generation is a new strike, never a park); a refresh deferred by the mint cooldown or RESILIENCE-03, at the real 5 s redial cadence (counts toward neither the hard-failure cap nor the per-window ceiling; it parks through the bound of 300 s without a fresh token); one fresh token, then a sibling moves the token on so every later refresh defers (still parks 300 s after that fresh token; review round 2); an outage longer than 300 s with only failed dials, and 808s alternating with failed dials, bare resets or 807s (past the bound an 808 parks at once if its redial began with a refresh, otherwise it takes one grace refresh and the next 808 past the bound parks whatever came between; review rounds 3 and 4); a failure reused from another socket within 10 s (Deferred, not a second strike); an 805 park and probe release in the middle of an episode (the park clears it); a healthy session of at least `MIN_HEALTHY_SESSION_MS` before the next 808 (new episode); a stop requested during the backoff (no refresh, no park decision); 807 and 809 outside an episode (`note_token_refresh` returns nothing). A generation recorded one install older than the presented token verifies the rejected generation, so a second rejection of that same token parks: one extra refresh lost, never a wrong park of a token that was accepted.
+52g/52h (2026-10-10): main socket silent 59 s with two live siblings (no redial), 60 s (fast redial in act, one would-redial count in shadow), 300 s (the old fallback whatever the evidence); one live sibling only (never confirms); a sibling stamp 11 s old or more than 5 s in the future (does not count); a sibling of another kind (does not count); the socket's own slot (excluded); 999 main instruments or 19 depth-20 (fallback); two main sockets eligible inside 15 s (the second loses the spacing CAS and waits); a deaf socket that bursts one frame after every dial (escalates 60 → 120 → 240 → 300; strikes reset only after 900 s with no silence redial); 09:14:59 and 15:15:00 (window shut), 09:15:00 and 15:14:59 (open); an overflow episode engaged or an 805 (fast paths off, fallback only); depth-200 silent 300 s and 899 s (no redial), 900 s (backstop); a cross-feed request raised before a redial (dropped as stale at the take), within 300 s of the last (cooling down), after an 805 (refused, path `data_silence`); a swap to a new depth-200 contract (baseline restarts at the swap); a depth shed while the read task keeps receiving (no cross-feed request: the baseline is the read-task stamp); an untracked contract (no evidence, backstop only); two segments sharing a security id (kept apart by the composite key).
+### Failure Modes
+52a: a foreign process's dial is invisible (Risk), so a single foreign eviction whose victim reconnects reads as a blip and the window can pass; the next 805 or corroborated close still fails it. Any of our sockets dialling within 20 s before an unrelated blip fails the window (errs toward fail). A box-wide network blip that also drops the probed socket still fails. A sibling that never reconnects, or keeps flapping, fails the window at its 120 s deadline or the deferral cap; a probe is never refunded.
+52a review fixes: a sibling dropping after the note cutoff (watch + 120 s after the first frame) while the pass is still deferred fails the window (`failed_deferral_exhausted`), so a flapping sibling cannot hold the one process-wide window; the pass is deferred at most 380 s after the latest first frame (Verified by `proptest_attribution_rules`; ⚠ CORRECTED in round 4: not the window's length, which is bounded at 740 s from the grant). The probed socket gets ONE watch restart per window: a second coded close (for example two 807s in a row while the token refresh lags) fails it and spends the probe (Risk, accepted: errs toward fail). A coded sibling close that does not heal in 120 s (a token refresh failing for two minutes) fails the window.
+52a review round 3: the one watch restart is shared between coded closes and our own teardowns, so a token-expiry close plus a failed subscribe in one window fails it (Risk, accepted: errs toward fail). The operator-armed probe close never runs in a window (refused once `ROTATION_HALTED` is set, which every window's 805 sets; Verified in source).
+52a review round 4: a refused dial still counts from its BeginDial until the refusal (at most the 15 s dial timeout); a timeout or `connect` loop still corroborates for 20 s (errs toward fail); a restart in the last seconds of a window's 500 s can leave its fresh watch ending just past 740 s, which then fails rather than passes (errs toward fail). Corrects the round-1 claim "the window lasts at most 380 s after its first frame": that was the deferral from the LATEST first frame, not the window.
+52a review round 5: the probed depth socket's frame-silence redial does not join the burst, so its own dial corroborates a sibling's no-code close within 20 s (errs toward fail); a probed depth socket whose redials keep failing holds the window until the deferral cap (errs toward fail).
+52a review round 6: a sibling drop between 600 s from the grant and the 240 s cutoff from a post-restart first frame fails the window at once, where before it was noted and could pass if it healed quickly. It costs a probe sooner and only after a restart (errs toward fail).
+52a review round 7: after a failed window whose socket left for good (a non-805 park ends its task), the episode stays `Waiting` and the main-feed widen stays refused for the rest of the session unless another 805 parks a socket of that pool and its probe passes. A main-feed widen is lost for the day; no running socket is touched (errs toward refusing).
+52a review round 8: a failed socket that reaches its next tick or dial more than 120 s after the failure gives the turn up before it re-parks (Assumed rare). The round-8 limit "a failed socket that parks for a non-805 reason without reaching the episodes keeps the turn until the 120 s hold runs out" is narrowed by round 9 to a socket that neither re-parks nor leaves.
+52a review round 9: a poll delayed by more than the 3 s slack can still fail a restarted window at the bound (errs toward fail). The 380 s deferral cap is unreachable for SIBLING notes only: the probed depth socket's own frame-silence redial has no note cutoff and no heal deadline, so the cap can fail a window while that redial runs or only its 20 s settle is left (errs toward fail). A heal that lands past its deadline now fails the window where before it passed (errs toward fail, which is the documented rule). A stale first-frame store landing after the newly granted socket's own would hide that frame and fail the window (cannot happen in practice: the new socket must dial first).
+52a review round 10 (2026-10-06): CORRECTED — there is no 3 s slack any more. The bound is 740 s, so a poll late by ANY amount at one of the poll-stamped instants can fail a restarted window at the bound (errs toward fail; it uses up one probe).
+52d (808): one socket's spurious 808 renews the account token, and if RenewToken invalidates the token the other sockets hold, they each get 807 and reconnect (Risk, Assumed; 809 has the same single-socket exposure today). Bounded to one renewal per generation by the single-flight gate, one per 10 s while renewals fail or are deferred (the result is shared across sockets), and four fresh-token refreshes per 300 s per slot. A genuinely wrong client id reported as 808 costs at most 1 + 3 dials, or up to 300 s of floored, damped, jittered redials without a fresh token (counted from the last fresh token, if there was one), then today's park and page. A rejection at the HTTP upgrade (`DialFailed`) does not refresh (out of scope, unchanged). A token accepted and then rejected within `MIN_HEALTHY_SESSION_MS` with no other close in between parks if it is the verified generation (Limitation, rare). Residual risk, recorded and NOT fixed here (pre-existing for 807/809): a spurious 808 soon after process start can reach `acquire_token`, because `mint_cooldown_allows(None)` is true, so the box mints a token that replaces the Lambda-minted one; RenewToken itself is not rate-limited beyond the per-slot caps above (Risk, Verified in source).
+52g/52h (2026-10-10): a false fast redial (Assumed rare: 2 live siblings, a held floor, 15 s spacing, escalation and shadow first) costs the prints in the ~2 s blind window of a genuine reconnect on up to 5,000 instruments; every dial into a full account risks an 805, so the fast paths are off during an overflow episode and after any 805. Pools with 2 or fewer sockets of a kind never confirm and stay at 300 s. A deaf depth-200 socket whose contract the main feed does not track now waits 900 s instead of 300 s (Risk, accepted: the measured 56-minute benign silence made 300 s a false-redial generator). If Dhan conflates depth-200 frames on trades, the cross-feed path could redial a healthy socket; bounded by 90 s, the 30 s lead, the 300 s cooldown and shadow mode. A clock step forward makes sibling stamps look old (fails toward the fallback); one backward makes them look future (more than 5 s ahead does not count).
+### Test Plan
+52a: `CARGO_INCREMENTAL=0 cargo test -p tickvault-core --lib overflow` and `--lib pool_supervisor`; the scope-lock guards (`tick_gap_reset_wiring_guard`, `top_volume_stock_only_guard`, `instance_type_lock_guard`); `cargo test -p tickvault-common --test claude_md_codebase_map_guard`; banned-pattern, pub-fn-test, pub-fn-wiring, plan-gate and per-item-guarantee hooks.
+52a review fixes: the same scoped commands; each fix bite-checked (old cap, a dropped `* 1_000`, a watched park that does not fail: 7 tests fail, restored: all pass).
+52a review round 3: the same scoped commands; bite-checked (without the burst join and the `SubscribeFailed` hook, three tests fail: the two new ones and the wiring pin); `proptest_attribution_rules` gains the teardown op and asserts no burst member's dial corroborates.
+52a review round 4: the same scoped commands plus `proptest_window_bound_holds_from_the_grant_across_restarts` (after every one-second poll a running window is younger than 740 s from its grant; a restart never moves the grant), `proptest_attribution_rules` (the same bound after every poll, and `granted_at` unchanged across `watched_restarted`), `test_a_refused_dial_loop_never_corroborates_a_sibling_close`, `test_a_timed_out_dial_still_corroborates_a_sibling_close`, `test_the_dial_failed_arm_feeds_the_eviction_stamp`, `connection::tests::test_dial_failure_label_separates_a_refused_upgrade`. Bite-checked against the pre-fix code: bound disabled, stamp clear disabled and label forced to `connect` (four tests fail), wiring removed (the wiring pin fails); restored, all pass.
+52a review round 5: `test_depth_frame_silence_holds_the_pass_until_the_watched_socket_redials` (fails with `watched_down` removed from `unsettled`: ProbePassed at F+330) and `test_overflow_attribution_call_sites_are_wired` (fails with the depth hook or the pre-connect stamp removed), each bite-checked.
+52a review round 6: `test_no_sibling_is_noted_past_the_grant_cutoff_after_a_restart` (fails without the grant cutoff), `test_a_note_just_inside_the_grant_cutoff_is_honoured_by_the_bound`, and `test_attribution_generator_reaches_the_probed_socket_down` (a seeded run of the proptest generator; fails if `watched_down` is never reached on a running window or such a window never passes). `proptest_window_bound_holds_from_the_grant_across_restarts` also generates the probed socket going down after its restart.
+52a review round 7: `test_a_failed_window_whose_socket_left_never_recovers_silently`, `test_only_an_episode_with_no_failed_window_recovers_with_nothing_parked`, `test_high_slot_closers_follow_the_same_attribution_rules`, and the expected-outcome checks in `proptest_attribution_rules`; each bite-checked.
+52a review round 8: `test_depth_cannot_take_the_turn_while_a_failed_main_socket_reparks` and `test_a_refused_retry_keeps_an_earlier_timed_out_dial_as_evidence`; each bite-checked.
+52a review round 9: the same scoped commands (`cargo test -p tickvault-core --lib -- pool_supervisor websocket::connection`, clippy, fmt, the three common guards, plan-verify, plan-gate). New: `test_a_failed_probe_that_leaves_for_good_reaches_the_episode_through_its_repark` (drives the production gate `left_reaches_episode` with the shell's re-park register), `test_a_heal_past_its_deadline_fails_without_waiting_for_a_poll`; rewritten: `test_a_window_that_settles_at_its_bound_still_passes` (one-second polls, a late stamping poll, pass at G+741.5); changed: `test_a_failed_window_whose_socket_left_never_recovers_silently` (one held report), `test_pass_deferral_is_capped` (its sibling now heals inside its deadline), `proptest_attribution_rules` (a heal outcome only inside the deadline, an unhealed outcome from a heal only past it, the held report only on a poll and once). Bite-checked: slack 0, the re-park clause removed, the heal deadline check removed, the held branch removed: each fails its test (and the proptest for the heal).
+52a review round 10 (2026-10-06): `test_a_window_that_settles_at_its_bound_still_passes` is now the on-time pass at G+740; new `test_a_late_poll_can_fail_a_restarted_window_at_its_bound` (a late stamping poll fails at G+740.5) and `test_regression_stale_first_frame_from_previous_window_never_stamps_the_new_one` (a stale first-frame store from the previous window never stamps the new one).
+52d (808): `cargo test -p tickvault-core --lib pool_supervisor` and `--lib token_manager`, `cargo test -p tickvault-app --lib dhan_feed_stack::tests::stale_credential_refresh_renews_against_the_dialled_generation`, the scope-lock and noise-lock guards in `crates/common/tests`, clippy and fmt, plus the hooks. Unit tests drive the state machine (first 808, verified-generation park, new generation is a new strike, hard-failure cap, deferrals bounded at 300 s without a fresh token at 100 s and at the real 5 s cadence, and after one fresh token, a reused failure that is not a second strike, stacked frame plus 808, a healthy session ending the episode, a non-808 close ending it, an 805 park ending it, the per-window ceiling, 807 and 809 unchanged, `ROTATION_HALTED` untouched, sixteen-socket fan-out); paused-clock shell tests drive `run_connection` with a counting refresh closure; one proptest bounds refreshes per window and checks nothing dials after a park; source pins hold the refresh-arm order, the shared delay helper and the untouched frame arm. No new DHAT test: no frame or tick path changed.
+52g/52h (2026-10-10): `CARGO_INCREMENTAL=0 cargo test -p tickvault-core --lib pool_supervisor` and `--lib tick_gap_detector`; `cargo test -p tickvault-core --test dhat_frame_silence_activity`; `cargo test -p tickvault-app --lib cross_feed`; the config-default tests in tickvault-common; `cargo test -p tickvault-common --test claude_md_codebase_map_guard`; banned-pattern, pub-fn-test, plan-gate hooks. The existing Depth200 watchdog test moves to MainFeed with evidence off (300 s) and a new Depth200 test pins the 900 s backstop.
+### Rollback
+52a: revert the commit. No schema, data, config or infrastructure change; the episodes go back to failing on any no-code close.
+52a review fixes: revert with the 52a commits; no data or config change.
+52a review round 3: revert its commit; no data or config change.
+52a review round 4: revert its commit; no data or config change. The `upgrade_refused` label reverts to `connect`.
+52a review round 5: revert its commit; no data or config change.
+52a review round 6: revert its commit; no data or config change.
+52a review round 7: revert its commit; no data or config change.
+52a review round 8: revert its commit; no data or config change.
+52a review round 9: revert its commit; no data or config change. The bound goes back to 740 s and the `held_after_failed_window` label stops being emitted (its series stays at whatever it counted).
+52a review round 10 (2026-10-06): reverting round 10 puts the 743 s bound back, which the round-4 REJECT row forbids without a fresh dated owner quote recorded first; revert the whole PR instead.
+52d (808): revert the PR. No schema, data or config change; an 808 goes back to parking on the first strike, and the reworded descriptions and page body go back to their old text.
+52g/52h (2026-10-10): set `[dhan_universe] frame_silence_fast_path = "off"` (exactly the old main-feed and depth-20 timing; the cross-feed check stops too), or revert the PR, which also restores the 300 s depth-200 redial. No schema, data or infrastructure change.
+### Observability
+52a: five new outcome labels on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (`sibling_reset_noted`, `sibling_healed`, `failed_eviction_corroborated`, `failed_sibling_unhealed`, `failed_watched_silent`); the two notes log a coded `warn!`, the failures a coded `error!`, both with `sibling_connection`. Prometheus only: no page, alarm, EMF name or Telegram change.
+52a review fixes: three more labels on the same two counters: `watched_restarted` (a note, coded `warn!`), `failed_watched_closed` and `failed_deferral_exhausted` (coded `error!`). Prometheus only: no page, alarm, EMF name or Telegram change.
+52a review round 3: no new label; the teardown reuses `watched_restarted` / `failed_watched_closed`, whose plain-words text now names it. Prometheus only: no page, alarm, EMF name or Telegram change.
+52a review round 4: no new outcome label (the bound reuses `failed_deferral_exhausted`); one new `reason` value `upgrade_refused` on the existing `tv_dhan_ws_dial_failed_total` counter (seeded at 0) and in `ws_event_audit.reason`. The EMF processor folds that label into the existing per-host series, so no new CloudWatch series (Assumed from the counter's documented folding). No page, alarm, filter or Telegram change.
+52a review round 5: no new label, counter, page, alarm or filter; a held window ends as `failed_deferral_exhausted` like any deferral.
+52a review round 6: no new label, counter, page, alarm or filter; a note refused past the grant cutoff ends as `failed_deferral_exhausted`.
+52a review round 7: no new label, counter, page, alarm or filter; the failure that leads to the held state is already logged once.
+52a review round 8: no new label, counter, page, alarm or filter.
+52a review round 9: one new outcome label, `held_after_failed_window`, on the existing `tv_dhan_ws_overflow_probe_total` / `tv_dhan_ws_depth_overflow_probe_total` counters (a note, coded `warn!` with `WS-GAP-01`, at most once per held state). The note lines now read "... after an 805: <detail>". A late heal reuses `failed_sibling_unhealed`. Prometheus only: no page, alarm, EMF name, filter or Telegram change.
+52a review round 10 (2026-10-06): no change; the poll slack constant is gone, so nothing new is published.
+52d (808): one new `reason` value `auth_rejected` on the existing `tv_dhan_ws_reconnect_total` (zero-registered at boot by the existing loop over `ReconnectReason::ALL`); the terminal park reuses `tv_dhan_ws_parked_total{reason="fatal_disconnect"}` and the existing `dhan-socket-parked` page; one new Prometheus counter `tv_token_renew_failure_reused_total` (not EMF-selected; counts reused failures and reused deferrals). Four coded `error!` stages under `WS-GAP-01` (`refresh_then_redial`, `parked_fresh_token_rejected`, `parked_refresh_unavailable`, `parked_refresh_ceiling`). No new alarm, page, EMF name or filter (noise-lock §2.12); two alarm descriptions reworded only.
+52g/52h (2026-10-10): four local `/metrics` series, seeded at 0, in no EMF selector and on no alarm: `tv_dhan_ws_frame_silence_redial_total{endpoint,basis}`, `tv_dhan_ws_frame_silence_would_redial_total{endpoint,basis}` (shadow count, once per silent episode), `tv_dhan_ws_data_silence_request_stale_total` (a cross-feed request dropped because the socket redialled before it was taken) and `tv_dhan_ws_conn_frame_gap_max_secs{connection}` (peak inter-frame gap inside 09:15–15:15, reset at 09:15). The existing `WS-GAP-03` frame-silence `warn!` gains `basis`, `threshold_secs` and `strikes`; the shadow count logs one `info!` (`source = "frame_silence_shadow"`); a cross-feed request logs a coded `warn!` (`source = "depth200_cross_feed"`); a refused request after an 805 counts on `tv_depth_dial_refused_after_805_total{path="data_silence"}`. No page, alarm, filter or Telegram change (noise lock §2.13).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 53 — ONE-TIME S3 DELETE OF THE PRE-9-OCT COPIES (Quote 29e, added 2026-10-09)
+
+Authority: Quote 29e in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` (owner tapped "One-time permission", 2026-10-09 21:52 IST).
+
+- [x] 53a — one-off role, Rust delete tool and dispatch workflow (crates/app, tickvault-app).
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs (the role file, the workflow, the tool and its tests were deleted by 53b after the run)
+  - Tests: (deleted with the tool by 53b; the run record is the ENDED note under Quote 29e)
+- [x] 53b — after the run: delete the role, workflow and tool; mark Quote 29e ENDED. Apply run 2026-10-10: 1,304 versions (109.10 GB) deleted, 0 left in scope, 214 later versions kept.
+  - Files: crates/app/Cargo.toml, crates/app/src/lib.rs, docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md, .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md
+  - Tests: (removal only; terraform plan in CI shows the role destroyed)
+
+### Design (Item 53)
+The tool lists every version and delete marker under 19 exact prefixes (17 market-data tables under `questdb-partitions/`, plus `raw-frames/` and `seal-spill/`), classifies each key by the date it starts with, and deletes only versions dated before 2026-10-09 by version id, 1,000 per DeleteObjects call. The role can list only those prefixes and delete only versions (never `s3:DeleteObject`, so no delete marker), and is denied today's keys, `deploys/`, `sebi-preserve/` and bucket settings. Code and IAM grant are held in lockstep by a test that reads the terraform file.
+
+### Edge Cases (Item 53)
+A key from any year but 2026, a nested path, or an unparsable date is kept and listed. A null version id is deleted as "null". A truncated listing with no next marker fails the run.
+
+### Failure Modes (Item 53)
+A refused delete is listed per key and fails the job; the verify listing fails the job if anything in scope remains. A run past 2026-10-16, an apply between 09:00 and 15:45 IST, an apply without the confirm word or without a prior successful dry run, or a run during a deploy is refused before any AWS call.
+
+### Test Plan (Item 53)
+Unit tests for classification, plan totals, refusal rules, report cap and the tf/code lockstep; binary tests for flag parsing and refusals. The dry run on the real bucket is the end-to-end check before apply.
+
+### Rollback (Item 53)
+Nothing is deleted until apply. Deleted versions cannot be restored; that is the owner's stated intent. The role is removed by 53b.
+
+### Observability (Item 53)
+The job summary and an uploaded artifact carry the per-group report before and after the delete, including every kept-unparsed key (up to 50).
+
+## ITEM 54 — Clean shutdown: no runtime drop at exit, and a lane that stops during WAL recovery (added 2026-10-10)
+
+Authority: the owner's 2026-10-10 ask to fix everything ("make everything to work and finish and fix and resolve everything"), relayed by the coordinator with the brief "fix the unclean shutdown, zero tick loss". Evidence from CloudWatch `/tickvault/prod/app`: 6 Oct 15:46:51 IST "PANIC: tickvault crashed" ("A Tokio 1.x context was found, but it is being shutdown", 20 ms after "tickvault stopped"); 9 Oct 22:41 and 10 Oct 02:17 IST "frame drain DIED (task cancelled)" about 85 s after "tickvault stopped".
+
+- [x] 54a — `main` leaks the runtime after `block_on` instead of dropping it; the lane checks for a stop before the boot refold, before each catch-up round and each lag-pause step, ends replay pacing on a stop, and closes its writers without spawning the drain or dialling when a stop arrived first (crates/app, tickvault-app).
+  - Files: crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs, crates/app/tests/shutdown_runtime_not_dropped_guard.rs
+  - Tests: main_leaks_the_runtime_after_block_on_and_never_drops_it, a_blocking_timer_fails_after_a_dropped_runtime_and_works_after_a_leaked_one, close_lane_before_dial_mirrors_the_drain_shutdown_tail, the_lane_never_spawns_the_drain_after_a_shutdown, the_boot_recovery_checks_for_a_shutdown_at_every_safe_boundary, close_lane_before_dial_hands_off_the_tail_and_joins_the_writer
+
+### Design (Item 54)
+Two causes, two fixes. (1) Dropping the tokio runtime at the end of `main` shuts the time and IO drivers down while blocking-pool threads may still wait on a timer through `Handle::block_on` (the tick spill replay round), which panics and, under `panic = "abort"`, dumps core; and it waits without bound for a worker stuck in synchronous work. `main` now leaks the runtime: every durable tier was already drained by the shutdown sequence, and work still running is crash-safe by design. (2) The lane read the stop only during its token wait and inside the drain, so a stop during the boot WAL refold or the catch-up drain ran both to the end and then spawned the drain into a dying runtime. The lane now reads `SOCKET_STOP` (requested first by `main`, never cleared, one atomic load) at safe boundaries only: it never interrupts a refold batch mid-way, because a half-folded batch would seal partial candles.
+
+### Edge Cases (Item 54)
+Stop before the boot refold: nothing is folded, staged segments stay in `replaying/` and the next boot re-offers them (same as the token-wait stop). Stop during a refold batch: the batch finishes unpaced; rows a full queue cannot take are rescued to the spill tier or marked unapplied in the WAL, exactly as an unpaced in-session replay does. Stop during a lag pause: noticed within one 5 s poll step. Stop after the catch-up but before the dial: the drain's own shutdown tail runs on a drain that saw no frames, then the lane returns; the lane-running flag was never set and the up-gauge never rose.
+
+### Failure Modes (Item 54)
+A refold batch or ack wait longer than `main`'s 30 s lane budget still logs the existing shutdown-timeout ERROR, and the process then exits with the lane mid-work: unconfirmed segments are re-read next boot (DEDUP makes the re-fold idempotent). Log lines written in the last moment before exit may not reach the log file, because the logging guards were already leaked for the process lifetime; this is unchanged from before. A stop between catch-up rounds ends the replay on a gap, so the candles still open at that point are withheld and counted on `tv_candle_refold_partial_suppressed_total` rather than written short (the raw ticks stay in `ticks` and the WAL); before this change the lane was cancelled there with no seal and nothing counted.
+
+### Test Plan (Item 54)
+A real-runtime bite test shows a blocking thread's timer failing after a dropped runtime and working after a leaked one. Source guards pin the leak in `main`, the stop checks at each boundary, the no-spawn-after-stop return, and the shutdown tail order against `run_frame_drain`. A behavioural test runs `close_lane_before_dial` on a lane with an offloaded writer and a buffered tick.
+
+### Rollback (Item 54)
+Revert the PR. No config, schema, table or alarm changes.
+
+### Observability (Item 54)
+New info lines: "shutdown arrived before the WAL refold", "shutdown arrived before the sockets were dialled"; the catch-up summary line gains `stop_reason = "shutdown"` and a planned stop is not counted on `tv_wal_catchup_budget_exhausted_total`. No new metric or alarm. Per-item guarantee matrix: see the plan's shared matrix section.
+
+## ITEM 56 — CONTRACT NAMES ON REBUILT ROWS (added 2026-10-10, operator: "Check whether other contracts have the same gaps. Zero tick loss is the rule, so fix and backfill automatically."): rebuilt rows lost their contract name
+
+- [x] Publish every option name (not only spot names) at boot, before the seal writer's boot drain and again before the lane's frame-log replay, from the newest day with a file within 7 days; the attach still owns the table once it publishes
+  - Files: crates/app/src/dhan_contract_universe.rs, crates/app/src/main.rs
+  - Tests: test_regression_option_labels_from_names_every_option_like_the_attach, test_option_labels_from_is_not_capped, test_option_labels_from_an_empty_file_is_empty, test_regression_newest_readable_day_steps_back_to_the_last_built_day, newest_readable_day_stops_at_the_lookback, test_boot_publish_wins_truth_table, day_key_packs_the_date_and_refuses_garbage, publish_contract_labels_at_boot_publishes_nothing_without_an_artifact
+- [x] Restore the blanked names automatically: once a day after the close (15:45 IST onward), for today and the 7 days before it whose contract files are still kept, re-insert every `dhan` row with a NULL `contract` whose `(security_id, segment)` that day's files name, with its name, through the table's own DEDUP key (QuestDB 9.3.5 refuses `UPDATE … FROM` on WAL tables). Candle tables, `ticks`, `feed_aux_packets`; not `market_depth`. A table without DEDUP, or with `contract` in its DEDUP key, is skipped. Each table is checked for a blank row first, so a clean day loads nothing; the day's names go into `contract_name_repair_map`, a scratch table with no WAL, created fresh for each day and dropped after it; a table is written only once QuestDB has applied every write to it and no new write arrived for 30 s. A run with a failure is retried, up to 3 runs a day. Covers 9 Oct from the first after-close run after the deploy.
+  - Files: crates/storage/src/contract_name_repair.rs, crates/storage/src/lib.rs, crates/storage/src/partition_manager.rs, crates/storage/tests/contract_name_repair_live.rs, crates/app/src/contract_name_repair_boot.rs, crates/app/src/dhan_contract_universe.rs, crates/app/src/lib.rs, crates/app/src/main.rs
+  - Tests: test_repair_insert_sql_copies_every_column_and_names_only_blank_dhan_rows, test_repair_insert_sql_refuses_a_table_missing_a_join_column, test_map_insert_sql_escapes_quotes, test_map_insert_sql_batch_stays_under_the_request_buffer, test_map_table_ddl_and_map_drop_sql_build_a_fresh_table_without_wal, test_repair_insert_sql_refuses_a_table_keyed_on_contract, test_table_is_quiet_needs_applied_and_two_equal_polls, test_an_unreachable_database_is_a_failure_not_a_skip, test_name_is_stored_verbatim_refuses_what_the_tick_writer_would_change, test_a_failed_run_is_retried_up_to_the_cap, test_scratch_tables_are_in_no_retention_list, test_count_and_repair_share_one_row_source, test_parse_single_long_reads_a_count, test_parse_table_flags_tells_absent_from_unreadable, test_parse_wal_progress_reads_applied_committed_and_suspended, test_parse_columns_reads_names_and_keys_in_order, test_answer_is_error_spots_a_refusal, test_is_valid_day_accepts_only_iso_dates, test_repair_is_due_only_after_the_close_and_once_a_day, test_repair_days_covers_the_incident_day_from_the_next_deploy, test_repair_tables_include_candles_ticks_and_aux_but_not_depth, contract_names_for_day_is_none_without_that_days_symbol_map, repair_names_blank_rows_in_place_and_leaves_everything_else (ignored; run against a local QuestDB 9.3.5 on 2026-10-10, passed)
+
+## Design (Item 56)
+
+Cause (inferred from the box logs and the code, not yet confirmed by a database query): the 9 Oct evening redeploys replayed the day's frame log and drained the spilled seals while the name table held only the 862 spot names (the boot published spots only; options arrived with the attach about 17 minutes later). Each rewritten option row was written without `contract`, and the DEDUP UPSERT replaced the named row whole, so `WHERE contract = 'ITC-27Oct2026-255-CE'` stopped matching rows that are still there. Fix: `publish_contract_labels_at_boot` adds `option_labels_from` (every OPTIDX/OPTSTK row of the contract file, uncapped, the same label as the attach) and runs twice, first just before `spawn_seal_writer_loop` and again before `spawn_dhan_feed_stack`. `boot_publish_wins` decides a replace: never after the attach, never empty, newer day wins, same day only a larger table. O(rows) once per boot call, cold.
+
+## Edge Cases (Item 56)
+
+Boot after midnight (no file for today) uses the newest earlier day within 7; no file in the window publishes nothing (column stays as it is); a contract file that becomes readable between the two boot calls replaces the smaller table; the attach running later replaces the boot table as before. BSE options and zero ids are skipped, as in the attach. Repair: a day whose files are gone (kept 7 days) is never tried; a day with a symbol map but no contract file names spots only; an id no file names stays NULL; rows of another feed are never touched; a second run finds nothing (the count is 0, no statement runs); a table still being written (WAL not applied, or a new commit between two polls 30 s apart) is not touched and the run is retried; a name the tick writer would store differently (a stripped character) is left out and counted.
+
+## Failure Modes (Item 56)
+
+A derivative id reassigned overnight would carry the newer day's name when an older day's frames are replayed after the newer file exists (the attach has the same limit). An unreadable contract file publishes spot names only, as before. A boot table never overwrites the attach's (the flag is set before the attach publishes; both boot calls run before the lane starts). Repair: a suspended name table, a refused statement or no answer within 600 s leaves the day for the next run and is counted (`tv_contract_name_repair_runs_total{outcome="partial"}`); a table without DEDUP or WAL, or missing one of the five join columns, is skipped and logged, never written (a re-insert there would duplicate rows). A day already copied to the cold bucket keeps blank names in that copy. A writer that starts while a repair statement runs (a boot replay, a spill drain) can have its newer copy replaced by the stored copy the statement read; the 30-minute boot grace and the quiet check narrow this to the length of one statement, it is not closed. If the disk-pressure archive drops a partition while a statement runs, the statement can leave only the repaired rows in it. An unanswered table check counts as a failure, never a skip.
+
+## Test Plan (Item 56)
+
+`cargo test -p tickvault-app --lib -- dhan_contract_universe` (98 passed), `cargo clippy -p tickvault-app --no-deps -- -D warnings -W clippy::perf` clean. Repair: the SQL builders and the schedule are unit-tested; `contract_name_repair_live` (ignored, needs QuestDB) builds a table with a blank row, a named row, an unnamed id, another feed and another day, runs the repair, and checks only the blank row changed, with every value kept, and that a second run is clean (passed on a local QuestDB 9.3.5, 2026-10-10).
+
+## Rollback (Item 56)
+
+Revert the PR: the boot publishes spot names only again and the after-close repair stops. Names the repair already wrote stay (they are the names the rows had before the redeploys); `contract_name_repair_map` is a scratch table and can be dropped.
+
+## Observability (Item 56)
+
+Two `info!` lines at boot (count and the day the names came from); the existing `tv_candle_contract_labels_published` gauge reads the full count from the first boot call instead of 862. Repair: one `info!` per day checked (names, rows restored, tables repaired, clean, skipped, failures) and one per run; counters `tv_contract_name_repair_rows_total` and `tv_contract_name_repair_runs_total{outcome}`, registered at 0 when the task starts. Statement failures are `warn!` (nothing is lost: the rows and their values stay; only the name is still missing). No page, alarm, EMF name or filter.
+
+## ITEM 55 — Late depth writes in fewer, larger commits (WAL apply backlog, 2026-10-10)
+
+Authority: Parthi, relayed 2026-10-10: "Bro make everything to work and finish and fix and resolve everything and merge and deploy everything now dude". The coordinator assigned the `market_depth` WAL apply backlog (about 235,000 transactions and rising) to this thread.
+
+Finding (Verified on a local QuestDB 9.3.5, a 6M-row hour partition with the `market_depth` columns, HOUR partitions, WAL and DEDUP key; paced commits as the after-close pass and the paced replay make them): every commit that adds rows to an hour partition that already holds rows rewrites roughly the whole partition — 464 MB for 1,000 rows, 495 MB for 10,000, 507 MB for 100,000, 0.62 GB for 1,000,000 — against about 1.7 MB for an in-order commit and 18 MB for 20 commits of exact duplicates. So a late batch costs the COUNT of its commits. The WAL replay flushed depth at 10,000 rows AND with every 1,000 tick rows (`LiveIngest::flush` always flushes the depth sink first), and the after-close pass at 10,000 rows.
+
+- [x] 55a — `DEPTH_LATE_FLUSH_BYTES` (16 MiB, half the producer ceiling) and `DepthIngest::late_flush_due`: a level writer flushes late rows by bytes (about 94,000 rows a commit), an array-row writer keeps its 8 MiB trigger.
+  - Files: crates/storage/src/depth_persistence.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: test_late_flush_due_is_late_bytes_for_level_rows_and_the_book_trigger_for_book_rows
+- [x] 55b — the WAL replay flushes depth on `depth_late_flush_due` only; a tick-only trigger calls the new `LiveIngest::flush_ticks`, and the pacer after it neither re-flushes nor waits on the held depth rows.
+  - Files: crates/app/src/dhan_feed_stack.rs
+  - Tests: test_flush_ticks_and_depth_late_flush_due_leave_depth_to_its_own_trigger, the_replay_loop_flushes_on_size_so_one_batch_cannot_build_a_four_gb_buffer, both_replay_passes_are_paced
+- [x] 55c — the after-close deferred pass flushes on `late_flush_due` (still once more at every bucket edge, so no batch spans two buckets).
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs
+  - Tests: the_late_depth_paths_use_the_late_trigger_and_the_live_drain_does_not, after_close_pass_writes_depth_only_and_clears_after_a_healthy_settle
+
+### Design (Item 55)
+Only the batch size of LATE depth writes changes. The live drain keeps `DEPTH_FLUSH_ROW_THRESHOLD` (its rows are in time order and cheap). `late_flush_due` is O(1): one length read per writer. `flush_ticks` is the tick half of `LiveIngest::flush`, split out unchanged; `flush` is now `flush_depth_sink` then `flush_ticks`, same order and same behaviour. Both replay callers still flush everything at the end of each refold.
+
+### Edge Cases (Item 55)
+A replay with ticks and no depth flushes ticks every 1,000 rows as before. A replay with depth and no ticks flushes depth at 16 MiB. Array-row (book) mode: the book writer keeps 8 MiB; the synchronous older-frame level writer takes the 16 MiB trigger. An offload queue that is full hands a 16 MiB batch back; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, as before.
+
+### Failure Modes (Item 55)
+No row is skipped; only the size of each commit changes. A failed late batch goes to the depth spill tier (replay) or leaves its bucket marked (after-close pass), exactly as a 10,000-row batch did; the DEDUP key makes a rewrite idempotent. A 16 MiB request is bounded by the ILP timeout of 5 s plus the client's minimum throughput allowance; the replay runs before the drain starts and the after-close pass on its own thread, so neither blocks the live feed. Each remaining late commit still rewrites its partition: the change cuts the count, not the cost of one. Why QuestDB on the box does not merge queued commits (it does locally under a burst) is Unknown.
+
+### Test Plan (Item 55)
+`cargo test -p tickvault-app --lib` (late_flush_due, flush_ticks, the replay and deferred-pass tests); `cargo test -p tickvault-storage --lib depth_persistence` (the compile-time bounds). After deploy: the WAL transaction count added by a boot replay (`wal_tables()` `sequencerTxn` before and after) and `tv_questdb_wal_apply_lag_max`.
+
+### Rollback (Item 55)
+Revert the commit. No schema, data or config change.
+
+### Observability (Item 55)
+Existing: `tv_questdb_wal_apply_lag_max`, the depth flush and spill counters, `tv_wal_replay_pace_waits_total`. No new metric.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 56 — silent depth-200 swap is resubscribed in place (added 2026-10-13, operator chose "Resubscribe at 90s (Recommended)" and then "yes everythignis entirley approved permission grnated dude")
+
+- [x] 56a — rule section first: the dated 2026-10-13 section in `docs/claude-rules-full/project/websocket-connection-scope-lock.md` and its summary bullet.
+  - Files: docs/claude-rules-full/project/websocket-connection-scope-lock.md, .claude/rules/project/websocket-connection-scope-lock.md
+  - Tests: tick_gap_reset_wiring_guard, instance_type_lock_guard
+- [x] 56b — per-socket silent-swap watch: one atomic word per slot armed before the subscribe write, cleared by the drain on the first depth-200 packet of the awaited contract (O(1), no allocation), handed back once by the 1 s idle tick after `depth200_silent_swap_resubscribe_secs` (default 90, 10..=600); the connection sends RequestCode 25 then 23 on the live socket. Refused after an 805 or when the guard no longer holds the contract.
+  - Files: crates/core/src/websocket/silent_swap.rs, crates/core/src/websocket/pool_supervisor.rs, crates/common/src/config.rs, crates/app/src/main.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/depth_first_packet.rs
+  - Tests: dhat_depth_drain, silent_swap tests (resend at the wait, no resend after a packet, one resend per swap, composite key, second swap cancels the first, 805 refusal, guard no longer holds), config bounds test
+
+### Design (Item 56)
+Dhan sometimes sends nothing for a contract swapped in by 25 then 23. Instead of waiting for the 900 s backstop redial, the socket that made the swap waits 90 s for the contract's first packet and, if none came, sends 25 then 23 again for that one contract on the same socket. 25 goes first because a duplicate 23 is answered with 804. Every depth-200 swap's subscribe-to-first-packet time is recorded under `tv_depth_first_packet_latency_ms{basis="depth200_socket"}`.
+
+### Edge Cases (Item 56)
+A second swap inside the wait replaces the watch (the 900 s backstop still covers a socket that swaps every minute). An 805 in the episode refuses the resend. A contract the guard no longer holds is never resent. A packet left in the ring from an earlier hold of the same contract can clear the watch (no resend; the backstop covers it).
+
+### Failure Modes (Item 56)
+If the 25 lands and the 23 fails, the socket takes the swap's existing `SubscribeFailed` redial. If Dhan ignores the 25, the 23 may draw one 804, at most once per swap. A wire failure is counted (`wire_failed`). Nothing here can open a socket or exceed the 1-instrument cap.
+
+### Test Plan (Item 56)
+`cargo test -p tickvault-core --lib`, `-p tickvault-app --lib`, `-p tickvault-common --lib`, `dhat_depth_drain`, the wiring and seeding guards. Live: 14 Oct 12:00 and 15:50 IST checks read the latency p99 next to the swap count and `tv_depth200_silent_swap_resubscribe_total`.
+
+### Rollback (Item 56)
+Set `depth200_silent_swap_resubscribe_secs = 600` (longest wait) or revert the commit. No schema or data change.
+
+### Observability (Item 56)
+`tv_depth200_silent_swap_resubscribe_total{outcome=sent|refused_halted_805|refused_not_held|wire_failed|recovered}`, seeded at 0, local `/metrics` only; one coded `warn!` (WS-GAP-02) per resend decision; the latency histogram above. No alarm, filter, EMF name or page.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 57 — Free disk bandwidth for live depth at ₹0 (added 2026-10-13, operator chose "₹0 fixes first (Recommended)": pause the old table's catch-up in market hours, stop the evening pass writing the old table, fewer and larger live depth writes)
+
+Finding (Verified from CloudWatch EBS bytes and the STORAGE-GAP-04 lines, 9, 12 and 13 Oct): the instance's disk burst runs out at 10:00 IST every day; after that reads plus writes sit at about 156 MB/s. QuestDB spends much of it applying the old `market_depth` WAL backlog (writer 632,973 / sequencer 771,919 at 08:31 on 13 Oct, 713,539 / 773,543 at 15:53, 725,495 / 783,385 at 19:00). The evening pass added about 9,842 old-table transactions between 15:53 and 19:00. Live depth into `market_depth_book` grew its sequencer by about 77,000 transactions on 13 Oct (about 3.2 a second) because the drain flushes depth with every tick flush.
+
+- [x] 57a — the after-close deferred pass writes only `market_depth_book` while array rows are on; it can no longer reach the old table. With array rows off (dev) it writes `market_depth` as before.
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/dhan_feed_stack.rs
+  - Tests: test_rewrite_inline_depth_goes_to_the_book_table_with_array_rows_on, test_the_pass_writer_is_book_only_with_an_array_row_instant
+- [x] 57b — the live drain no longer flushes depth with every tick flush: depth flushes on its own size trigger (8 MiB) and every `DEPTH_TIMER_FLUSH_EVERY_TICKS` (4) ticks of the 500 ms timer, i.e. every 2 s. Shutdown, replay and refold paths still flush everything.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/contract_attach_tests.rs (moved out unchanged to stay under the size pin), crates/common/tests/source_size_ratchet_guard.rs
+  - Tests: test_live_tick_flush_leaves_depth_to_its_own_cadence, test_depth_timer_cadence_counts_ticks, test_retry_idle_depth_parks_leaves_pending_rows_to_the_depth_tick, test_unbacked_depth_rows_keep_the_500ms_hand_off
+
+57c — pausing the old table's WAL apply in market hours — NOT DONE. Verified on a local QuestDB 9.3.5: `ALTER TABLE md SUSPEND WAL` answers "Cannot suspend table, database is not in dev mode"; QuestDB offers no per-table pause outside dev mode, and turning dev mode on in production is not taken. At 13 Oct's apply rate (about 80,000 transactions over the session) the remaining ~58,000 finish during 14 Oct once 57a stops new ones (Assumed; checked at the 14 Oct 16:10 IST review).
+
+### Design (Item 57)
+57a: the pass builds its depth writer in book-only mode when the lane has an array-row start instant, so every rewritten frame goes to `market_depth_book` whatever its receipt time; no level writer for `market_depth` is opened. 57b: the drain's tick triggers (1,000 rows, the 500 ms timer) call the tick half only; depth keeps its 8 MiB size trigger and gets a 2 s cadence from an O(1) counter on the existing 500 ms timer arm (no new timer, no allocation).
+
+### Edge Cases (Item 57)
+57a: a bucket from before the array-row switch (9 Oct and earlier) is rewritten in full into `market_depth_book`; packets the live drain had already written to `market_depth` in that bucket then exist in both tables (no loss; an honest limit, counted on `tv_wal_deferred_depth_rows_total{outcome="pre_switch_to_book"}`). No array-row instant (array rows off, or the book table failed at boot): unchanged, writes `market_depth`. 57b: the 09:15 burst still cuts batches at 8 MiB; a quiet depth socket flushes whatever is pending every 2 s; shutdown flushes both writers.
+
+### Failure Modes (Item 57)
+No row is skipped. 57a: a failed book write leaves the bucket marked, as before. 57b: a QuestDB stall now holds about 2 s of depth per retained span instead of about 0.2 s; the producer still cuts at `MAX_DEPTH_PRODUCER_BUFFER_BYTES` (32 MiB) and the span bound, then rescues to the depth spill tier as before. A depth row whose frame the WAL refused (no replay copy) still flushes on the next 500 ms tick, as before, so the RAM-only window does not grow; only rows the WAL can replay wait for the 2 s tick. A failed depth flush on the 2 s tick counts on the drain's `dropped` outcome (via `flush_depth`) where the per-tick full flush counted `depth_failed`; nothing alarms on either. A parked depth rescue is still retried on every 500 ms tick (`retry_idle_depth_parks`) when no depth row is pending.
+
+### Test Plan (Item 57)
+`cargo test -p tickvault-app --lib` (the pass routing tests, the drain flush tests and the source-scan guards that pin the flush calls), `dhat_live_ingest_seam`, `cargo test -p tickvault-storage --lib depth_persistence`. Live, 14 Oct 16:10 IST: `market_depth_book` sequencer growth over the session (expect about 0.5 transactions a second, from about 3.2), `market_depth` writer/sequencer (expect the gap to reach 0 and the sequencer to stop growing after 15:45), EBS read+write bytes after 10:00, `tv_questdb_wal_apply_lag_max`.
+
+### Rollback (Item 57)
+Revert the commit. No schema, data or config change.
+
+### Observability (Item 57)
+Existing: `tv_questdb_wal_apply_lag_max`, `tv_depth_flush_offloaded_total`, `tv_wal_deferred_depth_rows_total{outcome}` (new outcome value `pre_switch_to_book`, local `/metrics` only), the pass summary log line. No alarm, filter, EMF name or page.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 58 — Same-day drain: the box stays up after the close until the day's data is in the database (added 2026-10-21, operator Quote 31: "go ahead dude make the change … until or unelss movign all tehse dtaa to db never evr shut down" and "evryday move shdou lbe finsihed withint that day")
+
+**Status:** APPROVED by the operator in session (2026-10-21, "go ahead dude make the change"). Quote recorded first in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md` §0 Quote 31, summary stub and `aws-budget.md` cost note.
+
+**Why (MEASURED 2026-10-21):** the 20 Oct after-close depth pass wrote 3,067,442,594 rows (its first full run after the 14–16 Oct latch fault), paced only on a GROWING lag, so QuestDB went 0 → 6,758 transactions behind; the 17:30 stop left ~6,000 unapplied; the 21 Oct boot started 4,440 behind, the boot replay added 18.5M depth rows, the disk sat at its 500 MiB/s limit 08:35–09:55, tick flushes were rescued to spill every few seconds and depth was shed 09:05–09:08 and 09:20–09:33. Raising disk throughput was offered and declined by the owner.
+
+- [x] 58a — Absolute apply-lag reading in process. `ingest_shed::{publish_wal_apply_lag_max, publish_wal_apply_lag_unknown, wal_apply_lag_max, wal_suspended_tables}` (unknown = `u64::MAX`, reads as not done); published by `wal_suspension_watcher` on every complete poll, unknown on a partial poll or a blind probe. Tests: `test_publish_wal_apply_lag_max_reads_back_and_unknown_withdraws_it`.
+  - Files: crates/common/src/ingest_shed.rs, crates/storage/src/wal_suspension_watcher.rs
+- [x] 58b — Idle seal of the open WAL segment on request. `wal_idle_seal::request_idle_seal(wal_dir)` (its own module: `ws_frame_spill.rs` is at its size pin): the writer closes its open segment in its next lull (empty-channel poll), so the session's last bucket is no longer carried a day. Per-directory request list (one load per poll when idle). Tests: `test_request_idle_seal_closes_the_open_segment_and_the_next_frame_opens_a_new_one`, `every_segment_finalisation_syncs_including_the_rotation` (now four arms).
+  - Files: crates/storage/src/ws_frame_spill.rs, crates/storage/src/wal_idle_seal.rs, crates/storage/src/lib.rs
+- [x] 58c — The after-close depth pass runs through the night. Window `[15:45, 07:15)` wrapping midnight (`in_after_close_window`); pauses while the backlog is above `AFTER_CLOSE_APPLY_LAG_CEILING` (500) or unknown; the supervisor repeats every minute (ten after a no-progress round), seals the open segment first, skips the writer when nothing is marked, and publishes `last_pass_retryable_left` (uncertain-neighbour carries do not count). Tests: `test_regression_pass_pauses_on_a_large_backlog_and_runs_past_midnight`, `after_close_pass_stops_before_the_stop_time` (proptest), `secs_until_window_is_zero_inside_and_counts_to_the_afternoon_start`, `retryable_left_ignores_uncertain_carries_but_not_an_early_stop`, `test_publish_pass_outcome_reads_back_via_last_pass_retryable_left`, `next_round_gap_secs_backs_off_only_when_a_round_made_no_progress`, `in_after_close_window_wraps_midnight`.
+  - Files: crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/app/src/dhan_feed_stack.rs
+- [x] 58d — The drain hold. `crates/app/src/drain_hold.rs`: 15:40–07:30 IST, once a minute, `DayWork` (marks, spill folders, today's seal spill, backlog ≤ `DRAIN_HOLD_IDLE_LAG` (10), no suspended table, trusted sink); writes `/tickvault/<env>/drain-hold` `{"v":1,"state":"holding"|"released","until_unix","written_unix","left"}` every 5 min with a 20 min expiry cut at 07:30; releases after two done readings; `DRAIN-HOLD-01` on a failed write (log-sink-only). Spawned from `main.rs` when `TV_ENVIRONMENT` is set. Tests: `is_done_needs_every_part_and_unknown_is_not_done`, `test_regression_a_6000_transaction_backlog_holds_the_box`, `step_refreshes_releases_once_and_reholds`, `hold_until_is_bounded` (proptest), `hold_value_is_the_lambda_contract`, `waiting_spill_files_ignores_empty_and_missing`, `stop_follows_tonights_hold_only_after_a_hold_and_only_out_of_hours`.
+  - Files: crates/app/src/drain_hold.rs, crates/app/src/lib.rs, crates/app/src/main.rs, crates/common/src/error_code.rs, docs/error-runbooks/drain-hold-error-codes.md, .claude/triage/error-rules.yaml
+- [x] 58e — A held evening's stop is scheduled, not "unexpected". `shutdown_class::classify_shutdown_with_deploy_marker` returns `ScheduledStop` for a SIGTERM after a hold this process wrote tonight (evening, night, or up to 07:40 IST).
+  - Files: crates/app/src/shutdown_class.rs
+- [x] 58f — Every scheduled stop honours the hold; the budget stop never does. (Implemented 2026-10-21: lib 663 + guards pass; `drain_hold_wiring_guard` pins the target, both env vars, both IAM reads, and that the budget check and breach stop come before a hold is honoured.) `crates/aws-lambdas/src/drain_hold.rs` verdict (Active / RecentlyHeld / None; ignored 07:30–17:25 IST and more than an hour ahead); start watchdog new mode `daily_stop` (17:30, replaces the direct SSM stop), `stop_check`, `curfew_check`; hard-stop guard out-of-window stop; terraform target + IAM reads + env vars; guard `drain_hold_wiring_guard.rs`.
+  - Files: crates/aws-lambdas/src/drain_hold.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/aws-lambdas/src/hard_stop_guard.rs, deploy/aws/terraform/main.tf, deploy/aws/terraform/start-watchdog-lambda.tf, deploy/aws/terraform/budget-guards.tf
+
+- [x] 58g — Review fixes (2026-10-21, hot-path CLEAN; security 0 critical/0 high; hostile 1 high + 3 medium). (a) The hold is given up after `DRAIN_HOLD_STALL_SECS` (1 h) with no progress (`ProgressTracker`: pass rows written, or any part below its level at the last progress), so a stuck reading cannot hold the box 14 h a night; it re-holds when progress resumes. Tests: `observe_reports_a_stall_only_after_an_hour_without_any_progress`, `observe_never_counts_an_unknown_reading_as_progress`, `observe_counts_a_falling_backlog_after_a_rise_but_not_a_swing`. (b) A held night's quiet-stop window opens at 17:25 IST, not at the first hold write. (c) The pass outcome is forgotten between windows. (d) An empty `wal_tables()` reply is not a zero-backlog reading. (e) A failed measurement is a coded `DRAIN-HOLD-01` error. (f) Lambdas: on an active hold the hard-stop guard checks the budget first and stops on a breach; a quiet stop is quiet only when it succeeds and the box started before the hold was written; the 17:30 stop tries the stop when the instance state is unknown.
+  - Files: crates/app/src/drain_hold.rs, crates/app/src/dhan_feed_stack/deferred_depth_pass.rs, crates/storage/src/wal_suspension_watcher.rs, crates/aws-lambdas/src/hard_stop_guard.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/aws-lambdas/src/drain_hold.rs
+
+### Design (Item 58)
+The app is the only party that knows whether the day's data is in the database, so it publishes that as a short-lived SSM lease; the stop paths only read it. The lease expires on its own (20 min) so a dead app cannot keep the box up, and it can never reach past 07:30 IST, so the 07:35 curfew stops the box and the 08:30 start boots it fresh. The budget stop is evaluated before and independently of the lease. The write-back stops being a fixed 15:45–17:15 job and becomes a loop that keeps going until nothing it can finish is left, paced on the backlog's size so QuestDB is never left thousands of transactions behind.
+
+### Edge Cases (Item 58)
+- No marks, no spill, idle QuestDB at 15:40: released after two readings (15:42); the 17:30 stop proceeds as before.
+- Marks left only next to an unreadable segment: they do not hold the box (`retryable_left` = 0); they expire as before after `UNCERTAIN_CARRY_MAX_DAYS`.
+- Unknown backlog (watcher blind, first minute after boot): holds (not done), and the pass pauses.
+- Hold written, then the app crashes: the lease lapses within 20 min; the next curfew stops the box; the work stays on disk.
+- Work never finishes (QuestDB stuck): held until 07:30; the box is stopped at 07:35 and boots fresh at 08:30.
+- A weekday holiday: the box stops in the morning (holiday gate); no evening.
+- Friday evening: held at most to Saturday 07:30; the weekend guards stop it.
+
+### Failure Modes (Item 58)
+- SSM write fails: `DRAIN-HOLD-01` once per episode; the previous lease keeps the box up until it expires; then the box can stop with work left (nothing lost; next evening).
+- SSM read fails in a Lambda: treated as no hold (stop as before, cost-safe).
+- October budget: at the measured rate October reaches ~$173 without extra hours; the $170 budget stop is not gated and would stop the box for the rest of the month.
+
+### Test Plan (Item 58)
+Unit + property tests named above; storage `ws_frame_spill` idle-seal test and the finalisation source scan; app lib tests for `drain_hold`, `deferred_depth_pass`, `shutdown_class`; Lambda verdict boundary tests and the new wiring guard; common `error_code` crossref/tag/triage guards for `DRAIN-HOLD-01`.
+
+### Rollback (Item 58)
+Revert the PR. With the app reverted no hold is written, so the Lambdas stop the box as before (no hold = stop). The terraform daily_stop target can stay on the Lambda (it stops when no hold exists) or be re-pointed at the SSM automation.
+
+### Observability (Item 58)
+Info lines "drain hold written" / "drain hold released" with what is left; `DRAIN-HOLD-01` on a failed write; the Lambdas log every hold they honour; existing `tv_questdb_wal_apply_lag_max`, `tv_wal_deferred_depth_pass_total{outcome}`, `tv_wal_deferred_depth_rows_total`. No new metric, alarm, filter, EMF name or page (Quote 31).
+
+**Not in this item (honest scope):** the old WAL backlog (1,192 segments waiting on 21 Oct, from 9 Oct onward) is still replayed only at boot, capped at 3,000,000 frames per boot; shrinking it is PR W's work (on this branch, not yet merged) and a post-close replay round is a separate item. Today's data is in the database the same day; old days' false-unapplied segments are not.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 59 — The sealed-candle writer flushes at most once a second (added 2026-10-21, operator: "Fix and resolve everything dude")
+
+**Status:** APPROVED (operator, 2026-10-21, in session).
+
+**Why (MEASURED 2026-10-21, read-only CloudWatch):** `tv_questdb_wal_apply_lag_max` spiked a few minutes after 15-minute marks (10:10 842, 10:50 731, 11:40 673, 11:50 1,351); at 11:50:57 WAL-SUSPEND-01 named `candles_15m` (txn_lag 1,351) and the ingest shed turned on at 11:51:57. The seal writer flushed every 100 ms cycle that held a seal, so the ~4 minutes after a boundary (tick-by-tick seals, then the catch-up sweep at +240 s) sent up to ~2,400 tiny commits into one `ts` group of a DEDUP table.
+
+- [x] 59a — Pace the live flush. `SealWriterRunner::run_one_cycle_with_replay` flushes only when `seal_flush_due(ring_len, last_flush_secs, now_unix_secs)`: `SEAL_FLUSH_MIN_SEALS` (4,096) waiting, or a new cycle second (the loop passes the wall clock), or the first seal; otherwise the queue moves into the ring and nothing is flushed (the replay gate reads the cycle as neutral). `run_one_cycle` (shutdown drain) always flushes. Tests: `seal_flush_due_flushes_on_size_a_new_second_or_the_first_seal`, `test_regression_live_cycle_holds_seals_until_the_next_second`; existing chaos and recovery tests unchanged and green.
+  - Files: crates/storage/src/seal_writer_runner.rs
+
+### Design (Item 59)
+Hold in the ring, not in the ILP buffer: a held seal stays counted unwritten and keeps the rescue → spill → DLQ cascade and the crash marker exactly as before. Judged on the cycle's own second so simulated-time tests and a stepped clock both flush.
+
+### Edge Cases (Item 59)
+A boundary burst (≥ 4,096 waiting) flushes every cycle as before. A single seal after a quiet spell flushes at once. A clock stepped back flushes at once.
+
+### Failure Modes (Item 59)
+A failed flush rescues as before; the next try waits for the next second. A crash loses nothing more than before: held seals are in the ring, counted by the unwritten marker.
+
+### Test Plan (Item 59)
+Storage lib seal tests (181), `seal_drain_recovery`, `dhat_seal_queue_backlog`, `error_level_meta_guard`.
+
+### Rollback (Item 59)
+Revert; the writer flushes every cycle again.
+
+### Observability (Item 59)
+Existing `tv_questdb_wal_apply_lag_max` and WAL-SUSPEND-01 per table; a bar reaches QuestDB at most about a second later (`last_seal_drained_unix_secs` moves up to a second later; the 51d readiness wait tolerates it).
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 60 — The evening drain replays the WAL backlog the same evening (added 2026-10-21, operator: "Fix and resolve everything dude", under Quote 31)
+
+**Status:** APPROVED (operator, 2026-10-21, in session; Quote 31 authorizes "a post-close WAL catch-up run until done").
+
+**Why (MEASURED 2026-10-21):** 1,192 WAL segments from 9–20 Oct stay pinned by the unapplied ranges; only a boot's catch-up drain (before the sockets dial) replays them, and the 08:30 boot gets five minutes. The drain hold (Item 58) did not count them at all, although Quote 31's rule names "every waiting WAL segment is replayed".
+
+- [x] 60a — Backlog count. `wal_unapplied_ranges::backlog_segments` counts the waiting segments the held ranges pin (the pinned-gauge scan without publishing). Test: `test_backlog_segments_counts_only_segments_a_range_pins`.
+  - Files: crates/storage/src/wal_unapplied_ranges.rs
+- [x] 60b — Evening restarts. `evening_drain::evening_step` (pure): once the day's own work is done and the backlog is above 0, restart; at most 3 an evening, 40 minutes apart (60d), 15:50–05:00 IST, and none after a restart that did not shrink the backlog. The hold supervisor writes the state file (`data/state/evening-drain.state`), then asks `main` for a planned restart (`request_self_restart`, a `Notify` arm in `wait_for_shutdown_signal`, signal `self_restart`, classified planned, no shutdown message); systemd `Restart=always` starts the app again. The backlog holds the box only while a restart will come (`EveningStep::holds`). AWS only. Tests: `evening_step_*`, `state_for_restart_counts_per_evening`, `test_store_state_load_state_to_line_from_line_round_trip`, `in_restart_window_wraps_midnight`, `test_request_self_restart_resolves_a_later_self_restart_requested`, the `is_done` and `left_text` cases, `test_classify_shutdown_with_deploy_marker_table`.
+  - Files: crates/app/src/evening_drain.rs, crates/app/src/drain_hold.rs, crates/app/src/main.rs, crates/app/src/shutdown_class.rs, crates/app/src/lib.rs
+- [x] 60c — The restarted boot's catch-up clock is 15 minutes (`budget_or`, once per boot on a fresh pending flag); the frame cap, round cap, memory stop and disk floor are unchanged. Tests: `test_catchup_budget_for_only_a_fresh_evening_pending_flag`, `the_lane_and_main_are_wired_to_the_evening_drain`.
+  - Files: crates/app/src/dhan_feed_stack.rs
+- [x] 60d — Hostile-review fixes (2026-10-21): each restart's own catch-up is held for the whole spacing before the cap or the clock can end the evening; spacing 20 → 40 minutes (boot up to 5 min + 15-min catch-up + settling did not fit in 20); "gave up" is written to the state file (`state_for_give_up`) so it cannot flip back; no restart before the day's cross-verification marker or 17:25 IST (`crossverify_settled`); an unreadable backlog during a restart's catch-up keeps the hold; a state file that cannot be read stops the restarts (coded `DRAIN-HOLD-01`, once). Tests: `evening_step_holds_each_restarts_catch_up_then_judges_progress`, `evening_step_holds_the_last_restart_and_one_past_the_window`, `evening_step_stops_outside_the_window_and_after_giving_up`, `evening_step_waits_for_the_days_work_and_the_cross_check_then_restarts`, `state_for_give_up_keeps_tonights_count_and_resets_a_new_evening`, `crossverify_settled_by_marker_or_clock`.
+  - Files: crates/app/src/evening_drain.rs, crates/app/src/drain_hold.rs
+
+### Design (Item 60)
+Replay stays where it is safe today: the boot catch-up, before the sockets dial, with every per-boot bound. The evening only adds boots. One small state file carries the evening's count across the restart; the decision is a pure function of it, the backlog and the clock.
+
+### Edge Cases (Item 60)
+A backlog that cannot be read never restarts and never holds. A restart that does not shrink the backlog ends the evening's restarts (no loop). A pending flag older than 15 minutes, or seen in the morning, does not lengthen a boot. At most two restarts fall in any hour (40-minute spacing), so a deploy and a crash still fit under systemd's 5 starts an hour. No restart after 05:00, so the last 15-minute catch-up ends before the 07:30 ceiling.
+
+### Failure Modes (Item 60)
+The state file cannot be written: no restart that minute (an unrecorded restart would escape the cap). The restarted app fails to boot: systemd retries as for any crash; the hold lapses in 20 minutes and the box stops as before; the WAL stays on disk. The catch-up stops on memory, disk or the frame cap: the backlog shrinks less, the next restart (or the morning) continues.
+
+### Test Plan (Item 60)
+The unit tests above; app lib tests for drain_hold, evening_drain and shutdown_class; storage lib tests; `error_level_meta_guard`; source size ratchet.
+
+### Rollback (Item 60)
+Revert; the backlog no longer holds the box and the app never restarts itself. A leftover state file is ignored.
+
+### Observability (Item 60)
+The hold's `left` text and log line gain `wal_segments=N` (`+replaying` while held for it); each restart logs one `info!` with its number and the backlog; the restarted boot logs its longer clock. `tv_wal_unapplied_pinned_segments` and `tv_wal_replay_confirmed_segments_total` show the drain. No new alarm, page or metric (Quote 31).
+
+**Honest limits:** each restart replays at most the per-boot frame cap (3,000,000 frames, about one session), so the 9–20 Oct backlog (about ten sessions) takes several evenings. Each held hour costs about $0.19, and October is projected near the $170 stop before any held hour (Quote 31's limit). A backlog held by a QuestDB suspicion episode does not shrink, so the first restart ends the evening's restarts. The restarted app sends its usual boot message (at most 3 a night). Segments only `settling/unreadable/` holds, or a backlog the replay disk floor refuses, cost one useless restart before the evening gives up.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM 61 — Depth-20 and depth-200 switched off (added 2026-10-21, owner: "switch off both depth 20 and depth 200 dude okay?")
+
+**Status:** APPROVED (owner, 2026-10-21, in session; recorded first in `websocket-connection-scope-lock.md`, "2026-10-21 — DEPTH-20 AND DEPTH-200 ARE SWITCHED OFF").
+
+**Why (Verified from the repo's measured records):** depth is 1,530,651,649 rows a session against 64,349,753 ticks (24x), about 80% of the daily disk burn, and the main load behind the morning disk saturation and the evening catch-up. Switching it off is step 1 of getting AWS under $100 a month (steps 2–4, throughput, disk and instance, are separate dated quotes).
+
+- [x] 61a — The switch. `[dhan_universe] depth_sockets_enabled` (serde default false; `config/base.toml` false). Test: `test_dhan_universe_depth_sockets_enabled_defaults_off`.
+  - Files: crates/common/src/config.rs, config/base.toml
+- [x] 61b — The gate. `depth_switch` stores the boot value (main, before the stack spawns); `attach_depth_when_available` starts `depth_ready` and `depth_done` at `!depth_sockets_enabled()`, so no depth socket is attached or dialled while the main-feed half of the same attach runs unchanged. Tests: `test_set_depth_sockets_enabled_round_trips`, `the_attach_and_main_read_the_switch`; app lib 2,816 and integration suites green.
+  - Files: crates/app/src/depth_switch.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs, crates/app/src/lib.rs, crates/app/tests/source_scan_budget_guard.rs
+- [x] 61c — No false page. `depth-steering-stalled` reads `tv_depth_rebalance_age_secs` with missing data as a breach; with steering never started, `spawn_switched_off_heartbeat` publishes it at 0 (and `tv_depth_sockets_enabled` at 0, local only).
+  - Files: crates/app/src/depth_switch.rs
+
+### Design (Item 61)
+Gate at the narrowest point found by the impact map: the depth attach's two state flags, not the spawn (the same task attaches the main-feed contracts, spot top-up and backup copies). A process-wide atomic set once at boot avoids threading a new parameter through the stack; it reads `true` until set, so tests and harnesses keep the old behaviour.
+
+### Edge Cases (Item 61)
+Depth off: the selection is skipped, `outstanding_halves` never dials depth, the give-up arm never fires, the terminal path completes on contracts alone and `spawn_depth_rebalance` returns with one `info!`; the 09:12 readiness verdict publishes on contracts (`depth_ready` starts true). Cross-verification's depth-held option pass finds no targets and returns (`no_targets`, no page). The drain hold has no depth marks. Depth on: unchanged.
+
+### Failure Modes (Item 61)
+Config unreadable: the field defaults to false (off). Boot never calls the setter: depth stays as before (on). The steering heartbeat loop dies: the alarm reads missing data and pages (the same as today's steering loop dying).
+
+### Test Plan (Item 61)
+common lib + integration (0 failures), app lib 2,816 / bins / integration, storage integration, clippy `-D warnings`, pub-fn guard, banned-pattern scanner, size ratchet, source-scan budget.
+
+### Rollback (Item 61)
+Set `depth_sockets_enabled = true` (needs a fresh dated quote in the scope lock) and redeploy; nothing was deleted.
+
+### Observability (Item 61)
+One boot `info!` names the switch; `tv_depth_sockets_enabled` (0/1, local `/metrics`); depth tables stop growing. No new alarm, page, filter or EMF name.
+
+**Honest limits:** the steering alarm reads 0 while switched off, so it cannot fire then (there is nothing to steer). The depth ILP writer and offload thread stay idle in memory. The ranking sweep still computes depth candidates nothing reads. Disk throughput, disk size and instance are unchanged here.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEMS 62–68 — November clean start: removals, monitoring squeeze, 16:30 stop, rebuild, wipe, $75 stop (added 2026-10-21, owner: "yes fix and reosleve nad impleemnt everyhtign dude okay?")
+
+**Status:** APPROVED (owner, 2026-10-21 evening, in session). Authority, recorded first: Quotes 34, 35, 36, 37 in `docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md`, Quotes 32/33 for the rebuild, and `websocket-connection-scope-lock.md` "2026-10-21 (EVENING) — CANDLES_3S, CANDLES_5S AND TOP_VOLUME ARE REMOVED".
+
+- [x] 62 — **DONE 2026-10-22:** TF_COUNT 8, top_volume writers/ranking/sweep/spill/replay removed, depth pieces moved to option_rank.rs, delay renderer to delay_render.rs, seal spill format 6 + summary magic TVBWSUM2, 3s/5s/top_volume kept on the archive-only retention list. Remove the 3 s and 5 s candle timeframes and every `top_volume_*` writer (Quote 34). `TF_COUNT` 10 → 8; the ranking, window-close clock, sweep, writer threads, spill and replay go; depth-only pieces the steering code still needs (`OptionFamily`, `RankedContract`, `distinct_underlying_over`, the gainer helpers, the `TOP_VOLUME_*` constants the depth planners read) and `render_delay_into` are relocated, not deleted; seal spill / DLQ format version bumped and the boot-committed summary magic changed because tf ordinals shift (M30 7→5, M60 8→6, M10 9→7); `candles_3s`, `candles_5s`, `top_volume_*` stay on an archive-only list so retention keeps copying them to S3 and nothing drops them before the copy; the four top_volume loss-group filter rows, `tv_spill_free_probe_blind_total{tier="top_volume"}` and `Volume01MonotonicityBreach` go with the code. Map: `crates/app/src/top_volume_sweep.rs`, `top_volume_snapshot.rs`, `volume_leaderboard.rs`, `dhan_feed_stack.rs`, `dhan_feed_stack/top_volume_threads.rs`, `crates/storage/src/top_volume_rank_persistence.rs`, `tick_spill_replay.rs`, `crates/trading/src/candles/tf_index.rs`, `crates/storage/src/seal_spill.rs`, `seal_dlq.rs`, `seal_spill_ledger.rs`, `deploy/aws/terraform/loss-group-alarms.tf`, `config/base.toml`, `crates/common/src/config.rs`.
+  - Files: crates/trading/, crates/storage/, crates/app/, crates/common/, crates/api/, deploy/aws/terraform/, config/
+  - Tests: tf_index ordinal pins at 8, seal spill v6 round-trip and v5 refusal-or-translation, `dhat_live_ingest_seam`, `restart_differential`, every guard named in the removal map updated
+- [x] 63 — **DONE 2026-10-22:** `aws-sdk-costexplorer` replaced by `aws-sdk-budgets` =1.113.0 (owner approved the new dependency, "Approve (Recommended)"); one shared parse (`crates/aws-lambdas/src/budget_spend.rs`: missing pieces, NaN/infinite (coded LAMBDA-AWS-01), negative and non-USD refused as unknown); the guard, digest and console call `DescribeBudget`; IAM `budgets:ViewBudget` on `aws_budgets_budget.tv_monthly.arn` only (all `ce:` grants removed) and `BUDGET_NAME` / `BUDGET_ACCOUNT_ID` on the three Lambdas; on UTC day 1 a reading at or above the line is unknown (page, never stop: the reply has no month stamp); the digest's Yesterday and per-service lines are gone (one total). Budgets refreshes about every 8-12 h (Assumed, AWS docs); the native budget stop is the second, independent stop. Month-to-date spend from the free AWS Budgets API (`DescribeBudget` `CalculatedSpend.ActualSpend`) instead of paid Cost Explorer `GetCostAndUsage` in the hard-stop guard, the budget digest and the operator console (Quote 37). IAM: `budgets:ViewBudget` on the one budget; Cost Explorer permission removed once nothing calls it.
+  - Files: crates/aws-lambdas/src/hard_stop_guard.rs, budget_digest.rs, operator_control.rs, clients.rs, deploy/aws/terraform/ (Lambda IAM)
+  - Tests: spend parsed from a recorded `DescribeBudget` body; missing/zero/NaN spend fails closed exactly as the Cost Explorer path did
+- [x] 64 — **DONE 2026-10-22:** rule row §12.15.12 first; `daily_stop` `cron(0 11 ? * MON-FRI *)`, `stop_check` `cron(15 11 ? * MON-FRI *)`; one app stop constant `shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST` (59,400, pinned to both crons by test) from which the quiet window 16:25–16:45, the cross-verification deadline 16:24 / end bound 16:23 / evening attempt 16:50, the drain hold's earliest held stop and the evening-drain clear time derive; Lambda side `start_watchdog::STOP_TRIGGER_UTC_HOUR` 11, curfew close 16:30, `hard_stop_guard::UP_WINDOW_CLOSE_IST_HHMM` (1630) and the drain-hold ignored window (now ends 16:25) derive from the stop trigger; deploy-aws.yml up-window `-le 1630`; operator-facing strings 4:30 PM / 16:30; the compile-time fit is ONE worst-case attempt (no same-day retry on a normal day, stated in §12.15.12); the drain hold still blocks every stop path (tests at 16:25/16:30). Daily stop 17:30 → 16:30 IST (Quote 37): `tv-prod-daily-stop` cron, the start-watchdog stop-check and curfew windows, the cross-verification end bound (17:23 → 16:23, with the retry spacing and the 17:50 evening attempt re-derived) and every guard that pins 17:30; the Quote 31 drain hold is still honoured by every stop path.
+  - Files: deploy/aws/terraform/, crates/aws-lambdas/src/start_watchdog.rs, crates/app/src/dhan_live_crossverify_boot.rs (and constants), rule rows that name 17:30
+  - Tests: stop schedule and watchdog window pins at 16:30; cross-verification deadline derived from the stop; drain hold still blocks the stop
+- [ ] 65 — Alarm squeeze (Quote 37): delete the alarms and metrics of switched-off or removed features in the same change as the feature, then a written per-alarm review (`docs/audits/2026-10-alarm-review.md`: alarm, what it watches, kept or removed, which alarm covers it) taking 127 → about 60; noise-lock paging families keep their alarms unless that file records the removal first; dashboard kept.
+  - Files: deploy/aws/terraform/*.tf, docs/audits/2026-10-alarm-review.md, the alarm guards
+  - Tests: `alarmed_counters_are_seeded_guard`, `alarm_metric_has_a_route_guard`, `loss_counter_visibility_guard`, `live_lane_paging_lockstep_guard` green after each removal
+- [x] 66 — The Thursday 2026-10-22 rebuild (Quotes 32/33): a reviewed workflow that, after the 17:30 stop and before 08:30, copies every QuestDB table to S3 and verifies it, drains or copies the WAL, snapshots the old volume, builds the 150 GB gp3 root on r8g.large (multi-AZ shape kept), retunes `MemoryHigh` and QuestDB memory for 16 GiB, and changes every instance-type lockstep site together; the new disk creates none of the Quote 34 tables.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Built in fc4397956 (#2120) with fixes 3fb7fe3ff (#2130), b62d5b118 (#2131), 99079a29d (#2132); ran 28 Oct (rule file: ENDED 2026-10-29, runs 40733150126/40745078734); deploy/aws/terraform/variables.tf instance_type default "r8g.large" with validation, ebs_gp3_
+  - Files: .github/workflows (new rebuild workflow), deploy/aws/terraform/variables.tf, scripts/aws-upgrade-instance.sh, crates/storage/tests/instance_type_lock_guard.rs, rule files naming the instance type
+  - Tests: instance-type lockstep guard at r8g.large; workflow dry-run lists every table and its verified S3 copy before any volume change
+- [x] 67 — **DONE 2026-10-22.** Rust-only lock §0.14 APPROVED by the owner 2026-10-22 (~19:25 IST, "Approve, one-off (Recommended)"); the role is created by the terraform apply on merge. `wipe_2026_10_31.rs` (pure classifiers, keep-list = `rebuild_keep_tables()`), `wipe_box.rs` (`tickvault wipe-box`), `wipe_ssm.rs`, `bin/wipe_2026_10_31.rs`, `deploy/aws/terraform/wipe-2026-10-31.tf`, `.github/workflows/wipe-2026-10-31.yml`. The 2026-10-31 wipe tool (Quote 35): a one-off Rust tool and workflow, dry run then apply then verify listing, box files then S3 versions, scoped delete permission refused after 2026-11-01 IST, SEBI/audit keep-list enforced in code; removed by the next PR.
+  - Files: crates/aws-lambdas/ (or a tools bin), .github/workflows/ (one-off), deploy/aws/terraform/ (one-off role)
+  - Tests: keep-list refusal for every SEBI/audit table and `sebi-preserve/`, `deploys/`, `logs/`; date fence; dry run deletes nothing
+- [x] 68 — Native budget `limit_amount` and the other lockstep sites to $75 on or after 2026-11-01 (Quote 37). Not before.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. Superseded by dated Quotes 52/54/59: origin/main deploy/aws/terraform/budget.tf:261 limit_amount = "140" (November only, Quote 59), crates/aws-lambdas/src/hard_stop_guard.rs STANDING_BUDGET_KILL_USD = 62.0 (December on, Quote 54) and NOVEMBER_2026_KILL_USD = 1
+  - Files: deploy/aws/terraform/budget.tf, budget-guards.tf, crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs
+  - Tests: lockstep guard at $75
+
+### Design (Items 62–68)
+Each item is its own commit on `claude/awesome-edison-2jvfhx` (stacked on PR #2119), landed as one PR after #2119 merges (one PR at a time). 62 removes whole paths rather than gating them, because the owner ordered the tables deleted; pieces another live path reads (the depth planners, the delay renderer) move to a neutral module. 63 swaps the data source behind one function so callers are unchanged. 64 derives every later bound from one stop constant so the times cannot drift apart. 65 removes alarms only with the feature or with a written review row. 66 and 67 are reviewed, dry-run-first workflows, the Quote 29e shape.
+
+### Edge Cases (Items 62–68)
+62: a seal spill file written by the old build (v5, old ordinals) at the first boot of the new build must be translated or refused and kept, never decoded as the wrong timeframe; the six tables on the box keep being archived until copied. 63: a budget with no spend yet (first hours of a month) reads 0, not a failure. 64: a day whose cross-verification has not finished by 16:23 keeps its retry rules; a drain hold past 16:30 still wins. 66: a WAL backlog that cannot drain in the window is copied, not deleted. 67: anything dated 2026-11-01 or later, or on the keep-list, is refused.
+
+### Failure Modes (Items 62–68)
+62: a missed reader of a removed table fails a guard or a query test; ordinal confusion is caught by the spill version check. 63: Budgets API refusal fails closed (the guard treats unknown spend as it treats an unknown Cost Explorer result today). 64: a stop that fires during an unsaved day is held by the drain hold. 66: any copy that does not verify stops the workflow before the volume change; the old volume stays attached. 67: the dry run is reviewed before apply; the role expires.
+
+### Test Plan (Items 62–68)
+Per item: the crate's lib and integration tests, clippy `-D warnings -W clippy::perf`, `cargo fmt --check`, the guards named per item, DHAT gates on the drain (62), the restart differential (62), pub-fn test and wiring guards, banned-pattern scanner, source size ratchet.
+
+### Rollback (Items 62–68)
+62: revert the commit (the tables' S3 copies exist until 31 Oct). 63: revert; Cost Explorer permission restored in the same revert. 64: revert the cron and constants. 65: re-apply terraform from the previous commit. 66: re-attach the snapshot volume and the old instance type. 67: nothing to roll back after apply (Quote 35 states the loss); before apply, delete the role.
+
+### Observability (Items 62–68)
+62: the six tables stop growing; `tv_candle_*` counters show 8 timeframes. 63: the digest and guard log the spend source (`budgets`). 64: the stop Lambda logs the 16:30 stop and any drain-hold deferral. 65: the review file is the record. 66/67: workflow logs plus a verify listing committed to `docs/audits/`. No new alarm, page, metric filter or EMF name in any item.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row + 7-row), applied as for ITEM 45.
+
+## ITEM DT — DESIGN ADDENDUM (added 2026-10-28): the frame drain never waits behind other work (p99 tail)
+
+**Approved by:** Parthiban, 2026-10-28, decision card "Approve all steps (Recommended)" on: "Live today: a typical tick is in RAM in ~21 µs and the slowest 1% in ~0.1 ms; only 1 in 1,000 takes ~1 ms and a few per day take several ms. Approve the plan to remove that rare tail (measure first, give the candle-builder its own thread, put the reader+builder on one core at high priority and the database on the other)?" The card stated the high-priority setting is a security change approved by this answer. Crates: `tickvault-core` (crates/core), `tickvault-app` (crates/app); plus `deploy/systemd/tickvault.service`. Never `crates/trading/src/indicator` or `strategy` (§28).
+
+**Measured before (live, 28 Oct 09:15–09:45 IST, 131,476 frames, per-message histogram `tv_hot_path_stage_ns_bucket`):** socket_to_wal p50 ≤ 1 µs, p99 ≤ 16 µs, p99.9 ≤ 33 µs; ring_dwell p50 ≤ 16 µs, p99 ≤ 66 µs, p99.9 ≤ 1.05 ms; drain_main_frame p50 ≤ 4 µs, p99 ≤ 16 µs, p99.9 ≤ 33 µs. Worst per minute (27–28 Oct): ring_dwell 9.2 ms, `tv_dhan_feed_ring_dwell_max_ms` 18.4 ms, main_runtime_lag 8.8 ms. The drain is one task among ~117 on a 2-worker main runtime.
+
+- [x] DT0. Measure first: a per-message receipt→folded stage (`receipt_to_fold`) in `hot_path_telemetry` with finer low buckets, O(1), zero allocation (DHAT), plus a 2-core `taskset` harness (400 µs spacing, 12,500 packets/s burst) that prints p50/p99/p99.9. Time the metrics upkeep tick.
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/app/src/dhan_feed_stack.rs, crates/core/tests/ (harness)
+  - Tests: test_receipt_to_fold_stage_records_one_sample_per_frame, dhat_receipt_to_fold_stage_zero_alloc
+  - Done 2026-10-29: `hot_path_telemetry::{Stage::ReceiptToFold, record_receipt_to_fold_nanos, fine_bucket_index, fine_quantiles}` (58-bucket quarter-octave histogram, `tv_hot_path_receipt_to_fold_fine_*`), recorded once per main-feed frame in `run_frame_drain` after `drain_main_feed_frame`; `Stage::MetricsUpkeep` timed by `observability::time_one_metrics_upkeep` (replaces the library's untimed loop, same 5 s, same runtime); both never page (`PAGED_STAGE_COUNT` = 5). Scheduling evidence: `crates/storage/src/hot_thread_sched.rs` (`register_ws_reader_thread` from `reader_runtime::build_reader_runtime`, `note_frame_drain_thread` from the drain's flush arm, `SchedPublisher::publish` on `tv-telemetry`: `tv_hot_thread_run_delay_ns_total{thread}`, `tv_hot_thread_involuntary_switches_total{thread}`, `tv_host_cpu_steal_ticks_total`). Harness `crates/core/tests/receipt_to_fold_harness.rs` (`#[ignore]`d). Tests also: `test_receipt_to_fold_has_one_record_site_after_the_main_feed_fold`, `test_parse_schedstat_run_delay_ns_reads_the_second_field`, `test_parse_status_nonvoluntary_switches_finds_the_line`, `test_parse_proc_stat_steal_ticks_reads_the_eighth_field`, `test_time_one_metrics_upkeep_records_the_stage`.
+  - Review fixes 2026-10-29 (hostile review of DT0): (1) the `frame_drain` scheduling series followed the drain's last host with one baseline and threw away every second the drain moved between workers (the contended case); replaced by `thread="main_workers"`, the sum over every main-runtime worker, registered from the runtime's `on_thread_park` hook (`hot_thread_sched::register_main_worker_thread`, `main.rs::build_main_runtime`) and released from `on_thread_stop` (`release_main_worker_thread`); `note_frame_drain_thread` and its drain call are gone (tests `test_regression_alternating_drain_hosts_lose_no_wait`, `test_park_hook_registers_workers_and_stop_hook_releases_them`, `test_build_main_runtime_registers_its_workers_for_the_sched_series`; the static-slot tests now share one lock, so they no longer race). (2) The harness is relabelled a ring-plus-decode yardstick: its consumer is a stand-in, not `run_frame_drain`, so it cannot judge DT1/DT2 and the Test Plan's "harness gate" below applies only to the hand-off; DT1/DT2 are judged on the live `receipt_to_fold` stage. (3) `Stage::ReceiptToFold` no longer claims every tick: ring-refused frames record nothing there and are read on `tv_dhan_ws_ring_{full,closed}_total`. (4) The DHAT test documents the one-time `/proc/thread-self` read per worker thread it does not measure. (5) "Local `/metrics` only" was wrong for cost: the CloudWatch agent ships every `/metrics` sample to the metrics log group; DT0 adds about 143 series, Assumed ~$0.15 to $0.30 a month, recorded in the module headers (no relabel drop: the live series are how DT1 to DT3 get judged).
+- [ ] DT1. Sleeping consumer for the frame ring: a "drain parked" flag; the reader pays the wake only when it is set (same pattern as `wal_writer_wait`).
+  - Files: crates/core/src/websocket/frame_ring.rs
+  - Tests: test_reader_wakes_the_drain_only_when_it_is_parked, proptest_frame_ring_sleeping_consumer_never_loses_a_wake
+- [ ] DT2. The drain runs on its own OS thread `tv-frame-drain` (plain loop; timers as deadline checks; shutdown as an atomic flag), the chain WAL → ring → fold → rescue → catch-up seal → shutdown withhold/final seal unchanged.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs
+  - Tests: test_drain_thread_shutdown_empties_the_ring_and_runs_the_exit_seal, the existing drain source scans moved with it
+- [ ] DT3. Core placement and priority: reader runtime and drain on core 1 (real-time priority 2 and 1), OS + QuestDB + main runtime on core 0 on the 2-vCPU r8g.large; `LimitRTPRIO` in the unit; refusal falls back to a plain pinned thread with one coded warning.
+  - **2026-11-12 ~16:15 IST, owner card "Yes, both, measure 1 day (Recommended)":** real-time priority ON in the production unit (`TICKVAULT_HOT_RT_PRIORITY=1`, `LimitRTPRIO=2`; readers SCHED_FIFO 2, drain 1) for one measured session against 12 Nov (drain waited 133 s of 268 s run on core 1; worst seconds 36 ms drain, 41 ms reader; host 15-20% busy). The second half of the card (CloudWatch agent kept on core 0 by a host-tuning drop-in) follows in its own PR. Undo: delete the two unit lines after a close.
+  - Files: crates/core/src/websocket/reader_runtime.rs, crates/app/src/main.rs, deploy/systemd/tickvault.service
+  - Tests: test_rt_priority_refusal_falls_back_to_a_pinned_thread
+- [x] DT-S1. Core placement behind four switches, every one OFF by default (owner 2026-10-30: "see why the fuck because of cores issue ms delay that it is nto at all acceptable dude see whtwave rtit is alwya sless than one miocroseocnd dude okay?"). A lighter first cut of DT2 + DT3: (1) `TICKVAULT_DRAIN_THREAD=on` runs the SAME `run_frame_drain` future on its own OS thread `tv-feed-drain` with a current-thread runtime, pinned to the readers' core (thread and runtime built before the hand-over, so a refusal falls back to `tokio::spawn` with the future intact); (2) `TICKVAULT_HOT_RT_PRIORITY=1` gives readers SCHED_FIFO 2 and the drain 1 (`SCHED_RESET_ON_FORK`), refused with a coded HOT-PATH-03 line unless `kernel.sched_rt_runtime_us` is below its period; (3) `TICKVAULT_BACKGROUND_CORE=0` pins the main thread before the main runtime is built, so its workers and every thread they spawn (WAL writer, seal writer, telemetry) inherit core 0; (4) `TV_QDB_CORE_ISOLATION=1` in the compose `.env` makes `host-tuning apply` put QuestDB on core 0 with one WAL and one shared worker, and removing it undoes exactly that. All syscalls stay in the one approved `affinity` module. Live proof (one measured day with the switches on) is still to do; DT2's plain-loop rewrite and the rest of DT3 stay open.
+  - Files: crates/core/src/websocket/hot_thread_placement.rs, crates/core/src/websocket/reader_runtime.rs, crates/app/src/drain_thread.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs, crates/app/src/host_tuning.rs, crates/app/tests/drain_placement_harness.rs, deploy/systemd/tickvault.service, docs/error-runbooks/wave-1-error-codes.md
+  - **2026-10-30 ~17:45 IST, owner decision (card in the coordinator session): "Yes, Monday live test (Recommended)" — "Own-core ON for Monday 2 Nov only, never-sleeping sorter OFF, measured minute by minute."** Applied by the follow-up PR on `perf/sub-us-core-monday` in the PRODUCTION units only: `TICKVAULT_DRAIN_THREAD=on` + `TICKVAULT_BACKGROUND_CORE=0` in `deploy/systemd/tickvault.service`, `TV_QDB_CORE_ISOLATION=1` in `deploy/systemd/tickvault-host-tuning.service` (read by `host_tuning::plan_questdb_host_env_with_unit_switch`, never written into the box `.env`). Real-time priority and busy-poll stay OFF. Takes effect at the after-close deploy restart (every switch is read once at process or unit start; the deploy guard blocks 09:00–15:45 IST). **Review with the Mon 2 Nov 16:15 IST verdict**; switching off = delete the three lines in an after-close update. Busy-poll (owner 30 Oct ~16:42 IST: "Build it, switch off (Recommended)") is NOT built yet and is never to be switched on on the 2-core server; it waits for the 2 Nov 4-core verdict or a 4-core upgrade, each a separate owner decision.
+  - Tests: test_drain_on_its_own_thread_matches_the_shared_runtime_byte_for_byte, test_spawn_frame_drain_with_own_thread_gives_the_same_output_as_shared, test_decide_hot_rt_refuses_when_throttle_off_or_unreadable, test_decide_hot_rt_applies_reader_one_above_drain_when_throttle_active, test_set_current_thread_fifo_reader_rt_outcome_current_thread_is_fifo_on_reader_workers_only, test_plan_questdb_host_env_core_isolation_off_undoes_what_it_set, drain_placement_wait_for_cpu_three_ways
+
+- [x] DT4. Instant "period ended" view for decisions (owner 2026-10-28: "see what about ticks secons cmintiues candle formations dude see that also shodu lbe fully taken care right dude"). A liquid instrument's bar already seals on its own next tick; a quiet one seals only after `CATCHUP_LATENESS_MARGIN_SECS` (240 s, derived from the measured 198.69 s worst Dhan delivery lag) so a late print is not lost. For decisions, the drain publishes, at each timeframe boundary of the drain clock, a provisional "period ended" read of the open bucket (values complete in RAM at that instant) without sealing it; the stored bar still waits for the margin and is amended by a late print. Boundary work is O(instruments touched in the period) sliced in fixed steps on the drain thread, never per tick; per-instrument read O(1). Measured: boundary-to-view p99.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): closed as obsolete. None of the named symbols or tests are on main (period_end_view, test_period_end_view_reads_the_open_bucket_without_sealing, test_late_print_after_period_end_view_still_amends_the_stored_bar). The goal, decision candles available right after a period ends, was
+  - Files: crates/trading/src/candles/multi_tf_aggregator.rs (read-only view only; no indicator/strategy code, §28), crates/app/src/dhan_feed_stack.rs
+  - Tests: test_period_end_view_reads_the_open_bucket_without_sealing, test_late_print_after_period_end_view_still_amends_the_stored_bar
+
+- [x] DT-S0. Sub-microsecond per-tick target, step 0 (owner 2026-10-29: "go ahead with your recommendation"): lock in what is already true. `feed_drain_main_feed` 2500 → 1000 ns per tick (CI median 768.7 ns, p99 922 ns per tick on 7cacc0e83, job 123319329443; CI multiplies by 2.5, so the CI ceiling is 2.5 µs for both the median and the p99 tail gate). New bench `feed_drain/main_feed_frame_4_full`: four NSE_FNO Full packets per frame with every price field set (LTP, ATP, day OHLC, ten depth prices) and inline depth book rows (production shape), a non-vacuity check before timing (every packet folds, ten levels stored), `[elements]` divisor 4. No production code changed; no stored row changed.
+  - Files: quality/benchmark-budgets.toml, crates/app/benches/feed_drain.rs, CLAUDE.md (key count 20 → 21, headline row)
+  - Tests: benchmark_budget_reaches_a_bench_guard (every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count), bench_budget_elements_guard, the feed_drain bench itself (cargo bench --bench feed_drain)
+
+- [x] DT-SOCK. Sub-microsecond socket read path (owner 2026-10-30: every in-memory step under 1 µs at p99, benches that fail the build, identical output). (a) The WAL receipt anchor read per frame moves from an `ArcSwap` (three SeqCst read-modify-writes per load) to a two-slot versioned cell read with plain loads; identical receipts (proptest against the old arithmetic). (b) DT1 in part: the frame ring's `recv` takes a queued frame before registering on its `Notify`, so the drain registers (and a reader can find it waiting) only when it is about to sleep. (c) `ws_reader/frame_handle_ns` now times the real per-frame read path (classify + depth-200 note + `WalRingSink::accept`, consumer awake); budget 5000 → 1000 ns. NOT removed: the wake of a PARKED drain (futex/eventfd, ~18 µs on the dev VM, the same as a bare `Thread::unpark`); it needs a drain that does not park (DT2/DT3 or a polling drain), an owner call.
+  - Files: crates/storage/src/ws_frame_spill.rs, crates/core/src/websocket/frame_ring.rs, crates/core/benches/ws_reader_frame_handle.rs, crates/core/tests/socket_read_in_memory_harness.rs, quality/benchmark-budgets.toml
+  - Tests: proptest_receipt_identical_to_the_arcswap_arithmetic, test_anchor_cell_reader_never_sees_a_torn_pair, test_refresh_with_publishes_adopted_anchors_and_keeps_a_refused_one_out, test_publish_ends_even_even_after_a_slot_was_left_odd, test_reader_wakes_the_drain_only_when_it_is_parked, proptest_frame_ring_sleeping_consumer_never_loses_a_wake
+
+- [x] DT-S5. Per-tick side stores under 1 µs (owner 2026-10-30): a Criterion bench and a per-call p99 gate (`crates/core/benches/support/tail_gate.rs`, exits 1 over the budget, self-tested to fail) for each store the drain updates per tick besides the fold and the row: `crates/core/benches/tick_gap_detector.rs` (`observe`, full at 25,000), `crates/app/benches/spot_price_store.rs` (`record`, full at 25,000, plus a concurrent reader), `crates/app/benches/backup_dedup.rs` (`admit_tick`, set full at 5,000, Full-size packets), `crates/storage/benches/tick_conservation_ledger.rs` (`note_row_appended`, same day and day rollover); budgets 400 / 250 / 400 / 100 ns. Two changes, behaviour identical: `TickGapDetector::observe` probes the index itself and assigns or refuses out of line (tracked median 62 → 42 ns; equality vs the previous body: `proptest_observe_matches_the_previous_body`, `test_observe_refusal_at_capacity_matches_the_previous_body`); the backup table's index hashes with `ahash` (accept 65 → 55 ns, p99 220 → 153 ns). Spot store and ledger unchanged (27 ns, 8 ns).
+  - Files: quality/benchmark-budgets.toml, crates/app/benches/feed_drain.rs, CLAUDE.md (key count 20 → 21, headline row)
+  - Tests: benchmark_budget_reaches_a_bench_guard (every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count), bench_budget_elements_guard, the feed_drain bench itself (cargo bench --bench feed_drain)
+  - Files: quality/benchmark-budgets.toml, crates/app/benches/feed_drain.rs, CLAUDE.md (key count 20 → 21, headline row)
+  - Tests: benchmark_budget_reaches_a_bench_guard (every_latency_budget_reaches_at_least_one_benchmark, claude_md_states_the_real_budget_key_count), bench_budget_elements_guard, the feed_drain bench itself (cargo bench --bench feed_drain)
+- [x] DT-FOLD. Sub-microsecond per-tick target, the candle fold (owner 2026-10-30: "every in-memory step a tick passes through must take under 1 microsecond at p99"). The fold widens each day price once per tick through a per-instrument memo keyed by its f32 bits (it ran the decimal price-cleaning loop about ten times a tick: the day open and close every tick, the day high and low once per timeframe still in its first session bucket), and the bucket grid divides by compile-time constants with the first-session bucket read from a compile-time table. Sealed bars, amendments and per-tick verdicts are unchanged: a seeded old-vs-new digest over eight scenario classes (live, mid-session boot, replay with gaps and hand-over, day close, u32 wrap, disorder, hostile prices, withhold) was recorded on the unchanged fold and still matches. Measured (x86 dev container, Criterion median per tick, the corrected bench that walks the whole table): hit 20,000 instruments 1,262 → 1,047 ns, hit 500 instruments 320 → 230 ns, live mix 723 → 602 ns; live-mix per-tick p99 1,271 → 893 ns. New `candles/consume_tick_live_mix_2k` bench (a 1-second seal on almost every tick) with a p99 gate (best of three passes), budget `candles_consume_tick` 1,000 ns per tick (CI × 2.5). Not met: the 20,000-instrument hit walk is still about 1.05 µs median, dominated by cache misses over a ~57 MB slot table (the next step is slot layout, not compute). A fast in-bucket path was measured at 1.3% fewer instructions and dropped.
+  - Files: crates/trading/src/candles/tf_index.rs, crates/trading/src/candles/aggregator_cell.rs, crates/trading/src/candles/multi_tf_aggregator.rs, crates/trading/benches/candle_fold.rs, crates/trading/tests/fold_golden_digest.rs, quality/benchmark-budgets.toml, CLAUDE.md (key count 21 → 23)
+  - Tests: fold_golden_digest (fold_output_is_identical_to_the_pre_speed_change_fold, every_class_produces_a_distinct_digest, the_streams_reach_every_fold_outcome), proptest_from_tick_memo_equals_from_tick, test_first_session_bucket_matches_the_grid_on_every_day, test_bucket_start_constant_divisor_matches_runtime_width_at_edges, proptest_bucket_start_constant_divisor_matches_runtime_width, restart_differential, dhat_multi_tf_fold
+- [x] DT-P. Per-minute live proof table (owner 2026-10-30: every in-memory step under 1 µs at p99, with real-time proof from the live server). On the existing `tv-telemetry` thread, each one-second window `publish_once` already reads is summed into a fixed per-minute accumulator; at each minute change one row per stage goes to QuestDB `hot_path_latency_minute` (p50 / p99 / p99.9 as bucket upper bounds, exact max, exact count over 1,024 ns, `publishes`), DEDUP `(ts, stage, feed)`, `ALTER ADD COLUMN IF NOT EXISTS` self-heal, DAY-partitioned and swept with the audit tables. Hand-off is a pre-allocated 64-minute bounded queue to its own `tv-latency-minute` writer thread (full queue drops the newest minute, counted on `tv_hot_path_latency_minute_dropped_total{reason}`, local `/metrics` only). `record_stage_nanos` untouched; no page, no alarm, no config default changed. Also the DT0 WIP re-review: a worker refused a scheduling slot (all 8 held) now retries every 1,024 parks instead of never.
+  - Files: crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_path_telemetry.rs, crates/storage/src/hot_thread_sched.rs, crates/storage/src/partition_manager.rs, crates/app/src/main.rs, crates/storage/tests/dhat_hot_path_latency_minute.rs, crates/storage/tests/ilp_overflow_bound_guard.rs, crates/app/tests/ensure_ddl_boot_wiring_guard.rs
+  - Tests: dhat_publish_window_with_minute_accumulator_is_zero_allocation, test_empty_minute_has_zero_samples_and_null_percentiles, test_one_sample_sets_every_percentile_to_its_bucket, test_all_samples_in_one_bucket, test_regression_top_bucket_overflow_is_the_sentinel_never_null, test_minute_rollover_closes_the_previous_minute, test_clock_going_backwards_keeps_the_current_minute, test_forward_jump_closes_once_and_skips_the_gap, test_regression_refused_worker_retries_after_slots_free_up
+- [x] DT-C. Capacity answer from live data (coordinator relay of the owner, 2026-10-30: "is the 4-core server needed?"). Two more tables through the same queue and writer thread as DT-P: `host_capacity_minute` (DEDUP `ts, feed`: per minute, CPU wait total and worst second of the reader threads, the main-runtime workers (drain, seal writer) and the WAL writer; process / host busy / steal CPU %; disk read and write bytes/s and write await for the device behind `data/`; QuestDB apply backlog and growing tables from the existing watcher reading; ticks accepted / not landed / lost; main-feed ring-refused frames) and `capacity_verdict_daily` (DEDUP `ts, trading_date_ist, feed`: written at the first minute at or after 15:40 IST; per signal pass / fail / unknown for tick-step p99 ≤ 1,024 ns, minutes with a tick over 1 ms, reader / drain CPU wait < 1 ms per second, disk at or above 90% of 125 MiB/s for more than 5 minutes, backlog at 15:40; verdict UPGRADE_NEEDED when CPU wait fails or the backlog fails on a ≥ 90% busy host, UNKNOWN on fewer than 300 session minutes or any missing signal, else NOT_NEEDED; reasons text). One `info` line per day (`source = "capacity_verdict"`), no page, no alarm. SQL to read all three: `docs/runbooks/hot-path-capacity-proof.md`. Review fixes in the same change: a `receipt_to_fold` percentile above 16.8 ms takes the log2 bound and an overflow is `i64::MAX`, never NULL; each queued item is appended under a buffer marker and rewound whole on failure; the ensure retries 10 × 30 s and reports only its last attempt; the fine histogram is read right after its stage's max.
+  - Files: crates/storage/src/host_capacity_minute.rs, crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_thread_sched.rs, crates/storage/src/ws_frame_spill.rs, crates/core/src/websocket/pool_supervisor.rs, crates/app/src/observability.rs, crates/app/src/main.rs, docs/runbooks/hot-path-capacity-proof.md
+  - Tests: test_decide_verdict_every_pass_fail_combination, test_decide_verdict_missing_data_is_unknown, test_day_verdict_partial_day_is_unknown, test_day_verdict_rollover_writes_the_previous_day, test_day_verdict_clock_back_across_midnight_is_skipped, test_build_host_row_degenerate_inputs, test_parse_diskstats_for_finds_the_device_and_misses_cleanly, test_tally_ticks_lost_once_sums_every_series, test_regression_top_bucket_overflow_is_the_sentinel_never_null, dhat_publish_window_with_minute_accumulator_is_zero_allocation
+- [x] DT-ROWS. Sub-microsecond per-tick target, the row-build stage (owner 2026-10-30): building one tick's database row (ILP text in the writer's buffer; the send is out of scope). New bench `tick_row_append/{full_row,quote_row,tick_quotes_row}` (1,000 rows per iteration, production-like contract names, budget `tick_row_append` = 1,000 ns per row). Prices now go through `tick_price_f64` (exactly `round_to_2dp(f32_to_f64_clean(v))`, a one-divide fast path for prices with at most two decimals below 2^17), the segment symbol skips the UTF-8 walk when plain ASCII, and the line writer pays one `anyhow` context instead of twenty. Bytes unchanged: old-vs-new proptests over random ticks and rows (NaN, infinities, zero, negatives, extremes, hostile segments, both tables) plus an exhaustive `#[ignore]`d check of every f32 below 2^17. DHAT 0 blocks per row. Honest limit: about 90% of the remaining cost is inside questdb-rs (ryu float text, name escaping), which its public API cannot bypass; the stage is at the 1 µs line on the dev container (0.84-1.05 µs per row), not under it with margin.
+  - Files: crates/storage/src/tick_persistence.rs, crates/storage/src/tick_row_identity_tests.rs, crates/storage/src/feed_aux_persistence.rs, crates/storage/benches/tick_row_append.rs, crates/storage/Cargo.toml, crates/storage/tests/dhat_tick_row_append.rs, quality/benchmark-budgets.toml, CLAUDE.md (key count 21 → 23)
+  - Tests: tick_price_f64_is_bit_identical_to_the_legacy_conversion, tick_price_f64_edge_values_are_identical, tick_price_f64_matches_legacy_for_every_fast_path_f32, ilp_segment_symbol_matches_sanitize_ilp_symbol, row_from_any_tick_is_identical_to_the_legacy_row, ilp_line_bytes_are_identical_to_the_legacy_writer, writer_bytes_are_identical_to_the_legacy_row_and_line, legacy_oracle_is_not_vacuous, dhat_tick_row_append_is_zero_allocation
+- [x] DT-DEPTH. Sub-microsecond per-tick target, the depth path per level (owner 2026-10-30): every depth row passed its 11 table and column names as `&str`, so QuestDB's client re-validated each name character by character on every row. The fixed names now go in as pre-checked `ColumnName` / `TableName` (`depth_col`, `depth_table`; a `debug_assert` runs QuestDB's own check), bytes unchanged. Measured on the x86 dev container: `feed_drain/depth20_frame_4x20` 531 → 366 ns per level, `feed_drain/depth200_packet` 638 → 437 ns per level. New bench `depth_row_append/{level_row,book_row_5}` (1,000 rows per iteration, medians 393 and 378 ns per row) with a per-call p99 gate (671-866 ns over three runs). Budgets: `feed_drain_depth` 1500 → 1000 ns per level, new `depth_row_append` = 1000 ns per row. No stored row changed.
+  - Files: crates/storage/src/depth_persistence.rs, crates/storage/benches/depth_row_append.rs, crates/storage/tests/table_schema_lockstep_guard.rs, crates/storage/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md (key count 34 → 36 after integrating main, headline row), scripts/git-hooks/pre-commit (integration deadline repair)
+  - Tests: the_prechecked_writer_writes_the_same_bytes_as_the_checked_one, proptest_prechecked_depth_lines_match_the_checked_lines, the_depth_ilp_names_pass_questdbs_own_name_checks, a_bad_depth_column_name_fails_every_debug_build, dhat_depth_append_zero_alloc, spill_ceiling_is_free_space_based_guard, loss_counter_visibility_guard, benchmark_budget_reaches_a_bench_guard, bench_budget_elements_guard, the depth_row_append bench and its p99 gate
+  - Review repairs 2026-10-31: the invalid-name test expects its panic only when debug assertions are enabled; release verifies the unchecked name is retained. The schema guard recognizes `depth_col` literal arguments, rejects malformed/dynamic names, proves a wrong builder is caught, and pins representative writes from both depth row layouts so pre-checking names cannot silently remove their schema checks.
+  - Codex revalidation 2026-10-31, x86_64 Xeon 8573C: 2,808 storage tests passed, 11 existing ignored; the optimized invalid-name regression passed. Unscaled 200,000-call p99 was 499 ns per level row and 548 ns per five-level side; individual maxima exceeded 1 µs. Depth-20/depth-200 amortized medians were 325/368 ns per level. The Full-frame median was 2,132 ns per tick against 1,000 ns, so the complete median budget gate failed. The identical workload on main `49dd25239` measured 2,389 ns per tick on this host and also failed; this PR's observed median was 10.8% lower. The whole-path target remains open.
+  - Integration tooling repair 2026-10-31: the native Git secret-scan hook timed out at 30 s on the 107-file staged merge, including with compilation idle. The identical complete scan passed in 38.7 s under a longer bound. Its deadline now matches the already approved `pre-commit-gate.sh` formula (60 s base plus staged-count/8, minimum 60 s); findings and timeouts still block and the scanned file set is unchanged.
+  - Prerequisite integration 2026-10-31: the depth continuation merges PR #2158 at `0fd844582cbdac209f54e4394459b799f2ba797a`, whose exact-head All Green passed, to obtain the complete workspace all-targets Clippy cleanup. PR #2158 remains draft and unmerged; this is an explicit dependency, not a claim that it has landed on main. Both histories and both plan sections are retained. The depth writer, benchmark inputs, budgets and shared native-hook correction remain byte-identical to the reviewed `aebe31bbf` checkpoint, so the recorded timing scope and the still-failing Full-frame target above remain unchanged. Combined validation passed: full workspace all-targets Clippy, formatting, and 15,439 workspace tests (0 failed, 33 existing ignored); plan verification checked 175 ticked items with 31 still open. Independent combined-source review found no blocking regression. Normal commit/push gates and the combined head's own CI remain publication checks, separate from the prerequisite's green result.
+- [x] DT-OWN-ILP. Our own ILP row writer (owner decision 2026-10-30, "Yes, build our own"; the row-build stage sat at the 1 µs line because about 90% of it was inside questdb-rs). New `crates/storage/src/tick_ilp.rs`: the `IlpLine` trait (table, symbol, i64, f64, timestamp column, designated timestamp), implemented by the library `Buffer` and by `OwnIlpBuffer`; the `ticks`, `tick_quotes` and `feed_aux_packets` layouts are written once over it. `RawIlpSender` posts the bytes to `/write?precision=n` from its own thread with the library's request shape and the tick writer's timeout (5 s plus 1 s per 100 KiB, no internal retry); the writer's one fast retry, rescue, spill and replay are the same code for both encoders. Switch `[tick_storage] own_ilp_encoder`, default false (pinned in base.toml by a test); turning it on in production is a separate owner step after a measured live day.
+  - Design: integers two digits per division into a fixed 20-byte block; a whole number of paise below 1e13 written from that count (proof in the module docs: the decimal c/100 has at most 15 significant digits, so ryu's shortest text is exactly its digits); every other `f64` printed by a reused library buffer, so its text is the library's by construction.
+  - Edge cases: NaN payloads, ±infinity, -0.0, subnormals, f64::MAX/MIN, 1e13 bound, values just past it, hostile symbol text (space, comma, equals, CR, LF, backslash), negative and i64::MIN integers, negative designated timestamp (refused, as the library does), half-written row at flush (refused), mixed encoder buffer and sender (refused, bytes kept).
+  - Failure modes: transport error (retryable, bytes kept, one fast retry then rescue, as the library's SocketError); 400/401/404/500 mapped like the library (not retried, bytes kept for the rescue); sender thread gone (counted as a failed send); buffer over 100 MiB (refused unsent, as the library).
+  - Test plan: below; plus the bench's per-row p99 gate on our encoder.
+  - Measured 2026-10-30 (x86 dev container, busy: main's library rows read 1.17-1.36 µs there): our rows 0.65-0.77 µs median (Criterion), per-call p50 0.57-0.66 µs, p99 0.86-1.19 µs over three runs; the library path after this change 1.20-1.34 µs, level with main. The p99 sits at the 1 µs line on this VM (its p99 runs about 1.8x the median for fixed code); CI gates it at 2.5 µs (BENCH_BUDGET_MULTIPLIER).
+  - Rollback: `own_ilp_encoder = false` (the default) restores the library path with no other change.
+  - Observability: unchanged counters and logs (the writer's flush, retry, rescue and HOT-PATH-02 paths are shared); the error text names the endpoint like the library's.
+  - Files: crates/storage/src/tick_ilp.rs, crates/storage/src/tick_ilp_tests.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/feed_aux_persistence.rs, crates/storage/src/tick_row_identity_tests.rs, crates/storage/src/lib.rs, crates/storage/benches/tick_row_append.rs, crates/storage/tests/dhat_tick_row_append.rs, crates/common/src/config.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/main.rs, config/base.toml
+  - Tests: test_exact_cents_f64_edge_values_match_the_library, test_exact_cents_every_paise_up_to_ten_lakh_rupees_matches_the_library, test_exact_cents_any_f64_bits_match_the_library, test_exact_cents_every_f32_price_below_2_pow_17_matches_the_library, test_full_line_matches_the_library, test_call_order_refusals_match_the_library, test_send_makes_the_same_request_as_the_library, test_send_maps_refusals_like_the_library_and_keeps_the_bytes, test_send_transport_failure_is_retryable_and_keeps_the_bytes, test_push_u64_digits_matches_the_standard_formatter_at_every_length, writer_bytes_are_identical_to_the_legacy_row_and_line, ilp_line_bytes_are_identical_to_the_legacy_writer, test_tick_storage_config_ships_off_in_base_toml, dhat_tick_row_append_is_zero_allocation
+
+- [x] DT-S1-drain. Sub-microsecond per-tick target, frame-drain lane (owner 2026-10-30, branch `perf/sub-us-drain`): measured where a tick's instructions go (callgrind, Quote bench, about 7,000 instructions per tick: row building in the storage crate 58%, the 8-timeframe candle fold 20%, the drain's own walk and recorders about 7%, the tick gap detector 3%). Inside the drain lane: the `tv_packets_by_response_code` and `folded` counter increments are summed per frame (one run of equal codes, one folded total, flushed by a Drop guard on every return), `dispatch_frame_uncounted` + `count_packets_by_response_code` in the core parser; the parsed tick is bound by reference; the two window-maximum `fetch_max` per new trade are skipped when a relaxed load already holds a value at or above the sample (`fetch_max_if_above`). Rows, candles and counter totals unchanged (old-vs-new proptests in `dhan_feed_stack/frame_tally_tests.rs` and `parser::dispatcher::uncounted_dispatch_tests`). The larger wins sit in row building and the fold, which other lanes own: proposals in the PR body, not done here. Budget unchanged.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/ws_lag_class.rs, crates/app/src/dhan_feed_stack/frame_tally_tests.rs, crates/core/src/parser/dispatcher.rs, crates/core/src/parser/mod.rs
+  - Tests: test_folded_counter_total_equals_the_per_packet_count, proptest_code_runs_count_every_packet_once, proptest_fetch_max_if_above_equals_fetch_max, test_dispatch_frame_uncounted_parses_like_dispatch_frame, test_every_main_feed_packet_size_has_a_header
+- [x] DT-PRICE. Two-decimal fast path in the price widening (2026-11-17, owner-approved speed work, identical output; branch `perf/price-fast-path`): `tickvault-common` `f32_to_f64_clean` tries scale 100 first for `0 < |v| < 2^17` and falls back to the unchanged search. Bit-identical because below 2^17 the f32 spacing (≤ 2^-7) is under 0.01, so at most one `fl(M/100)` narrows to `v`, and a search hit at scale 1 or 10 is such a value (proof in the function docs). Verified: new vs frozen old for all 2^32 inputs, 0 differences, 417 s release; new vs text path for all 2^32, 0 differences, 345 s release; per call 13.6–14.1 → 6.0–6.5 ns on a price mix (re-run after the miss path stopped repeating scale 100: 12.6–17.0 → 5.7–5.9 ns; a miss-heavy mix of 3- and 4-decimal values 22.0–23.3 → 21.0–21.6 ns, so a miss costs no more). Frame level, Assumed and NOT a measured gain: `feed_drain/main_feed_full_frame_4` Criterion median 4.23 → 3.84 µs per frame, `_own` 4.33 → 4.15 µs, `_own_nodepth` 2.49 → 2.52 µs, one back-to-back pair each (x86 dev container); `_own` moved half as much and `_own_nodepth` the other way, so about 5% run-to-run noise; quote only the per-call figure as evidence; not measured on the production host. O(1), no allocation, no unsafe.
+  - Files: crates/common/src/price_precision.rs, crates/common/tests/ignored_test_guard.rs
+  - Tests: test_f32_to_f64_clean_matches_frozen_search_for_every_f32, test_f32_to_f64_clean_matches_frozen_search_near_the_fast_path_bound, proptest_f32_to_f64_clean_equals_frozen_search_any_bits, proptest_f32_to_f64_clean_equals_frozen_search_on_prices, test_two_decimal_fast_path_constants_are_the_proven_values, test_f32_to_f64_clean_fast_path_timing
+
+- [x] DT-PR0-DEPTH. Measure first (2026-11-17, plan ITEM DT step "PR 0, measure first", owner-approved speed work; a MEASUREMENT, never a speed-up). `drain_main_tick` reads 2,104 ns mean live; a production-shape harness attributed about 400 to 500 ns of a Full tick to inline depth. New never-paged stage `drain_inline_depth` (`hot_path_telemetry::Stage::DrainInlineDepth`, last in `ALL_STAGES`, `PAGED_STAGE_COUNT` unchanged, 1 ms budget) times `append_inline_depth` inside `drain_main_feed_frame` for about 1 in 64 Full packets that reach that call, refused ones included, at jittered gaps of 32..=95 calls from a fixed xorshift32 sequence (review fix: an every-64th cadence was phase-locked to the frame shape) (`dhan_feed_stack/inline_depth_sample.rs`, `InlineDepthSampler`: plain `u32`s on the single-owner `LiveIngest`, one add, one compare and one branch per call, the clock read only on a sampled packet; no atomic added per tick, no allocation). `hot_path_latency_minute` gets its row automatically (15 a minute); speed page tile labelled sampled and diagnostic, no strict tile. The live depth share is NOT yet measured (needs a deployed session).
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/storage/src/hot_path_latency_minute.rs, crates/api/src/handlers/speed_health.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/inline_depth_sample.rs, crates/app/tests/dhat_live_ingest_seam.rs, crates/app/tests/inline_depth_sample_guard.rs, docs/error-runbooks/hot-path-stall-error-codes.md, docs/runbooks/hot-path-capacity-proof.md, CLAUDE.md
+  - Tests: test_sample_sequence_is_jittered_and_fixed, test_dhat_window_holds_149_samples, test_samples_spread_over_frame_positions, test_cadence_survives_the_u32_wrap, test_only_the_append_is_inside_the_clock, test_drain_samples_one_in_64_full_packets_with_inline_depth, test_no_inline_depth_sink_counts_nothing, test_drain_inline_depth_is_a_recorded_never_paged_stage, test_every_minute_has_a_drain_inline_depth_row, test_drain_inline_depth_is_a_sampled_diagnostic_tile_only, drain_times_only_the_inline_depth_append_through_the_sampler, guard_bites_when_the_clock_holds_more_than_the_append, full_mode_frame_with_inline_depth_does_not_allocate_per_tick, full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick (each now asserts exactly 149 sampled packets inside its DHAT window), hot_path_stall_runbook_names_every_stage
+- [x] DT-FIX5. Both depth sides in one append; generation-checked name-table pin (2026-11-17, speed fix 5 of the 8-fix plan, owner-approved speed work, identical output; branch `perf/fix5-depth-append`). Removes work only. (1) `TickWriter::stage_row` (every tick and aux row) and the book writer's run-name miss no longer load the shared name table while its publish generation has not moved since the batch's last pin was loaded (`DepthStagedBatch` / `StagedBatch::try_pin_at_generation` and `current_pin_at_generation`; the book writer reads the name from the pinned table, `DepthStagedBatch::labels`): one acquire load and one compare instead of an `ArcSwap` load and guard drop. (2) `append_inline_depth_book` builds both sides on the stack and calls `DepthWriter::append_book_pair` once (`DepthBookPair`): window gate, layout check, name lookup, line length (equal level counts) and pending range done once; a level writer or a malformed side falls back to the two single appends. Same rows, order, bytes, refusals and counts (proven against two single appends and against the legacy text append, bite-tested). Measured 2026-11-17 (feed_drain, 4 alternating rounds, distinct binaries, x86 dev container, no metrics recorder; median of the four medians per 4-tick frame): quotes 2.438 → 2.245 µs (−7.9%), full_frame_4 4.944 → 4.567 µs (−7.6%), full_frame_4_own 4.555 → 4.173 µs (−8.4%), own_nodepth 3.094 → 3.032 µs (−2.0%); round-to-round noise about ±30%, so read as "not slower, likely faster". Not measured on the prod host. Review fix the same day: a publish bumps the generation to odd before its store and to even after (`PublishInFlight` guard, also on panic), and a cached pin is reused only on an even generation (`generation_is_settled`), so a descheduled publisher never leaves a row on the old table.
+  - Files: crates/storage/src/depth_persistence.rs, crates/storage/src/depth_stage.rs, crates/storage/src/tick_stage.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/depth_stage_tests.rs, crates/storage/src/depth_stage_oracle_tests.rs, crates/storage/src/tick_stage_tests.rs, crates/app/src/dhan_feed_stack.rs, CLAUDE.md
+  - Tests: proptest_fix5_append_book_pair_equals_two_single_appends, proptest_fix5_publish_heavy_stream_equals_the_legacy_append, proptest_fix5_generation_pin_equals_a_fresh_load_across_publishes, proptest_fix5_tick_generation_pin_equals_a_fresh_load_across_publishes, test_fix5_ninth_name_table_through_append_book_pair_keeps_every_byte, test_fix5_run_change_without_a_publish_reads_the_pinned_table, test_append_book_pair_on_a_level_writer_refuses_both_sides, test_append_book_pair_with_unequal_sides_writes_each_line_at_its_own_length, test_try_pin_at_generation_records_the_generation_only_on_success, test_current_pin_at_generation_answers_only_the_last_pin_of_that_generation, test_labels_reads_the_pinned_table_and_an_unused_slot_reads_empty, test_fix5_pin_steps_reach_a_ninth_table, test_tick_try_pin_at_generation_records_the_generation_only_on_success, test_tick_current_pin_at_generation_answers_only_the_last_pin_of_that_generation, test_pf4b_drain_book_append_never_writes_ilp_text
+- [x] DT-FIX6. Stage the raw tick; slim staged rows (2026-11-17, speed fix 6 of the 8-fix plan, owner-approved speed work, identical output; branch `perf/fix6-raw-tick-stage`). Removes work only. The drain builds a `RawTick` (88 B: id, `ts`, `received_at`, capture sequence computed as before, prices still `f32`) instead of a converted 264-byte `TickRow`; the six `tick_price_f64` conversions and the segment string run on the encoding thread (`RawTick::to_row` / `to_quote_row`, the same functions, the same row bit for bit). Every refusal and drain counter stays on the drain at the same moment (`checked_tick_identity` now shared with `TickRow::from_parsed_tick`; the optional-price count in the same field order; the non-finite tripwire on the `f32`). `StagedRow` 288 → 96 B: aux rows and test-only prepared rows live whole in a side store (`ExtraRow`, `push_extra`; consecutive side rows of one table and pin are one staged run), reserved and pre-touched with the batch (two allocations, about 6 MiB committed, was 4.5 MiB); `append_row` is test-only. Measured: 2026-11-17, x86 dev container, release, distinct base (d6af367d8) and new binaries, 4 alternating rounds, median of the four Criterion medians: `tick_row_append` per row full 95 → 37 ns, quote 98 → 37 ns, `tick_quotes` 84 → 25 ns (own encoder p50 122-142 → 73-74 ns, p99 259-303 → 87-108 ns); `feed_drain` per 4-tick frame quotes 1.70 → 1.46 µs (−14%), full_frame_4 3.50 → 2.87 µs (−18%), full_frame_4_own 3.48 → 2.87 µs (−17%), own_nodepth 2.30 → 1.63 µs (−29%, about 168 ns a tick), wrong_day_skip 754 → 736 ns (noise); wrong_day_written 1.52 → 1.88 µs (+23%, an aux row writes 280 B where it wrote 288 B: with glibc's mmap threshold pinned, `MALLOC_MMAP_THRESHOLD_=131072`, the two read 1.77 and 1.86 µs over three alternating runs with equal minor faults, so the gap is the bench rebuilding a writer every 1,024 frames, a second pre-sized allocation glibc no longer recycles from its heap, Assumed absent in production where batches are recycled, not measured there). Not measured on the prod host.
+  - Files: crates/storage/src/tick_stage.rs, crates/storage/src/tick_stage_raw.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/tick_stage_tests.rs, crates/storage/src/tick_stage_raw_tests.rs, crates/storage/src/tick_stage_oracle_tests.rs, crates/storage/tests/dhat_tick_row_append.rs, crates/storage/tests/dhat_tick_rescue_spare.rs, crates/storage/tests/pf4_drain_never_encodes_guard.rs, crates/storage/tests/session_window_gate_guard.rs
+  - Tests: proptest_raw_tick_to_row_and_to_quote_row_equal_the_converted_row, proptest_raw_tick_from_parsed_tick_counts_what_the_converted_row_counted, test_raw_tick_from_parsed_tick_counts_each_refusal_like_the_converted_row, proptest_pf4_staged_bytes_equal_the_legacy_append_library, proptest_pf4_staged_bytes_equal_the_legacy_append_own, test_push_extra_runs_side_rows_and_extra_row_table_and_capture_seq, dhat_tick_row_append_is_zero_allocation, dhat_rescue_hand_off_reuses_a_recycled_batch, pf4_the_drain_append_path_writes_no_ilp_text
+
+### Design (Item DT)
+The drain's per-frame work is O(packets) ≤ 0.26 ms worst; the tail is scheduling wait. A dedicated thread removes the wait behind ~117 tasks; core placement and priority remove CPU contention; the sleeping-consumer flag keeps the reader's hand-off O(1) and wake-free while the drain is busy. Each step lands as its own PR, measured live before the next (DT0 first).
+
+### Edge Cases (Item DT)
+Burst at 09:15 (12,500 packets/s); ring full (frame already in the WAL, re-folded later); drain thread panic (panic = abort in release: process exit, systemd restart, WAL replay); RT priority refused by the kernel or container; 1-vCPU host (both on one core, no RT); shutdown mid-burst; clock step; QuestDB stall (the drain's blocking flush paths still run inline, unchanged).
+
+### Failure Modes (Item DT)
+A runaway RT thread is capped by the kernel RT throttle (950 ms/s, Assumed default; checked at boot and logged). Lost wake → ring fills → shed to WAL → re-fold (no loss; counted). QuestDB on core 0 may apply slower (apply lag watched; rollback if worse).
+
+### Test Plan (Item DT)
+DHAT zero-alloc on the new stage and drain loop; proptest on the wake protocol; the 2-core harness gate p99 ≤ 500 µs; one live canary day on r8g.large: receipt→folded p50 ≤ 50 µs, p99 ≤ 200 µs, p99.9 ≤ 1 ms, worst per minute ≤ 1 ms, ticks lost 0 (owner 2026-10-28: "this shodu leb einstantl yfixed as less than 1 ms always dud eokay?"; tightened from p99 ≤ 500 µs / p99.9 ≤ 2 ms / worst ≤ 5 ms). Hypervisor steal time is measured and shown separately (`/proc/stat` steal, O(1) per sample on the telemetry thread), so a tick over 1 ms is attributed to us or to the host. The harness gate is p99 ≤ 200 µs.
+
+### Rollback (Item DT)
+Each step behind a config switch defaulting to today's behaviour until its live day passes (`[feeds] drain_thread`, `[feeds] rt_priority`); revert = flip the switch and redeploy; DT0 is measurement only.
+
+### Observability (Item DT)
+New stage `receipt_to_fold` in `tv_hot_path_stage_*` (local `/metrics`; any CloudWatch page needs its own dated noise-lock row first), boot log of the core layout and RT priority result, dashboard panels beside ring_dwell and runtime lag.
+
+- [x] DT-FIX4. Speed fix 4 of 8 (2026-11-17, plan ITEM DT, owner-approved speed work; removes work only). The drain computes the WebSocket lag once per new trade (`record_ws_lag` returns the whole-ms lag, `record_ws_lag_max(segment_code, lag)` reuses it; both still gated as before: max only on a live socket and a lag above 0), and four success counters (`tv_dhan_feed_ingest_ticks_total` and the `ltt_not_advanced`, `not_new_trade`, `not_a_trade` lag exclusions) are counted once per frame through `FrameTally`, flushed in its Drop on every return path, before any other drain arm can publish. Every loss, refusal and fault counter, the lag histogram, the day lag distribution and both maxima stay per tick. Measured (feed_drain, 3 alternating rounds, no metrics recorder): quotes -6%, others within +/-3% both ways, so no regression; the counter saving exists only under the production recorder and is not measured here.
+  - Files: crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/frame_tally_tests.rs, crates/app/tests/drain_loss_series_seeding_guard.rs, crates/app/tests/ws_lag_clock_guard.rs, CLAUDE.md
+  - Tests: frame_tally_tests (fixed every-class case + 96-case proptest against a per-tick twin), the lag-once old-vs-new edge test, dhat_ws_lag, dhat_ws_lag_recorder, dhat_live_ingest_seam, drain_loss_series_seeding_guard, ws_lag_clock_guard
+
+## DT-PROOF integration — recoverable writes and honest daily evidence (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed continue-all-work request, relayed by the coordinator on 2026-10-31. Integrate the four tested proposals on `0fd844582`; no live database, production setting, merge or auto-merge action.
+
+When the evidence store is unavailable, keep a bounded set of rows and retry. When the evidence is incomplete, report UNKNOWN. A healthy-looking daily row must not stand in for observations that were never made or never persisted.
+
+| Problem | Integrated behavior | Remaining boundary |
+| --- | --- | --- |
+| Sender initialization failed once | Retry initialization with the same bounded pending rows | Queue and pending caps can still discard; no durable proof spool |
+| Successful DDL response without the required keys | Verify all three real metadata contracts before enabling writes; retry with bounded backoff | Gate is a boot latch, not continuous external-schema monitoring |
+| Dedicated drain CPU wait omitted | Register the actual drain thread for its lifetime and select its scheduler sample | Shared mode uses main-worker proxy; member/interval validity remains limited |
+| Partial day or ambiguous 1,024 ns bucket looked complete | Require distinct calendar minutes and known signal evidence; legacy strict-latency ambiguity remains UNKNOWN | Source freshness and persisted-row completeness require separate readback |
+
+- [x] Integrate retrying proof writer and strict schema readiness, preserving wire names, keys and pending-row caps.
+  - Files: crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_path_latency_minute/proof_table_readiness.rs, crates/storage/src/hot_path_latency_minute/readiness_tests.rs, crates/app/src/hot_path_proof_boot.rs
+  - Tests: test_writer_recovers_after_initialization_failure_without_replacing_rows, test_disconnected_flush_enforces_the_pending_row_cap, test_ensure_hot_path_latency_minute_table_rejects_missing_keys_and_recovers, test_rejected_writer_start_never_spawns_an_ensure_task, test_ensure_retries_past_ten_with_a_bounded_backoff
+- [x] Integrate dedicated-drain lifecycle attribution and daily/calendar coverage without discarding either proposal's tests or the all-targets Clippy cleanup.
+  - Files: crates/storage/src/hot_thread_sched.rs, crates/storage/src/host_capacity_minute.rs, crates/storage/src/host_capacity_minute/coverage.rs, crates/storage/src/host_capacity_minute/coverage_tests.rs, crates/storage/src/hot_path_telemetry.rs, crates/storage/tests/dhat_hot_path_latency_minute.rs, crates/app/src/drain_thread.rs, crates/app/src/main.rs, crates/app/tests/drain_scheduler_registration.rs
+  - Tests: test_register_drain_thread_unwind_releases_registration, test_last_second_drain_run_delay_ns_uses_own_wait_in_host_row, test_spawn_frame_drain_with_registers_scheduler_until_normal_or_panicking_exit, test_day_verdict_missing_exclusion_counters_are_unknown, test_decide_verdict_strict_target_never_accepts_ambiguous_legacy_bucket
+- [ ] Run combined scoped tests, schema/overflow/boot guards, allocation ratchet, warnings-denied all-targets Clippy, plan/normal commit gates, and independent reviews; record actual results and remaining limits.
+  - Files: docs/runbooks/hot-path-capacity-proof.md, .claude/plans/active-plan-feed-hardening.md
+  - Validation: one Cargo job, clean local-package artifacts before reusing the shared target; detailed execution manifest saved with the integration report. No live result is inferred from local tests.
+
+The separately tested scheduler and daily-coverage proposal plans are consolidated into this item; their implementation, tests, prior negative controls and stated limits are retained. The four input patch identities and combined source hashes belong in the integration evidence packet. The 15-row and 7-row matrices in `.claude/rules/project/per-wave-guarantee-matrix.md` apply to each item above, with the following concrete scope:
+
+| Review box | Evidence or scope |
+| --- | --- |
+| Behavior and scenarios | Sender initialization/flush failure, missing/wrong keys, timeout/oversized metadata, retry/cancellation, retained-row wakeup, scheduler lifetime and replacement, partial/empty/duplicate calendar minutes |
+| Audit and uniqueness | Existing proof table layouts/DEDUP identities retained; no new audit table or schema |
+| Monitoring and logging | Existing drop/discard counters and coded errors retained; existing daily reasons identify UNKNOWN |
+| Alerting | No new metric, EMF label, alarm, page or live switch authorized in this change |
+| Tests and code checks | Combined focused/scoped app-storage tests, DHAT, source/metadata guards, Clippy, native hooks and independent review; coverage CI remains separate evidence |
+| Performance | Per-event recording unchanged; bounded minute bookkeeping and cold thread/DDL work; no sub-microsecond or exact one-second claim |
+| Security | Fixed SQL/table names, bounded response accumulation, existing endpoint/auth configuration; no new dependency or live endpoint |
+| Recovery | Bounded in-memory retries only; shutdown ownership, crash/power-loss durability and proof spooling remain open |
+| Deployment and rollback | Local integration only; revert this correction to restore previous behavior; deployment and dated live readback require their own evidence |
+
+The following matrices apply to each of the three DT-PROOF items. Demand labels are the rule's labels; they do not assert universal coverage or a live pass. Pending checks remain pending.
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+| --- | --- | --- | --- |
+| 100% code coverage | Existing ratcheted coverage floors; no local llvm-cov percentage asserted | PR coverage job remains separate | No floor lowered; review coverage delta in CI |
+| 100% audit coverage | Existing three proof tables and unchanged DEDUP identities | Dated metadata and row readback required; not run in production here | Schema lockstep and actual-key fixtures pass |
+| 100% testing coverage | Unit, integration, existing property suites, DHAT and schema/boot/source guards; earlier proposal negative controls retained | Scoped app/storage suite in progress | Fuzz, mutation campaign, sanitizers and live chaos are not claimed by these focused tests |
+| 100% code checks | Fmt, Clippy, banned-pattern, public-function, plan and secret gates | Native commit/push evidence and CI remain separate | Warnings denied; no guard bypass |
+| 100% code performance | Existing zero-allocation publisher/accumulator DHAT ratchet | No live latency pass inferred | Per-event recording unchanged; bounded cold/minute work |
+| 100% monitoring | Existing rows, metrics and daily reasons | Check dated rows plus local drop/discard counters | No new telemetry layer claimed or metric added |
+| 100% logging | Existing coded error paths and bounded drop-episode warning | Log success is not row persistence | Error-level metadata guard; retained existing codes |
+| 100% alerting | Existing alert configuration remains unchanged by explicit scope | No new page or alarm authorized | Missing-row observation is a manual runbook check here |
+| 100% security | Fixed SQL names, 64 KiB response cap, existing endpoint config | No production credential or endpoint action | Independent security review and secret scan required |
+| 100% security hardening | No new dependency, dynamic SQL name or external service | Deployment/IP policy unchanged | Attack-surface delta limited to bounded metadata reads |
+| 100% bugs fixing | Recovery, readiness, scheduler and coverage regressions | Missing evidence reports UNKNOWN | Three independent review roles coordinated by root |
+| 100% scenarios covering | Initialization, failed DDL, wrong metadata, oversized responses, pressure, retry and calendar gaps | Actual Monday failure/readback evidence still pending | Concrete fixture cases and previously executed negative controls retained |
+| 100% functionalities covering | New public-function tests and production call sites | Startup result distinguishes spawned from ready | Public-function test and wiring guards pass |
+| 100% code review | Prior proposal reviews plus final integrated reviews | No live result attributed to source review | Root collects all final roles before draft PR |
+| 100% extreme check | Bounded cap, timeout and recovery regression cases | No claim for every failure combination | Scoped tests and unchanged ratchets must pass |
+
+| Demand | Honest envelope | Per-item proof |
+| --- | --- | --- |
+| Zero ticks lost | Proof delivery is bounded and can discard; tick persistence path is unchanged | No new tick drop path; proof cap/drop behavior tested and disclosed |
+| WS never disconnects | No WebSocket lifetime guarantee made by this work | Subscription guards and reconnect implementation unchanged |
+| Never slow/locked/hanged | Cold HTTP is timeout-bounded; per-event allocation unchanged; OS/disk stalls remain possible | Existing DHAT ratchet and source review; no latency benchmark claim |
+| QuestDB never fails | Failed ensure/write leaves bounded pending data and retries; shutdown/crash can lose proof rows | Real metadata fixture regressions and prior owned QuestDB contract evidence |
+| O(1) latency | Fixed stage/slot bookkeeping per observation; calendar lookup is once per date on the cold telemetry path | No unbounded per-event scan or new event allocation |
+| Uniqueness + dedup | Existing proof keys retained; feed/stage/date identity validated from metadata | Exact key/type/timestamp tests and schema lockstep guards |
+| Real-time proof | Local changes improve evidence honesty; persisted/fresh dated observations still required | Monday runbook and explicit UNKNOWN for missing/ambiguous data; no live pass here |
+
+Known limits remain: a registered scheduler member can be unreadable behind another readable aggregate member; calendar minute counts do not certify exact sampling intervals; cached backlog values have no successful-poll timestamp; a daily decision accumulates before downstream persistence and cannot certify that every proof row landed; HTTP acknowledgement is not a power-loss durability guarantee. The current legacy 1,024 ns histogram cannot certify strict p99 below 1,000 ns. Strict instrumentation is separate coordinated work, not silently folded into this validation claim.
+## DT-STRICT — exact classification below 1,000 ns (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed strict-target request relayed by the coordinator, with explicit approval of the three nullable LONG fields, exact type readiness, same-snapshot counts and no new daily PASS path. Source preparation first; builds and quiet-host benchmarks require coordinator resource slots. No deployment or live setting change.
+
+The old first bin is like one box holding both 999 ns and 1,000 ns: its label cannot tell which side of the requested limit a sample occupied. Two disjoint boxes make that distinction while the old exporter can still add them together.
+
+| Evidence | Meaning |
+| --- | --- |
+| Historical p99 upper bound 1,024 ns | Strict target UNKNOWN |
+| Version 1, nonzero N, violations at most `N / 100` | Recorded population's nearest-rank p99 below 1,000 ns |
+| More violations | Observed strict FAIL; equality at 1,000 counts as a violation |
+| Missing/invalid version or counts, zero samples | UNKNOWN |
+| Positive counts without interval/freshness proof | No whole-session PASS |
+
+- [x] Split the first raw atomic bin, retaining one event-bin increment and the legacy exporter projection; derive exact counts from the same raw snapshot difference.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c) added crates/storage/src/hot_path_telemetry/strict_threshold.rs (mod strict_threshold; raw_bucket_index, strict_window, legacy_buckets) and strict_tests.rs with all four named tests, including test_record_stage_nanos_strict_boundaries_keep_le
+  - Files: crates/storage/src/hot_path_telemetry.rs, crates/storage/src/hot_path_telemetry/strict_threshold.rs, crates/storage/src/hot_path_telemetry/strict_tests.rs
+  - Tests: test_record_stage_nanos_strict_boundaries_keep_legacy_projection, test_strict_sample_counts_p99_below_1000ns_uses_exact_nearest_rank, test_strict_window_regression_is_unknown_and_next_window_recovers, test_strict_window_concurrent_real_recording_conserves_the_same_population
+- [x] Persist nullable versioned counts through additive DDL and protocol V1; require exact LONG readiness and omit all strict fields together on invalidity or signed overflow.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c): crates/storage/src/hot_path_latency_minute.rs has columns strict_version, strict_samples and strict_samples_at_or_above_1000ns as LONG (lines ~182-184), the row fields, and the ILP write through StrictSampleCounts::ilp_counts. strict_tests.r
+  - Files: crates/storage/src/hot_path_latency_minute.rs, crates/storage/src/hot_path_latency_minute/strict_tests.rs, crates/storage/src/hot_path_latency_minute/proof_table_readiness.rs, crates/storage/src/hot_path_latency_minute/readiness_tests.rs
+  - Tests: test_from_columns_and_strict_counts_reject_legacy_partial_and_bad_counts, test_minute_strict_counts_never_mix_receipt_fine_and_raw_populations, test_append_row_strict_version_and_counts_are_v1_integers_and_jointly_present, test_ensure_strict_columns_must_all_be_long_before_any_write
+- [x] Preserve observed strict failures in the daily evaluator, with explicit interval/freshness UNKNOWN for positive counts; document scope and keep operational stall behavior separate.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. #2187 (43f03f14c): crates/storage/src/host_capacity_minute.rs has strict_failed_minutes / strict_sampled_minutes and the reasons 'FAIL strict_1000ns_observed' and 'UNKNOWN strict_session_intervals_unproven'. coverage_tests.rs holds test_day_verdict_strict_fail
+  - Files: crates/storage/src/host_capacity_minute.rs, crates/storage/src/host_capacity_minute/coverage.rs, crates/storage/src/host_capacity_minute/coverage_tests.rs, docs/runbooks/hot-path-capacity-proof.md
+  - Tests: test_day_verdict_strict_failure_survives_1024_bound_and_incomplete_session, test_day_verdict_strict_passing_counts_do_not_certify_session_intervals
+- [ ] Validate boundaries, rank, resets/overflow, concurrency, schema/ILP compatibility and allocation; run meaningful negative controls and coordinated before/after recorder timing. Record measured scope and remaining gaps.
+  - Files: crates/storage/tests/dhat_hot_path_telemetry.rs, crates/storage/tests/dhat_hot_path_latency_minute.rs
+  - Tests: dhat_record_stage_nanos_and_stage_quantiles_are_zero_allocation, dhat_publish_window_with_minute_accumulator_is_zero_allocation
+
+Each item cross-references the 15-row and 7-row matrices in `.claude/rules/project/per-wave-guarantee-matrix.md`. Concrete scope: fixed arrays and one histogram increment per event; cold minute/schema work; unchanged table keys, exporter names/labels, stall budgets, alerts, dependencies and live toggles; three nullable LONG columns on the existing minute table; unit/property/concurrency/protocol/schema/DHAT checks and independent review. Coverage, full workspace checks, real engine migration and actual latency measurements need execution evidence. No absolute performance or loss guarantee is made. Exact observation intervals, source freshness, hidden scheduler members and uninstrumented inner operations remain separate work.
+
+## ADVERSARIAL-2159 — retained input properties and exact order integers
+
+- [x] Complete the preserved adversarial-input work and validate the integrated
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Merged in #2187 (43f03f14c), commit body 'fix(parser): preserve exact order integers with adversarial checks ... Preserve the net adversarial test and fuzz-target work from #2159'. It touches crates/core/src/parser/order_update.rs (+293), crates/core/src/instr
+  replacement branch. Continuation requested by the owner on 2026-10-31 through
+  the coordinator; implementation and independent review are in progress.
+  Files: crates/core/src/parser/order_update.rs,
+  crates/core/src/instrument/master_csv.rs, crates/core/tests/, crates/common/tests/,
+  crates/trading/tests/, crates/storage/tests/, crates/app/tests/, fuzz/,
+  .github/workflows/fuzz.yml.
+
+### Design (ADVERSARIAL-2159)
+
+The original source is commit `fd6ff357f1ec3c9aa688f916e1ab5581f111743b`
+from PR #2159. Its branch and commits remain intact. The replacement starts at
+the all-targets Clippy prerequisite `0fd844582cbdac209f54e4394459b799f2ba797a`
+(main baseline `49dd25239bde21411008b11bd76c51d5e0f8284f`) and applies the
+original branch's net work as a new conventional commit. The old handoff
+commit's unsupported subject cannot be repaired by a later commit because
+CommitLint scans the whole PR range; no force push, history rewrite or lint
+exemption is used.
+
+Retain all original adversarial suites, saved proptest cases, the decimal
+lot-size fix, seven new fuzz targets and their workflow entries. Extend the
+order fuzz round-trip oracle to every integer and text field. State the config
+mutation grid's actual guarantee: panic freedom and aggregate rejection-path
+non-vacuity, with typed field-specific refusals in its separate guard tests.
+
+For order JSON, construct a literal recursive JSON tree before normalization,
+then inspect original token spans for the winning integer aliases. The tree
+visitor treats every decoded object key literally even when the app's existing
+serde_json feature graph enables `raw_value`. It recursively wraps both maps
+and arrays; no nested node delegates to ordinary Value deserialization. The
+span walker runs only after successful whole-frame syntax validation, uses
+serde's IgnoredAny skipping and byte offsets, and decodes escaped keys with
+serde. A winning numeric token must equal the digitwise exact decimal integer
+and the normalized integer; it never substitutes a rounded quantity.
+
+The added token scans are linear in bounded frame bytes; total tree parsing
+retains map insertion costs and allocations. The 256 KiB input cap is not a
+heap-byte ceiling or a constant-time guarantee. Keep syntax/depth checks, typed errors,
+existing conservative float-shaped integer magnitude limit and string behavior.
+No parser dependency, feature declaration, version pin or coverage floor changes.
+
+The literal array visitor consumes the first element before reserving a small
+named initial capacity. Empty arrays retain zero capacity; nonempty arrays
+reserve four entries, without trusting size hints or multiplying the frame
+limit by every nested array. This is explicit allocation policy within the
+existing allocating JSON path, not an allocation exemption or strict heap cap.
+The typed numeric error uses formatting arguments to avoid a temporary String.
+
+### Edge Cases (ADVERSARIAL-2159)
+
+Cover every integer field and both casings, tiny fractions, underflow, exponent
+forms, signed zero, i64 endpoints and values outside the accepted range.
+Accepted-key precedence, accepted null fallback, same-key last-wins and wrapper
+casing remain unchanged. Validate selected values only; discarded conflicting
+aliases do not poison a valid winner. Escaped keys and nested/text lookalikes
+must select the same fields as the literal tree. Ordinary unknown keys and text
+remain usable; objects that resemble dependency-private tags stay objects.
+
+For strategy recipes, random single-byte deletion may leave a different valid
+recipe, so keep that property's explicit no-panic contract. A separate oracle
+first accepts a complete valid recipe, then removes its guaranteed final object
+delimiter and requires the typed BadRecipe refusal. Do not inflate the
+assertion-free test budget or pretend arbitrary deletion always corrupts JSON.
+
+Arbitrary byte domains also contain valid recipes, snapshots and manifests.
+Seed those values explicitly: assert accepted snapshot values and documented
+recipe outcomes; a valid manifest naming an absent file yields MissingFile,
+while malformed manifest entries yield BadManifest. Keep every original random
+byte domain. Temporary case directories acquire ownership only after exclusive
+creation, retry collisions within a fixed bound, and preserve an existing
+owner's sentinel. The main-feed fuzz oracle shares the production packet cap;
+a Rust integration regression calls the very same oracle at the cap and cap+1.
+
+### Failure Modes (ADVERSARIAL-2159)
+
+Reject a fractional numeric quantity rather than silently fabricating a nearby
+integer. Malformed frames and selected wrong-type integer values retain typed
+refusal. Correctly discarded aliases and unknown keys remain accepted under the
+existing rules. A span/tree disagreement fails the numeric check; no permissive
+fallback is added. The existing frame cap bounds additional scan work but does
+not prove a latency target. The lot-size fix also consults decimal text so an
+f64-rounded fraction cannot become a valid contract lot.
+
+### Test Plan (ADVERSARIAL-2159)
+
+Run the integrated parser unit and adversarial-order suites with standalone-core
+defaults and with the production-relevant serde_json/raw_value feature. Run the
+ordinary fractional-number validator-removal negative control, restore the
+source, and rerun positive tests. Execute all retained adversarial suites,
+the actual assertion-free ratchet against the current 145 baseline, relevant
+source/ignored-test/coverage-floor/fuzz guards, formatting and full workspace
+all-targets Clippy. Normal commit/push hooks and independent performance,
+security and hostile correctness reviews remain required.
+
+For the repaired test oracles, restore the original universal-refusal assertions,
+directory pre-deletion and cap-blind fuzz condition individually. Each named
+regression must fail for its intended reason; restore the reviewed source and
+rerun its positive suite. Do not count compilation failures as killed mutants.
+
+Clean local workspace package artifacts before moving a shared build cache
+between archive/checkout sources; preserve named tests, compile paths and exit
+codes. A built fuzz target is not a completed fuzz run. Report any fuzz duration,
+execution count, feature-specific gap or unexecuted check separately. Measure
+the final combined head before stating coverage percentages or raising floors.
+
+### Rollback (ADVERSARIAL-2159)
+
+Before merge, discard only the replacement branch's changes; the original PR
+and immutable source remain available. After merge, revert the reviewed repair
+commit if compatibility regressions are demonstrated, explicitly reopening the
+fractional-number defect rather than silently weakening its regression oracle.
+No database, live configuration, deployment or external state migration is part
+of this change.
+
+### Observability (ADVERSARIAL-2159)
+
+Reuse existing typed order parse errors and caller reporting. New numeric
+refusals name the fixed field without logging its raw value or an entire frame.
+Fuzz crashes and property failures retain their existing local/CI artifacts.
+No new page, alarm, network endpoint or per-frame diagnostic is introduced.
+
+### Per-Item Guarantee Matrix (ADVERSARIAL-2159)
+
+All 15 coverage/checking demands and all seven resilience demands in
+`per-wave-guarantee-matrix.md` apply within their stated envelopes. The original
+input suites and their bounds are preserved. This item does not claim exhaustive
+inputs, 100% measured coverage, zero-allocation parsing, live losslessness or
+unchanged latency without measurement.
+
+| Area | Required proof | Current scope |
+| --- | --- | --- |
+| Exact quantities | All-field/casing refusal and acceptance oracles; ordinary validator-removal control | Order JSON and cold master CSV only |
+| Compatibility | Alias/null/duplicate/escaped-key/wrapper controls in both JSON feature graphs | Existing accepted field rules |
+| Test integrity | Recipe positive/refusal pair, assertion-free budget unchanged, every retained suite executed | Named tests and exit codes, not annotation counts |
+| Fuzz integrity | Workflow/manifest target agreement and actual run evidence | A build alone is not a campaign |
+| Security and resource bounds | Literal recursive objects, existing frame cap, independent review | No global serde_json behavior change |
+| CI and release | Full lint gate, normal hooks, exact-head CI | No exemption, floor decrease, merge or deployment implied |
+
+### 2026-10-31 — Full-frame encoder comparison and honest tail evidence
+
+Status: approved benchmark/test implementation with focused validation completed; quiet timing remains open. Coordinator relayed the owner's renewed strict latency request and authorized this isolated delta and draft publication on reviewed #2149 head `9c4a202d872b92cb2bfc872f406deed12d2cb7be`, which depends on unmerged #2158. No runtime optimization or configuration switch is part of this item. The existing full-frame result remains 2,131.524 ns/tick as an amortized Criterion median (8,526.095 ns per four-packet frame), over the unscaled 1,000 ns/tick budget. That prior result belongs to integration `385bb98c9` / documentation `aebe31bbf`; no new timing has run under the current build load.
+
+Design: preserve every existing case/budget and the original Library Full fixture; compare the existing Own tick encoder using those identical bytes and the same inline-depth path. Extract the shared historical fixture into benchmark/test support. Collect one clock-pair duration per complete Full-frame call for each encoder, then sort and report raw frame p50/p99/p99.9/max/count. Clearly separate the unchanged inclusive, hardware-scaled amortized-cost gate from the unscaled strict `<1000 ns/frame` diagnostic and from any individual-tick p99 claim. Add only the Own case's divisor4; update the documented total key count. Runtime `own_ilp_encoder=false` remains unchanged.
+
+Edge cases: empty/zero-count workloads, a partial final frame pool, truncated Full input, fabricated output counts without pending writer rows, 999/1000/1001/1024/1025 ns, nearest-rank sample counts1/99/100/101/200, and u64::MAX. Cases check the ingest pending-tick counter and depth writer pending-level counter for four ticks and forty levels per frame with no fold refusal. These counters do not decode buffered wire values or establish database acceptance. The shared fixture retains its August15 historical stamp and four-instrument small working set; it does not cover post-October28 tick_quotes routing, official session eligibility, full-capacity cache behavior, production metrics, seal-channel backpressure or transport.
+
+Observed validation on the reviewed source: 19 distinct focused tests passed (eight evidence contracts, six existing tail-calculation tests, five budget/source guards), app all-target Clippy passed with default features and `-D warnings`, and the optimized `feed_drain` benchmark compiled without execution. Five saved controls failed their intended assertions: divide raw samples, remove inline-depth work, force an out-of-session fold refusal, select Library at the Own Criterion call, and select Library in the tail tuple labeled Own. The last two are source-wiring checks. Every selected restored positive and the final eight evidence tests passed; all source hashes were restored. The original source-only checkpoint and controls are preserved separately from this validation wording. Normal native commit/push/PR gates and head CI remain separate publication checks; these scoped results are not a new whole-workspace test run.
+
+Remaining proof: only after all competing builds/media stop may the pinned before/after executables run sequentially with multiplier1 and exact source/environment provenance. No first attempt or best-of retry selection. Before any later runtime encoder switch, separately validate real QuestDB representation equivalence and failure/retention behavior on an owned fixture; synthetic row equality or timing alone is insufficient.
+
+Rollback: revert this benchmark/test-only delta. Observability: no metrics, labels, alarms, schemas or live toggles. No existing gate is relaxed. This item shares the plan's existing 15-row guarantee and 7-row resilience matrices; completed source preparation is not completed latency, production coverage, runtime-switch or whole-session proof.
+
+- [ ] DT-FULL-PROOF: compile and validate identical Library/Own Full-frame evidence and complete a quiet unscaled comparison.
+  - Files: crates/app/benches/feed_drain.rs, crates/app/benches/support/full_frame_fixture.rs, crates/app/tests/feed_drain_full_frame_evidence.rs, quality/benchmark-budgets.toml, CLAUDE.md
+  - Tests: feed_drain_full_frame_evidence; benchmark_budget_reaches_a_bench_guard; bench_budget_elements_guard; feed_drain benchmark
+## Coverage recovery — preserved Claude checkpoints (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed instruction to resume all unfinished work, relayed by the coordinator on 2026-10-31. This phase integrates and reviews preserved coverage sources using the assigned isolated Cargo target and one build job. Publication, merge and live configuration are separate gates.
+
+### Design (coverage recovery)
+
+Preserve the histories of app PR #2161 (`09bfaea6b`), core coverage (`c65ac9f0d`), trading/API/common coverage (`f67a7912a`) and lambdas/logs coverage (`c4bde5b19`) in an isolated integration based on green but unmerged #2158 (`0fd844582`). Keep existing production behavior, dependency pins and coverage thresholds. The four sources contribute 33 files: app integration fixtures, two core unit-test modules and their cfg-gated declarations, three public-surface coverage tests, and test-only Lambda/logs fixtures. Review actual test oracles and isolation, not only test counts. A reduced public-function baseline is retained only after its full scanner confirms the measured count.
+
+### Edge Cases (coverage recovery)
+
+Cover failure and boundary branches already selected by the preserved fixtures: malformed/empty inputs, restored environment values, missing files, finite loopback fixtures, cancellation and reconnect, cloud SDK response formats, budget month boundaries, stale/missing cache data and subprocess failure. A test must not accidentally use live credentials or the current wall date as its expected oracle. Test-only modules must remain visibly cfg-gated for both Rust and source guards. No new ignored test or assertion-free exception is allowed.
+
+### Failure Modes (coverage recovery)
+
+Fresh integration can expose API drift, Clippy findings, shared-global races, incomplete mock protocols or tests that merely exercise a path without checking its result. Repair concrete findings without weakening assertions, adding blanket lint allowances, widening guard baselines or lowering coverage floors. Keep initial failure evidence. The historical #2161 coverage/DHAT failures are not classified as fixed until the current combined source is tested; distinguish an actual failing test from infrastructure failure using its log.
+
+### Test Plan (coverage recovery)
+
+- [x] Preserve all four coverage histories and reconcile any source overlap with current main and the #2158 lint prerequisite.
+  - Files: crates/app/tests/cov_feed_scoreboard_boot.rs, crates/core/src/websocket/order_update_connection_run_loop_cov_tests.rs, crates/core/src/websocket/pool_supervisor/cov_part1_tests.rs, crates/api/tests/coverage_gaps_api.rs, crates/common/tests/coverage_gaps_common.rs, crates/trading/tests/coverage_gaps_brutex_host.rs, crates/aws-lambdas/src/test_support.rs, crates/tickvault-logs-mcp/src/tools.rs
+  - Validation: immutable input heads, per-file provenance and a combined external patch/manifest; independent source reviews.
+- [x] Run meaningful combined tests and required guards when the coordinator grants a Cargo slot; repair findings without changing production behavior or guard policy.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Merged in 43f03f14c (#2187, consolidated recovery, merged through All Green): crates/app/tests/cov_feed_scoreboard_boot.rs, crates/api/tests/coverage_gaps_api.rs, crates/common/tests/coverage_gaps_common.rs, crates/trading/tests/coverage_gaps_brutex_host.rs al
+  - Files: crates/app/tests/bin_subprocess_reports.rs, crates/core/src/websocket/order_update_connection.rs, crates/core/src/websocket/pool_supervisor.rs, crates/aws-lambdas/src/dhan_token_minter.rs, crates/aws-lambdas/src/hard_stop_guard.rs, crates/aws-lambdas/src/start_watchdog.rs, crates/tickvault-logs-mcp/src/selftest.rs, .claude/hooks/.untested-pubfn-baseline
+  - Validation: formatting, workspace all-targets Clippy with warnings denied, complete workspace tests because common and more than three crates are touched, assertion/ignore/production-panic/size/secret/plan/public-function guards and normal native commit/push gates. Record actual command exits and ignored tests. No build is claimed by source reconstruction.
+- [x] Publish only after normal validation and review; measure exact-head coverage before proposing a ratchet increase in the same continuation.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Published via 43f03f14c (#2187); floors later raised to measured values in a50f123fb (#2246, quality/crate-coverage-thresholds.toml measured coverage floors)
+  - Files: quality/crate-coverage-thresholds.toml, .claude/plans/active-plan-feed-hardening.md
+  - Validation: unchanged floors during recovery; actual successful coverage per crate before any increase, exact-head All Green, and explicit unmerged #2158 dependency. No manual merge, force push or auto-merge arming.
+
+### Rollback (coverage recovery)
+
+The isolated branch and original remote heads remain preserved. A rejected test or integration can be corrected locally without changing the primary checkout or previously published branches. No environment, trading, feed, alarm or deployment setting changes in this work.
+
+### Observability (coverage recovery)
+
+Record original head, imported path, source review finding, fix, command and result in the external recovery manifest. Passing fixture tests establish only their tested inputs; coverage percentages, fresh production evidence and latency guarantees require separate measurements. Existing production metrics and logs are unchanged.
+
+The existing 15-row and 7-row guarantee matrices apply with this bounded envelope: executable assertions, retained branch history, existing source/coverage ratchets, no production behavior change and honest pending validation. Fuzz campaigns, sanitizers, live AWS/QuestDB actions and strict latency proof are not silently inferred from these coverage fixtures. Previously withheld parser probes and fuzz runs remain outside this recovery.
+
+Pre-commit source checkpoint (2026-10-31): the four preserved heads merged without conflicts onto `0fd844582cbdac209f54e4394459b799f2ba797a`. Source review corrected fixture ownership with exclusive create operations, API child-process CWD/token isolation and joined HTTP outcomes, scoped AWS endpoint overrides with exact restoration, six synchronous environment-lock/runtime boundaries, the missing `LoopbackRequest.path`, explicit core test-module boundaries and a bounded audit-row wait. One existing zero-cap batching test moved byte-for-byte into the external pool fixture so the parent stays at 26,178 lines under its unchanged 26,184 ceiling. The logs tail oracle now requires exactly both complete tail lines. The enabled rider fixture uses an explicitly never-due test target and checks the armed supervisor without entering the vendor downloader; this is wait-arm coverage, not a valid production configuration or download test. TF and REST response-cap fixtures now use valid JSON padded to the exact limit and one byte over, retaining their original assertions and adding a folded-row boundary oracle. REST's shared error stage does not independently distinguish its earlier header check. No production branch, dependency pin, coverage floor, source ceiling or live switch changed.
+
+Measured before the merge commit: Lambda library 745 passed; API/common/trading 10/18/32 passed; core fixture filter 67 passed; logs-MCP library 113 passed; repository guards 79 passed. All 16 original app integration targets passed 155 tests, followed by 35 passing tests in the two strengthened TF/REST targets; these overlapping runs are not a claimed complete 156-test rerun. All reported focused runs had zero failures and zero ignored tests after the recorded repairs. Workspace all-target Clippy with warnings denied passed on the same Rust sources. Initial failed compiles and fixture-path/schema corrections are retained in the external execution record. All 335 original branch-added names remain; name presence is not a coverage measurement.
+
+The normal native commit/push gates and fresh full-workspace tests on the resulting commit remain the next validation steps at this checkpoint. Exact command exits, final head and remote CI belong in the PR validation record. The unchanged full public-function scanner passed within its normal 120-second deadline and measured 307 mechanically unmatched public functions. Its baseline is deliberately ratcheted from main's 311 to that measured 307, strengthening the guard without changing exemptions; this is not a line-coverage percentage. Actual line coverage and the CI resource mitigation's effectiveness remain unmeasured here. Calendar-dependent fixtures only prove the branch exercised on their run date, and documented subprocess/listener lifetime limits are not promoted to cancellation guarantees.
+
+## ITEM 51-RECOVERY — full paused2164 source recovery on green2158 (2026-10-31)
+
+The user renewed the paused-work continuation; the coordinator assigned recovery of original57de60ae7 onto green0fd844 plus the reviewed record correction c0229b4b. Original refs and checked-item history are preserved. The assigned build slot has now produced the scoped local results recorded below. No old or sibling test result is inherited, no production request/activation/deployment is performed, and the five-active-plan cap is unchanged. Full workspace, remaining repository and native publication gates are still pending.
+
+### Design
+Replay the original seven Rust paths as deltas, retaining current main's newer code, and reconcile the seven documentation/plan paths separately. Preserve the existing `config.feeds.dhan_enabled` spawn gate, configuration defaults, vendor endpoint/pacing, archive hold ceiling and ungated disk-pressure path. The original51g adds past-day verification before15:41 when its bounded worst case fits; it is an explicit behavior expansion under the preserved Oct30 policy history, not restoration of the retired per-minute feeds. The new record integrity flag, strict read/write domain and corrupt-history preservation feed the actual coverage refusal. A separate historical-readiness correction must keep unknown/pending evidence from writing an archive-release marker.
+
+### Edge Cases
+Private fixture collisions, exact25,000/cap+1, duplicates and invalid IDs/seconds; legacy records without completeness, write failure and restart; calendar weekends/holidays, past-day age/marker/refusal filtering, backward wall-clock steps, stale worker state and duplicate pages. The original fixed09:15–15:40 comparison window and regular trading calendar remain; no Muhurat comparison or whole-session interval guarantee is introduced.
+
+### Failure Modes
+An incomplete persisted record stays unknown across successful reloads; a failure before persisting uncertainty can leave an older complete record after restart, and folder sync is best-effort. First-noted targets do not prove subsequent delivery. Historical readiness cannot be inferred from date alone; without an actual finality oracle, its marker must remain withheld. The existing bounded archive hold and disk-pressure exceptions remain explicit. The supervisor must recheck its actual deadline even after exhausting bounded re-sleeps. The worker and supervisor share one cold-path claim through paged-marker read, report and write; successful persistence suppresses a concurrent duplicate in this process. A failed marker write still permits a later page. The claim is not a cross-process transaction or bounded disk wait.
+
+### Test Plan
+Observed 2026-10-31 on candidate a2d8528b after byte-identical restoration: 120 comparator, 123 boot/readiness/paging, 21 day-record and 36 storage tests passed (300 unique, zero failures or ignores). Eleven independent controls each selected one test and failed its intended assertion with Cargo exit101: early supervisor clock, omitted historical marker veto, date-only historical readiness, removed page claim, replacement of corrupt history, omitted overflow persistence, missing legacy completeness treated as known, omitted writer input validation, removed cardinality check, removed duplicate check and ignored downstream knownness. Every control restored the fixed source; all four final positive suites passed afterward. Rust 1.95, offline/locked, one Cargo job and one test thread. Formatting passed. The initial plan verifier refused eight inherited stale references; the same reference-only corrections already reviewed in published2170 are applied here, without importing its separate security scope. Pending: remaining affected struct consumers and separately stacked coverage fixtures, repository guards, all-target Clippy, full workspace and native publication gates. Source/local fixture results do not establish live readiness, delivery or durability.
+
+### Rollback
+Revert only later-authorized focused commits. Original2164, green2158, green2170 and frozen ba44 audit remainder stay intact. No data repair, deletion, remote rollback or infrastructure change is part of this preparation.
+
+### Observability
+Retain only the four originally authorized reasons on the existing `xverify_failed` source; no new alarm, page family, filter, metric name, dimension or cadence is introduced. Ordinary absence of a proven historical oracle is not a fabricated final/applied observation. Live metrics/log publication and notification delivery remain unvalidated.
+
+Per-item guarantee matrix: see `.claude/rules/project/per-wave-guarantee-matrix.md` (15-row +7-row), applied as for ITEM45; the scoped tests above are current local evidence; full workspace, native/CI and live operational cells remain pending for this recovery.
+
+- [x] XVR-R1: reconcile original51e–51g and preserve retired-feed/default boundaries.
+  - Files: crates/app/src/dhan_live_crossverify.rs, crates/app/src/dhan_live_crossverify_boot.rs, crates/app/src/dhan_live_universe.rs, crates/storage/src/dhan_live_crossverify_persistence.rs
+  - Tests: test_past_days_to_check_last_chance_first, test_worker_step_table, coverage_columns_self_heal_reach_the_wire_and_stay_out_of_dedup
+- [x] XVR-R2: retain reviewed record-integrity fixes and isolated meaningful regressions.
+  - Files: crates/app/src/xverify_day_record.rs
+  - Tests: test_an_unreadable_record_is_retained_and_refused, test_coverage_known_stays_false_after_overflow_and_restart, test_legacy_record_without_completeness_stays_unknown_after_retry, test_invalid_recording_input_preserves_the_valid_prior_file, test_read_record_independently_refuses_distinct_over_cap_and_in_cap_duplicate
+- [x] XVR-R3: close early-supervisor and historical-readiness false-assurance paths within the documented boundaries.
+  - Files: crates/app/src/dhan_live_crossverify_boot.rs
+  - Tests: test_supervisor_never_pages_before_deadline_after_clock_steps, test_historical_unknown_readiness_cannot_release_a_fully_covered_archive, test_final_failure_page_claim_serializes_worker_and_supervisor, test_final_failure_page_claim_retries_after_marker_write_failure
+- [x] XVR-R4: remaining exact-candidate repository/Clippy/full-workspace validation and native publication gates; independent source review and scoped tests above are complete.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Recovery landed in 43f03f14c (#2187, All Green): crates/app/src/xverify_day_record.rs added; dhan_live_crossverify_boot.rs::test_supervisor_never_pages_before_deadline_after_clock_steps and test_historical_unknown_readiness_cannot_release_a_fully_covered_archi
+
+
+#### Full-workspace capacity inventory correction (2026-10-31)
+
+The normal full run on committed `5dac3fe1` stopped after 6,518 passes, one failure and six ignores. An unchanged-head `--no-fail-fast` diagnostic then completed 459 harnesses with 15,485 passes, one failure and 33 ignores, exit 101. Both failed only `every_literal_25000_usize_const_in_src_is_listed`: the existing day-record capacity was absent from the normal capacity inventory. These are preserved failed runs, not a full-workspace pass.
+
+`DAY_RECORD_MAX_INSTRUMENTS` is now registered in `crates/common/tests/per_entity_ceiling_lockstep_guard.rs` alongside the other main-feed capacity bounds; its deliberate list-count assertion moves from 16 to 17. No production cap, matcher, EXEMPT entry or existing assertion is weakened. Independent source review verified the original capacity meaning and exact guard-only delta. All five guard tests passed; temporarily changing only the local source cap to 25,001 made the actual equality guard fail its intended assertion (one selected test, exit 101). The source was restored byte-for-byte and all five tests passed again. This is one separate static guard control, not an additional runtime test or ten unique positive tests.
+
+The seven production Rust paths remain unchanged from the tested recovery. Final corrected-head full workspace, Clippy, native publication and exact-head CI remain pending; no live result, delivery or durability claim follows from these checks. The existing per-wave matrix and all earlier failure/coverage/calendar limits continue to apply.
+
+#### Public-function guard cost correction (2026-10-31)
+
+Committed `bd435277` subsequently passed the full workspace (15,486 passed, zero failed, 33 existing ignores), all-target Clippy and all 11 actual Loom cases. The genuine fast gate passed. The normal native push then failed because the required public-function test guard exceeded its unchanged 120-second deadline; no remote update or draft followed. Native hard audit/deny/Loom passed, and genuine fast-state dedup skipped heavy stages 1–5, which have the separate actual results above. That failed publication remains recorded.
+
+The independently reviewed shared scanner correction caches the existing test-file inventory once per current crate and replaces two per-declaration text-extraction subprocesses with equivalent Bash operations. It preserves function-name matching, duplicate counts, exemptions, baseline/report rules, staged behavior and the existing deadline. It introduces no cross-run cache or quality-state claim. Fourteen isolated Rust fixtures cover the retained matching/baseline behavior and poison-selected Git environments; two sanitizer-removal controls and the repeated-inventory control failed their intended assertions before exact restoration. The asserting helper is named `assert_outcome` so the existing assertion-free guard recognizes its real assertions; all fourteen tests and both canonical ratchet cases then passed, with its 145 ceiling unchanged.
+
+One bounded full scan on the earlier proposal tree completed in 83.342 seconds; its test-name corpus differs from `bd435277`, so neither its 310-versus-311 count nor that diagnostic time is an exact-head native gate result. The final two-file source is shared with the separately reviewed feed/strict continuations. Production application Rust remains unchanged. This composition and its new commit still require integrated fixtures, normal commit/full/Clippy/native gates and exact-head CI. The legacy name heuristic and stable-source assumption remain; no meaningful-coverage or live-performance guarantee is inferred.
+
+- Files: .claude/hooks/pub-fn-test-guard.sh, crates/common/tests/pub_fn_test_guard_behavior.rs
+- Tests: inventory_is_evaluated_once_per_crate_including_empty_inventories, fixture_git_children_cannot_mutate_a_poison_selected_external_repository, hook_child_cannot_false_pass_through_a_poison_selected_clean_index
+
+
+### 2026-10-31: shared public-function fixture deadline correction
+
+The scanner composition on `b37be277` passed 76 focused checks and normal
+commit gates. Its full-workspace attempt was stopped during compilation,
+before any test harness ran, after an actual sibling full run rejected the
+fixture's external timeout executable under the unchanged spawn allowlist.
+That interrupted attempt and the earlier `bd435277` native 120-second scanner
+failure remain separate; neither is a successful successor full run.
+
+The fixture now invokes visible Git/Bash commands and applies the existing
+ten-second bound in Rust while draining both output pipes concurrently.
+Per-stream overflow is an explicit error, not a truncated verdict. Cleanup
+attempts termination and direct-child reaping while preserving the original
+failure. Reaping depends on OS scheduling; arbitrary descendants are not
+terminated as a process group. Existing Git containment and all fourteen
+original test assertions remain; five new cases exercise deadlines, pipe
+backpressure, overflow and exit-status preservation. The production hook,
+allowlists, baseline, native deadlines and dependency graph are unchanged.
+
+Independent source review is complete within that direct-child scope.
+Actual corrected-source tests/controls and common guards remain pending,
+followed by a normal commit and exact-head workspace, Clippy, model and
+native/pre-PR validation. Earlier component passes are not substituted for
+those final checks. No publication, deployment or live result is claimed.
+
+Precommit validation follow-up: source `6aa7eddc` passed the complete common
+crate run with 1,805 passed, zero failures and one existing ignore across
+90 harnesses (offline/locked, one job and one test thread, 223.521 seconds
+including compilation). The actual browser spawn guard and all nineteen
+fixture cases passed. Separately, the helper author compiled deadline-removal
+and capture-cap-removal controls; each selected one test and failed its
+intended assertion with exit101, without an outer timeout. Restoring exact
+fixture `f55abd54` then passed all nineteen cases. These component results
+are independently hash-checked and remain attributed to their own sources.
+Only this evidence note changes after the common run; all Rust and hook
+bytes remain identical. Final committed-head workspace/Clippy/model/native
+checks are still pending, and the original failures remain preserved.
+
+## Dependency security — AWS family and lru panic safety (2026-10-31)
+
+**Status:** IN_PROGRESS
+**Approved by:** User's renewed instruction to fix and implement the known dependency finding, relayed by the coordinator with explicit approval of the nine-pin AWS family repair and isolated dependency resolution. Base is green coverage PR #2175 at `5786bf948baf86613df7a88c84f664ff9c3a0228`; it preserves the reviewed all-seven-SDK loopback regressions. Compilation, native publication and production changes require their normal later gates.
+
+### Design (dependency security)
+
+Repair the concrete `lru 0.16.4` / RUSTSEC-2026-0253 dependency finding through `aws-sdk-s3 1.157.0`, whose official requirement is `lru ^0.18.2`, together with the eight related exact AWS config/service pins. Keep every existing feature array and `default-features=false`. Resolve only the requested AWS group and necessary transitive constraints from the preserved lock, using a task-owned Cargo home and no compiler/build/test work in this phase. The independently reviewed, coordinator-approved policy also denies unsound informational advisories in cargo-audit and includes transitive unsound dependencies in cargo-deny. Do not regenerate unrelated dependencies, add advisory ignores or duplicate exceptions, alter runtime settings, or claim all four inaccessible Dependabot notices are identified/fixed.
+
+### Edge cases and failure modes (dependency security)
+
+The old S3 `^0.16.3` range cannot select the fixed lru line. Mixed old/new pre-1.0 Smithy generations can create duplicate packages; inspect every lock delta and resolve only from official constraints. Raw-lock optional packages, transitive MSRV/license changes, feature unification and `behavior-version-latest` default behavior require explicit review. The inspected String-key S3 cache and release panic-abort profile limit the published trigger; they do not justify skipping the repair or prove every upstream memory-safety path.
+
+### Validation plan (dependency security)
+
+- [x] Resolve and freeze the nine exact pins plus necessary transitive lock changes; record changed/added/removed packages, Rust requirements, licenses, duplicate families and enabled feature differences. Confirm no old affected lru copy remains.
+  - Files: Cargo.toml, Cargo.lock
+  - Validation: targeted Cargo resolution and locked metadata passed for baseline/candidate, both all-feature and default-feature ARM Linux graphs. The lock has 29 AWS-family version upgrades, lru 0.18.5, new bigdecimal/libm, and one hashbrown dependency-edge addition; existing duplicate-version sets and direct feature arrays/defaults are unchanged. No affected lru remains. No compilation, advisory/license-tool pass or runtime compatibility is inferred from metadata.
+- [x] On a granted lane, run existing SDK loopback, S3 archive/crossverify/checksum/refusal, auth/lock/notification, boot/control and Lambda regressions, plus full required workspace/Clippy/advisory/license/duplicate/native gates.
+  - Closed 2026-11-22 (plan-box audit, confirmed by a second checker): done on main. Merged in 43f03f14c (#2187) through All Green (Build&Verify, tests, Security&Audit): Cargo.toml aws-sdk-s3 =1.157.0, Cargo.lock lru 0.18.5
+  - Files: crates/aws-lambdas/src/clients.rs, crates/aws-lambdas/src/test_support.rs, crates/storage/src/s3_cold.rs, crates/storage/src/partition_archive.rs, crates/core/src/auth/secret_manager.rs, crates/core/src/instance_lock.rs, crates/core/src/notification/service.rs
+  - Validation: positive and failure assertions under owned local fixtures, actual selected counts/exits and independent review; no production credential, cloud request or notification send.
+- [x] Independently review and incorporate the stronger unsound-advisory policy, preserving the original three-file dependency packet and exact reviewed policy bytes.
+  - Files: .cargo/audit.toml, deny.toml
+  - Validation: independent security source review cleared the two-file proposal, and the coordinator authorized its incorporation. The only new values are audit output deny-unsound and cargo-deny unsound-all. Runtime behavior and actual advisory-tool results remain untested here.
+- [ ] Execute meaningful policy controls and publish only after final exact-head validation and CI; no default merge or deployment.
+  - Files: .cargo/audit.toml, deny.toml, scripts/git-hooks/pre-push, .github/workflows/ci.yml
+  - Validation: use an owned disposable fixture containing the original affected lock to demonstrate the old allowed-warning false pass and the strengthened unsound failure against the same legitimate advisory DB. Never alter the actual candidate's lock/policy, hook state or quality stamps for a control. Then require fresh full repaired-graph audit/deny/license/bans results. No guard bypass, floor reduction, advisory ignore or duplicate allowance. Dependabot alert-detail access remains gated by HTTP 403.
+
+### Rollback and evidence (dependency security)
+
+The original 5786 commit, original lock and all strict/source candidates remain preserved. Revert this isolated dependency delta to restore the prior pins; no live settings were changed. The existing per-wave matrices apply with the bounded scope of a dependency repair: runtime compatibility, real coverage, latency, native gates and live proof require actual evidence. No compiler or test pass is claimed at source preparation, and no guarantee of absence of vulnerabilities follows from an allowed-warning audit PASS.
+
+Resolved source checkpoint: 535 locked packages became 537, with only the requested AWS family, its lru replacement and necessary bigdecimal/libm/hashbrown edges changed. All changed AWS packages declare Rust 1.94.1; lru declares 1.85.0 and libm 1.63. Bigdecimal 0.4.11 declares no MSRV and uses the legacy MIT/Apache-2.0 license expression, so actual compiler/license gates remain required. Transitive features remove three legacy HTTP 0.2 compatibility selections and add hashbrown 0.17 default-hasher/inline-more; direct feature arrays remain identical. All initial logs are retained, including correction of the metadata runner's inherited GCP metadata guard before four byte-identical offline metadata confirmations. The repeated normal Dependabot read still returned HTTP 403; no alternative identity or endpoint was used. External source/lock/feature manifests preserve the original three-file packet, the independently reviewed two-file policy proposal, and the successor with that exact policy incorporated; no new resolver or compiler result is implied by composition.
+
+## LF-6b notes (2026-11-12) — live paper fill chain
+
+- LF-6b is tracked under LF-6 in `.claude/plans/active-plan-audit-2026-10-20.md` (not ticked; ticked only when its PR merges). It touches the frame drain (`crates/app/src/dhan_feed_stack.rs`, one tap call in the `IngestOutcome::Folded` arm behind the live-socket and not-replaying gates) and the order runtime (`crates/app/src/order_runtime.rs`, one `select!` arm, dry-run only). Off by default (`[live_fill] enabled = false`) and idle until an approved brutex strategy engine exists.
+
+## ITEM US1 — the last steps over 1 µs (2026-11-24, owner cards "Batch the writes (Recommended)", "Look ahead one price (Recommended)", "Measure live first (Recommended)", "Medium: ~8 agents (Recommended)")
+
+Owner, 2026-11-24: "go ahead and fix the 4 steps over 1 µs dude" / "fix and resoleve evryhtign entirley dude okay?". Of the four, the candle row write is already under 1 µs in production (`config/production.toml` `own_ilp_encoder = true`, p99 780–825 ns); the socket wake waits on a live measurement (no read access to the metrics log group from this session); two items below change code.
+
+- [x] US1-C Batch the seal rescue writes (crates/storage)
+  - Files: crates/storage/src/seal_absorption.rs, crates/storage/src/seal_writer_task.rs
+  - Tests: test_us1c_batch_rescue_writes_the_same_bytes_and_outcomes_as_per_seal, test_us1c_batch_rescue_partial_write_keeps_landed_records_and_dead_letters_the_rest, test_us1c_batch_rescue_below_floor_falls_back_to_per_seal, test_us1c_flush_failure_rescue_makes_one_disk_write, test_us1c_rescue_ring_batches_in_bounded_chunks
+- [x] US1-A REJECTED on measurement, nothing shipped. Prototype (`warm_slot_for`, next tick's slot warmed before folding the current one), cold run, 12 tables x 25,000 slots, 200,000 ticks, interleaved blocks, x86 dev container: plain p50 507-558 ns / p99 825-901 ns / p99.9 1.1-1.3 us; look-ahead p50 591-604 / p99 996-1,010 / p99.9 2.6-5.2 us. Slower, so reverted. The plain fold already measures under 1 us at p99 on this code (the 1.5-1.7 us figure was 2026-11-06).
+
+### Design
+
+US1-C. When a candle flush fails, `drain_once_reusing` sends each popped seal through `rescue_in_flight`, one spill `write(2)` per seal (up to 16,384 a cycle) under the spill lock. New `SealAbsorptionPipeline::rescue_in_flight_batch` serialises the run into a reused buffer and calls the existing `SealSpillWriter::append_seals` once (the escalation thread's DA-14 path): one floor check for the run, one write, the ledger checks unchanged, and on a failed write the kept leading records stay in the spill and only the rest go to the DLQ one record each. `rescue_ring` (shutdown) uses it in chunks of at most `RESCUE_BATCH_MAX_SEALS` (16,384). Same `Ok` contract as `append_seal`: when it returns, every kept record is in the page cache. Written in groups of at most 512 seals (bounds the spill-lock hold the frame drain's inline fallback can wait on). A group of one seal, a group holding two copies of one bar, and a group below the disk floor take the per-seal path, so the records written are byte-identical to the per-seal path (review 2026-11-24: one batch write of a fuller then an emptier copy would write both, and the mid-session replay can end on the last copy it reads). Scratch buffers live in the pipeline, cleared, never shrunk, bounded by the chunk size.
+
+US1-A. In the frame walk, resolve the next tick packet's fold slot and touch its open buckets before folding the current packet, so the two packets' cache misses overlap. Output unchanged.
+
+### Edge Cases
+
+Empty batch; one seal; a run where every copy is superseded by the ledger (no write, all `Spilled`); a run that does not fit above the disk floor (falls back to the per-seal path, exact old behaviour); a partial write (k whole records land); a write that lands nothing; DLQ also failing (Dropped, page unchanged); IST midnight (the rescue run uses one `now`, one day file, as before); shutdown ring larger than one chunk. US1-A: single-packet frame, last packet of a frame, a non-tick packet next, an unknown instrument next, a frame cut short by a bad packet.
+
+### Failure Modes
+
+US1-C: a flaky (not full) disk: before, seal i+1 retried the spill after seal i failed; now the rest of the run goes to the DLQ. Same choice the escalation thread made (DA-14); every seal is still Spilled, DlqWritten or a counted Dropped. A failed batch opens the spill failure episode once (one coded line, as before). US1-A: the warm-up only reads; a wrong guess costs one wasted load, never a wrong bar.
+
+### Test Plan
+
+Unit tests listed above, run with `cargo test -p tickvault-storage`; an `#[ignore]`d harness that prints the per-seal rescue cost at 1, 64, 1,024 and 16,384 seals, old and new; US1-A proptest and harness in the app crate; the existing seal chaos and DHAT tests unchanged and green.
+
+### Rollback
+
+Revert the commit. No on-disk format change, no config, no table change.
+
+### Observability
+
+Unchanged counters (`tv_seal_writer_drain_total{kind="rescued_spill"|"rescued_dlq"|"rescued_dropped"}`, the floor counter, the episode lines). The spill write count per failed cycle drops from N to 1.
+
+### Per-Item Guarantee Matrix
+
+See `per-wave-guarantee-matrix.md` (15-row and 7-row matrices apply as written; no new tick-drop path, no hot-path allocation: both changes run off the drain or inside the existing fold).
+
+## ITEM US1-B — short wait before sleeping on the frame drain (2026-11-24, owner card "Short wait before sleeping (Recommended)")
+
+Owner, 2026-11-24: "fix the belt step wake too dude", then the card: keep checking for the next frame for up to ~50 µs before the drain sleeps; measure on the test machine first, ship behind an on/off switch, check the live numbers tomorrow.
+
+- [x] US1-B Adaptive spin before park on the frame ring (crates/core, crates/common, crates/app)
+  - Files: crates/core/src/websocket/frame_ring.rs, crates/common/src/config.rs, config/base.toml, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/frame_ring_spin.rs, crates/app/src/main.rs, crates/core/tests/socket_to_wal_tail_harness.rs, CLAUDE.md
+  - Tests: test_spin_before_park_defaults_to_zero_and_parks_at_once, test_set_spin_before_park_caps_at_the_maximum, test_spin_that_times_out_parks_with_the_flag_cleared_and_is_woken, test_frame_pushed_during_the_spin_is_taken_with_no_wake, test_spin_returns_none_once_every_sender_is_gone, proptest_spin_before_park_never_strands_or_repeats_a_frame, test_spin_stats_count_hits_misses_and_time, test_spin_disarms_after_a_miss_and_rearms_after_a_short_sleep, test_frame_drain_spin_us_defaults_to_off_and_base_ships_fifty, test_configure_sets_the_spin_from_microseconds_and_zero_turns_it_off, test_publish_reads_the_ring_stats_without_panicking, test_effective_spin_us_is_off_for_an_own_thread_drain, test_regression_a_quick_wake_after_a_missed_spin_does_not_rearm, test_regression_a_stale_permit_wake_does_not_rearm, test_spin_disarms_after_the_consecutive_hit_cap
+
+### Design (Item US1-B)
+
+`FrameRingReceiver::recv`, on an empty ring and only while armed, sets the busy-poll flag and checks the ring for up to `spin_before_park` (one clock read per 32 checks) before the unchanged clear, register and re-check. A frame caught in the spin costs no wake on either side (the reader skips `notify_one`, the drain is not rescheduled). Adaptive: a spin that runs out disarms it; a sleep shorter than the spin re-arms it (two clock reads per sleep, spin on only). Capped at `FRAME_RING_SPIN_MAX` (1 ms). Switch `[dhan_feed] frame_drain_spin_us` (serde default 0 = off; base.toml 50).
+
+Review round (2026-11-24, 3 reviewers, 2 refuters per finding), fixed before merge: (a) a sleep right after a missed spin no longer re-arms (it started one budget late, so gaps of one to two budgets spun and still paid the wake); (b) only a wake that finds a frame re-arms (a stale `Notify` permit re-armed it); (c) after `FRAME_RING_SPIN_MAX_CONSECUTIVE_HITS` (64) catches in a row the ring sleeps once, so the drain's timer and idle arms run during a rush; (d) the spin runs only when the drain shares the main runtime: with its own thread on the readers' core (the production unit, `TICKVAULT_DRAIN_THREAD=on`) it is forced off, because at equal priority it holds the core the reader needs, and at real-time priority every frame delivered mid-spin counts as drain CPU wait in the daily capacity verdict. Refuted (0/2): the kernel real-time throttle tripping at real frame rates.
+
+### Edge Cases (Item US1-B)
+
+Zero spin (old path, no clock read); spin larger than the cap; last sender dropped during the spin (returns None at once); frame pushed during the spin; frame pushed just after it ends (the SeqCst clear before the re-check, argued at `set_busy_polling`); the recv future dropped inside `select!` mid-spin or mid-sleep (flag left set only until the next recv clears it, as for the existing busy-poll path); the cooperative budget (unchanged wrapper).
+
+### Failure Modes (Item US1-B)
+
+The spin holds the drain's worker for up to the budget: measured CPU on the x86 dev container, adaptive, 20,000 frames per shape: steady 400 µs gaps 0.0%, exponential mean 400 µs 1.5-1.6%, mean 100 µs 19.4-19.5%, bursts of mean 20 µs 87-88% (the drain stays awake through the burst). Before adaptive the same plain spin cost 12% at steady 400 µs gaps and caught almost nothing. Off-hours: one spin, then disarmed.
+
+### Test Plan (Item US1-B)
+
+Unit and property tests listed above (`cargo test -p tickvault-core --lib websocket::frame_ring`, `-p tickvault-common`, `-p tickvault-app --lib frame_ring_spin`); `#[ignore]`d harness `ring_wake_with_and_without_spin` (four gap shapes, spin 0 and 50 µs).
+
+### Rollback (Item US1-B)
+
+Set `frame_drain_spin_us = 0` (config only, next restart), or revert the commit. No storage, table or format change.
+
+### Observability (Item US1-B)
+
+`tv_frame_ring_spin_hits_total`, `tv_frame_ring_spin_misses_total`, `tv_frame_ring_spin_nanos_total` (local `/metrics` only, published on the drain's every-1,024-frames report; no alarm, filter or EMF name). Effect read on the existing `receipt_to_fold` and `ring_dwell` stages in `hot_path_latency_minute`.
+
+### Per-Item Guarantee Matrix (Item US1-B)
+
+See `per-wave-guarantee-matrix.md`; no new tick-drop path (every frame still reaches the drain, pinned by the never-strands proptest), no allocation on the recv path.
+
+## ITEM US1-D — split the 30 s silence scan into idle-arm steps (2026-11-24, owner card "Split into small pieces (Recommended)")
+
+Owner, 2026-11-24, after the measured cost (release harness `silence_arm_cost_at_the_authorized_ceiling`, x86 dev container, 20,000 instruments: whole arm median 185 µs warm, 436 µs cold, one 1.95 ms max): "Split into small pieces (Recommended)" — the 30 s timer only starts the check, the drain does 1,024 instruments at a time in its quiet moments, same silent counts, same alerts; a leftover at the next timer is finished at once and counted (the review fix of 2026-11-24 makes that the fresh sweep at the timer's own instant).
+
+- [x] US1-D Sliced silence sweep (crates/core, crates/app)
+  - Files: crates/core/src/pipeline/tick_gap_detector.rs, crates/app/src/subscribe_reconcile.rs, crates/app/src/dhan_feed_stack.rs, crates/app/src/dhan_feed_stack/silence_sweep.rs, crates/app/src/dhan_feed_stack/silence_arm_cost.rs, crates/app/tests/silence_arm_slot_guard.rs, crates/app/tests/dhat_silence_scan.rs, crates/storage/src/hot_path_telemetry.rs, CLAUDE.md
+  - Tests: proptest_scan_silence_slot_range_chunks_equal_the_full_scan, proptest_chunked_reconcile_sweep_matches_the_one_go_sweep, test_chunked_sweep_publishes_delivering_only_at_finish, test_interrupted_chunked_sweep_plans_no_round, test_round_finished_between_chunks_interrupts_the_sweep, test_forget_on_between_chunks_interrupts_the_sweep, test_record_rebind_between_chunks_interrupts_the_sweep, test_record_insert_between_chunks_interrupts_the_sweep, test_one_go_sweep_between_chunks_interrupts_the_sweep, test_interrupt_outside_the_reconcile_window_is_not_counted, test_abandon_chunked_reports_exhausted, proptest_sliced_silence_sweep_matches_the_one_go_scan, test_sliced_sweep_in_session_runs_the_dead_class_report, test_timer_overrun_drops_the_stale_sweep_and_scans_fresh_inline, test_slots_added_mid_sweep_wait_for_the_next_sweep, test_step_idle_work_alternates_catch_up_and_silence, test_begin_silence_sweep_on_an_empty_detector_finishes_at_once, test_step_silence_sweep_returns_done_only_at_the_end, test_abandon_silence_sweep_leaves_nothing_pending, test_scan_silence_slot_range_clamps_end_to_next_slot, test_scan_silence_slot_range_chunks_cover_every_verdict, test_scan_silence_slot_range_zero_count_returns_from, the_sliced_silence_step_judges_reconcile_by_slot_not_by_probe, test_the_drain_actually_asks_the_detector_what_it_recorded
+
+### Design (Item US1-D)
+
+Core: `TickGapDetector::scan_silence_slot_range(now_millis, from, end, count, sink) -> next` runs the existing loop body over `[from, min(end, next_slot, from + count))`; `scan_silence_slots` becomes the full range (same reports, same order). Reconcile: the per-sweep accumulators move into the book (`Inner.pending`), each chunk takes the lock once (`begin_chunked_at`, `note_chunk_at_slot` under a short guard, `finish_chunked_at(secs, day)`); per-socket counts go to `pending_delivering` and are published to `delivering` only at finish, so the executor never reads a half sweep; every other lock taker (record, forget, forget_on, round_finished) bumps an epoch, and a finish whose epoch moved plans no round that sweep (counted) and the next sweep plans it. The one-go `ReconcileSweep` stays for tests and the oracle. App: the timer arm keeps everything that does not read the scan (refusal read-out, gauges, cross-feed check, ring fill) and calls `begin_silence_sweep`, which freezes `now_millis`, the reconcile `Instant` and clock, the session-gate seconds, `silence_page_allowed_today()` and `end = tracked_instruments()`; `step_idle_work` runs one silence step of `SILENCE_SWEEP_STEP_SLOTS` (1,024) after seed and catch-up; the step that reaches `end` finishes the reconcile, the two gauges, the dead-class verdict and the page logic (moved unchanged into `silence_sweep.rs`, judged on the frozen values). If the timer fires with a sweep pending, that stale sweep is dropped and the new one runs to its end inline at the fresh instant, counted on `tv_silence_sweep_overrun_total`. While the catch-up seal and a sweep are both pending, `step_idle_work` alternates their steps.
+
+### Edge Cases (Item US1-D)
+
+Empty detector (begin finishes at once); slots added mid-sweep (outside `end`, picked up 30 s later, as a one-go scan at the begin instant would); a tick on an unvisited slot between steps (judged at the begin instant on its newer state: `silent_millis` saturates to 0, it reads live, which it is); a re-seed of an unvisited never-ticked slot (same, reads newer state); out-of-session timer (the gate is judged on the frozen seconds at finish, latches cleared as today); day roll at a timer fire with a sweep pending (the stale sweep is dropped; the new sweep runs inline on the new day); no reconcile book (the reconcile part is skipped, as today); shutdown with a sweep pending (abandoned: no page, the process is exiting).
+
+### Failure Modes (Item US1-D)
+
+No quiet moment for 30 s (open burst): the next timer drops the stale sweep (and its reconcile pass, whose exhausted instruments are still reported) and runs the new sweep to its end at once on the fresh instant, so each period still judges one sweep on fresh data and the worst case equals the old one-go stop, counted on `tv_silence_sweep_overrun_total`. In that state the idle steps already spent on the dropped sweep are wasted, so total CPU for the period can be up to about twice the old one-go scan (the single stop is no longer than before). Starvation by the catch-up seal (begun every 5 s): while both are pending the idle arm alternates their steps, so neither starves. A lock taker between chunks (record insert or rebind, forget, forget_on, a finished round, a one-go sweep): the sweep's judgement mixes two book states, so it plans no round (auto mode only; production runs shadow), counted only inside the reconcile window; the interrupted finish still publishes `delivering` and moves the silent-socket and feed-silent latches from those two states, which the next sweep (30 s later) corrects. Cost: O(step) per idle step, plus the finish on the last step (the reconcile finish, O(sockets + candidates), O(expected) on an IST day change; the gauges; the dead-class verdict); the harness times the finishing step apart (MEASURE 5b). MEASURED 2026-11-24 (release harness, x86 dev container, 20,000 instruments, medians): one step 9.5 µs warm, 22.5 µs cold (max 61.6 / 76.4 µs); finishing step 6.2 / 22.5 µs; whole sliced sweep 192 / 403 µs against the one-go arm 187 / 413 µs. Not measured on the prod host.
+
+### Test Plan (Item US1-D)
+
+Core range proptest (random chunk sizes concatenate to the full scan). Reconcile chunked-vs-one-go proptest with no taker between chunks (identical summaries, fingerprints, cell invariant), plus delivering-publication and interrupted-sweep tests. App sliced-vs-one-go proptest over random detector states and step sizes with no frames between steps (identical counts, `worst`, gauges, dead-class latch, page decisions), overrun test, mid-sweep-slot test. Existing oracle and source guards re-pointed to the new functions. DHAT: zero allocation across begin, 1,000 steps and finish. Harness: per-step and whole-sweep cost, release, x86 dev container.
+
+### Rollback (Item US1-D)
+
+Revert the commit. No config, table or format change; the counts, gauges and pages are the same.
+
+### Observability (Item US1-D)
+
+`tv_silence_sweep_overrun_total` and `tv_subscribe_reconcile_sweep_interrupted_total` (local `/metrics` only, registered at 0; no alarm, filter or EMF name). Effect read on the existing `drain_arm_silence` and `drain_arm_idle` stages and on `ring_dwell` in `hot_path_latency_minute`.
+
+### Per-Item Guarantee Matrix (Item US1-D)
+
+See `per-wave-guarantee-matrix.md`; no new tick-drop path (the scan only reads), no allocation per step (DHAT), O(step) per idle step plus the finish on the last step, O(1) begin (O(n) inline on an overrun), O(n) total per 30 s unchanged.

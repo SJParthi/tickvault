@@ -164,3 +164,59 @@ fn parsers_are_self_tested() {
     );
     assert_eq!(rust_const(src, "NOT_THERE"), None);
 }
+
+/// Pull `KEY=value` out of a systemd unit, ignoring `#` comments.
+fn unit_value(unit: &str, key: &str) -> Option<u64> {
+    unit.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix('=')?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+}
+
+#[test]
+fn max_map_count_constant_matches_the_deployed_sysctl_file() {
+    // Plan item 2 (2026-10-30): the boot check now reads vm.max_map_count.
+    let conf = read("deploy/aws/sysctl/99-tickvault-net.conf");
+    let src = read("crates/app/src/host_limits.rs");
+    let in_rust = rust_const(&src, "REQUIRED_MAX_MAP_COUNT")
+        .expect("host_limits.rs no longer defines REQUIRED_MAX_MAP_COUNT");
+    let in_conf = sysctl_value(&conf, "vm.max_map_count")
+        .expect("99-tickvault-net.conf no longer sets vm.max_map_count");
+    assert_eq!(
+        in_rust, in_conf,
+        "LOCKSTEP DRIFT: REQUIRED_MAX_MAP_COUNT = {in_rust} but the sysctl file sets \
+         vm.max_map_count = {in_conf}. Raise both or neither."
+    );
+}
+
+#[test]
+fn open_files_constant_matches_the_systemd_unit() {
+    // Plan item 2 (2026-10-30): the boot check reads this process's soft
+    // open-file limit, which the service unit sets with LimitNOFILE.
+    let unit = read("deploy/systemd/tickvault.service");
+    let src = read("crates/app/src/host_limits.rs");
+    let in_rust = rust_const(&src, "REQUIRED_OPEN_FILES")
+        .expect("host_limits.rs no longer defines REQUIRED_OPEN_FILES");
+    let in_unit =
+        unit_value(&unit, "LimitNOFILE").expect("tickvault.service no longer sets LimitNOFILE");
+    assert_eq!(
+        in_rust, in_unit,
+        "LOCKSTEP DRIFT: REQUIRED_OPEN_FILES = {in_rust} but tickvault.service sets \
+         LimitNOFILE={in_unit}. Raise both or neither."
+    );
+}
+
+#[test]
+fn unit_value_parser_is_self_tested() {
+    let unit = "# LimitNOFILE=1\nLimitNOFILE=65536\nLimitNPROC=4096\n";
+    assert_eq!(unit_value(unit, "LimitNOFILE"), Some(65_536));
+    assert_eq!(unit_value(unit, "LimitNPROC"), Some(4_096));
+    assert_eq!(unit_value("# LimitNOFILE=1\n", "LimitNOFILE"), None);
+    assert_eq!(unit_value(unit, "LimitCORE"), None);
+}

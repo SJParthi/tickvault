@@ -1,5 +1,37 @@
 # Runbook: Human-readable QuestDB console queries (`ticks_named` / `candles_named`)
 
+> ## ⚠ RETIRED 2026-09-22 — there are NO views any more
+>
+> The operator's 2026-09-22 directive (*"why the Fuck do we need even these
+> views bro"*, recorded in `websocket-connection-scope-lock.md`
+> "2026-09-22 (SECOND) — NO VIEWS ANYWHERE") removed every console view.
+> The app now DROPS `ticks_named`, `candles_named`, `market_depth_named` and
+> the old `candles_10m` view at boot (`console_views::drop_retired_views`),
+> before any table DDL. `candles_10m` is a real folded TABLE now.
+>
+> **How to query by name today:**
+>
+> | Table | By name |
+> |---|---|
+> | every `candles_<tf>` (incl. `candles_10m`) | read the table's own `contract` column directly — no join |
+> | `ticks`, `market_depth` | no name column yet (planned); use the manual join below against `instrument_lifecycle` |
+>
+> ```sql
+> -- Ticks by name, without a view (manual join, O(N) at SELECT time)
+> SELECT t.*, l.symbol_name
+> FROM ticks t
+> LEFT JOIN (SELECT security_id, exchange_segment, feed, symbol_name
+>            FROM instrument_lifecycle) l
+>   ON t.security_id = l.security_id AND t.segment = l.exchange_segment
+>  AND t.feed = l.feed
+> WHERE t.ts IN today()
+> LIMIT 100;
+> ```
+>
+> Everything below is retained as the historical record of the views and
+> is NOT current. Do not re-create a view to follow it — the next boot
+> drops it again.
+
 > **What this answers:** "How do I, as a human, query ticks and candles
 > BY NAME (NIFTY, RELIANCE, …) in the QuestDB console — without
 > hand-writing the composite instrument join every time?"
@@ -97,11 +129,11 @@ If a boot degraded (HTTP-CLIENT-01 `named_views_ensure` row in the
 rule file) or someone dropped the views, paste this directly:
 
 ```sql
-SELECT t.ts, il.symbol_name, il.display_name, il.instrument_type,
+SELECT t.received_at, t.ts, il.symbol_name, il.display_name, il.instrument_type,
        t.ltp, t.open, t.high, t.low, t.close, t.volume, t.oi,
        t.avg_price, t.last_trade_qty, t.total_buy_qty, t.total_sell_qty,
-       t.feed, t.segment, t.security_id, t.exchange_timestamp,
-       t.received_at, t.capture_seq
+       t.feed, t.segment, t.security_id,
+       t.capture_seq
 FROM ticks t
 LEFT JOIN (
     SELECT security_id, exchange_segment, feed,
@@ -117,10 +149,18 @@ ORDER BY t.ts DESC LIMIT 100;
 
 For candles, swap `FROM ticks t` → `FROM candles_1m c` (alias `c`) and
 the column list to
-`c.ts, il.symbol_name, il.display_name, il.instrument_type, c.open,
-c.high, c.low, c.close, c.volume, c.oi, c.tick_count, c.feed,
-c.segment, c.security_id, c.change_pct, c.close_pct_from_prev_day,
-c.open_pct, c.open_gap_pct`.
+`c.ts, c.contract, il.symbol_name, il.display_name, il.instrument_type,
+c.open, c.high, c.low, c.close, c.volume, c.oi, c.tick_count, c.feed,
+c.segment, c.security_id, c.percentage_change, c.open_percentage_change,
+c.total_buy_qty, c.total_sell_qty, c.open_latency, c.close_latency,
+c.window_span_latency`.
+
+> **2026-09-22:** this list named `change_pct`, `close_pct_from_prev_day`,
+> `open_pct` and `open_gap_pct`, all removed or renamed by the 2026-09-19
+> fresh-start reset — pasted as written it failed on the first missing
+> column. `volume` is SIGNED since that reset (negative when the bar closed
+> below the previous bar). `contract` is the option's name and is NULL for
+> spot, index and future candles.
 
 ## Introspection + definition changes
 

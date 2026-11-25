@@ -497,31 +497,6 @@ mod tests {
             "mod.rs re-gated `pub mod index_futures;` behind a feature \
              (preceding line: {preceding_line:?})"
         );
-        // (c) The Groww instruments file carries NO feature gate AT ALL —
-        //     the strongest simple pin (2026-07-13 hostile-review L1: the
-        //     previous 6-line look-back above `extract_index_future_entries`
-        //     could be evaded by an attribute placed ABOVE the doc block;
-        //     whole-file zero-occurrence cannot). The fn-existence check
-        //     keeps the pin non-vacuous. This assertion's own literal lives
-        //     in THIS file, so it can never satisfy itself in the scanned
-        //     Groww source.
-        let groww_src = include_str!("../feed/groww/instruments.rs");
-        assert!(
-            groww_src.contains("pub fn extract_index_future_entries("),
-            "groww instruments lost extract_index_future_entries — the §36.7 \
-             extraction site moved; re-point this ratchet"
-        );
-        assert!(
-            !groww_src.contains("cfg(feature"),
-            "feed/groww/instruments.rs regained a feature gate — the Groww \
-             futures extraction (and the whole Groww instruments module) must \
-             stay unconditional (daily-universe 2026-07-13 banner §(d))"
-        );
-        // (d) The dead empty-futures fallback stayed dead.
-        assert!(
-            !groww_src.contains("futures require the shared selector (feature-gated)"),
-            "the not(feature) empty-futures fallback returned to instruments.rs"
-        );
     }
 
     fn d(s: &str) -> NaiveDate {

@@ -1687,4 +1687,143 @@ mod tests {
             let _ = build_multi_order_request(&dhan_client_id, &[spec]);
         }
     }
+
+    /// The two private wire helpers are hand-written twins of the serde
+    /// renames on `TriggerOperator` / `TriggerTimeFrame`. If a variant's
+    /// rename changes and its helper arm does not, the request carries a
+    /// string Dhan rejects — so every variant is checked against serde.
+    #[test]
+    fn test_trigger_wire_helpers_match_serde_for_every_variant() {
+        let operators = [
+            TriggerOperator::CrossingUp,
+            TriggerOperator::CrossingDown,
+            TriggerOperator::CrossingAnySide,
+            TriggerOperator::GreaterThan,
+            TriggerOperator::LessThan,
+            TriggerOperator::GreaterThanEqual,
+            TriggerOperator::LessThanEqual,
+            TriggerOperator::Equal,
+            TriggerOperator::NotEqual,
+        ];
+        for operator in operators {
+            let serde_form = serde_json::to_string(&operator).unwrap();
+            assert_eq!(
+                format!("\"{}\"", trigger_operator_wire(operator)),
+                serde_form,
+                "{operator:?}"
+            );
+        }
+        let time_frames = [
+            TriggerTimeFrame::Day,
+            TriggerTimeFrame::OneMin,
+            TriggerTimeFrame::FiveMin,
+            TriggerTimeFrame::FifteenMin,
+        ];
+        for time_frame in time_frames {
+            let serde_form = serde_json::to_string(&time_frame).unwrap();
+            assert_eq!(
+                format!("\"{}\"", trigger_time_frame_wire(time_frame)),
+                serde_form,
+                "{time_frame:?}"
+            );
+        }
+    }
+
+    /// Each operator and time frame reaches the built condition verbatim.
+    #[test]
+    fn test_build_trigger_condition_carries_every_operator_and_time_frame() {
+        for (operator, wire) in [
+            (TriggerOperator::CrossingAnySide, "CROSSING_ANY_SIDE"),
+            (TriggerOperator::GreaterThanEqual, "GREATER_THAN_EQUAL"),
+            (TriggerOperator::LessThanEqual, "LESS_THAN_EQUAL"),
+            (TriggerOperator::Equal, "EQUAL"),
+            (TriggerOperator::NotEqual, "NOT_EQUAL"),
+        ] {
+            let condition = build_trigger_condition(
+                ConditionalSegment::NseEq,
+                "1333",
+                &TriggerConditionSpec::TechnicalWithValue {
+                    indicator: TriggerIndicatorName::Sma5,
+                    time_frame: TriggerTimeFrame::FiveMin,
+                    operator,
+                    comparing_value: 250.0,
+                },
+                "2026-08-24",
+                None,
+            )
+            .unwrap();
+            assert_eq!(condition.operator, wire);
+            assert_eq!(condition.time_frame.as_deref(), Some("FIVE_MIN"));
+        }
+    }
+
+    /// Every price/trigger refusal arm of the shared leg validator, one
+    /// boundary each: the value one step past the edge is refused with the
+    /// right typed error, never silently accepted.
+    #[test]
+    fn test_build_trigger_order_price_and_trigger_refusal_arms() {
+        let refuse_trigger = |spec: &TriggerOrderSpec| {
+            assert!(
+                matches!(
+                    build_trigger_order(spec),
+                    Err(ConditionalBuildError::BadTriggerPrice { .. })
+                ),
+                "{spec:?} must be refused on its trigger price"
+            );
+        };
+        let refuse_price = |spec: &TriggerOrderSpec| {
+            assert!(
+                matches!(
+                    build_trigger_order(spec),
+                    Err(ConditionalBuildError::BadPrice { .. })
+                ),
+                "{spec:?} must be refused on its price"
+            );
+        };
+
+        // Price one paise over the plausibility cap; exactly at it is legal.
+        let mut at_cap = limit_leg_spec();
+        at_cap.price_paise = MAX_PRICE_PAISE;
+        assert!(build_trigger_order(&at_cap).is_ok());
+        let mut over_cap = limit_leg_spec();
+        over_cap.price_paise = MAX_PRICE_PAISE + 1;
+        refuse_price(&over_cap);
+
+        // Negative trigger.
+        let mut negative_trigger = limit_leg_spec();
+        negative_trigger.trigger_price_paise = -1;
+        refuse_trigger(&negative_trigger);
+
+        // Trigger one paise over the cap.
+        let mut trigger_over_cap = limit_leg_spec();
+        trigger_over_cap.order_type = OrderType::StopLoss;
+        trigger_over_cap.trigger_price_paise = MAX_PRICE_PAISE + 1;
+        refuse_trigger(&trigger_over_cap);
+
+        // MARKET with a stray trigger.
+        let mut market_triggered = limit_leg_spec();
+        market_triggered.order_type = OrderType::Market;
+        market_triggered.price_paise = 0;
+        market_triggered.trigger_price_paise = 100;
+        refuse_trigger(&market_triggered);
+
+        // STOP_LOSS with no price.
+        let mut stop_loss_unpriced = limit_leg_spec();
+        stop_loss_unpriced.order_type = OrderType::StopLoss;
+        stop_loss_unpriced.price_paise = 0;
+        stop_loss_unpriced.trigger_price_paise = 24_900;
+        refuse_price(&stop_loss_unpriced);
+
+        // STOP_LOSS_MARKET with a price.
+        let mut slm_priced = limit_leg_spec();
+        slm_priced.order_type = OrderType::StopLossMarket;
+        slm_priced.trigger_price_paise = 24_900;
+        refuse_price(&slm_priced);
+
+        // STOP_LOSS_MARKET with no trigger.
+        let mut slm_untriggered = limit_leg_spec();
+        slm_untriggered.order_type = OrderType::StopLossMarket;
+        slm_untriggered.price_paise = 0;
+        refuse_trigger(&slm_untriggered);
+    }
 }

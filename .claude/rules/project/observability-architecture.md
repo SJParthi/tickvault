@@ -57,13 +57,12 @@ migration (#O1/#O2/#O3) — the 2026-07-06 zero-page incident is why this list
 now exists (`deploy/aws/terraform/error-code-alarms.tf`).
 
 Filtered+alarmed codes (each = one `error_code_alerts` map entry):
-DH-901, DH-906 (term-match tripwire — no coded emit site
-exists yet), AUTH-GAP-04 (the Groww stall-storm entry left this list
+**WS-GAP-03/universe-collapse (added 2026-08-22** — the universe-collapse arm ONLY, matched by a three-condition pattern including `$.source = "fell_back_to_indices"`; the bare code has ~50 connection-state emit sites and filtering on it alone would page on ordinary reconnect churn. Closes the gap where a fall back from ~24,600 instruments to 4 reported nothing: the 4 indices keep ticking, so the no-ticks alarm stays green. See `dhan-rest-only-noise-lock-2026-07-14.md` §2.3d**), DH-901, the order-error tripwire [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list], AUTH-GAP-04 (the Groww stall-storm entry left this list
 2026-07-15 — its only ERROR-level emit site, the deleted sidecar stall
 watchdog, died with the Groww live feed; see "Retired paging entries" below),
 (the WAL re-injection-abort entry left this list 2026-07-17 — its only
 emit site, the un-consumed `wal_reinject.rs` helper, was deleted in the
-dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01,
+dead live-WS sweep stage 1; see "Retired paging entries" below), PROC-01, **the resident-memory early-warning entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list] (added 2026-09-02** — the process's own resident-memory early warning, the one signal meant to fire BEFORE the OOM killer; it was log-sink-only and, with no memory directive on the systemd unit, its 80% line was measured against MemTotal (~31 GiB) and was unreachable. Paired with the same-day `MemoryHigh=15G` throttle + `OOMScoreAdjust=-900` on the unit; plain coded filter, `ok_recovery = true` because the monitor re-emits while RSS stays over the line. Dated row: `dhan-rest-only-noise-lock-2026-07-14.md` §2.3p**),
 **AGGREGATOR-DROP-01 (added 2026-07-09** — the
 audit found the Severity::Critical sealed-candle-drop code, the ONLY
 silent-data-loss path for sealed candles, paged nobody; it also gains a
@@ -71,7 +70,7 @@ redundant counter-side pager on `tv_seal_writer_drain_total{kind="dropped"}`
 — `tv-<env>-seal-writer-dropped`, `seal-drop-alarm.tf`, with the dropped
 series pre-registered at 0 post-recorder-install in main.rs per the
 feed-stall round-5 first-sample-baseline lesson; lockstep ratchet
-`crates/app/tests/seal_drop_paging_wiring_guard.rs`**)**, **WAL-SUSPEND-01
+`crates/app/tests/seal_drop_paging_wiring_guard.rs`**)**, **the WAL-suspension log entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list]
 (added 2026-07-10, W2 PR#6** — audit follow-up row 10: a WAL-suspended
 QuestDB table (post disk-full / apply error) keeps ACKing ILP rows while
 they silently stop becoming visible/applied, previously with ZERO signal;
@@ -80,10 +79,12 @@ fires one edge-latched ERROR per (table, suspension episode) — a merely-DOWN
 QuestDB never fires it, the boot-probe escalation codes own the down-server
 page; recovery = the operator's
 `ALTER TABLE <t> RESUME WAL`, never auto-executed; runbook
-`.claude/rules/project/wal-suspension-error-codes.md`**)** (the
-TICK-CONSERVE-01 entry added here 2026-07-14 by automation-gaps PR-3 left
+`.claude/rules/project/wal-suspension-error-codes.md`**)** (the daily
+tick-conservation entry added here 2026-07-14 by automation-gaps PR-3 left
 this list 2026-07-18 — its emit site was deleted with the retired
-tick-conservation audit; see "Retired paging entries" below), **AUTH-GAP-05
+tick-conservation audit; see "Retired paging entries" below. 2026-10-26, plan
+item K4: the code is live again as a LOG-ONLY daily verdict, so it is no longer
+named in this paragraph, which lists only the codes that page), **AUTH-GAP-05
 (added 2026-07-14, REST-audit gap 01** — SCOPED to the mint-FAILURE arm only
 via `$.cooldown_skip IS FALSE` (the boolean field exists only on that
 emission; IS FALSE additionally excludes the same-day noise-lock H3
@@ -135,6 +136,56 @@ the page ten minutes for a condition the detector has confirmed.
 `ok_recovery = true`, also unlike that pair: silence is not the permanent
 loss of a specific frame — instruments genuinely start ticking again, and
 "the feed is being heard again" is a real recovery worth telling**)**.
+and the depth swap-emptied-socket page (added 2026-08-28 under
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3m, **REMOVED 2026-10-22** by
+the alarm review under operator Quote 37, noise-lock §2.14 and
+`docs/audits/2026-10-alarm-review.md`: the swap runs only on depth sockets,
+which are switched off since 2026-10-21, so the filter could not match; its
+code is named here no longer so this list stays the paging list).
+and **the daily-rollup entry [REMOVED 2026-11-11 by the operator Quote 53 alarm review, `docs/audits/2026-11-alarm-review.md`; its code is named here no longer so this list stays the paging list] (added 2026-09-02** — authority
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.3q, operator reaffirmation that
+day. A daily rollup that fails to write loses the WHOLE per-connection day
+summary — the table you read to answer "which connection misbehaved
+yesterday". It was log-sink-only by ACCIDENT rather than by decision: a sweep
+of every storage write path found `ws_connection_rollup.rs` is the one file
+whose flush-failure arm pairs `error!` with no counter at all, and
+`Scoreboard01AggregationDegraded` is `Severity::Medium`, so the coverage guard
+never required it to be alarmed and it is not on the exempt list either. It
+fell between two rules. SAFE TO PAGE because the rollup runs ONCE per day
+after close: this can fire at most once a day and structurally cannot flap,
+unlike RISK-GAP-03's 25 pages in one session. `period = 86400` and `eval = 1`
+because a once-daily emitter has no second datapoint to wait for.
+`ok_recovery = false`, unlike RISK-GAP-03: the rollup does not retry within
+the day, so an OK an hour later is the datapoint ageing out, never the summary
+arriving. Nothing is LOST when it fires — the raw `ws_event_audit` and
+`feed_episode_audit` rows it folds from are unaffected and the day is
+re-rollable by hand; what is lost until then is the view**)**,
+and **AGGREGATOR-STALL-01 (added 2026-09-27** — audit PR40d, authority
+`dhan-rest-only-noise-lock-2026-07-14.md` §2.7: the operator chose to accept a
+stalled disk briefly pausing the live feed rather than add a third candle
+store, on condition that the pause is loud. When the escalation queue refuses
+a sealed candle, the frame drain writes it to spill itself and waits on the
+disk; a wait of 1 s or more is counted and logged at most once a minute, the
+window's stall count and longest wait folded into the next line. Nothing is
+lost: the candle is written. The honest limit is that the line is written when
+the wait ENDS, so a disk that never returns is caught by the liveness alarms,
+not this one. `ok_recovery = false`: a quiet window is not proof the disk is
+healthy**)**, and **HOT-PATH-STALL-01 (added 2026-10-02** — owner-approved,
+authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.8: in session, a tokio
+runtime or the frame drain made no progress for 2 s, or one hot-path step
+took 2 s; written by the telemetry thread, edge-triggered per signal, at most
+one line a minute. `ok_recovery = false`: a stall that ended is not a
+repair**)**, and **CLOCK-SKEW-01 (added 2026-11-12** — owner-approved,
+authority `dhan-rest-only-noise-lock-2026-07-14.md` §2.22, Quote 57: chrony's
+clock offset over 1 ms for 5 consecutive minute samples inside 09:00–15:40 IST;
+written by the clock-skew poller, once per episode; a failed sample is a `warn!`
+with this code and does not match the filter. `ok_recovery = false`: the rule
+forbids a recovery page**)**, and **DHAN-FEED-TIME-01 (added 2026-11-21** —
+owner cards 2026-11-20, authority `dhan-rest-only-noise-lock-2026-07-14.md`
+§2.24: the live feed's trade times still look wrong after the Dhan trade-time
+correction, or no candle for 10 minutes while prices arrive, inside the
+session; at most once per cause per IST day, latch saved off the drain, the day
+auto-held. `ok_recovery = false`: the rule forbids a recovery page**)**.
 **Everything else
 is log-sink-only** unless it has its own metric alarm (app-alarms.tf) or a
 typed `NotificationEvent`. Counter-side (non-errcode) pager added
@@ -272,8 +323,8 @@ Every variant carries:
 | 14 | same::`every_runbook_path_exists_on_disk` | `runbook_path()` always resolves to a real file |
 | 15 | `crates/common/tests/error_code_tag_guard.rs::every_error_macro_tagged_with_a_known_code_carries_code_field` | Every `error!` that mentions a code in its message MUST also have `code = ErrorCode::X.code_str()` |
 | 16 | same::`tagged_prefix_set_is_non_empty` | Guard setup sanity |
-| 17 | `crates/storage/tests/error_level_meta_guard.rs::flush_persist_broadcast_failures_must_use_error_level` | No flush/persist/drain failure may be logged at `warn!` |
-| 18 | same::`phrases_list_is_non_empty_and_lowercase` | Guard setup sanity |
+| 17 | `crates/storage/tests/error_level_meta_guard.rs::write_failure_warns_are_errors_or_reviewed` | Every `warn!` whose text pairs a durability word (flush, persist, spill, write, ...) with a failure word is either `error!`, marked `// APPROVED:`, or listed in `REVIEWED_WARN_SITES` with a reason; a stale list entry also fails (rewritten 2026-10-09: the old phrase list matched none of the code) |
+| 18 | same::`reviewed_list_is_lowercase_and_reasoned` + five `bite_*` tests | Guard setup sanity, and proof the scanner catches a two-line warn, a continued string and `tracing::warn!` |
 | 19 | `crates/app/src/observability.rs::test_histogram_buckets_are_non_empty_and_monotonic` | Prometheus `_duration_ns` buckets stay monotonic |
 | 20 | same::`init_errors_jsonl_appender_creates_directory` | JSONL sink does the side-effect it promises |
 | 21 | same::`sweep_errors_jsonl_retention_*` (4 tests) | 48h retention sweeper preserves fresh, deletes old, ignores unrelated, handles missing dir |
@@ -375,9 +426,11 @@ summary file and drives the above flow.
 
 ## What future sessions MUST NOT do
 
-1. **Do not re-audit WARN→ERROR for flush/persist/drain sites.** The 28
-   phrases in `crates/storage/tests/error_level_meta_guard.rs` are
-   ratcheted. Adding a new flush handler? The meta-guard tells you the
+1. **Do not re-audit WARN→ERROR for flush/persist/drain sites.** Every
+   such `warn!` is ratcheted in `crates/storage/tests/error_level_meta_guard.rs`
+   (`REVIEWED_WARN_SITES`, each with the reason it stays a warning; until
+   2026-10-09 the guard checked 28 fixed phrases that no longer appeared in
+   the code, so it could not fail). Adding a new flush handler? The meta-guard tells you the
    pattern by example. Don't scan the codebase from scratch.
 2. **Do not duplicate the ErrorCode enum.** If a new code is needed,
    add a variant + a rule-file mention in the SAME PR. The cross-ref
@@ -389,8 +442,11 @@ summary file and drives the above flow.
    Alloy/Loki scrapers, the summary writer, and the triage hook all
    hard-code these.
 5. **Do not introduce a new `warn!` on a flush/persist/drain failure.**
-   The meta-guard regexes these phrases; violations fail the build.
-   Use `error!` with a `code =` field.
+   The meta-guard reads every `warn!` body and fails the build on one it has
+   not seen. Use `error!` with a `code =` field, or add the site to
+   `REVIEWED_WARN_SITES` with the reason it stays a warning (for example,
+   a counter already pages through a loss-group alarm, so `error!` would
+   page twice).
 6. **Do not log at ERROR without a `code =` field** if the message
    mentions a known code prefix (I-P*, OMS-*, WS-*, STORAGE-*, etc.).
    The tag-guard fails the build.
@@ -493,7 +549,7 @@ summary file and drives the above flow.
       `chaos_ws_frame_spill_saturation.rs` (Phase 11.2 backpressure sim),
       `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). The CloudWatch
       alarm equivalents land alongside the prod CloudWatch migration.
-- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (68.3–99.4, target 100%; floors only move up) set in
+- [x] **Phase 12.1** — ratcheted per-crate line-coverage floors (86.4–99.4 on the test-inclusive gate figure since 2026-11-13, plus production-only `[production]` floors; target 100%; floors only move up) set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI
 - [x] **Phase 12.5** — O(1) hot-path ratchet: DHAT zero-alloc tests +

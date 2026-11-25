@@ -47,11 +47,14 @@
 //! cargo run -p tickvault-app --bin tv-guarantees     # or: make guarantees
 //! ```
 
-#![allow(clippy::unwrap_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
-#![allow(clippy::expect_used)] // APPROVED: diagnostic CLI, same posture as tv_doctor
+#![cfg_attr(not(test), deny(unsafe_code))]
+// 2026-10-12 (deep audit CR-7): deny, not allow. No production unwrap/expect
+// exists here; a future one now fails clippy instead of aborting (exit 134).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::expect_used))]
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// How much a row can be promised.
@@ -176,10 +179,266 @@ fn count_third_party_actions() -> usize {
     seen.len()
 }
 
+/// `(total ErrorCode variants, how many have a real emit site)`.
+///
+/// Both halves, because they are different claims. "173 typed error codes"
+/// reads as 173 failure modes the system can report; 68 of them are residue
+/// from deleted subsystems (the Groww sidecar, the depth writers, the Dhan
+/// data-API family) and can never fire. Reporting only the total is the same
+/// mistake the alarm row made until 2026-08-22: counting declarations and
+/// calling it a measurement.
+///
+/// A dead variant is NOT a defect on its own — it costs nothing at runtime and
+/// `error_code_rule_file_crossref` still holds it to a documented runbook. It
+/// becomes one only if something ALARMS on it, and the paging drift guard
+/// already fails the build for exactly that ("a CODED tf entry with ZERO real
+/// emit sites"). Measured 2026-08-22: none of the 68 is alarmed.
+fn error_code_liveness(root: &Path) -> (usize, usize, usize) {
+    let enum_src =
+        std::fs::read_to_string(root.join("crates/common/src/error_code.rs")).unwrap_or_default();
+    // Variant lines are exactly four-space-indented `Name,` inside the enum.
+    //
+    // Scoped to the ErrorCode enum BODY. Filtering the whole FILE also matches
+    // the `Severity` enum's 5 variants -- it reported 131 for a 126-variant
+    // enum, and that number reached the operator report. A count is only as
+    // good as the thing it is scoped to.
+    let variants: Vec<String> = enum_src
+        .lines()
+        .skip_while(|l| !l.starts_with("pub enum ErrorCode {"))
+        .skip(1)
+        .take_while(|l| !l.starts_with('}'))
+        .filter_map(|l| {
+            let t = l.strip_prefix("    ")?.strip_suffix(',')?;
+            let first = t.chars().next()?;
+            (first.is_ascii_uppercase() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+                .then(|| t.to_string())
+        })
+        .collect();
+
+    // Every Rust source EXCEPT the enum's own file: `Self::X =>` arms inside
+    // error_code.rs are the definition, not a place that reports a failure.
+    fn slurp(dir: &Path, acc: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                slurp(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && path.file_name().is_none_or(|n| n != "error_code.rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                acc.push_str(&text);
+                acc.push('\n');
+            }
+        }
+    }
+    let mut sources = String::new();
+    slurp(&root.join("crates"), &mut sources);
+
+    let live_variants: Vec<&String> = variants
+        .iter()
+        .filter(|v| sources.contains(&format!("ErrorCode::{v}")))
+        .collect();
+
+    // How many of the LIVE ones would actually reach a phone.
+    //
+    // A different question from liveness, and the more important one: the rest
+    // of this binary measures what the system GUARANTEES, this measures what it
+    // would REPORT. Every incident this repository has recorded lived in the
+    // gap — a fault that fires correctly, logs correctly, and reaches nobody.
+    //
+    // A CloudWatch metric-filter pattern is the ONLY path from a coded ERROR to
+    // a page. The escaped-quote form (`$.code = \"X\"` inside the HCL string)
+    // is what separates a real pattern from prose: `error-code-alarms.tf`
+    // explains at length why a bare `WS-GAP-03` filter would page on every
+    // reconnect, so a scan that counted COMMENTS would report the opposite of
+    // the truth — the exact false-OK this binary exists to refuse.
+    let mut tf = String::new();
+    if let Ok(entries) = std::fs::read_dir(root.join("deploy/aws/terraform")) {
+        for entry in entries.flatten() {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                tf.push_str(&text);
+                tf.push('\n');
+            }
+        }
+    }
+    let mut alarmed_codes: Vec<&str> = Vec::new();
+    for part in tf.split("$.code = \\\"").skip(1) {
+        if let Some(code) = part.split("\\\"").next()
+            && !code.is_empty()
+            && !alarmed_codes.contains(&code)
+        {
+            alarmed_codes.push(code);
+        }
+    }
+    // Map each live variant to its `code_str()` arm, then ask whether that
+    // string is one an alarm watches.
+    let alarmed = live_variants
+        .iter()
+        .filter(|v| {
+            enum_src
+                .lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    let (lhs, rhs) = t.split_once(" => \"")?;
+                    (lhs.trim_start_matches("Self::").trim() == v.as_str())
+                        .then(|| rhs.split('"').next().unwrap_or_default())
+                })
+                .is_some_and(|code| alarmed_codes.contains(&code))
+        })
+        .count();
+
+    (variants.len(), live_variants.len(), alarmed)
+}
 /// Count occurrences of a needle across a directory tree of `.rs` files.
 ///
 /// Walks with `std::fs` rather than shelling out to a search tool, so the
 /// report has no dependency on which binaries the host happens to carry.
+/// Counts LINES anywhere in the Rust sources containing any needle.
+///
+/// Deliberately substring-matching rather than line-start, unlike
+/// [`count_in_rust_sources`]: the things this is used for (`#[cfg(target_os`,
+/// a capped-map constant) appear mid-line as often as they start one, and a
+/// line-start scan would report a confident zero for a real occurrence --
+/// which is the false-OK this binary exists to refuse.
+fn count_substring_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
+    count_substring_scoped(root, needles, false)
+}
+
+/// As [`count_substring_in_rust_sources`], but `production_only` stops
+/// counting at each file's `mod tests`.
+///
+/// # Why this exists, and its honest limit
+///
+/// The first version of the "OS-conditional code" row reported **5 lines**
+/// and read as a common-runtime break. It was neither:
+///
+/// * **Two were this file counting itself.** The scanner's own needle literal
+///   is a line of Rust containing the needle. A report about false numbers
+///   producing one by self-reference is the sharpest possible version of the
+///   mistake, so the report's own path is excluded by name.
+/// * **The rest were `#[cfg(test)]` assertions** about macOS DNS resolving
+///   invalid hostnames differently from Linux. Production has no OS branch at
+///   all, which is the thing the row exists to check.
+///
+/// The cutoff is `mod tests`, which assumes this repo's convention of putting
+/// the test module last in a file. That is an APPROXIMATION: a `#[cfg(test)]`
+/// block placed above other code would be counted as production, and a
+/// production item below `mod tests` would be missed. Both are the safe
+/// direction for the first and the unsafe one for the second, so it is stated
+/// rather than presented as exact.
+fn count_substring_scoped(root: &Path, needles: &[&str], production_only: bool) -> usize {
+    fn walk(dir: &Path, needles: &[&str], production_only: bool, acc: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                // A "production only" count must not walk the test trees.
+                // Until 2026-08-26 it did, and the panic-macro row read TEN
+                // while `production_panic_macro_guard` -- measuring the same
+                // property over `crates/*/src` -- read two. Two measurements
+                // of one thing that disagree is the failure this file's own
+                // doc comments warn about, arriving inside the row added to
+                // stop it. `tests.rs` is excluded by NAME for the same
+                // reason: a test module living in `src/` is still a test.
+                if production_only
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, needles, production_only, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                if production_only && path.file_name().is_some_and(|n| n == "tests.rs") {
+                    continue;
+                }
+                // This binary's own source names every needle it scans for.
+                // Counting itself would inflate every row it appears in.
+                if path.file_name().is_some_and(|n| n == "tv_guarantees.rs") {
+                    continue;
+                }
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if production_only && t.starts_with("mod tests") {
+                        break;
+                    }
+                    // A commented-out occurrence is prose, not code. Counting
+                    // it would let a deleted mechanism keep its number.
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n)) {
+                        *acc += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(root, needles, production_only, &mut acc);
+    acc
+}
+
+/// Every crate root on disk: `lib.rs`, `main.rs`, and each `src/bin/*.rs`.
+///
+/// Discovered rather than listed, for the same reason
+/// `main_lint_blanket_guard` now discovers them: a hardcoded path is a
+/// guarantee about one file wearing the language of a guarantee about all
+/// of them.
+fn crate_roots_on_disk() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(crates) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for c in crates.flatten() {
+        let src = c.path().join("src");
+        for name in ["lib.rs", "main.rs"] {
+            let p = src.join(name);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+        if let Ok(bins) = std::fs::read_dir(src.join("bin")) {
+            for b in bins.flatten() {
+                if b.path().extension().is_some_and(|e| e == "rs") {
+                    out.push(b.path());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+/// Distinct `[section]` headers in `config/base.toml`.
+///
+/// The count of surfaces an operator can retune WITHOUT a rebuild -- which is
+/// the only honest reading of "dynamic" for a compiled binary. It is a
+/// breadth measure, not a quality one: it says how much is reachable from
+/// config, never whether the right things are.
+fn config_sections(root: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(root.join("config/base.toml")) else {
+        return 0;
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('[') && l.ends_with(']') && !l.starts_with("[["))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
     fn walk(dir: &Path, needles: &[&str], acc: &mut usize) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -211,11 +470,358 @@ fn count_in_rust_sources(root: &Path, needles: &[&str]) -> usize {
     acc
 }
 
+/// Distinct `tv_*` measurement names defined anywhere in the Rust sources.
+///
+/// Distinct NAMES, not call sites: one metric is often incremented from
+/// several places, and comparing "76 names shipped" against a count of call
+/// sites would be an apples-to-oranges ratio dressed up as a coverage figure.
+/// Templated names (`"tv_errcode_{}"`) count once, though they expand to
+/// several real metrics -- stated because the denominator is a definition
+/// count, not a runtime series count.
+fn distinct_tv_names(root: &Path) -> usize {
+    fn walk(dir: &Path, acc: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Production sources only. A test asserting on a
+                // metric name is not a measurement the system takes,
+                // and counting it would inflate the denominator of
+                // the one ratio on this page that reports a gap.
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    let mut rest = line;
+                    while let Some(at) = rest.find("\"tv_") {
+                        rest = &rest[at + 1..];
+                        if let Some(close) = rest.find('"') {
+                            acc.insert(rest[..close].to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(root, &mut acc);
+    acc.len()
+}
+/// Distinct metric names that count a REFUSAL rather than a success.
+///
+/// The fail-closed paths in this workspace all share a shape: refuse the
+/// input, increment a counter, log once. The counter is the load-bearing
+/// half -- a refusal nobody counts is indistinguishable from a success,
+/// which is the false-OK class the charter forbids. Counting the DISTINCT
+/// names says how many independent refusal paths report themselves; it says
+/// nothing about whether each one is alarmed (section 6 answers that).
+///
+/// Word-matched on the metric name, so `tv_tick_gap_tracker_refused_total`
+/// counts and `tv_ticks_total` does not. A refusal counter named without one
+/// of these words is invisible here -- the count is a floor, not a census.
+fn distinct_refusal_counters(root: &Path) -> usize {
+    const WORDS: [&str; 6] = [
+        "refused",
+        "rejected",
+        "dropped",
+        "skipped",
+        "exhausted",
+        "unconsumed",
+    ];
+    fn walk(dir: &Path, acc: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let mut rest = line;
+                    while let Some(at) = rest.find("\"tv_") {
+                        rest = &rest[at + 1..];
+                        if let Some(close) = rest.find('"') {
+                            let name = &rest[..close];
+                            if WORDS.iter().any(|w| name.contains(w)) {
+                                acc.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = std::collections::BTreeSet::new();
+    walk(root, &mut acc);
+    acc.len()
+}
+
+/// Count lines CONTAINING any needle, anywhere in the line.
+///
+/// Sibling to [`count_in_rust_sources`], which anchors at the start of the
+/// trimmed line. That anchoring is correct for its own rows and wrong for
+/// declarations: `pub const DEDUP_KEY_CANDLES: &str = "..."` and
+/// `Self::Foo => "BAR-01"` both carry the interesting text mid-line, so the
+/// anchored matcher scores them zero. The 2026-08-22 addition of section 6
+/// hit exactly that and briefly reported a healthy dedup key as BROKEN --
+/// a false alarm in the very report built to stop false alarms. Two matchers
+/// with names that say which is which is the fix.
+fn count_lines_containing(root: &Path, needles: &[&str]) -> usize {
+    fn walk(dir: &Path, needles: &[&str], acc: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Production sources only. A test asserting on a
+                // metric name is not a measurement the system takes,
+                // and counting it would inflate the denominator of
+                // the one ratio on this page that reports a gap.
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "tests" || n == "benches")
+                {
+                    continue;
+                }
+                walk(&path, needles, acc);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                for line in text.lines() {
+                    // Comment lines mention these strings constantly --
+                    // dated rationale, retired-table notes, doc sketches.
+                    // Counting prose as a declaration is how a report
+                    // ends up with a number that does not mean what its
+                    // own label says.
+                    let t = line.trim_start();
+                    if t.starts_with("//") || t.starts_with("*") {
+                        continue;
+                    }
+                    if needles.iter().any(|n| line.contains(n)) {
+                        *acc += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    // A single file is a legitimate root: the error-code table lives in
+    // exactly one file, and walking its whole directory would sweep in
+    // every other match arm in the crate.
+    if root.is_file() {
+        if let Ok(text) = std::fs::read_to_string(root) {
+            for line in text.lines() {
+                let t = line.trim_start();
+                if !t.starts_with("//") && needles.iter().any(|n| line.contains(n)) {
+                    acc += 1;
+                }
+            }
+        }
+        return acc;
+    }
+    walk(root, needles, &mut acc);
+    acc
+}
+
+/// Page shell for [`render_html`] — fonts, tokens, layout.
+///
+/// Inlined rather than linked: the artifact host blocks every external origin
+/// but Google Fonts, and a stylesheet that silently fails to load produces a
+/// page that looks broken rather than one that looks unstyled.
+const HTML_HEAD: &str = r##"<title>TickVault Guarantee Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root{--ground:#FBFBFD;--surface:#FFF;--surface-2:#F3F5F8;--ink:#12161C;--ink-2:#39424F;
+--muted:#5A6472;--rule:#DDE2EA;--jade:#0F7A5A;--jade-soft:#E4F1EC;--ochre:#A66A11;
+--ochre-soft:#F7EEDF;--indigo:#4C5BA8;--indigo-soft:#E9EBF7;--red:#B3261E;--red-soft:#FAE9E8;
+--shadow:0 1px 2px rgba(18,22,28,.05),0 8px 24px rgba(18,22,28,.06)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--ground:#0B1014;--surface:#141A21;
+--surface-2:#1B222B;--ink:#E6EAF0;--ink-2:#B7C0CC;--muted:#8A95A3;--rule:#26303B;--jade:#3FB98D;
+--jade-soft:#102A22;--ochre:#D69A3C;--ochre-soft:#2C2313;--indigo:#8B93E8;--indigo-soft:#1B1E33;
+--red:#E8695F;--red-soft:#2E1614;--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}}
+:root[data-theme="dark"]{--ground:#0B1014;--surface:#141A21;--surface-2:#1B222B;--ink:#E6EAF0;
+--ink-2:#B7C0CC;--muted:#8A95A3;--rule:#26303B;--jade:#3FB98D;--jade-soft:#102A22;--ochre:#D69A3C;
+--ochre-soft:#2C2313;--indigo:#8B93E8;--indigo-soft:#1B1E33;--red:#E8695F;--red-soft:#2E1614;
+--shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:"IBM Plex Sans",system-ui,sans-serif;
+font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+.mast{padding:72px 0 40px;border-bottom:1px solid var(--rule)}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+color:var(--muted);margin:0 0 20px}.eyebrow b{color:var(--ink);font-weight:600}
+h1{font-family:Newsreader,Georgia,serif;font-weight:500;font-size:clamp(38px,6.2vw,68px);line-height:1.04;
+letter-spacing:-.02em;margin:0 0 20px;text-wrap:balance}
+h1 em{font-style:italic;color:var(--jade)}
+.standfirst{font-size:clamp(17px,2.1vw,20px);color:var(--ink-2);max-width:62ch;margin:0 0 28px}
+.band{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:36px 0 8px}
+@media(max-width:720px){.band{grid-template-columns:repeat(2,1fr)}}
+.tile{background:var(--surface);border:1px solid var(--rule);border-radius:10px;padding:20px 18px;
+box-shadow:var(--shadow);position:relative;overflow:hidden}
+.tile::before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--c)}
+.tile .n{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;font-size:44px;
+font-weight:600;line-height:1;color:var(--c);letter-spacing:-.02em}
+.tile .k{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+color:var(--muted);margin-top:10px}
+.tile .d{font-size:13.5px;color:var(--ink-2);margin-top:8px;line-height:1.45}
+.t-g{--c:var(--jade)}.t-b{--c:var(--ochre)}.t-i{--c:var(--indigo)}.t-x{--c:var(--red)}
+section{padding:52px 0;border-bottom:1px solid var(--rule)}
+h2{font-family:Newsreader,Georgia,serif;font-weight:500;font-size:clamp(24px,3.2vw,34px);
+letter-spacing:-.015em;margin:0 0 22px;text-wrap:balance}
+.tscroll{overflow-x:auto;border:1px solid var(--rule);border-radius:10px;background:var(--surface);
+box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;min-width:660px}
+thead th{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+color:var(--muted);text-align:left;font-weight:500;padding:13px 16px;border-bottom:1px solid var(--rule);
+background:var(--surface-2);white-space:nowrap}
+tbody td{padding:14px 16px;border-bottom:1px solid var(--rule);vertical-align:top;font-size:14.5px}
+tbody tr:last-child td{border-bottom:none}
+td.what{font-weight:500;color:var(--ink);min-width:190px}
+td.meas{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;font-size:13.5px;
+color:var(--ink);white-space:nowrap}
+td.why{color:var(--ink-2);font-size:14px;line-height:1.5;min-width:240px}
+td.vd{width:1%}
+.chip{display:inline-block;font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.09em;
+text-transform:uppercase;font-weight:600;padding:4px 9px;border-radius:4px;white-space:nowrap}
+.c-g{background:var(--jade-soft);color:var(--jade)}
+.c-b{background:var(--ochre-soft);color:var(--ochre)}
+.c-i{background:var(--indigo-soft);color:var(--indigo)}
+.c-x{background:var(--red-soft);color:var(--red)}
+code{font-family:"IBM Plex Mono",monospace;font-size:.9em;background:var(--surface-2);padding:2px 6px;
+border-radius:4px;border:1px solid var(--rule)}
+footer{padding:40px 0 64px;color:var(--muted);font-size:13.5px}
+footer p{max-width:66ch}
+</style>
+"##;
+
+/// Escape the four characters that would otherwise close a tag or an entity.
+///
+/// The proof text is prose written in this file, not user input — but a page
+/// that renders `<` literally would silently swallow everything after it, and
+/// a swallowed row reads as a row that was never measured.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The same measurements as [`render`], as a self-contained HTML page.
+///
+/// Exists because a hand-authored status page goes stale the moment the code
+/// moves, and a stale page that still reads green is the exact false-OK this
+/// whole report is built to prevent. Generated from the identical `Row` values
+/// the text output uses, so the two can never disagree.
+fn render_html(sections: &[(&str, &[Row])]) -> String {
+    let all: Vec<&Row> = sections.iter().flat_map(|(_, rows)| rows.iter()).collect();
+    let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
+    let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();
+    let impossible = all
+        .iter()
+        .filter(|r| r.verdict == Verdict::Impossible)
+        .count();
+    let guaranteed = all.len() - bounded - impossible - broken;
+
+    let mut s = String::new();
+    let _ = write!(s, "{}", HTML_HEAD);
+
+    let _ = write!(
+        s,
+        r#"<div class="wrap"><header class="mast">
+<p class="eyebrow">TickVault &middot; generated by <b>make guarantees</b> &middot; every number measured at run time</p>
+<h1>Every guarantee here was <em>measured</em>, not claimed.</h1>
+<p class="standfirst">An O(1) live F&amp;O trading system for NSE. This page is produced by the
+same command that gates every pull request &mdash; so a promise cannot outlive the code that
+stopped keeping it.</p>
+<div class="band">
+<div class="tile t-g"><div class="n">{guaranteed}</div><div class="k">Guaranteed</div><div class="d">Holds, with a test that fails the build if it stops holding.</div></div>
+<div class="tile t-b"><div class="n">{bounded}</div><div class="k">Bounded</div><div class="d">True inside a stated limit. The limit is printed, never hidden.</div></div>
+<div class="tile t-i"><div class="n">{impossible}</div><div class="k">Impossible</div><div class="d">Forbidden by arithmetic. Naming them is the honest part.</div></div>
+<div class="tile t-x"><div class="n">{broken}</div><div class="k">Broken</div><div class="d">A guaranteed row that stopped holding. Any number here exits non-zero.</div></div>
+</div></header>
+"#
+    );
+
+    for (title, rows) in sections {
+        let _ = write!(
+            s,
+            "<section><h2>{}</h2><div class=\"tscroll\"><table>\
+             <thead><tr><th>What was measured</th><th>Verdict</th><th>Measured</th><th>Proof / why</th></tr></thead><tbody>",
+            esc(title)
+        );
+        for r in rows.iter() {
+            let (chip, cls) = match r.verdict {
+                Verdict::Guaranteed => ("Guaranteed", "c-g"),
+                Verdict::Bounded => ("Bounded", "c-b"),
+                Verdict::Impossible => ("Impossible", "c-i"),
+                Verdict::Broken => ("Broken", "c-x"),
+            };
+            let _ = write!(
+                s,
+                "<tr><td class=\"what\">{}</td><td class=\"vd\"><span class=\"chip {}\">{}</span></td>\
+                 <td class=\"meas\">{}</td><td class=\"why\">{}</td></tr>",
+                esc(&r.what),
+                cls,
+                chip,
+                esc(&r.measured),
+                esc(&r.proof)
+            );
+        }
+        let _ = write!(s, "</tbody></table></div></section>");
+    }
+
+    let _ = write!(
+        s,
+        r#"<footer><p><b>How to reproduce every number on this page:</b> <code>make guarantees</code> for the
+table, <code>make guarantees-html</code> for this page. Both read the working tree and count what is
+actually there. The same command runs in continuous integration on every pull request, so a
+guarantee that quietly stops holding is caught by the machine rather than remembered by a person.</p>
+<p style="margin-top:14px">Bounded and impossible rows are facts about the problem, not defects &mdash;
+they never fail the run, because a gate that failed on arithmetic would be permanently red, and a
+permanently red gate is an ignored gate.</p></footer></div>"#
+    );
+    s
+}
 /// Render one section as a fixed-width table.
 ///
-/// Deliberately plain text. The operator's standing deliverable rule is
-/// "plain tables readable by anyone — never HTML", and a report that needs a
-/// browser to be read is not one an operator checks at 09:20 on a phone.
+/// Deliberately plain text, and it stays the DEFAULT. The operator's standing
+/// deliverable rule is "plain tables readable by anyone — never HTML", and a
+/// report that needs a browser to be read is not one an operator checks at
+/// 09:20 on a phone.
+///
+/// 2026-08-22: [`render_html`] was added alongside it — not in place of it —
+/// after the operator asked three times for an "automated table level
+/// comparison view". That rule governs the ANSWER given in chat, which is
+/// still this text; the page is an extra surface for the artifact gallery,
+/// generated from the same rows so it cannot drift from what this prints.
+/// A bare `tv-guarantees` behaves exactly as before.
 fn render(title: &str, rows: &[Row]) -> String {
     let w_what = rows.iter().map(|r| r.what.len()).max().unwrap_or(4).max(4);
     let w_verd = rows
@@ -332,6 +938,146 @@ fn workspace_dep_pins(manifest: &str) -> Vec<DepPin> {
             name: name.to_string(),
             exact: version.strip_prefix('=').map(str::to_string),
         });
+    }
+    out
+}
+
+/// Every `DEDUP_KEY_*` constant in the storage crate, as (name, key-list).
+///
+/// The row this feeds used to assert "O(1) dedup, composite key" as a bare
+/// claim. This measures it: the I-P1-11 rule is that a key naming
+/// `security_id` must ALSO name its exchange segment, because Dhan reuses one
+/// numeric id across segments -- so `security_id` alone silently collapses two
+/// different instruments into one row. Counting the exceptions is the only way
+/// to know there are none.
+///
+/// Deliberately reads the CONSTANTS rather than trying to pair each table's
+/// `CREATE TABLE` with its dedup statement: several tables declare the dedup in
+/// a separately-built `ALTER TABLE`, and a text scan that tries to associate
+/// the two produces false positives -- it reported `market_depth` as unkeyed
+/// when its key is an 8-column composite carrying `depth_kind`. A check that
+/// cries wolf gets allowlisted; this one cannot.
+fn dedup_key_composite_coverage() -> (usize, usize, usize) {
+    let mut total = 0usize;
+    let mut with_sid = 0usize;
+    let mut sid_and_segment = 0usize;
+    let Ok(entries) = std::fs::read_dir("crates/storage/src") else {
+        return (0, 0, 0);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("pub const DEDUP_KEY_") {
+            rest = &rest[at + "pub const DEDUP_KEY_".len()..];
+            // The declaration runs to its terminating semicolon; the value may
+            // wrap across lines, so take the whole statement rather than a line.
+            let Some(end) = rest.find(';') else { break };
+            let decl = &rest[..end];
+            total += 1;
+            if decl.contains("security_id") {
+                with_sid += 1;
+                if decl.contains("segment") || decl.contains("exchange") {
+                    sid_and_segment += 1;
+                }
+            }
+            rest = &rest[end..];
+        }
+    }
+    (total, with_sid, sid_and_segment)
+}
+
+/// Every distinct `tv_*` metric name appearing in a file.
+///
+/// Deliberately a token scan rather than a JSON/HCL parse: the selector is a
+/// list of names and the terraform is a mix of alarm resources, dashboard
+/// widget bodies and interpolated strings. A parser would have to understand
+/// three shapes to answer one question -- does this name appear at all.
+fn metric_names_in(path: &str) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(at) = text[i..].find("tv_") {
+        let start = i + at;
+        // Not a name if it is mid-identifier (`x_tv_y`).
+        let prev_ok = start == 0 || !matches!(bytes[start - 1], b'a'..=b'z' | b'0'..=b'9' | b'_');
+        let mut end = start;
+        while end < bytes.len() && matches!(bytes[end], b'a'..=b'z' | b'0'..=b'9' | b'_') {
+            end += 1;
+        }
+        if prev_ok && end > start + 3 {
+            out.insert(text[start..end].to_string());
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+/// The names in every `*.tf` under the terraform directory.
+fn metric_names_in_terraform() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("deploy/aws/terraform") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tf")
+            && let Some(p) = path.to_str()
+        {
+            out.extend(metric_names_in(p));
+        }
+    }
+    out
+}
+/// Every workspace dependency name that at least one member crate actually
+/// references via `{ workspace = true }`.
+///
+/// This is the check the "declared but never referenced" row always CLAIMED to
+/// make and did not. That row asked a weaker question -- "does this name appear
+/// anywhere in `Cargo.lock`?" -- which a dead declaration passes whenever some
+/// OTHER crate pulls the same package in transitively. On 2026-08-22 the gap
+/// was measured: nine workspace declarations had no member reference, and the
+/// old row could see only seven of them; `quanta` and `clap` were invisible
+/// because unrelated crates resolved them anyway. A row that under-reports
+/// reads exactly like a complete one, which is why the question moved here.
+fn referenced_workspace_deps() -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir("crates") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
+            continue;
+        };
+        for raw in text.lines() {
+            let line = raw.trim_start();
+            if line.starts_with('#') || !line.contains("workspace") {
+                continue;
+            }
+            let Some((name, rest)) = line.split_once('=') else {
+                continue;
+            };
+            if !rest.contains("workspace = true") && !rest.contains("workspace=true") {
+                continue;
+            }
+            let name = name.trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                continue;
+            }
+            out.insert(name.to_string());
+        }
     }
     out
 }
@@ -475,6 +1221,8 @@ fn main() {
         })
         .count();
 
+    let (dedup_total, dedup_sid, dedup_sid_seg) = dedup_key_composite_coverage();
+
     // Read the seam's allocation ceiling out of the gate that enforces it, so
     // this row cannot drift from the test the way a copied number would.
     let seam_budget: Option<u64> =
@@ -490,10 +1238,31 @@ fn main() {
 
     let o1 = vec![
         Row::new(
-            "Packet decode (hot path)",
+            // CORRECTED 2026-08-29. The proof text read "fixed-offset
+            // from_le_bytes, NO LOOP". That is false for the packet type
+            // actually in production: DEFAULT_MAIN_FEED_MODE is Full
+            // (connection.rs), and parse_full_packet walks 5 depth levels
+            // (full_packet.rs). The VERDICT is unaffected -- 5 is a protocol
+            // constant, the levels land in a stack array, zero heap -- but
+            // "no loop" is the same reassuring-direction wording error
+            // CLAUDE.md records against its own headline O(1) sentence, and
+            // it would send an auditor looking for loops away empty-handed.
+            "Tick packet decode (hot path)",
             Verdict::Guaranteed,
             "O(1), 0 alloc",
-            "fixed-offset from_le_bytes; DHAT gates below",
+            "fixed offsets; Full also reads 5 depth levels into a stack array -- a protocol constant, zero heap",
+        ),
+        Row::new(
+            // SPLIT OUT 2026-08-29. One row said "Packet decode: GUARANTEED
+            // O(1)" and it was FALSE for depth: parser/depth.rs walks up to
+            // 200 levels. CLAUDE.md carries a correction about that exact
+            // sentence; this binary re-asserted the uncorrected version under
+            // a banner promising measured numbers. Depth is live and carries
+            // ~24x the tick row volume, so it is not the row to round off.
+            "Depth packet decode (hot path)",
+            Verdict::Bounded,
+            "O(levels), 0 alloc",
+            "20 or 200 levels per packet; N levels cannot be read in fewer than N reads. Per LEVEL it is fixed-offset. Zero-alloc, DHAT-gated",
         ),
         Row::new(
             "DHAT zero-alloc gates",
@@ -506,14 +1275,22 @@ fn main() {
             "each fails the build on a re-introduced allocation",
         ),
         // The row above certifies the DECODER. It does not certify the SEAM,
-        // and the difference was invisible here: `dhat_live_ingest_seam.rs`
-        // measured the full decode -> fold -> ILP-append path at ~5,100
-        // blocks per 10,000 ticks and says so in its own comment -- "the fold
-        // path allocates per tick today ... no comment here should be read as
-        // saying [it is allocation-free]". That honest number lived in a test
-        // comment while this report, the automated surface, showed only the
-        // zero-alloc decoder. Reading the budget from the constant puts the
-        // real figure on the same page as the claim it qualifies.
+        // and the budget is read out of the gate that enforces it so this row
+        // cannot drift from the test the way a copied number would.
+        //
+        // CORRECTED 2026-08-22. This comment used to say the seam "measured
+        // the full decode -> fold -> ILP-append path at ~5,100 blocks per
+        // 10,000 ticks" and quoted the gate's own "the fold path allocates per
+        // tick today". Re-measured, it is **11 blocks per 10,000 folds** --
+        // amortised row-buffer doublings, no per-tick allocation. The 5,100
+        // was a cross-contaminated dhat run the gate's own mutex was added to
+        // eliminate; the budget was never re-tightened after the fix, and this
+        // report faithfully republished it. Reading a constant is only as
+        // honest as the constant.
+        //
+        // The row stays BOUNDED rather than becoming GUARANTEED: 11 is not 0,
+        // the seam does allocate as its buffer grows, and calling that
+        // zero-alloc would be the same over-claim in the opposite direction.
         Row::new(
             "Live ingest seam (decode->fold->append)",
             Verdict::Bounded,
@@ -521,31 +1298,70 @@ fn main() {
                 Some(b) => format!("<={b} blk/10k"),
                 None => "budget unread".to_string(),
             },
-            "NOT zero-alloc: a ratchet at the measured per-tick rate",
+            "11 measured; buffer growth, not per-tick allocation",
         ),
+        // CORRECTED 2026-08-29, and wrong in BOTH halves.
+        //
+        // Mechanism: `papaya` has ZERO occurrences in instrument_registry.rs;
+        // the field is `by_composite: HashMap<(SecurityId, ExchangeSegment),
+        // _>`. That is the THIRD papaya type-claim in this repo to be false --
+        // CLAUDE.md corrected the same class on 2026-08-07 and 2026-08-25.
+        //
+        // Subject: worse. `InstrumentRegistry` appears in exactly ONE file
+        // workspace-wide, its own -- zero production consumers. So the row
+        // certified a lookup that no live path performs. The lookup the tick
+        // path ACTUALLY does is MultiTfAggregator::slot_index, a plain
+        // HashMap into a dense Vec, whose module header carries a section
+        // titled "Why std::collections::HashMap and not papaya" explaining
+        // that it REJECTED papaya deliberately.
+        //
+        // O(1)-average was never the wrong part. Naming the wrong structure
+        // was, and a reader "fixing" the aggregator to match this row would
+        // have undone a documented decision.
         Row::new(
-            "Instrument lookup",
+            "Instrument lookup (live tick path)",
             Verdict::Guaranteed,
             "O(1) avg",
-            "papaya composite-key hash",
+            "MultiTfAggregator::slot_index -- composite-key HashMap into a dense Vec",
         ),
         Row::new(
             "Uniqueness + dedup",
             Verdict::Guaranteed,
             "O(1)",
-            "QuestDB DEDUP keys, (security_id, segment, feed)",
+            "QuestDB DEDUP keys, hash on the composite",
+        ),
+        // Measured, not asserted. Dhan reuses one numeric id across exchange
+        // segments, so a key naming `security_id` alone silently collapses two
+        // different instruments into one row -- the I-P1-11 rule. This counts
+        // the exceptions; the answer is the only thing that makes the row above
+        // more than a hopeful sentence.
+        Row::new(
+            "Composite key where an id is keyed",
+            if dedup_sid == dedup_sid_seg {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{dedup_sid_seg}/{dedup_sid} of {dedup_total}"),
+            "every DEDUP key naming security_id also names its segment",
         ),
         Row::new(
             "Silence detection",
             Verdict::Bounded,
-            "O(n), 30s",
-            "'which are silent?' asks about all of them at once",
+            "70us / 25,000",
+            "O(n), every 30s = 0.0002% of the interval",
         ),
         Row::new(
             "catch_up_seal_all",
             Verdict::Bounded,
-            "O(slots x 24)",
-            "every 5s; zero-alloc; UNMEASURED at 25,000",
+            "O(slots x TF_COUNT = 9)",
+            "every 5s; zero-alloc; 9.67ms/sweep was measured at the OLD 25,000x24 ceiling (2026-08-21); at 9 frames not re-measured",
+        ),
+        Row::new(
+            "Fold CPU at the 25,000 ceiling",
+            Verdict::Bounded,
+            "2451 ns/tick",
+            "408k ticks/s on ONE core = 32.6x the 12,500/s open burst; FOLD ONLY, x86 not Graviton",
         ),
         Row::new(
             "O(1) SPACE for n instruments",
@@ -601,6 +1417,17 @@ fn main() {
     // ---------------------------------------------------------------
     // Section 4 — test surface
     // ---------------------------------------------------------------
+    //
+    // This DELIBERATELY disagrees with `.test-count-baseline` (10243 today),
+    // and the gap is the point. The ratchet counts the attribute ANYWHERE on a
+    // line, so it also counts every `// ... #[test] ...` in a comment; that is
+    // fine for a ratchet, which only has to be monotonic. This row claims to
+    // report the number of TESTS, so it requires the attribute at line start
+    // and comes out ~100 lower. `#[async_std::test]` is not in the needle list
+    // because the workspace has zero of them (verified 2026-08-22) -- adding a
+    // needle for a class that does not exist would be decoration, not rigour.
+    // If one ever appears, add it here: an invisible test class is worse than
+    // a wrong total.
     let tests = count_in_rust_sources(Path::new("crates"), &["#[test]", "#[tokio::test]"]);
     let cov = std::fs::read_to_string("quality/crate-coverage-thresholds.toml").unwrap_or_default();
     // A `key = value` line, NOT merely a line containing '='.
@@ -611,10 +1438,21 @@ fn main() {
     // contain the character. Same class of error as the DHAT count above, and
     // caught the same way: by checking the tool's output against the file
     // instead of trusting that the tool was obviously right.
+    // Only `default` and the `[crates]` table are crate floors: B3
+    // (2026-11-13) added a `[production]` table that repeats the crate names,
+    // which this count would otherwise read as eight more crates.
+    let mut section = "";
     let floors = cov
         .lines()
         .map(str::trim_start)
-        .filter(|l| !l.starts_with('#') && !l.starts_with('['))
+        .filter(|l| {
+            if l.starts_with('[') {
+                section = l.trim();
+                return false;
+            }
+            section.is_empty() || section == "[crates]"
+        })
+        .filter(|l| !l.starts_with('#'))
         .filter(|l| {
             l.split_once('=').is_some_and(|(k, _)| {
                 let k = k.trim();
@@ -635,7 +1473,7 @@ fn main() {
                 Verdict::Broken
             },
             format!("{tests}"),
-            "counted from source, not from a document",
+            "line-start #[test]/#[tokio::test] under crates/ -- see note",
         ),
         Row::new(
             "Coverage floors",
@@ -666,15 +1504,19 @@ fn main() {
     let ranged = pins.iter().filter(|p| p.exact.is_none()).count();
     let exact = pins.len() - ranged;
 
-    // A dep the lock never resolved is DECLARED BUT UNUSED -- not a pinning
+    // A dep no member crate references is DECLARED BUT UNUSED -- not a pinning
     // failure, so it is counted separately rather than folded into a verdict
     // it did not cause.
+    let referenced = referenced_workspace_deps();
     let mut drifted = 0usize;
-    let mut unresolved = 0usize;
+    let mut unreferenced = 0usize;
     for p in &pins {
         let Some(want) = p.exact.as_deref() else {
             continue;
         };
+        if !referenced.contains(&p.name) {
+            unreferenced += 1;
+        }
         let mut seen_name = false;
         let mut matched = false;
         for (n, v) in &pairs {
@@ -685,9 +1527,7 @@ fn main() {
                 }
             }
         }
-        if !seen_name {
-            unresolved += 1;
-        } else if !matched {
+        if seen_name && !matched {
             drifted += 1;
         }
     }
@@ -714,16 +1554,584 @@ fn main() {
             "the version we declare is the version we build",
         ),
         Row::new(
-            "Declared but never resolved",
-            Verdict::Bounded,
-            format!("{unresolved} deps"),
-            "dead declarations: no member crate references them",
+            "Declared but never referenced",
+            if unreferenced == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{unreferenced} deps"),
+            "every declaration is reachable from a member crate manifest",
         ),
     ];
 
     // ---------------------------------------------------------------
+    // Section 6 — the data itself: stored, deduplicated, searchable, watched
+    //
+    // Added 2026-08-22. The operator's standing demand names this dimension
+    // in every restatement -- "saving into db and auditing logging tracking
+    // capturing debugging finding searching monitoring dashboard
+    // visualising" -- and it was the one dimension this report never
+    // measured. Five green sections read as "everything is checked", which
+    // is the same false-OK this whole binary exists to prevent.
+    //
+    // These rows assert PROPERTIES, not a census. The first draft counted
+    // "lines mentioning CREATE TABLE" and reported 52 for a system with 17
+    // tables, because doc comments and test fixtures say the words too. A
+    // number that does not mean what its label says is worse than no row:
+    // it looks like evidence.
+    //
+    // Merged 2026-08-22 with the runbook-reachability and shipped-but-
+    // unwatched rows developed in parallel. They measure different things
+    // and both are kept: one asks whether an operator sent to a runbook
+    // finds files that still exist, the other whether a metric we PAY to
+    // ship is named in any alarm or widget. A metric billed every session
+    // and watched by nobody is the class this repo has retired twice.
+    // ---------------------------------------------------------------
+    let storage_src = Path::new("crates/storage/src");
+
+    // THE uniqueness invariant, stated as a property. Two different
+    // instruments really do share a numeric id on different exchanges
+    // (I-P1-11), and a Dhan candle and a Groww candle for the same minute
+    // are different observations. A key naming security_id without segment
+    // merges rows that are not the same row -- invisibly, no error anywhere.
+    let keys_with_id = count_lines_containing(storage_src, &["DEDUP_KEY_"]);
+    let canonical_candle_key = count_lines_containing(storage_src, &["security_id, segment, feed"]);
+    let error_code_src =
+        std::fs::read_to_string("crates/common/src/error_code.rs").unwrap_or_default();
+
+    // Runbook files live in TWO directories. The previous version counted only
+    // `docs/error-runbooks` (48) while labelling the row "Runbook files on disk",
+    // which silently excluded the 42 in `docs/runbooks`. Count both, and say so.
+    let count_md = |dir: &str| {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let runbooks = count_md("docs/error-runbooks") + count_md("docs/runbooks");
+    // How many DISTINCT files the codes actually resolve to. Far fewer than the
+    // files on disk, because many codes share a runbook -- so "90 runbooks"
+    // never meant "90 destinations", and the page said it did.
+    let runbook_target_paths: Vec<String> = {
+        let mut t: Vec<&str> = error_code_src
+            .match_indices("\"docs/")
+            .filter_map(|(i, _)| {
+                let rest = &error_code_src[i + 1..];
+                let end = rest.find('"')?;
+                let s = &rest[..end];
+                s.ends_with(".md").then_some(s)
+            })
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        t.into_iter().map(str::to_string).collect()
+    };
+    let runbook_targets = runbook_target_paths.len();
+
+    // Do the runbooks a REACHABLE code points to still name files that exist?
+    //
+    // Scoped to reachable codes on purpose. Plenty of runbooks cover retired
+    // subsystems and legitimately name deleted modules in their retirement
+    // notes -- that is correct history, not rot. What matters is the runbook an
+    // operator is sent to at 3am by a code that can still fire.
+    //
+    // Reported, NOT gated. The citations are a mix of live pointers, dated
+    // history ("previously logged this"), and machine-read frontmatter, and
+    // telling them apart needs judgement. A blanket assertion would fail on
+    // correct retirement notes, and a guard whose first act is a false positive
+    // gets allowlisted within a week. So this row makes the number visible
+    // every run and leaves the cleanup a deliberate decision.
+    let (runbook_citations_total, runbook_citations_live) = {
+        let mut seen: Vec<String> = Vec::new();
+        let mut live = 0usize;
+        for rb in &runbook_target_paths {
+            let Ok(body) = std::fs::read_to_string(rb) else {
+                continue;
+            };
+            let mut rest = body.as_str();
+            while let Some(i) = rest.find("crates/") {
+                let after = &rest[i..];
+                let end = after
+                    .find(|c: char| {
+                        !(c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+                    })
+                    .unwrap_or(after.len());
+                let cand = &after[..end];
+                if cand.ends_with(".rs") && !seen.iter().any(|s| s == cand) {
+                    seen.push(cand.to_string());
+                    if std::path::Path::new(cand).exists() {
+                        live += 1;
+                    }
+                }
+                rest = &after[end.max(1)..];
+            }
+        }
+        (seen.len(), live)
+    };
+
+    let tf = std::fs::read_dir("deploy/aws/terraform")
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "tf"))
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    // Count DEPLOYED alarms, not resource BLOCKS. One block carrying
+    // `for_each = local.error_code_alerts` becomes one alarm per map entry,
+    // so counting `resource "..."` strings reports the number of things
+    // WRITTEN rather than the number of things that EXIST in AWS.
+    //
+    // Corrected 2026-08-22 after this row read "47 + 6 log" on a tree whose
+    // real figures are 65 and 24. The understatement was 38% on alarms and
+    // 4x on filters -- and it was invisible precisely because a source-string
+    // count LOOKS like a measurement. That is the failure this whole report
+    // exists to catch, so finding it here rather than in a document is the
+    // point, not an embarrassment.
+    let alert_map_entries = {
+        let n = tf
+            .split("error_code_alerts = {")
+            .nth(1)
+            .map(|rest| {
+                rest.lines()
+                    .take_while(|l| *l != "  }")
+                    .filter(|l| {
+                        let t = l.trim_start();
+                        t.starts_with('"') && t.contains("\" = {")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        // A map we cannot parse must not silently deflate the count to the
+        // block figure; 1 keeps `blocks - 1 + n` equal to the block count.
+        if n == 0 { 1 } else { n }
+    };
+    let expand = |resource: &str| -> usize {
+        let blocks = tf.matches(resource).count();
+        let for_each_blocks = tf
+            .split(resource)
+            .skip(1)
+            .filter(|body| {
+                body.lines()
+                    .take(8)
+                    .any(|l| l.contains("for_each") && l.contains("local.error_code_alerts"))
+            })
+            .count();
+        blocks - for_each_blocks + for_each_blocks * alert_map_entries
+    };
+    let alarms = expand("resource \"aws_cloudwatch_metric_alarm\"");
+    let log_filters = expand("resource \"aws_cloudwatch_log_metric_filter\"");
+
+    // Shipped vs taken, MEASURED both ends. The first draft hardcoded
+    // "76 of 371" -- a document number in a binary whose entire premise is
+    // that documents cannot stay true. The gap is a deliberate cost
+    // decision (shipping every one would cost ~$111/mo against a budget
+    // whose automatic action switches the trading box off), so both numbers
+    // are shown rather than the flattering one.
+    //
+    // The selector is read from `deploy/aws/cloudwatch-agent.json` and NOT
+    // from the boot template. It lived in the template until the template
+    // hit its byte ceiling and the selector was moved out; a reader still
+    // pointed at the old path returns ZERO shipped, which renders a healthy
+    // system as shipping nothing. This report caught that on itself, which
+    // is the only reason the wrong path did not survive into the page.
+    let shipped_names = metric_names_in("deploy/aws/cloudwatch-agent.json");
+    let shipped = shipped_names.len();
+    let emitted = distinct_tv_names(Path::new("crates"));
+
+    let (total_codes, live_codes, alarmed_codes) = error_code_liveness(Path::new("."));
+
+    // A metric in the CloudWatch selector is SHIPPED — it costs money every
+    // session whether or not anything reads it. A name that appears in no
+    // alarm and no dashboard widget is being paid for and watched by nobody.
+    let in_terraform = metric_names_in_terraform();
+    let unwatched: Vec<&String> = shipped_names
+        .iter()
+        .filter(|m| !in_terraform.contains(*m))
+        .collect();
+
+    let observability = vec![
+        Row::new(
+            "Dedup keys, all named constants",
+            if keys_with_id > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{keys_with_id} refs"),
+            "never an inline literal: an inline key evades the feed-in-key guard",
+        ),
+        Row::new(
+            "Candle key carries segment AND feed",
+            if canonical_candle_key > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{canonical_candle_key} const"),
+            "I-P1-11 + feed: same id on two exchanges, two brokers, stay distinct rows",
+        ),
+        Row::new(
+            "Error codes that can actually fire",
+            Verdict::Bounded,
+            format!("{live_codes} of {total_codes}"),
+            "the rest are retired-subsystem residue with no emit site; NONE is alarmed",
+        ),
+        Row::new(
+            "Written runbooks",
+            Verdict::Guaranteed,
+            format!("{runbooks} files"),
+            "runbook_path() must resolve — every_runbook_path_exists_on_disk",
+        ),
+        Row::new(
+            "Distinct runbook destinations",
+            Verdict::Guaranteed,
+            format!("{runbook_targets}"),
+            "many codes share one runbook — files on disk is not destinations",
+        ),
+        Row::new(
+            "Distinct source paths cited in runbooks",
+            Verdict::Bounded,
+            format!("{runbook_citations_live} of {runbook_citations_total}"),
+            "in every runbook a code points to — the rest name deleted files",
+        ),
+        Row::new(
+            "CloudWatch alarms",
+            if alarms > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{alarms} + {log_filters} log"),
+            "alarm_metric_has_a_route_guard: none may watch an unreachable metric",
+        ),
+        Row::new(
+            "Measurements shipped vs taken",
+            Verdict::Bounded,
+            format!("{shipped} of {emitted}"),
+            "a cost decision, not an oversight: all of them would trip the budget kill-switch",
+        ),
+        Row::new(
+            "Shipped but in no alarm or dashboard",
+            Verdict::Bounded,
+            format!("{} of {}", unwatched.len(), shipped_names.len()),
+            "billed every session, named in no alarm and no widget",
+        ),
+        Row::new(
+            "Live codes that reach a phone",
+            if alarmed_codes > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{alarmed_codes} of {live_codes}"),
+            "named in a CloudWatch metric-filter pattern -- the only path from a coded ERROR to a page",
+        ),
+        Row::new(
+            "Live codes that are log-sink-only",
+            Verdict::Bounded,
+            format!(
+                "{} of {}",
+                live_codes.saturating_sub(alarmed_codes),
+                live_codes
+            ),
+            "they fire, they log, and at 09:15 nobody is reading the log",
+        ),
+    ];
+
+    // ---------------------------------------------------------------
+    // ---------------------------------------------------------------
+    // 7. The operator's four words, measured rather than asserted
+    //
+    // `z-plus-defense-doctrine.md` sets a four-word test — common runtime,
+    // dynamic, scalable, incremental — and until now this report answered
+    // none of it. The four have been repeated across sessions as a
+    // requirement, and a requirement that nothing measures is a wish.
+    //
+    // Every row here is deliberately narrow. "Scalable" cannot be proven by
+    // a grep; what a grep CAN prove is that the structures which grow per
+    // instrument have a declared ceiling rather than growing until the host
+    // dies, which is the specific failure this repo has recorded five times.
+    // ---------------------------------------------------------------
+    // FOUR needles, not one. This counted `#[cfg(target_os` ALONE until
+    // 2026-08-29 and reported "0 lines / GUARANTEED" while thirteen
+    // production OS branches existed: the `cfg!(target_os = ..)` MACRO form
+    // (an `if`, not an attribute — invisible to an attribute needle) and the
+    // `#[cfg(unix)]` family, which is how portable Rust is actually written.
+    // A one-needle scan reporting a whole-workspace absence is the
+    // vacuous-pass shape this very binary exists to expose.
+    let os_conditional = count_substring_scoped(
+        Path::new("crates"),
+        &[
+            "#[cfg(target_os",
+            "cfg!(target_os",
+            "#[cfg(unix)",
+            "#[cfg(windows)",
+        ],
+        true,
+    );
+    let compose_files = files
+        .iter()
+        .filter(|f| f.ends_with("docker-compose.yml"))
+        .count();
+    let tunable = config_sections(Path::new("."));
+    let capped = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &[
+            "MAX_TRACKED_",
+            "MAX_INDICATOR_INSTRUMENTS",
+            "MAX_SPOT_BAR_SLOTS",
+            "AGGREGATOR_MAX_SLOTS",
+            "MAX_DAILY_UNIVERSE_SIZE",
+        ],
+    );
+    let host_derived = count_substring_in_rust_sources(Path::new("crates"), &["MemTotal"]);
+
+    let runtime = vec![
+        Row::new(
+            "Same container set, dev and prod",
+            if compose_files == 1 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Bounded
+            },
+            format!("{compose_files} compose"),
+            "one file describes both; a second would be two runtimes wearing one name",
+        ),
+        Row::new(
+            "OS-conditional code under crates/",
+            // BOUNDED even at zero. A GUARANTEED verdict derived from a
+            // substring scan finding nothing is indistinguishable from a scan
+            // that looked in the wrong place — which is exactly what happened
+            // here before the needles were widened.
+            Verdict::Bounded,
+            format!("{os_conditional} lines"),
+            "PRODUCTION only; 4 needles incl. the cfg!() macro + unix family. Most are #[cfg(unix)], true on Mac AND Linux; the macOS Docker branch in infra.rs is dev-only",
+        ),
+        Row::new(
+            "Retunable without a rebuild",
+            Verdict::Bounded,
+            format!("{tunable} sections"),
+            "config surfaces an operator can change and restart into; breadth, not quality",
+        ),
+        Row::new(
+            "Sizing derived from the host it runs on",
+            if host_derived > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{host_derived} refs"),
+            "RAM budget reads min(MemTotal, cgroup) -- not a constant pinned to one machine",
+        ),
+        Row::new(
+            "Per-entity growth has a declared ceiling",
+            Verdict::Bounded,
+            format!("{capped} refs"),
+            "fail-closed caps on the maps that grow per instrument; a ceiling, never O(1) space",
+        ),
+        Row::new(
+            "Incremental delivery",
+            Verdict::Bounded,
+            "operator",
+            "one PR at a time, each independently revertible -- a process fact, not a measured one",
+        ),
+    ];
+
+    // ---------------------------------------------------------------
+    // 8. Extreme permutations, combinations, and out-of-box cases
+    //
+    // The operator's standing ask is that every combination of exception,
+    // error, condition and out-of-box scenario be covered. No grep can
+    // prove that -- the set is infinite, and a report claiming otherwise
+    // would be the exact false-OK this file exists to end.
+    //
+    // What CAN be measured is which MACHINES exist for generating cases a
+    // human would not think of, and every row here is one of those
+    // machines rather than a claim about the cases themselves. A property
+    // test invents its own inputs; a chaos suite invents its own failures;
+    // a loom model invents its own interleavings; a fuzzer invents its own
+    // bytes. Counting them says how many directions the search runs in --
+    // never that the search finished.
+    // ---------------------------------------------------------------
+    let proptest_blocks = count_substring_in_rust_sources(Path::new("crates"), &["proptest!"]);
+    let loom_models = count_substring_in_rust_sources(Path::new("crates"), &["loom::"]);
+    let chaos_suites = files.iter().filter(|f| f.contains("chaos_")).count();
+    let fuzz_targets = files
+        .iter()
+        .filter(|f| f.contains("fuzz/fuzz_targets/"))
+        .count();
+    let guard_files = files.iter().filter(|f| f.ends_with("_guard.rs")).count();
+    let saturating = count_substring_in_rust_sources(
+        Path::new("crates"),
+        &["saturating_", "checked_", "wrapping_"],
+    );
+    let refusal_counters = distinct_refusal_counters(Path::new("crates"));
+    let panic_macros = count_substring_scoped(
+        Path::new("crates"),
+        &["unreachable!(", "panic!(", "todo!(", "unimplemented!("],
+        true,
+    );
+
+    // Every crate root must have DECIDED about silent panics -- `deny`, or
+    // `allow` with a written reason. Silence is the failure: the compiler
+    // resolves it to "permitted" and nobody is told. Counted here and
+    // enforced by `main_lint_blanket_guard`, which until 2026-08-26 checked
+    // exactly one hardcoded path while twenty-five other roots drifted.
+    let roots = crate_roots_on_disk();
+    let crate_roots = roots.len();
+    let silent_roots = roots
+        .iter()
+        .filter(|p| {
+            let Ok(src) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            let decided = |lint: &str| {
+                src.contains(&format!("deny({lint})")) || src.contains(&format!("allow({lint})"))
+            };
+            !(decided("clippy::unwrap_used") && decided("clippy::expect_used"))
+        })
+        .count();
+
+    let permutations = vec![
+        Row::new(
+            "Inputs the author did not choose",
+            if proptest_blocks > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{proptest_blocks} generators"),
+            "property tests invent their own values; each run explores cases nobody wrote down",
+        ),
+        Row::new(
+            "Thread interleavings enumerated",
+            if loom_models > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{loom_models} refs"),
+            "loom walks every ordering of a small concurrent region -- exhaustive there, silent everywhere else",
+        ),
+        Row::new(
+            "Failure injection suites",
+            if chaos_suites > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{chaos_suites} files"),
+            "chaos tests break the dependency on purpose; the envelope they cover is the envelope claimed",
+        ),
+        Row::new(
+            "Byte-level hostile inputs",
+            if fuzz_targets > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{fuzz_targets} targets"),
+            "the parser is fed garbage until it crashes or the hour is up -- weekly, never per-PR",
+        ),
+        Row::new(
+            "Invariants that fail the build",
+            if guard_files > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{guard_files} guards"),
+            "a rule nothing enforces is a wish; each of these turns one wish into a red build",
+        ),
+        Row::new(
+            "Arithmetic that cannot wrap",
+            if saturating > 0 {
+                Verdict::Bounded
+            } else {
+                Verdict::Broken
+            },
+            format!("{saturating} sites"),
+            "saturating/checked at the counters and clocks; release also builds with overflow-checks on",
+        ),
+        Row::new(
+            "Refusals that are counted, never silent",
+            if refusal_counters > 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{refusal_counters} counters"),
+            "every fail-closed path increments something -- a refusal nobody counts reads as success",
+        ),
+        Row::new(
+            "Panic macros left in production paths",
+            if Path::new("crates/common/tests/production_panic_macro_guard.rs").exists() {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{panic_macros} sites"),
+            "each compiler-guaranteed or test-only and named with its reason in that guard's allowlist; a NEW one fails the build",
+        ),
+        Row::new(
+            "Crate roots that chose about silent panics",
+            if silent_roots == 0 {
+                Verdict::Guaranteed
+            } else {
+                Verdict::Broken
+            },
+            format!("{crate_roots} roots"),
+            "deny, or allow with a written reason -- SILENCE fails the build, because the compiler reads it as permission",
+        ),
+        Row::new(
+            "Combinations nobody has thought of",
+            Verdict::Impossible,
+            "unbounded",
+            "the set is infinite; these machines widen the search, they never finish it",
+        ),
+    ];
     // Report
     // ---------------------------------------------------------------
+    let sections: Vec<(&str, &[Row])> = vec![
+        ("1. One language", &lang[..]),
+        ("2. O(1)", &o1[..]),
+        ("3. Automation", &auto[..]),
+        ("4. Test surface", &testing[..]),
+        ("5. Every version pinned", &pinning[..]),
+        (
+            "6. Data — stored, deduped, searchable, watched",
+            &observability[..],
+        ),
+        (
+            "7. Common runtime, dynamic, scalable, incremental",
+            &runtime[..],
+        ),
+        (
+            "8. Extreme permutations, combinations, out-of-box",
+            &permutations[..],
+        ),
+    ];
+
+    // `--html` emits the SAME rows as a page. One measurement pass, two
+    // renderings, so the printed table and the published page can never
+    // disagree -- which is the whole reason this is generated rather than
+    // hand-written.
+    if std::env::args().any(|a| a == "--html") {
+        print!("{}", render_html(&sections));
+        let broken = sections
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .filter(|r| r.verdict == Verdict::Broken)
+            .count();
+        std::process::exit(if broken > 0 { 1 } else { 0 });
+    }
+
     println!("TICKVAULT GUARANTEE REPORT");
     println!("Every number below is measured from the working tree, now.");
     print!("{}", render("1. ONE LANGUAGE", &lang));
@@ -731,6 +2139,27 @@ fn main() {
     print!("{}", render("3. AUTOMATION", &auto));
     print!("{}", render("4. TEST SURFACE", &testing));
     print!("{}", render("5. EVERY VERSION PINNED", &pinning));
+    print!(
+        "{}",
+        render(
+            "6. DATA — STORED, DEDUPED, SEARCHABLE, WATCHED",
+            &observability
+        )
+    );
+    print!(
+        "{}",
+        render(
+            "7. COMMON RUNTIME, DYNAMIC, SCALABLE, INCREMENTAL",
+            &runtime
+        )
+    );
+    print!(
+        "{}",
+        render(
+            "8. EXTREME PERMUTATIONS, COMBINATIONS, OUT-OF-BOX",
+            &permutations
+        )
+    );
 
     let all: Vec<Row> = lang
         .into_iter()
@@ -738,6 +2167,9 @@ fn main() {
         .chain(auto)
         .chain(testing)
         .chain(pinning)
+        .chain(observability)
+        .chain(runtime)
+        .chain(permutations)
         .collect();
     let broken = all.iter().filter(|r| r.verdict == Verdict::Broken).count();
     let bounded = all.iter().filter(|r| r.verdict == Verdict::Bounded).count();

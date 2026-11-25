@@ -38,7 +38,44 @@ const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 // and OMITTED every live growing table, so the retention sweep visited nothing
 // real → unbounded active-table growth (a storage/cost runaway). `ticks` is the
 // only live HOUR-partitioned table.
-pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &["ticks", "market_depth"];
+// 2026-09-06: `top_volume_rank` joins the HOUR sweep (RENAMED to `top_volume`
+// 2026-09-12 by operator directive; the legacy name is retention-exempt below
+// so the coverage guard does not fail on a table the rename carries forward).
+// It is snapshot data at
+// the same order as the other two — ~13.4M rows and ~860 MB per session at
+// the authorized 250-contract ceiling across both option families — so it
+// belongs with `ticks` and `market_depth` rather than in the DAY list of
+// small audit tables. Leaving it EXEMPT would have been the quiet mistake:
+// an exempt table grows forever, and this one grows nearly a gigabyte a day.
+// 2026-09-22: the four DIRECT per-cadence tables `top_volume_1s` / `_3s` /
+// `_5s` / `_1m` replace the single `top_volume` table, and join the HOUR sweep
+// for the same reason it did. `top_volume` itself STAYS listed: no boot writes
+// it any more, but its already-captured partitions must still age out rather
+// than sit on the volume forever.
+// 2026-10-02 (item 45h): `feed_aux_packets` — the OI, previous-close,
+// market-status, disconnect, out-of-window-tick and connect-snapshot rows the
+// `ticks` table does not hold. HOUR-partitioned like `ticks`, on the
+// market-data window, archived before any detach like every table here.
+// 2026-10-22 (plan item 62, Quote 34): nothing writes `top_volume*` any more;
+// the five names STAY so their partitions on the box are still archived to S3
+// before any detach, and nothing drops them before that copy.
+pub(crate) const HOUR_PARTITIONED_TABLES: &[&str] = &[
+    "ticks",
+    // 2026-10-27 (plan item M5, owner Quote 41): repeat quotes, stamped at
+    // arrival. Same partitioning, retention class, archive and S3 copy as
+    // `ticks` (`partition_archive::is_intraday_table`).
+    "tick_quotes",
+    "market_depth",
+    // 2026-10-09 (plan item 49e step 3): the array-row depth table, swept on
+    // the same depth window as `market_depth` (see `partition_archive`).
+    "market_depth_book",
+    "top_volume",
+    "top_volume_1s",
+    "top_volume_3s",
+    "top_volume_5s",
+    "top_volume_1m",
+    "feed_aux_packets",
+];
 
 /// DAY-partitioned **audit + daily-data** tables the retention sweep DETACHes
 /// past the hot window. The 5 live **candle** tables (`candles_1m` …
@@ -100,6 +137,44 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "feed_scoreboard_daily",
     "feed_coverage_daily",
     "feed_episode_audit",
+    // (2026-08-29, operator directive on daily per-connection WebSocket
+    // monitoring): one row per (trading day, feed, ws_type, connection_index)
+    // — the per-CONNECTION daily verdict that `feed_scoreboard_daily` cannot
+    // give because it sums all sixteen sockets into one row per feed. Same
+    // SEBI-audit class + DAY partitioning as the scoreboard tables above;
+    // `feed` is in the DEDUP key. Swept with them, never exempt: it is a
+    // derived daily summary of two retained audit tables, so an aged-out
+    // partition loses nothing that `ws_event_audit` and `feed_episode_audit`
+    // do not still hold.
+    "ws_connection_daily",
+    // (2026-10-02) one row per live-feed reconnect gap, paired from the
+    // `ws_event_audit` lifecycle rows by the app forwarder. Same SEBI-audit
+    // class + DAY partitioning; `feed` is in the DEDUP key.
+    "feed_gap_audit",
+    // (2026-10-28, owner: "go ahead and add the daily expiry check") one row
+    // per (trading day, feed): did every option contract stored today sit on
+    // its underlying's nearest real expiry. Same SEBI-audit class + DAY
+    // partitioning; `feed` is in the DEDUP key.
+    "expiry_scope_audit",
+    // (2026-10-30, owner: real-time proof that every in-memory step is under
+    // 1 µs) one row per hot-path stage per minute, written by the
+    // `tv-latency-minute` thread. Measurement, not SEBI audit: swept on the
+    // same DAY window as the audit tables (archived to S3 before detach);
+    // `feed` is in the DEDUP key.
+    "hot_path_latency_minute",
+    // (2026-10-30) the per-minute host capacity row and the daily "is the
+    // 4-core box needed" verdict, same writer thread and window.
+    "host_capacity_minute",
+    "capacity_verdict_daily",
+    // (2026-11-12, plan item LF-6a, Quote 57) TCP + TLS handshake times to the
+    // Dhan hosts, 15 rows once per session. Measurement; same DAY window.
+    "network_rtt_session",
+    // (2026-08-29, per-table disk-footprint measurement): one row per
+    // (trading day, table) recording OBSERVED disk bytes. Same SEBI-audit
+    // class + DAY partitioning as the scoreboard tables above. Swept with
+    // them: it is a derived daily summary, and an aged-out partition loses a
+    // historical size reading, never data.
+    "table_storage_daily",
     // BRUTEX-XVERIFY-01/02 (2026-07-12, §37): one row per divergent cell /
     // one row per trading-day summary — same SEBI-audit class + DAY
     // partitioning as cross_verify_1m_audit / feed_scoreboard_daily.
@@ -124,6 +199,22 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     // normally near-empty — a large day IS the signal.
     "dhan_live_crossverify_cell_audit",
     "dhan_live_crossverify_daily",
+    // The vendor's own 1-minute tape, captured verbatim by the same 15:41
+    // sweep that produces the two rows above (2026-08-26, Item 38). It is
+    // the ONLY copy of what Dhan actually answered: without it a divergence
+    // verdict can be read but never re-checked by hand, because the REST
+    // side was judged and then discarded.
+    //
+    // DAY-partitioned and swept exactly like its two siblings, but it is NOT
+    // near-empty like them: the cell table is bounded by divergences, this
+    // one is bounded by INSTRUMENTS. One rotation third (~290 of ~865 spots)
+    // x 375 session minutes ~= 108K rows/day at full success, ~30 MB/day at
+    // the measured ~272 B/row, so ~2.7 GB across the 90-day hot window. At
+    // today's measured 50-successful-fetches ceiling it is ~19K rows/day.
+    // Stated as a number rather than "trivial" because it is the largest
+    // per-day writer in this list and the volume is what the retention sweep
+    // exists to bound.
+    "dhan_rest_1m_tape",
     // SPOT1M-01/02 (2026-07-12, per-minute REST pipeline PR-2): one row per
     // fetched (minute, index) — ~1,125 rows/day (375 min × 3 IDX_I SIDs),
     // trivial disk; same DAY partitioning + retention class as the
@@ -176,12 +267,22 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
     "order_leg_pnl",
     "order_update_events",
     "position_update_events",
-    // CADENCE-04 (2026-07-20, cross-fill visibility, operator directive):
+    // LF-5 (2026-11-12, owner Quote 57): one row per PAPER order event of the
+    // live signal-timing work (decision, sent, ack, fill, ...). The same
+    // order-audit class as order_audit above: 90d hot, then copied to S3 and
+    // verified before the partition leaves the box; the S3 copy is never
+    // deleted. A few dozen rows per signal, paper only today; `feed` is in
+    // the DEDUP key.
+    "live_order_events",
+    // LF-7 (2026-11-12): one row per trading day, the daily live paper fill
+    // calibration report's summary. Same order-audit class and DAY sweep as
+    // live_order_events above; `feed` is in the DEDUP key.
+    "live_fill_report_daily",
+    // CADENCE-04) (2026-07-20, cross-fill visibility, operator directive):
     // one row per cadence cross-fill firing / Groww fallback launch — a
     // handful of rows/day by construction (one per degraded lane per
     // cycle); same DAY partitioning + SEBI audit retention class as the
     // audit tables above. `lane` is the per-feed identity in its DEDUP key.
-    "cross_fill_audit",
 ];
 
 /// Tables EXEMPT from retention sweeping — NEVER detached or dropped.
@@ -251,6 +352,26 @@ pub(crate) const DAY_PARTITIONED_TABLES: &[&str] = &[
 /// than assumed — a retention exemption granted on a premise that does not hold
 /// is the failure mode this list must never carry, and it has now been recorded
 /// twice in one day for the same reason.
+///
+/// **CORRECTED 2026-09-03 — the paragraph above is stale in the direction that
+/// matters, and the correction makes the exemption SAFER, not weaker.** The
+/// 2026-08-21 Groww removal deleted `groww_contract_1m_boot` outright, so
+/// `ensure_option_contract_1m_rest_table` now has **ZERO callers anywhere** —
+/// not one caller behind a `false` flag. The table is therefore never CREATED,
+/// which is stronger than never written: MEASURED on the box the same day,
+/// `SELECT count() FROM rest_option_contract_1m` returns `table does not
+/// exist`, and `tables()` lists no name containing "contract".
+///
+/// So the exemption is discharged by absence: there is no table to sweep and
+/// none can appear while nothing calls the DDL. It stays on this list rather
+/// than moving to a sweep list because `OPTION_CONTRACT_1M_REST_TABLE` still
+/// exists as a constant and `partition_retention_coverage_guard` — correctly —
+/// demands a decision for every table-name constant in the crate; pointing a
+/// sweeper at a name that cannot resolve would be the worse answer.
+///
+/// The reusable half: a comment naming a caller is a claim with a date on it,
+/// and this one outlived its caller by thirteen days. Cite the SYMBOL and let
+/// grep settle it — which is exactly how this was caught.
 pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "instrument_lifecycle",
     "index_constituency",
@@ -258,7 +379,64 @@ pub(crate) const RETENTION_EXEMPT_TABLES: &[&str] = &[
     "spot_1m_rest",
     "option_chain_1m",
     "option_contract_1m_rest",
+    // Pre-2026-09-12 name of `top_volume`. Until 2026-09-22 a boot renamed it
+    // forward; since then nothing writes or renames it, and the one-shot
+    // fresh-start reset drops it. Exempt because the constant still exists, so
+    // the coverage guard demands a decision, and a sweeper pointed at a name
+    // with no writer would only ever find it absent.
+    "top_volume_rank",
+    // The one-shot fresh-start reset's own log (`fresh_start_reset.rs`). One
+    // row per reset id, never partitioned, never swept: dropping a row would
+    // let the one-shot wipe run a SECOND time on the next out-of-session boot.
+    "schema_reset_log",
+    // The one-off 20 Nov repair's own record (daily-universe Quote 63,
+    // `day_repair_audit_persistence.rs`): a few hundred rows once, the only
+    // record of a destructive repair, so kept and never swept.
+    "day_repair_audit",
 ];
+
+/// Scratch tables: their owner creates them fresh for every run and drops them after, so
+/// they never hold more than one run's rows and need no sweep. Not market
+/// data and not audit records, so they are neither swept, exempt, nor
+/// exported by the destructive operator actions.
+///
+/// - `contract_name_repair_map` (2026-10-10, plan item 56): the one-day name
+///   list the after-close contract name repair joins against
+///   (`contract_name_repair`), created fresh for each day and dropped after it.
+///
+/// (2026-10-29: the restore rehearsal's `rebuild_probe_` prefix left this
+/// list with the one-off rebuild tool that created it.)
+#[cfg(test)]
+const SCRATCH_TABLES: &[&str] = &["contract_name_repair_map"];
+
+/// Every table the retention system knows about, de-duplicated and sorted —
+/// the measurement set for `table_storage_probe`.
+///
+/// Built from the retention lists themselves rather than a second hand-kept
+/// list, so a table added to retention is measured automatically and the two
+/// can never drift. Includes the retention-EXEMPT tables deliberately: they
+/// are exempt from being SWEPT, not from occupying disk, and a current-state
+/// master that quietly grows is exactly the sort of thing nobody notices
+/// until a volume fills.
+#[must_use]
+pub fn all_managed_table_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = HOUR_PARTITIONED_TABLES.to_vec();
+    names.extend_from_slice(DAY_PARTITIONED_TABLES);
+    // 2026-09-18 — the EMITTED set: a dropped table has no `table_storage()` row,
+    // so measuring the retired fifteen would log a probe failure every cycle.
+    names.extend_from_slice(&crate::shadow_persistence::emitted_candle_table_names());
+    // 2026-10-22 (plan item 62): still on the box until copied (Quote 34).
+    names.extend_from_slice(&crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES);
+    names.extend_from_slice(RETENTION_EXEMPT_TABLES);
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+// `rebuild_keep_tables` (the 2026-10-22 rebuild and Quote 35 wipe keep-list:
+// every DAY-partitioned and retention-EXEMPT table) was DELETED 2026-10-29
+// with the one-off rebuild and wipe tools, its only callers, after their
+// 2026-10-28 runs (rust-only lock §§0.13/0.14).
 
 // ---------------------------------------------------------------------------
 // Partition Manager
@@ -363,7 +541,17 @@ impl PartitionManager {
         // `TfIndex::table_name()`) so the swept names can NEVER drift from what is
         // actually created/written. This is the dominant disk-growth source —
         // #1022 named phantom `candles_*_shadow` tables and missed it.
-        for table in crate::shadow_persistence::candle_table_names() {
+        // 2026-09-18 — the EMITTED set. Keeping all TF_COUNT names here would ask
+        // QuestDB about fifteen tables this boot has just dropped, once per retention
+        // cycle, forever: each returns an error the loop logs as a warn, which trains
+        // an operator to discount a real one.
+        // 2026-10-22 (plan item 62): plus the two archive-only tables
+        // (`candles_3s`, `candles_5s`), which nothing writes now but whose
+        // partitions still age out through the same archive-then-detach path.
+        for table in crate::shadow_persistence::emitted_candle_table_names()
+            .into_iter()
+            .chain(crate::shadow_persistence::ARCHIVE_ONLY_CANDLE_TABLES)
+        {
             if RETENTION_EXEMPT_TABLES.contains(&table) {
                 continue;
             }
@@ -523,11 +711,86 @@ pub(crate) struct PartitionRow {
 /// `candle_table_names()`) — never external input — so it is not
 /// injection-validated here; the untrusted `name` values are validated by
 /// [`is_valid_partition_name`] before they reach a DETACH statement.
+// TEST-EXEMPT: covered by test_eligibility_boundary_hot_days_minus_one_stays_hot
 pub(crate) fn build_detach_list_sql(table: &str, cutoff_days: u32) -> String {
     format!(
         "SELECT name, active FROM table_partitions('{}') \
          WHERE minTimestamp < dateadd('d', -{}, now())",
         table, cutoff_days
+    )
+}
+
+/// Hour-granular twin of [`build_detach_list_sql`], judged by each hour's END.
+///
+/// The same query as the day builder but for the unit (`'h'`), the IST shift
+/// of `now()` (below) and the window: it selects
+/// `minTimestamp < now_ist − (N + 1) h`. An hour partition starts at or
+/// before its `minTimestamp` and ends one hour after its start, so every
+/// partition selected ENDED at least `N` hours ago. Kept as a separate
+/// function rather than a unit parameter so the two call paths are visibly
+/// different at every call site: the day path is safe for every table, the
+/// hour path only for the closed list `partition_archive::HOUR_PATH_TABLES`.
+///
+/// ⚠ CHANGED 2026-11-07 (PR AA step 3, owner Quote 51 "more than 4 hours
+/// old"): this used `now_ist − N h` on `minTimestamp`, which judged an hour
+/// by its START, so an hour that ended only `N − 1` hours ago was selected
+/// (the 11:00 hour at 15:00 with `N = 4`). Judging by the end keeps one more
+/// hour on the box and makes the 4-hour floor a floor on the hour's end.
+///
+/// `table` is the same trusted-constant class as the day builder: it comes
+/// from `partition_archive::HOUR_PATH_TABLES`, never from external input.
+// TEST-EXEMPT: covered by the_hour_query_differs_from_the_day_query_only_in_its_unit
+pub(crate) fn build_closed_hour_list_sql(table: &str, cutoff_hours: u32) -> String {
+    // `now()` is UTC. `minTimestamp` on these tables is IST-SHIFTED — the
+    // stamping sites add IST_UTC_OFFSET_NANOS, which `depth_persistence`'s own
+    // header records as a deliberate 2026-08-19 correction. Comparing the two
+    // frames directly makes the real cutoff N + 5.5 hours.
+    //
+    // At the shipped `depth_hot_hours = 4` that is 9.5 hours, so an hour of
+    // depth written at 09:00 IST first becomes eligible at 18:30 IST — an hour
+    // AFTER the box stops. The mid-session reclaim this function exists for
+    // could never fire once, and a pressure episode at 14:00 selected ZERO
+    // partitions while the disk filled.
+    //
+    // Shifting `now()` into the same IST frame as the data is the whole fix.
+    // The DAY twin above carries the identical bias and absorbs it — 5.5 hours
+    // against a 1-day unit is noise — which is exactly why it went unnoticed
+    // until the unit shrank to hours and the bias became larger than the
+    // window itself.
+    //
+    // `+ 1`: the window is measured from the hour's END (see the doc above).
+    format!(
+        "SELECT name, active FROM table_partitions('{}') \
+         WHERE minTimestamp < dateadd('h', -{}, dateadd('s', {}, now()))",
+        table,
+        cutoff_hours.saturating_add(1),
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+    )
+}
+
+/// Day-granular ARCHIVE list for a table whose `ts` is IST stored as Z.
+///
+/// Added 2026-11-15 (audit live-4). The same query as
+/// [`build_detach_list_sql`] with `now()` shifted into the IST frame, as
+/// [`build_closed_hour_list_sql`] does: `minTimestamp < now_ist − N d`. The
+/// UTC form compared IST stamps with UTC `now()`, so for `ticks` (N = 1) the
+/// hours from 11:00 IST of day D became eligible only at about 16:30 IST of
+/// D+1, the box stop, and reached S3 on D+2.
+///
+/// Safe at N = 1: today's partitions have `minTimestamp` at or after today
+/// 00:00 IST, which is always later than `now_ist − 24 h`, so they are never
+/// selected. Used ONLY by the archive worklist for the IST-stamped market-data
+/// classes (`Intraday`, `Depth`); the retention detach keeps
+/// [`build_detach_list_sql`] unchanged.
+///
+/// `table` is the same trusted-constant class as the day builder.
+pub(crate) fn build_ist_day_list_sql(table: &str, cutoff_days: u32) -> String {
+    format!(
+        "SELECT name, active FROM table_partitions('{}') \
+         WHERE minTimestamp < dateadd('d', -{}, dateadd('s', {}, now()))",
+        table,
+        cutoff_days,
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS
     )
 }
 
@@ -625,6 +888,64 @@ pub(crate) fn parse_partition_rows(json: &str) -> Vec<PartitionRow> {
     // O(1) EXEMPT: end
 }
 
+/// The SQL that lists every partition of `table` with its size on disk
+/// (PR AA step 5, owner Quote 51): `name` and `diskSize` (bytes) from
+/// QuestDB's `table_partitions`. The daily leg sums one session day's
+/// partitions to size its free-space target.
+///
+/// No filter in SQL: the day is matched on the partition NAME in Rust
+/// ([`sum_partition_bytes_on_day`]), which needs no knowledge of how each
+/// table stamps `ts`. `table` is a trusted constant from
+/// `partition_archive::HOUR_PATH_TABLES`, never external input.
+pub(crate) fn build_partition_size_sql(table: &str) -> String {
+    format!("SELECT name, diskSize FROM table_partitions('{table}')")
+}
+
+/// Parses `(name, diskSize)` rows from QuestDB's `/exec` JSON.
+///
+/// Columns are found by name. Fails CLOSED: `None` when the body is not
+/// JSON, a column is missing, or any row has a missing, negative or
+/// non-integer size, so a half-read answer is never summed as if it were
+/// whole. An empty dataset is `Some(vec![])`. O(rows), cold path.
+pub(crate) fn parse_partition_sizes(json: &str) -> Option<Vec<(String, u64)>> {
+    // O(1) EXEMPT: begin — JSON parsing of a once-a-day size listing (cold path)
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    let columns = parsed.get("columns")?.as_array()?;
+    let mut name_idx: Option<usize> = None;
+    let mut size_idx: Option<usize> = None;
+    for (idx, col) in columns.iter().enumerate() {
+        match col.get("name").and_then(|n| n.as_str()) {
+            Some("name") => name_idx = Some(idx),
+            Some("diskSize") => size_idx = Some(idx),
+            _ => {}
+        }
+    }
+    let (name_idx, size_idx) = (name_idx?, size_idx?);
+    let dataset = parsed.get("dataset")?.as_array()?;
+    let mut rows = Vec::with_capacity(dataset.len());
+    for row in dataset {
+        let cols = row.as_array()?;
+        let name = cols.get(name_idx)?.as_str()?.to_string();
+        let size = cols.get(size_idx)?.as_u64()?;
+        rows.push((name, size));
+    }
+    Some(rows)
+    // O(1) EXEMPT: end
+}
+
+/// Bytes of the partitions that belong to IST day `day`: a DAY partition
+/// named `YYYY-MM-DD` or an HOUR partition named `YYYY-MM-DDTHH`.
+/// Saturating, so a hostile size can never wrap. O(rows), pure.
+pub(crate) fn sum_partition_bytes_on_day(rows: &[(String, u64)], day: chrono::NaiveDate) -> u64 {
+    let prefix = day.format("%Y-%m-%d").to_string();
+    rows.iter()
+        .filter(|(name, _)| {
+            name.strip_prefix(prefix.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('T'))
+        })
+        .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -691,9 +1012,58 @@ mod tests {
     /// `market_depth` is its own `RetentionClass::Depth` (see
     /// `partition_archive::retention_class`), because at ~21 GB/day the
     /// 35-day market-data window would commit 735 GB on a 100 GB root.
+    /// Renamed again on 2026-09-06 when `top_volume_rank` joined, for the
+    /// same reason the 2026-08-15 rename happened: a test whose name asserts
+    /// two entries while its body asserts three teaches the next reader
+    /// something false without them ever opening it.
+    ///
+    /// `top_volume_rank` earns the HOUR list on volume, not on kind.
+    ///
+    /// ⚠ CORRECTED 2026-09-12 — this read "~13.4M rows and ~860 MB per
+    /// session at the authorized 250-contract ceiling across both option
+    /// families", and BOTH halves of that basis are gone. The operator's
+    /// 2026-09-12 directive removed the 250-per-family cut (every traded
+    /// option contract is persisted) and took the cadence count from two to
+    /// four (1s, 3s, 5s, 1m). The figure is therefore withdrawn rather than
+    /// rescaled: the new bound is market-dependent, is derived in
+    /// `top_volume_rank_persistence`'s own header, and is ASSUMED there
+    /// pending the measuring query that header names. What is unchanged, and
+    /// is the only thing this row needs, is the DIRECTION: the new figure is
+    /// larger, so the HOUR-list placement is more right than before, not less.
+    ///
+    /// The quiet mistake
+    /// available here was `RETENTION_EXEMPT_TABLES` — exempt means never
+    /// swept, and a never-swept table that grows most of a gigabyte a day is
+    /// the disk-fill class that cost 2026-09-04 an entire trading session.
     #[test]
-    fn test_hour_partitioned_list_is_ticks_and_market_depth() {
-        assert_eq!(HOUR_PARTITIONED_TABLES, &["ticks", "market_depth"]);
+    fn test_hour_partitioned_list_is_ticks_depth_and_top_volume() {
+        assert_eq!(
+            HOUR_PARTITIONED_TABLES,
+            &[
+                "ticks",
+                "tick_quotes",
+                "market_depth",
+                "market_depth_book",
+                "top_volume",
+                "top_volume_1s",
+                "top_volume_3s",
+                "top_volume_5s",
+                "top_volume_1m",
+                "feed_aux_packets",
+            ]
+        );
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::feed_aux_persistence::FEED_AUX_PACKETS_TABLE)
+        );
+        // Plan item 49e step 3: the array-row depth table is HOUR-partitioned
+        // like the level table, pinned against its own name.
+        assert!(
+            HOUR_PARTITIONED_TABLES.contains(&crate::depth_persistence::MARKET_DEPTH_BOOK_TABLE)
+        );
+        // 2026-10-22 (plan item 62, Quote 34): nothing writes the four
+        // top_volume tables now, but their partitions on the box must keep
+        // aging out through the archive-then-detach sweep until copied, so
+        // they STAY here (the literal list above pins them).
     }
 
     #[test]
@@ -746,12 +1116,28 @@ mod tests {
 
     #[test]
     fn test_candle_tables_are_real_plain_names_not_shadow() {
-        // The candle tables swept by detach_old_partitions come from the single
-        // source of truth. They MUST be plain `candles_<TF>` (no `_shadow`) and
-        // number 21 (M1/M3/M5/M15/D1 + S1..S15 + S30, TF-diet second-scale) —
-        // the exact bug #1022 had (phantom `_shadow` names).
+        // The candle tables swept by detach_old_partitions come from the
+        // single source of truth. They MUST be plain `candles_<TF>` with no
+        // `_shadow` — the exact bug #1022 had (phantom `_shadow` names).
+        //
+        // The COUNT is deliberately not asserted. It read `21` in the comment
+        // and `24` in the assertion for long enough that the two disagreed in
+        // the same test, and the 2026-09-19 collapse to 9 frames made both
+        // wrong at once. `candle_table_names()` returns `[&str; TF_COUNT]`, so
+        // a length assertion is a type-level tautology anyway: it can only
+        // ever restate the constant, never check anything.
+        //
+        // Distinctness IS a real property and nothing else here checked it: a
+        // duplicated arm in `TfIndex::table_name` would silently fold two
+        // frames into one table, and the sweep would then sweep that table on
+        // whichever class won the classifier.
         let names = crate::shadow_persistence::candle_table_names();
-        assert_eq!(names.len(), 24, "expected 24 live candle tables");
+        assert!(
+            !names.is_empty(),
+            "no candle tables — the source of truth has drifted and this \
+             guard is vacuous"
+        );
+        let mut seen: Vec<&str> = Vec::new();
         for name in names {
             assert!(
                 name.starts_with("candles_"),
@@ -761,6 +1147,12 @@ mod tests {
                 !name.contains("_shadow"),
                 "candle table must be plain (no _shadow): {name}"
             );
+            assert!(
+                !seen.contains(&name),
+                "two fold frames share the table name {name} — one frame's \
+                 bars would land in the other's table"
+            );
+            seen.push(name);
         }
     }
 
@@ -882,6 +1274,25 @@ mod tests {
         assert_eq!(select_partitions_to_detach(&rows), vec!["2026-01-01"]);
     }
 
+    // Audit 2026-11-15 (live-4): the archive-only IST day list differs from
+    // the retention detach list ONLY by the IST shift of now(); the detach
+    // list itself stays UTC.
+    #[test]
+    fn test_build_ist_day_list_sql_differs_from_the_detach_list_only_by_the_ist_shift() {
+        let ist = build_ist_day_list_sql("ticks", 1);
+        let utc = build_detach_list_sql("ticks", 1);
+        let shift = format!(
+            "dateadd('s', {}, now())",
+            tickvault_common::constants::IST_UTC_OFFSET_SECONDS
+        );
+        assert!(ist.contains(&format!("dateadd('d', -1, {shift})")), "{ist}");
+        assert_eq!(ist.replace(&shift, "now()"), utc);
+        assert!(
+            !utc.contains("dateadd('s'"),
+            "retention detach stays UTC: {utc}"
+        );
+    }
+
     #[test]
     fn test_detach_list_sql_uses_inactive_not_active() {
         // Extreme-check ratchet: the selection must not reintroduce the buggy
@@ -980,5 +1391,160 @@ mod tests {
         use tickvault_common::config::PartitionRetentionConfig;
         let config = PartitionRetentionConfig::default();
         assert_eq!(config.retention_days, 90);
+    }
+
+    #[test]
+    fn test_all_managed_table_names_covers_every_retention_list_without_duplicates() {
+        let names = all_managed_table_names();
+
+        // Every source list must be represented. Building this set FROM the
+        // retention lists is the whole point — a table added to retention is
+        // measured automatically, and the two cannot drift.
+        for t in HOUR_PARTITIONED_TABLES {
+            assert!(names.contains(t), "hour-partitioned `{t}` is not measured");
+        }
+        for t in DAY_PARTITIONED_TABLES {
+            assert!(names.contains(t), "day-partitioned `{t}` is not measured");
+        }
+        for t in RETENTION_EXEMPT_TABLES {
+            assert!(
+                names.contains(t),
+                "retention-EXEMPT `{t}` is not measured — exempt from being \
+                 SWEPT is not exempt from occupying disk"
+            );
+        }
+        // 2026-09-18 — the EMITTED nine, not all TF_COUNT ordinals. The other
+        // fifteen are DROPPED at boot by `drop_retired_candle_tables`, so they
+        // have no `table_storage()` row: measuring them would log a probe
+        // failure every cycle, forever, for a table we deliberately removed.
+        for t in crate::shadow_persistence::emitted_candle_table_names() {
+            assert!(names.contains(&t), "candle table `{t}` is not measured");
+        }
+        for t in crate::shadow_persistence::retired_candle_table_names() {
+            assert!(
+                !names.contains(&t),
+                "retired candle table `{t}` must NOT be measured — it is \
+                 dropped at boot, so a probe for it can only ever fail"
+            );
+        }
+
+        // Sorted and deduplicated: a table appearing in two lists must be
+        // probed once, or its bytes are counted twice in any total.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "the list must be sorted");
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped, "the list must contain no duplicates");
+
+        // Non-vacuity: an empty list would satisfy every "contains" above
+        // only if the source lists were empty too, but assert the floor
+        // anyway — a measurement set of nothing measures nothing.
+        assert!(
+            names.len() > 10,
+            "only {} managed tables — the retention lists look empty",
+            names.len()
+        );
+    }
+
+    #[test]
+    fn test_scratch_tables_are_in_no_retention_list() {
+        // Regression (2026-10-10): the contract name map was first listed as
+        // a DAY-partitioned audit table, which made the operator console's
+        // volume reset treat it as a 5-year regulatory table to export.
+        for t in SCRATCH_TABLES {
+            assert!(!HOUR_PARTITIONED_TABLES.contains(t), "{t}");
+            assert!(!DAY_PARTITIONED_TABLES.contains(t), "{t}");
+            assert!(!RETENTION_EXEMPT_TABLES.contains(t), "{t}");
+            assert!(!all_managed_table_names().contains(t), "{t}");
+        }
+        assert!(
+            SCRATCH_TABLES.contains(&crate::contract_name_repair::CONTRACT_NAME_REPAIR_MAP_TABLE)
+        );
+    }
+
+    // ---- PR AA step 5: session bytes for the daily free target ----------
+
+    #[test]
+    fn test_build_partition_size_sql_lists_name_and_disk_size() {
+        assert_eq!(
+            build_partition_size_sql("tick_quotes"),
+            "SELECT name, diskSize FROM table_partitions('tick_quotes')"
+        );
+    }
+
+    /// `diskSize` is a real `table_partitions` column (QuestDB 9.x; Assumed,
+    /// checked here on the documented response shape), found by NAME.
+    #[test]
+    fn test_disk_size_column_parsed() {
+        let json = r#"{"query":"x","columns":[{"name":"index","type":"INT"},
+            {"name":"name","type":"STRING"},{"name":"diskSize","type":"LONG"},
+            {"name":"active","type":"BOOLEAN"}],
+            "dataset":[[0,"2026-11-06T09",1024,false],[1,"2026-11-07T09",4096,true]],
+            "count":2}"#;
+        let rows = parse_partition_sizes(json).expect("parses");
+        assert_eq!(
+            rows,
+            vec![
+                ("2026-11-06T09".to_string(), 1024),
+                ("2026-11-07T09".to_string(), 4096)
+            ]
+        );
+        // Column order does not matter.
+        let swapped = r#"{"columns":[{"name":"diskSize"},{"name":"name"}],
+            "dataset":[[7,"2026-11-07"]]}"#;
+        assert_eq!(
+            parse_partition_sizes(swapped),
+            Some(vec![("2026-11-07".to_string(), 7)])
+        );
+        assert_eq!(
+            parse_partition_sizes(
+                r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[]}"#
+            ),
+            Some(vec![])
+        );
+    }
+
+    /// Fails closed: a half-read answer must never be summed as whole.
+    #[test]
+    fn test_parse_partition_sizes_refuses_partial_answers() {
+        for bad in [
+            "not json",
+            r#"{"columns":[{"name":"name"}],"dataset":[["2026-11-07"]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",null]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",-5]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07",1.5]]}"#,
+            r#"{"columns":[{"name":"name"},{"name":"diskSize"}],"dataset":[["2026-11-07"]]}"#,
+        ] {
+            assert_eq!(parse_partition_sizes(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_sum_partition_bytes_on_day_matches_day_and_hour_names_only() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 7).expect("date");
+        let rows = vec![
+            ("2026-11-07".to_string(), 10),
+            ("2026-11-07T09".to_string(), 20),
+            ("2026-11-07T15".to_string(), 30),
+            ("2026-11-06T15".to_string(), 1_000),
+            ("2026-11-08".to_string(), 1_000),
+            ("2026-11-070".to_string(), 1_000),
+            ("2026-11-07X".to_string(), 1_000),
+        ];
+        assert_eq!(sum_partition_bytes_on_day(&rows, day), 60);
+        assert_eq!(
+            sum_partition_bytes_on_day(
+                &[
+                    ("2026-11-07".to_string(), u64::MAX),
+                    ("2026-11-07T09".to_string(), 5)
+                ],
+                day
+            ),
+            u64::MAX,
+            "saturates, never wraps"
+        );
+        assert_eq!(sum_partition_bytes_on_day(&[], day), 0);
     }
 }

@@ -93,14 +93,11 @@ fn test_boot_completed_is_emitted_on_both_boot_paths() {
 #[test]
 fn boot_completed_emit_sites_are_gated_on_live_feed() {
     let main_src = read_app("src/main.rs");
-    // The pure verdict helper must exist and be feed-agnostic (4 bool inputs:
-    // per-feed enabled + per-feed running).
+    // The pure verdict helper must exist (per-feed enabled + running).
     assert!(
-        main_src.contains("fn boot_completed_should_emit(")
-            && main_src.contains("dhan_enabled")
-            && main_src.contains("groww_enabled"),
-        "main.rs must define the pure `boot_completed_should_emit(dhan_enabled, groww_enabled, \
-         dhan_running, groww_running)` verdict helper — the feed-agnostic gate for the alive signal."
+        main_src.contains("fn boot_completed_should_emit(") && main_src.contains("dhan_enabled"),
+        "main.rs must define the pure `boot_completed_should_emit(dhan_enabled, dhan_running)` \
+         verdict helper — the gate for the alive signal."
     );
     // The async wrapper that waits (bounded) for a live feed then emits/withholds.
     assert!(
@@ -112,11 +109,10 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
     // lane-running signals (so a regression to an unconditional emit is caught).
     assert!(
         main_src.contains("boot_completed_should_emit(")
-            && main_src.contains("is_dhan_lane_running()")
-            && main_src.contains("is_groww_lane_running()"),
+            && main_src.contains("is_dhan_lane_running()"),
         "the feed-liveness gate must call `boot_completed_should_emit(...)` against \
-         `is_dhan_lane_running()` / `is_groww_lane_running()` — a bare unconditional emit is a \
-         regression that re-opens the alerting hole."
+         `is_dhan_lane_running()` — a bare unconditional emit is a regression that re-opens \
+         the alerting hole."
     );
     // The boot-path emit must go through the gate — no bare `emit_boot_completed();`
     // statement may remain on the success path (only the wrapper body calls it).
@@ -133,7 +129,15 @@ fn boot_completed_emit_sites_are_gated_on_live_feed() {
 
 #[test]
 fn test_metric_is_in_cloudwatch_scrape_filter() {
-    let tftpl = read_repo("deploy/aws/terraform/user-data.sh.tftpl");
+    // 2026-08-25: the deployed CloudWatch-agent config is
+    // `deploy/aws/cloudwatch-agent.json`. It used to be duplicated inside
+    // `user-data.sh.tftpl` and this guard read that copy — but the duplicate
+    // was ~1.6 KB and it pinned the template at exactly its 15,872-byte EC2
+    // budget with ZERO bytes free, so it was removed. The template now writes
+    // a minimal host-only fallback and copies this file into place after the
+    // Step 5 clone; `cw_agent_selector_lockstep_guard.rs` pins that the copy
+    // still happens and that no second selector reappears.
+    let tftpl = read_repo("deploy/aws/cloudwatch-agent.json");
     // 2026-07-02 root-cause fix (B1): the metric-name regex now lives ONLY in
     // `metric_selectors`. The old shape duplicated it into `label_matcher`
     // with `source_labels: ["__name__"]` — but `__name__` is not a series

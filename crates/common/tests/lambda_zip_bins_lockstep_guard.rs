@@ -228,3 +228,97 @@ fn parser_self_test_detects_a_missing_entry() {
     // The real assertion shape: list #1 is missing `beta`.
     assert!(!lists[0].contains(&"beta".to_string()));
 }
+
+/// Direct shared sources bypass the lambda crate tree: hash each imported
+/// common file explicitly, so a wire-only change replaces the deployed zip.
+fn direct_common_imports(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("#[path") && line.contains("../../common/"))
+        .map(|line| {
+            let rel = line
+                .strip_prefix("#[path = \"../../common/")
+                .and_then(|rest| rest.strip_suffix("\"]"))
+                .expect("common path import format changed; update the digest guard");
+            format!("crates/common/{rel}")
+        })
+        .collect()
+}
+
+/// Pin the executable digest expression, not a path mentioned in a comment.
+fn workflow_digest_inputs(workflow: &str) -> Vec<Vec<&str>> {
+    workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("SRC_DIGEST="))
+        .map(|line| {
+            line.strip_prefix(
+                "SRC_DIGEST=$( { git rev-parse \"HEAD:crates/aws-lambdas\"; sha256sum ",
+            )
+            .and_then(|rest| rest.strip_suffix(" | cut -d' ' -f1; } | sha256sum | cut -d' ' -f1 )"))
+            .expect("lambda source digest expression changed; update the guard deliberately")
+            .split_whitespace()
+            .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn every_lambda_source_digest_covers_direct_common_imports() {
+    let source = load("crates/aws-lambdas/src/lib.rs");
+    let imports = direct_common_imports(&source);
+    for required in [
+        "crates/common/src/operator_movers_wire.rs",
+        "crates/common/src/operator_stock_movers_wire.rs",
+    ] {
+        assert!(
+            imports.iter().any(|path| path == required),
+            "the directly imported wire regression fixture disappeared: {required}"
+        );
+    }
+    let workflow = load(".github/workflows/terraform-apply.yml");
+    let inputs = workflow_digest_inputs(&workflow);
+    assert_eq!(
+        inputs.len(),
+        2,
+        "plan and apply must both hash lambda sources"
+    );
+    assert_eq!(inputs[0], inputs[1], "plan/apply source digests diverged");
+    for (idx, files) in inputs.iter().enumerate() {
+        assert!(files.contains(&"Cargo.lock"), "digest lost Cargo.lock");
+        for imported in &imports {
+            assert!(
+                files.contains(&imported.as_str()),
+                "source digest #{} omits direct common import {imported}; wire-only changes would leave a stale lambda",
+                idx + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn source_digest_parser_distinguishes_missing_wire_inputs() {
+    let source = "#[path = \"../../common/src/operator_movers_wire.rs\"]\n\
+                  #[path = \"../../common/src/operator_stock_movers_wire.rs\"]\n";
+    assert_eq!(
+        direct_common_imports(source),
+        [
+            "crates/common/src/operator_movers_wire.rs",
+            "crates/common/src/operator_stock_movers_wire.rs"
+        ]
+    );
+    let workflow = load(".github/workflows/terraform-apply.yml");
+    let imports = direct_common_imports(source);
+    for omitted in &imports {
+        let mutated = workflow.replace(&format!(" {omitted}"), "");
+        let inputs = workflow_digest_inputs(&mutated);
+        assert_eq!(inputs.len(), 2);
+        assert!(
+            inputs
+                .iter()
+                .all(|files| !files.contains(&omitted.as_str()))
+        );
+        assert!(inputs.iter().all(|files| files.contains(&"Cargo.lock")));
+    }
+}

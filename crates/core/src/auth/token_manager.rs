@@ -82,6 +82,23 @@ pub type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
 /// only; no server-controlled body can appear inside this wrapper).
 pub(crate) const PROFILE_SEND_LEG_WRAPPER: &str = "profile request failed:";
 
+/// Send-leg wrapper from `acquire_token` — the `generateAccessToken` POST
+/// failed before ANY response was received, so the tail is reqwest's own
+/// text (DNS, TLS, proxy, timeout), never Dhan's. `is_permanent_auth_error`
+/// treats it as transient whatever words that text contains.
+pub(crate) const MINT_SEND_LEG_WRAPPER: &str = "generateAccessToken request failed:";
+
+/// Non-2xx wrapper from `acquire_token`: `"<this> <status> url=… body=…"`.
+/// The body is server-controlled (an HTML error page from a load balancer
+/// or firewall as often as Dhan JSON), so `is_permanent_auth_error` reads
+/// it only for a 4xx other than 429 — a 5xx or 429 is transient whatever
+/// its body says.
+pub(crate) const MINT_HTTP_STATUS_WRAPPER: &str = "generateAccessToken HTTP";
+
+/// Wrapper from `acquire_token` when a 2xx body is neither a Dhan error
+/// object nor a token. No Dhan verdict was parsed, so it is transient.
+pub(crate) const MINT_PARSE_FAILURE_WRAPPER: &str = "failed to parse auth response";
+
 /// HTTP-response wrapper from `get_user_profile`:
 /// `"profile request HTTP {status} url={url} body={body}"`. Everything
 /// after `body=` is server-controlled (bounded + secret-redacted but
@@ -118,6 +135,62 @@ pub(crate) const MINT_COOLDOWN_REFUSAL_REASON_PREFIX: &str =
 #[must_use]
 pub(crate) fn mint_cooldown_allows(elapsed_since_last_attempt_secs: Option<u64>) -> bool {
     elapsed_since_last_attempt_secs.is_none_or(|s| s >= DHAN_TOKEN_GENERATION_COOLDOWN_SECS)
+}
+
+/// R3 (2026-10-01). Pure. A failed post-807 renewal pages iff the dialled
+/// token is still the current one (no fresh token landed meanwhile) and the
+/// failure is terminal: not the mint-cooldown skip, and not the RESILIENCE-03
+/// refusal, which `acquire_token` already paged. Prefix-anchored on our own
+/// literals, never a scan of a server body (SEC-R2-2).
+#[must_use]
+fn stale_credential_failure_pages(err: &ApplicationError, dialled: u64, current: u64) -> bool {
+    current == dialled && !is_deferred_renewal_failure(err)
+}
+
+/// 808 refresh-once (scope lock 2026-10-06): reason PREFIX of a renewal
+/// result answered from [`RENEW_FAILURE_REUSE_MS`]'s record instead of a
+/// request. It carries no new evidence about the token, so
+/// [`is_deferred_renewal_failure`] counts it as a deferral: one real failure
+/// is one strike, however many sockets read it back. The original reason
+/// follows the prefix.
+pub(crate) const RENEW_FAILURE_REUSED_REASON_PREFIX: &str =
+    "renew-reused: a renewal for this token ended moments ago";
+
+/// 808 refresh-once (scope lock 2026-10-06). Pure, O(1). True iff a renewal
+/// failure is a DEFERRAL, not a real failure: the mint-cooldown skip, the
+/// RESILIENCE-03 lock refusal, or a result reused from a renewal that just
+/// ended. Prefix-anchored on our own literals, never a scan of a server body
+/// (SEC-R2-2). The feed's refresh closure uses it to report a deferral, which
+/// does not count toward the 808 park.
+#[must_use]
+pub fn is_deferred_renewal_failure(err: &ApplicationError) -> bool {
+    match err {
+        ApplicationError::AuthenticationFailed { reason } => {
+            reason.starts_with(MINT_COOLDOWN_REFUSAL_REASON_PREFIX)
+                || reason.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX)
+                || reason.starts_with(RENEW_FAILURE_REUSED_REASON_PREFIX)
+        }
+        _ => false,
+    }
+}
+
+/// 808 refresh-once (scope lock 2026-10-06): how long a failed
+/// stale-credential renewal (outright, or deferred by the mint cooldown or
+/// the RESILIENCE-03 lock) is reused for later callers that saw the same
+/// token generation. Ten seconds covers a sixteen-socket burst (5 s floor
+/// plus at most 375 ms jitter, then the queue on the gate). A caller inside
+/// the window gets the recorded result back as a DEFERRAL and sends nothing;
+/// the first caller after it sends a real request. So a retry IS held back
+/// for up to ten seconds, which is far below the 125 s mint cooldown and
+/// the 300 s 808 episode bound that covers deferrals.
+pub const RENEW_FAILURE_REUSE_MS: u64 = 10_000;
+
+/// R3 (2026-10-01). True exactly once per token `generation`. O(1),
+/// lock-free, allocation-free: one atomic swap.
+#[must_use]
+fn take_stale_credential_page(latch: &std::sync::atomic::AtomicU64, generation: u64) -> bool {
+    let mark = generation.wrapping_add(1);
+    latch.swap(mark, std::sync::atomic::Ordering::AcqRel) != mark
 }
 
 /// Wave 2 Item 5.4 (AUTH-GAP-03) — global TokenManager handle so the
@@ -236,6 +309,18 @@ pub struct TokenManager {
     /// and this caller returns success WITHOUT issuing its own request. That
     /// is what turns sixteen renewals into one.
     renew_generation: std::sync::atomic::AtomicU64,
+    /// `generation + 1` of the last token generation whose post-807 renewal
+    /// failure paged (0 = never). One page per dead token, not one per socket:
+    /// sixteen sockets told 807 on the same token share one generation.
+    stale_credential_paged_generation: std::sync::atomic::AtomicU64,
+    /// 808 refresh-once (scope lock 2026-10-06): the last failed
+    /// stale-credential renewal, outright or deferred — `(seen generation,
+    /// when, redacted reason)`. Sixteen sockets rejected together queue on
+    /// [`Self::renew_gate`]; once the first one's renewal fails, the rest
+    /// reuse that result for [`RENEW_FAILURE_REUSE_MS`] (as a deferral)
+    /// instead of each sending their own renewal and login. Only [`Self::force_renewal_unless_replaced`] reads or
+    /// writes it. Cold path: one lock per post-disconnect refresh.
+    recent_stale_failure: std::sync::Mutex<Option<(u64, std::time::Instant, String)>>,
 }
 
 impl TokenManager {
@@ -338,6 +423,8 @@ impl TokenManager {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         });
 
         // Set when SSM held a well-formed, unexpired token that Dhan REJECTED.
@@ -450,6 +537,13 @@ impl TokenManager {
                                     now_ist,
                                 );
                                 manager.token.store(Arc::new(Some(state)));
+                                // Audit PR22 hardening: every install of a
+                                // usable token bumps the generation, so a socket
+                                // that recorded an older one can never mistake
+                                // this token for the one it dialled with.
+                                manager
+                                    .renew_generation
+                                    .fetch_add(1, std::sync::atomic::Ordering::Release);
 
                                 // PROVE it works before committing to it.
                                 //
@@ -486,6 +580,35 @@ impl TokenManager {
                                              minter's token stays the one active token for this \
                                              account"
                                         );
+                                        notifier.notify(NotificationEvent::AuthenticationSuccess);
+                                        return Ok(manager);
+                                    }
+                                    // Audit PR L1 (2026-10-26): only a REAL
+                                    // rejection (401/403) mints. A probe that
+                                    // could not reach a verdict (network, 429,
+                                    // 5xx, 400, parse) keeps the shared token:
+                                    // minting here would kill the scheduled
+                                    // minter's token over a REST outage, and
+                                    // the mid-session watchdog re-checks it.
+                                    Err(e)
+                                        if !crate::auth::mid_session_watchdog::profile_failure_rejects_token(
+                                            &e.to_string(),
+                                        ) =>
+                                    {
+                                        warn!(
+                                            error = %e,
+                                            expires_at = %manager.current_expiry_display(),
+                                            "adopted the SHARED Dhan token from SSM WITHOUT a \
+                                             verdict: /v2/profile failed for a reason that is not \
+                                             a token rejection (network, rate limit, server error \
+                                             or parse), so this box does not mint. The \
+                                             mid-session profile watchdog re-checks it"
+                                        );
+                                        metrics::counter!(
+                                            "tv_dhan_shared_token_adoption_total",
+                                            "outcome" => "adopted_unverified"
+                                        )
+                                        .increment(1);
                                         notifier.notify(NotificationEvent::AuthenticationSuccess);
                                         return Ok(manager);
                                     }
@@ -561,12 +684,58 @@ impl TokenManager {
                 token_cache::load_token_cache(&manager.credentials.client_id)
         {
             manager.token.store(Arc::new(Some(cached_token)));
-            info!(
-                expires_at = %manager.current_expiry_display(),
-                "using cached token — skipped Dhan auth HTTP call"
-            );
-            notifier.notify(NotificationEvent::AuthenticationSuccess);
-            return Ok(manager);
+            // Audit PR22 hardening: see the SSM adoption above.
+            manager
+                .renew_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            // PROBE BEFORE ADOPTING — the same one HTTP call the SSM branch
+            // above makes, for the same reason, which this branch was missing.
+            //
+            // Dhan allows ONE active token per account. The scheduled minter
+            // runs at 06:05 IST and that mint INVALIDATES whatever this box
+            // cached yesterday. So on any boot where the SSM read fails for an
+            // ordinary reason -- a transport blip, an IAM hiccup -- control
+            // reaches here holding a token that parses perfectly, has not
+            // expired by its own `exp`, and is already dead.
+            //
+            // Adopting it then RETURNS, skipping the mint below, and the box
+            // runs the whole session 401-ing every REST leg and the WebSocket
+            // handshake while the log says "using cached token" and the
+            // notifier says AuthenticationSuccess. Every operator-facing signal
+            // reads healthy; the first real symptom is no ticks at 09:15, and
+            // the only alarm that catches it is `dhan-no-ticks-flowing`, ten
+            // minutes into the session.
+            //
+            // `shared_token_rejected_by_broker` guards only the case where SSM
+            // was READ and its token was REFUSED. An SSM read FAILURE leaves
+            // that flag false, which is precisely the path that reaches an
+            // unprobed cache.
+            //
+            // On failure the token is cleared and control falls through to the
+            // mint below, so a probe that cannot run (network down, Dhan down)
+            // costs a mint, never a wedged boot. Found by the 2026-09-09
+            // boot-path sweep.
+            match manager.get_user_profile().await {
+                Ok(_) => {
+                    info!(
+                        expires_at = %manager.current_expiry_display(),
+                        "using cached token — VERIFIED against /v2/profile, so a token the \
+                         06:05 minter has since invalidated cannot be adopted silently"
+                    );
+                    notifier.notify(NotificationEvent::AuthenticationSuccess);
+                    return Ok(manager);
+                }
+                Err(e) => {
+                    manager.token.store(Arc::new(None));
+                    warn!(
+                        error = %e,
+                        "the cached Dhan token parses and has not expired, but Dhan REJECTED \
+                         it — the scheduled minter almost certainly re-minted after this cache \
+                         was written, and Dhan allows one active token per account. Falling \
+                         through to mint."
+                    );
+                }
+            }
         }
 
         // Slow path: full auth via Dhan API.
@@ -984,6 +1153,27 @@ impl TokenManager {
         // effects. `RenewToken` (try_renew_token) is deliberately NOT
         // gated — renewing our own still-active token harms no peer.
         if mint_refused_by_instance_lock(self.instance_lock_held.as_deref()) {
+            // CONC-4 review (2026-10-11): a clean stop now releases the lock
+            // and clears the held flag a few seconds before exit. A renewal
+            // landing in that window is refused the same way, but no peer
+            // holds the lock, so it is logged at info and does not page
+            // "another tickvault instance holds the dual-instance lock".
+            if crate::instance_lock::lock_released_at_shutdown() {
+                info!(
+                    code =
+                        tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
+                            .code_str(),
+                    stage = "shutting_down",
+                    "RESILIENCE-03: refusing generateAccessToken — this process is stopping \
+                     and has released the dual-instance lock"
+                );
+                return Err(ApplicationError::AuthenticationFailed {
+                    reason: format!(
+                        "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint \
+                         refused (fail-closed)"
+                    ),
+                });
+            }
             error!(
                 code = tickvault_common::error_code::ErrorCode::Resilience03MintRefusedLockNotHeld
                     .code_str(),
@@ -1040,7 +1230,7 @@ impl TokenManager {
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken request failed: {}",
+                    "{MINT_SEND_LEG_WRAPPER} {}",
                     redact_url_params(&err.to_string())
                 ),
             })?;
@@ -1054,7 +1244,7 @@ impl TokenManager {
             // not present in `url`; redact defensively anyway).
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "generateAccessToken HTTP {status} url={} body={}",
+                    "{MINT_HTTP_STATUS_WRAPPER} {status} url={} body={}",
                     redact_url_params(&url),
                     capture_rest_error_body(&body_text)
                 ),
@@ -1081,7 +1271,7 @@ impl TokenManager {
             // material that url-param redaction alone would miss.
             ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "failed to parse auth response (HTTP {status}): {err}\nResponse body: {}",
+                    "{MINT_PARSE_FAILURE_WRAPPER} (HTTP {status}): {err}\nResponse body: {}",
                     capture_rest_error_body(&body_text)
                 ),
             }
@@ -1233,9 +1423,33 @@ impl TokenManager {
         // of each other now produce ONE renewal: the first through the gate
         // does the work, the other fifteen wake, observe the generation has
         // moved, and return that caller's success as their own.
-        let seen_generation = self
-            .renew_generation
-            .load(std::sync::atomic::Ordering::Acquire);
+        let seen_generation = self.renew_generation();
+        self.renew_with_fallback_since(seen_generation, false).await
+    }
+
+    /// [`Self::renew_with_fallback`] against a generation the CALLER sampled.
+    ///
+    /// Audit PR22 (2026-09-27): sampling when the call starts is too late for
+    /// a socket. Its 807 names the token it DIALLED with, but the call comes
+    /// after a 5 s floor plus up to 375 ms of jitter, and a sibling's renewal
+    /// finishes inside that gap. A late socket then sampled the NEW
+    /// generation, found the gate free and renewed again — invalidating the
+    /// token its sibling had just installed, which sent the sibling back to
+    /// 807. `seen_generation` is therefore the generation the caller's
+    /// credential belongs to; if the token has moved on since, nothing is
+    /// renewed and the caller simply presents the newer token.
+    ///
+    /// `reuse_recent_failure` (808 refresh-once, 2026-10-06): when true, a
+    /// failure (outright or deferred) for this same generation less than
+    /// [`RENEW_FAILURE_REUSE_MS`] old is returned again, prefixed with
+    /// [`RENEW_FAILURE_REUSED_REASON_PREFIX`] so it reads as a deferral,
+    /// without a request; a new failure is recorded (redacted) for the next
+    /// caller. Only the stale-credential path passes true.
+    async fn renew_with_fallback_since(
+        &self,
+        seen_generation: u64,
+        reuse_recent_failure: bool,
+    ) -> Result<(), ApplicationError> {
         let _flight = self.renew_gate.lock().await;
         let current_generation = self
             .renew_generation
@@ -1253,7 +1467,60 @@ impl TokenManager {
             );
             return Ok(());
         }
+        if reuse_recent_failure && let Some(reason) = self.recent_failure_for(seen_generation) {
+            metrics::counter!("tv_token_renew_failure_reused_total").increment(1);
+            tracing::debug!(
+                seen_generation,
+                "token renewal skipped — a renewal for this same token failed moments ago, \
+                 so its result is reused (as a deferral) instead of sending another request"
+            );
+            return Err(ApplicationError::AuthenticationFailed {
+                reason: format!("{RENEW_FAILURE_REUSED_REASON_PREFIX} — {reason}"),
+            });
+        }
+        let result = self.renew_or_mint().await;
+        if reuse_recent_failure && let Err(err) = &result {
+            // Stored redacted and bounded: the reason is logged again by
+            // every socket that reuses it. The redaction keeps our own
+            // prefixes (no URL, no token in them) at the front.
+            let reason = match err {
+                ApplicationError::AuthenticationFailed { reason } => {
+                    capture_rest_error_body(reason)
+                }
+                other => capture_rest_error_body(&other.to_string()),
+            };
+            *self
+                .recent_stale_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((seen_generation, std::time::Instant::now(), reason));
+        }
+        result
+    }
 
+    /// The reason of a failed stale-credential renewal for
+    /// `seen_generation` recorded less than [`RENEW_FAILURE_REUSE_MS`] ago.
+    /// O(1): one lock, one compare, one clone of a short string on a hit.
+    fn recent_failure_for(&self, seen_generation: u64) -> Option<String> {
+        let guard = self
+            .recent_stale_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_ref() {
+            Some((generation, at, reason))
+                if *generation == seen_generation
+                    && at.elapsed() < Duration::from_millis(RENEW_FAILURE_REUSE_MS) =>
+            {
+                Some(reason.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `renewToken`, falling back to `generateAccessToken` unless the mint
+    /// cooldown holds it back. Runs under [`Self::renew_gate`], taken by the
+    /// caller.
+    async fn renew_or_mint(&self) -> Result<(), ApplicationError> {
         match self.try_renew_token().await {
             Ok(()) => Ok(()),
             Err(renew_err) => {
@@ -1392,6 +1659,7 @@ impl TokenManager {
                 consecutive_circuit_breaker_cycles =
                     consecutive_circuit_breaker_cycles.saturating_add(1);
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
                     attempts,
                     circuit_breaker_cycle = consecutive_circuit_breaker_cycles,
                     max_cycles =
@@ -1420,6 +1688,8 @@ impl TokenManager {
                     >= tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
                 {
                     error!(
+                        code =
+                            tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
                         "token renewal halted after {} consecutive failures — operator must intervene",
                         consecutive_circuit_breaker_cycles
                     );
@@ -1505,11 +1775,21 @@ impl TokenManager {
     }
 
     /// Saves the current token to the disk cache for fast crash recovery.
+    ///
+    /// The write (a file create, write and `fsync`, then a rename) runs on the
+    /// runtime's blocking pool, never on the calling task (audit-fixes H2,
+    /// 2026-10-03). A renewal after an 807/809 is called from a socket read
+    /// task on the reader runtime, so an inline `fsync` on a slow disk stalled
+    /// every socket that runtime serves. The blocking job re-reads the CURRENT
+    /// token under a process-wide lock, so two renewals close together can
+    /// never leave the older token as the cache's last write, and they never
+    /// share the temp file. Best-effort, as before: the cache only speeds up a
+    /// restart, and a write lost at exit means the next boot reads or mints a
+    /// token the usual way.
     fn save_current_token_to_cache(&self) {
-        let guard = self.token.load();
-        if let Some(token_state) = guard.as_ref().as_ref() {
-            token_cache::save_token_cache(token_state, &self.credentials.client_id);
-        }
+        let handle = Arc::clone(&self.token);
+        let client_id = self.credentials.client_id.clone();
+        offload_blocking(move || write_current_token_cache(&handle, &client_id));
     }
 
     /// Publishes the current token to SSM so peer consumers of the SAME Dhan
@@ -1660,6 +1940,80 @@ impl TokenManager {
         self.renew_with_fallback().await
     }
 
+    /// The number of successful token replacements so far (mints plus
+    /// renewals). One `Acquire` load, O(1).
+    ///
+    /// A socket reads this BEFORE it reads the token it dials with, so the
+    /// value it records is never newer than the token it presented; see
+    /// [`Self::force_renewal_unless_replaced`].
+    pub fn renew_generation(&self) -> u64 {
+        self.renew_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Audit PR22 (2026-09-27) — renew after a stale-credential disconnect
+    /// (807/809, and since 2026-10-06 a first 808) ONLY if the token the
+    /// socket dialled with is still current. An outright failure for the same
+    /// generation is reused for [`RENEW_FAILURE_REUSE_MS`] (808 refresh-once),
+    /// so a sixteen-socket burst sends one renewal, not sixteen.
+    ///
+    /// `dialled_generation` is [`Self::renew_generation`] as the socket read
+    /// it when it dialled. If any mint or renewal has completed since, that
+    /// socket's credential is already replaced: the call returns `Ok(())`
+    /// without a request (counted on `tv_token_renew_coalesced_total`) and
+    /// the socket's next dial presents the newer token. Otherwise it renews
+    /// exactly as [`Self::force_renewal`] does, under the same single-flight
+    /// gate, so sixteen sockets that dialled with one token renew it once.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying renew/generate error.
+    pub async fn force_renewal_unless_replaced(
+        &self,
+        dialled_generation: u64,
+    ) -> Result<(), ApplicationError> {
+        metrics::counter!(
+            "tv_token_force_renewal_total",
+            "trigger" => "stale_credential"
+        )
+        .increment(1);
+        let result = self
+            .renew_with_fallback_since(dialled_generation, true)
+            .await;
+        // 2026-10-01 (reality check, R3): a failure here used to page nothing.
+        // The only page was the profile watchdog's, ~30 minutes later and only
+        // in market hours, while the live feed could not reconnect at all.
+        if let Err(err) = &result
+            && stale_credential_failure_pages(err, dialled_generation, self.renew_generation())
+            && take_stale_credential_page(
+                &self.stale_credential_paged_generation,
+                dialled_generation,
+            )
+        {
+            let rendered = err.to_string();
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "stale_credential_token_unobtainable",
+                dialled_generation,
+                error = %rendered,
+                "Dhan live feed got 807, 808 or 809 and the token could not be obtained: \
+                 renewal and the fallback login both failed; paging once for this token \
+                 generation"
+            );
+            self.notifier
+                .notify(NotificationEvent::AuthenticationFailed {
+                    reason: format!(
+                        "a Dhan live-feed connection was told its login is no longer valid (Dhan \
+                     code 807, 808 or 809) and both the renewal and a fresh login failed ({}). \
+                     The Dhan live feed cannot reconnect until a login is obtained; it keeps \
+                     retrying on its own",
+                        capture_rest_error_body(&rendered)
+                    ),
+                });
+        }
+        result
+    }
+
     /// Wave 2 Item 5.4 (G1) — current token expiry timestamp.
     ///
     /// Returns the IST `DateTime` at which the cached token expires,
@@ -1739,6 +2093,8 @@ impl TokenManager {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1754,18 +2110,68 @@ impl TokenManager {
 ///
 /// Note: TOTP errors are excluded — they may be transient due to window
 /// boundary timing. Use [`is_totp_error`] to handle TOTP retries separately.
+///
+/// 2026-10-01 (follow-up named in commit b2553a1): this used to scan the
+/// WHOLE rendered reason with unanchored `contains`, so two kinds of text
+/// that are not a credential verdict could end the boot retry loop:
+/// - the RESILIENCE-03 literal planted ANYWHERE in a server-controlled HTTP
+///   body (SEC-R1-3: our own refusal is matched at the reason's start,
+///   on the shared [`RESILIENCE03_MINT_REFUSAL_REASON_PREFIX`], exactly as
+///   the AUTH-GAP-05 watchdog's `is_inflight_lock_refusal` does);
+/// - a transport failure whose reqwest text mentions "blocked" or "disabled"
+///   (a proxy or firewall refusing the connection). [`MINT_SEND_LEG_WRAPPER`]
+///   reasons carry reqwest's words, never Dhan's, so they are always
+///   transient.
+///
+/// The account words are matched as whole words, so "unblocked" or
+/// "disabledAt" never read as "blocked" / "disabled".
+///
+/// Only text that can be a Dhan verdict is scanned: a `status:error` body
+/// on a 2xx, or the body of a 4xx other than 429. A 5xx or 429 body (an
+/// HTML page from a firewall or load balancer saying "Request blocked"),
+/// a body that parsed as neither ([`MINT_PARSE_FAILURE_WRAPPER`]) and a
+/// transport failure are all transient. Limit: a camelCase code such as
+/// `accountBlocked` is one word and does not match; Dhan sends sentences
+/// ("Invalid Pin"), and splitting camelCase would also split `disabledAt`.
 fn is_permanent_auth_error(reason: &str) -> bool {
-    let lower = reason.to_lowercase();
+    let core = super::mid_session_watchdog::reason_core(reason);
+    if core.starts_with(RESILIENCE03_MINT_REFUSAL_REASON_PREFIX) {
+        return true;
+    }
+    if core.starts_with(MINT_SEND_LEG_WRAPPER) || core.starts_with(MINT_PARSE_FAILURE_WRAPPER) {
+        return false;
+    }
+    if let Some(after) = core.strip_prefix(MINT_HTTP_STATUS_WRAPPER)
+        && !is_client_refusal_status(after)
+    {
+        return false;
+    }
+    let lower = core.to_lowercase();
     lower.contains("invalid pin")
         || lower.contains("invalid client")
-        || lower.contains("blocked")
-        || lower.contains("suspended")
-        || lower.contains("disabled")
-        // RESILIENCE-03 (2026-07-04): a mint refused because the
-        // dual-instance lock is not held cannot succeed on retry —
-        // the peer owns the session. Fail fast so the boot retry
-        // loop / renewal loop escalates instead of spinning.
-        || lower.contains("resilience-03")
+        || contains_word(&lower, "blocked")
+        || contains_word(&lower, "suspended")
+        || contains_word(&lower, "disabled")
+}
+
+/// Pure. True iff the text after [`MINT_HTTP_STATUS_WRAPPER`] starts with a
+/// 4xx status other than 429 — the only non-2xx answers whose body can be a
+/// verdict on the credentials. Anything unparseable reads as not a refusal.
+fn is_client_refusal_status(after_wrapper: &str) -> bool {
+    let code: u16 = after_wrapper
+        .trim_start()
+        .get(..3)
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0);
+    (400..500).contains(&code) && code != 429
+}
+
+/// Pure. True iff `word` appears in `haystack` as a whole ASCII word.
+/// `haystack` and `word` are expected lower-case.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    haystack
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
 }
 
 /// RESILIENCE-03 pure decision: should a `generateAccessToken` MINT be
@@ -1798,6 +2204,40 @@ fn is_dhan_rate_limited(reason: &str) -> bool {
     reason.contains("every 2 minutes") || reason.contains("once every")
 }
 
+/// Serialises token-cache writes so the last write is always the newest token
+/// and two writers never share the temp file.
+static TOKEN_CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Writes whatever token is current at the moment the write runs.
+fn write_current_token_cache(handle: &TokenHandle, client_id: &secrecy::SecretString) {
+    let _held = TOKEN_CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let current = handle.load_full();
+    if let Some(token_state) = current.as_ref() {
+        token_cache::save_token_cache(token_state, client_id);
+    }
+}
+
+/// Runs `job` on the current runtime's blocking pool, or inline when there is
+/// no runtime (a synchronous caller has no task to stall). Returns `true` when
+/// the job was handed off. O(1) for the caller: one spawn.
+fn offload_blocking<F>(job: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            drop(runtime.spawn_blocking(job));
+            true
+        }
+        Err(_) => {
+            job();
+            false
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1806,6 +2246,92 @@ fn is_dhan_rate_limited(reason: &str) -> bool {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
+
+    /// Audit-fixes H2 (2026-10-03): inside a runtime the token-cache write is
+    /// handed to the blocking pool and runs on another thread, so the calling
+    /// task (a socket read task after an 807/809) never waits on the fsync.
+    #[test]
+    fn test_regression_h2_token_cache_write_never_runs_on_the_calling_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let caller = std::thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let offloaded = runtime.block_on(async move {
+            offload_blocking(move || {
+                let _ = tx.send(std::thread::current().id());
+            })
+        });
+        assert!(offloaded, "inside a runtime the write is handed off");
+        let ran_on = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the job ran");
+        assert_ne!(ran_on, caller, "the write ran on a blocking-pool thread");
+        drop(runtime);
+    }
+
+    /// Without a runtime there is no task to stall, and the write runs inline.
+    #[test]
+    fn test_offload_blocking_without_a_runtime_runs_inline() {
+        let caller = std::thread::current().id();
+        let ran_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&ran_on);
+        let offloaded = offload_blocking(move || {
+            *slot.lock().expect("slot") = Some(std::thread::current().id());
+        });
+        assert!(!offloaded);
+        assert_eq!(*ran_on.lock().expect("slot"), Some(caller));
+    }
+
+    /// The source keeps the cache write off the caller: the wrapper goes
+    /// through `offload_blocking`, and nothing else in this file calls
+    /// `save_token_cache` directly.
+    #[test]
+    fn test_regression_h2_cache_save_goes_through_the_offload() {
+        let src = include_str!("token_manager.rs");
+        let production = src
+            .split("// Tests\n// ----")
+            .next()
+            .expect("production part");
+        assert!(
+            production.contains(
+                "offload_blocking(move || write_current_token_cache(&handle, &client_id));"
+            )
+        );
+        assert_eq!(
+            production.matches("token_cache::save_token_cache(").count(),
+            1,
+            "only write_current_token_cache writes the cache"
+        );
+    }
+
+    /// CONC-4 review (2026-10-11): a refusal after this process released
+    /// its own lock at shutdown returns before the page, and the page is
+    /// still sent for every other refusal.
+    #[test]
+    fn test_mint_refusal_after_own_shutdown_release_does_not_page() {
+        let src = include_str!("token_manager.rs");
+        let production = src
+            .split("// Tests\n// ----")
+            .next()
+            .expect("production part");
+        let tripwire = production
+            .find("if mint_refused_by_instance_lock(")
+            .expect("tripwire");
+        let latch = production[tripwire..]
+            .find("crate::instance_lock::lock_released_at_shutdown()")
+            .expect("shutdown latch checked inside the tripwire");
+        let page = production[tripwire..]
+            .find("NotificationEvent::AuthenticationFailed")
+            .expect("page still sent for a peer-held lock");
+        assert!(
+            latch < page,
+            "the shutdown latch is checked before the page"
+        );
+        let between = &production[tripwire + latch..tripwire + page];
+        assert!(between.contains("stage = \"shutting_down\""));
+        assert!(between.contains("return Err(ApplicationError::AuthenticationFailed"));
+    }
 
     /// Adoption must PROVE the token works before skipping the mint.
     ///
@@ -1889,6 +2415,239 @@ mod tests {
     /// test-only construction lives in one place.
     fn make_test_manager(initial_token: Option<TokenState>) -> Arc<TokenManager> {
         TokenManager::new_for_test(initial_token)
+    }
+
+    // R3 (2026-10-01, reality check): a failed renewal after an 807 pages
+    // once per dead token, and never for a non-terminal skip.
+    #[test]
+    fn test_stale_credential_failure_pages_only_on_terminal_failure_of_the_current_token() {
+        let auth = |r: String| ApplicationError::AuthenticationFailed { reason: r };
+        let terminal = auth("generateAccessToken HTTP 500 url=x body=y".to_string());
+        assert!(stale_credential_failure_pages(&terminal, 7, 7));
+        assert!(
+            !stale_credential_failure_pages(&terminal, 7, 8),
+            "a fresh token landed meanwhile: no page"
+        );
+        let totp = ApplicationError::TotpGenerationFailed {
+            reason: "bad".to_string(),
+        };
+        assert!(stale_credential_failure_pages(&totp, 0, 0));
+        let renew = ApplicationError::TokenRenewalFailed {
+            attempts: 0,
+            reason: "x".to_string(),
+        };
+        assert!(stale_credential_failure_pages(&renew, 0, 0));
+        let skip = auth(format!("{MINT_COOLDOWN_REFUSAL_REASON_PREFIX} — 3s ago"));
+        assert!(
+            !stale_credential_failure_pages(&skip, 0, 0),
+            "the cooldown skip is not terminal"
+        );
+        let lock = auth(format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        ));
+        assert!(
+            !stale_credential_failure_pages(&lock, 0, 0),
+            "acquire_token already paged the lock refusal"
+        );
+        let forged = auth(format!(
+            "generateAccessToken HTTP 401 body={MINT_COOLDOWN_REFUSAL_REASON_PREFIX}"
+        ));
+        assert!(
+            stale_credential_failure_pages(&forged, 0, 0),
+            "a server body cannot forge a skip"
+        );
+    }
+
+    /// 808 refresh-once (2026-10-06): only our own two refusal prefixes are
+    /// deferrals; everything else, a forged server body included, is a real
+    /// failure.
+    #[test]
+    fn test_is_deferred_renewal_failure_truth_table() {
+        let auth = |r: String| ApplicationError::AuthenticationFailed { reason: r };
+        assert!(is_deferred_renewal_failure(&auth(format!(
+            "{MINT_COOLDOWN_REFUSAL_REASON_PREFIX} — 3s ago"
+        ))));
+        assert!(is_deferred_renewal_failure(&auth(format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        ))));
+        assert!(is_deferred_renewal_failure(&auth(format!(
+            "{RENEW_FAILURE_REUSED_REASON_PREFIX} — generateAccessToken HTTP 500"
+        ))));
+        assert!(!is_deferred_renewal_failure(&auth(
+            "generateAccessToken HTTP 500".to_string()
+        )));
+        assert!(
+            !is_deferred_renewal_failure(&auth(format!(
+                "generateAccessToken HTTP 401 body={MINT_COOLDOWN_REFUSAL_REASON_PREFIX}"
+            ))),
+            "a server body cannot forge a deferral"
+        );
+        assert!(!is_deferred_renewal_failure(
+            &ApplicationError::TotpGenerationFailed {
+                reason: "bad".to_string()
+            }
+        ));
+        assert!(!is_deferred_renewal_failure(
+            &ApplicationError::TokenRenewalFailed {
+                attempts: 0,
+                reason: MINT_COOLDOWN_REFUSAL_REASON_PREFIX.to_string(),
+            }
+        ));
+    }
+
+    /// 808 refresh-once (2026-10-06): sixteen sockets rejected together send
+    /// ONE renewal. Once the first outright failure is recorded, a caller on
+    /// the same generation inside the reuse window gets it back without a
+    /// request; past the window it sends one again.
+    #[tokio::test]
+    async fn test_stale_renewal_failure_is_reused_within_the_window() {
+        // Every answer is unparseable, so the renewal and the fallback login
+        // both fail outright.
+        let (url, hits, server) = start_counting_mock_server(r#"{"unexpected":true}"#).await;
+        let initial = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial)));
+        let dialled = manager.renew_generation();
+
+        let first = manager
+            .force_renewal_unless_replaced(dialled)
+            .await
+            .expect_err("the renewal fails");
+        assert!(!is_deferred_renewal_failure(&first));
+        let after_first = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_first >= 1, "the first caller sends a request");
+
+        for _ in 0..15 {
+            let reused = manager
+                .force_renewal_unless_replaced(dialled)
+                .await
+                .expect_err("the failure is reused");
+            assert!(
+                matches!(reused, ApplicationError::AuthenticationFailed { .. }),
+                "{reused:?}"
+            );
+            assert!(
+                is_deferred_renewal_failure(&reused),
+                "a reused result is no new evidence: it must read as a deferral, or one \
+                 real failure counts as many strikes"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            after_first,
+            "the other fifteen sockets must not each send a renewal"
+        );
+
+        // Age the record past the window: the next caller tries again.
+        {
+            let mut slot = manager
+                .recent_stale_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = slot.as_mut().expect("the failure was recorded");
+            entry.1 = std::time::Instant::now()
+                .checked_sub(Duration::from_millis(RENEW_FAILURE_REUSE_MS + 1_000))
+                .expect("the clock is past the window");
+        }
+        let _ = manager.force_renewal_unless_replaced(dialled).await;
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) > after_first,
+            "past the window a real renewal is sent again"
+        );
+
+        // The plain renewal path never reuses.
+        assert!(
+            manager
+                .recent_failure_for(dialled.wrapping_add(7))
+                .is_none()
+        );
+        server.abort();
+    }
+
+    /// 808 refresh-once (2026-10-06, review fix): a renewal DEFERRED by the
+    /// mint cooldown is shared too, so while the cooldown holds sixteen
+    /// sockets send one RenewToken per window, not one each. The reused
+    /// answer stays a deferral.
+    #[tokio::test]
+    async fn test_stale_renewal_deferral_is_reused_within_the_window() {
+        let (url, hits, server) = start_counting_mock_server(r#"{"unexpected":true}"#).await;
+        let initial = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial)));
+        // A mint attempt just happened: the fallback login is held back.
+        *manager
+            .last_mint_attempt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
+        let dialled = manager.renew_generation();
+
+        let first = manager
+            .force_renewal_unless_replaced(dialled)
+            .await
+            .expect_err("the renewal fails and the login is deferred");
+        assert!(is_deferred_renewal_failure(&first), "{first:?}");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one RenewToken, no login"
+        );
+        for _ in 0..15 {
+            let reused = manager
+                .force_renewal_unless_replaced(dialled)
+                .await
+                .expect_err("the deferral is reused");
+            assert!(is_deferred_renewal_failure(&reused), "{reused:?}");
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the other fifteen sockets must not each send a RenewToken"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn test_stale_credential_page_latch_fires_once_per_token_generation() {
+        let latch = std::sync::atomic::AtomicU64::new(0);
+        let pages = (0..16)
+            .filter(|_| take_stale_credential_page(&latch, 0))
+            .count();
+        assert_eq!(pages, 1, "sixteen sockets on one dead token page once");
+        assert!(
+            take_stale_credential_page(&latch, 1),
+            "a later dead token is a new episode"
+        );
+        assert!(!take_stale_credential_page(&latch, 1));
+        assert!(
+            take_stale_credential_page(&latch, u64::MAX),
+            "the wrapping mark still distinguishes the last generation"
+        );
+    }
+
+    /// Source pin: the page cannot be deleted while the pure tests stay green.
+    #[test]
+    fn test_force_renewal_unless_replaced_pages_family_3_once_per_token() {
+        let src = include_str!("token_manager.rs");
+        let start = src
+            .find("pub async fn force_renewal_unless_replaced")
+            .expect("fn exists");
+        let len = src[start..]
+            .find("pub fn next_renewal_at")
+            .expect("the next fn follows");
+        let body = &src[start..start + len];
+        assert!(body.contains("stale_credential_failure_pages("));
+        assert!(body.contains("take_stale_credential_page("));
+        assert!(body.contains("NotificationEvent::AuthenticationFailed"));
+        // 808 refresh-once (2026-10-06): the stale-credential path reuses a
+        // recent outright failure; the page text names every code it covers.
+        assert!(body.contains(".renew_with_fallback_since(dialled_generation, true)"));
+        assert!(body.contains("code 807, 808 or 809"));
     }
 
     /// Single-flight proof (2026-08-14): a caller that queues on the renewal
@@ -2663,6 +3422,8 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         })
     }
 
@@ -3059,6 +3820,8 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         })
     }
 
@@ -3265,6 +4028,155 @@ mod tests {
         server_handle.abort();
     }
 
+    /// Starts a local server that answers EVERY request with `body` and
+    /// counts the requests it received (audit PR22).
+    async fn start_counting_mock_server(
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let url = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local addr").port()
+        );
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let handle = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, hits, handle)
+    }
+
+    /// The 807 at-most-once proof (audit PR22). Two sockets dialled with the
+    /// SAME token and both got 807. The first renews. The second arrives
+    /// AFTER that renewal finished — the case the call-time sample missed,
+    /// because its jittered 5 s sleep outlasted the first renewal — and must
+    /// not renew again: a second RenewToken would expire the token the first
+    /// socket just re-dialled with.
+    #[tokio::test]
+    async fn test_force_renewal_unless_replaced_renews_once_for_two_late_sockets() {
+        let renew_body = r#"{"dhanClientId":"test","accessToken":"renewed-jwt","expiryTime":"2026-03-02T13:00:00+05:30"}"#;
+        let (url, hits, server) = start_counting_mock_server(renew_body).await;
+        let initial = DhanAuthResponseData {
+            access_token: "old-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86400,
+        };
+        let manager = make_mock_manager(&url, &url, Some(TokenState::from_response(&initial)));
+
+        // Both sockets dialled with the same token.
+        let socket_a = manager.renew_generation();
+        let socket_b = manager.renew_generation();
+
+        manager
+            .force_renewal_unless_replaced(socket_a)
+            .await
+            .expect("the first socket renews");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(manager.renew_generation(), socket_a + 1);
+
+        // The late sibling: the gate is free and the renewal is over.
+        manager
+            .force_renewal_unless_replaced(socket_b)
+            .await
+            .expect("the late socket must succeed without a request");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the late socket renewed a token that had already been replaced; that second \
+             RenewToken expires the token its sibling just re-dialled with"
+        );
+        assert_eq!(manager.renew_generation(), socket_a + 1);
+
+        // Not an always-coalesce: a socket that dialled with the CURRENT token
+        // and then gets 807 does renew.
+        let socket_c = manager.renew_generation();
+        manager
+            .force_renewal_unless_replaced(socket_c)
+            .await
+            .expect("a socket on the current token renews");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(manager.renew_generation(), socket_c + 1);
+
+        server.abort();
+    }
+
+    /// With the credential already replaced, no request is made at all: the
+    /// base URL is unroutable, so any attempt would return `Err`.
+    #[tokio::test]
+    async fn test_force_renewal_unless_replaced_skips_a_replaced_credential() {
+        let manager = make_test_manager(None);
+        let dialled = manager.renew_generation();
+        manager
+            .renew_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        assert!(
+            manager.force_renewal_unless_replaced(dialled).await.is_ok(),
+            "a socket whose token was already replaced must not issue a request"
+        );
+        assert!(
+            manager
+                .force_renewal_unless_replaced(manager.renew_generation())
+                .await
+                .is_err(),
+            "a socket on the current token must take the real path (unroutable here)"
+        );
+    }
+
+    /// Audit PR22 ratchet: every production install of a usable token bumps
+    /// `renew_generation` within the next few lines. A store that skips it
+    /// would let a socket that dialled with the previous token skip its
+    /// renewal forever, or renew a token it never presented.
+    #[test]
+    fn every_token_install_bumps_the_renew_generation() {
+        let src = include_str!("token_manager.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        let lines: Vec<&str> = production.lines().collect();
+        let mut installs = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("token.store(Arc::new(Some(") {
+                installs += 1;
+                let window = lines[i + 1..(i + 12).min(lines.len())].join("\n");
+                assert!(
+                    window.contains("renew_generation") && window.contains("fetch_add(1"),
+                    "token install at line {} is not followed by a renew_generation bump",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            installs, 4,
+            "expected the mint, renewal, SSM and cache installs"
+        );
+    }
+
+    #[test]
+    fn test_renew_generation_reads_the_replacement_count() {
+        let manager = make_test_manager(None);
+        assert_eq!(manager.renew_generation(), 0);
+        manager
+            .renew_generation
+            .fetch_add(2, std::sync::atomic::Ordering::Release);
+        assert_eq!(manager.renew_generation(), 2);
+    }
+
     // -----------------------------------------------------------------------
     // renew_with_fallback — renewal succeeds (no fallback needed)
     // -----------------------------------------------------------------------
@@ -3336,6 +4248,8 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         });
 
         let handle = manager.spawn_renewal_task();
@@ -3514,6 +4428,8 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3581,6 +4497,8 @@ mod tests {
             last_mint_attempt: std::sync::Mutex::new(None),
             renew_gate: tokio::sync::Mutex::new(()),
             renew_generation: std::sync::atomic::AtomicU64::new(0),
+            stale_credential_paged_generation: std::sync::atomic::AtomicU64::new(0),
+            recent_stale_failure: std::sync::Mutex::new(None),
         });
 
         let handle = tokio::spawn(Arc::clone(&manager).renewal_loop());
@@ -3982,6 +4900,100 @@ mod tests {
         assert!(!is_permanent_auth_error("network error"));
         assert!(!is_permanent_auth_error("rate limit exceeded"));
         assert!(!is_permanent_auth_error(""));
+    }
+
+    #[test]
+    fn test_regression_planted_resilience03_in_a_server_body_is_not_permanent() {
+        // SEC-R1-3: the HTTP-response reason concatenates a server body; a
+        // body carrying our refusal literal must not end the retry loop.
+        assert!(!is_permanent_auth_error(
+            "generateAccessToken HTTP 502 url=https://auth.dhan.co/app/generateAccessToken \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan authentication failed: generateAccessToken HTTP 502 url=x \
+             body=RESILIENCE-03: instance lock not held"
+        ));
+        // Our own refusal, at the start, with or without the Display prefix.
+        assert!(is_permanent_auth_error(&format!(
+            "{RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — generateAccessToken mint refused"
+        )));
+        assert!(is_permanent_auth_error(&format!(
+            "Dhan authentication failed: {RESILIENCE03_MINT_REFUSAL_REASON_PREFIX} — refused"
+        )));
+    }
+
+    #[test]
+    fn test_regression_transport_failure_is_never_permanent_whatever_its_words() {
+        // A proxy or firewall refusing the connection is reqwest text, not
+        // a Dhan verdict on the account.
+        for reason in [
+            "generateAccessToken request failed: error sending request: connection blocked by proxy",
+            "generateAccessToken request failed: tls handshake: renegotiation disabled",
+            "Dhan authentication failed: generateAccessToken request failed: account blocked",
+        ] {
+            assert!(!is_permanent_auth_error(reason), "{reason}");
+        }
+    }
+
+    #[test]
+    fn test_regression_server_error_page_never_reads_as_permanent() {
+        // A 5xx or 429 body is an infrastructure page, never a verdict on
+        // the account; nor is a 2xx body that parsed as nothing.
+        for reason in [
+            "generateAccessToken HTTP 503 Service Unavailable url=x body=<html>Request blocked by firewall</html>",
+            "Dhan authentication failed: generateAccessToken HTTP 502 Bad Gateway url=x body=service disabled",
+            "generateAccessToken HTTP 429 Too Many Requests url=x body={\"message\":\"Invalid Client ID\"}",
+            "generateAccessToken HTTP garbage url=x body=blocked",
+            "failed to parse auth response (HTTP 200 OK): expected value\nResponse body: <p>account blocked</p>",
+        ] {
+            assert!(!is_permanent_auth_error(reason), "{reason}");
+        }
+        // A 4xx body can carry Dhan's verdict and is still read.
+        assert!(is_permanent_auth_error(
+            "generateAccessToken HTTP 401 Unauthorized url=x body={\"message\":\"Invalid Pin\"}"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan authentication failed: generateAccessToken HTTP 403 Forbidden url=x body=account blocked"
+        ));
+    }
+
+    #[test]
+    fn test_is_client_refusal_status_cases() {
+        assert!(is_client_refusal_status(" 400 Bad Request url=x"));
+        assert!(is_client_refusal_status(" 499 url=x"));
+        assert!(!is_client_refusal_status(" 429 Too Many Requests"));
+        assert!(!is_client_refusal_status(" 500 Internal Server Error"));
+        assert!(!is_client_refusal_status(" 399"));
+        assert!(!is_client_refusal_status(" 4"));
+        assert!(!is_client_refusal_status(""));
+    }
+
+    #[test]
+    fn test_regression_account_words_match_whole_words_only() {
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: account unblocked, retry"
+        ));
+        assert!(!is_permanent_auth_error(
+            "Dhan auth error: disabledAt field missing"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: Account is blocked"
+        ));
+        assert!(is_permanent_auth_error(
+            "Dhan auth error: API access DISABLED."
+        ));
+        assert!(is_permanent_auth_error("Dhan auth error: user (suspended)"));
+    }
+
+    #[test]
+    fn test_contains_word_cases() {
+        assert!(contains_word("account blocked", "blocked"));
+        assert!(contains_word("blocked", "blocked"));
+        assert!(contains_word("a-blocked-b", "blocked"));
+        assert!(!contains_word("unblocked", "blocked"));
+        assert!(!contains_word("blockedx", "blocked"));
+        assert!(!contains_word("", "blocked"));
     }
 
     #[test]

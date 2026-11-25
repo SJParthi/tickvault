@@ -266,22 +266,23 @@ resource "aws_lambda_permission" "questdb_console_apigw" {
 }
 
 # Per-Lambda error alarm (mirrors the operator-control alarm pattern).
-resource "aws_cloudwatch_metric_alarm" "questdb_console_front_errors" {
-  count               = var.enable_questdb_console ? 1 : 0
-  alarm_name          = "tv-${var.environment}-questdb-console-front-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "questdb-console front Lambda erroring — the console may be failing"
-  dimensions          = { FunctionName = aws_lambda_function.questdb_console_front[0].function_name }
-  treat_missing_data  = "notBreaching"
-}
+# alarm "questdb_console_front_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 output "questdb_console_url" {
   value       = var.enable_questdb_console ? aws_apigatewayv2_stage.questdb_console[0].invoke_url : null
   description = "THE QuestDB console URL (API Gateway → front Lambda). Device-key gated inside the handler; opened one-click from the operator portal's 🗄 button."
 }
+
+# Per-Lambda error alarm for the PROXY half (2026-08-25, operator
+# "Fix wbrytjonf dude oaku" — the §2.3f dated authorization).
+#
+# The FRONT half has had this alarm since the console shipped; the proxy never
+# did, so half the surface was watched and half was not. Shape mirrors the
+# front alarm above deliberately, INCLUDING its lack of alarm_actions: both
+# console alarms are dashboard-only. That is a real residual and it is stated
+# rather than quietly changed here — the console is an operator convenience
+# surface, not the trading path, and giving one half a pager while the other
+# stays silent would be a worse inconsistency than the one being fixed.
+# alarm "questdb_console_proxy_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.

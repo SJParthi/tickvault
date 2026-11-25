@@ -26,6 +26,7 @@
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
 const LIVE_UNIVERSE_RS: &str = include_str!("../src/dhan_live_universe.rs");
+use tickvault_app::dhan_live_universe::MAPPING_WAIT_DEADLINE_SECS;
 
 /// Strip `//` line comments so a prose mention of a symbol cannot satisfy a
 /// scan that is meant to find real code.
@@ -92,9 +93,27 @@ fn the_wait_is_bounded_and_fail_soft() {
     );
 
     let code = code_only(src);
+    // 2026-09-07: this asserted `started.elapsed() < deadline`. That bound is
+    // the defect, not the protection — it measured from BOOT while the only
+    // producer writes at its own build hour, so a 07:34 boot gave up at 07:44
+    // against an artifact that appeared at 08:0x. Four boots collapsed that
+    // morning. The loop is still bounded, and more tightly: `end_ist` is capped
+    // at the 09:10 cutoff AND at MAPPING_WAIT_MAX_STALL_SECS, so the same
+    // hang-behind-a-vendor-outage argument holds with the clock the producer
+    // actually runs on.
     assert!(
-        code.contains("started.elapsed() < deadline"),
-        "the poll loop must be deadline-bounded"
+        code.contains("< end_ist"),
+        "the poll loop must be bounded by the wall-clock end instant"
+    );
+    assert!(
+        code.contains("fn mapping_wait_end_ist_secs"),
+        "the end instant must come from a pure, testable rule — the old bound was an inline \
+         duration nobody could exercise without a real boot"
+    );
+    assert!(
+        code.contains("MAPPING_WAIT_MAX_STALL_SECS"),
+        "the rider extension must carry a stall ceiling — without one an overnight boot waits \
+         until morning, which is a worse failure than the one being fixed"
     );
 
     // Fail-soft: the function returns rather than panicking or looping forever.
@@ -119,6 +138,14 @@ fn every_wait_outcome_is_counted() {
         "already_present",
         "became_ready",
         "timed_out",
+        "pre_open_cutoff",
+        // 2026-09-07: a boot whose nearest producer is hours away. Without its
+        // own label it was indistinguishable from a rider that ran and failed,
+        // and the three overnight boots that day looked like three failures.
+        "producer_too_far",
+        // 2026-10-10: a non-trading day has no session to subscribe for, so
+        // the boot does not wait for the rider at all.
+        "non_trading_day",
     ] {
         assert!(
             src.contains(outcome),
@@ -134,11 +161,235 @@ fn a_disabled_rider_does_not_burn_the_whole_deadline() {
         .find("if !cfg.enabled")
         .expect("the wait must short-circuit when the rider that writes the artifact is off");
     let loop_at = code
-        .find("while started.elapsed()")
-        .expect("the poll loop must exist");
+        .find("while tickvault_common::market_hours::now_ist_secs_of_day() < end_ist")
+        .expect(
+            "the poll loop must exist and must be bounded by the WALL CLOCK. It was bounded by \
+             elapsed time until 2026-09-07, when a 07:34 boot gave up at 07:44 against a rider \
+             that writes at 08:00 — two clocks that could disagree, and did.",
+        );
     assert!(
         disabled_at < loop_at,
         "the `[dhan_universe] enabled = false` check must come BEFORE the poll loop. With no \
          writer, waiting the full deadline reaches the same fallback having wasted the time."
+    );
+}
+
+const DHAN_UNIVERSE_RS: &str = include_str!("../src/dhan_universe.rs");
+
+/// The lane blocks at boot on `write_mapping_atomic`. Anything slow placed
+/// ahead of it spends the lane's budget on work nothing is waiting for.
+///
+/// # The regression this pins (2026-08-21)
+///
+/// `write_dhan_lifecycle` — a ~150,000-row QuestDB round trip — landed in
+/// #1773 on 2026-08-20 and was inserted BEFORE the artifact write. The lane's
+/// 120 s budget had been derived on 2026-08-18 from a 9-second build that did
+/// not contain it. The two numbers were never reconciled, and the cost of
+/// losing that race is the whole session: the lane reads the artifact once at
+/// boot, so a timeout pins it to 4 index SIDs until a restart.
+///
+/// The file states the rule itself, for `persist_constituents`: "Disk first,
+/// then the table. The artifact is the cheaper, more reliable record."
+///
+/// **2026-10-28 (owner Quote 44):** `write_dhan_lifecycle` is deleted with the
+/// daily lifecycle write, so it is no longer a row here; this guard now
+/// asserts it is GONE. The new slow step, the cold-bucket copy of the day's
+/// artifact files (`spawn_snapshot_upload`), must also sit after the artifact
+/// write, and it must run on its own task from the rider, never inside
+/// `build_once` (the build the lane's budget is measured against).
+#[test]
+fn no_questdb_write_runs_before_the_mapping_artifact() {
+    let code = code_only(DHAN_UNIVERSE_RS);
+
+    let artifact_at = code
+        .find("write_mapping_atomic(date")
+        .expect("`build_once` no longer writes the mapping artifact");
+
+    assert!(
+        !code.contains("write_dhan_lifecycle"),
+        "the daily lifecycle write was stopped by owner Quote 44 and must not come back"
+    );
+
+    // The S3 copy is started by the rider after `build_once` returned, never
+    // from inside the build.
+    let build_at = code
+        .find("async fn build_once(")
+        .expect("`build_once` must exist");
+    let build_end = build_at
+        + code[build_at..]
+            .find("\n}\n")
+            .expect("`build_once` body must close");
+    assert!(
+        !code[build_at..build_end].contains("spawn_snapshot_upload("),
+        "the snapshot copy must not run inside `build_once`"
+    );
+    let spawn_at = code
+        .find("pub fn spawn_dhan_universe_rider(")
+        .expect("the rider spawn must exist");
+    let rider_at = code
+        .find("async fn run_dhan_universe_rider(")
+        .expect("the rider loop must exist");
+    assert!(
+        code[rider_at..].contains("instrument_snapshot_upload::spawn_snapshot_upload("),
+        "the rider must start the snapshot copy after a successful build"
+    );
+    assert!(
+        spawn_at < rider_at
+            && code[spawn_at..rider_at]
+                .contains("instrument_snapshot_upload::register_snapshot_metrics()"),
+        "the snapshot counters must be seeded when the rider starts"
+    );
+
+    for slow in ["persist_constituents(questdb", "spawn_snapshot_upload("] {
+        let at = code
+            .find(slow)
+            .unwrap_or_else(|| panic!("`{slow}` call site not found in dhan_universe.rs"));
+        assert!(
+            artifact_at < at,
+            "`{slow}` runs BEFORE `write_mapping_atomic`. It is a QuestDB round trip, and the \
+             live lane blocks at boot waiting for that artifact \
+             (`dhan_live_universe::await_mapping_artifact`). Putting a network write in front \
+             of it spends the lane's whole budget on work nothing waits for — and when the \
+             budget runs out the session collapses to 4 index SIDs for the day. Move it below \
+             the artifact write, as `persist_constituents` already is."
+        );
+    }
+}
+
+/// A duration alone cannot bound this wait safely: a late boot would still be
+/// waiting when the market opens, and dialing nothing at 09:15 is worse than
+/// dialing a partial set.
+#[test]
+fn the_wait_is_bounded_by_the_clock_as_well_as_the_duration() {
+    let src = LIVE_UNIVERSE_RS;
+    let code = code_only(src);
+
+    assert!(
+        src.contains("MAPPING_WAIT_NEVER_PAST_IST_SECS"),
+        "the boot wait must carry a wall-clock cutoff as well as a duration. With only a \
+         duration, a box that boots at 09:05 is still waiting when the bell rings."
+    );
+    assert!(
+        code.contains("MAPPING_WAIT_NEVER_PAST_IST_SECS"),
+        "the cutoff constant is declared but never USED in code — a bound that is not \
+         consulted is not a bound"
+    );
+    assert!(
+        code.contains(r#""outcome" => "pre_open_cutoff""#),
+        "the cutoff must be counted; an unlabelled exit is an unobservable one"
+    );
+
+    // The cutoff has to sit before the 09:15 open with room to dial.
+    assert!(
+        code.contains("9 * 3_600 + 10 * 60"),
+        "the pre-open cutoff must remain 09:10 IST — five minutes before the 09:15 open, \
+         which is the room the lane needs to resolve the universe, plan the pool and dial \
+         its sockets. Moving it later eats that room; moving it earlier throws away wait \
+         budget that costs nothing on a normal morning."
+    );
+}
+
+/// The lane's budget must not silently drift back below the build it waits on.
+#[test]
+fn the_wait_budget_is_not_the_stale_nine_second_figure() {
+    let code = code_only(LIVE_UNIVERSE_RS);
+    assert!(
+        code.contains("MAPPING_WAIT_DEADLINE_SECS: u64 = 600"),
+        "the boot wait budget changed. It is sized against the SLOW path — up to 49 \
+         sequential index-constituent CSV fetches — not the 9-second build measured on \
+         2026-08-18 before those existed. `dhan_universe::BUILD_DEADLINE_SECS` budgets 900 s \
+         for the same work; a lane budget far below it means the lane gives up while the \
+         build it is waiting for is still healthy and running. If you lower this, re-measure \
+         the build first and say so here."
+    );
+}
+
+/// The deploy's readiness gate must accommodate the wait budget above.
+///
+/// Added 2026-08-27, after deploy run 33029989145 reported FAILURE on a
+/// perfectly healthy binary. `deploy-aws.yml` polls `systemctl is-active`
+/// for 300 s and then declares "app likely never sent READY=1"; the app's
+/// documented worst-case boot wait — `MAPPING_WAIT_DEADLINE_SECS`, right
+/// above — is **600 s**. 600 > 300, so the gate can condemn a boot the app
+/// itself considers healthy and still inside its own budget.
+///
+/// It normally does not bite, and that is exactly why it went unnoticed: on
+/// a routine morning the rider writes the artifact in about **2.4 seconds**
+/// (measured 2026-08-26 — armed 08:31:01.46, ready 08:31:03.89, READY=1 at
+/// 08:31:03.89). The full budget is only spent when the rider genuinely
+/// cannot build — deploying at 07:00 IST, before the vendor publishes the
+/// day's master, is one real case, and it is the one that produced a 🆘 page,
+/// a skipped provenance write, and an auto-stopped service on a deploy whose
+/// binary had already swapped in and booted.
+///
+/// This pins the RELATIONSHIP rather than either number, so moving the app's
+/// budget moves the requirement with it.
+#[test]
+fn the_deploy_readiness_gate_outlasts_the_boot_wait_budget() {
+    let workflow = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/deploy-aws.yml"),
+    )
+    .expect("read .github/workflows/deploy-aws.yml");
+
+    // The gate is `for i in $(seq 1 N); do ... sleep S; done` on one line.
+    let gate = workflow
+        .lines()
+        .find(|l| l.contains("READY_OK=no") && l.contains("seq 1 "))
+        .expect(
+            "deploy-aws.yml no longer has the READY_OK readiness poll. If it was renamed, \
+             re-point this guard; if it was removed, the app's boot budget is unguarded.",
+        );
+
+    let polls: u64 = gate
+        .split("seq 1 ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("could not read the poll COUNT out of the READY_OK loop");
+    let sleep_secs: u64 = gate
+        .rsplit("sleep ")
+        .next()
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|n| n.trim().parse().ok())
+        .expect("could not read the SLEEP interval out of the READY_OK loop");
+
+    let gate_secs = polls * sleep_secs;
+    assert!(
+        gate_secs > MAPPING_WAIT_DEADLINE_SECS,
+        "the deploy readiness gate is {gate_secs}s but the app's documented worst-case boot \
+         wait is {MAPPING_WAIT_DEADLINE_SECS}s. A deploy would report FAILED — 🆘 page, \
+         skipped provenance write, auto-stopped service — on a binary that swapped in \
+         cleanly and is still inside its own budget. Raise the poll count in \
+         deploy-aws.yml, or lower MAPPING_WAIT_DEADLINE_SECS; do not delete this test."
+    );
+}
+
+/// Quote 44 review: the snapshot copy must go to the SAME cold bucket as the
+/// raw frames. main.rs hands the rider `[partition_retention] archive_bucket`
+/// (the value the raw-frame uploader loads), and the rider passes it on to
+/// the copy instead of a hardcoded "derive from the environment".
+#[test]
+fn the_snapshot_copy_uses_the_configured_cold_bucket() {
+    let main = code_only(MAIN_RS);
+    let call_at = main
+        .find("spawn_dhan_universe_rider(")
+        .expect("main.rs must spawn the universe rider");
+    let call_end = call_at
+        + main[call_at..]
+            .find(");")
+            .expect("the rider spawn call must close");
+    assert!(
+        main[call_at..call_end].contains("config.partition_retention.archive_bucket.clone()"),
+        "the rider must be handed the configured cold bucket"
+    );
+    assert!(
+        main.contains("let raw_upload_bucket = config.partition_retention.archive_bucket.clone();"),
+        "the raw-frame uploader must read the same setting"
+    );
+    let rider = code_only(DHAN_UNIVERSE_RS);
+    assert!(
+        rider.contains("spawn_snapshot_upload(\n                        snapshot_bucket.clone(),"),
+        "the rider must pass its configured bucket to the snapshot copy"
     );
 }

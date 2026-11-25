@@ -186,34 +186,35 @@ Cluster A (this session's PR; Files/Tests per the judge-approved final design):
 
 - [x] A1 — order_runtime.rs actor: supervised single-owner task, select! arms (order-update / marks / reconcile / 16:00 reset / 15:30 sweep / self-test), NotifierAlertSink — merged via PR #1562 (checkbox ticked 2026-07-17, post-merge follow-up)
   - Files: crates/app/src/order_runtime.rs, crates/app/src/oms_wiring.rs
-  - Tests: test_traded_update_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
+  - Tests: test_apply_fill_reaches_risk_engine_net_lots_nonzero, test_alert_sink_event_mapping, test_halt_fires_risk_halt_once_per_episode, prop_fill_mirror_matches_risk_net_lots
 - [x] A2 — FillEvent widening of handle_order_update (+ 4-line trading_pipeline graft) — merged via PR #1562
   - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/types.rs, crates/trading/src/oms/mod.rs, crates/app/src/trading_pipeline.rs
-  - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_segment_char_parse_matrix
+  - Tests: test_same_status_refresh_applies_delta_not_cumulative, test_duplicate_update_zero_delta_skipped, test_partial_lot_remainder_floors_and_errors, test_fill_sign_from_managed_order_transaction_type, test_parse_segment_chars_matrix
 - [x] A3 — ticks→update_market_price gate (marks_wanted AtomicBool + MarkUpdate try_send tap) — merged via PR #1562. *Seam re-home note (2026-07-17): the planned `groww_bridge.rs` consume seam died with the Groww live feed (#1581, 2026-07-15); the tap shipped at the Groww per-minute REST legs' persist-confirm choke points (`groww_spot_1m_boot.rs` + `groww_contract_1m_boot.rs`), ≤4 spot + ~30 contract marks/min*
-  - Files: crates/app/src/groww_spot_1m_boot.rs, crates/app/src/groww_contract_1m_boot.rs, crates/app/src/main.rs (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
-  - Tests: test_marks_wanted_false_skips_send, test_mark_channel_full_drops_counted_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
+  - Files: crates/app/src/main.rs (the Groww spot-1m and contract-1m boot modules this item also touched were deleted with the Groww feed on 2026-08-21) (originally planned: crates/app/src/groww_bridge.rs — deleted 2026-07-15)
+  - Tests: test_mark_forward_skips_send_when_marks_wanted_false, test_mark_forward_channel_full_counts_drops_and_never_blocks, dhat_mark_forward (0 alloc / 10K), Criterion order_gate/mark_forward ≤ 50ns
 - [x] A4 — WAL drain + conditional confirm in dhan_rest_stack Phase 5a — **CUT 2026-07-14, not implemented** (resolved-by-supersession; ticked 2026-07-17 so the cut is recorded, never silently skipped): the operator Dhan noise lock (`dhan-rest-only-noise-lock-2026-07-14.md` §3 + scope-lock §A.1) removed the order-update WAL drain/confirm AND the `run_order_update_connection(.., wal_spill: Some(..))` socket spawn from the shipped scope. The retained live re-arm spec lives in `order-runtime-dryrun.md` §2 — re-arming needs a fresh dated operator quote in the noise-lock file FIRST
   - Files: (none shipped — see the §2 re-arm spec)
-  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_spawns_no_order_update_ws_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
+  - Tests: test_rest_stack_wires_order_runtime + test_rest_stack_order_update_push_gated_and_no_canary pin the shipped socket-free/WAL-free shape; ratchet_order_runtime_spawned_only_from_rest_stack shipped
 - [x] A5 — reconcile scheduler with honest dry-run heartbeat + local Σfills==net_lots invariant — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
-  - Tests: test_dry_run_reconcile_classified_heartbeat_not_ok, test_local_reconcile_divergence_errors
+  - Tests: test_dry_run_reconcile_returns_empty_report, test_local_reconcile_invariant_holds_and_diverges (2026-10-01: names updated to the current tests. The original `classified_heartbeat_not_ok` test no longer exists, and no current test asserts that a dry-run reconcile heartbeat is classified "not ok"; recorded, not fixed)
 - [x] A6 — paper filler + once-daily gated self-test + orphan-fill loudness — merged via PR #1562
   - Files: crates/app/src/order_runtime.rs
-  - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_refused_on_holiday_and_off_hours, test_orphan_fill_update_warns_and_counts, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
+  - Tests: test_paper_fill_deferred_until_finite_positive_mark, test_terminal_order_never_refilled, test_selftest_single_cycle_latched, test_selftest_window_gate_boundaries, test_orphan_fill_update_tolerated_book_unchanged, test_source_n_filtered_empty_tolerated, order_runtime_e2e (crates/app/tests/)
 - [x] A7 — risk P&L lot_size fix + evaluate_daily_loss_halt + trigger_halt code field + sid-segment tripwire — merged via PR #1562
   - Files: crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
-  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_sid_segment_collision_skips_and_errors, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
+  - Tests: test_unrealized_pnl_multiplies_lot_size, test_evaluate_daily_loss_halt_boundary, test_tripwire_divergence_error_latched_per_sid, test_apply_fill_refuses_unknown_segment, test_daily_reset_clears_book_mirror_tripwire_flag_atomically
 - [x] A8 — config section + rule files (order-runtime-dryrun.md; dated notes in ws-reinject-error-codes.md + websocket-connection-scope-lock.md) — merged via PR #1562
-  - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, .claude/rules/project/ws-reinject-error-codes.md
+  - Files: crates/common/src/config.rs, config/base.toml, .claude/rules/project/order-runtime-dryrun.md, docs/error-runbooks/ws-reinject-error-codes.md
   - Tests: config validation unit tests (interval ≥ 60, capacity bounds), serde-default-off test
 
 Other clusters (checked off by their owning sessions' PRs, all referencing THIS plan):
 
-- [ ] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
-  - Files: crates/storage/src/ (new *_audit_persistence.rs modules)
+- [x] C1 — order_audit-family QuestDB persistence revival (feed-in-key DEDUP)
+  - Files: crates/storage/src/order_audit_persistence.rs, crates/storage/src/pnl_audit_persistence.rs, crates/app/src/order_observability.rs
   - Tests: TBD by owning session (8-element template ratchets)
+  - Ticked 2026-10-01 (Item 48 of active-plan-feed-hardening.md): the box was never ticked, but `OrderAuditWriter` and `ensure_order_audit_table` are live — `order_observability.rs` writes the rebuilt SEBI `order_audit` + `pnl_audit` rows.
 - [x] CT1 — Conditional & Multi Order surface (dhanhq v2 /alerts family): typed constructors +
       `POST /alerts/multi/orders` wrapper, dormant behind the hardcoded alerts gate,
       Equities/Indices fail-closed segment lock
@@ -296,9 +297,10 @@ Other clusters (checked off by their owning sessions' PRs, all referencing THIS 
     multi-order/gate tests, 23 conditional.rs constructor tests (incl. the proptest),
     14 types.rs wire-shape tests, 3 dhan_api_coverage.rs orphan/extractor tests —
     58 total.
-- [ ] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
+- [x] D1 — orphan-watchdog re-homing + expired date-gate re-arm (PR #1545)
   - Files: crates/app/src/main.rs, crates/trading/src/oms/engine.rs, crates/common/src/constants.rs
-  - Tests: TBD by cluster D session (watchdog wiring source-scan guard)
+  - Tests: crates/app/tests/orphan_position_watchdog_wiring_guard.rs
+  - Ticked 2026-10-01 (Item 48 of active-plan-feed-hardening.md): the daily 15:25 IST orphan-position watchdog is spawned process-wide in `main.rs` (the 2026-07-14 re-home); the box was never ticked.
 - [x] E1 — exit-order layer (Super Order/OCO wiring, MPP verify, slicing) — serial after A
   - Files: crates/trading/src/oms/ (engine.rs, api_client.rs call sites), crates/app/src/order_runtime.rs
   - Tests: TBD by owning session
@@ -504,5 +506,46 @@ letter registrar — please confirm.
   - Files: crates/trading/src/oms/order_readiness.rs, engine.rs, types.rs
   - Tests: test_place_order_live_refused_when_no_readiness_installed_zero_http_zero_token_fetch, test_place_order_dry_run_ignores_readiness_gate_byte_identical, test_evaluate_order_readiness_stale_boundary_2100_passes_2101_refuses
 - [x] F3 — ORDER-READY-01 ErrorCode + rule file + OmsAlert 🔷 DHAN attribution
-  - Files: crates/common/src/error_code.rs, .claude/rules/project/order-readiness-error-codes.md, engine.rs
+  - Files: crates/common/src/error_code.rs, docs/error-runbooks/order-readiness-error-codes.md, engine.rs
   - Tests: test_order_ready_01_contract, test_all_oms_alert_operator_messages_start_with_dhan_badge
+
+## Cluster G — order decision path under 1 µs in memory (branch claude/order-path-sub-us, 2026-10-30)
+
+Owner (Parthiban), 30 Oct 2026, relayed by the coordinator: every in-memory
+step of the order path under 1 µs at p99, proven by benches that fail the
+build if it slips, with identical behaviour. Network calls, `dry_run`, the
+indicator and strategy trees, and the REST surface are out of scope. Matrices:
+by cross-reference, as for the clusters above.
+
+- [x] Criterion bench `crates/app/benches/order_path.rs` (production Prometheus recorder installed) + budget key `order_path = 1000` and elements row in `quality/benchmark-budgets.toml`
+  - Files: crates/app/benches/order_path.rs, crates/app/Cargo.toml, quality/benchmark-budgets.toml, CLAUDE.md (key count)
+  - Tests: benchmark_budget_reaches_a_bench_guard, claude_md_states_the_real_budget_key_count
+- [x] Per-call p50/p99 harness (ignored, wall clock): crates/app/tests/order_path_p99_harness.rs
+  - Tests: order_path_per_call_latency_distribution
+- [x] Correlation ids drawn ahead of use (pool of 256, cold refill at construction and the daily reset; on-demand fallback) and one-allocation encoder
+  - Files: crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/engine.rs
+  - Tests: proptest_encoder_matches_the_legacy_two_allocation_form, test_next_id_is_a_v4_prefix_of_the_dhan_length_and_never_repeats, test_clear_refills_the_pool_for_the_next_day
+- [x] Metric handles cached at first use (rate limiter allowed counter, breaker state gauge, paper placed counter, placement histogram); literal labels where a label variable allocated (order budget refusal, rejected mark, fills recorded); `track_ref` removes one String copy per paper placement
+  - Files: crates/trading/src/oms/rate_limiter.rs, crates/trading/src/oms/circuit_breaker.rs, crates/trading/src/oms/engine.rs, crates/trading/src/risk/engine.rs, crates/app/src/order_runtime.rs
+  - Tests: order_path_metrics_keep_their_names_labels_and_counts
+
+- [x] Owner decisions, Fri 30 Oct 2026 ~16:50 IST, relayed by the coordinator session (card answered there):
+  (1) Q: "Fix it the way we already fixed the tick-delay measurement: fixed counters set up at startup, same metric name, nothing new to read?" A: "Yes, fixed counters (Recommended)" — "Same name on the dashboard and alerts; the internal bucket layout changes slightly. Removes about 400 ns from the slowest orders."
+  (2) Q: the per-placement "PAPER TRADE" INFO line (~2.5 µs). A: "Write it after the order (Recommended)" — "Same log line, same content, but written by a background helper right after the order is placed, so it no longer slows the order step. Nothing is lost."
+  - Files: crates/trading/src/oms/placement_telemetry.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/mod.rs, crates/app/src/order_runtime.rs (once-a-second publish)
+  - Tests: fixed_placement_buckets_render_what_the_recorder_histogram_rendered, test_helper_line_is_identical_to_the_old_inline_line, dhat_order_path_with_the_production_recorder, test_apply_fill_counts_paper_and_live_under_their_literal_labels, test_track_ref_matches_track_outcomes_and_keeps_the_callers_id
+
+- [x] Per-call p99 gate in the bench (house `tail_gate`): exits 1 when any order-path step's p99 is over 1,000 ns; book tables prefaulted at construction; `ahash` on the order book, alias map and correlation index; paper id written without `format!`; old-vs-new decisions proptest
+  - Files: crates/app/benches/order_path.rs, crates/trading/src/oms/engine.rs, crates/trading/src/oms/idempotency.rs, crates/trading/src/oms/reconciliation.rs
+  - Tests: proptest_pooled_ids_decide_exactly_like_on_demand_ids, proptest_paper_order_id_matches_format, test_paper_order_id_matches_format_at_the_extremes
+
+Design: no output changes beyond the two the owner chose above; ids, metric names, labels and counts are the same.
+Edge cases: pool empty (falls back to `generate_id`), recorder installed after
+first use (handle stays bound to the earlier one; production installs at boot),
+log queue full or helper thread not started (the line is written inline and
+counted on `tv_oms_paper_trade_log_inline_total{reason}`), abrupt process stop
+(at most one 20 ms poll of PAPER TRADE lines unwritten; the orders themselves
+are in the book and the audit).
+Failure modes: none new; a refused order is refused exactly as before.
+Rollback: revert the PR; no data or config change.
+Observability: unchanged series (pinned by the parity test).

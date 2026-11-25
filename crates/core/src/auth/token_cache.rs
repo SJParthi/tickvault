@@ -103,14 +103,7 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
 
     // Write to temp file first (atomic write pattern)
     let write_result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-
-        // Set restrictive permissions BEFORE writing the token
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        let mut file = create_owner_only(std::path::Path::new(&tmp_path))?;
 
         file.write_all(json.as_bytes())?;
         file.sync_all()?;
@@ -131,6 +124,24 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
     }
 
     debug!("token cache saved for fast restart");
+}
+
+/// Replaces a stale temp entry without writing through its symlink or hard link.
+/// On Unix the new inode is owner-only from creation, before any token is written.
+/// `create_new` also refuses a final entry inserted after removal. Production
+/// callers hold the token-manager write lock; this is not a cross-process lock
+/// or protection against changes to ancestor directories.
+fn create_owner_only(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// Loads a cached token from disk, validating expiry and client_id.
@@ -583,5 +594,154 @@ mod tests {
         );
 
         delete_cache_file();
+    }
+}
+
+#[cfg(test)]
+mod owner_only_tests {
+    use super::create_owner_only;
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Read;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "tv-token-owner-only-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn temp(&self) -> PathBuf {
+            self.0.join("token.tmp")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_create_owner_only_writes_a_new_file() {
+        let fixture = Fixture::new();
+        let path = fixture.temp();
+        let mut file = create_owner_only(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        file.write_all(b"synthetic-token").unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_is_private_before_the_first_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let path = fixture.temp();
+        let file = create_owner_only(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_replaces_stale_file_without_reusing_its_open_inode() {
+        let fixture = Fixture::new();
+        let path = fixture.temp();
+        fs::write(&path, b"old-public-content").unwrap();
+        let mut old_reader = fs::File::open(&path).unwrap();
+        let mut file = create_owner_only(&path).unwrap();
+        file.write_all(b"synthetic-private-token").unwrap();
+        drop(file);
+        let mut old_content = Vec::new();
+        old_reader.read_to_end(&mut old_content).unwrap();
+        assert_eq!(old_content, b"old-public-content");
+        assert_eq!(fs::read(&path).unwrap(), b"synthetic-private-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_replaces_a_symlink_without_touching_its_target() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("unrelated");
+        fs::write(&target, b"sentinel").unwrap();
+        std::os::unix::fs::symlink(&target, fixture.temp()).unwrap();
+        create_owner_only(&fixture.temp())
+            .unwrap()
+            .write_all(b"synthetic-token")
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"sentinel");
+        assert!(
+            !fs::symlink_metadata(fixture.temp())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(fixture.temp()).unwrap(), b"synthetic-token");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_replaces_a_dangling_symlink_without_creating_its_target() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("absent");
+        std::os::unix::fs::symlink(&target, fixture.temp()).unwrap();
+        create_owner_only(&fixture.temp()).unwrap();
+        assert!(!target.exists());
+        assert!(
+            fs::symlink_metadata(fixture.temp())
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_owner_only_replaces_a_hard_link_without_touching_its_target() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("unrelated");
+        fs::write(&target, b"sentinel").unwrap();
+        fs::hard_link(&target, fixture.temp()).unwrap();
+        create_owner_only(&fixture.temp())
+            .unwrap()
+            .write_all(b"synthetic-token")
+            .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"sentinel");
+        assert_eq!(fs::read(fixture.temp()).unwrap(), b"synthetic-token");
+    }
+
+    #[test]
+    fn test_create_owner_only_refuses_a_directory_without_deleting_its_contents() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.temp()).unwrap();
+        let sentinel = fixture.temp().join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        assert!(create_owner_only(&fixture.temp()).is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn test_create_owner_only_refuses_a_missing_parent() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("absent").join("token.tmp");
+        assert_eq!(
+            create_owner_only(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!path.parent().unwrap().exists());
     }
 }

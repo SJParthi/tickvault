@@ -24,13 +24,16 @@ use metrics::counter;
 use tickvault_common::broker_order_events::next_event_seq;
 use tickvault_common::config::{OrderLegPnlConfig, QuestDbConfig};
 use tickvault_common::error_code::ErrorCode;
+use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
 use tickvault_storage::order_leg_pnl_persistence::{
     OrderLegPnlRecord, OrderLegPnlWriter, ensure_order_leg_pnl_table,
 };
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::groww_cadence_executor::SharedLegIdentityIndex;
+use tickvault_common::feed::Feed;
+
+use crate::leg_identity::SharedLegIdentityIndex;
 use crate::order_runtime::{LegPnlEvent, LegPnlKind};
 
 /// Seconds between supervised consumer respawns after an abnormal exit.
@@ -125,7 +128,7 @@ fn record_from_event(
     };
     OrderLegPnlRecord {
         ts_ist_nanos: event.ts_utc_ns.saturating_add(IST_OFFSET_NANOS),
-        feed: "groww",
+        feed: Feed::Dhan.as_str(),
         security_id: i64::try_from(event.sid).unwrap_or(-1),
         segment: segment_slug(event.segment_code),
         event_seq: next_event_seq(),
@@ -159,14 +162,23 @@ fn flush_leg_pnl_writer(writer: &mut OrderLegPnlWriter) {
     if writer.pending() == 0 {
         return;
     }
-    if let Err(err) = writer.flush() {
+    // The flush is a blocking HTTP call and, when it fails, a disk-tier
+    // write with two fsyncs (audit PR42b); keep both off the async worker.
+    let flushed = if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| writer.flush())
+    } else {
+        writer.flush()
+    };
+    if let Err(err) = flushed {
         counter!("tv_order_leg_pnl_persist_errors_total", "stage" => "flush").increment(1);
         error!(
             code = ErrorCode::OrderPnl01PersistFailed.code_str(),
             stage = "flush",
             error = %err,
-            "order_leg_pnl: ILP flush refused — pending rows discarded \
-             (poisoned-buffer defense; DEDUP-idempotent re-appends)"
+            "order_leg_pnl: ILP flush refused and the disk tier refused the batch too — \
+             pending rows discarded (poisoned-buffer defense)"
         );
     }
 }
@@ -176,7 +188,12 @@ async fn run_order_leg_pnl_consumer(
     rx_slot: SharedReceiverSlot<LegPnlEvent>,
     identity_index: SharedLegIdentityIndex,
 ) {
-    ensure_order_leg_pnl_table(&questdb).await;
+    // Audit J3 (2026-10-26): a refused ensure starts the background re-run.
+    if !ensure_order_leg_pnl_table(&questdb).await {
+        crate::candle_ddl_boot::spawn_audit_ensure_until_keyed_once(&questdb);
+    }
+    // Audit PR42b: the disk-tier drain starts only after the table is ensured.
+    spawn_audit_spill_drain_once(AuditSpillTable::OrderLegPnl, &questdb);
     let Some(mut guard) = ReceiverGuard::take(&rx_slot) else {
         error!(
             code = ErrorCode::OrderPnl01PersistFailed.code_str(),
@@ -188,7 +205,7 @@ async fn run_order_leg_pnl_consumer(
     let mut writer = OrderLegPnlWriter::new(&questdb);
     info!(
         "order_leg_pnl: consumer running — draining leg P&L events to QuestDB \
-         (feed=groww, paper mode)"
+         (feed=dhan, paper mode)"
     );
     while let Some(event) = guard.recv().await {
         persist_leg_pnl_record(&mut writer, &record_from_event(&event, &identity_index));
@@ -269,7 +286,7 @@ pub fn spawn_order_leg_pnl_capture(
     let _supervisor = spawn_supervised_order_leg_pnl_consumer(questdb.clone(), rx, identity_index);
     info!(
         channel_capacity = capacity,
-        "order_leg_pnl: supervised QuestDB consumer spawned (feed=groww, paper mode)"
+        "order_leg_pnl: supervised QuestDB consumer spawned (feed=dhan, paper mode)"
     );
     Some(tx)
 }
@@ -279,9 +296,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
-    use crate::groww_cadence_executor::{
-        LegIdentityIndex, OptionLegIdentity, new_shared_leg_identity_index,
-    };
+    use crate::leg_identity::{LegIdentityIndex, OptionLegIdentity, new_shared_leg_identity_index};
 
     fn questdb_config() -> QuestDbConfig {
         QuestDbConfig {
@@ -352,7 +367,7 @@ mod tests {
         assert_eq!(record.expiry, "n/a");
         assert_eq!(record.option_type, "n/a");
         assert_eq!(record.strike_paise, 0);
-        assert_eq!(record.feed, "groww");
+        assert_eq!(record.feed, Feed::Dhan.as_str());
         assert_eq!(record.segment, "NSE_FNO");
         assert_eq!(record.event_kind, "mark");
         assert_eq!(record.security_id, 42);

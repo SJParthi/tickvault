@@ -21,28 +21,37 @@
 //! The writer is a thin wrapper that drains the absorption pipeline,
 //! calls this extractor, and feeds the `Buffer`.
 
+use tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
 use tickvault_common::price_precision::round_to_2dp;
 use tickvault_common::segment::segment_code_to_str;
 use tickvault_trading::candles::BufferedSeal;
 
-/// Typed row record matching the plain `candles_<tf>` DDL columns
-/// emitted by [`crate::shadow_persistence::ensure_shadow_candle_tables`]:
+/// Typed row record for the `candles_<tf>` tables written by
+/// [`crate::shadow_persistence::ensure_shadow_candle_tables`].
 ///
-/// ```sql
-/// CREATE TABLE candles_<TF> (
-///     segment       SYMBOL,           -- segment_code_to_str
-///     security_id   INT,              -- u32 → i64 widening
-///     ts            TIMESTAMP,        -- IST nanoseconds
-///     open          DOUBLE,
-///     high          DOUBLE,
-///     low           DOUBLE,
-///     close         DOUBLE,
-///     volume        LONG,             -- u64 → i64 (saturating)
-///     oi            LONG,             -- already i64
-///     tick_count    INT               -- u32 → i64 widening
-/// ) timestamp(ts) PARTITION BY DAY
-///   DEDUP UPSERT KEYS(ts, security_id, segment);
-/// ```
+/// **The DDL is deliberately NOT reproduced here.** It used to be, as a
+/// twenty-line SQL sketch, and by 2026-08-22 that sketch was wrong in four
+/// separate ways at once: it omitted the `feed` column entirely, it still
+/// showed `security_id INT` from before the u64 widening, it showed
+/// `tick_count INT`, and it predated the `*_pct_from_prev_day` columns. Worst
+/// of it, the sketch stated the dedup key as `(ts, security_id, segment)` —
+/// no `feed` — while a doc comment thirty lines below it in this same file
+/// correctly stated `(ts, security_id, segment, feed)`.
+///
+/// That is not a cosmetic problem. A dedup key without `feed` means a Dhan
+/// candle and a Groww candle for the same instrument and minute collide, and
+/// one silently overwrites the other. A reader trusting the sketch would
+/// conclude the system had exactly that bug. An automated sweep on
+/// 2026-08-22 flagged precisely this line as a suspected live defect and
+/// cost real time proving it was only the comment that was wrong — the same
+/// way a stale row in CLAUDE.md's own complexity table manufactured a false
+/// finding on 2026-08-12.
+///
+/// So this doc cites SYMBOLS instead of copying values, because a symbol
+/// survives every edit above it and a copied snapshot does not:
+///
+/// - column list and types → `ensure_shadow_candle_tables`
+/// - dedup key → [`crate::shadow_persistence::DEDUP_KEY_CANDLES`]
 ///
 /// All numeric fields are pre-widened to the questdb-rs ILP API's
 /// expected types (`i64` for INT/LONG columns, `f64` for DOUBLE) so
@@ -82,9 +91,29 @@ pub struct ShadowSealRow {
     pub low: f64,
     /// `LiveCandleState::close` — already `f64`.
     pub close: f64,
-    /// `LiveCandleState::volume` (`u64`) widened with saturation to
-    /// `i64`. Volumes ≥ `i64::MAX` would saturate (impossible in
-    /// practice).
+    /// The bar's **SIGNED GROSS VOLUME** — every unit that traded in the
+    /// bucket, carrying the bar's direction in its sign.
+    ///
+    /// Read from [`LiveCandleState::signed_volume`], which owns the whole
+    /// rule: negative when this bar's `close` is BELOW the previous bar's
+    /// close of the same timeframe, positive otherwise. The MAGNITUDE is the
+    /// unaltered gross volume, so `abs(volume)` is exactly what this column
+    /// held before it was signed.
+    ///
+    /// ⚠ **Three separate cases print POSITIVE and none of them means "the
+    /// close rose"**: a flat bar, the session's first bucket (no previous
+    /// close), and a previous close that cannot be ordered. Positive is the
+    /// default, not an assertion.
+    ///
+    /// ⚠ **This is NOT net order flow.** A bar that traded 1,000 into the bid
+    /// and 900 into the offer and closed one tick up reports `+1_900`, not
+    /// `-100`. The tick-rule flow value is no longer persisted anywhere —
+    /// the trade, and the operator ruling behind it, are recorded in
+    /// `websocket-connection-scope-lock.md` § "2026-09-18 (FOURTH)".
+    ///
+    /// Widened from the state's `u64` with saturation at `i64::MAX`
+    /// (impossible in practice; a saturating read stays a plausible
+    /// "impossibly large" rather than wrapping to a fake sell bar).
     pub volume: i64,
     /// `LiveCandleState::oi` — already `i64`.
     pub oi: i64,
@@ -112,6 +141,43 @@ pub struct ShadowSealRow {
     /// (today's 09:15 open vs yesterday's close). Lands in the
     /// `open_gap_pct` DOUBLE column (operator request 2026-06-02).
     pub open_gap_pct: f64,
+    /// `LiveCandleState::total_buy_qty` (`u32`) widened to `i64`. The vendor's
+    /// total PENDING BUY-order quantity resting in the book at this bar's last
+    /// observed packet — **not executed volume**. `0` is the vendor's ABSENT
+    /// sentinel (a Ticker-mode packet carries no book), and is persisted as
+    /// `0` rather than NULL because the fold already applied the
+    /// last-non-zero rule: a `0` here means the whole bar saw no book.
+    pub total_buy_qty: i64,
+    /// `LiveCandleState::total_sell_qty` (`u32`) widened to `i64`. Same
+    /// semantics as `total_buy_qty` — pending SELL orders, not trades.
+    pub total_sell_qty: i64,
+    /// Nanoseconds between this bar's window OPENING and the first tick of it
+    /// that this process RECEIVED. `None` when the bucket carries no receipt
+    /// clock at all — a pre-`TVW3` WAL replay, or a seal that went to disk and
+    /// came back (the 128-byte spill record is full and does not carry the
+    /// stamps, so a replayed seal reports unknown rather than a fabricated 0).
+    ///
+    /// The writer renders BOTH halves of the pair from this one figure:
+    /// `open_latency` (whole units, human-readable) and `open_latency_ns`
+    /// (exact, the only one that may be sorted on). `None` writes NEITHER —
+    /// an empty cell is the honest rendering of an unknown delay, where
+    /// `0 nanoseconds` would claim the fastest possible delivery.
+    ///
+    /// ⚠ This MEASURES receipt against the window; it never BUCKETS by it.
+    /// `ts` is the exchange clock and nothing else decides which bar a trade
+    /// enters (`fold_clock_ist_secs`, the 2026-09-18 SECOND directive).
+    pub open_latency_ns: Option<i64>,
+    /// Nanoseconds between the last tick of this bar that this process
+    /// RECEIVED and the window CLOSING. Same `None` contract and same
+    /// measure-never-bucket rule as [`Self::open_latency_ns`].
+    pub close_latency_ns: Option<i64>,
+    /// Nanoseconds from the first RECEIVED tick of this bar to the last —
+    /// the receipt window the bar's data actually occupied. `Some(0)` is a
+    /// real reading (a single-tick bucket has a zero span) and is rendered
+    /// `0 nanoseconds`, which is why this is an `Option` rather than a
+    /// sentinel: the unknown case and the genuinely-instant case must not
+    /// share a value.
+    pub window_span_latency_ns: Option<i64>,
 }
 
 impl ShadowSealRow {
@@ -126,15 +192,56 @@ impl ShadowSealRow {
     /// - `security_id = u32 → i64` — widening cast, never lossy.
     /// - `segment = segment_code_to_str(u8)` — `&'static str`, maps the
     ///   8 known segments + UNKNOWN.
-    /// - `volume = u64 → i64` saturating cast (defensive — production
-    ///   volumes never approach `i64::MAX`).
+    /// - `volume = LiveCandleState::signed_volume()` — the gross volume
+    ///   carrying the bar's direction in its sign (2026-09-18 directive).
     /// - All other numeric fields are pass-through.
     #[inline]
     #[must_use]
     pub fn from_buffered_seal(seal: &BufferedSeal) -> Self {
         let timestamp_ist_nanos =
             i64::from(seal.state.bucket_start_ist_secs).saturating_mul(1_000_000_000);
-        let volume_i64 = i64::try_from(seal.state.volume).unwrap_or(i64::MAX);
+        let volume_i64 = seal.state.signed_volume();
+        // The three delays, derived HERE rather than stored on
+        // `LiveCandleState`: the fold keeps the two receipt STAMPS (16 bytes,
+        // multiplied by TF_COUNT and by AGGREGATOR_MAX_SLOTS), and the window
+        // edges they are measured against are already known from the bucket
+        // start and the frame's own period. Storing three more derived figures
+        // per open bucket would pay fleet RAM for arithmetic that costs
+        // nothing at seal time.
+        //
+        // `0` on a stamp is the "no receipt" sentinel, so it maps to `None`
+        // and the writer emits NEITHER half of that pair. A seal that was
+        // spilled to disk and replayed arrives here with both stamps at `0`
+        // for exactly that reason — the 128-byte spill record is full and does
+        // not carry them, so a replayed bar reports its delays as unknown
+        // instead of fabricating an instant one.
+        let window_open_ist_nanos = timestamp_ist_nanos;
+        // The window CLOSE is the bucket end, clamped to the session close
+        // (15:40 IST, `TICK_PERSIST_END_SECS_OF_DAY_IST`). Without the clamp
+        // the last M30/M60 bar of the day measured its close delay against
+        // 16:00 or later — a minute-scale "delay" that was just the market
+        // shutting. Added 2026-09-22 (review findings A09/A13).
+        let bucket_start = i64::from(seal.state.bucket_start_ist_secs);
+        let bucket_end_secs = bucket_start.saturating_add(i64::from(seal.tf.seconds_per_bucket()));
+        let session_close_secs = bucket_start - bucket_start.rem_euclid(86_400)
+            + i64::from(TICK_PERSIST_END_SECS_OF_DAY_IST);
+        let window_close_secs = if bucket_start < session_close_secs {
+            bucket_end_secs.min(session_close_secs)
+        } else {
+            bucket_end_secs
+        };
+        let window_close_ist_nanos = window_close_secs.saturating_mul(1_000_000_000);
+        let first_receipt = seal.state.first_receipt_ist_nanos;
+        let last_receipt = seal.state.last_receipt_ist_nanos;
+        let open_latency_ns =
+            (first_receipt > 0).then(|| first_receipt.saturating_sub(window_open_ist_nanos));
+        let close_latency_ns =
+            (last_receipt > 0).then(|| window_close_ist_nanos.saturating_sub(last_receipt));
+        // Both stamps required: a span needs two real edges, and the fold
+        // seeds them together, so one present without the other cannot happen
+        // — the test is belt-and-braces rather than a case being handled.
+        let window_span_latency_ns = (first_receipt > 0 && last_receipt > 0)
+            .then(|| last_receipt.saturating_sub(first_receipt));
         Self {
             table_name: seal.tf.table_name(),
             timestamp_ist_nanos,
@@ -160,6 +267,11 @@ impl ShadowSealRow {
             // the per-instrument RAM budget (operator request 2026-06-02).
             change_pct: seal.state.close_pct_from_prev_day,
             open_gap_pct: seal.state.open_gap_pct,
+            total_buy_qty: i64::from(seal.state.total_buy_qty),
+            total_sell_qty: i64::from(seal.state.total_sell_qty),
+            open_latency_ns,
+            close_latency_ns,
+            window_span_latency_ns,
         }
     }
 }
@@ -177,7 +289,7 @@ mod tests {
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
     };
     use tickvault_common::feed::Feed;
-    use tickvault_trading::candles::{LiveCandleState, TfIndex};
+    use tickvault_trading::candles::{LiveCandleState, TF_COUNT, TfIndex};
 
     fn mk_seal(sid: u64, seg: u8, tf: TfIndex, bucket: u32, close: f64) -> BufferedSeal {
         let mut state = LiveCandleState::empty();
@@ -261,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_name_dispatches_correctly_for_all_twenty_one_tfs() {
+    fn test_table_name_dispatches_correctly_for_every_frame() {
         for tf in TfIndex::ALL {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(
@@ -277,29 +389,28 @@ mod tests {
         // Pin the EXACT strings so a future refactor of TfIndex doesn't
         // silently change the ILP-emitted table name (which would split
         // candles across two tables — silent data loss class bug).
+        // 2026-09-19 nine-frame collapse. Two things this list gets right
+        // that the 21-entry version it replaces did not:
+        //   - it is COMPLETE. The old list pinned 21 of the then-24 frames;
+        //     M2, M30 and M60 had no entry at all, so their table names were
+        //     unpinned while the test's name claimed otherwise.
+        //   - the length is asserted against TF_COUNT below, so a frame added
+        //     without a pin fails the build instead of going unnoticed.
         let pairs = [
             (TfIndex::M1, "candles_1m"),
             (TfIndex::M3, "candles_3m"),
             (TfIndex::M5, "candles_5m"),
             (TfIndex::M15, "candles_15m"),
-            (TfIndex::D1, "candles_1d"),
             (TfIndex::S1, "candles_1s"),
-            (TfIndex::S2, "candles_2s"),
-            (TfIndex::S3, "candles_3s"),
-            (TfIndex::S4, "candles_4s"),
-            (TfIndex::S5, "candles_5s"),
-            (TfIndex::S6, "candles_6s"),
-            (TfIndex::S7, "candles_7s"),
-            (TfIndex::S8, "candles_8s"),
-            (TfIndex::S9, "candles_9s"),
-            (TfIndex::S10, "candles_10s"),
-            (TfIndex::S11, "candles_11s"),
-            (TfIndex::S12, "candles_12s"),
-            (TfIndex::S13, "candles_13s"),
-            (TfIndex::S14, "candles_14s"),
-            (TfIndex::S15, "candles_15s"),
-            (TfIndex::S30, "candles_30s"),
+            (TfIndex::M30, "candles_30m"),
+            (TfIndex::M60, "candles_60m"),
+            (TfIndex::M10, "candles_10m"),
         ];
+        assert_eq!(
+            pairs.len(),
+            TF_COUNT,
+            "every frame must have a pinned table name"
+        );
         for (tf, expected) in pairs {
             let row = ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0));
             assert_eq!(row.table_name, expected, "TF {tf:?}");
@@ -411,13 +522,79 @@ mod tests {
 
     #[test]
     fn test_volume_saturates_when_above_i64_max() {
+        // The baseline is set ABOVE the close DELIBERATELY. With the
+        // `LiveCandleState::empty()` default of `0.0` this test was VACUOUS:
+        // `signed_volume` returns early on `prev <= 0.0`, so the old
+        // "saturated volume MUST stay positive" assertion was satisfied by
+        // the no-baseline rule and could not fail whatever the saturation
+        // arm did. Driving the NEGATING arm is what actually exercises it.
         let mut state = LiveCandleState::empty();
         state.bucket_start_ist_secs = 1_716_000_900;
         state.volume = u64::MAX;
+        state.close = 100.0;
+        state.bucket_open_prev_close = 101.0;
         let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
         let row = ShadowSealRow::from_buffered_seal(&seal);
-        assert_eq!(row.volume, i64::MAX);
-        assert!(row.volume > 0, "saturated volume MUST stay positive");
+        assert_eq!(
+            row.volume,
+            -i64::MAX,
+            "a saturated magnitude must still take the bar's sign, and the \
+             negation must not overflow: -i64::MAX is i64::MIN + 1"
+        );
+        assert_ne!(
+            row.volume,
+            i64::MIN,
+            "i64::MIN is unreachable by construction; reaching it would mean \
+             the saturation used wrapping arithmetic"
+        );
+        // And the same bar with a RISING close keeps the positive saturation.
+        let mut up = LiveCandleState::empty();
+        up.bucket_start_ist_secs = 1_716_000_900;
+        up.volume = u64::MAX;
+        up.close = 102.0;
+        up.bucket_open_prev_close = 101.0;
+        let up_seal = BufferedSeal::new(13, 0, TfIndex::M1, up, Feed::Dhan);
+        assert_eq!(ShadowSealRow::from_buffered_seal(&up_seal).volume, i64::MAX);
+    }
+
+    #[test]
+    fn the_row_carries_the_sign_not_just_the_magnitude() {
+        // The 2026-09-18 directive: the persisted `volume` is the bar's own
+        // gross volume carrying its direction. A row built from a bar that
+        // closed BELOW the previous bar of the same timeframe must reach the
+        // writer already negative — the conversion is the only place the sign
+        // is applied, so a regression here silently un-signs every candle.
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = 1_716_000_900;
+        state.volume = 900;
+        state.bucket_open_prev_close = 101.0;
+        state.close = 100.0;
+        let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
+        let row = ShadowSealRow::from_buffered_seal(&seal);
+        assert_eq!(row.volume, -900, "a down bar signs its whole gross volume");
+        assert_eq!(
+            row.volume.unsigned_abs(),
+            state.volume,
+            "the magnitude must survive the sign — `abs()` is what the 10m \
+             derivation sums, so a lost magnitude breaks it silently"
+        );
+    }
+
+    #[test]
+    fn an_up_bar_and_a_flat_bar_both_reach_the_row_positive() {
+        for (prev, close) in [(99.0_f64, 100.0_f64), (100.0, 100.0)] {
+            let mut state = LiveCandleState::empty();
+            state.bucket_start_ist_secs = 1_716_000_900;
+            state.volume = 900;
+            state.bucket_open_prev_close = prev;
+            state.close = close;
+            let seal = BufferedSeal::new(13, 0, TfIndex::M1, state, Feed::Dhan);
+            let row = ShadowSealRow::from_buffered_seal(&seal);
+            assert_eq!(
+                row.volume, 900,
+                "prev={prev} close={close}: only a LOWER close signs negative"
+            );
+        }
     }
 
     #[test]
@@ -455,7 +632,9 @@ mod tests {
         // I-P1-11: same security_id with different segments MUST
         // produce composite-key-distinct rows (different `segment`
         // string). The DEDUP UPSERT KEYS on the candle tables
-        // (ts, security_id, segment) rely on this.
+        // (see `shadow_persistence::DEDUP_KEY_CANDLES` -- not restated here,
+        // because the copy at the top of this file drifted for months) rely
+        // on this.
         let row_idx =
             ShadowSealRow::from_buffered_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0));
         let row_eq =
@@ -507,5 +686,90 @@ mod tests {
         assert_eq!(row.volume, 1_000_000);
         assert_eq!(row.oi, 7_777_777);
         assert_eq!(row.tick_count, 42);
+    }
+
+    // ---- the three receipt delays (2026-09-22) --------------------------
+
+    /// An IST-naive day start: a whole multiple of 86,400.
+    const DAY: u32 = 1_789_948_800;
+    const SEC: i64 = 1_000_000_000;
+
+    fn seal_with_receipts(tf: TfIndex, bucket: u32, first: i64, last: i64) -> BufferedSeal {
+        let mut seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, tf, bucket, 101.0);
+        seal.state.first_receipt_ist_nanos = first;
+        seal.state.last_receipt_ist_nanos = last;
+        seal
+    }
+
+    #[test]
+    fn from_buffered_seal_measures_the_three_delays_against_the_window() {
+        assert_eq!(DAY % 86_400, 0, "fixture must be a day start");
+        let bucket = DAY + 9 * 3600 + 15 * 60; // 09:15
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open + SEC,      // first trade received 1 s in
+            open + 59 * SEC, // last received 1 s before the close
+        ));
+        assert_eq!(row.open_latency_ns, Some(SEC));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        assert_eq!(row.window_span_latency_ns, Some(58 * SEC));
+    }
+
+    #[test]
+    fn from_buffered_seal_reports_no_receipt_as_unknown_never_zero() {
+        let row =
+            ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, DAY + 33_300, 0, 0));
+        assert_eq!(row.open_latency_ns, None);
+        assert_eq!(row.close_latency_ns, None);
+        assert_eq!(row.window_span_latency_ns, None);
+    }
+
+    #[test]
+    fn from_buffered_seal_single_receipt_has_a_real_zero_span() {
+        let bucket = DAY + 33_300;
+        let t = i64::from(bucket) * SEC + 30 * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(TfIndex::M1, bucket, t, t));
+        assert_eq!(row.window_span_latency_ns, Some(0));
+    }
+
+    /// A receipt stamped before its window (ring-dwell back-dating) is a
+    /// NEGATIVE open delay — reported as it is, not clamped to zero.
+    #[test]
+    fn from_buffered_seal_keeps_a_negative_open_delay() {
+        let bucket = DAY + 33_300;
+        let open = i64::from(bucket) * SEC;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M1,
+            bucket,
+            open - 2 * SEC,
+            open + 10 * SEC,
+        ));
+        assert_eq!(row.open_latency_ns, Some(-2 * SEC));
+    }
+
+    /// A09/A13: the last M60 bar (15:00) ends at the 15:40 session close, not
+    /// 16:00. A trade received at 15:39:59 is 1 s from the close, not 20 min.
+    #[test]
+    fn from_buffered_seal_clamps_the_last_bar_to_the_session_close() {
+        let bucket = DAY + 15 * 3600; // 15:00
+        let last = (i64::from(DAY) + 15 * 3600 + 39 * 60 + 59) * SEC; // 15:39:59
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            bucket,
+            i64::from(bucket) * SEC + SEC,
+            last,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
+        // A mid-session M60 bar is NOT clamped.
+        let mid = DAY + 10 * 3600;
+        let row = ShadowSealRow::from_buffered_seal(&seal_with_receipts(
+            TfIndex::M60,
+            mid,
+            i64::from(mid) * SEC,
+            i64::from(mid) * SEC + 3599 * SEC,
+        ));
+        assert_eq!(row.close_latency_ns, Some(SEC));
     }
 }

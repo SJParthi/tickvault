@@ -24,7 +24,7 @@
 //!  6. The deploy workflow loses the LOG-INGESTION-SMOKE step (or oidc.tf
 //!     loses the `logs:FilterLogEvents` grant it needs).
 //!  7. The market-hours gate Lambda loses its weekday-NSE-holiday safety
-//!     (2026-07-07 round-1 review fix): holiday-gate.sh SELF-STOPS the box
+//!     (2026-07-07 round-1 review fix): the holiday gate SELF-STOPS the box
 //!     on weekday NSE holidays while the gate's open cron is holiday-blind
 //!     MON-FRI — a blind 09:20 enable + OK reset would false-page both
 //!     breaching-on-missing gated alarms (~09:25 / ~09:35 IST) every
@@ -35,7 +35,7 @@
 //!     two holiday-blind self-healers (start-watchdog 08:45 IST check,
 //!     aws-autopilot every 15 min) kept restarting the holiday-stopped box
 //!     all day, and a 1-3 min up-burst bracketing the 09:20 sample restored
-//!     the false page. holiday-gate.sh now stamps today's IST date into the
+//!     the false page. The holiday gate now stamps today's IST date into the
 //!     /tickvault/<env>/holiday-stop-date SSM param BEFORE its stop; both
 //!     restarters skip their self-start on marker == today (the war ends at
 //!     the source), and the gate Lambda checks the marker FIRST (race-proof)
@@ -106,7 +106,13 @@ fn reference_collect_list() -> Vec<(String, String)> {
 /// loads on the box). Only `"file_path"` lines are considered, so comments
 /// / mkdir lines mentioning `data/logs` can never false-fail the guard.
 fn tftpl_file_paths() -> Vec<String> {
-    let body = read("deploy/aws/terraform/user-data.sh.tftpl");
+    // 2026-08-25: the log-collection config now lives ONLY in
+    // deploy/aws/cloudwatch-agent.json — the ~1.6 KB duplicate inside
+    // user-data.sh.tftpl was removed because it pinned that template at
+    // exactly its 15,872-byte EC2 budget with zero bytes free. The template
+    // keeps a minimal host-only fallback (syslog only) and copies this file
+    // into place after the Step 5 clone.
+    let body = read("deploy/aws/cloudwatch-agent.json");
     body.lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("\"file_path\":")?;
@@ -164,25 +170,42 @@ fn test_reference_agent_config_globs_match_observability_constants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_userdata_inline_config_globs_match_reference() {
-    // The tftpl also ships /var/log/messages to the system group — that
-    // entry is allowlisted; the remaining app-log globs must byte-match the
-    // reference config (which test 1 pins to the observability constants).
-    let mut app_paths: Vec<String> = tftpl_file_paths()
-        .into_iter()
-        .filter(|p| p != "/var/log/messages")
-        .collect();
-    app_paths.sort();
-    let mut expected = vec![expected_errors_glob(), expected_app_glob()];
-    expected.sort();
-    assert_eq!(
-        app_paths, expected,
-        "Z+ L3 RECONCILE drift-guard: user-data.sh.tftpl is the config the box \
-         ACTUALLY loads (`amazon-cloudwatch-agent-ctl -a fetch-config`); its \
-         app-log collect_list globs drifted from deploy/aws/cloudwatch-agent.json \
-         / the observability constants. The 2026-07-06 incident was exactly this \
-         file tailing globs the app no longer writes."
+fn the_userdata_fallback_tails_syslog_only_and_never_the_app_logs() {
+    // RETIRED-AND-REPLACED 2026-08-25.
+    //
+    // This test used to compare the app-log globs in `user-data.sh.tftpl`
+    // against `cloudwatch-agent.json`, because the template embedded a
+    // byte-identical copy of that config. The copy is gone — it was ~1.6 KB
+    // and it pinned the template at exactly its 15,872-byte EC2 budget with
+    // ZERO bytes free — so the template now writes a MINIMAL host-only
+    // fallback and copies the repo file into place after the Step 5 clone.
+    // Comparing the two today would be the file against itself: vacuously
+    // green, which is worse than absent. Test 1 above already pins the real
+    // config against the observability constants.
+    //
+    // What replaces it is the property the new arrangement needs. The
+    // fallback exists for a box whose clone FAILED — which is precisely the
+    // box that has no app binary and therefore no app logs. A fallback that
+    // declared app-log globs would have the agent tailing paths that cannot
+    // exist, which is the 2026-07-06 incident's exact shape (an agent
+    // configured for globs the app no longer writes), re-created in the one
+    // config that runs when nothing else does.
+    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    assert!(
+        user_data.contains("/var/log/messages"),
+        "the host-only fallback must still ship syslog — it is the only log signal a \
+         box whose clone failed can produce"
     );
+    for app_glob in [expected_errors_glob(), expected_app_glob()] {
+        assert!(
+            !user_data.contains(&app_glob),
+            "the user-data fallback declares the app-log glob `{app_glob}`. That config \
+             is in force ONLY when the repo clone failed — the same failure that means \
+             there is no app binary and no app logs. Tailing a path that cannot exist is \
+             the 2026-07-06 incident's shape. App globs belong in \
+             deploy/aws/cloudwatch-agent.json, which user-data copies in after the clone."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,11 +265,11 @@ fn test_stream_names_are_stable() {
         );
     }
     // Deployed config: both stream names must survive verbatim.
-    let user_data = read("deploy/aws/terraform/user-data.sh.tftpl");
+    let user_data = read("deploy/aws/cloudwatch-agent.json");
     for stream in ["{instance_id}/errors-jsonl", "{instance_id}/app"] {
         assert!(
             user_data.contains(&format!("\"log_stream_name\": \"{stream}\"")),
-            "user-data.sh.tftpl lost the stable log stream name `{stream}`"
+            "cloudwatch-agent.json lost the stable log stream name `{stream}`"
         );
     }
 }
@@ -321,7 +344,7 @@ fn test_alarm_is_gated_by_market_hours_lambda() {
 }
 
 /// Round-1 review fix (2026-07-07): the gate Lambda's OPEN mode must be
-/// weekday-NSE-holiday safe. `deploy/aws/holiday-gate.sh` self-stops the box
+/// weekday-NSE-holiday safe. `tickvault holiday-gate` self-stops the box
 /// at boot on a definitive holiday verdict, while the gate's open cron is a
 /// holiday-blind plain MON-FRI schedule — so a blind enable + OK reset at
 /// 09:20 IST would drive both breaching-on-missing gated alarms
@@ -354,7 +377,7 @@ fn test_gate_lambda_open_is_holiday_safe() {
             norm.contains(pin),
             "market-hours-liveness-alarm.tf lost the holiday-safety pin `{pin}` — {why}. \
              Regressing this restores the weekday-NSE-holiday false page \
-             (box self-stopped by holiday-gate.sh + holiday-blind MON-FRI open cron \
+             (box self-stopped by the holiday gate + holiday-blind MON-FRI open cron \
              + treat_missing_data=breaching)."
         );
     }
@@ -368,7 +391,7 @@ fn test_gate_lambda_open_is_holiday_safe() {
         (
             "fail-open, treating as up",
             "an EC2 API error must NEVER suppress the trading-day liveness page \
-             — the check fails open, exactly mirroring holiday-gate.sh",
+             — the check fails open, exactly mirroring the holiday gate",
         ),
         (
             "leaving actions disabled",
@@ -400,11 +423,11 @@ fn test_gate_lambda_open_is_holiday_safe() {
 /// Round-3 review fix (2026-07-07): the round-1 single 09:20 IST
 /// instance-state sample is RACY — holiday-blind restarters (start-watchdog
 /// 08:45 self-start + aws-autopilot every 15 min, incl. the 03:45 UTC ≈
-/// 09:15 IST slot + GH cron jitter) fight holiday-gate.sh's self-stop all
+/// 09:15 IST slot + GH cron jitter) fight the holiday gate's self-stop all
 /// day, and a 1-3 min up-burst bracketing the 09:20 sample re-arms the
 /// breaching-on-missing alarms → the exact holiday false page. The gate
 /// Lambda's open path must therefore consult the race-proof
-/// holiday-stop-date SSM marker (stamped by holiday-gate.sh BEFORE its
+/// holiday-stop-date SSM marker (stamped by the holiday gate BEFORE its
 /// stop) FIRST, with the instance-state sample as the second line for the
 /// marker-less manual-stop case, and must fail OPEN on any SSM error.
 #[test]
@@ -417,7 +440,7 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
     for (pin, why) in [
         (
             "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\"",
-            "the gate Lambda must be told WHERE holiday-gate.sh stamps the \
+            "the gate Lambda must be told WHERE the holiday gate stamps the \
              intentional-stop marker",
         ),
         (
@@ -574,7 +597,7 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
 
 /// Round-3 review fix (2026-07-07): the holiday-stop marker chain. Every
 /// link must survive — losing ANY one restores the holiday restart war:
-///   writer:   holiday-gate.sh stamps the marker BEFORE stop-instances
+///   writer:   the holiday gate stamps the marker BEFORE stop-instances
 ///   reader 1: start-watchdog mode=check skips self-start on marker==today
 ///             (also kills the pre-existing false Critical "auto-start
 ///             FAILED" page every weekday holiday)
@@ -584,23 +607,24 @@ fn test_gate_lambda_open_checks_holiday_marker_first() {
 ///             can ssm:GetParameter the marker param
 #[test]
 fn test_holiday_stop_marker_chain_is_wired() {
-    // --- writer: holiday-gate.sh, marker put BEFORE the stop ---------------
-    let gate = read("deploy/aws/holiday-gate.sh");
+    // --- writer: the holiday gate (a shell script until 2026-10-01, audit
+    //     D6c; now `crates/app/src/holiday_gate.rs`), marker put BEFORE the stop
+    let gate = read("crates/app/src/holiday_gate.rs");
     assert!(
         gate.contains("holiday-stop-date"),
-        "holiday-gate.sh lost the holiday-stop-date marker write — the \
+        "the holiday gate lost the holiday-stop-date marker write — the \
          intentional stop leaves no trace and the holiday-blind restarters \
          (start-watchdog + aws-autopilot) fight it all day"
     );
     let put_pos = gate
-        .find("ssm put-parameter")
-        .expect("holiday-gate.sh must write the marker via `aws ssm put-parameter`"); // APPROVED: test
+        .find(".put_parameter()")
+        .expect("the holiday gate must write the marker via SSM PutParameter"); // APPROVED: test
     let stop_pos = gate
-        .find("ec2 stop-instances")
-        .expect("holiday-gate.sh must still stop the instance on a holiday verdict"); // APPROVED: test
+        .find(".stop_instances()")
+        .expect("the holiday gate must still stop the instance on a holiday verdict"); // APPROVED: test
     assert!(
         put_pos < stop_pos,
-        "holiday-gate.sh must stamp the marker BEFORE stop-instances — writing \
+        "the holiday gate must stamp the marker BEFORE stop-instances — writing \
          after (or never) leaves a window where every restarter + the 09:20 \
          gate sample sees an unexplained stop"
     );

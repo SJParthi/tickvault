@@ -1,0 +1,15 @@
+{
+  "dataset": [
+    ["ts", "TIMESTAMP", true, true, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["trading_date_ist", "TIMESTAMP", false, true, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["feed", "SYMBOL", false, true, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["verdict", "SYMBOL", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["reason", "SYMBOL", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["accepted_rows", "LONG", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["db_tick_rows", "LONG", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["not_landed_rows", "LONG", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["shortfall", "LONG", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["count_reads", "LONG", false, false, true, true, "DAY", "ts", 32, 32, 32, false],
+    ["process_start", "TIMESTAMP", false, false, true, true, "DAY", "ts", 32, 32, 32, false]
+  ]
+}

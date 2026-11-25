@@ -9,12 +9,14 @@
 //! - **Recoverable text**. The binary spill file is exact + compact
 //!   but operator-opaque. Once we are routing seals to the DLQ the
 //!   normal pipeline is already broken; the operator needs to be
-//!   able to `cat data/dlq/seals-YYYY-MM-DD.ndjson | jq` to inspect
+//!   able to `cat data/dlq/seals_v4-YYYY-MM-DD.ndjson | jq` to inspect
 //!   what was lost. NDJSON is the canonical text-streaming format
 //!   matching the existing `data/logs/errors.jsonl.*` rotation.
 //! - **Append-only single-line records.** A partial trailing line on
-//!   crash is silently dropped during replay (the `serde_json::from_str`
-//!   on the corrupt line returns `Err` and the reader skips it).
+//!   crash is refused during replay (the `serde_json::from_str` on the
+//!   corrupt line returns `Err`; the reader counts it and skips it). Deep
+//!   audit DA-14: the next append first closes such a line with a newline,
+//!   so it cannot glue itself to the next record and take that one too.
 //! - **Forward-compatible.** Adding a new field to `SealDlqRecord`
 //!   produces a JSON object with one extra key; older replay code
 //!   that doesn't know about it ignores via `#[serde(default)]`.
@@ -28,7 +30,7 @@
 //!   without re-deriving the trading-side `BufferedSeal`.
 //! - [`SealDlqWriter`] — append-only NDJSON file writer with the
 //!   exact `seal_spill.rs` API surface:
-//!   - IST-date file rotation (`seals-2026-05-10.ndjson`).
+//!   - IST-date file rotation (`seals_v4-2026-05-10.ndjson`).
 //!   - `append_record()` (one line per call).
 //!   - `read_all()` recovery scan that silently drops corrupt
 //!     lines with `warn!` so a single bad line does NOT stall replay.
@@ -46,18 +48,24 @@
 //! = operator-action-required; the host is OOM AND out of disk AND
 //! the `data/dlq/` directory is unwritable.
 
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::feed::Feed;
 
-use crate::seal_spill::SerializedSeal;
+use crate::seal_spill::{
+    SEAL_SPILL_FORMAT_VERSION, SerializedSeal, ist_day_number, seal_spill_version_is_readable,
+    sync_directory,
+};
 
 /// Production DLQ directory — sibling of `data/spill/` so operators
 /// looking at `data/` see all three absorption tiers next to each
@@ -71,7 +79,8 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 ///
 /// Field-by-field correspondence with `SerializedSeal`:
 /// - `security_id`, `exchange_segment_code` — composite key (I-P1-11).
-/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..=20).
+/// - `tf_ordinal` — `TfIndex::as_ordinal()` (0..`TF_COUNT`; eight frames since
+///   2026-10-22, plan item 62; nine from 2026-09-19). Its MEANING depends on `format_version` — see that field.
 /// - `bucket_start_ist_secs`, `tick_count`, `volume`,
 ///   `bucket_start_cumulative`, `oi`, `open`, `high`, `low`, `close`
 ///   — `LiveCandleState` payload.
@@ -84,6 +93,22 @@ const SEAL_DLQ_DIR: &str = "data/dlq";
 // path, so a `Clone`-only record is fine — every conversion uses `&self`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SealDlqRecord {
+    /// The seal-record format this line was written under — the SAME number
+    /// as byte 7 of a binary spill record, [`SEAL_SPILL_FORMAT_VERSION`],
+    /// because the two tiers carry the same `tf_ordinal` space.
+    ///
+    /// Added 2026-09-22. Until then the DLQ carried NO version at all, so a
+    /// line written under the 24-frame ordinal space (before 2026-09-19)
+    /// decoded silently into the nine-frame space: `tf_ordinal` 5 was `S1`
+    /// and is now `M30`, so a one-second bar was re-ingested as a thirty-minute
+    /// bar with nothing in any log to say so. The binary spill had a version
+    /// byte for exactly this reason; the NDJSON sibling never did.
+    ///
+    /// `#[serde(default)]` makes every pre-2026-09-22 line read as `0`, which
+    /// is below every real version, so readers REFUSE it — the only safe
+    /// reading of a record whose ordinal space cannot be known.
+    #[serde(default)]
+    pub format_version: u8,
     // `u64` (2026-06-29 widening) — the seal DLQ carries BOTH Dhan (≤u32) and
     // Groww (bit-62 index ids > u32) seals; NDJSON round-trips u64 natively.
     #[serde(default)]
@@ -112,10 +137,26 @@ pub struct SealDlqRecord {
     pub close: f64,
     #[serde(default)]
     pub close_pct_from_prev_day: f64,
+    /// The PREVIOUS sealed bar's close — the baseline the persisted `volume`'s
+    /// SIGN is measured against (`LiveCandleState::signed_volume`).
+    ///
+    /// This key carried the same meaning before 2026-09-10, when it was
+    /// replaced by `net_volume_signed` / `net_volume_classified` for the
+    /// tick-rule flow scheme; the 2026-09-18 directive retired that scheme and
+    /// the key is back. Both of those names are simply absent from records
+    /// this writer produces, and `serde` ignores them on the way in, so an
+    /// NDJSON file from either era decodes without error.
+    ///
+    /// `0.0` means "no baseline" — the session's first bucket, or a record
+    /// written by a version that did not carry it. `signed_volume()` reports
+    /// such a bar POSITIVE, which is the documented default rather than a
+    /// claim that the close rose.
     #[serde(default)]
-    pub oi_pct_from_prev_day: f64,
+    pub bucket_open_prev_close: f64,
     #[serde(default)]
-    pub volume_pct_from_prev_day: f64,
+    pub total_buy_qty: u32,
+    #[serde(default)]
+    pub total_sell_qty: u32,
     /// §31 Option 2 (2026-06-01): % vs the official 09:15 session open.
     #[serde(default)]
     pub open_pct: f64,
@@ -143,6 +184,10 @@ impl From<&SerializedSeal> for SealDlqRecord {
     #[inline]
     fn from(s: &SerializedSeal) -> Self {
         Self {
+            // Stamped on EVERY write, so every line this build produces is
+            // readable by this build and refused by any build whose ordinal
+            // space differs.
+            format_version: SEAL_SPILL_FORMAT_VERSION,
             security_id: s.security_id,
             exchange_segment_code: s.exchange_segment_code,
             // Round-trip feed provenance through the DLQ NDJSON.
@@ -158,8 +203,9 @@ impl From<&SerializedSeal> for SealDlqRecord {
             low: s.low,
             close: s.close,
             close_pct_from_prev_day: s.close_pct_from_prev_day,
-            oi_pct_from_prev_day: s.oi_pct_from_prev_day,
-            volume_pct_from_prev_day: s.volume_pct_from_prev_day,
+            bucket_open_prev_close: s.bucket_open_prev_close,
+            total_buy_qty: s.total_buy_qty,
+            total_sell_qty: s.total_sell_qty,
             open_pct: s.open_pct,
             change_pct: s.change_pct,
             open_gap_pct: s.open_gap_pct,
@@ -190,8 +236,9 @@ impl From<&SealDlqRecord> for SerializedSeal {
             low: r.low,
             close: r.close,
             close_pct_from_prev_day: r.close_pct_from_prev_day,
-            oi_pct_from_prev_day: r.oi_pct_from_prev_day,
-            volume_pct_from_prev_day: r.volume_pct_from_prev_day,
+            bucket_open_prev_close: r.bucket_open_prev_close,
+            total_buy_qty: r.total_buy_qty,
+            total_sell_qty: r.total_sell_qty,
             open_pct: r.open_pct,
             change_pct: r.change_pct,
             open_gap_pct: r.open_gap_pct,
@@ -199,7 +246,7 @@ impl From<&SealDlqRecord> for SerializedSeal {
     }
 }
 
-/// Returns today's IST date in `seals-YYYY-MM-DD.ndjson` form for the
+/// Returns today's IST date in `seals_v4-YYYY-MM-DD.ndjson` form for the
 /// DLQ filename. Pure function for testability (clock injected by
 /// caller in tests). Mirrors `seal_spill::ist_date_filename` but with
 /// the `.ndjson` suffix.
@@ -210,7 +257,73 @@ fn ist_date_filename(now_unix_secs: i64) -> String {
         .timestamp_opt(ist_secs, 0)
         .single()
         .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
-    dt.format("seals-%Y-%m-%d.ndjson").to_string()
+    dt.format("seals_v4-%Y-%m-%d.ndjson").to_string()
+}
+
+/// Counter for a failed DLQ sync, one series per `reason`.
+pub const SEAL_DLQ_SYNC_FAILED_COUNTER: &str = "tv_seal_dlq_sync_failed_total";
+
+/// Torn last lines the DLQ closed with a newline before appending (deep audit
+/// DA-14): each is one line a process died writing, which the replay refuses
+/// and counts. Local `/metrics` only, registered at 0 at boot.
+pub const SEAL_DLQ_TORN_LINE_CLOSED_COUNTER: &str = "tv_seal_dlq_torn_line_closed_total";
+
+/// How a DLQ file ends (deep audit DA-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastLine {
+    /// Empty, or ends with a newline.
+    Terminated,
+    /// Ends in a complete record that lacks only its newline.
+    CompleteUnterminated,
+    /// Ends in a partial line: one candle the replay will refuse.
+    Torn,
+}
+
+/// The longest last line read back: far above any real record (a few
+/// hundred bytes), so a longer unterminated tail is torn by definition.
+const DLQ_LAST_LINE_PROBE_BYTES: usize = 4_096;
+
+/// Classifies how `file` (of length `len`) ends. Reads the last byte first
+/// (one seek, one 1-byte read): a file ending in a newline, the steady
+/// state, costs nothing more. Only an unterminated file reads up to
+/// [`DLQ_LAST_LINE_PROBE_BYTES`] more from the end into a stack buffer (one
+/// more seek and bounded read), with no allocation unless the last line must
+/// be parsed.
+/// The append position is unaffected: the file is opened in append mode, so
+/// every write still lands at the end.
+fn read_unterminated_last_line(file: &mut std::fs::File, len: u64) -> std::io::Result<LastLine> {
+    if len == 0 {
+        return Ok(LastLine::Terminated);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(LastLine::Terminated);
+    }
+    let probe = len.min(DLQ_LAST_LINE_PROBE_BYTES as u64);
+    file.seek(SeekFrom::Start(len - probe))?;
+    let mut buf = [0u8; DLQ_LAST_LINE_PROBE_BYTES];
+    let tail = &mut buf[..probe as usize];
+    file.read_exact(tail)?;
+    let Some(newline) = tail.iter().rposition(|byte| *byte == b'\n') else {
+        // No newline in the probe: either the whole file is one unterminated
+        // line no longer than the probe, or the line is longer than any
+        // record and therefore torn.
+        if len > probe {
+            return Ok(LastLine::Torn);
+        }
+        return Ok(classify_last_line(tail));
+    };
+    Ok(classify_last_line(&tail[newline + 1..]))
+}
+
+/// A complete record parses; anything else is a torn line.
+fn classify_last_line(line: &[u8]) -> LastLine {
+    match serde_json::from_slice::<SealDlqRecord>(line) {
+        Ok(_) => LastLine::CompleteUnterminated,
+        Err(_) => LastLine::Torn,
+    }
 }
 
 /// Append-only NDJSON DLQ writer. One instance lives in the writer
@@ -219,15 +332,70 @@ pub struct SealDlqWriter {
     /// DLQ directory — production uses `SEAL_DLQ_DIR`; tests
     /// override via `with_dlq_dir_for_test`.
     dlq_dir: PathBuf,
+    /// Day files written since the last [`Self::sync_written`], and whether
+    /// a directory entry was created (2026-10-04: the DLQ was flushed to the
+    /// page cache and never synced, so a power cut could take records it had
+    /// reported written).
+    unsynced: Mutex<DlqUnsynced>,
+    /// Edge latch for the sync-failure `error!`: one line per failing
+    /// episode, cleared by the next clean sync.
+    sync_failing: AtomicBool,
+    /// Serialises a whole append (deep audit DA-14 review): the stat, the
+    /// last-line check, the close of a torn line, the write and the cut-back
+    /// of a failed write. Every `Arc` handle (the seal writer, the escalation
+    /// thread, the frame drain's inline fallback) shares this one writer, so
+    /// one lock covers every appender in the process. Without it, one
+    /// appender's cut-back to the length IT saw could delete a record another
+    /// had just written and reported. Never held across a sync; the DLQ is
+    /// the last tier of a failure path, so it is uncontended in the steady
+    /// state (nothing is written to it at all).
+    append_lock: Mutex<()>,
+    /// Test-only one-shot failure: the next line write lands this many bytes,
+    /// waits, then fails as a full disk does (deep audit DA-14 review).
+    #[cfg(test)]
+    fail_next_write_after: Mutex<Option<usize>>,
+    /// Test-only: set once the armed write has landed its partial bytes.
+    #[cfg(test)]
+    failing_write_started: AtomicBool,
+}
+
+/// What [`SealDlqWriter::sync_written`] still has to sync. Two day slots
+/// suffice: the writers sync at least once a second while the DLQ is
+/// written, so only the IST midnight can separate two days between syncs. A
+/// third day before any sync replaces the older slot and is counted
+/// (`reason="slot_overflow"`); that day's file is then synced by nobody.
+#[derive(Default)]
+struct DlqUnsynced {
+    /// `(IST day number, a unix second inside that day)` per written day.
+    days: [Option<(i64, i64)>; 2],
+    /// A new day file was created: the DLQ directory entry needs a sync.
+    dir: bool,
+    /// The DLQ directory itself was created: its parent's entry too.
+    parent: bool,
+}
+
+impl DlqUnsynced {
+    /// Records a write to the day holding `now_unix_secs`. O(1).
+    fn note_day(&mut self, now_unix_secs: i64) {
+        let day = ist_day_number(now_unix_secs);
+        if self.days.iter().flatten().any(|(held, _)| *held == day) {
+            return;
+        }
+        if let Some(free) = self.days.iter_mut().find(|slot| slot.is_none()) {
+            *free = Some((day, now_unix_secs));
+            return;
+        }
+        metrics::counter!(SEAL_DLQ_SYNC_FAILED_COUNTER, "reason" => "slot_overflow").increment(1);
+        let oldest = usize::from(self.days[1].map(|(d, _)| d) < self.days[0].map(|(d, _)| d));
+        self.days[oldest] = Some((day, now_unix_secs));
+    }
 }
 
 impl SealDlqWriter {
     /// Production constructor. Uses `data/dlq/`.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            dlq_dir: PathBuf::from(SEAL_DLQ_DIR),
-        }
+        Self::with_dlq_dir_for_test(PathBuf::from(SEAL_DLQ_DIR))
     }
 
     /// Test constructor. Tests pass an isolated `tempdir` to allow
@@ -235,7 +403,102 @@ impl SealDlqWriter {
     #[must_use]
     // TEST-EXEMPT: test-only helper used as construction source by every test in this module (test_append_record_then_read_all_roundtrip, test_seal_dlq_writer_clear_*, test_seal_dlq_writer_skips_corrupt_lines_gracefully, etc.). Separate name-matched test would be redundant.
     pub fn with_dlq_dir_for_test(dir: PathBuf) -> Self {
-        Self { dlq_dir: dir }
+        Self {
+            dlq_dir: dir,
+            unsynced: Mutex::new(DlqUnsynced::default()),
+            sync_failing: AtomicBool::new(false),
+            append_lock: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_write_after: Mutex::new(None),
+            #[cfg(test)]
+            failing_write_started: AtomicBool::new(false),
+        }
+    }
+
+    fn lock_unsynced(&self) -> std::sync::MutexGuard<'_, DlqUnsynced> {
+        self.unsynced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Test probe: is any DLQ write or created entry still unsynced?
+    #[cfg(test)]
+    // TEST-EXEMPT: test-only probe, exercised by the sync tests
+    pub(crate) fn has_unsynced_writes(&self) -> bool {
+        let unsynced = self.lock_unsynced();
+        unsynced.days.iter().any(Option::is_some) || unsynced.dir || unsynced.parent
+    }
+
+    /// Syncs every DLQ day file written since the last call, and the DLQ
+    /// directory entry when a day file (or the directory) was created.
+    ///
+    /// `append_record` never syncs: the frame drain's inline fallback can
+    /// reach it, and it must not wait for the device. The seal writer task
+    /// (after a cycle that escalated) and the escalation thread (after a
+    /// batch, and at exit) call this instead, off the drain. The lock is held
+    /// only to take the pending set, never across a sync. **O(days ≤ 2)**
+    /// opens and syncs, plus at most two directory syncs.
+    ///
+    /// Returns `true` when there was nothing to sync or every sync succeeded.
+    /// A failed item is put back so the next call retries it, counted on
+    /// `tv_seal_dlq_sync_failed_total{reason="sync"}`, and logged once per
+    /// failing episode. A day file removed since (replayed and cleared) has
+    /// nothing left to lose and is skipped.
+    pub fn sync_written(&self) -> bool {
+        let pending = std::mem::take(&mut *self.lock_unsynced());
+        if pending.days.iter().all(Option::is_none) && !pending.dir && !pending.parent {
+            return true;
+        }
+        let mut failed = DlqUnsynced::default();
+        let mut first_err: Option<std::io::Error> = None;
+        for (day, now_unix_secs) in pending.days.into_iter().flatten() {
+            let path = self.dlq_path(now_unix_secs);
+            let outcome = match std::fs::OpenOptions::new().append(true).open(&path) {
+                Ok(file) => file.sync_data(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = outcome {
+                failed.days[usize::from(failed.days[0].is_some())] = Some((day, now_unix_secs));
+                first_err.get_or_insert(err);
+            }
+        }
+        if pending.dir
+            && let Err(err) = sync_directory(&self.dlq_dir)
+        {
+            failed.dir = true;
+            first_err.get_or_insert(err);
+        }
+        if pending.parent
+            && let Some(parent) = self.dlq_dir.parent()
+            && let Err(err) = sync_directory(parent)
+        {
+            failed.parent = true;
+            first_err.get_or_insert(err);
+        }
+        let Some(err) = first_err else {
+            self.sync_failing.store(false, Ordering::Relaxed);
+            return true;
+        };
+        metrics::counter!(SEAL_DLQ_SYNC_FAILED_COUNTER, "reason" => "sync").increment(1);
+        {
+            let mut unsynced = self.lock_unsynced();
+            for (_, now_unix_secs) in failed.days.into_iter().flatten() {
+                unsynced.note_day(now_unix_secs);
+            }
+            unsynced.dir |= failed.dir;
+            unsynced.parent |= failed.parent;
+        }
+        if !self.sync_failing.swap(true, Ordering::Relaxed) {
+            error!(
+                code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                dlq_dir = ?self.dlq_dir,
+                ?err,
+                "seal dead-letter: syncing the day file failed; records reported written may \
+                 be lost on a power cut until a sync succeeds"
+            );
+        }
+        false
     }
 
     /// Returns the path of the DLQ file for the given UTC unix
@@ -247,7 +510,8 @@ impl SealDlqWriter {
 
     /// Append one record to the daily DLQ file as a single NDJSON
     /// line (`{...}\n`). Creates the DLQ directory + file if needed.
-    /// O(1) per call; uses `BufWriter` to coalesce small writes.
+    /// O(1) per call: one open, one `fstat`, one seek and 1-byte read of the
+    /// last byte, and one `write(2)` of the whole line.
     ///
     /// Per locked decision L-C1, this is the THIRD tier of the
     /// ring → spill → DLQ chain. If THIS append also fails, the
@@ -255,27 +519,130 @@ impl SealDlqWriter {
     /// `error!(code = ErrorCode::AggregatorDrop01.code_str())` per
     /// the AGGREGATOR-DROP-01 runbook.
     pub fn append_record(&self, record: &SealDlqRecord, now_unix_secs: i64) -> Result<()> {
+        // Serialised end to end (deep audit DA-14 review): see `append_lock`.
+        let _append = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let created_dir = !self.dlq_dir.is_dir();
         std::fs::create_dir_all(&self.dlq_dir)
             .with_context(|| format!("failed to create dlq dir {:?}", self.dlq_dir))?;
         let path = self.dlq_path(now_unix_secs);
-        let file = std::fs::OpenOptions::new()
+        // Read access too (deep audit DA-14): the last line is checked below.
+        // `append` still puts every write at the end, whatever the position.
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open dlq file {path:?}"))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(record)
+        let before = file
+            .metadata()
+            .with_context(|| format!("failed to stat dlq file {path:?}"))?
+            .len();
+        // An empty file was (almost always) just created: its directory entry
+        // must reach the device too. A false positive costs one extra
+        // directory sync. Recorded before the write so a write that fails
+        // after a partial line still gets that line synced.
+        let created_file = before == 0;
+        {
+            let mut unsynced = self.lock_unsynced();
+            unsynced.note_day(now_unix_secs);
+            unsynced.dir |= created_file;
+            unsynced.parent |= created_dir;
+        }
+        // Deep audit DA-14 (CRASH-1 partial): a file that does not end in a
+        // newline ends in a line a process died writing, or one a failed write
+        // of this process could not cut back (no appender of this process can
+        // be mid-write: they all hold `append_lock`). Appending
+        // straight after it glued the NEXT record onto that fragment, so the
+        // replay refused both as one line and lost a record this call had
+        // reported written. The line is closed with a newline first. It is
+        // counted as a refused candle only when it does not parse: a complete
+        // record that only lacks its newline is closed and replays.
+        let mut base = before;
+        let last_line = read_unterminated_last_line(&mut file, before)?;
+        if last_line != LastLine::Terminated {
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to close a torn dlq line in {path:?}"))?;
+            base = before.saturating_add(1);
+            if last_line == LastLine::Torn {
+                metrics::counter!(SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(1);
+                error!(
+                    code = ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                    source = "seal_dlq_torn_line",
+                    ?path,
+                    "seal DLQ: the file ended in a partial line (a process died mid-write, or a \
+                     failed write here could not be cut back); \
+                     it is closed with a newline so the next record is not glued to it. The \
+                     partial line is one candle the replay will refuse and count"
+                );
+            } else {
+                info!(
+                    source = "seal_dlq_torn_line",
+                    ?path,
+                    "seal DLQ: the last record was complete but lacked its newline; closed \
+                     so the next record is not glued to it (it replays normally)"
+                );
+            }
+        }
+        let mut line = serde_json::to_string(record)
             .with_context(|| "failed to serialise SealDlqRecord to JSON")?;
-        writer
-            .write_all(line.as_bytes())
-            .with_context(|| format!("failed to write dlq line to {path:?}"))?;
-        writer
-            .write_all(b"\n")
-            .with_context(|| format!("failed to write dlq newline to {path:?}"))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush dlq line to {path:?}"))?;
+        line.push('\n');
+        // One write of the whole line. On failure the file is cut back to
+        // `base`, its length before this record (after the newline that
+        // closed a torn line, which is never removed again, so a fragment is
+        // closed and counted once). Under `append_lock`, so the cut cannot
+        // reach another appender's record.
+        if let Err(err) = self.write_line(&mut file, line.as_bytes()) {
+            let cut = file.set_len(base);
+            return match cut {
+                Ok(()) => Err(err)
+                    .with_context(|| format!("failed to write dlq line to {path:?} (cut back)")),
+                Err(cut_err) => Err(err).with_context(|| {
+                    format!(
+                        "failed to write dlq line to {path:?}; cutting the partial line back \
+                         ALSO failed ({cut_err}); the next append closes it with a newline"
+                    )
+                }),
+            };
+        }
         Ok(())
+    }
+
+    /// The one `write(2)` of a DLQ line. In tests an armed one-shot lands only
+    /// part of the line, waits so concurrent appenders get every chance to
+    /// run, then fails as a full disk does.
+    fn write_line(&self, file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+        // Taken in its own statement, so the hook's mutex is released before
+        // the sleep: held across it, the hook itself would serialise the
+        // appenders and hide a missing `append_lock`.
+        #[cfg(test)]
+        let armed = self
+            .fail_next_write_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        #[cfg(test)]
+        if let Some(landed) = armed {
+            file.write_all(&bytes[..landed.min(bytes.len())])?;
+            self.failing_write_started.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "test: the disk took only part of the line",
+            ));
+        }
+        file.write_all(bytes)
+    }
+
+    /// Test hook: the next line write lands `bytes` bytes and then fails.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write_after_for_test(&self, bytes: usize) {
+        *self
+            .fail_next_write_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bytes);
     }
 
     /// Drains the daily DLQ file by reading every line into the
@@ -297,6 +664,7 @@ impl SealDlqWriter {
             .with_context(|| format!("failed to open dlq file {path:?}"))?;
         let reader = BufReader::new(file);
         let mut all = Vec::new();
+        let mut stale_refused = 0usize;
         for (line_no, line_result) in reader.lines().enumerate() {
             let line = match line_result {
                 Ok(l) => l,
@@ -317,6 +685,13 @@ impl SealDlqWriter {
                 continue;
             }
             match serde_json::from_str::<SealDlqRecord>(trimmed) {
+                // A range, not `<`: a record from a NEWER build is exactly as
+                // unreadable as an older one — the case is a deploy rollback,
+                // where this binary meets lines its successor wrote. Version 4
+                // is still read (2026-10-01): 4 → 5 renumbered nothing.
+                Ok(rec) if !seal_spill_version_is_readable(rec.format_version) => {
+                    stale_refused += 1;
+                }
                 Ok(rec) => all.push(rec),
                 Err(err) => {
                     warn!(
@@ -327,6 +702,16 @@ impl SealDlqWriter {
                     );
                 }
             }
+        }
+        if stale_refused > 0 {
+            warn!(
+                ?path,
+                stale_refused,
+                current_format_version = SEAL_SPILL_FORMAT_VERSION,
+                "refused dlq lines written under a DIFFERENT seal format version \
+                 (their tf_ordinal belongs to another timeframe numbering, so \
+                 decoding them would file a bar under the wrong timeframe)"
+            );
         }
         info!(?path, count = all.len(), "drained dlq file");
         Ok(all)
@@ -423,8 +808,9 @@ mod tests {
             low: 99.0,
             close,
             close_pct_from_prev_day: 1.5,
-            oi_pct_from_prev_day: -0.2,
-            volume_pct_from_prev_day: 12.3,
+            bucket_open_prev_close: 98.5,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
             open_pct: 7.7,
             change_pct: 1.5,
             open_gap_pct: 0.8,
@@ -459,8 +845,108 @@ mod tests {
         assert_eq!(r.low, 0.0);
         assert_eq!(r.close, 0.0);
         assert_eq!(r.close_pct_from_prev_day, 0.0);
-        assert_eq!(r.oi_pct_from_prev_day, 0.0);
-        assert_eq!(r.volume_pct_from_prev_day, 0.0);
+        assert_eq!(r.bucket_open_prev_close, 0.0);
+        assert_eq!(r.total_buy_qty, 0);
+        assert_eq!(r.total_sell_qty, 0);
+    }
+
+    /// A DLQ line from EITHER earlier era still parses — the deploy-boundary
+    /// case, now in both directions.
+    ///
+    /// `data/dlq/seals-*.ndjson` is append-only and survives a restart, so the
+    /// first boot after this change reads whatever the previous builds wrote.
+    /// Two distinct shapes exist on disk:
+    ///
+    ///   * pre-2026-09-10 — carries `bucket_open_prev_close`, which is the key
+    ///     this build writes again, so it decodes with its baseline intact.
+    ///   * 2026-09-10..2026-09-18 — carries `net_volume_signed` /
+    ///     `net_volume_classified` and NO baseline. Those keys no longer exist
+    ///     on the record, so the parse depends on them being IGNORED (no
+    ///     `deny_unknown_fields`) rather than rejected, and the missing
+    ///     baseline must default to `0.0` rather than failing.
+    ///
+    /// `0.0` is the honest reading for that second shape: the record genuinely
+    /// did not carry a baseline, and `signed_volume()` reports such a bar
+    /// positive rather than inventing a comparison.
+    #[test]
+    fn a_dlq_line_from_either_earlier_era_parses_rather_than_failing() {
+        let with_baseline = r#"{
+            "security_id": 13,
+            "exchange_segment_code": 0,
+            "feed": "dhan",
+            "tf_ordinal": 0,
+            "bucket_start_ist_secs": 1716000900,
+            "tick_count": 5,
+            "volume": 1234,
+            "bucket_start_cumulative": 1000,
+            "oi": 50000,
+            "open": 100.0,
+            "high": 105.0,
+            "low": 99.0,
+            "close": 102.5,
+            "close_pct_from_prev_day": 1.5,
+            "bucket_open_prev_close": 24200.10,
+            "total_buy_qty": 89600,
+            "total_sell_qty": 4800,
+            "open_pct": 0.0,
+            "change_pct": 0.0,
+            "open_gap_pct": 0.0
+        }"#;
+
+        let r: SealDlqRecord = serde_json::from_str(with_baseline)
+            .expect("a pre-2026-09-10 DLQ line must still parse");
+        assert_eq!(r.security_id, 13, "the rest of the record survives intact");
+        assert_eq!(r.volume, 1234);
+        assert_eq!(
+            r.bucket_open_prev_close, 24200.10,
+            "the key means what it meant before, so the baseline survives"
+        );
+
+        // The flow-era shape: the two retired keys present, the baseline absent.
+        let flow_era = r#"{
+            "security_id": 13,
+            "exchange_segment_code": 0,
+            "feed": "dhan",
+            "tf_ordinal": 0,
+            "bucket_start_ist_secs": 1716000900,
+            "tick_count": 5,
+            "volume": 1234,
+            "bucket_start_cumulative": 1000,
+            "oi": 50000,
+            "open": 100.0,
+            "high": 105.0,
+            "low": 99.0,
+            "close": 102.5,
+            "close_pct_from_prev_day": 1.5,
+            "net_volume_signed": -4242,
+            "net_volume_classified": true,
+            "total_buy_qty": 89600,
+            "total_sell_qty": 4800,
+            "open_pct": 0.0,
+            "change_pct": 0.0,
+            "open_gap_pct": 0.0
+        }"#;
+
+        let r: SealDlqRecord = serde_json::from_str(flow_era)
+            .expect("a 2026-09-10..09-18 DLQ line must parse, with the retired keys ignored");
+        assert_eq!(r.security_id, 13, "the rest of the record survives intact");
+        assert_eq!(r.volume, 1234);
+        assert_eq!(
+            r.bucket_open_prev_close, 0.0,
+            "no baseline was recorded, so none is invented"
+        );
+
+        // And the replay path it feeds signs the bar positive rather than
+        // comparing its close against a fabricated baseline.
+        let seal = SerializedSeal::from(&r);
+        let replayed = seal
+            .try_into_buffered_seal()
+            .expect("a known tf ordinal round-trips");
+        assert_eq!(
+            replayed.state.signed_volume(),
+            1234,
+            "no baseline means positive, never a sign derived from 0.0"
+        );
     }
 
     #[test]
@@ -473,7 +959,7 @@ mod tests {
 
     #[test]
     fn test_seal_dlq_record_json_field_names_are_stable_for_jq() {
-        // Operator demand: `cat data/dlq/seals-*.ndjson | jq` must
+        // Operator demand: `cat data/dlq/seals_v4-*.ndjson | jq` must
         // work. Pin the exact JSON keys so a future serde rename
         // does not silently break operator tooling.
         let r = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 102.5));
@@ -492,8 +978,9 @@ mod tests {
             "low",
             "close",
             "close_pct_from_prev_day",
-            "oi_pct_from_prev_day",
-            "volume_pct_from_prev_day",
+            "bucket_open_prev_close",
+            "total_buy_qty",
+            "total_sell_qty",
             "open_pct",
             "change_pct",
             "open_gap_pct",
@@ -522,8 +1009,9 @@ mod tests {
         assert_eq!(r.low, s.low);
         assert_eq!(r.close, s.close);
         assert_eq!(r.close_pct_from_prev_day, s.close_pct_from_prev_day);
-        assert_eq!(r.oi_pct_from_prev_day, s.oi_pct_from_prev_day);
-        assert_eq!(r.volume_pct_from_prev_day, s.volume_pct_from_prev_day);
+        assert_eq!(r.bucket_open_prev_close, s.bucket_open_prev_close);
+        assert_eq!(r.total_buy_qty, s.total_buy_qty);
+        assert_eq!(r.total_sell_qty, s.total_sell_qty);
     }
 
     #[test]
@@ -553,8 +1041,9 @@ mod tests {
             low: 0.0,
             close: 0.0,
             close_pct_from_prev_day: -3.5,
-            oi_pct_from_prev_day: -10.0,
-            volume_pct_from_prev_day: -100.0,
+            bucket_open_prev_close: 98.5,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
             open_pct: -50.0,
             change_pct: -3.5,
             open_gap_pct: -1.2,
@@ -574,7 +1063,12 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc_noon);
-        assert_eq!(name, "seals-2026-01-01.ndjson");
+        assert_eq!(name, "seals_v4-2026-01-01.ndjson");
+        assert!(name.starts_with(crate::seal_writer_task::SEAL_FILE_PREFIX));
+        assert!(
+            !name.starts_with(crate::seal_writer_task::LEGACY_SEAL_FILE_PREFIX),
+            "a v4 DLQ file must be invisible to a pre-v4 binary's drain"
+        );
         assert!(name.ends_with(".ndjson"));
     }
 
@@ -587,7 +1081,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let name = ist_date_filename(utc);
-        assert_eq!(name, "seals-2026-05-10.ndjson");
+        assert_eq!(name, "seals_v4-2026-05-10.ndjson");
     }
 
     #[test]
@@ -613,7 +1107,7 @@ mod tests {
             .expect("valid")
             .timestamp();
         let p = writer.dlq_path(utc_noon);
-        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.ndjson"));
+        assert!(p.to_string_lossy().ends_with("seals_v4-2026-05-10.ndjson"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -635,6 +1129,123 @@ mod tests {
         assert_eq!(drained[0], r1);
         assert_eq!(drained[1], r2);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_sync_written_syncs_each_written_day_and_its_new_directory_entries() {
+        // 2026-10-04: the DLQ was flushed to the page cache and never synced.
+        // `append_record` records what to sync (it never syncs: the drain's
+        // inline fallback reaches it); `sync_written` syncs it and clears it.
+        let root = temp_dlq_dir("sync-written");
+        let dir = root.join("dlq");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        assert!(writer.sync_written(), "nothing written is a clean no-op");
+        let day_one = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .unwrap_or_else(|| panic!("valid"))
+            .timestamp();
+        let day_two = day_one + 86_400;
+        let record = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        writer
+            .append_record(&record, day_one)
+            .unwrap_or_else(|err| panic!("append day one: {err}"));
+        writer
+            .append_record(&record, day_two)
+            .unwrap_or_else(|err| panic!("append day two: {err}"));
+        {
+            let unsynced = writer.lock_unsynced();
+            assert_eq!(
+                unsynced.days.iter().flatten().count(),
+                2,
+                "both days must be pending"
+            );
+            assert!(unsynced.dir, "a new day file's entry must be pending");
+            assert!(unsynced.parent, "the created directory's entry too");
+        }
+        assert!(writer.sync_written(), "both days must sync");
+        assert!(!writer.has_unsynced_writes(), "a clean sync clears the set");
+        // A second record on an existing, non-empty file needs no directory
+        // sync, only the file.
+        writer
+            .append_record(&record, day_two)
+            .unwrap_or_else(|err| panic!("append again: {err}"));
+        {
+            let unsynced = writer.lock_unsynced();
+            assert!(!unsynced.dir && !unsynced.parent, "no new entry was made");
+            assert_eq!(unsynced.days.iter().flatten().count(), 1);
+        }
+        // A day file replayed and removed in between has nothing to lose.
+        writer
+            .clear_dlq_for_date(day_two)
+            .unwrap_or_else(|err| panic!("clear: {err}"));
+        assert!(writer.sync_written(), "a removed day file is skipped");
+        assert!(!writer.has_unsynced_writes());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_note_day_keeps_the_two_newest_days_when_a_third_arrives_unsynced() {
+        let mut unsynced = DlqUnsynced::default();
+        unsynced.note_day(0);
+        unsynced.note_day(86_400);
+        unsynced.note_day(86_400 + 60);
+        assert_eq!(
+            unsynced.days.iter().flatten().count(),
+            2,
+            "same day is one slot"
+        );
+        unsynced.note_day(2 * 86_400);
+        let mut days: Vec<i64> = unsynced.days.iter().flatten().map(|(d, _)| *d).collect();
+        days.sort_unstable();
+        assert_eq!(
+            days,
+            vec![ist_day_number(86_400), ist_day_number(2 * 86_400)],
+            "the oldest day is the one given up"
+        );
+    }
+
+    #[test]
+    fn test_append_record_never_syncs_and_sync_written_holds_no_lock() {
+        // `append_record` is reachable from the frame drain's inline fallback,
+        // so it must never wait for the device; `sync_written` must release
+        // the lock before it syncs, or an inline append would wait for it.
+        let src = include_str!("seal_dlq.rs");
+        let body = |name: &str| {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let rest = &src[start..];
+            let end = rest.find("\n    ///").unwrap_or(rest.len());
+            &rest[..end]
+        };
+        let append = body("pub fn append_record(");
+        assert!(
+            !append.contains("sync_data") && !append.contains("sync_all"),
+            "append_record must never sync"
+        );
+        let sync = body("pub fn sync_written(");
+        let taken = sync
+            .find("std::mem::take")
+            .unwrap_or_else(|| panic!("the pending set must be taken"));
+        // The guard is a temporary of the `take` statement, so it is dropped
+        // at that statement's end, before any sync.
+        assert!(
+            sync[taken..].starts_with("std::mem::take(&mut *self.lock_unsynced());"),
+            "the lock must live only for the take"
+        );
+        assert!(!sync[..taken].contains("sync_data"));
+        let first_sync = sync
+            .find("sync_data")
+            .unwrap_or_else(|| panic!("the day files must be synced"));
+        let after_take = taken + "std::mem::take(&mut *self.lock_unsynced());".len();
+        assert!(
+            sync[after_take..first_sync]
+                .matches("lock_unsynced")
+                .count()
+                == 0,
+            "no lock may be held across a sync"
+        );
     }
 
     #[test]
@@ -708,6 +1319,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Deep audit DA-14 (CRASH-1 partial): a DLQ file left ending in a
+    /// partial line (a process died mid-write) must not swallow the next
+    /// record. Before, the next append glued itself onto the fragment and the
+    /// replay refused both as one line: a record reported written was lost.
+    #[test]
+    fn test_regression_da14_torn_last_line_does_not_swallow_the_next_record() {
+        let dir = temp_dlq_dir("da14-torn-line");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        writer.append_record(&r1, now).expect("append r1");
+        // The crash: half a JSON line, no newline.
+        let path = writer.dlq_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            f.write_all(b"{\"security_id\":51,\"exchange_seg")
+                .expect("write torn line");
+        }
+        writer.append_record(&r2, now).expect("append r2");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained,
+            vec![r1, r2],
+            "the record appended after the tear must survive whole"
+        );
+        let text = std::fs::read_to_string(&path).expect("read text");
+        assert_eq!(text.lines().count(), 3, "r1, the closed fragment, r2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn test_seal_dlq_writer_skips_blank_lines_silently() {
         // A trailing newline produces a blank line on read — must be
@@ -751,7 +1400,7 @@ mod tests {
             let r = SealDlqRecord::from(&mk_serialized_seal(
                 13,
                 0,
-                (i % 9) as u8,
+                (i as usize % tickvault_trading::candles::tf_index::TF_COUNT) as u8,
                 1_716_000_000 + i,
                 100.0 + i as f64,
             ));
@@ -762,7 +1411,10 @@ mod tests {
         for (i, r) in drained.iter().enumerate() {
             assert_eq!(r.bucket_start_ist_secs, 1_716_000_000 + i as u32);
             assert_eq!(r.close, 100.0 + i as f64);
-            assert_eq!(r.tf_ordinal, (i % 9) as u8);
+            assert_eq!(
+                r.tf_ordinal,
+                (i % tickvault_trading::candles::tf_index::TF_COUNT) as u8
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -847,5 +1499,223 @@ mod tests {
 
         assert_eq!(dlq_bytes_at(&dir), 1000, "only .ndjson records count");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- deep audit DA-14 review: the DLQ append is serialised ----------
+
+    /// Counts one counter name through a recorder scoped with
+    /// `metrics::with_local_recorder` (never a global install).
+    struct TornLineRecorder {
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    struct TornLineCounter {
+        total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl metrics::CounterFn for TornLineCounter {
+        fn increment(&self, value: u64) {
+            self.total
+                .fetch_add(value, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn absolute(&self, _: u64) {}
+    }
+
+    impl metrics::Recorder for TornLineRecorder {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            if key.name() == SEAL_DLQ_TORN_LINE_CLOSED_COUNTER {
+                metrics::Counter::from_arc(std::sync::Arc::new(TornLineCounter {
+                    total: std::sync::Arc::clone(&self.total),
+                }))
+            } else {
+                metrics::Counter::noop()
+            }
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    fn da14_now() -> i64 {
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp()
+    }
+
+    #[test]
+    fn test_fail_next_write_after_for_test_fails_exactly_one_write() {
+        let dir = temp_dlq_dir("da14-one-shot");
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let record = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 1.0));
+        writer.fail_next_write_after_for_test(5);
+        assert!(writer.append_record(&record, now).is_err());
+        writer.append_record(&record, now).expect("one shot only");
+        assert_eq!(writer.read_all(now).expect("read"), vec![record]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One appender's failed write cuts back only its own partial line:
+    /// records other threads append meanwhile, and were told were written,
+    /// all survive. Without the append lock the cut-back to the length the
+    /// failing appender saw deleted them.
+    #[test]
+    fn test_regression_da14_failed_dlq_write_never_cuts_another_appenders_record() {
+        let dir = temp_dlq_dir("da14-concurrent-cut");
+        let writer = std::sync::Arc::new(SealDlqWriter::with_dlq_dir_for_test(dir.clone()));
+        let now = da14_now();
+        writer
+            .append_record(
+                &SealDlqRecord::from(&mk_serialized_seal(1, 0, 0, 1_716_000_900, 1.0)),
+                now,
+            )
+            .expect("first record");
+        writer.fail_next_write_after_for_test(20);
+        let failing = {
+            let writer = std::sync::Arc::clone(&writer);
+            std::thread::spawn(move || {
+                writer.append_record(
+                    &SealDlqRecord::from(&mk_serialized_seal(2, 0, 0, 1_716_000_900, 2.0)),
+                    now,
+                )
+            })
+        };
+        // Start the others only once the failing append holds its partial
+        // line, so the one-shot cannot be taken by another thread.
+        let started = std::time::Instant::now();
+        while !writer
+            .failing_write_started
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        let mut appenders = Vec::new();
+        for thread in 0..3u64 {
+            let writer = std::sync::Arc::clone(&writer);
+            appenders.push(std::thread::spawn(move || {
+                let mut written = 0usize;
+                for i in 0..40u64 {
+                    let sid = 100 + thread * 1_000 + i;
+                    let record =
+                        SealDlqRecord::from(&mk_serialized_seal(sid, 0, 0, 1_716_000_900, 3.0));
+                    if writer.append_record(&record, now).is_ok() {
+                        written += 1;
+                    }
+                }
+                written
+            }));
+        }
+        assert!(
+            failing.join().expect("join").is_err(),
+            "the armed write fails"
+        );
+        let written: usize = appenders.into_iter().map(|h| h.join().expect("join")).sum();
+        assert_eq!(written, 120, "every other append succeeded");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(
+            drained.len(),
+            1 + written,
+            "every record reported written must replay; the failed one must not"
+        );
+        assert!(drained.iter().all(|record| record.security_id != 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A torn line is closed and counted ONCE: a failed append after the
+    /// close cuts back to just past the closing newline, so the next append
+    /// finds the line closed and does not count it again.
+    #[test]
+    fn test_regression_da14_torn_line_is_counted_once_across_a_failed_append() {
+        let dir = temp_dlq_dir("da14-count-once");
+        let recorder = TornLineRecorder {
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        let r3 = SealDlqRecord::from(&mk_serialized_seal(51, 0, 4, 1_716_001_500, 300.0));
+        writer.append_record(&r1, now).expect("append r1");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(writer.dlq_path(now))
+                .expect("open append");
+            f.write_all(b"{\"security_id\":51,\"exch").expect("torn");
+        }
+        metrics::with_local_recorder(&recorder, || {
+            writer.fail_next_write_after_for_test(10);
+            assert!(writer.append_record(&r2, now).is_err(), "armed write fails");
+            writer.append_record(&r3, now).expect("append r3");
+        });
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one torn fragment, counted once"
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![r1, r3]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A last record that is complete but lacks its newline is closed and
+    /// replays; it is not counted as a refused candle.
+    #[test]
+    fn test_regression_da14_complete_unterminated_record_is_closed_not_counted() {
+        let dir = temp_dlq_dir("da14-complete-unterminated");
+        let recorder = TornLineRecorder {
+            total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let writer = SealDlqWriter::with_dlq_dir_for_test(dir.clone());
+        let now = da14_now();
+        let r1 = SealDlqRecord::from(&mk_serialized_seal(13, 0, 0, 1_716_000_900, 100.0));
+        let r2 = SealDlqRecord::from(&mk_serialized_seal(25, 0, 4, 1_716_001_500, 200.0));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let line = serde_json::to_string(&r1).expect("json");
+        std::fs::write(writer.dlq_path(now), line.as_bytes()).expect("seed");
+        metrics::with_local_recorder(&recorder, || {
+            writer.append_record(&r2, now).expect("append r2");
+        });
+        assert_eq!(
+            recorder.total.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a complete record is not a refused candle"
+        );
+        assert_eq!(writer.read_all(now).expect("read"), vec![r1, r2]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

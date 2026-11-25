@@ -25,6 +25,15 @@ const QUOTE_CACHE_TTL_SECS: u64 = 1;
 /// `board_data` handler docs).
 const BOARD_CACHE_TTL_SECS: u64 = 2;
 
+/// TTL for the cached `/api/debug/speed-health` body (owner 2026-10-30). The
+/// `/dashboard` page polls every 5 s, so one QuestDB-and-metrics pass per 5 s
+/// covers any number of open tabs.
+const SPEED_HEALTH_CACHE_TTL_SECS: u64 = 5;
+/// TTL for the cached `/api/fno-stocks` response body (2026-10-30). The
+/// dashboard polls every 5 s, so each poll sees a fresh answer; a burst of
+/// tabs costs at most one movers query per 2 s while QuestDB is healthy.
+const FNO_STOCKS_CACHE_TTL_SECS: u64 = 2;
+
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::feed_health::FeedHealthRegistry;
 
@@ -134,13 +143,18 @@ impl SystemHealthStatus {
 
     /// Whether ANY producer has ever pushed a websocket connection count.
     ///
-    /// `false` means "no writer exists" — the live market-data WebSocket
-    /// feeds were retired (Dhan 2026-07-13, Groww 2026-07-15) and the Dhan
-    /// pool watchdog was deleted with the lane, so nothing calls
-    /// [`SystemHealthStatus::set_websocket_connections`] today. `/health`
-    /// renders that as `retired`, never as `disconnected`, and
+    /// `false` means "no writer exists". `/health` renders that as `retired`,
+    /// never as `disconnected`, and
     /// [`SystemHealthStatus::overall_status`] skips the connection-count
     /// predicate while it holds.
+    ///
+    /// **The producer exists again as of 2026-08-22.** It died with the Dhan
+    /// live lane (retired 2026-07-13, Groww 2026-07-15) and the revival
+    /// (2026-08-09, default ON 2026-08-11) did not replace it, so for eleven
+    /// days a box running sixteen sockets still answered `retired` here.
+    /// `dhan_feed_stack::publish_alive_connections` now pushes the live count
+    /// on every socket transition, which arms this flag on the first dial.
+    /// A dhan-off boot still reads `false`, which is the truth on that boot.
     pub fn websocket_reported(&self) -> bool {
         self.websocket_reported.load(Ordering::Relaxed)
     }
@@ -372,13 +386,26 @@ struct AppStateInner {
     /// TTL cache for the `/api/stats` response body (2026-07-09 audit
     /// hardening — public-funnel DoS/DB-load surface). Single slot, 5s TTL.
     stats_cache: crate::response_cache::SingleSlotTtlCache,
-    /// TTL cache for `/api/quote/{security_id}` 200 bodies. Per-SID, 1s TTL,
+    /// TTL cache for `/api/quote/{security_id}` 200 bodies. Per-(SID, segment), 1s TTL,
     /// hard entry cap; the handler caches ONLY 200 responses so garbage
     /// attacker-chosen security_ids can never grow the map.
     quote_cache: crate::response_cache::BoundedTtlCache,
     /// TTL cache for the `/api/board/data` response body (2026-07-09
     /// follow-up). Single slot, 2s TTL — see [`BOARD_CACHE_TTL_SECS`].
     board_cache: crate::response_cache::SingleSlotTtlCache,
+    /// TTL cache for the `/api/debug/speed-health` body. Single slot, 5 s TTL.
+    speed_health_cache: crate::response_cache::SingleSlotTtlCache,
+    /// Single-flight lock for a speed-health cache miss, so concurrent misses
+    /// run one pass instead of one each.
+    speed_health_refresh: tokio::sync::Mutex<()>,
+    /// Address of this process's own metrics page, set once at boot from
+    /// `[observability]` when metrics are on; unset in tests and when off, in
+    /// which case the speed-health figures read from it show "not available".
+    metrics_scrape_url: std::sync::OnceLock<String>,
+    /// TTL cache for the `/api/fno-stocks` response body (2026-10-30).
+    /// Single slot, 2s TTL — see [`FNO_STOCKS_CACHE_TTL_SECS`].
+    fno_stocks_cache: crate::response_cache::SingleSlotTtlCache,
+    stock_movers_cache: crate::handlers::stock_movers::MoversCache,
 }
 
 impl SharedAppState {
@@ -461,6 +488,15 @@ impl SharedAppState {
                 board_cache: crate::response_cache::SingleSlotTtlCache::new(
                     std::time::Duration::from_secs(BOARD_CACHE_TTL_SECS),
                 ),
+                speed_health_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(SPEED_HEALTH_CACHE_TTL_SECS),
+                ),
+                metrics_scrape_url: std::sync::OnceLock::new(),
+                speed_health_refresh: tokio::sync::Mutex::new(()),
+                stock_movers_cache: crate::handlers::stock_movers::MoversCache::default(),
+                fno_stocks_cache: crate::response_cache::SingleSlotTtlCache::new(
+                    std::time::Duration::from_secs(FNO_STOCKS_CACHE_TTL_SECS),
+                ),
             }),
         }
     }
@@ -527,6 +563,40 @@ impl SharedAppState {
     // TEST-EXEMPT: trivial accessor; exercised by the board-handler cache test.
     pub fn board_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
         &self.inner.board_cache
+    }
+
+    /// Returns the `/api/debug/speed-health` TTL response cache (5 s).
+    // TEST-EXEMPT: trivial accessor; exercised by the speed-health handler cache test.
+    pub fn speed_health_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.speed_health_cache
+    }
+
+    /// The single-flight lock a speed-health cache miss holds while it
+    /// computes (owner 2026-10-30).
+    pub fn speed_health_refresh(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.speed_health_refresh
+    }
+
+    /// Sets the address of this process's own metrics page. The first call
+    /// wins; returns `false` when it was already set (the address is fixed for
+    /// the process lifetime, like the config it comes from).
+    pub fn set_metrics_scrape_url(&self, url: String) -> bool {
+        self.inner.metrics_scrape_url.set(url).is_ok()
+    }
+
+    /// The metrics-page address, or `None` when metrics are off or not set.
+    pub fn metrics_scrape_url(&self) -> Option<&str> {
+        self.inner.metrics_scrape_url.get().map(String::as_str)
+    }
+
+    /// Returns the `/api/fno-stocks` TTL response cache (2026-10-30).
+    // TEST-EXEMPT: trivial accessor; exercised by the fno-stocks cache test.
+    pub(crate) fn stock_movers_cache(&self) -> &crate::handlers::stock_movers::MoversCache {
+        &self.inner.stock_movers_cache
+    }
+
+    pub fn fno_stocks_cache(&self) -> &crate::response_cache::SingleSlotTtlCache {
+        &self.inner.fno_stocks_cache
     }
 }
 
@@ -598,7 +668,7 @@ mod tests {
         use tickvault_common::config::FeedsConfig;
         let fr = Arc::new(FeedRuntimeState::from_config(&FeedsConfig {
             dhan_enabled: true,
-            groww_enabled: true,
+            truedata_enabled: true,
             ..Default::default()
         }));
         let state = SharedAppState::new_with_feed_runtime(
@@ -614,10 +684,10 @@ mod tests {
             Arc::clone(&fr),
         );
         // The accessor returns the SAME shared runtime instance we injected.
-        assert!(state.feed_runtime().is_enabled(Feed::Groww));
-        fr.set_enabled(Feed::Groww, false);
+        assert!(state.feed_runtime().is_enabled(Feed::Truedata));
+        fr.set_enabled(Feed::Truedata, false);
         assert!(
-            !state.feed_runtime().is_enabled(Feed::Groww),
+            !state.feed_runtime().is_enabled(Feed::Truedata),
             "AppState shares the one Arc — a flip is observed through it"
         );
     }

@@ -79,7 +79,7 @@ PrevClose packet for non-index instruments.
 | 07c-conditional-trigger.md | PASS | Equities/Indices only, indicator names |
 | 07d-edis.md | PASS | T-PIN flow, CDSL mandate |
 | 07e-postback.md | PASS | snake_case filled_qty (noted inconsistency) |
-| 08-annexure-enums.md | PASS | Exchange segment gap at 6, FeedRequestCode 25 not 24, rate limits |
+| 08-annexure-enums.md | PASS | Exchange segment gap at 6, FeedRequestCode 25 not 24 *(⚠ SUPERSEDED 2026-09-10: 25 proven IGNORED live, 24 ships)*, rate limits |
 | instrument-master.md | PASS | Daily refresh, detailed CSV for F&O |
 | live-order-update.md | PASS | JSON not binary, MsgCode 42, single-char codes |
 | market-quote.md | PASS | `client-id` header, 1/sec rate limit, string response keys |

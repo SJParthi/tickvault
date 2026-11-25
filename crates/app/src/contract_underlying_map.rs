@@ -1,0 +1,2267 @@
+//! Which underlying a contract belongs to — the one lookup the ranking needs
+//! and the drain does not have.
+//!
+//! ## Why this exists
+//!
+//! `option_rank::RankedContract` carries an `underlying_id`, and it is
+//! load-bearing twice: the depth-200 selector requires five DISTINCT
+//! underlyings, and gainer eligibility is judged per underlying. A tick
+//! carries neither — it has the contract's own id and nothing else.
+//!
+//! ## Where the answer comes from: the daily MASTER, at attach
+//!
+//! ⚠ **CORRECTED 2026-09-06, before this module ever ran.** The first version
+//! of this header named the per-minute option-chain REST leg as the source —
+//! *"the chain leg already stores BOTH ids on every row it writes"* — and that
+//! is TRUE of the rows it writes and USELESS for the family that matters.
+//!
+//! `CHAIN_1M_UNDERLYINGS` (`constants.rs`) is a **const-asserted 3-element
+//! array**: NIFTY=13, BANKNIFTY=25, SENSEX=51. Every one is an INDEX. So
+//! `option_chain_1m` holds only index-option legs — roughly 1,250 contracts —
+//! and holds NOTHING for the ~20,220 STOCK options, which are the **only**
+//! family the 2026-09-06 depth lock subscribes (*"for depth 20 and depth 200
+//! only stocks options contracts strikes dude okay? No underlying spot or
+//! futures or indices or indices fmo"*).
+//!
+//! Wired that way this map would have answered for exactly the family that
+//! must never reach depth and returned `None` for the family that must. The
+//! stock leaderboard would have ranked nothing, depth would have subscribed
+//! nothing, and no counter would have moved — the false-OK class, inside the
+//! change meant to deliver the operator's ask. It is recorded rather than
+//! quietly rewritten because the reasoning error is the reusable part: the
+//! chain leg IS the right source for `dhan_depth_universe`, whose layout was
+//! index ATM pairs, and citing that precedent carried a premise the
+//! 2026-09-06 lock had already retired.
+//!
+//! **The source is the pair of daily artifacts**, which is what the plan's own
+//! settled Decision B says (`active-plan-volume-depth-steering.md` — *"the
+//! contract artifact, at attach"*) and what `dhan_depth_universe` already
+//! joins at attach. `ContractRow` says which contracts exist and what class
+//! each is (`OPTIDX`/`OPTSTK` — the family); the mapping artifact resolves an
+//! underlying SYMBOL to an id. [`legs_from_artifact`] performs that join.
+//!
+//! That covers BOTH families, and it is the source that DETERMINES the
+//! subscription — so the map cannot drift from what is actually subscribed,
+//! which a second, narrower source can and would.
+//!
+//! **No new REST call, no new table, no rule-file edit.** `/marketfeed/quote`
+//! stays FORBIDDEN (`no-rest-except-live-feed-2026-06-27.md` §11.3) and is not
+//! needed; the master is already downloaded and parsed every morning.
+//!
+//! ## Why `ArcSwap` and not a lock
+//!
+//! The writer is the attach path; the reader is the frame drain, on the hot
+//! path. The attach rebuilds the WHOLE mapping rather than mutating it, so the
+//! natural shape is publish-a-new-snapshot: readers take a lock-free `load()`
+//! and never block, and a rebuild never contends with a tick. That is the
+//! `token_manager` pattern this repository already uses for the same reason.
+//!
+//! A `Mutex` would put the drain behind a lock held by a rebuild of ~21,000
+//! entries — small, but on the only task emptying the socket, which is the
+//! drain-stall shape that ends in upstream tick loss.
+//!
+//! ## Complexity
+//!
+//! Lookup is **O(1) average**: one atomic load plus one hash probe on the
+//! I-P1-11 composite key. Zero allocation on the read path — `load()` returns
+//! a guard, not a clone of the map. A rebuild is O(n) in the legs and happens
+//! ONCE PER DAY on the attach path, never on the drain.
+//!
+//! [`legs_from_artifact`] is ONE O(n) pass over the contract rows with one
+//! hash probe each — never a per-contract scan for its underlying, which would
+//! be O(contracts x underlyings).
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use tickvault_common::types::ExchangeSegment;
+use tickvault_core::websocket::pool_supervisor::SubscribeInstrument;
+
+use crate::dhan_contract_universe::ContractRow;
+use crate::option_rank::OptionFamily;
+
+/// The I-P1-11 composite identity of a contract. The bare `security_id` is
+/// reused across segments, so keying on it alone would let one segment's
+/// contract answer for another's.
+pub type ContractKey = (u64, ExchangeSegment);
+
+/// The contract-to-owner table [`ContractUnderlyingMap::owner_of`] probes on
+/// every option tick. Hashed with `ahash` rather than SipHash (audit plan
+/// PR10): faster on a short integer key, and still keyed at random per process.
+pub type OwnerMap = HashMap<ContractKey, ContractOwner, ahash::RandomState>;
+
+/// Ceiling on tracked contracts. Matches the authorized subscription universe
+/// and every other per-instrument map in the lane, so one figure covers them
+/// all and there is no second number to keep in step.
+pub const MAX_TRACKED_CONTRACTS: usize = 25_000;
+
+/// Counter for legs refused while building a snapshot.
+pub const REFUSED_COUNTER: &str = "tv_contract_underlying_refused_total";
+
+/// Why a leg was left out of a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegRefusal {
+    /// `contract_security_id` was the parser's absent-field default, or
+    /// otherwise not a usable id.
+    ZeroOrNegativeContractId,
+    /// The underlying's id was missing or not usable.
+    ZeroOrNegativeUnderlyingId,
+    /// The underlying SYMBOL is not in the mapping artifact, so the contract
+    /// cannot be grouped. Expected in small numbers on any day the two
+    /// artifacts were built from different masters.
+    UnresolvedUnderlyingSymbol,
+    /// The contract is on an exchange this lane does not subscribe (BSE and
+    /// everything beyond NSE derivatives).
+    UnsupportedSegment,
+    /// The underlying resolved, but to the WRONG CLASS — an index option
+    /// pointing at an equity, or a stock option at an index. The mapping
+    /// artifact is a union keyed on symbol, so a name present as both
+    /// resolves by file order; refusing is what stops that order deciding a
+    /// a contract's grouping.
+    UnderlyingClassMismatch,
+    /// The master carried no usable `LOT_SIZE` for this contract.
+    ///
+    /// REFUSED rather than defaulted to 1. A lot size is the divisor that
+    /// turns traded units into lots, so defaulting it leaves that contract
+    /// ranked in RAW UNITS while every sibling is ranked in lots — which puts
+    /// it at the top of the board by a factor of its own lot size and hands a
+    /// depth socket to whichever contract the master happened to be missing a
+    /// column for. A contract absent from the board is visible in this
+    /// counter; a contract wrongly at the top of it is not.
+    MissingLotSize,
+    /// The snapshot is at its ceiling.
+    AtCapacity,
+}
+
+impl LegRefusal {
+    /// Every variant, so the counter can be seeded exhaustively.
+    ///
+    /// A const array rather than a derive: adding a variant without adding it
+    /// here leaves that reason's series unseeded, and an unseeded series is one
+    /// the CloudWatch agent drops on its first sample -- silent on the one day
+    /// it fires. `all_variants_are_in_the_seed_list` pins that this stays whole.
+    pub const ALL: [Self; 7] = [
+        Self::ZeroOrNegativeContractId,
+        Self::ZeroOrNegativeUnderlyingId,
+        Self::UnresolvedUnderlyingSymbol,
+        Self::UnsupportedSegment,
+        Self::UnderlyingClassMismatch,
+        Self::MissingLotSize,
+        Self::AtCapacity,
+    ];
+
+    /// Stable label for the refusal counter.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ZeroOrNegativeContractId => "zero_contract_id",
+            Self::ZeroOrNegativeUnderlyingId => "zero_underlying_id",
+            Self::UnresolvedUnderlyingSymbol => "unresolved_underlying_symbol",
+            Self::UnsupportedSegment => "unsupported_segment",
+            Self::UnderlyingClassMismatch => "underlying_class_mismatch",
+            Self::MissingLotSize => "missing_lot_size",
+            Self::AtCapacity => "at_capacity",
+        }
+    }
+}
+
+/// One option contract's identity, reduced to what the ranking needs.
+///
+/// Deliberately NOT a master row or a chain row: this module needs exactly
+/// five fields, and taking a whole vendor row would couple the ranking to
+/// whichever producer happened to be wired first — which is the coupling that
+/// produced the corrected source claim in this module's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegIds {
+    /// The option contract's own security id.
+    pub contract_security_id: i64,
+    /// The underlying's security id.
+    pub underlying_security_id: i64,
+    /// The CONTRACT's segment — not the underlying's.
+    ///
+    /// The two genuinely differ: an index option's underlying sits in
+    /// `IDX_I` while the contract is subscribed under `NSE_FNO`, and a stock
+    /// option's underlying is `NSE_EQ`. Filing a contract under its
+    /// underlying's segment would put every entry under a segment no tick
+    /// ever arrives on, and every lookup would miss SILENTLY (I-P1-11).
+    pub contract_segment: ExchangeSegment,
+    /// Which leaderboard this contract belongs in.
+    ///
+    /// Carried on the SAME row as the underlying id, and that is the point:
+    /// the two facts come from one master row, so they cannot disagree. A
+    /// second, separately-built family map could drift from this one, and the
+    /// drift would be invisible — a stock option ranked as an index option
+    /// simply never reaches depth.
+    pub family: OptionFamily,
+    /// Contract multiplier from the master's `LOT_SIZE` column — how many
+    /// units one lot is.
+    ///
+    /// Guaranteed non-zero: [`legs_from_artifact`] refuses a leg whose master
+    /// row carried no usable lot size rather than defaulting it, so a divide
+    /// by this value cannot fault and cannot silently rank one contract in a
+    /// different unit from its siblings.
+    pub lot_size: u32,
+}
+
+/// What the map answers: who a contract belongs to, and which board it is on.
+///
+/// One value rather than two maps, so the per-tick path is ONE hash probe and
+/// the two facts are physically incapable of disagreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContractOwner {
+    /// The underlying's security id — the depth-200 distinct-underlying key.
+    pub underlying_id: u64,
+    /// Which leaderboard the contract is ranked on.
+    pub family: OptionFamily,
+    /// Units per lot, from the daily master. Always non-zero — see [`LegIds`].
+    ///
+    /// Carried HERE, on the same value the drain already looks up, so the
+    /// ranking path pays ONE hash probe for owner, family and multiplier
+    /// together. A separate lot-size map would be a second probe on the hot
+    /// path and a second thing that can go missing independently.
+    pub lot_size: u32,
+}
+
+/// What building a snapshot produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotBuild {
+    /// Contracts in the snapshot.
+    pub accepted: usize,
+    /// Legs left out, with the reason.
+    pub refusals: Vec<(i64, LegRefusal)>,
+}
+
+/// Builds a mapping snapshot from one minute's chain legs. Pure.
+///
+/// A later leg for the same contract overwrites an earlier one — the chain is
+/// a snapshot of one minute, so a repeat is a re-observation, not a conflict.
+#[must_use]
+pub fn build_snapshot(legs: &[LegIds]) -> (OwnerMap, SnapshotBuild) {
+    let mut map: OwnerMap = HashMap::with_capacity_and_hasher(
+        legs.len().min(MAX_TRACKED_CONTRACTS),
+        ahash::RandomState::new(),
+    );
+    let mut refusals = Vec::new();
+
+    for leg in legs {
+        // `contract_security_id` defaults to 0 when the vendor omits the
+        // field, and `dhan_depth_universe` already filters on the same value
+        // for the same reason: a zero id would map a real contract onto
+        // instrument 0.
+        let Ok(contract_id) = u64::try_from(leg.contract_security_id) else {
+            refusals.push((
+                leg.contract_security_id,
+                LegRefusal::ZeroOrNegativeContractId,
+            ));
+            continue;
+        };
+        if contract_id == 0 {
+            refusals.push((
+                leg.contract_security_id,
+                LegRefusal::ZeroOrNegativeContractId,
+            ));
+            continue;
+        }
+        let Ok(underlying_id) = u64::try_from(leg.underlying_security_id) else {
+            refusals.push((
+                leg.contract_security_id,
+                LegRefusal::ZeroOrNegativeUnderlyingId,
+            ));
+            continue;
+        };
+        if underlying_id == 0 {
+            refusals.push((
+                leg.contract_security_id,
+                LegRefusal::ZeroOrNegativeUnderlyingId,
+            ));
+            continue;
+        }
+        // Enforced HERE and not only in `legs_from_artifact`, because this is
+        // the function that CONSTRUCTS `ContractOwner`, and that type's
+        // contract says its lot size is never zero. A caller assembling legs
+        // by hand — a test, or a future second producer — must not be able to
+        // publish a value that makes a divide fault on the drain.
+        if leg.lot_size == 0 {
+            refusals.push((leg.contract_security_id, LegRefusal::MissingLotSize));
+            continue;
+        }
+        let key = (contract_id, leg.contract_segment);
+        // An UPDATE to a contract already in the snapshot is always allowed;
+        // only a NEW contract can hit the ceiling. Refusing the update would
+        // pin a stale underlying against a contract that had moved.
+        if map.len() >= MAX_TRACKED_CONTRACTS && !map.contains_key(&key) {
+            refusals.push((leg.contract_security_id, LegRefusal::AtCapacity));
+            continue;
+        }
+        map.insert(
+            key,
+            ContractOwner {
+                underlying_id,
+                family: leg.family,
+                lot_size: leg.lot_size,
+            },
+        );
+    }
+
+    let accepted = map.len();
+    (map, SnapshotBuild { accepted, refusals })
+}
+
+/// Turns the two daily artifacts into ranking legs — the ONLY producer wired
+/// to production, and the correction recorded in this module's header.
+///
+/// # Why these two inputs
+///
+/// This is the join `dhan_depth_universe::load_depth_candidates` already
+/// performs at attach, on the same two artifacts, for the same reason: the
+/// contract artifact says WHICH contracts exist and what class each is, and
+/// the mapping artifact resolves an underlying SYMBOL to an id. Neither
+/// answers alone.
+///
+/// Reusing the production pair rather than re-parsing the master is what keeps
+/// the ranking map and the SUBSCRIPTION derived from one source. A separately
+/// parsed master would be a second derivation that can drift, and the drift
+/// would be invisible — a contract ranked under an underlying the subscription
+/// path does not use simply never groups correctly.
+///
+/// # The class check is a refusal, not a preference
+///
+/// `parse_symbol_map` is a UNION of the index mappings and the F&O underlying
+/// mappings, and it inserts by symbol — so a name present as both an index and
+/// an equity resolves to whichever the artifact listed last. Rather than
+/// inherit that file-order dependency, this checks the segment the map carries
+/// against the contract's own class: an `OPTIDX` must resolve to an `IDX_I`
+/// underlying and an `OPTSTK` to an `NSE_EQ` one. A mismatch is REFUSED and
+/// counted, never accepted — a contract grouped under the wrong underlying
+/// breaks the depth-200 distinct-underlying rule silently, which is worse than
+/// one contract missing from the board.
+///
+/// # The lot size is a refusal for the same reason
+///
+/// A missing `LOT_SIZE` is refused, never defaulted to 1. The lot size is the
+/// divisor that puts every contract's traded volume in the SAME unit, so a
+/// contract that keeps its raw units outranks its siblings by a factor of its
+/// own lot size — and it does so at the top of the board, where it takes a
+/// depth socket. Refusing costs one contract; defaulting corrupts the
+/// ordering, and only the refusal leaves a counter behind.
+///
+/// # Complexity
+///
+/// One O(n) pass over the contract rows with one hash probe each. Never a scan
+/// per contract, which would be O(contracts x underlyings).
+#[must_use]
+pub fn legs_from_artifact(
+    contracts: &[ContractRow],
+    symbols: &HashMap<String, (u64, u8)>,
+) -> (Vec<LegIds>, Vec<(i64, LegRefusal)>) {
+    let idx_code = ExchangeSegment::IdxI.binary_code();
+    let eq_code = ExchangeSegment::NseEquity.binary_code();
+
+    let mut legs = Vec::new();
+    let mut refusals = Vec::new();
+    for row in contracts {
+        let family = match row.c.as_str() {
+            "OPTIDX" => OptionFamily::Index,
+            "OPTSTK" => OptionFamily::Stock,
+            // Futures and anything else are not ranked. Skipped SILENTLY and
+            // never counted: they are the ordinary contents of the artifact,
+            // not a defect, and counting them would make the refusal counter
+            // measure the file's shape instead of a problem.
+            _ => continue,
+        };
+        let contract_id = match i64::try_from(row.i) {
+            Ok(id) if id > 0 => id,
+            // A zero id is the parser's "absent or unusable" answer. Mapping a
+            // real contract onto instrument 0 would look healthy and group
+            // every such contract together.
+            _ => {
+                refusals.push((0, LegRefusal::ZeroOrNegativeContractId));
+                continue;
+            }
+        };
+        // BSE derivatives return `None` and are REFUSED, not defaulted. The
+        // selector narrowed to NSE on 2026-08-20 and depth is NSE-only at the
+        // vendor, so a BSE contract filed under an NSE segment would be an
+        // entry no tick can ever match — silently.
+        let Some(contract_segment) = crate::dhan_contract_universe::derivative_segment(&row.x)
+        else {
+            refusals.push((contract_id, LegRefusal::UnsupportedSegment));
+            continue;
+        };
+        // Same normalization `parse_symbol_map` applied when it built the map.
+        // Looking up an un-normalized symbol would miss every entry whose
+        // source row carried different case or padding.
+        let Some(&(underlying_id, underlying_segment)) =
+            symbols.get(row.u.trim().to_uppercase().as_str())
+        else {
+            refusals.push((contract_id, LegRefusal::UnresolvedUnderlyingSymbol));
+            continue;
+        };
+        let expected = match family {
+            OptionFamily::Index => idx_code,
+            OptionFamily::Stock => eq_code,
+        };
+        if underlying_segment != expected {
+            refusals.push((contract_id, LegRefusal::UnderlyingClassMismatch));
+            continue;
+        }
+        let Ok(underlying_security_id) = i64::try_from(underlying_id) else {
+            refusals.push((contract_id, LegRefusal::ZeroOrNegativeUnderlyingId));
+            continue;
+        };
+        if underlying_security_id <= 0 {
+            refusals.push((contract_id, LegRefusal::ZeroOrNegativeUnderlyingId));
+            continue;
+        }
+        // `ContractRow::z` is `0` when the master carried no `LOT_SIZE`, and
+        // `#[serde(default)]` also yields `0` for an artifact written by a
+        // binary that predates the column. Both are the same answer — we do
+        // not know this contract's multiplier — and both are REFUSED rather
+        // than defaulted, per `LegRefusal::MissingLotSize`.
+        if row.z == 0 {
+            refusals.push((contract_id, LegRefusal::MissingLotSize));
+            continue;
+        }
+        legs.push(LegIds {
+            contract_security_id: contract_id,
+            underlying_security_id,
+            contract_segment,
+            family,
+            lot_size: row.z,
+        });
+    }
+    (legs, refusals)
+}
+
+/// Refusals tallied by reason, largest first, zeros omitted.
+///
+/// The PURE half, deliberately: it takes no recorder and returns data, so the
+/// tallying rule is testable exactly as `build_snapshot` is. The counting half
+/// is [`count_artifact_refusals`].
+///
+/// Ordered by count DESCENDING and then by label, so the output is
+/// deterministic for a test and reads dominant-cause-first for a human. A
+/// refusal storm is almost always ONE cause, and the first pair is it.
+#[must_use]
+pub fn tally_refusals(refusals: &[(i64, LegRefusal)]) -> Vec<(LegRefusal, usize)> {
+    let mut tally: Vec<(LegRefusal, usize)> =
+        LegRefusal::ALL.iter().map(|&r| (r, 0usize)).collect();
+    for (_, reason) in refusals {
+        if let Some(slot) = tally.iter_mut().find(|(r, _)| r == reason) {
+            slot.1 += 1;
+        }
+    }
+    tally.retain(|(_, n)| *n > 0);
+    tally.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+    tally
+}
+
+/// Counts artifact-scan refusals on the per-reason counter and returns a
+/// one-line breakdown for the log.
+///
+/// # Why this exists (MEASURED 2026-09-09)
+///
+/// [`legs_from_artifact`] returns its refusals to the caller, and until today
+/// the caller logged only `refused_in_artifact_scan = <count>` and dropped the
+/// reasons. [`publish_from_legs`] counts the refusals IT produces; nothing
+/// counted these.
+///
+/// That gap cost real diagnosis time. On 2026-09-08 and 2026-09-09 the live
+/// lane refused 113,182 and then 113,746 option legs — EVERY leg in the
+/// artifact — and published an empty map, so the top-volume board ranked
+/// nothing for two whole sessions. The telemetry said `113746` and not one
+/// word about why; the cause (`missing_lot_size`, from a vendor `LOT_SIZE` of
+/// `"75.0"` that an integer parse refused) had to be found by reading source.
+/// One `missing_lot_size=113746` would have named it immediately.
+///
+/// # The honest limit of the counter half
+///
+/// The CloudWatch agent folds a metric's label values into ONE summed series
+/// per host, so the per-reason split does NOT survive to CloudWatch — there it
+/// is a single total. That is why this returns a STRING for the log line as
+/// well: the log is the surface where the breakdown actually reaches an
+/// operator. The counter is the local `/metrics` view and the trend.
+///
+/// Returns `"none"` for an empty slice rather than an empty string, so a log
+/// field is never blank and "nothing was refused" is stated rather than
+/// inferred from absence.
+#[must_use]
+pub fn count_artifact_refusals(refusals: &[(i64, LegRefusal)]) -> String {
+    for (_, reason) in refusals {
+        metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(1);
+    }
+    let tally = tally_refusals(refusals);
+    if tally.is_empty() {
+        return "none".to_owned();
+    }
+    tally
+        .iter()
+        .map(|(reason, n)| format!("{}={}", reason.as_str(), n))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+/// The artifact-scan refusals of contracts the main feed SUBSCRIBED.
+///
+/// Audit PR M / M4 (2026-10-26): every attach attempt counted each failing
+/// option leg of every expiry and exchange (42,510 `unsupported_segment` BSE
+/// legs and 1,518 `unresolved_underlying_symbol` per attempt), none of them
+/// subscribed, so the counter measured the artifact's shape. A refusal of a
+/// subscribed contract still counts, so the 2026-09-09 class (every leg
+/// refused) still shows. A refusal with no usable id (`0`) is kept: it cannot
+/// be attributed, and it means a broken artifact. O(selected + refusals), cold.
+#[must_use]
+pub fn subscribed_refusals(
+    refusals: &[(i64, LegRefusal)],
+    selected: &[SubscribeInstrument],
+) -> Vec<(i64, LegRefusal)> {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
+    refusals
+        .iter()
+        .copied()
+        .filter(|(id, _)| refusal_is_subscribed(*id, &picked))
+        .collect()
+}
+
+/// Whether a refused leg's contract is in `picked`. A refusal carries the bare
+/// id, so both derivative segments are probed on the I-P1-11 composite key; an
+/// unusable id is kept (unattributable, see [`subscribed_refusals`]).
+fn refusal_is_subscribed(id: i64, picked: &HashSet<ContractKey>) -> bool {
+    match u64::try_from(id) {
+        Ok(0) | Err(_) => true,
+        Ok(id) => [ExchangeSegment::NseFno, ExchangeSegment::BseFno]
+            .iter()
+            .any(|segment| picked.contains(&(id, *segment))),
+    }
+}
+
+/// Puts the legs the main feed will actually SUBSCRIBE ahead of the rest, so
+/// they are the ones that fit inside [`MAX_TRACKED_CONTRACTS`].
+///
+/// # Why the order matters (MEASURED 2026-09-10)
+///
+/// [`legs_from_artifact`] yields every OPTIDX/OPTSTK leg in the artifact across
+/// ALL expiries — **76,890** on 2026-09-10 — while [`build_snapshot`] keeps the
+/// FIRST 25,000 it meets and refuses the rest (**51,890** `AtCapacity` that
+/// day). Artifact order is not subscription order, so a contract that was on
+/// the wire could sit among the refused, and an unmapped contract is skipped
+/// by the ranking SILENTLY: it never reaches a depth socket and nothing says
+/// why. Ordering the selected set first turns "whichever 25,000 the file
+/// listed first" into "every contract we subscribed, then whatever room is
+/// left".
+///
+/// Matches on the I-P1-11 composite `(security_id, segment)`, never the id
+/// alone. Stable: relative order inside each half is preserved, so the refusal
+/// set is deterministic across boots for the same artifact and selection.
+/// Returns the reordered legs and how many of them were in the selection.
+///
+/// # Complexity
+///
+/// O(selected) to build the set, one O(legs) partition pass — cold, once per
+/// attach on the contract task, never a hot path.
+#[must_use]
+pub fn order_selected_first(
+    legs: Vec<LegIds>,
+    selected: &[SubscribeInstrument],
+) -> (Vec<LegIds>, usize) {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
+    let (mut ordered, rest): (Vec<LegIds>, Vec<LegIds>) = legs.into_iter().partition(|leg| {
+        u64::try_from(leg.contract_security_id)
+            .is_ok_and(|id| picked.contains(&(id, leg.contract_segment)))
+    });
+    let selected_count = ordered.len();
+    ordered.extend(rest);
+    (ordered, selected_count)
+}
+
+/// The published mapping. Cheap to clone — it is one `Arc`.
+#[derive(Debug, Clone)]
+pub struct ContractUnderlyingMap {
+    inner: Arc<ArcSwap<OwnerMap>>,
+    /// Human-readable contract labels, resolved ONCE per publish.
+    ///
+    /// A SECOND snapshot rather than a field on [`ContractOwner`], and that is
+    /// the load-bearing decision: `owner_of` is the PER-TICK call and
+    /// `ContractOwner` is `Copy`, so putting an `Arc<str>` on it would put a
+    /// refcount bump on every tick. Nothing on the tick path needs a label —
+    /// only the per-sweep projection does — so the label lives in its own
+    /// snapshot that only that path loads.
+    labels: Arc<ArcSwap<HashMap<ContractKey, Arc<str>>>>,
+}
+
+impl Default for ContractUnderlyingMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContractUnderlyingMap {
+    /// An empty mapping. Every lookup returns `None` until the first publish.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(OwnerMap::default())),
+            labels: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        }
+    }
+
+    /// Replaces the mapping with a new snapshot, atomically.
+    ///
+    /// Readers in flight keep the old snapshot until they drop it, so a
+    /// rebuild can never hand the drain a half-built map.
+    pub fn publish(&self, snapshot: OwnerMap) {
+        self.inner.store(Arc::new(snapshot));
+    }
+
+    /// Replaces the label snapshot, atomically. Built by
+    /// [`labels_from_artifact`] from the SAME `&[ContractRow]` the legs come
+    /// from, so the two cannot describe different contract sets.
+    pub fn publish_labels(&self, snapshot: HashMap<ContractKey, Arc<str>>) {
+        self.labels.store(Arc::new(snapshot));
+    }
+
+    /// The whole label table, for ONE sweep.
+    ///
+    /// Loaded once per projection, never per row: the caller holds this `Arc`
+    /// for the length of the sweep and hands the storage row a `&str` borrowed
+    /// out of it. One atomic load per sweep, one pointer copy per row, zero
+    /// allocation — which is the reason the label is resolved at publish time
+    /// rather than formatted on the frame drain.
+    #[must_use]
+    pub fn label_snapshot(&self) -> Arc<HashMap<ContractKey, Arc<str>>> {
+        arc_swap::Guard::into_inner(self.labels.load())
+    }
+
+    /// How many labels the published snapshot holds.
+    #[must_use]
+    pub fn label_len(&self) -> usize {
+        self.labels.load().len()
+    }
+
+    /// Builds and publishes in one step, returning what was refused.
+    ///
+    /// Refusals are counted here rather than in `build_snapshot`, which stays
+    /// pure so the decision rule is testable without a metrics recorder.
+    pub fn publish_from_legs(&self, legs: &[LegIds]) -> SnapshotBuild {
+        self.publish_counting(legs, &|_| true).0
+    }
+
+    /// [`Self::publish_from_legs`] for legs ordered by [`order_selected_first`]:
+    /// the first `selected_first` legs are the subscribed ones. The map is
+    /// built from ALL the legs, as before; only a refusal of a SUBSCRIBED
+    /// contract is counted and logged. Returns the build and that count.
+    ///
+    /// Audit PR M / M4 (2026-10-26): the attach retries every few seconds
+    /// until the pricing quorum holds, and each attempt counted 60,988
+    /// `at_capacity` refusals, every one a leg of a contract nobody subscribed
+    /// (other expiries), so the counter and the warn line measured the
+    /// artifact's size, not a defect.
+    pub fn publish_from_legs_selected_first(
+        &self,
+        legs: &[LegIds],
+        selected_first: usize,
+    ) -> (SnapshotBuild, usize) {
+        let picked: HashSet<ContractKey> = legs[..selected_first.min(legs.len())]
+            .iter()
+            .filter_map(|l| {
+                u64::try_from(l.contract_security_id)
+                    .ok()
+                    .map(|id| (id, l.contract_segment))
+            })
+            .collect();
+        self.publish_counting(legs, &|id| refusal_is_subscribed(id, &picked))
+    }
+
+    /// Builds, publishes, and counts the refusals `counts` keeps. O(legs),
+    /// once per attach attempt, cold.
+    fn publish_counting(
+        &self,
+        legs: &[LegIds],
+        counts: &dyn Fn(i64) -> bool,
+    ) -> (SnapshotBuild, usize) {
+        let (map, build) = build_snapshot(legs);
+        let counted: Vec<(i64, LegRefusal)> = build
+            .refusals
+            .iter()
+            .copied()
+            .filter(|(id, _)| counts(*id))
+            .collect();
+        // A refusal means a contract cannot be RANKED at all — the ranking is
+        // narrower than the subscription, silently, and a counter alone would
+        // leave that reaching nobody. One SUMMARY line per publish, not per leg.
+        // per leg: this runs ONCE PER DAY at attach over a bounded leg count, so
+        // whole picture fits in a single line and a per-leg line would be
+        // thousands of them for one event.
+        for (_, reason) in &counted {
+            metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(1);
+        }
+        if let Some((_, first)) = counted.first() {
+            tracing::warn!(
+                refused = counted.len(),
+                accepted = build.accepted,
+                legs = legs.len(),
+                first_reason = first.as_str(),
+                "contract-to-underlying mapping refused chain legs — those \
+                 contracts cannot be ranked or depth-steered today \
+                 (one line per publish; per-reason counts are on the counter)"
+            );
+        }
+        // An EMPTY published map is the silent catastrophe this arm exists for.
+        //
+        // The refusal warn above cannot cover it: a build with ZERO legs has no
+        // refusals, so `refusals.is_empty()` is true and nothing is said --
+        // while `owner_of` then returns `None` for every tick and the entire
+        // ranking subsystem produces nothing, all session, reporting healthy.
+        //
+        // That is the exact false-OK class this repository keeps removing, and
+        // it is reachable by ordinary means: an artifact with no OPTIDX/OPTSTK
+        // rows, or a symbol map that failed to load (its own arm leaves an
+        // empty `HashMap` and continues by design).
+        //
+        // Coded, so it reaches the error triage path rather than only a log
+        // anyone happens to read.
+        if build.accepted == 0 {
+            tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                legs = legs.len(),
+                refused = build.refusals.len(),
+                "contract-to-underlying mapping published an EMPTY map — NOTHING can be \
+                 ranked or depth-steered today. Every tick will look unmapped, the \
+                 top-volume boards stay empty, and no other signal says so."
+            );
+        }
+        self.publish(map);
+        let counted = counted.len();
+        (build, counted)
+    }
+
+    /// Who this contract belongs to and which board it ranks on, or `None`.
+    ///
+    /// **This is the per-tick call**, and `None` is the common, correct answer:
+    /// the main feed carries ~870 spots and ~660 futures alongside the options,
+    /// and none of them is in this map. The caller SKIPS an absent contract; it
+    /// must never be counted as a refusal, or the refusal counter measures the
+    /// ordinary shape of the feed instead of a defect.
+    ///
+    /// O(1) average: one atomic load, one hash probe. A caller must never
+    /// substitute a zero underlying for `None` — that would collapse every
+    /// unmapped contract onto ONE pseudo-underlying, and the depth-200
+    /// distinct-underlying rule would then admit five strikes of nothing.
+    #[must_use]
+    pub fn owner_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<ContractOwner> {
+        self.inner.load().get(&(contract_id, segment)).copied()
+    }
+
+    /// The underlying's id alone, for callers that do not need the family.
+    ///
+    /// A thin projection of [`Self::owner_of`] rather than a second lookup
+    /// path, so the two can never answer differently.
+    #[must_use]
+    pub fn underlying_of(&self, contract_id: u64, segment: ExchangeSegment) -> Option<u64> {
+        self.owner_of(contract_id, segment)
+            .map(|owner| owner.underlying_id)
+    }
+
+    /// How many contracts the published snapshot holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.load().len()
+    }
+
+    /// Whether nothing has been published yet, or the last publish was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The process-wide map.
+///
+/// Global for the same reason `depth_subscription_view` is: the PUBLISHER is
+/// the contract-universe attach and the READER is the frame drain, and the two
+/// sit on opposite sides of several `tokio::spawn` boundaries whose signatures
+/// already carry a dozen arguments each.
+///
+/// Defaults to an EMPTY map, which is the truthful answer before the attach has
+/// run -- and `publish_from_legs` now says so LOUDLY if the first publish is
+/// also empty, so "empty because nothing has attached yet" cannot be confused
+/// with "empty because the attach produced nothing".
+#[must_use]
+pub fn global_contract_underlying_map() -> &'static std::sync::Arc<ContractUnderlyingMap> {
+    static MAP: std::sync::OnceLock<std::sync::Arc<ContractUnderlyingMap>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Arc::new(ContractUnderlyingMap::new()))
+}
+
+/// Puts the refusal counter on the wire at zero before the first publish.
+///
+/// The CloudWatch agent computes a counter as the delta between consecutive
+/// samples and DROPS the first sample of a series it has never seen. A counter
+/// whose first increment IS the event therefore publishes nothing on the one
+/// day it matters -- the same first-sample rule that hid
+/// `tv_depth_rows_spilled_total` on 2026-08-28 and made 104,540 depth rows
+/// permanently unclassifiable.
+///
+/// Every reason is seeded, not just one: an unseeded label is a series that
+/// does not exist until it fires, which is exactly the case being protected.
+pub fn pre_register_contract_underlying_counters() {
+    for reason in LegRefusal::ALL {
+        metrics::counter!(REFUSED_COUNTER, "reason" => reason.as_str()).increment(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FNO: ExchangeSegment = ExchangeSegment::NseFno;
+    const BFO: ExchangeSegment = ExchangeSegment::BseFno;
+
+    fn leg(contract: i64, underlying: i64) -> LegIds {
+        LegIds {
+            contract_security_id: contract,
+            underlying_security_id: underlying,
+            contract_segment: FNO,
+            lot_size: 75,
+            family: OptionFamily::Stock,
+        }
+    }
+
+    /// Projects the owner back to the bare underlying id, so the existing
+    /// assertions keep reading as "which underlying did this land under".
+    fn under(map: &OwnerMap, key: ContractKey) -> Option<u64> {
+        map.get(&key).map(|o| o.underlying_id)
+    }
+
+    #[test]
+    fn build_snapshot_maps_every_usable_leg() {
+        let (map, build) = build_snapshot(&[leg(100, 13), leg(101, 13), leg(200, 25)]);
+        assert_eq!(build.accepted, 3);
+        assert!(build.refusals.is_empty());
+        assert_eq!(under(&map, (100, FNO)), Some(13));
+        assert_eq!(under(&map, (200, FNO)), Some(25));
+    }
+
+    #[test]
+    fn build_snapshot_refuses_the_zero_contract_id_sentinel() {
+        // `contract_security_id` defaults to 0 when the vendor omits it, and
+        // mapping it would file a real contract onto instrument 0.
+        let (map, build) = build_snapshot(&[leg(0, 13), leg(100, 13)]);
+        assert_eq!(build.accepted, 1);
+        assert_eq!(
+            build.refusals,
+            vec![(0, LegRefusal::ZeroOrNegativeContractId)]
+        );
+        assert!(!map.contains_key(&(0, FNO)));
+    }
+
+    #[test]
+    fn build_snapshot_refuses_a_zero_or_negative_underlying() {
+        let (_, build) = build_snapshot(&[leg(100, 0), leg(101, -5)]);
+        assert_eq!(build.accepted, 0);
+        assert_eq!(build.refusals.len(), 2);
+        assert!(
+            build
+                .refusals
+                .iter()
+                .all(|(_, r)| *r == LegRefusal::ZeroOrNegativeUnderlyingId)
+        );
+    }
+
+    #[test]
+    fn build_snapshot_refuses_a_negative_contract_id() {
+        let (_, build) = build_snapshot(&[leg(-1, 13)]);
+        assert_eq!(build.accepted, 0);
+        assert_eq!(
+            build.refusals,
+            vec![(-1, LegRefusal::ZeroOrNegativeContractId)]
+        );
+    }
+
+    #[test]
+    fn build_snapshot_keys_on_the_composite_so_two_segments_never_collide() {
+        // I-P1-11. A NIFTY option and a SENSEX option can share a numeric id;
+        // without the segment one would answer for the other.
+        let legs = [
+            LegIds {
+                contract_security_id: 500,
+                underlying_security_id: 13,
+                contract_segment: FNO,
+                family: OptionFamily::Stock,
+                lot_size: 75,
+            },
+            LegIds {
+                contract_security_id: 500,
+                underlying_security_id: 51,
+                contract_segment: BFO,
+                family: OptionFamily::Index,
+                lot_size: 15,
+            },
+        ];
+        let (map, build) = build_snapshot(&legs);
+        assert_eq!(build.accepted, 2);
+        assert_eq!(under(&map, (500, FNO)), Some(13));
+        assert_eq!(under(&map, (500, BFO)), Some(51));
+    }
+
+    #[test]
+    fn build_snapshot_lets_a_later_leg_overwrite_an_earlier_one() {
+        // One minute's chain is a snapshot; a repeat is a re-observation.
+        let (map, build) = build_snapshot(&[leg(100, 13), leg(100, 25)]);
+        assert_eq!(build.accepted, 1);
+        assert_eq!(under(&map, (100, FNO)), Some(25));
+    }
+
+    #[test]
+    fn build_snapshot_refuses_a_new_contract_at_the_ceiling() {
+        let mut legs: Vec<LegIds> = (1..=MAX_TRACKED_CONTRACTS as i64)
+            .map(|i| leg(i, 13))
+            .collect();
+        legs.push(leg(999_999, 13));
+        let (map, build) = build_snapshot(&legs);
+        assert_eq!(map.len(), MAX_TRACKED_CONTRACTS);
+        assert_eq!(build.refusals, vec![(999_999, LegRefusal::AtCapacity)]);
+    }
+
+    #[test]
+    fn build_snapshot_still_updates_a_tracked_contract_at_the_ceiling() {
+        // The ceiling bounds how many contracts are held, never how fresh
+        // their mapping is. Refusing this would pin a stale underlying.
+        let mut legs: Vec<LegIds> = (1..=MAX_TRACKED_CONTRACTS as i64)
+            .map(|i| leg(i, 13))
+            .collect();
+        legs.push(leg(7, 25));
+        let (map, build) = build_snapshot(&legs);
+        assert_eq!(under(&map, (7, FNO)), Some(25));
+        assert!(build.refusals.is_empty());
+    }
+
+    #[test]
+    fn underlying_of_returns_none_before_the_first_publish() {
+        // None, never 0 — a zero underlying would collapse every unmapped
+        // contract onto ONE pseudo-underlying, and the depth-200
+        // distinct-underlying rule would admit five strikes of nothing.
+        let m = ContractUnderlyingMap::new();
+        assert!(m.is_empty());
+        assert_eq!(m.underlying_of(100, FNO), None);
+    }
+
+    #[test]
+    fn publish_from_legs_makes_the_mapping_readable_and_reports_refusals() {
+        let m = ContractUnderlyingMap::new();
+        let build = m.publish_from_legs(&[leg(100, 13), leg(0, 13)]);
+        assert_eq!(build.accepted, 1);
+        assert_eq!(build.refusals.len(), 1);
+        assert_eq!(m.underlying_of(100, FNO), Some(13));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn publish_replaces_rather_than_merges() {
+        // The chain leg rebuilds the WHOLE mapping each minute. A contract
+        // that has left the chain (an expired strike) must LEAVE the map, or
+        // the ranking keeps steering depth at a contract nobody trades.
+        let m = ContractUnderlyingMap::new();
+        m.publish_from_legs(&[leg(100, 13), leg(101, 13)]);
+        assert_eq!(m.len(), 2);
+        m.publish_from_legs(&[leg(101, 13)]);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.underlying_of(100, FNO), None);
+        assert_eq!(m.underlying_of(101, FNO), Some(13));
+    }
+
+    #[test]
+    fn a_clone_shares_the_same_published_mapping() {
+        // The drain holds a clone; the chain leg holds the original. A
+        // publish on one must be visible to the other, or the drain reads an
+        // empty map forever.
+        let writer = ContractUnderlyingMap::new();
+        let reader = writer.clone();
+        writer.publish_from_legs(&[leg(100, 13)]);
+        assert_eq!(reader.underlying_of(100, FNO), Some(13));
+    }
+
+    #[test]
+    fn as_str_labels_are_distinct_for_every_refusal_reason() {
+        let labels = [
+            LegRefusal::ZeroOrNegativeContractId.as_str(),
+            LegRefusal::ZeroOrNegativeUnderlyingId.as_str(),
+            LegRefusal::AtCapacity.as_str(),
+        ];
+        let mut sorted = labels;
+        sorted.sort_unstable();
+        sorted.iter().zip(sorted.iter().skip(1)).for_each(|(a, b)| {
+            assert_ne!(a, b, "refusal labels must be distinct: {labels:?}");
+        });
+    }
+
+    // ---------------------------------------------------------------------
+    // legs_from_artifact — the corrected producer
+    // ---------------------------------------------------------------------
+
+    fn contract(id: u64, class: &str, underlying: &str, exch: &str) -> ContractRow {
+        ContractRow {
+            i: id,
+            x: exch.to_owned(),
+            c: class.to_owned(),
+            e: 20_260_925,
+            s: 2_500_000,
+            l: "CE".to_owned(),
+            u: underlying.to_owned(),
+            // A REAL lot size, because the production default is a real lot
+            // size: every row the master carries a `LOT_SIZE` for has one.
+            // Leaving this at the absent-field 0 would make every test below
+            // exercise the refusal path instead of the path it is named for.
+            z: 75,
+        }
+    }
+
+    /// The mapping artifact as production builds it: a UNION of the index
+    /// mappings (`IDX_I`) and the F&O underlying mappings (`NSE_EQ`).
+    fn symbol_map() -> HashMap<String, (u64, u8)> {
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let eq = ExchangeSegment::NseEquity.binary_code();
+        HashMap::from([
+            ("NIFTY".to_owned(), (13_u64, idx)),
+            ("BANKNIFTY".to_owned(), (25_u64, idx)),
+            ("RELIANCE".to_owned(), (2885_u64, eq)),
+            ("TCS".to_owned(), (11536_u64, eq)),
+        ])
+    }
+
+    #[test]
+    fn legs_from_artifact_resolves_both_families() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].underlying_security_id, 13);
+        assert_eq!(legs[0].family, OptionFamily::Index);
+        assert_eq!(legs[1].underlying_security_id, 2885);
+        assert_eq!(legs[1].family, OptionFamily::Stock);
+        // Both are subscribed under the CONTRACT's segment, never the
+        // underlying's — an entry under `IDX_I` or `NSE_EQ` would match no
+        // tick this lane ever receives.
+        assert!(legs.iter().all(|l| l.contract_segment == FNO));
+    }
+
+    /// The NEGATIVE CONTROL for the defect this module's header records.
+    ///
+    /// `option_chain_1m` covers three INDEX underlyings and cannot represent a
+    /// stock symbol at all, so a symbol map derived from it resolves every
+    /// index option and NO stock option. This builds exactly that map and
+    /// asserts the stock side comes back empty — proving the corrected source
+    /// earns its place, rather than asserting that it does.
+    #[test]
+    fn an_index_only_symbol_map_resolves_zero_stock_options() {
+        let idx = ExchangeSegment::IdxI.binary_code();
+        let chain_only: HashMap<String, (u64, u8)> = HashMap::from([
+            ("NIFTY".to_owned(), (13_u64, idx)),
+            ("BANKNIFTY".to_owned(), (25_u64, idx)),
+            ("SENSEX".to_owned(), (51_u64, idx)),
+        ]);
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+            contract(601, "OPTSTK", "TCS", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &chain_only);
+        assert_eq!(
+            legs.iter()
+                .filter(|l| l.family == OptionFamily::Stock)
+                .count(),
+            0,
+            "an index-only map must resolve no stock option — this is the \
+             defect the corrected source removes"
+        );
+        assert_eq!(legs.len(), 1, "only the index option resolves");
+        assert_eq!(refusals.len(), 2);
+        assert!(
+            refusals
+                .iter()
+                .all(|(_, r)| *r == LegRefusal::UnresolvedUnderlyingSymbol)
+        );
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_class_mismatch_rather_than_grouping_wrongly() {
+        // The mapping artifact is a union keyed on symbol, so a name present
+        // as BOTH an index and an equity resolves by file order. Refusing is
+        // what stops that order silently deciding a contract's grouping.
+        let rows = [contract(500, "OPTIDX", "RELIANCE", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(500, LegRefusal::UnderlyingClassMismatch)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_bse_contract_rather_than_defaulting_it() {
+        // Depth is NSE-only at the vendor and the selector narrowed to NSE on
+        // 2026-08-20. Filing a BSE contract under an NSE segment would be an
+        // entry no tick can ever match.
+        let rows = [contract(700, "OPTIDX", "NIFTY", "BSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(700, LegRefusal::UnsupportedSegment)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_skips_non_options_silently_and_never_counts_them() {
+        // Futures are the ordinary contents of the artifact, not a defect.
+        // Counting them would make the refusal counter measure the file's
+        // shape instead of a problem.
+        let rows = [
+            contract(800, "FUTIDX", "NIFTY", "NSE"),
+            contract(801, "FUTSTK", "RELIANCE", "NSE"),
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert_eq!(legs.len(), 1);
+        assert!(
+            refusals.is_empty(),
+            "futures must not be counted as refusals"
+        );
+    }
+
+    #[test]
+    fn legs_from_artifact_normalizes_the_symbol_the_way_the_map_was_built() {
+        // `parse_symbol_map` stores `symbol.trim().to_uppercase()`. Looking up
+        // an un-normalized symbol would miss every entry whose source row
+        // carried different case or padding.
+        let rows = [contract(600, "OPTSTK", "  reliance  ", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].underlying_security_id, 2885);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_the_zero_contract_id_sentinel() {
+        let rows = [contract(0, "OPTSTK", "RELIANCE", "NSE")];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(0, LegRefusal::ZeroOrNegativeContractId)]);
+    }
+
+    #[test]
+    fn legs_from_artifact_carries_the_masters_lot_size_onto_every_leg() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            ContractRow {
+                z: 250,
+                ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+            },
+        ];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(refusals.is_empty(), "unexpected refusals: {refusals:?}");
+        // Per-contract, not one figure for the file: NIFTY and RELIANCE have
+        // genuinely different multipliers, and a shared default would rank
+        // one of them in the wrong unit.
+        assert_eq!(legs[0].lot_size, 75);
+        assert_eq!(legs[1].lot_size, 250);
+    }
+
+    #[test]
+    fn legs_from_artifact_refuses_a_missing_lot_size_rather_than_defaulting_it() {
+        // `z == 0` is BOTH answers that mean "unknown": a master row with no
+        // `LOT_SIZE` column, and an artifact written by a binary that predates
+        // the field (`#[serde(default)]`). Defaulting either to 1 would rank
+        // this contract in raw units — 75x its siblings on a NIFTY-sized lot —
+        // and put it at the top of the board, taking a depth socket.
+        let rows = [ContractRow {
+            z: 0,
+            ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+        }];
+        let (legs, refusals) = legs_from_artifact(&rows, &symbol_map());
+        assert!(legs.is_empty());
+        assert_eq!(refusals, vec![(600, LegRefusal::MissingLotSize)]);
+    }
+
+    #[test]
+    fn build_snapshot_refuses_a_zero_lot_size_so_contract_owner_is_never_zero() {
+        // Defence in depth: `legs_from_artifact` already refuses, but
+        // `build_snapshot` is what CONSTRUCTS `ContractOwner`, whose contract
+        // says the lot size is never zero. A hand-built leg — a test, or a
+        // future second producer — must not be able to publish a value that
+        // makes the ranking divide by zero.
+        let legs = [LegIds {
+            lot_size: 0,
+            ..leg(600, 2885)
+        }];
+        let (map, build) = build_snapshot(&legs);
+        assert!(map.is_empty());
+        assert_eq!(build.accepted, 0);
+        assert_eq!(build.refusals, vec![(600, LegRefusal::MissingLotSize)]);
+    }
+
+    #[test]
+    fn a_published_owner_always_carries_a_divisible_lot_size() {
+        // The property the whole gate exists for, asserted end to end on the
+        // published map rather than on the builder's return value.
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            ContractRow {
+                z: 0,
+                ..contract(600, "OPTSTK", "RELIANCE", "NSE")
+            },
+        ];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+        assert!(map.owner_of(500, FNO).is_some_and(|o| o.lot_size > 0));
+        // And the one we could not compute a lot size for is simply absent —
+        // never present with a made-up multiplier.
+        assert!(map.owner_of(600, FNO).is_none());
+    }
+
+    #[test]
+    fn owner_of_and_underlying_of_can_never_disagree() {
+        // `underlying_of` is a PROJECTION of `owner_of`, not a second lookup
+        // path. Pinned because two independent lookups over the same map is
+        // exactly the drift this module consolidated into one value to avoid.
+        let rows = [contract(600, "OPTSTK", "RELIANCE", "NSE")];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+
+        assert_eq!(
+            map.owner_of(600, FNO).map(|o| o.underlying_id),
+            map.underlying_of(600, FNO)
+        );
+        assert_eq!(map.underlying_of(600, FNO), Some(2885));
+
+        // An absent contract: both answer `None`, and the caller SKIPS rather
+        // than counting a refusal — spots and futures land here legitimately.
+        assert!(map.owner_of(999, FNO).is_none());
+        assert!(map.underlying_of(999, FNO).is_none());
+    }
+
+    #[test]
+    fn legs_from_artifact_feeds_a_map_that_answers_both_families() {
+        // End to end: artifact -> legs -> published map -> per-tick lookup.
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        let map = ContractUnderlyingMap::new();
+        map.publish_from_legs(&legs);
+
+        let stock = map.owner_of(600, FNO).expect("stock option must resolve");
+        assert_eq!(stock.underlying_id, 2885);
+        assert_eq!(stock.family, OptionFamily::Stock);
+
+        let index = map.owner_of(500, FNO).expect("index option must resolve");
+        assert_eq!(index.family, OptionFamily::Index);
+
+        // A spot or future the map never held: absent, and the caller SKIPS it
+        // rather than counting a refusal.
+        assert!(map.owner_of(13, ExchangeSegment::IdxI).is_none());
+    }
+
+    /// The label format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS
+    /// section mandates, so a row of this table can be pasted into a support
+    /// draft unchanged.
+    #[test]
+    fn contract_label_renders_the_mandated_precise_format() {
+        assert_eq!(
+            contract_label("NIFTY", 20260925, 2_450_000, "CE"),
+            "NIFTY-25Sep2026-24500-CE"
+        );
+        assert_eq!(
+            contract_label("RELIANCE", 20260625, 2_800_000, "PE"),
+            "RELIANCE-25Jun2026-28000-PE"
+        );
+        // A single-digit day is zero-padded, so 5 Sep sorts and reads beside
+        // 25 Sep instead of collating between 19 and 20.
+        assert_eq!(
+            contract_label("TCS", 20260905, 400_000, "CE"),
+            "TCS-05Sep2026-4000-CE"
+        );
+        // Whitespace and case come from the master verbatim; the map is built
+        // on a trimmed symbol, so the label must trim the same way or the two
+        // describe the same contract differently.
+        assert_eq!(
+            contract_label("  INFY  ", 20261231, 150_000, " CE "),
+            "INFY-31Dec2026-1500-CE"
+        );
+    }
+
+    /// A fractional strike keeps its paise.
+    ///
+    /// Rounding would make two ADJACENT strikes print the same label on a
+    /// low-priced underlying, which is exactly the ambiguity a precise label
+    /// exists to remove.
+    #[test]
+    fn contract_label_keeps_a_fractional_strike() {
+        assert_eq!(
+            contract_label("IDEA", 20260925, 1_250, "PE"),
+            "IDEA-25Sep2026-12.50-PE"
+        );
+        assert_eq!(
+            contract_label("YESBANK", 20260925, 2_075, "CE"),
+            "YESBANK-25Sep2026-20.75-CE"
+        );
+    }
+
+    /// A nonsense expiry renders its digits VERBATIM rather than being
+    /// dropped or guessed: a wrong-looking expiry in the label is a visible
+    /// defect, a missing one is an invisible one.
+    #[test]
+    fn contract_label_renders_an_implausible_expiry_verbatim() {
+        assert_eq!(
+            contract_label("NIFTY", 0, 2_450_000, "CE"),
+            "NIFTY-0-24500-CE"
+        );
+        assert_eq!(
+            contract_label("NIFTY", 20261345, 2_450_000, "CE"),
+            "NIFTY-20261345-24500-CE"
+        );
+        // A future with no leg has no trailing separator — a dangling `-`
+        // would read as a truncated label.
+        assert_eq!(
+            contract_label("NIFTY", 20260925, 0, ""),
+            "NIFTY-25Sep2026-0"
+        );
+    }
+
+    /// The label map covers exactly the contracts the OWNER map can admit —
+    /// options only, same segment derivation, same zero-id refusal.
+    ///
+    /// A shape difference between the two is what would make a projection-time
+    /// miss ambiguous: `SnapshotRefusal::LabelUnavailable` is supposed to mean
+    /// DRIFT, and it can only mean that if the two passes agree on which
+    /// contracts exist.
+    #[test]
+    fn labels_from_artifact_covers_the_same_contracts_the_legs_do() {
+        let rows = [
+            contract(500, "OPTIDX", "NIFTY", "NSE"),
+            contract(600, "OPTSTK", "RELIANCE", "NSE"),
+            // Not an option — never ranked, so never labelled.
+            contract(800, "FUTIDX", "NIFTY", "NSE"),
+            // BSE derivatives are refused by the leg pass; refused here too.
+            contract(700, "OPTIDX", "NIFTY", "BSE"),
+            // The zero-id sentinel.
+            contract(0, "OPTSTK", "RELIANCE", "NSE"),
+        ];
+        let labels = labels_from_artifact(&rows);
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+
+        assert_eq!(
+            labels.len(),
+            2,
+            "options on NSE with a real id, and only those"
+        );
+        for leg in &legs {
+            let key = (
+                u64::try_from(leg.contract_security_id).expect("positive"),
+                leg.contract_segment,
+            );
+            assert!(
+                labels.contains_key(&key),
+                "every leg the owner map admits must have a label: {key:?}"
+            );
+        }
+        assert!(labels.contains_key(&(500, FNO)));
+        assert!(labels.contains_key(&(600, FNO)));
+        assert!(!labels.contains_key(&(800, FNO)), "futures are not ranked");
+        assert!(!labels.contains_key(&(0, FNO)), "the zero-id sentinel");
+    }
+
+    /// The published snapshot is what the projection reads, and it is
+    /// SEPARATE from the owner snapshot — publishing one must not disturb
+    /// the other, because the two are published in sequence at attach.
+    #[test]
+    fn publish_labels_does_not_disturb_the_owner_snapshot() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0, "nothing published yet");
+        assert!(map.label_snapshot().is_empty());
+
+        let rows = [contract(600, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(map.label_len(), 1);
+        // The owner map is untouched by a label publish.
+        assert!(map.owner_of(600, FNO).is_none());
+
+        let (legs, _) = legs_from_artifact(&rows, &symbol_map());
+        map.publish_from_legs(&legs);
+        assert!(map.owner_of(600, FNO).is_some());
+        assert_eq!(
+            map.label_snapshot().get(&(600, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE"),
+            "an owner publish must not clear the labels"
+        );
+    }
+
+    #[test]
+    fn label_snapshot_starts_empty_and_returns_what_was_published() {
+        let map = ContractUnderlyingMap::new();
+        // Before attach there is no artifact, so the drain must still get a
+        // readable snapshot rather than an unwrap on `None`.
+        assert!(
+            map.label_snapshot().is_empty(),
+            "the label snapshot must be readable before anything is published"
+        );
+
+        let rows = [contract(700, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&rows));
+        assert_eq!(
+            map.label_snapshot().get(&(700, FNO)).map(AsRef::as_ref),
+            Some("RELIANCE-25Sep2026-25000-CE")
+        );
+
+        // Two reads must hand back the SAME allocation, not two clones: the
+        // drain loads this once per sweep and borrows row labels out of it.
+        let first = map.label_snapshot();
+        let second = map.label_snapshot();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each read cloned the map — the per-row borrow would then dangle \
+             or cost an allocation per sweep"
+        );
+    }
+
+    #[test]
+    fn label_len_counts_every_published_label_and_replaces_wholesale() {
+        let map = ContractUnderlyingMap::new();
+        assert_eq!(map.label_len(), 0);
+
+        let two = [
+            contract(800, "OPTSTK", "RELIANCE", "NSE"),
+            contract(801, "OPTSTK", "TCS", "NSE"),
+        ];
+        map.publish_labels(labels_from_artifact(&two));
+        assert_eq!(map.label_len(), 2);
+
+        // An expiry rollover republishes a SMALLER set. The new snapshot must
+        // REPLACE the old one, never merge into it — a merge would leave
+        // yesterday's expired contracts labelled and readable forever.
+        let one = [contract(800, "OPTSTK", "RELIANCE", "NSE")];
+        map.publish_labels(labels_from_artifact(&one));
+        assert_eq!(
+            map.label_len(),
+            1,
+            "a republish merged into the previous snapshot instead of replacing it"
+        );
+        assert!(
+            map.label_snapshot().get(&(801, FNO)).is_none(),
+            "a contract dropped by the new artifact kept its stale label"
+        );
+    }
+
+    #[test]
+    fn all_variants_are_in_the_seed_list() {
+        // An unseeded reason is a series the CloudWatch agent drops on its
+        // first sample -- silent on exactly the day it fires. Adding a variant
+        // without adding it here would reintroduce that, so the count is
+        // asserted against the match arms rather than trusted.
+        let labels: std::collections::HashSet<&str> =
+            LegRefusal::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(
+            labels.len(),
+            LegRefusal::ALL.len(),
+            "labels must be distinct"
+        );
+        for r in [
+            LegRefusal::ZeroOrNegativeContractId,
+            LegRefusal::ZeroOrNegativeUnderlyingId,
+            LegRefusal::UnresolvedUnderlyingSymbol,
+            LegRefusal::UnsupportedSegment,
+            LegRefusal::UnderlyingClassMismatch,
+            LegRefusal::AtCapacity,
+        ] {
+            assert!(labels.contains(r.as_str()), "{} is not seeded", r.as_str());
+        }
+    }
+
+    #[test]
+    fn tally_refusals_orders_by_count_descending_so_the_dominant_cause_is_first() {
+        let refusals = vec![
+            (1, LegRefusal::UnresolvedUnderlyingSymbol),
+            (2, LegRefusal::MissingLotSize),
+            (3, LegRefusal::MissingLotSize),
+            (4, LegRefusal::MissingLotSize),
+            (5, LegRefusal::UnsupportedSegment),
+            (6, LegRefusal::UnsupportedSegment),
+        ];
+        let tally = tally_refusals(&refusals);
+        assert_eq!(
+            tally,
+            vec![
+                (LegRefusal::MissingLotSize, 3),
+                (LegRefusal::UnsupportedSegment, 2),
+                (LegRefusal::UnresolvedUnderlyingSymbol, 1),
+            ],
+            "the largest cause must sort first — a triager reads the head of \
+             this list and stops"
+        );
+    }
+
+    #[test]
+    fn tally_refusals_omits_reasons_that_did_not_fire() {
+        let tally = tally_refusals(&[(1, LegRefusal::AtCapacity)]);
+        assert_eq!(tally, vec![(LegRefusal::AtCapacity, 1)]);
+        // A zero for every other reason would bury the one that fired among
+        // six that did not, which is the opposite of the point.
+        assert_eq!(tally.len(), 1);
+    }
+
+    #[test]
+    fn tally_refusals_of_nothing_is_empty() {
+        assert!(tally_refusals(&[]).is_empty());
+    }
+
+    #[test]
+    fn tally_refusals_breaks_a_tie_on_the_label_so_the_output_is_deterministic() {
+        // Equal counts must not order by hash or by input position: a log line
+        // that reorders between runs cannot be diffed across sessions.
+        let a = tally_refusals(&[(1, LegRefusal::MissingLotSize), (2, LegRefusal::AtCapacity)]);
+        let b = tally_refusals(&[(2, LegRefusal::AtCapacity), (1, LegRefusal::MissingLotSize)]);
+        assert_eq!(a, b, "the same multiset must render the same order");
+        assert_eq!(
+            a[0].0,
+            LegRefusal::AtCapacity,
+            "at_capacity < missing_lot_size"
+        );
+    }
+
+    #[test]
+    fn count_artifact_refusals_names_the_dominant_reason_first() {
+        // The 2026-09-09 shape, scaled down: every leg refused for ONE reason.
+        // This is the string that would have ended the two-session diagnosis
+        // immediately, so it is asserted verbatim rather than by `contains`.
+        let refusals: Vec<(i64, LegRefusal)> = (0..5)
+            .map(|i| (i, LegRefusal::MissingLotSize))
+            .chain(std::iter::once((99, LegRefusal::UnsupportedSegment)))
+            .collect();
+        assert_eq!(
+            count_artifact_refusals(&refusals),
+            "missing_lot_size=5 unsupported_segment=1"
+        );
+    }
+
+    #[test]
+    fn count_artifact_refusals_says_none_rather_than_going_blank() {
+        // An empty field reads as "the log line is broken"; "none" states the
+        // fact. Also proves the function is safe with no recorder installed.
+        assert_eq!(count_artifact_refusals(&[]), "none");
+    }
+
+    #[test]
+    fn count_artifact_refusals_covers_every_reason_the_enum_carries() {
+        // Pairs with `all_variants_are_in_the_seed_list`: a variant added to
+        // `LegRefusal` without a label would render here, so this fails rather
+        // than silently dropping the new reason out of the breakdown.
+        let refusals: Vec<(i64, LegRefusal)> = LegRefusal::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &r)| (i as i64, r))
+            .collect();
+        let rendered = count_artifact_refusals(&refusals);
+        for reason in LegRefusal::ALL {
+            assert!(
+                rendered.contains(&format!("{}=1", reason.as_str())),
+                "reason {} missing from {rendered}",
+                reason.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn pre_register_contract_underlying_counters_never_panics_without_a_recorder() {
+        // Not-panicking IS the whole property here, and the name says so: with
+        // no recorder installed there is nothing observable to assert against.
+        // The seed runs at attach, before any recorder is guaranteed installed
+        // in a test process, and a seeding call that aborts the attach would
+        // cost the whole contract universe. Every refusal reason being seeded
+        // is a separate claim, checked by the label test above.
+        pre_register_contract_underlying_counters();
+    }
+
+    #[test]
+    fn publish_from_legs_reports_an_empty_publish_rather_than_swallowing_it() {
+        // The silent-catastrophe arm. Zero legs means zero refusals, so the
+        // refusal warn cannot fire, and `owner_of` then returns None for every
+        // tick while every counter reads healthy.
+        let map = ContractUnderlyingMap::new();
+        let build = map.publish_from_legs(&[]);
+        assert_eq!(build.accepted, 0);
+        assert!(build.refusals.is_empty());
+        assert!(
+            map.is_empty(),
+            "an empty publish must REPLACE the map, not leave a stale one live"
+        );
+    }
+
+    #[test]
+    fn global_contract_underlying_map_is_one_map_and_starts_empty() {
+        // Two maps would mean the attach publishes into one and the drain reads
+        // the other, failing silently as "no contract is ever mapped".
+        let a = global_contract_underlying_map();
+        let b = global_contract_underlying_map();
+        assert!(std::sync::Arc::ptr_eq(a, b));
+    }
+
+    // -- order_selected_first (2026-09-10: the artifact holds ~77k option legs
+    //    against a 25,000 cap; artifact order used to decide who was mapped) --
+
+    fn subscribed(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    /// A08 (2026-09-22): a subscribed option at the END of an artifact larger
+    /// than the cap still gets its name. The plain file-order walk is the
+    /// control — it proves the fixture really does overflow the cap, so this
+    /// test cannot pass by the cap being out of reach.
+    #[test]
+    fn labels_from_artifact_selected_first_names_a_subscribed_contract_past_the_cap() {
+        let mut rows: Vec<ContractRow> = (1..=MAX_TRACKED_CONTRACTS as u64)
+            .map(|i| contract(i, "OPTSTK", "RELIANCE", "NSE"))
+            .collect();
+        let late = MAX_TRACKED_CONTRACTS as u64 + 7;
+        rows.push(contract(late, "OPTIDX", "NIFTY", "NSE"));
+
+        let file_order = labels_from_artifact(&rows);
+        assert_eq!(file_order.len(), MAX_TRACKED_CONTRACTS);
+        assert!(
+            !file_order.contains_key(&(late, FNO)),
+            "control: the file-order walk must drop the late row, or the fixture proves nothing"
+        );
+
+        let labels = labels_from_artifact_selected_first(&rows, &[subscribed(late, FNO)]);
+        assert_eq!(labels.len(), MAX_TRACKED_CONTRACTS, "the cap still holds");
+        assert!(
+            labels.contains_key(&(late, FNO)),
+            "the subscribed contract is named"
+        );
+    }
+
+    /// The same numeric id on a different segment is a different instrument
+    /// (I-P1-11) and earns no priority.
+    #[test]
+    fn labels_from_artifact_selected_first_matches_the_composite_key() {
+        let rows = [contract(500, "OPTIDX", "NIFTY", "NSE")];
+        let labels = labels_from_artifact_selected_first(
+            &rows,
+            &[subscribed(500, ExchangeSegment::NseEquity)],
+        );
+        // Still labelled in pass 2 — the selection only reorders, never filters.
+        assert!(labels.contains_key(&(500, FNO)));
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn order_selected_first_keeps_subscribed_contracts_ahead_and_stable() {
+        let legs: Vec<LegIds> = (1..=5).map(|i| leg(i, 13)).collect();
+        let picked = [subscribed(4, FNO), subscribed(2, FNO)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        let ids: Vec<i64> = ordered.iter().map(|l| l.contract_security_id).collect();
+        // Selected first, in their ORIGINAL relative order; then the rest,
+        // also in original order. Stability is what makes the refusal set
+        // deterministic across boots.
+        assert_eq!(ids, vec![2, 4, 1, 3, 5]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn order_selected_first_matches_the_composite_key_never_the_id_alone() {
+        // I-P1-11: a subscription for id 7 on NSE_EQ is a DIFFERENT instrument
+        // from option contract 7 on NSE_FNO. Matching on the bare id would
+        // promote a contract nobody subscribed.
+        let legs = vec![leg(7, 13), leg(8, 13)];
+        let picked = [subscribed(7, ExchangeSegment::NseEquity)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        assert_eq!(count, 0);
+        let ids: Vec<i64> = ordered.iter().map(|l| l.contract_security_id).collect();
+        assert_eq!(ids, vec![7, 8], "nothing promoted, order untouched");
+    }
+
+    #[test]
+    fn a_subscribed_contract_listed_last_in_the_artifact_is_mapped_before_the_cap() {
+        // The 2026-09-10 shape: more legs than the cap, and the contract we
+        // actually put on the wire sits at the END of the artifact. Before
+        // the reorder it was the one refused; the ranking then skipped every
+        // one of its ticks silently.
+        let last = MAX_TRACKED_CONTRACTS as i64 + 1;
+        let legs: Vec<LegIds> = (1..=last).map(|i| leg(i, 13)).collect();
+        let picked = [subscribed(last as u64, FNO)];
+        let (ordered, count) = order_selected_first(legs, &picked);
+        assert_eq!(count, 1);
+        let (map, build) = build_snapshot(&ordered);
+        assert_eq!(map.len(), MAX_TRACKED_CONTRACTS);
+        assert_eq!(
+            under(&map, (last as u64, FNO)),
+            Some(13),
+            "the subscribed contract must be mapped — it is the one whose ticks arrive"
+        );
+        // The cap refuses in ARRIVAL order, so the leg that no longer fits is
+        // the LAST unselected one — the subscribed leg took the slot the
+        // artifact's tail would have had. The refusal is still counted, never
+        // hidden. (The first draft of this assertion expected leg 1 refused,
+        // which would mean the map evicted an already-accepted leg — it does
+        // not, and must not.)
+        assert_eq!(
+            build.refusals,
+            vec![(MAX_TRACKED_CONTRACTS as i64, LegRefusal::AtCapacity)]
+        );
+        assert_eq!(under(&map, (1, FNO)), Some(13), "leg 1 keeps its slot");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Human-readable contract labels (operator 2026-09-13)
+// ---------------------------------------------------------------------------
+
+/// The label written when a contract has no resolvable one.
+///
+/// A STATIC string, deliberately, and never the id rendered at projection
+/// time: the projection runs on the frame drain over up to
+/// [`MAX_TRACKED_CONTRACTS`] rows x four cadences, and a `format!` there is the
+/// per-row heap allocation `hot-path.md` bans outright. The row still carries
+/// `security_id` and `segment`, so an `unmapped` label costs a join, never the
+/// identity.
+///
+/// Reaching it means the label map and the owner map DISAGREE — they are built
+/// from the same `&[ContractRow]` in the same pass, so a miss is real drift and
+/// is counted (`SnapshotRefusal::LabelUnavailable`), never silently blank.
+pub const UNLABELLED_CONTRACT: &str = "unmapped";
+
+/// Hard ceiling, in BYTES, on a rendered contract label.
+///
+/// # Why a cap exists at all (2026-09-13)
+///
+/// [`contract_label`] builds its label from `row.u` (the underlying) and
+/// `row.l` (the leg) — verbatim artifact strings, only `trim()`ed. Neither is
+/// length-checked anywhere upstream. The `top_volume` ILP writer sizes its
+/// producer ceiling from `TOP_VOLUME_ILP_ROW_BYTES = 448`, a number MEASURED
+/// against a 46-byte worst-case label
+/// (`MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE`, in
+/// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`). So 448 was
+/// presented as a bound and was not one: a long or corrupt artifact symbol
+/// made the row exceed it.
+///
+/// The consequence is bounded and LOUD rather than silent — the writer trips
+/// `WidthCapped` and `bail!`s naming the dropped count — but **that table has
+/// no spill tier**, so those rows are permanently gone. Capping the label
+/// trades a clipped display string for a batch that still lands.
+///
+/// # The derivation
+///
+/// | term | value |
+/// |---|---|
+/// | `TOP_VOLUME_ILP_ROW_BYTES` (the assumed width the ceiling is sized from) | 448 B |
+/// | `MEASURED_WORST_CASE_ILP_ROW_BYTES` (the real line, measured) | 401 B |
+/// | ...of which the label was | 46 B |
+/// | non-label remainder of the line | 401 - 46 = **355 B** |
+/// | therefore the label's budget inside 448 | 448 - 355 = **93 B** |
+///
+/// The cap must sit at or above **46** so no realistic label is ever clipped,
+/// and at or below **93** so no label can overrun the budget. **64** is chosen
+/// inside that band: 18 B of room above today's widest real symbol, and 29 B
+/// left under the ceiling.
+///
+/// Those 29 B are not slack, they are the residual this cap does NOT fully
+/// close: an ILP SYMBOL value escapes `,`, `=` and space with a backslash, so
+/// a label containing them is WIDER on the wire than its byte length here.
+/// Neither 448 nor the 401 measurement ever accounted for that — it applies
+/// equally to the 46-byte label shipping today — so the 29 B absorbs up to 29
+/// escaped characters and the general case is flagged rather than claimed
+/// solved.
+///
+/// FRAMING, checked 2026-09-22 because a security review asked whether a raw
+/// newline in a master-CSV field could split one ILP line into two: it cannot.
+/// questdb-rs 6.1.0 escapes `\n`, `\r` and `\\` in a SYMBOL value as well as
+/// `,`, `=` and space (`ingress/buffer.rs::must_escape_unquoted`). The cost of
+/// such a byte is width — covered by the paragraph above — never injection.
+///
+/// The two 448/401 terms are LITERALS in this doc rather than imports: both
+/// are private consts in `tickvault-storage`, and naming them here is the same
+/// honest middle that file already takes with its own `OPTION_FAMILIES` — a
+/// change to either is a visible edit here rather than an invisible drift.
+pub const MAX_CONTRACT_LABEL_BYTES: usize = 64;
+
+/// Appended to a label [`contract_label`] had to shorten.
+///
+/// Truncation must be VISIBLE: a silently shortened symbol reads as a
+/// different (possibly real) contract, which is worse than an obviously
+/// clipped one — and this label is the string `CLAUDE.md`'s DHAN SUPPORT
+/// section has an operator paste into a vendor ticket. Four ASCII bytes, none
+/// of which an ILP SYMBOL value escapes, and greppable as a whole word so a
+/// truncation episode can be counted from the table after the fact.
+const LABEL_TRUNCATION_MARKER: &str = "~cut";
+
+// The marker must fit inside the cap with room to carry some of the label,
+// or truncation would produce a label that is only a marker.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES > LABEL_TRUNCATION_MARKER.len() * 2,
+    "the label cap must leave room for real label bytes beside the truncation \
+     marker, or every truncated label renders as the marker alone"
+);
+// Independent term (1): the widest REAL label measured by
+// `the_assumed_ilp_row_width_covers_a_real_worst_case_line`. Below this the
+// cap would start clipping labels that legitimately occur today.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES >= 46,
+    "the label cap must cover the widest REAL label (46 B, \
+     MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE) or ordinary contracts \
+     start truncating"
+);
+// Independent term (2): the label's budget inside the ILP row width the
+// top_volume producer ceiling is sized from. Above this a row can overrun a
+// ceiling whose table has NO spill tier, so an over-wide row is a lost row.
+const _: () = assert!(
+    MAX_CONTRACT_LABEL_BYTES <= 93,
+    "the label cap must sit inside the 93 B the 448 B assumed ILP row width \
+     leaves for it over the 355 B non-label remainder. Above it, one row can \
+     push a sweep past MAX_TOP_VOLUME_PRODUCER_BUFFER_BYTES and this table \
+     drops rows with no spill tier"
+);
+
+/// Caps a rendered label at [`MAX_CONTRACT_LABEL_BYTES`], on a char boundary.
+///
+/// Deterministic (a given input always yields the same output), never
+/// panicking (`String::truncate` would panic on a non-boundary index, so the
+/// index is walked back to one first), and never splitting a UTF-8 sequence —
+/// an artifact symbol is not guaranteed ASCII, and half a codepoint in a
+/// SYMBOL column is a corrupt row rather than a short one.
+fn cap_label(mut label: String) -> String {
+    if label.len() <= MAX_CONTRACT_LABEL_BYTES {
+        return label;
+    }
+    let mut cut = MAX_CONTRACT_LABEL_BYTES - LABEL_TRUNCATION_MARKER.len();
+    // Walk DOWN to the nearest char boundary. `cut` starts strictly inside the
+    // string (the early return above proves `len` is larger), and 0 is always
+    // a boundary, so this terminates and `truncate` cannot panic.
+    while cut > 0 && !label.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    label.truncate(cut);
+    label.push_str(LABEL_TRUNCATION_MARKER);
+    label
+}
+
+/// Month names for the expiry component, indexed 1..=12.
+const MONTH_ABBREV: [&str; 13] = [
+    "???", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Renders one contract's full human label: `NIFTY-25Sep2026-24500-CE`.
+///
+/// The format is the one `CLAUDE.md`'s DHAN SUPPORT COMMUNICATIONS section
+/// mandates for every contract cited to the vendor ("precise contract labels
+/// (e.g. `NIFTY-Jun2026-28500-CE`) — NEVER generic"), so a row of this table
+/// can be pasted into a support draft unchanged.
+///
+/// **Cold path, called ONCE per contract per publish** — once a day at attach,
+/// over ~22,000 rows. It allocates; that is the entire point of resolving here
+/// rather than at projection time.
+///
+/// `expiry_ymd` is the master's `YYYYMMDD`. A value that does not parse as a
+/// plausible date renders its digits verbatim rather than being dropped: a
+/// wrong-looking expiry in the label is a visible defect, a missing one is an
+/// invisible one. Strike is in PAISE and renders as rupees — whole when the
+/// paise divide, with the fraction kept when they do not, because a strike
+/// like 1234.50 is real on low-priced underlyings and rounding it would make
+/// two adjacent strikes print the same label.
+///
+/// The result is CAPPED at [`MAX_CONTRACT_LABEL_BYTES`] and marked when it is
+/// — `underlying` and `leg` are verbatim artifact strings with no length check
+/// anywhere upstream, and an uncapped one made a `top_volume` row exceed the
+/// width its producer ceiling is sized from, on a table with no spill tier.
+/// See that constant for the derivation and for the escaping residual it does
+/// not close.
+#[must_use]
+pub fn contract_label(underlying: &str, expiry_ymd: u32, strike_paise: i64, leg: &str) -> String {
+    let year = expiry_ymd / 10_000;
+    let month = (expiry_ymd / 100) % 100;
+    let day = expiry_ymd % 100;
+    let rupees = strike_paise / 100;
+    let paise = (strike_paise % 100).abs();
+    let mut out = String::with_capacity(40);
+    out.push_str(underlying.trim());
+    out.push('-');
+    if (1..=12).contains(&month) && (1..=31).contains(&day) && year >= 1970 {
+        // `{day:02}` so 5 Sep sorts and reads beside 25 Sep.
+        out.push_str(&format!("{day:02}{}{year}", MONTH_ABBREV[month as usize]));
+    } else {
+        // Verbatim rather than dropped — see the fn doc.
+        out.push_str(&expiry_ymd.to_string());
+    }
+    out.push('-');
+    if paise == 0 {
+        out.push_str(&rupees.to_string());
+    } else {
+        out.push_str(&format!("{rupees}.{paise:02}"));
+    }
+    let leg = leg.trim();
+    if !leg.is_empty() {
+        out.push('-');
+        out.push_str(leg);
+    }
+    // The cap goes at the END, over the WHOLE rendered label, not on each
+    // component: a pathological `underlying`, a pathological `leg` and a
+    // pathological `expiry_ymd` (which renders its digits verbatim by design)
+    // all widen the same row, and one choke point is the only shape that
+    // bounds their sum.
+    cap_label(out)
+}
+
+/// Builds the contract-id -> label table from the day's artifact rows.
+///
+/// Keyed and filtered EXACTLY as [`legs_from_artifact`] is — options only,
+/// same segment derivation, same zero-id refusal — so the two maps cover the
+/// same contracts and a miss at projection time is genuine drift rather than a
+/// shape difference. Anything the owner map refuses for a reason this pass
+/// cannot see (an unresolved underlying symbol, a missing lot size) simply
+/// never reaches the leaderboard, so an extra entry here is harmless.
+///
+/// `Arc<str>` rather than `String`: the projection hands the storage row a
+/// borrowed `&str` out of the published snapshot, so the per-row cost is one
+/// pointer copy and ZERO allocation. `Arc<str>` also stores the length inline
+/// with no spare capacity word, which matters at ~22,000 entries.
+#[must_use]
+pub fn labels_from_artifact(contracts: &[ContractRow]) -> HashMap<ContractKey, Arc<str>> {
+    labels_from_artifact_selected_first(contracts, &[])
+}
+
+/// [`labels_from_artifact`], but every SUBSCRIBED contract is labelled before
+/// any unsubscribed one.
+///
+/// Added 2026-09-22 (review finding A08, HIGH). The table is capped at
+/// [`MAX_TRACKED_CONTRACTS`] and the artifact holds ~121,000 option rows, so a
+/// file-order walk filled the cap with whatever came first and every
+/// subscribed option past row 25,000 wrote its candles with a NULL
+/// `contract`. The owner map already orders selected-first
+/// ([`order_selected_first`]); this makes the labels follow the same rule.
+///
+/// Two passes over the rows, O(rows), once per attach — never on the tick path.
+#[must_use]
+pub fn labels_from_artifact_selected_first(
+    contracts: &[ContractRow],
+    selected: &[SubscribeInstrument],
+) -> HashMap<ContractKey, Arc<str>> {
+    let picked: HashSet<ContractKey> = selected
+        .iter()
+        .map(|instrument| (instrument.security_id, instrument.segment))
+        .collect();
+    let mut labels: HashMap<ContractKey, Arc<str>> =
+        HashMap::with_capacity(contracts.len().min(MAX_TRACKED_CONTRACTS));
+    // Pass 1 takes only subscribed keys; pass 2 fills what room is left. With
+    // an empty selection pass 1 takes nothing and this is the plain file-order
+    // walk.
+    for want_selected in [true, false] {
+        if want_selected && picked.is_empty() {
+            continue;
+        }
+        for row in contracts {
+            if !matches!(row.c.as_str(), "OPTIDX" | "OPTSTK") {
+                continue;
+            }
+            if row.i == 0 {
+                continue;
+            }
+            let Some(segment) = crate::dhan_contract_universe::derivative_segment(&row.x) else {
+                continue;
+            };
+            let key = (row.i, segment);
+            if picked.contains(&key) != want_selected {
+                continue;
+            }
+            if labels.len() >= MAX_TRACKED_CONTRACTS && !labels.contains_key(&key) {
+                continue;
+            }
+            labels.insert(
+                key,
+                Arc::from(contract_label(&row.u, row.e, row.s, &row.l).as_str()),
+            );
+        }
+    }
+    labels
+}
+
+#[cfg(test)]
+mod label_cap_tests {
+    use super::{
+        LABEL_TRUNCATION_MARKER, MAX_CONTRACT_LABEL_BYTES, contract_label, labels_from_artifact,
+    };
+
+    /// The expiry/strike/leg tail every fixture below shares, so a test can
+    /// reconstruct what the UNCAPPED render would have been and assert the
+    /// truncation is a real prefix of it.
+    const TAIL: &str = "-25Sep2026-24500-CE";
+
+    /// The widest label the storage-side width harness measures the ILP row
+    /// against. It must survive untouched, or this cap is clipping contracts
+    /// that legitimately trade today.
+    const WIDEST_REAL_LABEL: &str = "MAZAGONDOCKSHIPBUILDERS-25Sep2026-123456.75-CE";
+
+    #[test]
+    fn an_ordinary_label_is_untouched_by_the_cap() {
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, "CE");
+        assert_eq!(label, "NIFTY-25Sep2026-24500-CE");
+        assert!(
+            !label.contains(LABEL_TRUNCATION_MARKER),
+            "a 24 B label must not be marked as truncated"
+        );
+    }
+
+    /// Non-vacuous in the direction that matters: the cap must not be so tight
+    /// that the REAL worst case trips it. This is the lower bound the
+    /// const-assert pins, proven end to end through `contract_label`.
+    #[test]
+    fn the_widest_real_label_still_renders_in_full() {
+        let label = contract_label("MAZAGONDOCKSHIPBUILDERS", 20_260_925, 12_345_675, "CE");
+        assert_eq!(label, WIDEST_REAL_LABEL);
+        assert_eq!(label.len(), 46, "the measured worst case is 46 B");
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(!label.contains(LABEL_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn an_over_long_label_truncates_within_the_cap_and_says_so() {
+        // A pathological artifact symbol: 200 ASCII bytes where a real one is
+        // at most 23. This is the shape that made a row exceed the ILP width
+        // the `top_volume` producer ceiling is sized from, on a table with no
+        // spill tier — so the row was permanently lost rather than clipped.
+        let underlying = "A".repeat(200);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(
+            label.len() <= MAX_CONTRACT_LABEL_BYTES,
+            "a truncated label measured {} B against a {MAX_CONTRACT_LABEL_BYTES} B cap",
+            label.len()
+        );
+        assert!(
+            label.ends_with(LABEL_TRUNCATION_MARKER),
+            "truncation must be VISIBLE, not a silently shortened symbol: {label}"
+        );
+        // Deterministic: the same input renders the same label every time, so
+        // a DEDUP key carrying this column cannot split one contract in two.
+        assert_eq!(
+            label,
+            contract_label(&underlying, 20_260_925, 2_450_000, "CE")
+        );
+    }
+
+    /// The leg is the OTHER uncapped artifact string, and the cap is applied
+    /// once over the WHOLE rendered label rather than per component.
+    #[test]
+    fn an_over_long_leg_is_capped_by_the_same_choke_point() {
+        let leg = "C".repeat(300);
+        let label = contract_label("NIFTY", 20_260_925, 2_450_000, &leg);
+        assert!(label.len() <= MAX_CONTRACT_LABEL_BYTES);
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// Truncation must land on a char boundary. `String::truncate` PANICS on a
+    /// byte index inside a UTF-8 sequence and repo law bans a panic on a
+    /// production path — an artifact symbol is not guaranteed ASCII.
+    ///
+    /// The ASCII padding is deliberately FIRST so the cap's byte index lands
+    /// at a different offset within the 3-byte run on each iteration; without
+    /// it every cut would land on an exact multiple of 3 and the boundary walk
+    /// would never execute, leaving this test vacuous.
+    #[test]
+    fn a_multi_byte_label_truncates_on_a_char_boundary_without_panicking() {
+        for pad in 0..6_usize {
+            let underlying = format!("{}{}", "x".repeat(pad), "\u{20b9}".repeat(120));
+            let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "pad {pad}: multi-byte label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER), "pad {pad}");
+
+            // The real proof, and the reason this is not just a "did not
+            // panic" test: strip the marker and what remains must be a
+            // character-aligned PREFIX of the label that would have rendered
+            // uncapped. A split codepoint fails both halves.
+            //
+            // The slice index is safe by the assert above: the marker is
+            // ASCII, so `len - marker.len()` is the boundary it starts at.
+            let kept = &label[..label.len() - LABEL_TRUNCATION_MARKER.len()];
+            let uncapped = format!("{underlying}{TAIL}");
+            assert!(
+                uncapped.starts_with(kept),
+                "pad {pad}: truncation is not a prefix of the full label"
+            );
+            assert!(
+                uncapped.is_char_boundary(kept.len()),
+                "pad {pad}: truncation split a UTF-8 sequence at byte {}",
+                kept.len()
+            );
+        }
+    }
+
+    /// A label so pathological that only the marker could survive must still
+    /// be a label. An empty SYMBOL value is a different failure from a
+    /// truncated one and must not be reachable here.
+    #[test]
+    fn truncation_always_keeps_some_of_the_original_label() {
+        let underlying = "\u{1f600}".repeat(64);
+        let label = contract_label(&underlying, 20_260_925, 2_450_000, "CE");
+        assert!(label.len() > LABEL_TRUNCATION_MARKER.len());
+        assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+    }
+
+    /// The cap reaches the PUBLISHED snapshot, not just the free function —
+    /// `labels_from_artifact` is the only producer the projection reads, so a
+    /// cap that stopped at `contract_label` would bound nothing in production.
+    #[test]
+    fn the_published_label_snapshot_carries_capped_labels() {
+        use crate::dhan_contract_universe::ContractRow;
+
+        let rows = vec![ContractRow {
+            i: 42,
+            // `EXCH_ID`, which `derivative_segment` maps — "NSE", not the
+            // segment name.
+            x: "NSE".to_owned(),
+            c: "OPTSTK".to_owned(),
+            e: 20_260_925,
+            s: 2_450_000,
+            l: "CE".to_owned(),
+            u: "B".repeat(250),
+            z: 50,
+        }];
+        let labels = labels_from_artifact(&rows);
+        assert_eq!(labels.len(), 1, "the fixture must actually publish a label");
+        for label in labels.values() {
+            assert!(
+                label.len() <= MAX_CONTRACT_LABEL_BYTES,
+                "a published label measured {} B",
+                label.len()
+            );
+            assert!(label.ends_with(LABEL_TRUNCATION_MARKER));
+        }
+    }
+}
+
+/// Audit PR M / M4 (2026-10-26): only refusals of SUBSCRIBED contracts count.
+#[cfg(test)]
+mod subscribed_refusal_tests {
+    use super::*;
+
+    const FNO: ExchangeSegment = ExchangeSegment::NseFno;
+
+    fn leg(contract: i64, lot_size: u32) -> LegIds {
+        LegIds {
+            contract_security_id: contract,
+            underlying_security_id: 13,
+            contract_segment: FNO,
+            lot_size,
+            family: OptionFamily::Stock,
+        }
+    }
+
+    fn picked(id: u64, segment: ExchangeSegment) -> SubscribeInstrument {
+        SubscribeInstrument {
+            security_id: id,
+            segment,
+        }
+    }
+
+    fn at_capacity_count(handle: &metrics_exporter_prometheus::PrometheusHandle) -> String {
+        handle
+            .render()
+            .lines()
+            .find(|l| l.starts_with(REFUSED_COUNTER) && l.contains(LegRefusal::AtCapacity.as_str()))
+            .and_then(|l| l.rsplit(' ').next())
+            .unwrap_or("absent")
+            .to_owned()
+    }
+
+    // Regression: 2026-10-26 — each attach attempt counted 60,988 `at_capacity`
+    // refusals of legs nobody subscribed. The map still holds every leg that
+    // fits (unchanged); only a subscribed contract's refusal is counted.
+    #[test]
+    fn test_regression_unsubscribed_at_capacity_legs_are_not_counted() {
+        // Two subscribed legs first, then one past the cap of unsubscribed.
+        let mut legs = vec![leg(1, 75), leg(2, 75)];
+        legs.extend((10..10 + MAX_TRACKED_CONTRACTS as i64 + 1).map(|id| leg(id, 75)));
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let map = ContractUnderlyingMap::new();
+        let (build, counted) = metrics::with_local_recorder(&recorder, || {
+            pre_register_contract_underlying_counters();
+            map.publish_from_legs_selected_first(&legs, 2)
+        });
+        assert_eq!(
+            build.accepted, MAX_TRACKED_CONTRACTS,
+            "the map is full, as before"
+        );
+        assert_eq!(
+            build.refusals.len(),
+            3,
+            "three unsubscribed legs past the cap"
+        );
+        assert_eq!(counted, 0, "none of them is a subscribed contract");
+        assert_eq!(at_capacity_count(&handle), "0");
+        assert!(map.owner_of(1, FNO).is_some() && map.owner_of(2, FNO).is_some());
+    }
+
+    #[test]
+    fn test_publish_from_legs_selected_first_still_counts_a_subscribed_refusal() {
+        let legs = vec![leg(1, 0), leg(2, 75), leg(3, 0)];
+        let map = ContractUnderlyingMap::new();
+        let (build, counted) = map.publish_from_legs_selected_first(&legs, 2);
+        assert_eq!(build.refusals.len(), 2, "both zero-lot legs are refused");
+        assert_eq!(counted, 1, "only the subscribed one (id 1) counts");
+    }
+
+    #[test]
+    fn test_publish_from_legs_still_counts_every_refusal() {
+        let map = ContractUnderlyingMap::new();
+        let build = map.publish_from_legs(&[leg(1, 0), leg(2, 0)]);
+        assert_eq!(build.refusals.len(), 2);
+    }
+
+    #[test]
+    fn test_subscribed_refusals_keeps_subscribed_and_unattributable_ones() {
+        let refusals = vec![
+            (100, LegRefusal::MissingLotSize),
+            (200, LegRefusal::UnsupportedSegment),
+            (300, LegRefusal::UnresolvedUnderlyingSymbol),
+            (0, LegRefusal::ZeroOrNegativeContractId),
+        ];
+        let selected = vec![
+            picked(100, FNO),
+            picked(300, ExchangeSegment::BseFno),
+            // Same bare id as 200 but a SPOT: must not adopt the derivative's refusal.
+            picked(200, ExchangeSegment::NseEquity),
+        ];
+        let kept = subscribed_refusals(&refusals, &selected);
+        assert_eq!(
+            kept,
+            vec![
+                (100, LegRefusal::MissingLotSize),
+                (300, LegRefusal::UnresolvedUnderlyingSymbol),
+                (0, LegRefusal::ZeroOrNegativeContractId),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_subscribed_refusals_of_nothing_subscribed_is_empty_but_for_zero_ids() {
+        let refusals = vec![
+            (5, LegRefusal::AtCapacity),
+            (-1, LegRefusal::MissingLotSize),
+        ];
+        assert_eq!(
+            subscribed_refusals(&refusals, &[]),
+            vec![(-1, LegRefusal::MissingLotSize)]
+        );
+    }
+}

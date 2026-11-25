@@ -3,7 +3,8 @@
 //! `c1a50504` per the coordinator fast-path decision).
 //!
 //! **The incident this pins closed:** tickvault.service is `Type=notify`
-//! with `WatchdogSec=60`. Both pre-existing `notify_systemd_ready()` sites
+//! with `WatchdogSec=` (150 since 2026-09-03; the guard parses the live
+//! value, it never hardcodes it). Both pre-existing `notify_systemd_ready()` sites
 //! were Dhan-gated (the FAST crash-recovery arm + inside `start_dhan_lane`),
 //! so the Phase-A `dhan_enabled=false` flip (#1496) left every prod boot
 //! stuck `activating` forever — `systemctl restart tickvault` never
@@ -77,7 +78,32 @@ fn test_comment_stripper_removes_commented_needles() {
 }
 
 const READY_NEEDLE: &str = "infra::notify_systemd_ready();";
-const PINGER_SPAWN_NEEDLE: &str = "let _process_global_watchdog_pinger = tokio::spawn(";
+/// RE-BLESSED 2026-09-01: `tokio::spawn(` -> a dedicated OS thread.
+///
+/// Every property this guard has ever enforced is UNCHANGED and still
+/// enforced below: exactly one site, in the shared boot prefix, before
+/// READY=1, not feed-gated, with a body that really pings on
+/// `WATCHDOG_INTERVAL_SECS`. Only the primitive moved, and it moved because
+/// the tokio one was measured failing.
+///
+/// MEASURED over 24 hours to 2026-09-01: 12 watchdog timeouts and 10 SIGKILL
+/// restarts. The runtime runs 2 worker threads (`TICKVAULT_TOKIO_WORKER_THREADS=2`,
+/// the CPU partition of operator Quote 17b) and the universe rider performs
+/// synchronous `std::fs` on a worker. Two such calls occupy BOTH workers, the
+/// timer wheel driving `tokio::time::interval` stalls, this pinger never runs,
+/// and systemd kills the process at t+60s -- taking all 14 sockets down and
+/// forcing a cold resubscribe of ~21,730 instruments over a ~246s window.
+///
+/// A liveness beacon must not depend on the health of the thing it reports on.
+/// On its own OS thread with `std::thread::sleep` the pinger cannot be starved
+/// by the runtime it is reporting on.
+///
+/// The 2026-08-20 `MissedTickBehavior::Delay` property is PRESERVED and is now
+/// structural rather than configured: `sleep` re-bases from the actual wake, so
+/// a late wake is a real gap and can never be repaid in a burst. That is now a
+/// consequence of the primitive instead of a setting a refactor can drop.
+const PINGER_SPAWN_NEEDLE: &str =
+    "let _process_global_watchdog_pinger = std::thread::Builder::new()";
 
 /// Pin 1 — READY=1 is provably reached on the boot path.
 /// PR-C2 re-shape (2026-07-13, operator retirement directive —
@@ -205,6 +231,7 @@ fn test_watchdog_pinger_is_shared_prefix_feed_unconditional_and_real() {
 /// WatchdogSec). Parses the REAL unit file so the two sides cannot drift
 /// apart silently.
 #[test]
+#[allow(clippy::assertions_on_constants)] // APPROVED: this guard pins a relation between compile-time constants and is meant to fail when one is edited.
 fn test_pinger_interval_within_unit_watchdog_budget() {
     let unit = strip_line_comments(&read("deploy/systemd/tickvault.service"));
     assert!(

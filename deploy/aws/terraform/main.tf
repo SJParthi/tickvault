@@ -1,3 +1,7 @@
+# ⚠ CORRECTED 2026-10-11: the header below is history. The live instance lock
+# is r8g.xlarge (4 vCPU / 32 GiB), multi-AZ, per daily-universe-scope-expansion
+# §7 Quote 13 (2026-08-08); var.instance_type's validation pins it. The
+# t4g.medium envelope and bills below describe a superseded box.
 # DLT AWS stack — t4g.medium budget envelope (INTERIM ~₹1,289/mo incl GST:
 # 270 hrs, live 30 GB EBS [verified 2026-07-19 via describe-volumes — the
 # 2026-07-13 approved grow to 50 never physically applied; the ~₹1,471 figure
@@ -15,7 +19,7 @@
 #
 # Deployed resources:
 #   - VPC with a single public subnet (no NAT to stay under budget)
-#   - Security group: SSH from operator_cidr, no inbound from market
+#   - Security group: SSH only from operator_cidr when set (none by default), no inbound from market
 #   - IAM role: SSM read+write+delete (instance lock) + CloudWatch write +
 #     SNS publish + S3 cold-tier read/write
 #   - EC2 t4g.medium (ARM Graviton2, 2 vCPU / 4 GiB — 2026-07-15 downsize lock;
@@ -28,9 +32,10 @@
 #   - SSM parameters for Dhan credentials, Telegram tokens, QuestDB creds,
 #     instance lock (dual-instance prevention — see crates/core/src/instance_lock.rs)
 #   - SNS topic for CRITICAL alerts → 4-channel fan-out (SMS+Telegram+Email+Connect)
-#   - EventBridge rules for daily 08:30 IST start / 17:30 IST stop (Mon-Fri;
-#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14 — the 9-hour
-#     window. The START is unchanged, which is why no morning schedule moved.)
+#   - EventBridge rules for daily 08:30 IST start / 16:30 IST stop (Mon-Fri;
+#     stop moved 16:30 -> 17:30 on 2026-08-08 per operator Quote 14, and back
+#     17:30 -> 16:30 on 2026-10-22 per operator Quote 37, plan item 64. The
+#     START is unchanged both times, which is why no morning schedule moved.)
 #     trading weekdays only per operator lock 2026-05-29 §7 Quote 5; weekends +
 #     NSE holidays = OFF unless the operator manually starts the instance)
 #   - CloudWatch log group + metric alarms (5 core infrastructure signals)
@@ -141,12 +146,17 @@ resource "aws_security_group" "tv_app" {
   description = "DLT app: SSH from operator, egress to Dhan + AWS services"
   vpc_id      = aws_vpc.dlt.id
 
-  ingress {
-    description = "SSH from operator"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.operator_cidr]
+  # SSH only when operator_cidr is set (audit PR36c, 2026-10-03); empty by
+  # default, so no port is open to the internet. See variables.tf.
+  dynamic "ingress" {
+    for_each = var.operator_cidr == "" ? [] : [var.operator_cidr]
+    content {
+      description = "SSH from operator"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
   # B4 QuestDB console (questdb-console.tf): the console's VPC back-Lambda
@@ -187,14 +197,11 @@ resource "aws_security_group" "tv_app" {
 # IAM
 # ---------------------------------------------------------------------------
 
-# Customer-managed KMS key for the Groww shared-token SSM parameters. Created
-# and owned by the bruteX repo's groww-token-minter terraform (operator lock
-# 2026-07-02, .claude/rules/project/groww-shared-token-minter-2026-07-02.md §1)
-# — referenced here read-only so the instance role can be granted kms:Decrypt
-# on exactly this one key (least privilege; no wildcard key access).
-data "aws_kms_key" "tickvault_groww" {
-  key_id = "alias/tickvault-groww"
-}
+# 2026-08-21: the read-only lookup of the customer-managed key
+# alias/tickvault-groww was REMOVED with the Groww feed. It existed only so the
+# instance role could decrypt /tickvault/<env>/groww/access-token, and nothing
+# reads that parameter now. The alias is owned by another repository, so a dead
+# lookup here would also fail `terraform plan` the day that repository retires it.
 
 resource "aws_iam_role" "tv_instance" {
   name = "tv-${var.environment}-instance-role"
@@ -234,9 +241,8 @@ resource "aws_iam_role_policy" "tv_instance" {
           #      so a second minter would invalidate ours and start a re-mint
           #      war. Contract: groww-shared-token-minter-2026-07-02.md §9.
           # No extra KMS grant is needed for that param: it is written as a
-          # SecureString under the DEFAULT aws/ssm key. (The kms:Decrypt
-          # statement below is specific to the Groww param, which uses the
-          # customer-managed alias/tickvault-groww CMK owned by bruteX.)
+          # SecureString under the DEFAULT aws/ssm key. This role holds no
+          # kms:Decrypt statement at all since 2026-08-21 -- see the note below.
           "ssm:PutParameter",
           # DeleteParameter needed for graceful release of the
           # dual-instance lock at shutdown — see PR #764
@@ -253,28 +259,11 @@ resource "aws_iam_role_policy" "tv_instance" {
           "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
         ]
       },
-      {
-        # Groww shared-token decrypt (sidecar crash-loop fix, 2026-07-02):
-        # /tickvault/prod/groww/access-token is a SecureString encrypted with
-        # the CUSTOMER-MANAGED key alias/tickvault-groww (owned by the bruteX
-        # groww-token-minter terraform). Unlike AWS-managed aws/ssm keys, a
-        # CMK-encrypted param needs kms:Decrypt in THIS identity policy in
-        # addition to the ssm:GetParameter grant above — without it the
-        # GetParameter(WithDecryption=true) decrypt leg is denied, which
-        # crash-looped the Groww sidecar (CloudWatch 15:03-15:14 IST,
-        # 2026-07-02). Scoped to exactly that one key AND only via SSM
-        # (mirrors the telegram-webhook-lambda.tf ViaService pattern).
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-        ]
-        Resource = data.aws_kms_key.tickvault_groww.arn
-        Condition = {
-          StringEquals = {
-            "kms:ViaService" = "ssm.${var.aws_region}.amazonaws.com"
-          }
-        }
-      },
+      # 2026-08-21: a kms:Decrypt statement on alias/tickvault-groww lived here.
+      # It existed for exactly one read -- the CMK-encrypted Groww access-token
+      # parameter -- and that reader is gone with the Groww feed. Removed rather
+      # than left in place: a standing decrypt grant on a key this role never
+      # uses is privilege it no longer needs.
       {
         Effect = "Allow"
         Action = [
@@ -308,11 +297,11 @@ resource "aws_iam_role_policy" "tv_instance" {
         # S3 cold-bucket access for the box. Consumers (2026-07-13 audit):
         #   - partition manager S3 archival (partitions/* — the designed >90d
         #     cold-tier leg; STORAGE-GAP-04)
-        #   - BruteX cross-verify CSV read (crossverify/* — §37 KEEP class)
-        #   - Groww NDJSON capture archival (groww-capture/* — added 2026-07-13
-        #     with the disk-retention hardening PR; s3:PutObject + s3:GetObject
-        #     for head-object verification are ALREADY covered by this
-        #     whole-bucket statement, so no new statement was needed)
+        #   (the BruteX cross-verify CSV read and the Groww NDJSON capture
+        #    archival were the other two consumers; both left with the Groww
+        #    feed on 2026-08-21. This grant is whole-bucket, so their departure
+        #    narrows nothing by itself -- recorded so the next reader does not
+        #    hunt for writers that no longer exist.)
         Effect = "Allow"
         Action = [
           "s3:GetObject",
@@ -325,8 +314,36 @@ resource "aws_iam_role_policy" "tv_instance" {
         ]
       },
       {
+        # Plan item LF-7 (2026-11-12, owner Quote 57): the daily live paper fill
+        # report copies its files to live-fill-logs/<date>/. The whole-bucket
+        # grant above already covers that PutObject, so no new Allow is added
+        # (it would narrow nothing). This explicit Deny is the real control: the
+        # box can never delete a report copy, any version of it, whatever any
+        # other statement allows. No lifecycle change (tv_cold only transitions).
+        Effect = "Deny"
+        Action = [
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+        ]
+        Resource = "arn:aws:s3:::tv-${var.environment}-cold/live-fill-logs/*"
+      },
+      {
+        # Plan PR MV (2026-11-06): the movers universe publisher writes ONE
+        # object (live-view-bucket.tf). PutObject on that key only.
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = "arn:aws:s3:::tv-${var.environment}-live-view/movers/universe.json"
+      },
+      {
+        # Plan PR MV review: the publisher builds only while a portal viewer
+        # is active; it reads the Lambda's heartbeat. GetObject on that key only.
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:aws:s3:::tv-${var.environment}-live-view/movers/viewer.json"
+      },
+      {
         # NSE-holiday self-stop: the boot-time holiday gate
-        # (deploy/aws/holiday-gate.sh) stops THIS instance on a non-trading
+        # (`tickvault holiday-gate`) stops THIS instance on a non-trading
         # day so the Mon-Fri start cron never bills a full no-op day.
         # Scoped by the Name tag (NOT the instance ARN) on purpose — the
         # instance -> instance-profile -> role -> policy chain would create a
@@ -446,8 +463,11 @@ resource "aws_instance" "tv_app" {
   #                    out-of-band by scripts/aws-upgrade-instance.sh or the
   #                    guarded downsize-instance.yml workflow at a controlled
   #                    off-market time. Terraform must not fight that or revert
-  #                    it. The var.instance_type validation still documents the
-  #                    desired t4g.medium for any fresh provision.
+  #                    it. The var.instance_type validation pins r8g.xlarge
+  #                    for any fresh provision.
+  #                    ⚠ CORRECTED 2026-10-11: this said the validation
+  #                    documented t4g.medium as the desired type. It pins
+  #                    r8g.xlarge (Quote 13, 2026-08-08); t4g.medium is history.
   #   - user_data:     bootstrap-only (see note above); deploys are over SSM.
   #   - root_block_device size/iops/throughput: scripts/aws-upgrade-instance.sh
   #                    bumps these ONLINE (aws ec2 modify-volume, no stop, no data
@@ -513,7 +533,8 @@ resource "aws_cloudwatch_log_group" "tv_app" {
 #
 # IST offset is UTC+5:30, so:
 #   Weekday start 08:30 IST = 03:00 UTC (Mon-Fri)
-#   Weekday stop  17:30 IST = 12:00 UTC (Mon-Fri)  [2026-08-08 Quote 14]
+#   Weekday stop  16:30 IST = 11:00 UTC (Mon-Fri)  [2026-10-22 Quote 37; was
+#                 17:30 IST = 12:00 UTC from 2026-08-08, Quote 14]
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "daily_start" {
@@ -524,7 +545,10 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
   # so terraform re-enables this rule. The Jul 4 pause set state = "DISABLED";
   # the #1404 revert REMOVED the attribute, and with `state` absent the AWS
   # provider stops managing rule state - the rule stayed DISABLED on AWS.
-  state = "ENABLED"
+  # Audit PR30 (2026-09-27): DISABLED while the budget-stop latch holds, so
+  # an apply never re-enables the rule the hard-stop guard disabled on a
+  # budget breach (variables.tf daily_start_enabled; terraform-apply.yml).
+  state = var.daily_start_enabled ? "ENABLED" : "DISABLED"
 }
 
 # 2026-08-08 (operator Quote 14): stop moved 16:30 -> 17:30 IST for the 9-hour
@@ -536,16 +560,27 @@ resource "aws_cloudwatch_event_rule" "daily_start" {
 # open, deploy-watchdog) and every one of them stays correct. Only the two
 # stop-side schedules move.
 #
+# 2026-10-22 (operator Quote 37, plan item 64): stop moved back 17:30 -> 16:30
+# IST (11:00 UTC). Start stays 08:30.
+#
 # KEEP IN LOCKSTEP (each force-stops or false-alarms if it disagrees):
-#   - start-watchdog-lambda.tf stop_check cron -> 17:45 IST
-#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 12
-#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 17*60+30 (curfew)
-#   - hard_stop_guard.rs in_up_window upper bound = 1730
-# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs.
+#   - start-watchdog-lambda.tf stop_check cron -> 16:45 IST, cron(15 11 ...)
+#   - start_watchdog.rs STOP_TRIGGER_UTC_HOUR = 11
+#   - start_watchdog.rs OPERATING_CLOSE_IST_MINUTES = 16*60+30 (curfew)
+#   - hard_stop_guard.rs in_up_window upper bound = 1630
+#   - shutdown_class.rs SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST = 59,400 (the app's
+#     quiet window and every cross-verification bound derive from it)
+# Pinned by crates/aws-lambdas/tests/stop_window_lockstep_guard.rs and
+# shutdown_class::test_scheduled_daily_stop_matches_the_main_tf_daily_stop_cron.
+#
+# Operator Quote 31 (2026-10-21): this rule now fires the start-watchdog
+# Lambda (mode "daily_stop", target in start-watchdog-lambda.tf), which skips
+# the stop while the app's drain hold says the day's data is still going into
+# the database. The hold can never keep the box past 07:30 IST.
 resource "aws_cloudwatch_event_rule" "daily_stop" {
   name                = "tv-${var.environment}-daily-stop"
-  description         = "Stop tickvault instance at 17:30 IST on trading weekdays (Mon-Fri)"
-  schedule_expression = "cron(0 12 ? * MON-FRI *)"
+  description         = "Stop tickvault instance at 16:30 IST on trading weekdays (Mon-Fri)"
+  schedule_expression = "cron(0 11 ? * MON-FRI *)"
 }
 
 # ---------------------------------------------------------------------------
@@ -643,9 +678,10 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
         ]
       },
       {
+        # The daily start target passes only this role as AutomationAssumeRole.
         Effect   = "Allow"
         Action   = "iam:PassRole"
-        Resource = "*"
+        Resource = aws_iam_role.eventbridge_ec2_scheduler.arn
         Condition = {
           StringEquals = {
             "iam:PassedToService" = "ssm.amazonaws.com"
@@ -658,7 +694,6 @@ resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
 
 locals {
   ssm_start_arn = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:$DEFAULT"
-  ssm_stop_arn  = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
 }
 
 resource "aws_cloudwatch_event_target" "daily_start" {
@@ -686,37 +721,39 @@ resource "aws_cloudwatch_event_target" "daily_start" {
   }
 }
 
-resource "aws_cloudwatch_event_target" "daily_stop" {
-  rule      = aws_cloudwatch_event_rule.daily_stop.name
-  target_id = "stop-instance"
-  arn       = local.ssm_stop_arn
-  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
-
-  input = jsonencode({
-    InstanceId           = [aws_instance.tv_app.id]
-    AutomationAssumeRole = [aws_iam_role.eventbridge_ec2_scheduler.arn]
-  })
-
-  # Same resilience on the 16:30 IST stop — a dropped stop means the box bills
-  # 24/7 (~₹5,500/mo vs the locked ~₹2,919/mo per §7). Retry + DLQ
-  # + the 16:45 stop-watchdog are the defense in depth.
-  retry_policy {
-    maximum_retry_attempts       = 5
-    maximum_event_age_in_seconds = 600
-  }
-
-  dead_letter_config {
-    arn = aws_sqs_queue.eventbridge_dlq.arn
-  }
-}
+# The daily_stop TARGET lives in start-watchdog-lambda.tf since operator
+# Quote 31 (2026-10-21): the daily stop (16:30 since 2026-10-22) now invokes the start-watchdog Lambda
+# (mode "daily_stop"), which honours the app's drain hold, instead of the SSM
+# stop automation, which could not. The rule above is unchanged.
 
 # S3 cold-storage bucket for tick data > 14 days old.
 resource "aws_s3_bucket" "tv_cold" {
   bucket = "tv-${var.environment}-cold"
 }
 
+# Versioning ON (operator Quotes 27 + 28, 2026-09-29, ITEM 45f): an overwrite
+# or a delete leaves the prior version in place. Suspending it is a REJECT in
+# docs/claude-rules-full/project/daily-universe-scope-expansion-2026-05-27.md.
+resource "aws_s3_bucket_versioning" "tv_cold" {
+  bucket = aws_s3_bucket.tv_cold.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# Objects move to cheaper tiers and are NEVER expired (Quotes 27 + 28,
+# 2026-09-29, ITEM 45f). The 5-year expiry this block used to carry was
+# removed: SEBI's five years is a floor, not a ceiling, and the operator
+# ordered that nothing captured is ever deleted. No rule here may expire a
+# current or a noncurrent version; crates/common/tests/aws_infra_wiring.rs
+# fails the build if one is added.
 resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
   bucket = aws_s3_bucket.tv_cold.id
+
+  # A lifecycle configuration on a versioned bucket must be applied after
+  # versioning is enabled.
+  depends_on = [aws_s3_bucket_versioning.tv_cold]
 
   rule {
     id     = "tick-cold-tiering"
@@ -734,8 +771,42 @@ resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
       storage_class = "GLACIER_IR"
     }
 
-    expiration {
-      days = 1825 # 5 years per SEBI retention
+    # A version replaced or deleted is kept, on a cheaper tier.
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "GLACIER_IR"
+    }
+  }
+
+  # Raw capture-at-receipt WAL segments (ITEM 45e uploads them here). They are
+  # read back only to rebuild a day. Operator Quote 53 (2026-11-11, card
+  # "Cheaper S3 class for old raw frames (Recommended)"): after 30 days they
+  # move to S3 Glacier Instant Retrieval, readable at once, current and
+  # noncurrent versions alike; nothing is deleted or expired. Until Quote 53
+  # this rule sent them to Deep Archive (cheaper per GB, but a 12-hour restore
+  # before a read). An object already in Deep Archive stays there: lifecycle
+  # cannot move an object back up to Glacier IR. This rule overlaps the
+  # catch-all rule above on day 30; when two transitions to different classes
+  # fall due together, S3 takes the lower-cost class, which here is Glacier IR
+  # (Assumed from the AWS lifecycle documentation; not observed on this bucket
+  # yet). `questdb-partitions/` (the ticks and candles brutex reads) gets no
+  # rule of its own under Quote 53.
+  rule {
+    id     = "raw-frames-glacier-ir"
+    status = "Enabled"
+
+    filter {
+      prefix = "raw-frames/"
+    }
+
+    transition {
+      days          = 30
+      storage_class = "GLACIER_IR"
+    }
+
+    noncurrent_version_transition {
+      noncurrent_days = 30
+      storage_class   = "GLACIER_IR"
     }
   }
 }
@@ -746,4 +817,35 @@ resource "aws_s3_bucket_public_access_block" "tv_cold" {
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}
+
+# ---------------------------------------------------------------------------
+# Quote 53 date gate (2026-11-11). The owner authorized the alarm review
+# (docs/audits/2026-11-alarm-review.md), the metric trim and the dashboard
+# delete "FROM DECEMBER". terraform-apply.yml applies on every push to main
+# that touches this directory and again on its weekday retries, so merging
+# this change in November would apply it in November. This precondition
+# refuses any plan made before 2026-12-01 00:00 IST (2026-11-30 18:30 UTC):
+# the apply job fails with the message below and nothing changes in AWS.
+#
+# plantimestamp() is the time the plan was made (known at plan time, Terraform
+# 1.5+); `terraform validate` sees it as unknown, so validation still passes.
+# Honest cost: while the gate holds, EVERY terraform apply fails, not only the
+# Quote 53 part, and each failed run reports itself. Merge on or after
+# 1 December to avoid that. Delete this block in the first change after
+# 2026-12-01. Pinned by crates/common/tests/quote53_alarm_review_cover_guard.rs.
+#
+# This gate covers ONLY the terraform half. The metric trim in
+# deploy/aws/cloudwatch-agent.json reaches the box through deploy-aws.yml and
+# the morning boot copy, with no terraform in the path; test 9 of the same
+# guard fails the build while that trimmed file is in the tree before
+# 2026-12-01 00:00 IST (same quote53_early_apply_approved switch).
+# ---------------------------------------------------------------------------
+resource "terraform_data" "quote53_not_before_december" {
+  lifecycle {
+    precondition {
+      condition     = var.quote53_early_apply_approved || timecmp(plantimestamp(), "2026-11-30T18:30:00Z") >= 0
+      error_message = "Quote 53 (alarm cuts, metric trim, dashboard delete) may be applied only on or after 1 December 2026 IST. Wait until then, or record the owner's dated go-ahead under Quote 53 and set the quote53_early_apply_approved default to true in the same change."
+    }
+  }
 }

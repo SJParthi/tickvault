@@ -11,7 +11,7 @@
 //! Token access is via a callback trait to decouple from the core crate.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use metrics::counter;
@@ -23,9 +23,10 @@ use tickvault_common::constants::{
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::order_types::{
-    OrderStatus, OrderType, OrderUpdate, OrderValidity, TransactionType,
+    OrderStatus, OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
 use tickvault_common::sanitize::capture_rest_error_body;
+use tickvault_common::types::ExchangeSegment;
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -33,9 +34,15 @@ use super::error_taxonomy::{self, DhanErrorClass, OrderEndpoint, OrderErrorPolic
 use super::exit_rules;
 use super::idempotency::CorrelationTracker;
 use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
-use super::rate_limiter::OrderRateLimiter;
+use super::placement_telemetry::{self, PaperTradeRecord, PlacementLatency};
+use super::rate_limiter::{OrderBudget, OrderRateLimiter};
 use super::reconciliation::reconcile_orders;
-use super::state_machine::{is_valid_transition, parse_order_status};
+
+mod order_book;
+use super::state_machine::{
+    UNKNOWN_ORDER_STATUS_COUNTER, UNKNOWN_STATUS_LOG_MAX_CHARS, is_valid_transition,
+    parse_order_status,
+};
 use super::types::{
     DhanForeverOrderRequest, DhanModifyOrderRequest, DhanModifySuperOrderRequest,
     DhanPlaceOrderRequest, DhanPlaceSuperOrderRequest, DhanSuperOrderResponse,
@@ -44,7 +51,9 @@ use super::types::{
     PlaceForeverOcoRequest, PlaceOrderRequest, PlaceSuperOrderRequest, ReconciliationReport,
     SEGMENT_CODE_UNKNOWN, SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY, SlicingResponse,
     SuperOrderLegSnapshot, SuperOrderPlacement, VerifyState, parse_segment_chars,
+    resolve_order_segment_str,
 };
+use order_book::{OrderBook, OrderMap};
 
 // ---------------------------------------------------------------------------
 // Token Provider trait
@@ -162,8 +171,9 @@ pub trait OmsAlertSink: Send + Sync {
 /// modify/cancel update local state only, reconcile is a no-op.
 /// This ensures the system NEVER touches real money during development.
 pub struct OrderManagementSystem {
-    /// Order state keyed by Dhan order ID.
-    orders: HashMap<String, ManagedOrder>,
+    /// Order state keyed by Dhan order ID, with an O(1) count of the
+    /// non-terminal orders kept beside it (audit plan PR6, `order_book.rs`).
+    orders: OrderBook,
     /// Broker `order_no` -> the canonical key in [`Self::orders`].
     ///
     /// Exists because a WebSocket update can arrive carrying a broker
@@ -188,13 +198,18 @@ pub struct OrderManagementSystem {
     /// nothing to diverge. The obvious alternative — moving the record to the
     /// new key — would break every caller holding the id `place_order`
     /// returned, cancellation included.
-    order_no_aliases: HashMap<String, String>,
+    order_no_aliases: HashMap<String, String, ahash::RandomState>,
     /// Correlation ID tracker for idempotency.
     correlations: CorrelationTracker,
     /// Dhan REST API client.
     api_client: OrderApiClient,
     /// SEBI rate limiter.
     rate_limiter: OrderRateLimiter,
+    /// The broker's per-minute / per-hour / per-day order ceilings. The
+    /// limiter above paces the per-SECOND burst; this bounds the totals.
+    /// Added 2026-08-22 -- three of the vendor's four documented tiers had
+    /// no enforcement at all.
+    order_budget: OrderBudget,
     /// Circuit breaker for Dhan API.
     circuit_breaker: OrderCircuitBreaker,
     /// Token provider for authentication.
@@ -237,6 +252,15 @@ pub struct OrderManagementSystem {
     /// MPP verify-ladder bookkeeping keyed by order id (a separate map so
     /// the `ManagedOrder` struct stays untouched for Cluster A).
     verify_states: HashMap<String, VerifyState>,
+    /// `tv_orders_placed_total{mode="paper"}`, resolved once at first use
+    /// instead of a registry lookup per placement (about 40 ns with the
+    /// production recorder, measured 2026-10-30). Resolved at first USE, not
+    /// at construction, so it binds to the recorder installed at boot.
+    paper_placed_total: OnceLock<metrics::Counter>,
+    /// `tv_order_placement_duration_ns` as fixed atomic buckets (owner,
+    /// 2026-10-30: "Yes, fixed counters"), published once a second by the
+    /// order runtime. See `placement_telemetry`.
+    placement_latency: PlacementLatency,
 }
 
 /// Cluster F: order-path halt record. Set idempotently; cleared only by an
@@ -252,6 +276,124 @@ struct HaltInfo {
 }
 
 impl OrderManagementSystem {
+    /// Hard ceiling on orders tracked in memory for one trading day.
+    ///
+    /// # Why this exists (added 2026-08-22)
+    ///
+    /// `orders`, `super_orders` and `verify_states` had no cap, and the daily
+    /// bound both `CLAUDE.md` and the workspace O(1) table attributed to them
+    /// -- "bounded by the 7,000/day order GCRA" -- **does not exist**.
+    /// `OrderRateLimiter::check` enforces orders-per-SECOND only, and
+    /// `DailyRequestTracker`, named in the OMS-GAP-04 rule text as the
+    /// 5,000-orders/day enforcer, has zero occurrences in this workspace.
+    ///
+    /// So the real bound was `reset_daily()` plus the box being switched off
+    /// at 17:30. At the per-second limit that is on the order of 324,000
+    /// tracked orders across a nine-hour session, each holding an owned
+    /// `String` id and a `ManagedOrder`. The re-index on
+    /// `handle_order_update` can hold a second entry for the same order, so
+    /// the true figure is worse than the count of orders placed.
+    ///
+    /// # Why refusal is correct here, unlike the risk engine
+    ///
+    /// `RiskEngine` records a fill for a position we already HOLD, so
+    /// refusing there would hide a real leg and it halts instead. An order
+    /// placement is different: refusing happens BEFORE the order exists, so
+    /// nothing is held that the book has not recorded. Refusal is therefore
+    /// the strictly safe direction, and it is checked beside the existing
+    /// rate-limit gate rather than at the insert, so no API call is made.
+    ///
+    /// Set to 25,000 -- the same figure every other per-entity ceiling in this
+    /// workspace uses, and comfortably above any legitimate day.
+    pub const MAX_TRACKED_ORDERS: usize = 25_000;
+
+    /// Hard ceiling on `order_no_aliases`, bounded SEPARATELY from
+    /// [`Self::MAX_TRACKED_ORDERS`] rather than shared with it.
+    ///
+    /// # Why its own ceiling, and not the order book's
+    ///
+    /// The two maps grow on DIFFERENT axes, which is the whole point:
+    ///
+    /// * `orders` grows only when WE place one, gated by `order_budget`
+    ///   (7,000/day).
+    /// * `order_no_aliases` grows on INBOUND broker updates — no budget, no
+    ///   rate limiter, no cap of its own before this constant. And the insert
+    ///   is guarded on `update.order_no` alone, with no guard on the canonical
+    ///   id, so ONE order yields one alias per distinct broker `order_no` it is
+    ///   ever reported under, not one alias total.
+    ///
+    /// Sharing a ceiling would therefore let broker chatter consume the order
+    /// book's headroom. That matters more than it sounds:
+    /// `check_order_book_capacity` is not placement-only despite its name — it
+    /// also gates `modify_order` and `cancel_order`, so exhausting that ceiling
+    /// blocks EXITING a position we already hold. A shared bound was written on
+    /// 2026-08-25 and reverted the same day for exactly this reason.
+    ///
+    /// # Why refusing the alias is the safe direction here
+    ///
+    /// Unlike a refused cancel, a refused alias is RECOVERABLE. The refusal
+    /// logs both ids, so the mapping this map declined to hold can be
+    /// reconstructed by hand from the log — the `CorrelationTracker` reasoning
+    /// (`MAX_TRACKED_CORRELATIONS`) applied to the same class of identity. The
+    /// cost is bounded and visible: a later update arriving under that
+    /// `order_no` resolves through `correlations` instead, or surfaces as an
+    /// orphan update rather than silently mutating the wrong order.
+    ///
+    /// Set to 25,000, matching every other per-entity ceiling in this
+    /// workspace, and cleared wholesale by `reset_daily` like the maps beside it.
+    pub const MAX_TRACKED_ORDER_ALIASES: usize = 25_000;
+
+    /// Refuses a placement once the day's order book is full.
+    ///
+    /// Called beside `rate_limiter.check()` on every placement path so a
+    /// refusal costs no API call and creates no order.
+    fn check_order_book_capacity(&self) -> Result<(), OmsError> {
+        // Counts `orders` ONLY. `order_no_aliases` is bounded SEPARATELY by
+        // `MAX_TRACKED_ORDER_ALIASES` at its own insert site.
+        //
+        // A 2026-08-25 change summed the two maps here and was REVERTED the
+        // same day, because both halves of its reasoning were false and the
+        // consequence was dangerous:
+        //
+        //   1. It claimed "an order contributes at most one alias". The insert
+        //      at `handle_order_update` is guarded on `update.order_no` alone,
+        //      with NO guard on the canonical id, so every distinct broker
+        //      `order_no` that resolves to the same order creates another
+        //      entry. Proven empirically: one order, five updates carrying
+        //      distinct `order_no`s, five aliases.
+        //   2. It claimed aliases "grow on the same axis" as orders. They do
+        //      not. `orders` growth is gated by `order_budget.try_consume`
+        //      (7,000/day); aliases are created by INBOUND broker updates,
+        //      which pass through no budget, no rate limiter and no cap. A
+        //      chatty or misbehaving feed could therefore fill the shared
+        //      ceiling on its own.
+        //
+        // The consequence is what makes this worth the comment: this function
+        // is NOT placement-only despite its name and its doc. It gates
+        // `place_order`, `modify_order`, `cancel_order`, `verify_order_execution`
+        // and `check_order_gates`. Refusing here blocks a CANCEL -- i.e. it
+        // prevents exiting a position we already hold, which is exactly the
+        // failure the `MAX_TRACKED_POSITIONS` design rejects as strictly worse
+        // than memory growth. Feed chatter must never be able to cause it.
+        let tracked = self.orders.len();
+        if tracked >= Self::MAX_TRACKED_ORDERS {
+            metrics::counter!("tv_oms_order_book_full_total").increment(1);
+            tracing::error!(
+                code = ErrorCode::OmsGapRateLimit.code_str(),
+                tracked,
+                max = Self::MAX_TRACKED_ORDERS,
+                "OMS order book is FULL for today - refusing the placement. No \
+                 order was sent, so nothing is held that the book has not \
+                 recorded. Cleared by the daily reset."
+            );
+            return Err(OmsError::OrderBookFull {
+                tracked,
+                max: Self::MAX_TRACKED_ORDERS,
+            });
+        }
+        Ok(())
+    }
+
     /// Creates a new OMS in **dry-run mode** (default).
     ///
     /// In dry-run mode, no HTTP calls are ever made to Dhan. All orders
@@ -268,12 +410,16 @@ impl OrderManagementSystem {
         token_provider: Box<dyn TokenProvider>,
         client_id: String,
     ) -> Self {
-        Self {
-            orders: HashMap::with_capacity(256),
-            order_no_aliases: HashMap::with_capacity(64),
+        // Cold: the "PAPER TRADE" helper thread starts here (once per
+        // process), so no placement pays for it.
+        placement_telemetry::ensure_paper_trade_logger();
+        let mut oms = Self {
+            orders: OrderBook::with_capacity(ORDER_BOOK_PREFAULT_ORDERS),
+            order_no_aliases: HashMap::with_capacity_and_hasher(64, ahash::RandomState::new()),
             correlations: CorrelationTracker::new(),
             api_client,
             rate_limiter,
+            order_budget: OrderBudget::new(),
             circuit_breaker: OrderCircuitBreaker::new(),
             token_provider,
             client_id,
@@ -288,7 +434,67 @@ impl OrderManagementSystem {
             stop_all_alert_latched: false,
             super_orders: HashMap::with_capacity(16),
             verify_states: HashMap::with_capacity(16),
+            paper_placed_total: OnceLock::new(),
+            placement_latency: PlacementLatency::new(),
+        };
+        oms.prefault_order_book();
+        oms
+    }
+
+    /// Writes every page of the order book's hash table once, at construction
+    /// (cold), so no placement takes a first-touch page fault.
+    ///
+    /// # Why (2026-10-30, the order-path sub-microsecond work)
+    ///
+    /// `HashMap::with_capacity` reserves the table but the kernel maps its
+    /// pages only when they are first written, and a hash spreads the first
+    /// orders over all of them: the first few dozen placements of a process
+    /// each wrote a fresh page. Measured on the x86 dev container: placement
+    /// p50 about 1 µs, p99 about 7.2 µs. This fills the table with
+    /// placeholder orders and clears it: the map is empty again, keeps its
+    /// capacity, and every page it will use is already mapped. The freed key
+    /// strings also leave warm heap memory behind for the first orders' ids.
+    ///
+    /// Cold: `ORDER_BOOK_PREFAULT_ORDERS` inserts once per book (once per
+    /// process in production). The daily reset clears the map in place, so
+    /// the pages stay mapped.
+    fn prefault_order_book(&mut self) {
+        // O(1) EXEMPT: bounded at ORDER_BOOK_PREFAULT_ORDERS, cold path (construction only)
+        for index in 0..ORDER_BOOK_PREFAULT_ORDERS {
+            let key = format!("PREFAULT-{index}");
+            self.orders.insert(
+                key,
+                ManagedOrder {
+                    order_id: String::new(),
+                    correlation_id: String::new(),
+                    security_id: 0,
+                    exchange_segment: ExchangeSegment::IdxI,
+                    transaction_type: TransactionType::Buy,
+                    order_type: OrderType::Market,
+                    product_type: ProductType::Intraday,
+                    validity: OrderValidity::Day,
+                    quantity: 0,
+                    price: 0.0,
+                    trigger_price: 0.0,
+                    status: OrderStatus::Transit,
+                    traded_qty: 0,
+                    avg_traded_price: 0.0,
+                    lot_size: 0,
+                    created_at_us: 0,
+                    updated_at_us: 0,
+                    needs_reconciliation: false,
+                    modification_count: 0,
+                },
+            );
         }
+        self.orders.clear();
+    }
+
+    /// Publishes `tv_order_placement_duration_ns_{bucket,count,sum}` from the
+    /// fixed buckets. Cold: O(14) loads, a no-op when nothing was placed since
+    /// the last call. The order runtime calls it once a second.
+    pub fn publish_placement_latency(&self) {
+        self.placement_latency.publish();
     }
 
     /// Returns whether the OMS is in dry-run (paper trading) mode.
@@ -346,6 +552,17 @@ impl OrderManagementSystem {
             // record); without this the CB stays stuck HalfOpen after the halt is
             // cleared and every later order is refused with CircuitBreakerOpen.
             self.circuit_breaker.reset();
+            // 2026-11-13 (audit B2 finding 9): the order budget is NOT reset here.
+            // Clearing a halt mid-day used to zero the 250/min, 1000/hr and
+            // 7000/day counters on top of what was already sent today. Nothing
+            // resets the budget now (`reset_daily` does not either): the minute
+            // and hour tiers roll by time and the day tier at 00:00 IST. Orders
+            // refused while halted spent nothing: every local refusal after
+            // `try_consume` gives the budget back (B2 review, 2026-11-13),
+            // including a failed token fetch and the STOP-ALL latch before the
+            // first send (round 4). Still counted: a token fetch that fails on
+            // the auth retry pass, and a STOP-ALL abort at a later DH-904 ladder
+            // rung, since an earlier request of that call was sent.
         }
     }
 
@@ -372,7 +589,26 @@ impl OrderManagementSystem {
 
     /// O(1) live-order gate: halt check + readiness evaluation. Place + Modify
     /// ONLY (Cancel is exempt — exposure-reducing). First failure wins.
+    ///
+    /// Every caller runs it AFTER `circuit_breaker.check()`, which takes the
+    /// single HalfOpen probe. A refusal here sends nothing, so it records no
+    /// success or failure on the breaker; the probe is therefore given back
+    /// (audit B2, 2026-11-13), otherwise every later order on every path was
+    /// refused with CircuitBreakerOpen until the 16:00 daily reset.
     fn check_live_order_gates(
+        &mut self,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        let verdict = self.evaluate_live_order_gates(endpoint, correlation_id);
+        if verdict.is_err() {
+            self.release_unsent_order();
+        }
+        verdict
+    }
+
+    /// The halt and readiness checks behind [`Self::check_live_order_gates`].
+    fn evaluate_live_order_gates(
         &mut self,
         endpoint: OrderEndpoint,
         correlation_id: &str,
@@ -430,7 +666,33 @@ impl OrderManagementSystem {
         Err(OmsError::OrderReadinessRefused { reason })
     }
 
-    /// Apply the engine-layer policy for a surfaced order error. The wrapper
+    /// Apply the engine-layer policy for a surfaced order error, then settle
+    /// the circuit breaker's HalfOpen probe. A class the breaker does not
+    /// count (halt, rate, refresh classes, R19) records no outcome, so when
+    /// the call ends on such an answer (any action but `Retry`) the probe the
+    /// call took is given back (audit B2 follow-up, 2026-11-13). Before, an
+    /// HTTP 429, a DH-904 ladder exhaustion, an 805 or a failed 807/808/809
+    /// refresh answering the probe left the flag set and every later order
+    /// was refused until the 16:00 daily reset. A `Retry` keeps the probe:
+    /// the retried request settles it. O(1) on top of the policy.
+    async fn apply_engine_error_policy(
+        &mut self,
+        err: &OmsError,
+        endpoint: OrderEndpoint,
+        auth_retry_used: &mut bool,
+    ) -> EngineAction {
+        let action = self
+            .decide_engine_action(err, endpoint, auth_retry_used)
+            .await;
+        let counted = error_taxonomy::classify_oms_error(err)
+            .is_none_or(error_taxonomy::trips_circuit_breaker);
+        if !counted && !matches!(action, EngineAction::Retry) {
+            self.circuit_breaker.release_probe();
+        }
+        action
+    }
+
+    /// The engine-layer policy for a surfaced order error. The wrapper
     /// (`*_with_policy`) already ran the DH-904 ladder + 805 latch + Cancel
     /// single-retry; this layer owns the auth rotate-retry-once, the halt latch,
     /// the 806 readiness-poison, and the circuit-breaker decision (R19). Returns
@@ -444,7 +706,7 @@ impl OrderManagementSystem {
     // Genuinely ambiguous outcomes (908/909/800/5xx/transport) are NEVER retried
     // here (Place/Modify NeverRetry); the correlation-probe adopt-or-flag
     // (flagged follow-up) is the real net for those.
-    async fn apply_engine_error_policy(
+    async fn decide_engine_action(
         &mut self,
         err: &OmsError,
         endpoint: OrderEndpoint,
@@ -540,14 +802,7 @@ impl OrderManagementSystem {
             OrderErrorPolicy::StopAllCooldown => {
                 // C2: fire the operator alert ONCE per stop-all episode, not on
                 // every throttled call during the 60s window.
-                if !self.stop_all_alert_latched {
-                    self.stop_all_alert_latched = true;
-                    self.fire_alert(OmsAlert::OrderApiStopAll {
-                        cooldown_secs: DATA_805_STOP_ALL_COOLDOWN_SECS,
-                    });
-                } else {
-                    debug!("DATA-805 stop-all alert already fired this episode");
-                }
+                self.note_stop_all_episode();
                 EngineAction::PassThroughSilent
             }
             // NeverRetry / CheckParamsNoRetry / LogAndAlert / CancelSingleRetry
@@ -595,7 +850,11 @@ impl OrderManagementSystem {
         validate_order_fields(&request)?;
 
         // Step 1: Rate limiter check (runs even in dry-run for realistic simulation)
+        self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
+
         if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
             });
@@ -604,6 +863,7 @@ impl OrderManagementSystem {
 
         // Step 2: Circuit breaker check
         if let Err(err) = self.circuit_breaker.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::CircuitBreakerOpened {
                 consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
             });
@@ -611,18 +871,21 @@ impl OrderManagementSystem {
         }
 
         // Step 3: Generate correlation ID
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate order without any HTTP call ----
         if self.dry_run {
             self.paper_order_counter = self.paper_order_counter.saturating_add(1);
-            let paper_order_id = format!("PAPER-{}", self.paper_order_counter);
+            let paper_order_id = paper_order_id_string(self.paper_order_counter);
 
             let order = ManagedOrder {
                 order_id: paper_order_id.clone(),
-                correlation_id: correlation_id.clone(),
+                // Moved, not cloned: the tracker below borrows it from the
+                // record (2026-10-30, one allocation fewer per placement).
+                correlation_id,
                 security_id: request.security_id,
+                exchange_segment: request.exchange_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -641,22 +904,26 @@ impl OrderManagementSystem {
             };
 
             self.correlations
-                .track(correlation_id, paper_order_id.clone());
-            self.orders.insert(paper_order_id.clone(), order);
+                .track_ref(&order.correlation_id, paper_order_id.clone());
+            self.orders.insert(paper_order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
-            counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
-            metrics::histogram!("tv_order_placement_duration_ns")
-                .record(start.elapsed().as_nanos() as f64);
+            self.paper_placed_total
+                .get_or_init(|| counter!("tv_orders_placed_total", "mode" => "paper"))
+                .increment(1);
+            self.placement_latency
+                .record_ns(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
-            info!(
-                order_id = %paper_order_id,
-                security_id = request.security_id,
-                transaction_type = %request.transaction_type.as_str(),
-                quantity = request.quantity,
-                price = request.price,
-                "PAPER TRADE: order simulated (no HTTP call)"
-            );
+            // The same INFO line as before, written by the helper thread right
+            // after this order (owner, 2026-10-30: "Write it after the
+            // order"). See `placement_telemetry::log_paper_trade`.
+            placement_telemetry::log_paper_trade(PaperTradeRecord {
+                paper_order_counter: self.paper_order_counter,
+                security_id: request.security_id,
+                transaction_type: request.transaction_type,
+                quantity: request.quantity,
+                price: request.price,
+            });
 
             return Ok(paper_order_id);
         }
@@ -690,10 +957,13 @@ impl OrderManagementSystem {
                 // unexpected live-mode attempts during the sandbox window.
                 metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
                 error!(
+                    code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                    source = "sandbox_enforcement",
                     "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
                      re-arm (sentinel 2099-12-31; a dated operator quote + \
                      constant edit are required to go live)"
                 );
+                self.release_unsent_order(); // audit B2: nothing sent
                 return Err(OmsError::SandboxEnforcement);
             }
         }
@@ -707,7 +977,11 @@ impl OrderManagementSystem {
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
-            exchange_segment: EXCHANGE_SEGMENT_NSE_FNO.to_owned(),
+            // I-P1-11 (2026-10-04): the instrument's OWN segment, the same one
+            // the tracked `ManagedOrder` records. This was the constant
+            // `NSE_FNO` for every order whatever its instrument, so the wire
+            // and the order book could name two different instruments.
+            exchange_segment: request.exchange_segment.as_str().to_owned(),
             product_type: request.product_type.as_str().to_owned(),
             order_type: request.order_type.as_str().to_owned(),
             validity: request.validity.as_str().to_owned(),
@@ -722,9 +996,13 @@ impl OrderManagementSystem {
 
         // Step 5: Call Dhan REST API through the STOP-ALL latch + DH-904 ladder,
         // with an at-most-once auth rotate-retry at the engine layer.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         let response = loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .place_order_with_policy(access_token.expose_secret(), &dhan_request)
@@ -777,6 +1055,7 @@ impl OrderManagementSystem {
             order_id: response.order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: request.exchange_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -797,12 +1076,12 @@ impl OrderManagementSystem {
         // Step 7: Track in state
         self.correlations
             .track(correlation_id, response.order_id.clone());
-        self.orders.insert(response.order_id.clone(), order);
+        self.orders.insert(response.order_id.as_str(), order);
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("tv_orders_placed_total", "mode" => "live").increment(1);
-        metrics::histogram!("tv_order_placement_duration_ns")
-            .record(start.elapsed().as_nanos() as f64);
+        self.placement_latency
+            .record_ns(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
         info!(
             order_id = %response.order_id,
@@ -852,12 +1131,15 @@ impl OrderManagementSystem {
         validate_disclosed_quantity(request.quantity, request.disclosed_quantity)
             .map_err(|reason| OmsError::RiskRejected { reason })?;
 
-        self.rate_limiter.check()?;
-        self.circuit_breaker.check()?;
+        self.check_order_book_capacity()?;
+
+        self.order_budget.try_consume(now_epoch_s())?;
+
+        self.rate_and_circuit_or_give_back()?;
 
         // ---- DRY-RUN: update local state only, no HTTP ----
         if self.dry_run {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.order_type = request.order_type;
                 order.quantity = request.quantity;
                 order.price = request.price;
@@ -872,6 +1154,10 @@ impl OrderManagementSystem {
 
         // Step 3a (Cluster F): live-order readiness gate (fail-closed). Runs
         // BEFORE the token fetch. Cancel is exempt; Modify is NOT.
+        // 2026-11-13 (audit B2 follow-up): the sandbox sentinel first, the
+        // same one place_order and every exit arm run. Before, a plain modify
+        // skipped it and could reach Dhan while every place was still blocked.
+        self.refuse_inside_sandbox()?;
         self.check_live_order_gates(OrderEndpoint::Modify, order_id)?;
 
         // ---- LIVE MODE ----
@@ -891,9 +1177,13 @@ impl OrderManagementSystem {
 
         // STOP-ALL latch + DH-904 ladder in the client wrapper; auth
         // rotate-retry-once + halt latch + circuit-breaker decision here.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .modify_order_with_policy(access_token.expose_secret(), order_id, &dhan_request)
@@ -924,7 +1214,7 @@ impl OrderManagementSystem {
         }
 
         // Update local state with modification details
-        if let Some(order) = self.orders.get_mut(order_id) {
+        if let Some(mut order) = self.orders.get_mut(order_id) {
             order.order_type = request.order_type;
             order.quantity = request.quantity;
             order.price = request.price;
@@ -959,12 +1249,15 @@ impl OrderManagementSystem {
             });
         }
 
-        self.rate_limiter.check()?;
-        self.circuit_breaker.check()?;
+        self.check_order_book_capacity()?;
+
+        self.order_budget.try_consume(now_epoch_s())?;
+
+        self.rate_and_circuit_or_give_back()?;
 
         // ---- DRY-RUN: simulate cancel locally ----
         if self.dry_run {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.status = OrderStatus::Cancelled;
                 order.updated_at_us = now_epoch_us();
             }
@@ -977,9 +1270,13 @@ impl OrderManagementSystem {
         // It must always be attempted so the operator can flatten during a halt.
         // STOP-ALL latch + DH-904 ladder + cancel single-retry in the client
         // wrapper; auth rotate-retry-once + circuit-breaker decision here.
+        self.refuse_unsent_inside_stop_all()?;
         let mut auth_retry_used = false;
         loop {
-            let access_token = self.token_provider.get_access_token()?;
+            let access_token = self.probe_back_on_token_err(
+                self.token_provider.get_access_token(),
+                !auth_retry_used,
+            )?;
             match self
                 .api_client
                 .cancel_order_with_policy(access_token.expose_secret(), order_id)
@@ -1011,7 +1308,7 @@ impl OrderManagementSystem {
 
         // Mark for reconciliation — cancel is async; WebSocket will confirm,
         // but if WS is down we need REST reconciliation to pick it up.
-        if let Some(order) = self.orders.get_mut(order_id) {
+        if let Some(mut order) = self.orders.get_mut(order_id) {
             order.needs_reconciliation = true;
             order.updated_at_us = now_epoch_us();
         }
@@ -1084,32 +1381,91 @@ impl OrderManagementSystem {
             && !update.order_no.is_empty()
             && self.orders.contains_key(&order_id)
         {
-            let previous = self
-                .order_no_aliases
-                .insert(update.order_no.clone(), order_id.clone());
-            if previous.is_none() {
-                debug!(
+            // Fail-closed at the alias ceiling, and LOUD. An existing alias is
+            // never evicted -- evicting one silently orphans a broker order_no
+            // that can no longer resolve to its order. Refusing a NEW one keeps
+            // every mapping we already hold correct, and the refusal carries
+            // BOTH ids so the mapping we declined is recoverable by hand.
+            //
+            // CRITICAL: refusing the alias must NOT abort this update. The
+            // alias is an optimisation for resolving FUTURE updates; `order_id`
+            // is already resolved here, and everything below -- the status
+            // transition and the fill/`FillEvent` computation -- must still run.
+            // An early return here would discard a TRADED update and lose the
+            // fill, which is far worse than an unbounded map. That exact
+            // mistake was written and caught before it shipped.
+            let at_alias_ceiling = !self.order_no_aliases.contains_key(&update.order_no)
+                && self.order_no_aliases.len() >= Self::MAX_TRACKED_ORDER_ALIASES;
+            if at_alias_ceiling {
+                metrics::counter!("tv_oms_order_aliases_refused_total").increment(1);
+                tracing::error!(
+                    code = ErrorCode::OmsGapIdempotency.code_str(),
                     canonical_order_id = %order_id,
                     broker_order_no = %update.order_no,
-                    "aliased broker order_no to the tracked order"
+                    tracked = self.order_no_aliases.len(),
+                    max = Self::MAX_TRACKED_ORDER_ALIASES,
+                    "OMS broker order_no alias table is FULL - refusing this NEW \
+                     alias. Both ids are in this line, so the mapping is \
+                     recoverable by hand. Existing aliases are untouched and \
+                     still resolve, and THIS update is still processed in full. \
+                     Cleared by the daily reset."
                 );
+            } else {
+                let previous = self
+                    .order_no_aliases
+                    .insert(update.order_no.clone(), order_id.clone());
+                if previous.is_none() {
+                    debug!(
+                        canonical_order_id = %order_id,
+                        broker_order_no = %update.order_no,
+                        "aliased broker order_no to the tracked order"
+                    );
+                }
             }
         }
 
         let new_status = match parse_order_status(&update.status) {
             Some(status) => status,
             None => {
-                warn!(
+                // AUDIT INP-7 (2026-10-11): this was an uncoded `warn!` with
+                // no counter and no flag, so a fill under a status spelling we
+                // did not know stayed invisible until the next reconcile. Now
+                // it is counted, logged with OMS-GAP-01 (no CloudWatch filter,
+                // so no page) and the order is flagged for reconciliation, the
+                // same shape as the invalid-transition arm below. Cold: only
+                // an unknown status allocates, for the bounded log copy.
+                //
+                // ⚠ CORRECTED 2026-10-11 (review of INP-7): "flagged for
+                // reconciliation" claims more than the code does. Nothing in
+                // production reads `needs_reconciliation`: `reconcile()`
+                // returns at once in dry-run (the only mode today), and in
+                // live mode it skips a REST row whose status is also unknown,
+                // so the flag would never clear. The counter and the coded
+                // `error!` are what make the event visible; the flag is a
+                // marker with no reader yet.
+                counter!(UNKNOWN_ORDER_STATUS_COUNTER).increment(1);
+                let shown_status: String = update
+                    .status
+                    .chars()
+                    .take(UNKNOWN_STATUS_LOG_MAX_CHARS)
+                    .collect();
+                error!(
+                    code = ErrorCode::OmsGapStateMachine.code_str(),
+                    source = "unknown_status",
                     order_id = %order_id,
-                    status = %update.status,
-                    "unknown order status in WebSocket update"
+                    status = %shown_status,
+                    "unknown order status in WebSocket update — update skipped and counted; \
+                     order marked needs_reconciliation, which nothing acts on today"
                 );
+                if let Some(mut order) = self.orders.get_mut(&order_id) {
+                    order.needs_reconciliation = true;
+                }
                 return Ok(None);
             }
         };
 
         // Get mutable reference to order
-        let order = match self.orders.get_mut(&order_id) {
+        let mut order = match self.orders.get_mut(&order_id) {
             Some(o) => o,
             None => return Ok(None),
         };
@@ -1141,19 +1497,24 @@ impl OrderManagementSystem {
             // Same status — just update fields (e.g., partial fill qty update).
             // Fill delta is computed BEFORE the copy so incremental
             // PART_TRADED quantity refreshes still produce a FillEvent.
-            let fill = Self::extract_fill_delta(order, update);
-            Self::apply_fill_fields(order, update);
+            let fill = Self::extract_fill_delta(&order, update);
+            Self::apply_fill_fields(&mut order, update);
             return Ok(fill);
         }
 
         if !is_valid_transition(old_status, new_status) {
             error!(
+                code = ErrorCode::OmsGapStateMachine.code_str(),
+                source = "invalid_transition",
                 order_id = %order_id,
                 from = %old_status.as_str(),
                 to = %new_status.as_str(),
                 "INVALID ORDER STATE TRANSITION — flagging for reconciliation"
             );
             order.needs_reconciliation = true;
+            // The guard borrows `order_id` as the book key; release it (and
+            // let it settle the active set) before the id moves into the error.
+            drop(order);
             return Err(OmsError::InvalidTransition {
                 order_id,
                 from: old_status.as_str().to_owned(),
@@ -1162,11 +1523,11 @@ impl OrderManagementSystem {
         }
 
         // Fill delta BEFORE the copy overwrites the previous traded_qty.
-        let fill = Self::extract_fill_delta(order, update);
+        let fill = Self::extract_fill_delta(&order, update);
 
         // Apply transition
         order.status = new_status;
-        Self::apply_fill_fields(order, update);
+        Self::apply_fill_fields(&mut order, update);
 
         // Emit metrics for terminal states
         match new_status {
@@ -1336,7 +1697,7 @@ impl OrderManagementSystem {
             .get_all_orders(access_token.expose_secret())
             .await?;
 
-        let (report, updates) = reconcile_orders(&self.orders, &dhan_orders);
+        let (report, updates) = reconcile_orders(self.orders.map(), &dhan_orders);
 
         // Apply corrections (status + fill data).
         //
@@ -1354,7 +1715,7 @@ impl OrderManagementSystem {
         // the umbrella follow-up. Non-terminal corrections apply as before.
         let mut skipped_local_terminal: u64 = 0;
         for update in updates {
-            if let Some(order) = self.orders.get_mut(&update.order_id) {
+            if let Some(mut order) = self.orders.get_mut(&update.order_id) {
                 // C8 (fix-round 2026-07-14, honest envelope): an UPWARD
                 // traded_qty correction here raises the delta baseline
                 // WITHOUT emitting a FillEvent — the missed fill can never
@@ -1477,11 +1838,21 @@ impl OrderManagementSystem {
     /// Returns all active (non-terminal) orders.
     ///
     /// # Performance
-    /// O(N_all_orders) + a `Vec` heap alloc per call (terminal orders
-    /// accumulate until the daily reset) — COLD-PATH ONLY. Per-mark callers
-    /// use the runtime's sid-keyed pending index instead (HP-2).
+    /// O(active-set capacity + active orders) + a `Vec` heap alloc per call — COLD-PATH ONLY
+    /// (exit commands). Until 2026-11-23 this scanned every order held,
+    /// terminal ones included (they accumulate until the daily reset); the
+    /// book now keeps the active keys beside the map (audit plan PR6,
+    /// `engine/order_book.rs`). Order is unspecified. Per-mark callers use
+    /// the runtime's sid-keyed pending index instead (HP-2).
     pub fn active_orders(&self) -> Vec<&ManagedOrder> {
-        self.orders.values().filter(|o| !o.is_terminal()).collect()
+        self.active_orders_iter().collect()
+    }
+
+    /// The active (non-terminal) orders without the `Vec`: O(active-set
+    /// capacity + active orders), no allocation (see `OrderBook::active_values`). Terminal orders are not visited. Order is
+    /// unspecified.
+    pub fn active_orders_iter(&self) -> impl Iterator<Item = &ManagedOrder> {
+        self.orders.active_values()
     }
 
     /// Returns the number of active (non-terminal) orders WITHOUT the
@@ -1489,14 +1860,25 @@ impl OrderManagementSystem {
     /// — the marks-gate republish runs per event arm).
     ///
     /// # Performance
-    /// O(N_all_orders) scan, zero allocation.
+    /// O(1), zero allocation: the count is kept beside the order map and
+    /// moved on every insert, status change and clear (audit plan PR6,
+    /// `engine/order_book.rs`). Until 2026-11-23 this was an O(orders held)
+    /// scan, terminal orders included, run once a second by the order
+    /// runtime. Debug builds still run the old scan and assert the two
+    /// agree, so every engine and runtime test cross-checks the count.
     pub fn active_order_count(&self) -> usize {
-        self.orders.values().filter(|o| !o.is_terminal()).count()
+        let count = self.orders.active_count();
+        debug_assert_eq!(
+            count,
+            self.orders.values().filter(|o| !o.is_terminal()).count(),
+            "O(1) active-order count drifted from the scan"
+        );
+        count
     }
 
     /// Returns all orders (active + terminal).
-    pub fn all_orders(&self) -> &HashMap<String, ManagedOrder> {
-        &self.orders
+    pub fn all_orders(&self) -> &OrderMap {
+        self.orders.map()
     }
 
     /// Returns the total number of orders placed.
@@ -1520,6 +1902,12 @@ impl OrderManagementSystem {
         self.total_updates = 0;
         self.paper_order_counter = 0;
         self.circuit_breaker.reset();
+        // 2026-11-13 (audit B2 finding 9, then its follow-up): the order
+        // budget is NOT cleared here. Its day tier is the IST calendar date
+        // and opens a new window at 00:00 IST by itself; clearing it at this
+        // 16:00 reset let a day's 7,000 be spent twice inside one IST date.
+        // The minute and hour tiers roll by time, so a burst across the
+        // reset never exceeds the broker's 250/min or 1,000/hr.
         // Cluster F (R8): the order-path halt latch is INTENTIONALLY NOT cleared
         // here. A broker account-class halt (DH-902/903/…) persists across the
         // daily reset until a deliberate operator `clear_order_halt()`.
@@ -1530,6 +1918,14 @@ impl OrderManagementSystem {
     #[cfg(test)]
     pub(crate) fn enable_live_mode(&mut self) {
         self.dry_run = false;
+    }
+}
+
+/// Writes any "PAPER TRADE" lines still queued for the helper thread, so an
+/// orderly shutdown (or a test) loses none of them. Cold.
+impl Drop for OrderManagementSystem {
+    fn drop(&mut self) {
+        placement_telemetry::flush_paper_trade_log();
     }
 }
 
@@ -1570,6 +1966,12 @@ impl OrderManagementSystem {
         // Step 0a: pure-rule validation (exit_rules — zero I/O).
         exit_rules::validate_super_order_request(&request)?;
 
+        // I-P1-11: the segment this order is booked under is the one its wire
+        // body carries (super orders send the `EXCHANGE_SEGMENT_NSE_FNO`
+        // constant). Parsed, never assumed; an unknown string refuses here,
+        // before any gate or HTTP call.
+        let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
+
         // Step 0b: relative price ordering (BUY target > entry etc.).
         // LIMIT entries only — MARKET entries carry price 0.0 (U1).
         if request.order_type == OrderType::Limit {
@@ -1597,7 +1999,7 @@ impl OrderManagementSystem {
         self.check_order_gates()?;
 
         // Step 3: correlation ID.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate the 3-leg bracket without any HTTP call ----
@@ -1609,6 +2011,7 @@ impl OrderManagementSystem {
                 order_id: entry_order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: order_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -1674,7 +2077,7 @@ impl OrderManagementSystem {
 
             self.correlations
                 .track(correlation_id, entry_order_id.clone());
-            self.orders.insert(entry_order_id.clone(), entry);
+            self.orders.insert(entry_order_id.as_str(), entry);
             self.super_orders.insert(entry_order_id.clone(), managed);
             self.total_placed = self.total_placed.saturating_add(1);
 
@@ -1698,7 +2101,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
 
         let dhan_request = DhanPlaceSuperOrderRequest {
             dhan_client_id: self.client_id.clone(),
@@ -1728,9 +2136,7 @@ impl OrderManagementSystem {
             }
             Err(err) => {
                 // 429/DH-904 never trips the breaker (API healthy, throttled).
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): the alert reason is a
                 // future sink payload — sanitized like every log rendering.
                 self.fire_alert(OmsAlert::OrderRejected {
@@ -1825,6 +2231,7 @@ impl OrderManagementSystem {
             order_id: entry_order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: order_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -1860,7 +2267,7 @@ impl OrderManagementSystem {
 
         self.correlations
             .track(correlation_id, entry_order_id.clone());
-        self.orders.insert(entry_order_id.clone(), entry);
+        self.orders.insert(entry_order_id.as_str(), entry);
         self.super_orders.insert(entry_order_id.clone(), managed);
         self.total_placed = self.total_placed.saturating_add(1);
 
@@ -2010,7 +2417,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2): a leg modify changes price and quantity, so it
+        // takes the same live gates as `modify_order` (sandbox sentinel, then
+        // halt latch and readiness) before any token fetch. Cancels stay exempt.
+        self.check_live_exit_gates(OrderEndpoint::Modify, order_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = build_super_modify_request(&self.client_id, order_id, &modify);
 
         let accepted_unparsed = match self
@@ -2024,9 +2436,7 @@ impl OrderManagementSystem {
                 resp.order_status == SUPER_ORDER_STATUS_ACCEPTED_UNPARSED_BODY
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
@@ -2044,7 +2454,7 @@ impl OrderManagementSystem {
         // broker-side, so the tracked entry is flagged for the REST
         // reconcile (the registry apply above stays, mirroring dry-run).
         if accepted_unparsed {
-            if let Some(order) = self.orders.get_mut(order_id) {
+            if let Some(mut order) = self.orders.get_mut(order_id) {
                 order.needs_reconciliation = true;
                 order.updated_at_us = now_epoch_us();
             }
@@ -2148,7 +2558,8 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
 
         match self
             .api_client
@@ -2160,9 +2571,7 @@ impl OrderManagementSystem {
                 self.record_api_success_and_alert_recovery();
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 error!(
                     code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
                     order_id = %order_id,
@@ -2179,7 +2588,7 @@ impl OrderManagementSystem {
                 // Cancel is async server-side — flag the tracked entry for
                 // reconciliation (mirror of cancel_order's live path); the
                 // verify ladder / reconcile confirms the terminal state.
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.needs_reconciliation = true;
                     order.updated_at_us = now_epoch_us();
                 }
@@ -2220,11 +2629,15 @@ impl OrderManagementSystem {
         // OCO-leg completeness, I-P0-03 expiry gate).
         exit_rules::validate_forever_oco(&request)?;
 
+        // I-P1-11: booked under the segment the forever body carries (see
+        // `build_forever_request`). Parsed, never assumed.
+        let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
+
         // Steps 1+2: rate limiter + circuit breaker.
         self.check_order_gates()?;
 
         // Step 3: correlation ID.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: simulate without any HTTP call ----
@@ -2236,6 +2649,7 @@ impl OrderManagementSystem {
                 order_id: paper_order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: order_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -2257,7 +2671,7 @@ impl OrderManagementSystem {
 
             self.correlations
                 .track(correlation_id, paper_order_id.clone());
-            self.orders.insert(paper_order_id.clone(), order);
+            self.orders.insert(paper_order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
             counter!("tv_forever_orders_placed_total", "mode" => "paper").increment(1);
@@ -2272,7 +2686,12 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = build_forever_request(&self.client_id, &correlation_id, &request);
 
         let response = match self
@@ -2285,9 +2704,7 @@ impl OrderManagementSystem {
                 resp
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
@@ -2326,6 +2743,7 @@ impl OrderManagementSystem {
             order_id: response.order_id.clone(),
             correlation_id: correlation_id.clone(),
             security_id: request.security_id,
+            exchange_segment: order_segment,
             transaction_type: request.transaction_type,
             order_type: request.order_type,
             product_type: request.product_type,
@@ -2345,7 +2763,7 @@ impl OrderManagementSystem {
 
         self.correlations
             .track(correlation_id, response.order_id.clone());
-        self.orders.insert(response.order_id.clone(), order);
+        self.orders.insert(response.order_id.as_str(), order);
         self.total_placed = self.total_placed.saturating_add(1);
 
         counter!("tv_forever_orders_placed_total", "mode" => "live").increment(1);
@@ -2389,7 +2807,7 @@ impl OrderManagementSystem {
         self.check_order_gates()?;
 
         // Step 3: ONE correlation ID shared by every slice.
-        let correlation_id = self.correlations.generate_id();
+        let correlation_id = self.correlations.next_id();
         let now_us = now_epoch_us();
 
         // ---- DRY-RUN: N paper orders, one per computed slice ----
@@ -2403,6 +2821,7 @@ impl OrderManagementSystem {
                     order_id: paper_order_id.clone(),
                     correlation_id: correlation_id.clone(),
                     security_id: request.security_id,
+                    exchange_segment: request.exchange_segment,
                     transaction_type: request.transaction_type,
                     order_type: request.order_type,
                     product_type: request.product_type,
@@ -2419,7 +2838,7 @@ impl OrderManagementSystem {
                     needs_reconciliation: false,
                     modification_count: 0,
                 };
-                self.orders.insert(paper_order_id.clone(), order);
+                self.orders.insert(paper_order_id.as_str(), order);
                 self.total_placed = self.total_placed.saturating_add(1);
                 counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
                 order_ids.push(paper_order_id);
@@ -2439,6 +2858,10 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
+        // 2026-11-13 (audit B2 finding 8): the same live gates place_order runs
+        // (sandbox sentinel, then halt latch and readiness), before any token
+        // fetch or network call. The dry-run branch above still returns first.
+        self.check_live_exit_gates(OrderEndpoint::Place, &correlation_id)?;
         // The escape hatch actually engaged — strategy doctrine caps the
         // per-signal quantity at the freeze limit, so this is warn-worthy.
         warn!(
@@ -2448,11 +2871,12 @@ impl OrderManagementSystem {
             "order exceeds freeze limit — routing through /orders/slicing (escape hatch)"
         );
 
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token =
+            self.probe_back_on_token_err(self.token_provider.get_access_token(), true)?;
         let dhan_request = DhanPlaceOrderRequest {
             dhan_client_id: self.client_id.clone(),
             transaction_type: request.transaction_type.as_str().to_owned(),
-            exchange_segment: EXCHANGE_SEGMENT_NSE_FNO.to_owned(),
+            exchange_segment: request.exchange_segment.as_str().to_owned(),
             product_type: request.product_type.as_str().to_owned(),
             order_type: request.order_type.as_str().to_owned(),
             validity: request.validity.as_str().to_owned(),
@@ -2475,9 +2899,7 @@ impl OrderManagementSystem {
                 resp
             }
             Err(err) => {
-                if !matches!(err, OmsError::DhanRateLimited) {
-                    self.circuit_breaker.record_failure();
-                }
+                self.record_exit_api_failure(&err);
                 // M1 (refuter round 1, 2026-07-14): sanitized alert reason.
                 self.fire_alert(OmsAlert::OrderRejected {
                     correlation_id: correlation_id.clone(),
@@ -2580,6 +3002,7 @@ impl OrderManagementSystem {
                 order_id: resp.order_id.clone(),
                 correlation_id: correlation_id.clone(),
                 security_id: request.security_id,
+                exchange_segment: request.exchange_segment,
                 transaction_type: request.transaction_type,
                 order_type: request.order_type,
                 product_type: request.product_type,
@@ -2597,7 +3020,7 @@ impl OrderManagementSystem {
                 needs_reconciliation: true,
                 modification_count: 0,
             };
-            self.orders.insert(resp.order_id.clone(), order);
+            self.orders.insert(resp.order_id.as_str(), order);
             self.total_placed = self.total_placed.saturating_add(1);
             counter!("tv_orders_placed_total", "mode" => "live").increment(1);
             order_ids.push(resp.order_id.clone());
@@ -2660,7 +3083,12 @@ impl OrderManagementSystem {
         }
 
         // Step 1: the probe consumes the shared GCRA — dry-run included.
-        self.rate_limiter.check()?;
+        self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
+        if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
+            return Err(err);
+        }
 
         // ---- DRY-RUN: tracked paper order ⇒ deterministic verdict, no HTTP ----
         if self.dry_run {
@@ -2670,7 +3098,7 @@ impl OrderManagementSystem {
         }
 
         // LIVE-EXIT-ARM
-        let access_token = self.token_provider.get_access_token()?;
+        let access_token = self.budget_back_on_token_err(self.token_provider.get_access_token())?;
 
         let verdict = if is_super {
             // ONE batched list GET serves ALL tracked supers (no per-ID
@@ -2794,18 +3222,97 @@ impl OrderManagementSystem {
 
     /// Steps 1+2 of the pinned skeleton: rate limiter then circuit breaker,
     /// with the place_order alert semantics.
-    fn check_order_gates(&self) -> Result<(), OmsError> {
+    fn check_order_gates(&mut self) -> Result<(), OmsError> {
+        self.check_order_book_capacity()?;
+        self.order_budget.try_consume(now_epoch_s())?;
+
         if let Err(err) = self.rate_limiter.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::RateLimitExhausted {
                 limit_type: "per_second".to_string(),
             });
             return Err(err);
         }
         if let Err(err) = self.circuit_breaker.check() {
+            self.order_budget.give_back(); // B2 review: nothing sent
             self.fire_alert(OmsAlert::CircuitBreakerOpened {
                 consecutive_failures: u64::from(self.circuit_breaker.failure_count()),
             });
             return Err(err);
+        }
+        Ok(())
+    }
+
+    /// A live order refused by a local gate AFTER the budget and the circuit
+    /// breaker admitted it: nothing was sent, so give back the HalfOpen probe
+    /// (audit B2) and the one order of budget the caller spent (B2 review,
+    /// 2026-11-13). Without the budget half, refusals during a halt used up
+    /// the hour tier and, once the halt was cleared, every place, modify and
+    /// cancel was refused until the hour rolled. O(1).
+    fn release_unsent_order(&mut self) {
+        self.circuit_breaker.release_probe();
+        self.order_budget.give_back();
+    }
+
+    /// The per-second limiter and the circuit breaker for the arms that run
+    /// them without alerts (`modify_order`, `cancel_order`). A refusal sends
+    /// nothing, so it gives back the one order of budget the caller spent
+    /// just before (B2 review, 2026-11-13). O(1).
+    fn rate_and_circuit_or_give_back(&mut self) -> Result<(), OmsError> {
+        let verdict = self
+            .rate_limiter
+            .check()
+            .and_then(|()| self.circuit_breaker.check());
+        if verdict.is_err() {
+            self.order_budget.give_back();
+        }
+        verdict
+    }
+
+    /// The live-arm gates `place_order` and `modify_order` run, for every exit
+    /// method that sends a NEW order (super, forever/OCO, sliced: `Place`) or
+    /// changes one (super-order leg modify: `Modify`). Added 2026-11-13 (audit
+    /// B2 finding 8): those arms ran only `check_order_gates` (book, budget,
+    /// rate, circuit) and skipped the sandbox sentinel and the halt and
+    /// readiness gate, so with `dry_run` removed they could reach Dhan while
+    /// `place_order` was still blocked. Call it after the dry-run branch and
+    /// before the token fetch. Only adds refusals; cancels stay exempt. A
+    /// refusal gives back the circuit breaker's HalfOpen probe (nothing was
+    /// sent, see [`Self::check_live_order_gates`]).
+    fn check_live_exit_gates(
+        &mut self,
+        endpoint: OrderEndpoint,
+        correlation_id: &str,
+    ) -> Result<(), OmsError> {
+        self.refuse_inside_sandbox()?;
+        self.check_live_order_gates(endpoint, correlation_id)
+    }
+
+    /// The sandbox sentinel shared by every live arm that is not
+    /// `place_order` (which keeps its own copy in its body, pinned by the
+    /// sandbox guard): the exit arms through [`Self::check_live_exit_gates`]
+    /// and, since the B2 follow-up (2026-11-13), `modify_order`, which before
+    /// ran halt and readiness only and could reach Dhan while every place was
+    /// still blocked. A refusal gives back the HalfOpen probe (nothing was
+    /// sent). Compiled out of test builds only, like place_order's copy.
+    #[cfg_attr(test, allow(clippy::unused_self, clippy::unnecessary_wraps))]
+    fn refuse_inside_sandbox(&mut self) -> Result<(), OmsError> {
+        #[cfg(not(test))]
+        {
+            use tickvault_common::constants::SANDBOX_DEADLINE_EPOCH_SECS;
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
+                error!(
+                    code = ErrorCode::OmsGapDryRunSafety.code_str(),
+                    source = "sandbox_enforcement",
+                    "SANDBOX ENFORCEMENT: live orders blocked pending explicit \
+                     re-arm (sentinel 2099-12-31; a dated operator quote + \
+                     constant edit are required to go live)"
+                );
+                self.release_unsent_order();
+                return Err(OmsError::SandboxEnforcement);
+            }
         }
         Ok(())
     }
@@ -2822,6 +3329,98 @@ impl OrderManagementSystem {
         self.circuit_breaker.record_success();
         if self.circuit_breaker.was_previously_open(prev_failures) {
             self.fire_alert(OmsAlert::CircuitBreakerClosed);
+        }
+    }
+
+    /// Records one failed live exit-arm API call on the circuit breaker. A
+    /// throttled answer (HTTP 429 / DH-904) never trips the breaker, because
+    /// the API is healthy; it records nothing, so it gives back the HalfOpen
+    /// probe the call took instead (audit B2 follow-up, 2026-11-13). Before,
+    /// a 429 answering the probe left the probe flag set with no outcome and
+    /// every later order was refused until the 16:00 daily reset. O(1).
+    fn record_exit_api_failure(&self, err: &OmsError) {
+        if matches!(err, OmsError::DhanRateLimited) {
+            self.circuit_breaker.release_probe();
+        } else {
+            self.circuit_breaker.record_failure();
+        }
+    }
+
+    /// Wraps the token fetch of every live arm that ran
+    /// `circuit_breaker.check()` first (the provider call goes in as the
+    /// argument).
+    /// A failed fetch (no token, expired token) sends nothing and records no
+    /// success or failure, so it gives back the HalfOpen probe that check
+    /// took (audit B2 follow-up, 2026-11-13). The fetch stays spelled out at
+    /// each call site, where the exit-order lockout guard looks for it.
+    /// `reconcile` and `verify_order_execution` never take the probe and
+    /// fetch the token directly. O(1).
+    ///
+    /// 2026-11-13 (B2 review round 4): when `nothing_sent` is true it also
+    /// gives back the one order of budget the call spent, because no request
+    /// left the process. Before, a missing or expired token kept the budget
+    /// spent, so retries while the token was gone could fill the hour tier
+    /// and then lock out every place, modify and cancel for up to an hour.
+    /// The exit arms send nothing before the fetch and pass `true`. The
+    /// place, modify and cancel loops pass `!auth_retry_used`: after an auth
+    /// rotate-retry the first request was sent and stays counted.
+    fn probe_back_on_token_err(
+        &mut self,
+        token: Result<SecretString, OmsError>,
+        nothing_sent: bool,
+    ) -> Result<SecretString, OmsError> {
+        if token.is_err() {
+            self.circuit_breaker.release_probe();
+            if nothing_sent {
+                self.order_budget.give_back();
+            }
+        }
+        token
+    }
+
+    /// The token fetch of `verify_order_execution`, which spends one order of
+    /// budget but takes no breaker probe: a failed fetch sent nothing, so it
+    /// gives the budget back (B2 review round 4, 2026-11-13). O(1).
+    fn budget_back_on_token_err(
+        &mut self,
+        token: Result<SecretString, OmsError>,
+    ) -> Result<SecretString, OmsError> {
+        if token.is_err() {
+            self.order_budget.give_back();
+        }
+        token
+    }
+
+    /// The DATA-805 STOP-ALL latch, checked once before the first send of
+    /// `place_order`, `modify_order` and `cancel_order` (B2 review round 4,
+    /// 2026-11-13). While the latch holds, the wrapper would refuse at its
+    /// first rung with nothing sent, but the engine cannot tell that refusal
+    /// from a later-rung abort (earlier rungs were sent), so the budget stayed
+    /// spent. Checked here, the refusal is known to be unsent: it gives back
+    /// the HalfOpen probe and the order's budget, and raises the stop-all
+    /// alert once per episode exactly as the policy arm does. A latch engaged
+    /// after this check (only by this call's own ladder, the latch belongs to
+    /// this engine's client) keeps the budget spent, which counts more,
+    /// never less. O(1).
+    fn refuse_unsent_inside_stop_all(&mut self) -> Result<(), OmsError> {
+        if let Err(err) = self.api_client.check_stop_all_latch() {
+            self.note_stop_all_episode();
+            self.release_unsent_order();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// The once-per-episode DATA-805 stop-all alert (C2), shared by the
+    /// policy arm and [`Self::refuse_unsent_inside_stop_all`]. O(1).
+    fn note_stop_all_episode(&mut self) {
+        if !self.stop_all_alert_latched {
+            self.stop_all_alert_latched = true;
+            self.fire_alert(OmsAlert::OrderApiStopAll {
+                cooldown_secs: DATA_805_STOP_ALL_COOLDOWN_SECS,
+            });
+        } else {
+            debug!("DATA-805 stop-all alert already fired this episode");
         }
     }
 
@@ -2865,7 +3464,7 @@ impl OrderManagementSystem {
             price,
             ..
         } = modify
-            && let Some(order) = self.orders.get_mut(order_id)
+            && let Some(mut order) = self.orders.get_mut(order_id)
         {
             order.order_type = *order_type;
             order.quantity = *quantity;
@@ -2897,7 +3496,7 @@ impl OrderManagementSystem {
             so.updated_at_us = now_us;
         }
         if leg == OrderLeg::EntryLeg
-            && let Some(order) = self.orders.get_mut(order_id)
+            && let Some(mut order) = self.orders.get_mut(order_id)
         {
             order.status = OrderStatus::Cancelled;
             order.updated_at_us = now_us;
@@ -2965,7 +3564,7 @@ impl OrderManagementSystem {
                 traded_qty,
                 avg_price,
             } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.traded_qty = *traded_qty;
                     order.avg_traded_price = *avg_price;
                     if order.status != OrderStatus::Traded {
@@ -2979,7 +3578,7 @@ impl OrderManagementSystem {
                 }
             }
             ExecutionVerdict::PartiallyFilled { traded_qty, .. } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.traded_qty = *traded_qty;
                     if order.status != OrderStatus::PartTraded
                         && is_valid_transition(order.status, OrderStatus::PartTraded)
@@ -2993,7 +3592,7 @@ impl OrderManagementSystem {
                     // forgotten. Live policy actions (modify-to-aggressive /
                     // cancel-remainder) are deliberately NOT implemented in
                     // this dry-run PR — logged + flagged only.
-                    if let Some(order) = self.orders.get_mut(order_id) {
+                    if let Some(mut order) = self.orders.get_mut(order_id) {
                         order.needs_reconciliation = true;
                     }
                     error!(
@@ -3009,7 +3608,7 @@ impl OrderManagementSystem {
                 // H1 (2026-07-14 hostile review): an at-limit resting order
                 // is flagged for the REST reconcile — verify-ladder
                 // exhaustion is never a silent Pending.
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     order.needs_reconciliation = true;
                     order.updated_at_us = now_us;
                 }
@@ -3033,7 +3632,7 @@ impl OrderManagementSystem {
                 let in_budget_list_lag = raw_status == exit_rules::VERIFY_RAW_NOT_IN_SUPER_LIST
                     && elapsed_secs < deadline_secs;
                 if !in_budget_list_lag {
-                    if let Some(order) = self.orders.get_mut(order_id) {
+                    if let Some(mut order) = self.orders.get_mut(order_id) {
                         order.needs_reconciliation = true;
                         order.updated_at_us = now_us;
                     }
@@ -3048,7 +3647,7 @@ impl OrderManagementSystem {
                 }
             }
             ExecutionVerdict::Terminal { status } => {
-                if let Some(order) = self.orders.get_mut(order_id) {
+                if let Some(mut order) = self.orders.get_mut(order_id) {
                     if order.status != *status {
                         if is_valid_transition(order.status, *status) {
                             order.status = *status;
@@ -3257,6 +3856,16 @@ fn build_super_modify_request(
             ..base
         },
     }
+}
+
+/// I-P1-11: resolves the segment an order is BOOKED under from the segment
+/// string its wire body carries, so the order book and the broker can never
+/// name two different instruments. An unknown string refuses the order
+/// (counted + coded inside [`resolve_order_segment_str`]) — never a guess.
+/// O(1).
+fn wire_order_segment(wire_segment: &str, security_id: u64) -> Result<ExchangeSegment, OmsError> {
+    resolve_order_segment_str(wire_segment, security_id)
+        .ok_or(OmsError::UnknownExchangeSegment { security_id })
 }
 
 /// Builds the Forever/OCO wire body. SINGLE omits every second-leg field;
@@ -3566,6 +4175,42 @@ fn halt_error_code(cause: &'static str) -> ErrorCode {
     }
 }
 
+/// `PAPER-<counter>`, the paper order id, in one exactly-sized allocation.
+///
+/// Same text as `format!("PAPER-{counter}")` (pinned by
+/// `proptest_paper_order_id_matches_format`), without the formatting
+/// machinery: the decimal digits are written into a stack buffer and the
+/// string is allocated once at its final length (2026-10-30, the order-path
+/// sub-microsecond work).
+///
+/// # Performance
+/// O(digits), at most 20 divisions by 10, one allocation.
+fn paper_order_id_string(counter: u64) -> String {
+    const PREFIX: &str = "PAPER-";
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let mut rest = counter;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut id = String::with_capacity(PREFIX.len() + digits.len() - start);
+    id.push_str(PREFIX);
+    for &digit in &digits[start..] {
+        id.push(char::from(digit));
+    }
+    id
+}
+
+/// Orders the book is pre-sized for, and the placeholder count
+/// [`OrderManagementSystem::prefault_order_book`] writes once at construction
+/// so every page of the table is mapped before the first real order.
+const ORDER_BOOK_PREFAULT_ORDERS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3602,6 +4247,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -3983,7 +4629,7 @@ mod tests {
     fn test_fill_lots_i32_clamp_and_lot_size_zero_normalized() {
         // Clamp: an absurd cumulative qty saturates to i32::MAX lots.
         let mut oms = make_oms_with_order("1", OrderStatus::Pending);
-        if let Some(order) = oms.orders.get_mut("1") {
+        if let Some(mut order) = oms.orders.get_mut("1") {
             order.lot_size = 1;
         }
         let mut update = make_order_update("1", "TRADED");
@@ -3998,7 +4644,7 @@ mod tests {
 
         // lot_size 0 → normalized to 1 (3 units = 3 lots).
         let mut oms2 = make_oms_with_order("2", OrderStatus::Pending);
-        if let Some(order) = oms2.orders.get_mut("2") {
+        if let Some(mut order) = oms2.orders.get_mut("2") {
             order.lot_size = 0;
         }
         let mut u2 = make_order_update("2", "TRADED");
@@ -4028,13 +4674,35 @@ mod tests {
         assert_eq!(oms.active_order_count(), oms.active_orders().len());
     }
 
+    /// PR6 index half: the active iterator lists exactly the non-terminal
+    /// orders, the same set the full scan finds, and skips terminal ones.
+    #[test]
+    fn test_active_orders_iter_lists_only_open_orders() {
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let ids: Vec<&str> = oms
+            .active_orders_iter()
+            .map(|o| o.order_id.as_str())
+            .collect();
+        assert_eq!(ids, ["1"]);
+        let mut traded = make_order_update("1", "TRADED");
+        traded.traded_qty = 50;
+        traded.avg_traded_price = 100.0;
+        let _ = oms.handle_order_update(&traded);
+        assert_eq!(oms.active_orders_iter().count(), 0, "terminal skipped");
+        assert_eq!(
+            oms.all_orders().len(),
+            1,
+            "the terminal order is still held"
+        );
+    }
+
     /// Fill sign comes from the tracked ManagedOrder's transaction_type
     /// (authoritative), never the serde-default wire TxnType.
     #[test]
     fn test_fill_sign_from_managed_order_transaction_type() {
         // Sell order: positive traded_qty delta must yield NEGATIVE lots.
         let mut oms = make_oms_with_order("1", OrderStatus::Pending);
-        if let Some(order) = oms.orders.get_mut("1") {
+        if let Some(mut order) = oms.orders.get_mut("1") {
             order.transaction_type = TransactionType::Sell;
         }
         let mut update = make_order_update("1", "TRADED");
@@ -4133,6 +4801,7 @@ mod tests {
             order_id: "2".to_owned(),
             correlation_id: "corr-2".to_owned(),
             security_id: 100,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4226,6 +4895,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4261,6 +4931,7 @@ mod tests {
 
         let make_request = || PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4294,6 +4965,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4388,6 +5060,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4423,6 +5096,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4458,6 +5132,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4630,6 +5305,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4694,6 +5370,7 @@ mod tests {
     fn test_validate_order_fields_limit_order_valid() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4711,6 +5388,7 @@ mod tests {
     fn test_validate_order_fields_market_order_valid() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4728,6 +5406,7 @@ mod tests {
     fn test_validate_order_fields_market_nonzero_price() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,
@@ -4746,6 +5425,7 @@ mod tests {
     fn test_validate_order_fields_sl_with_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4763,6 +5443,7 @@ mod tests {
     fn test_validate_order_fields_sl_zero_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLoss,
             product_type: ProductType::Intraday,
@@ -4781,6 +5462,7 @@ mod tests {
     fn test_validate_order_fields_slm_zero_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -4799,6 +5481,7 @@ mod tests {
     fn test_validate_order_fields_slm_with_trigger() {
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -4821,6 +5504,7 @@ mod tests {
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4845,6 +5529,7 @@ mod tests {
         let tomorrow = chrono::Utc::now().date_naive() + chrono::Duration::days(1);
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -4865,6 +5550,7 @@ mod tests {
     fn test_validate_no_expiry_date_passes() {
         let request = PlaceOrderRequest {
             security_id: 11536,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5396,6 +6082,40 @@ mod tests {
         assert_eq!(oms.order("1").unwrap().status, OrderStatus::Pending);
     }
 
+    #[test]
+    fn handle_update_unknown_status_flags_needs_reconciliation() {
+        // Audit INP-7 (2026-10-11): an unknown status is no longer a silent
+        // skip — it is counted and logged, and the order is marked
+        // `needs_reconciliation`. (Review 2026-10-11: no production code
+        // reads that flag yet, so the mark alone corrects nothing.)
+        let mut oms = make_oms_with_order("1", OrderStatus::Confirmed);
+        assert!(!oms.order("1").unwrap().needs_reconciliation);
+        let update = make_order_update("1", "WEIRD");
+        let result = oms.handle_order_update(&update);
+        assert!(matches!(result, Ok(None)));
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::Confirmed, "status unchanged");
+        assert!(
+            order.needs_reconciliation,
+            "an unknown status must flag the order for reconciliation"
+        );
+    }
+
+    #[test]
+    fn handle_order_update_accepts_mixed_case_traded_and_emits_the_fill() {
+        // Audit INP-7 (2026-10-11): the vendor spells statuses in mixed case
+        // ("Cancelled" in its own example); "Traded" must fill, not vanish.
+        let mut oms = make_oms_with_order("1", OrderStatus::Pending);
+        let mut update = make_order_update("1", "Traded");
+        update.traded_qty = 50;
+        update.avg_traded_price = 250.0;
+        let result = oms.handle_order_update(&update).expect("valid transition");
+        assert!(result.is_some(), "a mixed-case TRADED must emit a fill");
+        let order = oms.order("1").unwrap();
+        assert_eq!(order.status, OrderStatus::Traded);
+        assert!(!order.needs_reconciliation);
+    }
+
     // -----------------------------------------------------------------------
     // Coverage: order not found after status parse (race with removal)
     // -----------------------------------------------------------------------
@@ -5449,6 +6169,7 @@ mod tests {
 
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::StopLossMarket,
             product_type: ProductType::Intraday,
@@ -5513,6 +6234,7 @@ mod tests {
             order_id: "active-1".to_owned(),
             correlation_id: "c1".to_owned(),
             security_id: 100,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5688,6 +6410,7 @@ mod tests {
     fn make_place_request() -> PlaceOrderRequest {
         PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5777,6 +6500,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5828,6 +6552,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5876,6 +6601,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5924,6 +6650,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -5963,6 +6690,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6001,6 +6729,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6041,6 +6770,7 @@ mod tests {
             order_id: "1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6082,6 +6812,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: format!("corr-{order_id}"),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -6436,11 +7167,251 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // 2026-10-30: old vs new decisions on the paper order path.
+    //
+    // Two books see the same random sequence of placements and broker
+    // updates. Book A takes its correlation ids from the pre-drawn pool (the
+    // 2026-10-30 path); book B has its pool drained first, so every id is
+    // drawn on demand, which is how every placement worked before. Every
+    // outcome, fill and order record must match, the random correlation id
+    // and the wall-clock stamps aside.
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    enum PaperOp {
+        Place {
+            security_id: u64,
+            buy: bool,
+            limit: bool,
+            quantity: i64,
+        },
+        Update {
+            target: usize,
+            status: &'static str,
+            traded_qty: i64,
+            avg_price: f64,
+        },
+    }
+
+    fn paper_op() -> impl proptest::strategy::Strategy<Value = PaperOp> {
+        use proptest::prelude::*;
+        let statuses = prop_oneof![
+            Just("PENDING"),
+            Just("TRADED"),
+            Just("PART_TRADED"),
+            Just("CANCELLED"),
+            Just("REJECTED"),
+            Just("EXPIRED"),
+            Just("NOT_A_STATUS"),
+        ];
+        prop_oneof![
+            (0_u64..4, any::<bool>(), any::<bool>(), 1_i64..6).prop_map(
+                |(security_id, buy, limit, quantity)| PaperOp::Place {
+                    security_id,
+                    buy,
+                    limit,
+                    quantity
+                }
+            ),
+            (
+                0_usize..12,
+                statuses,
+                0_i64..8,
+                prop_oneof![Just(0.0), Just(101.5), Just(-1.0)]
+            )
+                .prop_map(|(target, status, traded_qty, avg_price)| PaperOp::Update {
+                    target,
+                    status,
+                    traded_qty,
+                    avg_price
+                }),
+        ]
+    }
+
+    fn paper_book() -> OrderManagementSystem {
+        OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(1_000),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        )
+    }
+
+    /// Runs one op and returns its outcome as text; ids are deterministic
+    /// (`PAPER-<n>`), so the text compares across books.
+    fn run_paper_op(
+        oms: &mut OrderManagementSystem,
+        placed: &mut Vec<String>,
+        op: &PaperOp,
+    ) -> String {
+        use std::future::Future as _;
+        match *op {
+            PaperOp::Place {
+                security_id,
+                buy,
+                limit,
+                quantity,
+            } => {
+                let request = PlaceOrderRequest {
+                    security_id,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    transaction_type: if buy {
+                        TransactionType::Buy
+                    } else {
+                        TransactionType::Sell
+                    },
+                    order_type: if limit {
+                        OrderType::Limit
+                    } else {
+                        OrderType::Market
+                    },
+                    product_type: ProductType::Intraday,
+                    validity: OrderValidity::Day,
+                    quantity,
+                    price: if limit { 100.0 } else { 0.0 },
+                    trigger_price: 0.0,
+                    lot_size: 25,
+                    expiry_date: None,
+                };
+                let mut future = std::pin::pin!(oms.place_order(request));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                match future.as_mut().poll(&mut cx) {
+                    std::task::Poll::Ready(Ok(order_id)) => {
+                        placed.push(order_id.clone());
+                        format!("placed {order_id}")
+                    }
+                    std::task::Poll::Ready(Err(err)) => format!("refused {err:?}"),
+                    std::task::Poll::Pending => "awaited".to_owned(),
+                }
+            }
+            PaperOp::Update {
+                target,
+                status,
+                traded_qty,
+                avg_price,
+            } => {
+                let order_no = placed
+                    .get(target % placed.len().max(1))
+                    .cloned()
+                    .unwrap_or_else(|| "PAPER-UNKNOWN".to_owned());
+                let mut update: OrderUpdate =
+                    serde_json::from_str("{}").expect("OrderUpdate fields are serde-default"); // APPROVED: test
+                update.exchange = "NSE".to_owned();
+                update.segment = "D".to_owned();
+                update.order_no = order_no;
+                update.status = status.to_owned();
+                update.traded_qty = traded_qty;
+                update.avg_traded_price = avg_price;
+                update.source = "P".to_owned();
+                format!("{:?}", oms.handle_order_update(&update))
+            }
+        }
+    }
+
+    /// Every order record with the random and wall-clock fields blanked.
+    fn comparable_book(oms: &OrderManagementSystem) -> Vec<(String, ManagedOrder)> {
+        let mut rows: Vec<(String, ManagedOrder)> = oms
+            .all_orders()
+            .iter()
+            .map(|(key, order)| {
+                let mut order = order.clone();
+                order.correlation_id = String::new();
+                order.created_at_us = 0;
+                order.updated_at_us = 0;
+                (key.to_string(), order)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_paper_order_id_matches_format(counter in proptest::prelude::any::<u64>()) {
+            proptest::prop_assert_eq!(paper_order_id_string(counter), format!("PAPER-{counter}"));
+        }
+    }
+
+    #[test]
+    fn test_paper_order_id_matches_format_at_the_extremes() {
+        for counter in [0_u64, 1, 9, 10, 99, 100, 12_345, u64::MAX - 1, u64::MAX] {
+            let id = paper_order_id_string(counter);
+            assert_eq!(id, format!("PAPER-{counter}"));
+            assert_eq!(id.capacity(), id.len(), "one exactly-sized allocation");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+        #[test]
+        fn proptest_pooled_ids_decide_exactly_like_on_demand_ids(
+            ops in proptest::collection::vec(paper_op(), 1..40)
+        ) {
+            let mut pooled = paper_book();
+            let mut on_demand = paper_book();
+            // Drain book B's pool, so each of its ids is drawn on demand.
+            for _ in 0..super::super::idempotency::CORRELATION_ID_POOL_SIZE {
+                let _ = on_demand.correlations.next_id();
+            }
+            let (mut placed_a, mut placed_b) = (Vec::new(), Vec::new());
+            for op in &ops {
+                let a = run_paper_op(&mut pooled, &mut placed_a, op);
+                let b = run_paper_op(&mut on_demand, &mut placed_b, op);
+                proptest::prop_assert_eq!(&a, &b, "op {:?}", op);
+            }
+            proptest::prop_assert_eq!(comparable_book(&pooled), comparable_book(&on_demand));
+            proptest::prop_assert_eq!(pooled.total_placed(), on_demand.total_placed());
+            proptest::prop_assert_eq!(pooled.total_updates(), on_demand.total_updates());
+            // Every placed order is still matched back by its correlation id.
+            for order in pooled.all_orders().values().chain(on_demand.all_orders().values()) {
+                proptest::prop_assert_eq!(order.correlation_id.len(), 30);
+            }
+        }
+    }
+
     #[test]
     fn test_order_latency_metric() {
-        // Verify histogram macro compiles and doesn't panic when invoked.
-        // O(1) atomic call — safe for cold path (order placement).
-        metrics::histogram!("tv_order_placement_duration_ns").record(1000.0_f64);
+        // The fixed-bucket placement latency records and publishes without
+        // a recorder installed (every handle is a no-op then).
+        let oms = OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        oms.placement_latency.record_ns(1_000);
+        oms.publish_placement_latency();
+        assert_eq!(oms.placement_latency.published_count(), 1);
+    }
+
+    #[test]
+    fn test_publish_placement_latency_covers_a_paper_placement() {
+        let mut oms = OrderManagementSystem::new(
+            OrderApiClient::new(
+                reqwest::Client::new(),
+                "https://api.dhan.co/v2".to_owned(),
+                "100".to_owned(),
+            ),
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        let placed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime") // APPROVED: test
+            .block_on(oms.place_order(make_place_request()));
+        assert!(placed.is_ok(), "a paper placement succeeds");
+        oms.publish_placement_latency();
+        assert_eq!(oms.placement_latency.published_count(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -6601,6 +7572,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -7152,6 +8124,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: format!("corr-{order_id}"),
             security_id: 49081,
+            exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -7311,6 +8284,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let placement = oms
             .place_super_order(make_super_request(), 1_800)
             .await
@@ -7337,6 +8311,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(400, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(result.is_err());
         assert_eq!(oms.circuit_breaker.failure_count(), 1);
@@ -7349,6 +8324,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(429, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(matches!(result.unwrap_err(), OmsError::DhanRateLimited));
         assert_eq!(oms.circuit_breaker.failure_count(), 0);
@@ -7491,6 +8467,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, modify_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -7652,6 +8629,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, cancel_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -7699,6 +8677,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let order_id = oms.place_forever_oco(make_forever_request()).await.unwrap();
 
         assert_eq!(order_id, "FO-1");
@@ -7789,6 +8768,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -7822,6 +8802,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -7886,6 +8867,7 @@ mod tests {
         let (base_url, handle) = start_multi_mock(vec![(200, pending), (200, traded)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let first = oms.verify_order_execution("D-1", 1, 30).await.unwrap();
@@ -7914,6 +8896,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -7930,6 +8913,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -7949,6 +8933,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -7973,6 +8958,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -7991,6 +8977,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(429, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let result = oms.verify_order_execution("D-1", 5, 30).await;
@@ -8006,6 +8993,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8031,6 +9019,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "TRADED", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::PartTraded, 75);
 
@@ -8059,6 +9048,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8085,6 +9075,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8113,6 +9104,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 30, 30).await.unwrap();
@@ -8135,6 +9127,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_order(&mut oms, "D-1", OrderStatus::Pending, 50);
 
         let verdict = oms.verify_order_execution("D-1", 5, 30).await.unwrap();
@@ -8320,6 +9313,7 @@ mod tests {
         let body = r#"{"orderId":"SO/../1","orderStatus":"PENDING","legDetails":[]}"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_super_order(make_super_request(), 1_800).await;
         assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
         assert_eq!(oms.total_placed(), 0);
@@ -8330,6 +9324,7 @@ mod tests {
         let body = r#"[{"orderId":"S-1","orderStatus":"TRANSIT"},{"orderId":"S 2","orderStatus":"TRANSIT"}]"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
         let result = oms.place_order_sliced(request, 100).await;
@@ -8341,6 +9336,7 @@ mod tests {
         let body = r#"{"orderId":"FO\n1","orderStatus":"CONFIRM"}"#;
         let (base_url, handle) = start_oms_mock(200, body).await;
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let result = oms.place_forever_oco(make_forever_request()).await;
         assert!(matches!(result, Err(OmsError::DhanApiError { .. })));
         assert!(oms.all_orders().is_empty());
@@ -8358,6 +9354,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, cancel_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -8385,6 +9382,7 @@ mod tests {
             start_multi_mock(vec![(200, place_body), (200, modify_body)]).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         oms.place_super_order(make_super_request(), 1_800)
             .await
             .unwrap();
@@ -8463,6 +9461,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         insert_tracked_super(&mut oms, "SO-9", "PENDING", 75);
         insert_tracked_order(&mut oms, "SO-9", OrderStatus::Pending, 75);
 
@@ -8492,6 +9491,7 @@ mod tests {
         let (base_url, handle) = start_oms_mock(200, &body).await;
 
         let mut oms = make_live_oms(&base_url);
+        install_ready(&mut oms);
         let mut request = make_place_request();
         request.quantity = 250;
 
@@ -8524,4 +9524,132 @@ mod tests {
         assert!(oms.verify_states.is_empty());
         assert!(oms.all_orders().is_empty());
     }
+
+    // -- 2026-08-22: the order book is bounded -------------------------------
+
+    fn capacity_test_oms() -> OrderManagementSystem {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        )
+    }
+
+    #[test]
+    fn order_book_capacity_refuses_before_any_api_call() {
+        // The daily bound two documents attributed to these maps did not
+        // exist: OrderRateLimiter is per-SECOND, and DailyRequestTracker has
+        // zero occurrences anywhere in this workspace. This is the bound that
+        // actually does, and it refuses BEFORE the placement so no order can
+        // exist that the book has not recorded.
+        let mut oms = capacity_test_oms();
+        for i in 0..OrderManagementSystem::MAX_TRACKED_ORDERS {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+        }
+        match oms.check_order_book_capacity() {
+            Err(OmsError::OrderBookFull { tracked, max }) => {
+                assert_eq!(tracked, OrderManagementSystem::MAX_TRACKED_ORDERS);
+                assert_eq!(max, OrderManagementSystem::MAX_TRACKED_ORDERS);
+            }
+            other => panic!("expected OrderBookFull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_order_can_produce_many_aliases_so_they_are_bounded_separately() {
+        // The load-bearing fact, pinned because a 2026-08-25 change assumed the
+        // opposite and shipped on it. The alias insert is guarded on
+        // `update.order_no` alone -- there is NO guard on the canonical id --
+        // so one order yields one alias per distinct broker order_no it is
+        // ever reported under. Five updates, one order, five aliases.
+        //
+        // This is why the alias map has its OWN ceiling: it grows on inbound
+        // broker updates (no budget, no rate limiter), not on orders placed.
+        let mut oms = capacity_test_oms();
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        for n in 0..5 {
+            oms.order_no_aliases
+                .insert(format!("BROKER-NO-{n}"), "O1".to_owned());
+        }
+        assert_eq!(oms.orders.len(), 1);
+        assert_eq!(
+            oms.order_no_aliases.len(),
+            5,
+            "one order can be aliased under many broker order_no values"
+        );
+    }
+
+    #[test]
+    fn a_full_alias_table_never_blocks_placing_modifying_or_cancelling() {
+        // The dangerous half of the reverted change. `check_order_book_capacity`
+        // is NOT placement-only despite its name: it gates place_order,
+        // modify_order, cancel_order, verify_order_execution and
+        // check_order_gates. Summing the alias map into it meant inbound broker
+        // chatter could refuse a CANCEL -- blocking the exit of a position we
+        // already hold, the exact failure MAX_TRACKED_POSITIONS rejects as
+        // strictly worse than memory growth.
+        //
+        // A completely full alias table must leave the order book fully usable.
+        let mut oms = capacity_test_oms();
+        for n in 0..OrderManagementSystem::MAX_TRACKED_ORDER_ALIASES {
+            oms.order_no_aliases
+                .insert(format!("BROKER-NO-{n}"), "O1".to_owned());
+        }
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        assert!(
+            oms.check_order_book_capacity().is_ok(),
+            "a saturated alias table must never block a cancel or a modify"
+        );
+    }
+
+    #[test]
+    fn a_book_below_the_ceiling_admits_normally() {
+        let mut oms = capacity_test_oms();
+        oms.orders.insert(
+            "O1".to_owned(),
+            make_reconcile_order("O1", OrderStatus::Pending),
+        );
+        assert!(oms.check_order_book_capacity().is_ok());
+    }
+
+    #[test]
+    fn the_daily_reset_reopens_a_full_book() {
+        // The ceiling is per trading day, not per process.
+        let mut oms = capacity_test_oms();
+        for i in 0..OrderManagementSystem::MAX_TRACKED_ORDERS {
+            oms.orders.insert(
+                format!("O{i}"),
+                make_reconcile_order(&format!("O{i}"), OrderStatus::Pending),
+            );
+        }
+        assert!(oms.check_order_book_capacity().is_err());
+        oms.reset_daily();
+        assert!(
+            oms.check_order_book_capacity().is_ok(),
+            "the daily reset must clear the book"
+        );
+    }
+
+    #[test]
+    fn the_order_ceiling_agrees_with_every_other_per_entity_ceiling() {
+        assert_eq!(OrderManagementSystem::MAX_TRACKED_ORDERS, 25_000);
+    }
+
+    // Audit B2 (2026-11-13) tests live in `engine/tests/b2_tests.rs` (size pin).
+    mod b2_tests;
 }

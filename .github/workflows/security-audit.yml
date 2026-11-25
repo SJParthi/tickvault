@@ -30,18 +30,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.95.0"
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@2096c74c99c2f065b14e98d9738b44dd2018c2b7 # cargo-audit
-
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@e76ddd6ceed25b6c2aa8dfe0ec368bf2fb77a498 # cargo-deny
+      # The action takes the tool from `tool:`. These steps used to name it
+      # only in the pin comment, which worked while the pinned ref was the
+      # tool-named tag; once dependabot (#2078) moved the pin to a plain
+      # release SHA, neither tool was installed and the job failed with
+      # "no such command: deny" (2026-10-12). Same pins as ci.yml.
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # same SHA pin as ci.yml
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
       - name: Supply chain check (CVEs + licenses + bans + sources)
         run: cargo deny check
 
-      - name: Check for yanked crates
-        run: cargo audit --deny yanked
+      - name: Audit workspace and fuzz lockfiles
+        run: cargo audit --deny yanked --file Cargo.lock && cargo audit --deny yanked --file fuzz/Cargo.lock

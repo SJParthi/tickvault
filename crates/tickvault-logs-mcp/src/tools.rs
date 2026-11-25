@@ -1,4 +1,4 @@
-//! The 14 MCP tools — behavior-parity ports of server.py's tool functions
+//! The 14 MCP tools — behavior-parity ports of the retired reference implementation's tool functions
 //! (`tool_tail_errors` .. `tool_cloudwatch_logs`) + the advertised registry
 //! (byte-identical names / descriptions / inputSchema values; object key
 //! ORDER is normalized by the parity harness, array order is preserved).
@@ -24,14 +24,14 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use crate::config::{self, Ctx, Env, RealEnv};
-use crate::pycompat::{
-    decode_utf8_ignore, decode_utf8_replace, py_fnmatch, py_int, py_slice_chars, py_splitlines,
-    py_tail_chars, py_urllib_quote,
+use crate::legacy_compat::{
+    decode_utf8_ignore, decode_utf8_replace, legacy_fnmatch, legacy_int, legacy_slice_chars,
+    legacy_splitlines, legacy_tail_chars, legacy_urllib_quote,
 };
 use crate::signature::signature_hash;
 use crate::sigv4::{
-    AmzNow, build_cloudwatch_filter_args, build_cloudwatch_sigv4_request,
-    filter_and_trim_portal_events, parse_cloudwatch_events, parse_portal_logs_raw,
+    AmzNow, build_cloudwatch_sigv4_request, filter_and_trim_portal_events, parse_cloudwatch_events,
+    parse_portal_logs_raw,
 };
 
 pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
@@ -39,16 +39,59 @@ pub const SUMMARY_FILENAME: &str = "errors.summary.md";
 pub const AUTO_FIX_LOG: &str = "auto-fix.log";
 
 /// Subprocess poll granularity while waiting on a spawned child
-/// (parity: server.py subprocess timeout loop).
+/// (parity: the retired reference implementation subprocess timeout loop).
 const PROC_POLL_INTERVAL_MS: u64 = 25;
-/// Subprocess timeout for `scripts/doctor.sh` (parity: server.py timeout=120).
+
+/// How long the parent waits for one pipe reader to reach end-of-stream after
+/// the child has exited or been killed.
+///
+/// # The hang this bounds
+///
+/// `run_with_timeout` enforced its timeout against the CHILD and not against
+/// the READERS. On the success path it called `join()` on both reader threads
+/// with no bound, and `read_to_end` returns only at EOF — which arrives when
+/// EVERY holder of the pipe's write end has closed it, not when the child
+/// exits. A child that backgrounds anything (`&`, `nohup`, `docker compose up
+/// -d` — which this repository's own session hook runs) leaves a GRANDCHILD
+/// holding the inherited pipe, so EOF never comes, `join()` never returns, and
+/// the MCP server hangs inside the function whose entire purpose is a timeout.
+///
+/// This is the same class as the `tiny_server` accept loop bounded in #1883: a
+/// blocking call with nothing to notice a deadline with.
+///
+/// Five seconds because the child is already gone by this point — the pipes
+/// either drain immediately or a grandchild is holding them, and no amount of
+/// further waiting distinguishes the two.
+const PROC_READER_DRAIN_TIMEOUT_MS: u64 = 5_000;
+
+/// Bytes ONE captured stream may hold. 8 MiB.
+///
+/// The previous `read_to_end` had no ceiling, so a chatty or looping child
+/// could grow the parent's heap without limit — the unbounded-growth shape this
+/// repository bans everywhere else.
+///
+/// Honest consequence of capping: at the cap the reader stops and its end of
+/// the pipe drops, so a child that keeps writing takes an EPIPE and usually
+/// dies. That is a REPORTED death — the exit code reaches the caller — and it
+/// is the better half of the trade against an unbounded parent heap.
+const PROC_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Appended to `stderr` when a reader did not reach end-of-stream in time.
+///
+/// It goes into the OUTPUT rather than only a `bool`, because the failure it
+/// describes is silent by construction: the caller otherwise sees a successful
+/// exit code beside a short or empty stream and has no way to tell that from a
+/// command that genuinely printed nothing.
+const PROC_CAPTURE_TRUNCATED_NOTICE: &str = "\n[tickvault-logs-mcp] capture INCOMPLETE: a pipe \
+     reader did not reach end-of-stream within the drain budget, so the output above may be \
+     partial. The usual cause is a background grandchild that inherited the pipe and is still \
+     holding it open.\n";
+/// Subprocess timeout for `scripts/doctor.sh` (parity: the retired reference implementation timeout=120).
 const DOCTOR_TIMEOUT_SECS: u64 = 120;
-/// Subprocess timeout for `git log` (parity: server.py timeout=10).
+/// Subprocess timeout for `git log` (parity: the retired reference implementation timeout=10).
 const GIT_LOG_TIMEOUT_SECS: u64 = 10;
-/// Subprocess timeout for `docker compose ps` (parity: server.py timeout=15).
+/// Subprocess timeout for `docker compose ps` (parity: the retired reference implementation timeout=15).
 const DOCKER_PS_TIMEOUT_SECS: u64 = 15;
-/// Subprocess timeout for the read-only aws CLI fallback (parity: server.py timeout=30).
-const AWS_CLI_TIMEOUT_SECS: u64 = 30;
 
 /// Raw bytes of the retired runtime's own name. WIRE VALUE, not prose — two
 /// tool error strings and one advertised `inputSchema` description echo it
@@ -81,16 +124,16 @@ fn grep_pattern_description() -> String {
 // ---------------------------------------------------------------------------
 
 /// legacy text-mode universal-newline translation (`\r\n`/`\r` -> `\n`) —
-/// applied everywhere server.py reads files / subprocess output in text
+/// applied everywhere the retired reference implementation reads files / subprocess output in text
 /// mode (read_text, open(..., "r"), subprocess text=True).
-fn py_textmode(text: &str) -> String {
+fn legacy_textmode(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// legacy file-object line iteration semantics AFTER universal-newline
 /// translation, with terminators stripped: `"a\nb\n"` -> ["a","b"],
 /// `"a\nb"` -> ["a","b"], `""` -> [].
-fn py_file_lines(text: &str) -> Vec<&str> {
+fn legacy_file_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -102,7 +145,7 @@ fn py_file_lines(text: &str) -> Vec<&str> {
 }
 
 /// legacy `lines[-limit:]` slice (handles 0 => everything, negatives).
-fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
+fn legacy_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
     let n = lines.len() as i64;
     let start = if limit > 0 {
         (n - limit).max(0)
@@ -114,7 +157,7 @@ fn py_neg_slice<T>(lines: &[T], limit: i64) -> &[T] {
 
 /// legacy `datetime.isoformat()` for an offset-aware datetime: seconds,
 /// `.ffffff` only when the microseconds are non-zero, offset as `+HH:MM`.
-fn py_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
+fn legacy_isoformat(dt: &chrono::DateTime<chrono::FixedOffset>) -> String {
     use chrono::{Offset, Timelike};
     let micros = dt.nanosecond() / 1_000;
     let mut s = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
@@ -134,7 +177,7 @@ fn env_truthy(env: &dyn Env, key: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// errors.jsonl.* discovery + event parsing (server.py:209-237)
+// errors.jsonl.* discovery + event parsing (the retired reference implementation:209-237)
 // ---------------------------------------------------------------------------
 
 /// Newest-first list of errors.jsonl.* files, with the 2026-07-05 grace
@@ -196,12 +239,134 @@ fn event_signature(ev: &Map<String, Value>) -> String {
 // File-backed tools
 // ---------------------------------------------------------------------------
 
-/// server.py `tool_tail_errors`.
+/// Bytes one log-file read may hold, taken from the END of the file. 32 MiB.
+///
+/// Every file tool used `std::fs::read`, which loads the whole file: a
+/// day's `app.YYYY-MM-DD.log` on the box runs to gigabytes, and one tool
+/// call held all of it (plus its line index) in this process's heap. Tail
+/// tools only ever wanted the end, so the end is what is read. Each reply
+/// says when a file was cut (`truncated` / `truncated_files`), so a short
+/// history never reads as a complete one.
+pub const LOG_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Lines `app_log_tail` and `triage_log_tail` may return in one reply.
+/// `limit <= 0` used to mean "every line", which on a full log was the
+/// whole file as one JSON reply.
+pub const LOG_TAIL_MAX_LINES: i64 = 5_000;
+
+/// Bytes one call may read across ALL `errors.jsonl.*` files. 128 MiB.
+///
+/// Each file is already capped at `LOG_READ_MAX_BYTES`, but the files rotate
+/// hourly and are never pruned by this tool, so a per-file cap alone scales
+/// with how many hours of history sit in the directory. Files past the budget
+/// are named in `skipped_files`, newest files first read.
+pub const LOG_SCAN_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Bytes one runbook or rule file may hold before the runbook finder skips
+/// it. 4 MiB: the largest file in the four trees is about 540 KB today.
+pub const RUNBOOK_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read at most the last `cap` bytes of `path`. `Ok((bytes, true))` when the
+/// file was longer: the cut lands mid-line, so the partial first line is
+/// dropped and only whole lines come back.
+fn read_tail_capped(path: &Path, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut out = Vec::new();
+    if len <= cap {
+        // Read the length seen at the size check, not to EOF: a file that
+        // grows meanwhile would otherwise end mid-line while reporting
+        // `truncated = false`.
+        file.take(len).read_to_end(&mut out)?;
+        return Ok((out, false));
+    }
+    // One byte before the window says whether the window starts on a line
+    // boundary: if that byte is a newline the first line is whole and kept;
+    // otherwise it is the tail of a cut line and is dropped.
+    file.seek(SeekFrom::Start(len - cap - 1))?;
+    file.take(cap + 1).read_to_end(&mut out)?;
+    let starts_on_boundary = out.first() == Some(&b'\n');
+    if out.is_empty() {
+        return Ok((out, true));
+    }
+    out.remove(0);
+    if !starts_on_boundary {
+        match out.iter().position(|&b| b == b'\n') {
+            Some(newline) => {
+                out.drain(..=newline);
+            }
+            None => out.clear(),
+        }
+    }
+    Ok((out, true))
+}
+
+/// Keep only the last `limit` newline-terminated lines of `bytes` (plus an
+/// unterminated last line), so the line index built afterwards is sized by
+/// the reply rather than by the 32 MiB read. Returns the number of lines
+/// the buffer held before trimming, counted by newline bytes.
+///
+/// Splitting on `\n` alone keeps at least `limit` lines under the legacy
+/// splitter too, which also breaks on `\r` and a few other separators.
+fn keep_last_lines(bytes: &mut Vec<u8>, limit: i64) -> usize {
+    let unterminated = usize::from(bytes.last().is_some_and(|&b| b != b'\n'));
+    let total = bytes.iter().filter(|&&b| b == b'\n').count() + unterminated;
+    let keep = usize::try_from(limit).unwrap_or(usize::MAX);
+    if total > keep {
+        // The newline that ends line (total - keep - 1), counting from 0.
+        let mut seen = 0usize;
+        let skip = total - keep;
+        if let Some(cut) = bytes.iter().position(|&b| {
+            if b == b'\n' {
+                seen += 1;
+            }
+            seen == skip
+        }) {
+            bytes.drain(..=cut);
+        }
+    }
+    total
+}
+
+fn clamp_tail_limit(limit: i64) -> i64 {
+    if limit <= 0 || limit > LOG_TAIL_MAX_LINES {
+        LOG_TAIL_MAX_LINES
+    } else {
+        limit
+    }
+}
+
+/// Read a whole UTF-8 file through ONE open, refusing it past `cap`:
+/// `Ok(None)` when the file holds more than `cap` bytes. A separate size
+/// check followed by `read_to_string` would still load a file that grew in
+/// between.
+fn read_whole_capped(path: &Path, cap: u64) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut out = String::new();
+    std::fs::File::open(path)?
+        .take(cap.saturating_add(1))
+        .read_to_string(&mut out)?;
+    if out.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
+/// the retired reference implementation `tool_tail_errors`.
 pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
+    let limit = clamp_tail_limit(limit);
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
     let mut events: Vec<Value> = Vec::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -209,12 +374,16 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        let lines = py_splitlines(&text);
+        let text = legacy_textmode(&raw);
+        let lines = legacy_splitlines(&text);
         for line in lines.iter().rev() {
             let Some(ev) = parse_event(line) else {
                 continue;
@@ -241,6 +410,8 @@ pub fn tool_tail_errors(ctx: &Ctx, limit: i64, code: Option<&str>) -> Value {
         "dir": dir_path.to_string_lossy(),
         "count": events.len(),
         "files_scanned": files.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
         "events": events,
     })
 }
@@ -273,7 +444,7 @@ fn parse_event_ts(ev: &Map<String, Value>) -> Option<chrono::DateTime<chrono::Fi
 /// `chrono::Duration::minutes` aborted the whole server for
 /// |m| >= 153_722_867_280_913). `Err` replicates the legacy runtime's exception
 /// bands BYTE-EXACTLY (empirically mapped against the merge-base
-/// server.py, 2026-07-18; each `str(exc)` is wrapped by the dispatch
+/// the retired reference implementation, 2026-07-18; each `str(exc)` is wrapped by the dispatch
 /// into `-32000 tool list_novel_signatures failed: {msg}`):
 ///  1. `timedelta(minutes=m)` computes `days = floor(m / 1440)` and
 ///     converts it to a C int (32-bit) BEFORE the magnitude check —
@@ -307,14 +478,14 @@ fn novel_cutoff(
     // checked_sub_signed None == outside chrono's ±262k-year range,
     // which is strictly outside legacy's year 1..=9999 range too.
     let cutoff = now.checked_sub_signed(delta).ok_or_else(out_of_range)?;
-    if cutoff < py_datetime_min() || cutoff > py_datetime_max() {
+    if cutoff < legacy_datetime_min() || cutoff > legacy_datetime_max() {
         return Err(out_of_range());
     }
     Ok(cutoff)
 }
 
 /// legacy `datetime.min` as aware-UTC: 0001-01-01T00:00:00.
-fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
+fn legacy_datetime_min() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
         .with_ymd_and_hms(1, 1, 1, 0, 0, 0)
@@ -323,7 +494,7 @@ fn py_datetime_min() -> chrono::DateTime<chrono::Utc> {
 }
 
 /// legacy `datetime.max` as aware-UTC: 9999-12-31T23:59:59.999999.
-fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
+fn legacy_datetime_max() -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     chrono::Utc
         .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
@@ -332,7 +503,7 @@ fn py_datetime_max() -> chrono::DateTime<chrono::Utc> {
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
-/// server.py `tool_list_novel_signatures`. `Err` == the legacy
+/// the retired reference implementation `tool_list_novel_signatures`. `Err` == the legacy
 /// OverflowError bands of `novel_cutoff` (computed FIRST, before any
 /// file I/O — same order as legacy's line-312 cutoff).
 pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value, String> {
@@ -343,7 +514,14 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
 
     let mut order: Vec<String> = Vec::new();
     let mut first_seen: HashMap<String, NovelInfo> = HashMap::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -351,12 +529,16 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        for line in py_splitlines(&text) {
+        let text = legacy_textmode(&raw);
+        for line in legacy_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
                 continue;
             };
@@ -382,7 +564,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
                         code: obj.get("code").cloned().unwrap_or(Value::Null),
                         severity: obj.get("severity").cloned().unwrap_or(Value::Null),
                         target: obj.get("target").cloned().unwrap_or(Value::Null),
-                        message_trunc: py_slice_chars(
+                        message_trunc: legacy_slice_chars(
                             obj.get("message").and_then(Value::as_str).unwrap_or(""),
                             200,
                         )
@@ -408,7 +590,7 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
                 "severity": info.severity,
                 "target": info.target,
                 "message": info.message_trunc,
-                "first_seen_ts": py_isoformat(ts),
+                "first_seen_ts": legacy_isoformat(ts),
             }));
         }
     }
@@ -419,13 +601,23 @@ pub fn tool_list_novel_signatures(ctx: &Ctx, since_minutes: i64) -> Result<Value
     Ok(json!({
         "dir": dir_path.to_string_lossy(),
         "since_minutes": since_minutes,
-        "cutoff_utc": py_isoformat(&cutoff_fixed),
+        "cutoff_utc": legacy_isoformat(&cutoff_fixed),
         "novel_count": novel.len(),
         "novel": novel,
+        // Novelty is judged only over what was read: a file cut to its last
+        // LOG_READ_MAX_BYTES, or skipped past the scan budget, loses its
+        // oldest lines, so a signature first seen ONLY there reads as novel.
+        "caveat": if truncated_files.is_empty() && skipped_files.is_empty() {
+            Value::Null
+        } else {
+            json!("some error files were cut or skipped (truncated_files, skipped_files); a signature first seen only in the unread part is reported as novel, with a later first_seen_ts")
+        },
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
     }))
 }
 
-/// server.py `tool_summary_snapshot`.
+/// the retired reference implementation `tool_summary_snapshot`.
 pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
     let mut path = ctx.machine_logs_dir().join(SUMMARY_FILENAME);
     if !path.exists() {
@@ -441,15 +633,23 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
             "markdown": "",
         });
     }
-    match std::fs::read_to_string(&path) {
+    // The summary writer keeps this file to a page; a file past the log-read
+    // ceiling is not the summary, and is refused rather than loaded whole.
+    match read_whole_capped(&path, LOG_READ_MAX_BYTES) {
+        Ok(None) => json!({
+            "path": path.to_string_lossy(),
+            "exists": true,
+            "error": format!("summary file is over the {LOG_READ_MAX_BYTES}-byte read ceiling"),
+            "markdown": "",
+        }),
         Err(err) => json!({
             "path": path.to_string_lossy(),
             "exists": true,
             "error": err.to_string(), // OS error text — documented deviation
             "markdown": "",
         }),
-        Ok(raw) => {
-            let markdown = py_textmode(&raw);
+        Ok(Some(raw)) => {
+            let markdown = legacy_textmode(&raw);
             let line_count = markdown.matches('\n').count();
             json!({
                 "path": path.to_string_lossy(),
@@ -461,14 +661,14 @@ pub fn tool_summary_snapshot(ctx: &Ctx) -> Value {
     }
 }
 
-/// server.py `tool_triage_log_tail`.
+/// the retired reference implementation `tool_triage_log_tail`.
 pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
     let path = ctx.logs_dir().join(AUTO_FIX_LOG);
     if !path.exists() {
         return json!({"path": path.to_string_lossy(), "exists": false, "lines": []});
     }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
+    let (bytes, truncated) = match read_tail_capped(&path, LOG_READ_MAX_BYTES) {
+        Ok(read) => read,
         Err(err) => {
             return json!({
                 "path": path.to_string_lossy(),
@@ -478,30 +678,44 @@ pub fn tool_triage_log_tail(ctx: &Ctx, limit: i64) -> Value {
             });
         }
     };
-    let text = py_textmode(&raw);
-    let lines = py_splitlines(&text);
+    let limit = clamp_tail_limit(limit);
+    let mut bytes = bytes;
+    let lines_read = keep_last_lines(&mut bytes, limit);
+    let text = legacy_textmode(&decode_utf8_replace(&bytes));
+    let lines = legacy_splitlines(&text);
     let tail: &[&str] = if lines.len() as i64 > limit {
-        py_neg_slice(&lines, limit)
+        legacy_neg_slice(&lines, limit)
     } else {
         &lines
     };
     json!({
         "path": path.to_string_lossy(),
         "exists": true,
-        "total_lines": lines.len(),
+        // Lines in the part that was read; the whole file when `truncated`
+        // is false.
+        "total_lines": if lines_read as i64 > limit { lines_read } else { lines.len() },
         "returned": tail.len(),
+        "truncated": truncated,
         "lines": tail,
     })
 }
 
-/// server.py `tool_signature_history`. `signature` is echoed verbatim
+/// the retired reference implementation `tool_signature_history`. `signature` is echoed verbatim
 /// (legacy echoes whatever JSON value was passed).
 pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value {
+    let limit = clamp_tail_limit(limit);
     let want = signature.as_str();
     let dir_path = ctx.machine_logs_dir();
     let files = iter_errors_jsonl_files(&dir_path);
     let mut matches: Vec<Value> = Vec::new();
-    for (_, f) in &files {
+    let mut truncated_files: Vec<String> = Vec::new();
+    let mut skipped_files: Vec<String> = Vec::new();
+    let mut scanned_bytes: u64 = 0;
+    for (name, f) in &files {
+        if scanned_bytes >= LOG_SCAN_MAX_TOTAL_BYTES {
+            skipped_files.push(name.clone());
+            continue;
+        }
         // 2026-07-18 review LOW-1: lossy-decode (the app_log_tail
         // behavior) instead of silently dropping a WHOLE errors file on
         // invalid UTF-8 while still listing it in files_scanned — every
@@ -509,12 +723,16 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
         // per-line JSON parse and is skipped by the existing per-line
         // semantics. A genuinely unreadable file (io error) keeps the
         // skip-continue.
-        let Ok(bytes) = std::fs::read(f) else {
+        let Ok((bytes, cut)) = read_tail_capped(f, LOG_READ_MAX_BYTES) else {
             continue;
         };
+        scanned_bytes = scanned_bytes.saturating_add(bytes.len() as u64);
+        if cut {
+            truncated_files.push(name.clone());
+        }
         let raw = decode_utf8_replace(&bytes);
-        let text = py_textmode(&raw);
-        for line in py_splitlines(&text) {
+        let text = legacy_textmode(&raw);
+        for line in legacy_splitlines(&text) {
             let Some(ev) = parse_event(line) else {
                 continue;
             };
@@ -537,6 +755,8 @@ pub fn tool_signature_history(ctx: &Ctx, signature: &Value, limit: i64) -> Value
         "signature": signature,
         "count": matches.len(),
         "events": matches,
+        "truncated_files": truncated_files,
+        "skipped_files": skipped_files,
     })
 }
 
@@ -553,35 +773,43 @@ fn rglob_md(dir: &Path, out: &mut Vec<PathBuf>) {
             rglob_md(&path, out);
         } else if ft.is_file() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if py_fnmatch(&name, "*.md") {
+            if legacy_fnmatch(&name, "*.md") {
                 out.push(path);
             }
         }
     }
 }
 
-/// server.py `tool_find_runbook_for_code`.
+/// the retired reference implementation `tool_find_runbook_for_code`.
 pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
     let root = &ctx.repo_root;
     let runbooks_dir = root.join("docs").join("runbooks");
     let rules_dir = root.join(".claude").join("rules");
+    // Since the 2026-07-20 rules-tree diet the per-code runbooks live in
+    // docs/error-runbooks, and the full rule texts behind the summary stubs
+    // in docs/claude-rules-full — searching only the first two trees missed
+    // most codes.
+    let error_runbooks_dir = root.join("docs").join("error-runbooks");
+    let rules_full_dir = root.join("docs").join("claude-rules-full");
 
     let mut matches: Vec<Value> = Vec::new();
-    for search_dir in [runbooks_dir, rules_dir] {
+    for search_dir in [runbooks_dir, error_runbooks_dir, rules_dir, rules_full_dir] {
         if !search_dir.exists() {
             continue;
         }
         let mut md_files = Vec::new();
         rglob_md(&search_dir, &mut md_files);
         for md in md_files {
-            let Ok(raw) = std::fs::read_to_string(&md) else {
+            // Skipped when over RUNBOOK_FILE_MAX_BYTES or not UTF-8, like an
+            // unreadable file before.
+            let Ok(Some(raw)) = read_whole_capped(&md, RUNBOOK_FILE_MAX_BYTES) else {
                 continue;
             };
-            let text = py_textmode(&raw);
+            let text = legacy_textmode(&raw);
             if !text.contains(code) {
                 continue;
             }
-            let lines = py_splitlines(&text);
+            let lines = legacy_splitlines(&text);
             for (idx, line) in lines.iter().enumerate() {
                 if line.contains(code) {
                     let start = idx.saturating_sub(2);
@@ -613,15 +841,66 @@ pub fn tool_find_runbook_for_code(ctx: &Ctx, code: &str) -> Value {
 // HTTP tools (blocking reqwest — cold path, out-of-process)
 // ---------------------------------------------------------------------------
 
+/// Every tool talks to one fixed address (QuestDB, the app API, CloudWatch
+/// Logs, the portal) and none of them answers with a redirect. Following one
+/// would let a reply send the next request somewhere the tool never checked,
+/// such as the database behind the read-only SQL gate, so redirects are off.
 fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("http client build failed: {e}"))
 }
 
-/// server.py `tool_questdb_sql`.
+/// Bytes one HTTP reply may hold before the tool refuses it. 8 MiB, the same
+/// ceiling as one captured subprocess stream (`PROC_CAPTURE_MAX_BYTES`).
+///
+/// `resp.bytes()` had no ceiling: a `select *` over a large table, or a
+/// `LIMIT lo,hi` range (which the row cap deliberately leaves alone), could
+/// grow this process's heap by gigabytes and then hand all of it to the
+/// caller as one reply.
+pub const HTTP_REPLY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Why the questdb tool refused a query before sending it.
+pub const QUESTDB_READ_ONLY_REFUSAL: &str = "refused: this tool is read-only. Send exactly ONE \
+     statement starting with SELECT, SHOW, EXPLAIN or WITH, with no comments and no \
+     data-changing keyword (insert, update, delete, drop, alter, truncate, create, copy and the \
+     rest of the operator console's list). SELECT and WITH are capped at 1000 rows.";
+
+/// Read a reply body up to `cap` bytes. `Ok((bytes, true))` when the body
+/// was LONGER than `cap` — the caller refuses it rather than parse a cut.
+fn read_body_capped<R: std::io::Read>(body: R, cap: u64) -> Result<(Vec<u8>, bool), String> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    body.take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| e.to_string())?;
+    let over = out.len() as u64 > cap;
+    if over {
+        out.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+    }
+    Ok((out, over))
+}
+
+fn reply_too_large_error() -> String {
+    format!(
+        "reply larger than {} MiB — narrow the query (fewer columns, a smaller LIMIT, or an \
+         aggregate)",
+        HTTP_REPLY_MAX_BYTES / (1024 * 1024)
+    )
+}
+
+/// the retired reference implementation `tool_questdb_sql`, behind the
+/// operator console's read-only gate (2026-09-27): the text is refused
+/// before any connection unless `sql_gate::is_safe_sql` passes it, and
+/// SELECT/WITH carry a 1000-row cap. `query` in the reply is what the
+/// caller sent; `sent_query` is what reached the database.
 pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
+    if !crate::sql_gate::is_safe_sql(query) {
+        return json!({"ok": false, "query": query, "error": QUESTDB_READ_ONLY_REFUSAL});
+    }
+    let sent = crate::sql_gate::cap_sql_rows(query);
     let env = RealEnv;
     let qdb = config::endpoint_url(
         &env,
@@ -631,10 +910,10 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
         "http://127.0.0.1:9000",
         None,
     );
-    let full = format!("{qdb}/exec?query={}", py_urllib_quote(query));
+    let full = format!("{qdb}/exec?query={}", legacy_urllib_quote(&sent));
     let client = match http_client(15) {
         Ok(c) => c,
-        Err(e) => return json!({"ok": false, "query": query, "error": e}),
+        Err(e) => return json!({"ok": false, "query": query, "sent_query": sent, "error": e}),
     };
     let resp = match client.get(&full).send() {
         Ok(r) => r,
@@ -643,7 +922,7 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
             // deviation the parity transcript AVOIDS (the mock HTTP server
             // is always up, so this arm is unreachable in parity); the
             // harness does NOT mask transport-error text.
-            return json!({"ok": false, "query": query, "error": e.to_string()});
+            return json!({"ok": false, "query": query, "sent_query": sent, "error": e.to_string()});
         }
     };
     let status = resp.status();
@@ -656,15 +935,18 @@ pub fn tool_questdb_sql(ctx: &Ctx, query: &str) -> Value {
             "error": format!("HTTP Error {}: {}", status.as_u16(), reason),
         });
     }
-    let body = match resp.bytes() {
-        Ok(b) => decode_utf8_replace(&b),
-        Err(e) => return json!({"ok": false, "query": query, "error": e.to_string()}),
+    let body = match read_body_capped(resp, HTTP_REPLY_MAX_BYTES) {
+        Ok((_, true)) => {
+            return json!({"ok": false, "query": query, "sent_query": sent, "error": reply_too_large_error()});
+        }
+        Ok((b, false)) => decode_utf8_replace(&b),
+        Err(e) => return json!({"ok": false, "query": query, "sent_query": sent, "error": e}),
     };
     match serde_json::from_str::<Value>(&body) {
-        Ok(parsed) => json!({"ok": true, "query": query, "response": parsed}),
+        Ok(parsed) => json!({"ok": true, "query": query, "sent_query": sent, "response": parsed}),
         Err(e) => {
             // legacy JSONDecodeError text differs — documented deviation.
-            json!({"ok": false, "query": query, "error": e.to_string()})
+            json!({"ok": false, "query": query, "sent_query": sent, "error": e.to_string()})
         }
     }
 }
@@ -698,8 +980,78 @@ fn split_scheme_host(url: &str) -> (String, Option<String>) {
     }
 }
 
-/// server.py `tool_tickvault_api`.
+/// Refusal for a caller-supplied `base_url` (audit PR29b, 2026-09-27).
+pub const API_BASE_OVERRIDE_REFUSAL: &str = "refused: base_url is no longer accepted. \
+     tickvault_api only calls the configured app API (TICKVAULT_API_URL or the active \
+     profile's tickvault_api_url).";
+
+/// Refusal for a path outside the app API's read routes (audit PR29b).
+pub const API_PATH_REFUSAL: &str = "refused: path must be /health or start with /api/, with \
+     no '..', '%', '@', '\\', '#', '://', spaces or control characters.";
+
+/// Refusal when the configured API base is the database's own address
+/// (audit PR29b): a GET there would skip the read-only SQL gate.
+pub const API_BASE_IS_QUESTDB_REFUSAL: &str = "refused: the configured tickvault API address \
+     is the database's address, so a GET there would bypass questdb_sql's read-only gate. Fix \
+     TICKVAULT_API_URL / tickvault_api_url.";
+
+/// A `tickvault_api` path is allowed only when it is one of the app's own
+/// read routes and carries nothing that could redirect the request
+/// (audit PR29b). O(len) over the path.
+pub fn api_path_is_allowed(path: &str) -> bool {
+    let route_ok = path == "/health" || path.starts_with("/health?") || path.starts_with("/api/");
+    let chars_ok = path
+        .chars()
+        .all(|c| !c.is_control() && !c.is_whitespace() && !matches!(c, '%' | '@' | '\\' | '#'));
+    route_ok && chars_ok && !path.contains("..") && !path.contains("://")
+}
+
+/// (scheme, host, port) of a URL with loopback names folded together and
+/// the scheme's default port filled in, so two spellings of one address
+/// compare equal. `None` when the URL has no host.
+fn url_origin(url: &str) -> Option<(String, String, u16)> {
+    let (scheme, host) = split_scheme_host(url);
+    let host = host?;
+    let rest = url.split_once("://").map_or("", |(_, r)| r);
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let netloc = rest[..end].rsplit('@').next().unwrap_or("");
+    let port_text = if let Some(after) = netloc.strip_prefix('[') {
+        after.split_once("]:").map(|(_, p)| p)
+    } else {
+        netloc.rsplit_once(':').map(|(_, p)| p)
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = match port_text {
+        Some(p) if !p.is_empty() => p.parse::<u16>().ok()?,
+        _ => default_port,
+    };
+    let host = match host.as_str() {
+        // APPROVED: loopback spellings folded for an address comparison, never a connection target.
+        "localhost" | "::1" | "0.0.0.0" => "127.0.0.1".to_string(),
+        _ => host,
+    };
+    Some((scheme, host, port))
+}
+
+/// True when the two URLs name the same address. An unparseable URL
+/// compares as the same, so the check fails closed.
+pub fn same_origin(a: &str, b: &str) -> bool {
+    match (url_origin(a), url_origin(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
+/// the retired reference implementation `tool_tickvault_api`, narrowed by
+/// audit PR29b (2026-09-27): the caller can no longer name the host, the
+/// path must be one of the app's read routes, and the call is refused
+/// when the configured API address is the database's, so a GET can never
+/// reach QuestDB's `/exec` around the read-only SQL gate and the bearer
+/// token only ever goes to the configured API.
 pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Value {
+    if base_url.is_some_and(|b| !b.is_empty()) {
+        return json!({"ok": false, "error": API_BASE_OVERRIDE_REFUSAL});
+    }
     let env = RealEnv;
     let api_url = config::endpoint_url(
         &env,
@@ -707,13 +1059,27 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         "tickvault_api_url",
         "TICKVAULT_API_URL",
         "http://127.0.0.1:3001",
-        base_url,
+        None,
     );
     let path = if path.starts_with('/') {
         path.to_string()
     } else {
         format!("/{path}")
     };
+    if !api_path_is_allowed(&path) {
+        return json!({"ok": false, "error": API_PATH_REFUSAL, "path": path});
+    }
+    let qdb_url = config::endpoint_url(
+        &env,
+        &ctx.cfg,
+        "questdb_url",
+        "TICKVAULT_QUESTDB_URL",
+        "http://127.0.0.1:9000",
+        None,
+    );
+    if same_origin(&api_url, &qdb_url) {
+        return json!({"ok": false, "error": API_BASE_IS_QUESTDB_REFUSAL});
+    }
     let full = format!("{api_url}{path}");
     let bearer = env
         .get("TICKVAULT_API_BEARER_TOKEN")
@@ -725,11 +1091,11 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         Err(e) => return json!({"ok": false, "error": e, "url": full}),
     };
     if !bearer.is_empty() {
-        // Security parity with server.py (adversarial re-review 2026-07-04):
+        // Security parity with the retired reference implementation (adversarial re-review 2026-07-04):
         // never send the bearer over plaintext http to a non-local host.
         let (scheme, host) = split_scheme_host(&full);
         let host = host.unwrap_or_default();
-        // APPROVED: loopback allowlist for the plaintext-bearer refusal guard, never a connection target (security parity with server.py).
+        // APPROVED: loopback allowlist for the plaintext-bearer refusal guard, never a connection target (security parity with the retired reference implementation).
         let is_local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
         if scheme != "https" && !is_local {
             return json!({
@@ -758,9 +1124,12 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
         });
     }
     let status_code = status.as_u16();
-    let body = match resp.bytes() {
-        Ok(b) => decode_utf8_replace(&b),
-        Err(e) => return json!({"ok": false, "error": e.to_string(), "url": full}),
+    let body = match read_body_capped(resp, HTTP_REPLY_MAX_BYTES) {
+        Ok((_, true)) => {
+            return json!({"ok": false, "error": reply_too_large_error(), "url": full});
+        }
+        Ok((b, false)) => decode_utf8_replace(&b),
+        Err(e) => return json!({"ok": false, "error": e, "url": full}),
     };
     match serde_json::from_str::<Value>(&body) {
         Ok(parsed) => json!({"ok": true, "status": status_code, "url": full, "json": parsed}),
@@ -768,7 +1137,7 @@ pub fn tool_tickvault_api(ctx: &Ctx, path: &str, base_url: Option<&str>) -> Valu
             "ok": true,
             "status": status_code,
             "url": full,
-            "text": py_slice_chars(&body, 4000),
+            "text": legacy_slice_chars(&body, 4000),
         }),
     }
 }
@@ -788,13 +1157,89 @@ pub enum ProcError {
     Timeout,
 }
 
+/// Read one child pipe on its own thread, into a SHARED, CAPPED buffer.
+///
+/// Two properties the previous `read_to_end`-into-a-returned-`Vec` did not
+/// have, and both are the point:
+///
+/// * the bytes are visible to the parent WHILE the thread is still running, so
+///   a reader that never reaches EOF still yields what it received. With
+///   `read_to_end` the result is all-or-nothing, so the hang and a genuinely
+///   empty stream produced the identical observation.
+/// * the buffer is bounded by [`PROC_CAPTURE_MAX_BYTES`].
+///
+/// The returned receiver fires once, when the thread is done. The parent waits
+/// on THAT with a timeout rather than on `join()`, which cannot take one.
+fn spawn_bounded_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    std::sync::mpsc::Receiver<()>,
+) {
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&shared);
+    // Bounded by construction: exactly one message is ever sent, so a capacity
+    // of 1 means `send` never blocks and the channel can never grow. An
+    // unbounded `channel()` would carry the same single message and is banned
+    // repo-wide, so the bounded form is both compliant and strictly narrower.
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0_u8; 8192];
+            // A read error ends the capture exactly as EOF does: there is
+            // nothing further to collect either way, and looping on a failing
+            // pipe is the busy-wait version of the hang this function bounds.
+            while let Ok(read) = pipe.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                // A poisoned lock means the parent panicked; stop rather than
+                // spin, and let the parent's own unwind be the report.
+                let Ok(mut held) = sink.lock() else { break };
+                let Some(room) = PROC_CAPTURE_MAX_BYTES.checked_sub(held.len()) else {
+                    break;
+                };
+                if room == 0 {
+                    break;
+                }
+                held.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        }
+        let _ignored = done_tx.send(());
+    });
+    (shared, done_rx)
+}
+
+/// Take what a reader has captured, waiting a BOUNDED time for it to finish.
+///
+/// Returns the bytes and whether the reader actually reached end-of-stream.
+/// `false` is the hang case, and the caller must say so in the output rather
+/// than hand back a short stream that reads as complete.
+fn collect_bounded_stream(
+    buffer: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: &std::sync::mpsc::Receiver<()>,
+    deadline: std::time::Instant,
+) -> (Vec<u8>, bool) {
+    // ONE deadline SHARED by both streams, not one budget each. A grandchild
+    // inherits stdout AND stderr, so a per-stream budget doubles the worst
+    // case — the parent waits the full drain twice for a single cause. The
+    // first draft of this fix did exactly that and its own regression test
+    // caught it, failing at the harness bound.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let finished = done.recv_timeout(remaining).is_ok();
+    let bytes = buffer
+        .lock()
+        .map(|held| held.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+    (bytes, finished)
+}
+
 fn run_with_timeout(
     program: &str,
     args: &[String],
     cwd: &Path,
     timeout: Duration,
 ) -> Result<ProcResult, ProcError> {
-    use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(program)
         .args(args)
@@ -804,28 +1249,21 @@ fn run_with_timeout(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ProcError::Spawn(e.to_string()))?;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ignored = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ignored = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let (out_buffer, out_done) = spawn_bounded_pipe_reader(child.stdout.take());
+    let (err_buffer, err_done) = spawn_bounded_pipe_reader(child.stderr.take());
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = out_handle.join().unwrap_or_default();
-                let stderr = err_handle.join().unwrap_or_default();
+                // BOUNDED, never `join()`. The child has exited; if a
+                // grandchild it spawned still holds the pipe, EOF never comes
+                // and an unbounded join would park the server here forever.
+                let drain_by =
+                    std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS);
+                let (stdout, stdout_drained) =
+                    collect_bounded_stream(&out_buffer, &out_done, drain_by);
+                let (stderr, stderr_drained) =
+                    collect_bounded_stream(&err_buffer, &err_done, drain_by);
                 let code = match status.code() {
                     Some(c) => i64::from(c),
                     None => {
@@ -840,16 +1278,28 @@ fn run_with_timeout(
                         }
                     }
                 };
+                let mut stderr_text = legacy_textmode(&decode_utf8_replace(&stderr));
+                if !stdout_drained || !stderr_drained {
+                    stderr_text.push_str(PROC_CAPTURE_TRUNCATED_NOTICE);
+                }
                 return Ok(ProcResult {
                     code,
-                    stdout: py_textmode(&decode_utf8_replace(&stdout)),
-                    stderr: py_textmode(&decode_utf8_replace(&stderr)),
+                    stdout: legacy_textmode(&decode_utf8_replace(&stdout)),
+                    stderr: stderr_text,
                 });
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ignored = child.kill();
                     let _ignored = child.wait();
+                    // Bounded here too. Killing the child usually closes the
+                    // pipes and both readers return at once; when a grandchild
+                    // holds them this reaps nothing and simply returns, rather
+                    // than leaving the threads unwaited on every timeout.
+                    let reap_by = std::time::Instant::now()
+                        + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS);
+                    let _ignored = collect_bounded_stream(&out_buffer, &out_done, reap_by);
+                    let _ignored = collect_bounded_stream(&err_buffer, &err_done, reap_by);
                     return Err(ProcError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(PROC_POLL_INTERVAL_MS));
@@ -867,7 +1317,7 @@ pub fn parse_doctor_stdout(stdout: &str) -> (Vec<Value>, i64, i64) {
     let mut rows: Vec<Value> = Vec::new();
     let mut pass_count = 0i64;
     let mut fail_count = 0i64;
-    for line in py_splitlines(stdout) {
+    for line in legacy_splitlines(stdout) {
         let line = line.trim_end();
         for status in ["[PASS]", "[FAIL]", "[WARN]", "[SKIP]"] {
             if let Some(stripped) = line.strip_prefix(status) {
@@ -886,7 +1336,7 @@ pub fn parse_doctor_stdout(stdout: &str) -> (Vec<Value>, i64, i64) {
     (rows, pass_count, fail_count)
 }
 
-/// server.py `tool_run_doctor`.
+/// the retired reference implementation `tool_run_doctor`.
 pub fn tool_run_doctor(ctx: &Ctx) -> Value {
     let out = match run_with_timeout(
         "bash",
@@ -909,7 +1359,7 @@ pub fn tool_run_doctor(ctx: &Ctx) -> Value {
         "pass_count": pass_count,
         "fail_count": fail_count,
         "rows": rows,
-        "raw_stdout_tail": if out.stdout.is_empty() { "" } else { py_tail_chars(&out.stdout, 2000) },
+        "raw_stdout_tail": if out.stdout.is_empty() { "" } else { legacy_tail_chars(&out.stdout, 2000) },
     })
 }
 
@@ -917,13 +1367,13 @@ pub fn tool_run_doctor(ctx: &Ctx) -> Value {
 /// output (unit-testable).
 pub fn parse_git_log_stdout(stdout: &str) -> Vec<Value> {
     let mut commits: Vec<Value> = Vec::new();
-    for line in py_splitlines(stdout) {
+    for line in legacy_splitlines(stdout) {
         let parts: Vec<&str> = line.split('\u{1f}').collect();
         if parts.len() != 4 {
             continue;
         }
         commits.push(json!({
-            "sha": py_slice_chars(parts[0], 12),
+            "sha": legacy_slice_chars(parts[0], 12),
             "author": parts[1],
             "date": parts[2],
             "subject": parts[3],
@@ -932,7 +1382,7 @@ pub fn parse_git_log_stdout(stdout: &str) -> Vec<Value> {
     commits
 }
 
-/// server.py `tool_git_recent_log`.
+/// the retired reference implementation `tool_git_recent_log`.
 pub fn tool_git_recent_log(ctx: &Ctx, limit: i64) -> Value {
     let fmt = "%H%x1f%an%x1f%aI%x1f%s";
     let out = match run_with_timeout(
@@ -956,7 +1406,7 @@ pub fn tool_git_recent_log(ctx: &Ctx, limit: i64) -> Value {
     json!({"ok": true, "count": commits.len(), "commits": commits})
 }
 
-/// server.py `tool_docker_status`.
+/// the retired reference implementation `tool_docker_status`.
 pub fn tool_docker_status(ctx: &Ctx) -> Value {
     let compose_file = ctx
         .repo_root
@@ -994,11 +1444,11 @@ pub fn tool_docker_status(ctx: &Ctx) -> Value {
         return json!({
             "ok": false,
             "exit_code": out.code,
-            "stderr": py_slice_chars(out.stderr.trim(), 1000),
+            "stderr": legacy_slice_chars(out.stderr.trim(), 1000),
         });
     }
     let mut containers: Vec<Value> = Vec::new();
-    for line in py_splitlines(&out.stdout) {
+    for line in legacy_splitlines(&out.stdout) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -1010,18 +1460,22 @@ pub fn tool_docker_status(ctx: &Ctx) -> Value {
     json!({"ok": true, "count": containers.len(), "containers": containers})
 }
 
-/// server.py `tool_app_log_tail`.
+/// the retired reference implementation `tool_app_log_tail`.
 pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
     let log_dir = ctx.logs_dir();
     let date = match date {
         Some(d) => d.to_string(),
         None => chrono::Utc::now().format("%Y-%m-%d").to_string(),
     };
-    // PARITY (review r3 LOW-b): legacy builds `log_dir / f"app.{date}.log"`
-    // with pathlib, which drops `.` components at parse time — an
-    // arg-derived date like "x/./y" must echo `.../app.x/y.log`, never
-    // `.../app.x/./y.log`. Same file on disk either way (POSIX); only the
-    // echoed string differs.
+    if !is_log_date(&date) {
+        return json!({
+            "ok": false,
+            "error": format!("date must be YYYY-MM-DD, got {:?}", legacy_slice_chars(&date, 40)),
+            "log_dir": log_dir.to_string_lossy(),
+        });
+    }
+    // `pathlib_lexical` kept from the parity port; with the date shape
+    // checked above there is no `.` component left for it to drop.
     let log_file = config::pathlib_lexical(&log_dir.join(format!("app.{date}.log")));
     if !log_file.exists() {
         return json!({
@@ -1030,8 +1484,8 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             "log_dir": log_dir.to_string_lossy(),
         });
     }
-    let bytes = match std::fs::read(&log_file) {
-        Ok(b) => b,
+    let (bytes, truncated) = match read_tail_capped(&log_file, LOG_READ_MAX_BYTES) {
+        Ok(read) => read,
         Err(err) => {
             return json!({
                 "ok": false,
@@ -1040,20 +1494,39 @@ pub fn tool_app_log_tail(ctx: &Ctx, limit: i64, date: Option<&str>) -> Value {
             });
         }
     };
-    let text = py_textmode(&decode_utf8_replace(&bytes));
-    let lines = py_file_lines(&text);
-    let tail: &[&str] = if limit > 0 {
-        py_neg_slice(&lines, limit)
-    } else {
-        &lines
-    };
+    let limit = clamp_tail_limit(limit);
+    let mut bytes = bytes;
+    let lines_read = keep_last_lines(&mut bytes, limit);
+    let text = legacy_textmode(&decode_utf8_replace(&bytes));
+    let lines = legacy_file_lines(&text);
+    let tail: &[&str] = legacy_neg_slice(&lines, limit);
     json!({
         "ok": true,
         "path": log_file.to_string_lossy(),
-        "total_lines": lines.len(),
+        // Lines in the part that was read; the whole file when `truncated`
+        // is false.
+        "total_lines": if lines_read as i64 > limit { lines_read } else { lines.len() },
         "returned": tail.len(),
+        "truncated": truncated,
         "lines": tail,
     })
+}
+
+/// True for a `YYYY-MM-DD` shape: ten bytes, digits with `-` at 4 and 7.
+///
+/// `date` is joined into a path, so before 2026-09-27 a value such as
+/// `x/../../../etc/y` named any `*.log` file on the machine. Only the shape
+/// is checked — a well-shaped impossible date simply finds no file.
+fn is_log_date(date: &str) -> bool {
+    let b = date.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                *c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1545,7 @@ const GREP_SKIP_DIRS: [&str; 5] = ["target", ".git", "node_modules", "data", ".t
 /// (a normalized root never carries a trailing slash). The bare `/` and
 /// `//` roots are special-cased for totality: their string form IS the
 /// separator, and pathlib still refuses `/` vs `//` cross-root strips.
-fn py_relative_to(path: &Path, root: &Path) -> Option<String> {
+fn legacy_relative_to(path: &Path, root: &Path) -> Option<String> {
     let p = path.to_string_lossy();
     let r = root.to_string_lossy();
     if r == "/" {
@@ -1115,7 +1588,7 @@ fn grep_walk(
             continue;
         }
         if let Some(glob) = file_glob
-            && !py_fnmatch(&name, glob)
+            && !legacy_fnmatch(&name, glob)
         {
             continue;
         }
@@ -1128,8 +1601,8 @@ fn grep_walk(
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
-        let text = py_textmode(&decode_utf8_ignore(&bytes));
-        for (idx, line) in py_file_lines(&text).iter().enumerate() {
+        let text = legacy_textmode(&decode_utf8_ignore(&bytes));
+        for (idx, line) in legacy_file_lines(&text).iter().enumerate() {
             if regex.is_match(line) {
                 // PARITY (review r3 LOW-a): legacy's
                 // `full_path.relative_to(root)` raises ValueError on the
@@ -1155,7 +1628,7 @@ fn grep_walk(
                 // via pathlib_lexical; repo root at config load), so a
                 // plain `<root>/` string prefix is exactly pathlib's
                 // parts-prefix rule for a multi-component root.
-                let rel = match py_relative_to(&path, root) {
+                let rel = match legacy_relative_to(&path, root) {
                     Some(p) => p,
                     None => {
                         return Err(format!(
@@ -1168,7 +1641,7 @@ fn grep_walk(
                 matches.push(json!({
                     "file": rel,
                     "line": idx + 1,
-                    "text": py_slice_chars(line, 500),
+                    "text": legacy_slice_chars(line, 500),
                 }));
                 if matches.len() >= max_matches {
                     break;
@@ -1190,7 +1663,7 @@ fn grep_walk(
     Ok(())
 }
 
-/// server.py `tool_grep_codebase` (max_matches fixed at 200 — the legacy
+/// the retired reference implementation `tool_grep_codebase` (max_matches fixed at 200 — the legacy
 /// registry never passes it). `Err` = the legacy runtime `Path.relative_to`
 /// ValueError for a match under an absolute `path` outside the repo root;
 /// the dispatcher maps it to the -32000 `tool grep_codebase failed: ...`
@@ -1246,7 +1719,7 @@ pub fn tool_grep_codebase(
 }
 
 // ---------------------------------------------------------------------------
-// cloudwatch_logs — SigV4 -> portal -> aws CLI fallback chain
+// cloudwatch_logs — SigV4 -> portal chain (the aws CLI fallback was removed 2026-09-27)
 // ---------------------------------------------------------------------------
 
 fn cloudwatch_log_group(env: &dyn Env) -> String {
@@ -1347,7 +1820,7 @@ fn cloudwatch_via_sigv4(
                 "region": region,
                 "error": format!(
                     "CloudWatch FilterLogEvents failed: reqwest::Error: {}",
-                    py_slice_chars(&text, 300)
+                    legacy_slice_chars(&text, 300)
                 ),
             });
         }
@@ -1357,7 +1830,7 @@ fn cloudwatch_via_sigv4(
         let reason = status.canonical_reason().unwrap_or("").to_string();
         let err_body = resp
             .bytes()
-            .map(|b| py_slice_chars(&decode_utf8_replace(&b), 400).to_string())
+            .map(|b| legacy_slice_chars(&decode_utf8_replace(&b), 400).to_string())
             .unwrap_or_default();
         let detail = if err_body.is_empty() {
             reason
@@ -1470,7 +1943,7 @@ fn cloudwatch_via_portal(env: &dyn Env, filter_pattern: Option<&str>, limit: i64
             "source": "portal",
             "portal_url": url,
             "error": "portal returned ok=false (check the bearer token / box state)",
-            "portal_response": py_slice_chars(&parsed.to_string(), 400),
+            "portal_response": legacy_slice_chars(&parsed.to_string(), 400),
         });
     }
     let raw = parsed.get("raw").and_then(Value::as_str).unwrap_or("");
@@ -1497,9 +1970,15 @@ fn legacy_truthy(v: &Value) -> bool {
     }
 }
 
-/// server.py `tool_cloudwatch_logs` — SigV4 -> portal -> aws CLI.
+/// the retired reference implementation `tool_cloudwatch_logs` — SigV4 -> portal.
+///
+/// The third, `aws` CLI, path was removed on 2026-09-27: it spawned an
+/// external interpreter-based program, and the SigV4 path above it does the
+/// same read natively in Rust with the same read-only key. An environment
+/// whose only credential is an `aws` CLI profile now gets the
+/// "no log reader configured" answer, which names both remaining paths.
 pub fn tool_cloudwatch_logs(
-    ctx: &Ctx,
+    _ctx: &Ctx,
     minutes: i64,
     filter_pattern: Option<&str>,
     limit: i64,
@@ -1512,56 +1991,15 @@ pub fn tool_cloudwatch_logs(
     if !portal_url(&env).is_empty() && !portal_token(&env).is_empty() {
         return cloudwatch_via_portal(&env, filter_pattern, limit);
     }
-    let region = aws_region(&env);
-    let group = cloudwatch_log_group(&env);
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    let start_ms = ((now_unix - (minutes.max(1) as f64) * 60.0) * 1000.0) as i64;
-    let argv = build_cloudwatch_filter_args(&group, &region, start_ms, limit, filter_pattern);
-    let out = match run_with_timeout(
-        &argv[0],
-        &argv[1..],
-        &ctx.repo_root,
-        Duration::from_secs(AWS_CLI_TIMEOUT_SECS),
-    ) {
-        Ok(out) => out,
-        Err(ProcError::Spawn(_)) => {
-            return json!({
-                "ok": false,
-                "error": "no log reader configured — set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 path (no aws CLI, no portal), OR set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN to read via the operator dashboard, OR wire a read-only AWS credential + aws CLI. None is present in this session.",
-                "log_group": group,
-            });
-        }
-        Err(ProcError::Timeout) => {
-            return json!({"ok": false, "error": "aws logs filter-log-events timed out after 30s"});
-        }
-    };
-    if out.code != 0 {
-        return json!({
-            "ok": false,
-            "exit_code": out.code,
-            "error": "aws logs call failed — most likely no read-only AWS credentials in this environment yet. Prefer the direct SigV4 path (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) or the portal path (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). stderr below.",
-            "stderr": py_slice_chars(out.stderr.trim(), 800),
-            "log_group": group,
-        });
-    }
-    let events = parse_cloudwatch_events(&out.stdout, limit);
     json!({
-        "ok": true,
-        "source": "aws_cli",
-        "log_group": group,
-        "region": region,
-        "lookback_minutes": minutes,
-        "filter_pattern": filter_pattern.unwrap_or(""),
-        "returned": events.len(),
-        "events": events,
+        "ok": false,
+        "error": "no log reader configured — set AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (+ AWS_DEFAULT_REGION) for the direct SigV4 path, OR set TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN to read via the operator dashboard. Neither is present in this session.", // secret-scan-ignore: env-var NAMES, no credential value
+        "log_group": cloudwatch_log_group(&env),
     })
 }
 
 // ---------------------------------------------------------------------------
-// Registry — names / descriptions / schemas byte-identical to server.py
+// Registry — names / descriptions / schemas byte-identical to the retired reference implementation
 // ---------------------------------------------------------------------------
 
 pub const TOOL_NAMES: [&str; 14] = [
@@ -1584,18 +2022,17 @@ pub const TOOL_NAMES: [&str; 14] = [
 const DESC_TAIL_ERRORS: &str = "Return the last N ERROR events from data/logs/machine/errors.jsonl.*. Optionally filter by `code` (e.g. 'I-P1-11', 'DH-904').";
 const DESC_NOVEL: &str = "Signatures first observed within the last N minutes. Uses the same FNV-1a signature hash as the Rust summary_writer.";
 const DESC_SUMMARY: &str = "Return the current errors.summary.md markdown. Regenerated every 60s by the Rust summary_writer task.";
-const DESC_TRIAGE: &str =
-    "Last N lines of data/logs/auto-fix.log — audit trail of the error-triage hook's actions.";
+const DESC_TRIAGE: &str = "Last N lines of data/logs/auto-fix.log — audit trail of the error-triage hook's actions. Reads at most the last 32 MiB and returns at most 5000 lines; `truncated` says when the file was longer.";
 const DESC_SIG_HISTORY: &str = "All events whose computed signature hash equals `signature`. Use after list_novel_signatures to drill into a specific signature's full history.";
-const DESC_RUNBOOK: &str = "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), search every file under docs/runbooks/ AND .claude/rules/ for the code and return matching file paths + a preview of the relevant section. Lets Claude jump from a Telegram alert to the operator runbook in one tool call.";
-const DESC_QUESTDB: &str = "Run arbitrary SQL against the local QuestDB (HTTP /exec). Returns columnar JSON. Lets Claude query the trading data plane — ticks, orders, historical_candles, materialized views — without pg CLI.";
+const DESC_RUNBOOK: &str = "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), search every file under docs/runbooks/, docs/error-runbooks/, .claude/rules/ AND docs/claude-rules-full/ for the code and return matching file paths + a preview of the relevant section. Lets Claude jump from a Telegram alert to the operator runbook in one tool call.";
+const DESC_QUESTDB: &str = "Run READ-ONLY SQL against the local QuestDB (HTTP /exec). Exactly one SELECT, SHOW, EXPLAIN or WITH statement, no comments, no data-changing keyword (the operator console's gate); anything else is refused before it is sent. SELECT and WITH are capped at 1000 rows and a reply at 8 MiB. Returns columnar JSON. Lets Claude query the trading data plane — ticks, orders, candles — without pg CLI.";
 const DESC_GREP: &str = "Regex-search the repo for a pattern. Skips target/, .git/, node_modules/, data/, .terraform/. Returns up to 200 matches of {file, line, text}. Lets Claude find any function, error string, config key, test name across the workspace in one call.";
 const DESC_DOCTOR: &str = "Invoke `bash scripts/doctor.sh` and return the parsed output as {pass_count, fail_count, rows[{status, detail}]}. One-call total-system health check for Claude.";
 const DESC_GIT: &str = "Return the last N commits on the current branch with sha/author/date/subject. Lets Claude investigate 'what changed recently' without leaving the MCP surface.";
 const DESC_API: &str = "HTTP GET against the tickvault app's own REST API (port 3001 by default). Paths: /health, /api/stats, /api/quote/{security_id}, /api/instruments/diagnostic, /api/option-chain, /api/pcr, /api/index-constituency. Returns status + json (or text).";
 const DESC_DOCKER: &str = "Return `docker compose ps --format json` for the tickvault stack. Gives Claude container name/service/state/health without shelling into the host.";
-const DESC_APP_LOG: &str = "Last N lines of data/logs/app.YYYY-MM-DD.log (full INFO/DEBUG output, not just ERRORs). Optional `date` (YYYY-MM-DD) picks a different day; defaults to today UTC.";
-const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). FALLBACK: read-only aws CLI on /tickvault/prod/app. Args: minutes (lookback; SigV4 + aws paths), filter_pattern (CloudWatch filter on SigV4 + aws, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured."; // secret-scan-ignore: env-var NAMES in a tool description, no credential value
+const DESC_APP_LOG: &str = "Last N lines of data/logs/app.YYYY-MM-DD.log (full INFO/DEBUG output, not just ERRORs). Optional `date` (YYYY-MM-DD) picks a different day; defaults to today UTC. Reads at most the last 32 MiB of the file and returns at most 5000 lines; `truncated` says when the file was longer.";
+const DESC_CLOUDWATCH: &str = "Read recent PROD logs — fully automated, no human paste/download. PREFERRED: direct CloudWatch read via a SigV4-signed HTTPS request — the ONLY input is a read-only AWS key in the env (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY [+ AWS_SESSION_TOKEN], AWS_DEFAULT_REGION); no aws CLI, no portal, no boto3. NEXT: the operator-control dashboard's logs endpoint (TICKVAULT_PORTAL_URL + TICKVAULT_PORTAL_TOKEN). Args: minutes (lookback; SigV4 path), filter_pattern (CloudWatch filter on SigV4, substring on portal, e.g. \"ERROR\" or \"WS-GAP-05\"), limit (default 100). The AWS secret/token is NEVER logged nor returned. Clear ok=false error if no path is configured."; // secret-scan-ignore: env-var NAMES in a tool description, no credential value
 
 /// (name, description) pairs in registry order — used by the self-test.
 pub fn tool_descriptions() -> Vec<(&'static str, &'static str)> {
@@ -1618,7 +2055,7 @@ pub fn tool_descriptions() -> Vec<(&'static str, &'static str)> {
 }
 
 /// The `tools/list` result array — same names, descriptions and
-/// inputSchema VALUES as server.py's TOOLS registry (object key order is
+/// inputSchema VALUES as the retired reference implementation's TOOLS registry (object key order is
 /// normalized by the harness; array order — incl. `required` — preserved).
 pub fn tools_list_json() -> Value {
     json!([
@@ -1771,10 +2208,6 @@ pub fn tools_list_json() -> Value {
                         "type": "string",
                         "description": "API path starting with /",
                     },
-                    "base_url": {
-                        "type": "string",
-                        "description": "Override TICKVAULT_API_URL for a single call.",
-                    },
                 },
                 "required": ["path"],
             },
@@ -1836,7 +2269,7 @@ pub fn tools_list_json() -> Value {
 fn get_int(args: &Map<String, Value>, key: &str, default: i64) -> Result<i64, String> {
     match args.get(key) {
         None => Ok(default),
-        Some(v) => py_int(v),
+        Some(v) => legacy_int(v),
     }
 }
 
@@ -1964,6 +2397,141 @@ pub fn call_tool(
 mod tests {
     use super::*;
 
+    /// Run `run_with_timeout` on a helper thread so a REGRESSION fails this
+    /// test instead of hanging it.
+    ///
+    /// This shape is not decoration. The defect under test is an unbounded
+    /// block, so calling it directly would make the un-fixed code park the
+    /// test runner — the exact outcome being fixed, and worthless as a signal.
+    /// The channel converts "parked forever" into a named assertion failure.
+    fn run_off_thread(
+        script: &str,
+        harness_budget: Duration,
+    ) -> Option<Result<ProcResult, ProcError>> {
+        // Bounded: exactly one result is ever sent, so capacity 1 never blocks.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let owned = script.to_owned();
+        std::thread::spawn(move || {
+            let out = run_with_timeout(
+                "sh",
+                &["-c".to_owned(), owned],
+                Path::new("."),
+                Duration::from_secs(30),
+            );
+            let _ignored = tx.send(out);
+        });
+        rx.recv_timeout(harness_budget).ok()
+    }
+
+    /// THE REGRESSION. A child that backgrounds anything leaves a GRANDCHILD
+    /// holding the inherited stdout pipe, so end-of-stream never arrives even
+    /// though the child itself exited immediately.
+    ///
+    /// `read_to_end` + `join()` waits for that EOF with no bound. Here the
+    /// grandchild holds the pipe for 15 seconds and the harness gives up at
+    /// 10 — so an unbounded join fails this test in ten seconds rather than
+    /// parking the suite.
+    #[test]
+    fn a_grandchild_holding_the_pipe_cannot_park_the_reader_join() {
+        let Some(result) = run_off_thread("sleep 15 & echo held-open", Duration::from_secs(10))
+        else {
+            panic!(
+                "run_with_timeout did not return within 10s while a backgrounded grandchild held \
+                 the stdout pipe. That is the unbounded-join hang: the child exited at once, but \
+                 EOF waits for EVERY holder of the write end to close it."
+            )
+        };
+        let Ok(proc) = result else {
+            panic!("the child exited cleanly, so this must not be a spawn error or a timeout")
+        };
+        assert_eq!(
+            proc.code, 0,
+            "the shell exited 0 and that code must survive"
+        );
+        assert!(
+            proc.stdout.contains("held-open"),
+            "bytes written before the reader gave up must still be returned — an \
+             all-or-nothing capture makes the hang indistinguishable from an empty stream. \
+             Got: {:?}",
+            proc.stdout
+        );
+        assert!(
+            proc.stderr.contains("capture INCOMPLETE"),
+            "a stream that never reached end-of-stream must SAY so; otherwise a partial \
+             capture reads as a complete one. Got: {:?}",
+            proc.stderr
+        );
+    }
+
+    /// The bound must not cost the ordinary case anything.
+    #[test]
+    fn an_ordinary_command_still_captures_both_streams_and_says_nothing_extra() {
+        let Some(result) =
+            run_off_thread("echo out-line; echo err-line 1>&2", Duration::from_secs(10))
+        else {
+            panic!("a trivial command must return well inside the harness budget")
+        };
+        let Ok(proc) = result else {
+            panic!("expected a clean run")
+        };
+        assert_eq!(proc.code, 0);
+        assert!(proc.stdout.contains("out-line"), "got {:?}", proc.stdout);
+        assert!(proc.stderr.contains("err-line"), "got {:?}", proc.stderr);
+        assert!(
+            !proc.stderr.contains("capture INCOMPLETE"),
+            "a fully drained run must NOT be marked truncated — a notice that fires on healthy \
+             runs is one operators learn to ignore. Got: {:?}",
+            proc.stderr
+        );
+    }
+
+    /// A non-zero exit still reports its code, with the pipes drained.
+    #[test]
+    fn a_failing_command_reports_its_exit_code() {
+        let Some(Ok(proc)) = run_off_thread("echo boom 1>&2; exit 3", Duration::from_secs(10))
+        else {
+            panic!("expected a clean run with a non-zero exit code")
+        };
+        assert_eq!(proc.code, 3);
+        assert!(proc.stderr.contains("boom"), "got {:?}", proc.stderr);
+    }
+
+    /// The capture is CAPPED. Driven through the reader directly rather than a
+    /// real 8 MiB child, so the test costs milliseconds instead of seconds.
+    #[test]
+    fn spawn_bounded_pipe_reader_stops_at_the_capture_ceiling() {
+        let oversized = vec![b'x'; PROC_CAPTURE_MAX_BYTES + 4096];
+        let (buffer, done) = spawn_bounded_pipe_reader(Some(std::io::Cursor::new(oversized)));
+        let (bytes, finished) = collect_bounded_stream(
+            &buffer,
+            &done,
+            std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS),
+        );
+        assert!(
+            finished,
+            "the reader must FINISH at the ceiling rather than spin — a capped reader that \
+             never sends is the hang with a different cause"
+        );
+        assert_eq!(
+            bytes.len(),
+            PROC_CAPTURE_MAX_BYTES,
+            "the buffer must stop exactly at the ceiling, never grow past it"
+        );
+    }
+
+    /// An absent pipe is not an error, and must not leave the parent waiting.
+    #[test]
+    fn spawn_bounded_pipe_reader_completes_on_a_missing_pipe() {
+        let (buffer, done) = spawn_bounded_pipe_reader(Option::<std::io::Cursor<Vec<u8>>>::None);
+        let (bytes, finished) = collect_bounded_stream(
+            &buffer,
+            &done,
+            std::time::Instant::now() + Duration::from_millis(PROC_READER_DRAIN_TIMEOUT_MS),
+        );
+        assert!(finished, "a `None` pipe must signal completion immediately");
+        assert!(bytes.is_empty());
+    }
+
     #[test]
     fn tool_names_match_registry_order() {
         let list = tools_list_json();
@@ -2006,7 +2574,7 @@ mod tests {
 
     /// PR #1644 R6 CRITICAL: `novel_cutoff` must NEVER panic and must
     /// replicate the legacy runtime's OverflowError bands byte-exactly. Thresholds
-    /// below were binary-searched against the merge-base server.py's
+    /// below were binary-searched against the merge-base the retired reference implementation's
     /// `timedelta(minutes=m)` / `now - td` on 2026-07-18 with the SAME
     /// injected `now` (2026-07-18T10:00:00Z).
     #[test]
@@ -2103,20 +2671,20 @@ mod tests {
     }
 
     #[test]
-    fn py_neg_slice_matches_legacy_semantics() {
+    fn legacy_neg_slice_matches_legacy_semantics() {
         let v = [1, 2, 3, 4, 5];
-        assert_eq!(py_neg_slice(&v, 2), &[4, 5]);
-        assert_eq!(py_neg_slice(&v, 10), &v);
-        assert_eq!(py_neg_slice(&v, 0), &v); // lines[-0:] == lines[0:]
-        assert_eq!(py_neg_slice(&v, -2), &[3, 4, 5]); // lines[2:]
+        assert_eq!(legacy_neg_slice(&v, 2), &[4, 5]);
+        assert_eq!(legacy_neg_slice(&v, 10), &v);
+        assert_eq!(legacy_neg_slice(&v, 0), &v); // lines[-0:] == lines[0:]
+        assert_eq!(legacy_neg_slice(&v, -2), &[3, 4, 5]); // lines[2:]
     }
 
     #[test]
-    fn py_file_lines_matches_legacy_iteration() {
-        assert_eq!(py_file_lines("a\nb\n"), vec!["a", "b"]);
-        assert_eq!(py_file_lines("a\nb"), vec!["a", "b"]);
-        assert_eq!(py_file_lines(""), Vec::<&str>::new());
-        assert_eq!(py_file_lines("\n"), vec![""]);
+    fn legacy_file_lines_matches_legacy_iteration() {
+        assert_eq!(legacy_file_lines("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(legacy_file_lines("a\nb"), vec!["a", "b"]);
+        assert_eq!(legacy_file_lines(""), Vec::<&str>::new());
+        assert_eq!(legacy_file_lines("\n"), vec![""]);
     }
 
     #[test]
@@ -2241,11 +2809,11 @@ mod tests {
     }
 
     #[test]
-    fn py_isoformat_matches_legacy() {
+    fn legacy_isoformat_matches_legacy() {
         let dt = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00+00:00").unwrap();
-        assert_eq!(py_isoformat(&dt), "2026-07-18T05:30:00+00:00");
+        assert_eq!(legacy_isoformat(&dt), "2026-07-18T05:30:00+00:00");
         let dt2 = chrono::DateTime::parse_from_rfc3339("2026-07-18T05:30:00.123456+05:30").unwrap();
-        assert_eq!(py_isoformat(&dt2), "2026-07-18T05:30:00.123456+05:30");
+        assert_eq!(legacy_isoformat(&dt2), "2026-07-18T05:30:00.123456+05:30");
     }
 
     #[test]
@@ -2311,7 +2879,7 @@ mod tests {
         // in the subpath of `/<root>` — the legacy runtime raises the -32000
         // ValueError on the first match. Rust `strip_prefix` collapses
         // `//` and would fail OPEN (ok:true); the pathlib-parts
-        // `py_relative_to` must error with the `//`-quoted text.
+        // `legacy_relative_to` must error with the `//`-quoted text.
         let base = std::env::temp_dir().join(format!("tv-mcp-grepds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("sub")).unwrap();
@@ -2361,22 +2929,169 @@ mod tests {
     }
 
     #[test]
-    fn app_log_tail_dotted_date_error_echo_is_pathlib_normalized() {
-        // Review r3 LOW-b: legacy echoes `.../app.x/y.log` (pathlib drops
-        // the `.` component at parse time); the Rust echo must match.
+    fn app_log_tail_refuses_a_date_that_is_not_yyyy_mm_dd() {
+        // Replaces the 2026-07 parity test that echoed `app.x/y.log` for the
+        // date "x/./y": a path-shaped date named files outside the log
+        // directory, so it is now refused before any path is built.
+        let base = std::env::temp_dir().join(format!("tv-mcp-date-{}", std::process::id()));
+        let logs = base.join("data").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(base.join("data").join("secret.log"), "outside\n").unwrap();
         let ctx = Ctx {
-            repo_root: std::env::temp_dir().join(format!("tv-mcp-alt-{}", std::process::id())),
+            repo_root: base.clone(),
             cfg: config::EndpointsConfig::default(),
         };
-        let out = tool_app_log_tail(&ctx, 5, Some("x/./y"));
-        assert_eq!(out["ok"], json!(false));
-        let err = out["error"].as_str().unwrap();
-        assert!(err.starts_with("log file not found: "), "{err}");
-        assert!(
-            err.ends_with("app.x/y.log"),
-            "legacy drops the `.` component: {err}"
+        for date in [
+            "x/./y",
+            "x/../../secret",
+            "../secret",
+            "2026-09-2",
+            "2026/09/27",
+            "2026-09-27x",
+        ] {
+            let out = tool_app_log_tail(&ctx, 5, Some(date));
+            assert_eq!(out["ok"], json!(false), "{date}");
+            let err = out["error"].as_str().unwrap();
+            assert!(err.starts_with("date must be YYYY-MM-DD"), "{date}: {err}");
+        }
+        // A well-shaped date still reads normally.
+        std::fs::write(logs.join("app.2026-09-27.log"), "a\nb\n").unwrap();
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-09-27"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["lines"], json!(["a", "b"]));
+        assert_eq!(out["truncated"], json!(false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_tail_capped_keeps_only_whole_lines_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("tv-mcp-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.log");
+        std::fs::write(&path, "first line\nsecond\nthird\n").unwrap();
+        // Under the cap: the whole file, not cut.
+        let (all, cut) = read_tail_capped(&path, 1024).unwrap();
+        assert_eq!(
+            (all.as_slice(), cut),
+            (b"first line\nsecond\nthird\n".as_slice(), false)
         );
-        assert!(!err.contains("/./"), "{err}");
+        // A cap that lands mid-line drops the partial line.
+        let (tail, cut) = read_tail_capped(&path, 10).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"third\n");
+        // A cap inside the last line leaves nothing rather than half a line.
+        let (none, cut) = read_tail_capped(&path, 3).unwrap();
+        assert!(cut);
+        assert!(none.is_empty());
+        // A window that starts exactly on a line boundary keeps that line
+        // (the off-by-one the first version had: it dropped it).
+        let (tail, cut) = read_tail_capped(&path, 6).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"third\n");
+        let (tail, cut) = read_tail_capped(&path, 13).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"second\nthird\n");
+        // A last line with no trailing newline survives a cut too.
+        let open_ended = dir.join("g.log");
+        std::fs::write(&open_ended, "a\nb\nc").unwrap();
+        let (tail, cut) = read_tail_capped(&open_ended, 3).unwrap();
+        assert!(cut);
+        assert_eq!(tail, b"b\nc");
+        // Exactly at the file length is not a cut.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let (_, cut) = read_tail_capped(&path, len).unwrap();
+        assert!(!cut);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_limit_is_clamped() {
+        assert_eq!(clamp_tail_limit(0), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(-3), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(LOG_TAIL_MAX_LINES + 1), LOG_TAIL_MAX_LINES);
+        assert_eq!(clamp_tail_limit(7), 7);
+    }
+
+    #[test]
+    fn keep_last_lines_sizes_the_index_by_the_reply() {
+        let mut b = b"1\n2\n3\n4\n".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 2), 4);
+        assert_eq!(b, b"3\n4\n");
+        // An unterminated last line counts as a line and is kept.
+        let mut b = b"1\n2\n3".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 2), 3);
+        assert_eq!(b, b"2\n3");
+        // Fewer lines than the limit: untouched.
+        let mut b = b"1\n2\n".to_vec();
+        assert_eq!(keep_last_lines(&mut b, 5), 2);
+        assert_eq!(b, b"1\n2\n");
+        // Empty input.
+        let mut b = Vec::new();
+        assert_eq!(keep_last_lines(&mut b, 3), 0);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn read_whole_capped_refuses_a_file_over_the_cap() {
+        let dir = std::env::temp_dir().join(format!("tv-mcp-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.json");
+        std::fs::write(&path, "abcdef").unwrap();
+        assert_eq!(
+            read_whole_capped(&path, 6).unwrap().as_deref(),
+            Some("abcdef")
+        );
+        assert_eq!(read_whole_capped(&path, 5).unwrap(), None);
+        assert!(read_whole_capped(&dir.join("missing"), 5).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_log_tail_returns_the_last_lines_of_a_long_file() {
+        let base = std::env::temp_dir().join(format!("tv-mcp-long-{}", std::process::id()));
+        let logs = base.join("data").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let body: String = (0..10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(logs.join("app.2026-09-27.log"), body).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_app_log_tail(&ctx, 3, Some("2026-09-27"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["lines"], json!(["line7", "line8", "line9"]));
+        assert_eq!(out["total_lines"], json!(10));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_body_capped_refuses_a_reply_over_the_cap() {
+        let (b, over) = read_body_capped(&b"abcdef"[..], 6).unwrap();
+        assert_eq!((b.as_slice(), over), (b"abcdef".as_slice(), false));
+        let (b, over) = read_body_capped(&b"abcdefg"[..], 6).unwrap();
+        assert!(over);
+        assert_eq!(b.len(), 6);
+    }
+
+    #[test]
+    fn questdb_sql_refuses_a_destructive_query_before_connecting() {
+        // The gate runs before any endpoint is resolved or any client is
+        // built, so a refused query comes back as the read-only refusal —
+        // never a connection error — whatever the environment points at.
+        let cfg = config::EndpointsConfig::default();
+        let ctx = Ctx {
+            repo_root: std::env::temp_dir(),
+            cfg,
+        };
+        for q in [
+            "drop table ticks",
+            "truncate table ticks",
+            "select 1; drop table ticks",
+        ] {
+            let out = tool_questdb_sql(&ctx, q);
+            assert_eq!(out["ok"], json!(false), "{q}");
+            assert_eq!(out["error"], json!(QUESTDB_READ_ONLY_REFUSAL), "{q}");
+        }
     }
 
     /// 2026-07-18 review LOW-1: an errors.jsonl file containing an
@@ -2416,5 +3131,331 @@ mod tests {
             "exactly the two valid events (binary line skipped per-line): {out}"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn api_path_is_allowed_only_for_the_app_read_routes() {
+        for ok in [
+            "/health",
+            "/health?x=1",
+            "/api/stats",
+            "/api/quote/13",
+            "/api/debug/logs/summary",
+        ] {
+            assert!(api_path_is_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "/",
+            "/exec?query=SELECT 1",
+            "/exec",
+            "/imp",
+            "/healthz",
+            "/api",
+            "/api/../exec",
+            "/api/%2e%2e/exec",
+            "//127.0.0.1:9000/exec",
+            "/api/x@127.0.0.1:9000/x",
+            "/api/x\\y",
+            "/health#/exec",
+            "/api/http://127.0.0.1:9000/exec",
+            "/api/x y",
+            "/api/x\ny",
+            "/api/x\ty",
+        ] {
+            assert!(!api_path_is_allowed(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn same_origin_folds_loopback_spellings_and_default_ports() {
+        assert!(same_origin(
+            "http://127.0.0.1:9000",
+            "http://localhost:9000"
+        ));
+        assert!(same_origin("http://127.0.0.1:9000/", "http://[::1]:9000"));
+        assert!(same_origin(
+            "http://0.0.0.0:9000",
+            "http://127.0.0.1:9000/exec"
+        ));
+        assert!(same_origin("http://host", "http://host:80"));
+        assert!(same_origin("https://host", "https://host:443"));
+        assert!(same_origin(
+            "http://user@127.0.0.1:9000",
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:3001",
+            "http://127.0.0.1:9000"
+        ));
+        assert!(!same_origin(
+            "http://127.0.0.1:9000",
+            "https://127.0.0.1:9000"
+        ));
+        assert!(!same_origin("http://a:9000", "http://b:9000"));
+        // Unparseable fails closed (reads as the same address).
+        assert!(same_origin("not a url", "http://127.0.0.1:9000"));
+        assert!(same_origin(
+            "http://127.0.0.1:notaport",
+            "http://127.0.0.1:9000"
+        ));
+    }
+
+    #[test]
+    fn tickvault_api_refuses_a_caller_base_url_before_any_network() {
+        let ctx = Ctx {
+            repo_root: std::path::PathBuf::from("/nonexistent"),
+            cfg: config::EndpointsConfig::default(),
+        };
+        let out = tool_tickvault_api(&ctx, "/health", Some("http://127.0.0.1:9000"));
+        assert_eq!(out["ok"], false);
+        assert_eq!(out["error"], API_BASE_OVERRIDE_REFUSAL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failure arms of the file and HTTP tools that the parity tests above do not
+// reach: a log path that cannot be read, a summary past the read ceiling, and
+// the two CloudWatch readers' refusals. Every case asserts the tool answers
+// `ok:false` / `error` instead of panicking, and that no credential travels.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod failure_arm_tests {
+    use super::*;
+    use crate::config::MapEnv;
+
+    /// A throwaway repo root with `data/logs/` (and `data/logs/machine/`).
+    fn scratch_root(tag: &str) -> (PathBuf, Ctx) {
+        let base = std::env::temp_dir().join(format!(
+            "tv-mcp-arm-{tag}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(base.join("data").join("logs").join("machine")).unwrap();
+        let ctx = Ctx {
+            repo_root: base.clone(),
+            cfg: config::EndpointsConfig::default(),
+        };
+        (base, ctx)
+    }
+
+    fn map_env(pairs: &[(&str, &str)]) -> MapEnv {
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn summary_snapshot_refuses_a_file_past_the_read_ceiling() {
+        let (base, ctx) = scratch_root("summary-big");
+        let path = ctx.machine_logs_dir().join(SUMMARY_FILENAME);
+        // Sparse: one byte past the ceiling, no disk spent.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(LOG_READ_MAX_BYTES + 1)
+            .unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["exists"], json!(true));
+        assert_eq!(out["markdown"], json!(""));
+        assert!(
+            out["error"].as_str().unwrap_or("").contains("read ceiling"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn summary_snapshot_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("summary-dir");
+        std::fs::create_dir_all(ctx.machine_logs_dir().join(SUMMARY_FILENAME)).unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["exists"], json!(true));
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{out}"
+        );
+        assert_eq!(out["markdown"], json!(""));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn summary_snapshot_falls_back_to_the_legacy_top_level_file() {
+        let (base, ctx) = scratch_root("summary-legacy");
+        std::fs::remove_dir_all(base.join("data").join("logs").join("machine")).unwrap();
+        std::fs::write(ctx.logs_dir().join(SUMMARY_FILENAME), "# ok\nline\n").unwrap();
+        let out = tool_summary_snapshot(&ctx);
+        assert_eq!(out["markdown"], json!("# ok\nline\n"));
+        assert_eq!(out["line_count"], json!(2));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn triage_log_tail_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("triage-dir");
+        std::fs::create_dir_all(ctx.logs_dir().join(AUTO_FIX_LOG)).unwrap();
+        let out = tool_triage_log_tail(&ctx, 5);
+        assert_eq!(out["exists"], json!(true));
+        assert_eq!(out["lines"], json!([]));
+        assert!(
+            out["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_reports_an_unreadable_path_as_an_error() {
+        let (base, ctx) = scratch_root("applog-dir");
+        std::fs::create_dir_all(ctx.logs_dir().join("app.2026-10-30.log")).unwrap();
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-10-30"));
+        assert_eq!(out["ok"], json!(false), "{out}");
+        assert!(out["error"].as_str().is_some_and(|e| !e.is_empty()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_refuses_a_path_shaped_date_and_a_missing_file() {
+        let (base, ctx) = scratch_root("applog-date");
+        let out = tool_app_log_tail(&ctx, 5, Some("x/../../etc/passwd"));
+        assert_eq!(out["ok"], json!(false));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("date must be YYYY-MM-DD")
+        );
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-01-01"));
+        assert_eq!(out["ok"], json!(false));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("log file not found")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn app_log_tail_keeps_only_whole_lines_of_a_file_past_the_ceiling() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (base, ctx) = scratch_root("applog-big");
+        let path = ctx.logs_dir().join("app.2026-10-30.log");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // A sparse head of NULs (no newline) then two real lines at the end:
+        // the cut lands inside the head, so only the two lines come back.
+        file.seek(SeekFrom::Start(LOG_READ_MAX_BYTES + 10)).unwrap();
+        file.write_all(b"\ntail-one\ntail-two\n").unwrap();
+        drop(file);
+        let out = tool_app_log_tail(&ctx, 5, Some("2026-10-30"));
+        assert_eq!(out["ok"], json!(true), "{out}");
+        assert_eq!(out["truncated"], json!(true));
+        let lines = out["lines"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            lines,
+            vec![json!("tail-one"), json!("tail-two")],
+            "only both complete tail lines survive, without the partial NUL prefix: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cloudwatch_sigv4_refuses_an_invalid_region_before_any_request() {
+        let env = map_env(&[
+            ("AWS_REGION", "AP_SOUTH_1"),
+            ("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE"),
+            ("AWS_SECRET_ACCESS_KEY", "never-sent-secret"),
+        ]);
+        let out = cloudwatch_via_sigv4(&env, 5, Some("ERROR"), 10);
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["source"], json!("cloudwatch_sigv4"));
+        assert_eq!(out["log_group"], json!("/tickvault/prod/app"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("invalid AWS region")
+        );
+        assert!(!out.to_string().contains("never-sent-secret"));
+    }
+
+    #[test]
+    fn cloudwatch_region_falls_back_through_the_default_region() {
+        assert_eq!(aws_region(&map_env(&[])), "ap-south-1");
+        assert_eq!(
+            aws_region(&map_env(&[("AWS_DEFAULT_REGION", "us-east-1")])),
+            "us-east-1"
+        );
+        assert_eq!(
+            aws_region(&map_env(&[
+                ("AWS_REGION", "eu-west-1"),
+                ("AWS_DEFAULT_REGION", "us-east-1")
+            ])),
+            "eu-west-1"
+        );
+        assert_eq!(
+            cloudwatch_log_group(&map_env(&[("TICKVAULT_CLOUDWATCH_LOG_GROUP", "/g")])),
+            "/g"
+        );
+        let (key, secret, token) = aws_credentials(&map_env(&[("AWS_SESSION_TOKEN", "")]));
+        assert_eq!((key.as_str(), secret.as_str(), token), ("", "", None));
+    }
+
+    #[test]
+    fn cloudwatch_portal_refuses_plaintext_http() {
+        let env = map_env(&[
+            ("TICKVAULT_PORTAL_URL", "http://portal.example/"),
+            ("TICKVAULT_PORTAL_TOKEN", "never-sent-token"),
+        ]);
+        let out = cloudwatch_via_portal(&env, None, 10);
+        assert_eq!(out["ok"], json!(false));
+        assert_eq!(out["source"], json!("portal"));
+        assert_eq!(out["portal_url"], json!("http://portal.example"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("must use https://")
+        );
+        assert!(!out.to_string().contains("never-sent-token"));
+    }
+
+    #[test]
+    fn cloudwatch_portal_reports_an_unreachable_host_without_the_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("https://127.0.0.1:{port}/logs");
+        let env = map_env(&[
+            ("TICKVAULT_PORTAL_URL", url.as_str()),
+            ("TICKVAULT_PORTAL_TOKEN", "never-sent-token"),
+        ]);
+        let out = cloudwatch_via_portal(&env, Some("ERROR"), 10);
+        assert_eq!(out["ok"], json!(false), "{out}");
+        assert_eq!(out["source"], json!("portal"));
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("portal logs call failed"),
+            "{out}"
+        );
+        assert!(!out.to_string().contains("never-sent-token"));
+    }
+
+    #[test]
+    fn legacy_truthy_matches_the_reference_truthiness() {
+        assert!(!legacy_truthy(&Value::Null));
+        assert!(!legacy_truthy(&json!(false)));
+        assert!(legacy_truthy(&json!(true)));
+        assert!(!legacy_truthy(&json!(0)));
+        assert!(legacy_truthy(&json!(1.5)));
+        assert!(!legacy_truthy(&json!("")));
+        assert!(legacy_truthy(&json!("x")));
+        assert!(!legacy_truthy(&json!([])));
+        assert!(legacy_truthy(&json!([0])));
+        assert!(!legacy_truthy(&json!({})));
+        assert!(legacy_truthy(&json!({"a": 1})));
     }
 }

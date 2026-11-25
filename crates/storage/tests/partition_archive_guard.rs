@@ -103,9 +103,23 @@ fn base_toml_enables_archive_with_market_data_window() {
 fn main_rs_wires_archive_before_detach_and_keeps_detach() {
     let main_rs = read_workspace_file("crates/app/src/main.rs");
 
-    let archive_idx = main_rs
-        .find("archive_and_drop_old_partitions")
-        .expect("main.rs must run the partition archive cycle");
+    // UPDATED 2026-09-01. This test used to look for an INLINE
+    // `archive_and_drop_old_partitions` call in main.rs, and it was right to:
+    // that is where the sweep lived. The sweep moved to a boot-spawned
+    // scheduler because the inline site sat in the post-market arm, which is
+    // unreachable on any run started after 15:30 IST and is skipped entirely
+    // when shutdown arrives by SIGTERM — i.e. exactly how the 17:30 box stop
+    // always arrives.
+    //
+    // The INVARIANT this test defends is unchanged and is still real: the
+    // archive must precede the detach, because a detach renames a partition
+    // without exporting it, freeing zero bytes and putting it beyond the
+    // archiver's reach. What changed is where to look for it.
+    let archive_idx = main_rs.find("spawn_supervised_daily_archive_loop").expect(
+        "main.rs must spawn the daily archive scheduler — without it \
+             NOTHING runs the archive cycle, because the inline post-market \
+             site it replaced was deleted in the same change",
+    );
     let detach_idx = main_rs.find("detach_old_partitions").expect(
         "main.rs must KEEP the legacy detach cycle (its total_detached \
                  log lines are the CloudWatch evidence trail)",
@@ -114,12 +128,52 @@ fn main_rs_wires_archive_before_detach_and_keeps_detach() {
         archive_idx < detach_idx,
         "the archive cycle MUST run BEFORE the detach cycle — otherwise a \
          >retention_days partition gets DETACHED (renamed, unarchived, zero \
-         bytes freed) before the archiver can export it to S3"
+         bytes freed) before the archiver can export it to S3. The scheduler \
+         is spawned at BOOT and fires at 15:30:02 IST; the detach sits in the \
+         later post-market arm, so boot-before-post-market is the ordering \
+         that expresses it now."
     );
+
+    // Regression (2026-10-11, audit RET-1): spawn order is NOT run order. The
+    // archive window opens at 15:30:02 and its first pass lands minutes later,
+    // while the post-market detach runs ~2 s after the close on the same
+    // Standard-class cutoff. So the detach must not run at all while the
+    // archive leg is on, or it renames the day's newly aged audit partition
+    // before the archiver can export it.
+    let detach_block_start = main_rs[..detach_idx]
+        .rfind("let retention_days = config.partition_retention.retention_days;")
+        .expect("the detach block must read config.partition_retention.retention_days");
+    let gate = main_rs[detach_block_start..detach_idx]
+        .find("if config.partition_retention.archive_enabled {");
     assert!(
-        main_rs.contains("config.partition_retention.archive_enabled"),
-        "the archive cycle must be gated on the archive_enabled config flag \
-         (the instant-rollback contract)"
+        gate.is_some(),
+        "the legacy detach must be skipped when archive_enabled is true — \
+         otherwise it detaches today's newly aged partition before the archive \
+         pass can export it (audit RET-1)"
+    );
+
+    // SINGLE DRIVER. Two copies of the sweep — one inline here, one in the
+    // scheduler — could drift apart, and the more dangerous direction is the
+    // quiet one: the inline copy runs only on a clean non-SIGTERM shutdown,
+    // so a divergence would show up on the rarest path and nowhere else.
+    assert!(
+        !main_rs.contains("archive_and_drop_old_partitions"),
+        "main.rs must NOT call the archive cycle directly — it is driven by \
+         `daily_archive_boot::spawn_supervised_daily_archive_loop` and by the \
+         disk-pressure leg, and those two already serialise against each \
+         other through ARCHIVE_PASS_LOCK. A third inline driver would be \
+         outside that lock."
+    );
+
+    // The instant-rollback contract moved WITH the sweep: the gate is now the
+    // scheduler's own refusal to spawn. Checked at its new home rather than
+    // dropped, because a config flag nobody reads is a rollback that does not
+    // roll back.
+    let boot = read_workspace_file("crates/app/src/daily_archive_boot.rs");
+    assert!(
+        boot.contains("cfg.archive_enabled"),
+        "the archive scheduler must be gated on the archive_enabled config \
+         flag (the instant-rollback contract)"
     );
 }
 
@@ -177,23 +231,38 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     // from a REAL post-export recount + a REAL post-upload S3 HeadObject —
     // a refactor stubbing either input (e.g. `Some(exported.rows)`) would
     // make the verify vacuously true and let a corrupt archive gate a drop.
+    // 2026-11-07 (PR AA step 2): export, upload and verify moved out of
+    // `process_one` into `copy_and_verify_partition`, which BOTH gates use:
+    // `process_one` (the exact WAL gate) and the snapshot gate, through the
+    // `ArchiveIo::copy_and_verify` impl. The input checks below read that
+    // shared body, and both callers must still reach it.
     let archive_src = read_workspace_file("crates/storage/src/partition_archive.rs");
     let process_one = extract_fn_body(&archive_src, "async fn process_one");
     assert!(
-        process_one.contains("self.recount_rows("),
-        "process_one must obtain the recount from the real recount_rows() call"
+        process_one.contains(".copy_and_verify_partition("),
+        "process_one must copy and verify through copy_and_verify_partition"
+    );
+    let snapshot_copy = extract_fn_body(&archive_src, "async fn copy_and_verify(");
+    assert!(
+        snapshot_copy.contains("self.copy_and_verify_partition("),
+        "the snapshot gate's copy must go through copy_and_verify_partition"
+    );
+    let copy = extract_fn_body(&archive_src, "async fn copy_and_verify_partition");
+    assert!(
+        copy.contains("self.recount_rows("),
+        "copy_and_verify_partition must obtain the recount from the real recount_rows() call"
     );
     assert!(
-        process_one.contains("self.head_object_meta("),
-        "process_one must obtain the S3 length + checksum from the real \
+        copy.contains("self.head_object_meta("),
+        "copy_and_verify_partition must obtain the S3 length + checksum from the real \
          head_object_meta() call"
     );
     // The two fetched values must be the ones handed to verify_archive —
     // pin the binding names appearing in the verify_archive call.
-    let verify_call_idx = process_one
+    let verify_call_idx = copy
         .find("verify_archive(")
-        .expect("process_one must call verify_archive");
-    let verify_call = &process_one[verify_call_idx..];
+        .expect("copy_and_verify_partition must call verify_archive");
+    let verify_call = &copy[verify_call_idx..];
     for needle in ["recount", "s3_len"] {
         assert!(
             verify_call.contains(needle),
@@ -202,19 +271,27 @@ fn verify_inputs_come_from_real_recount_and_head_calls() {
     }
     // Round 2: the reuse decision must compare the STORED checksum against
     // the freshly exported digest (content identity, not just length).
+    // 2026-10-22 (plan item 66): the upload-or-reuse step moved out of
+    // `process_one` into `place_archive`, which the rebuild copy shares, so
+    // the reuse arm is checked there and `process_one` must still reach it.
     assert!(
-        process_one.contains("checksum_sha256_b64"),
+        copy.contains("self\n            .place_archive(") || copy.contains("self.place_archive("),
+        "copy_and_verify_partition must place the archive through place_archive"
+    );
+    let place_archive = extract_fn_body(&archive_src, "async fn place_archive");
+    assert!(
+        place_archive.contains("checksum_sha256_b64"),
         "the reuse arm must consult the stored sha256 checksum"
     );
     assert!(
-        process_one.contains("gzip_sha256_b64"),
+        place_archive.contains("gzip_sha256_b64"),
         "the reuse arm must compare against the freshly exported gzip sha256"
     );
     // Vacuous-pass tripwires: verify inputs must never be self-satisfied.
     for forbidden in ["Some(exported.rows)", "Some(exported.gzip_bytes)"] {
         assert!(
-            !process_one.contains(forbidden),
-            "process_one must never feed verify_archive a self-satisfied \
+            !process_one.contains(forbidden) && !copy.contains(forbidden),
+            "the copy must never feed verify_archive a self-satisfied \
              input ({forbidden}) — that makes the verify vacuous"
         );
     }

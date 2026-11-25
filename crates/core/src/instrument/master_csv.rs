@@ -180,7 +180,15 @@ pub struct MasterRow {
     pub strike_paise: i64,
     /// `OPTION_TYPE` — which leg, or [`OptionLeg::None`].
     pub option_leg: OptionLeg,
-    /// `UNDERLYING_SYMBOL`, uppercased. Empty for non-derivative rows.
+    /// `UNDERLYING_SYMBOL`, uppercased.
+    ///
+    /// ⚠ CORRECTED 2026-09-23: this said "Empty for non-derivative rows".
+    /// FALSE on the live master — an NSE cash-equity row carries its TICKER
+    /// here (`RELIANCE`) while `symbol_name` holds the COMPANY name
+    /// (`RELIANCE INDUSTRIES LTD`), verified on prod `instrument_lifecycle`.
+    /// A consumer joining a cash-equity row to its derivatives must key on
+    /// THIS field; `dhan_universe::fno_underlying_mappings` joined on
+    /// `symbol_name` and resolved only the vendor's test rows because of it.
     ///
     /// The grouping key for contract selection. `UNDERLYING_SECURITY_ID` is
     /// deliberately NOT carried: it is an id without its segment, and an id
@@ -188,6 +196,13 @@ pub struct MasterRow {
     /// is unambiguous within the NSE derivative segment and is what the
     /// selection actually groups on.
     pub underlying_symbol: String,
+    /// `LOT_SIZE` — the contract multiplier, or `0` when absent.
+    ///
+    /// Zero is the ABSENT sentinel and is never a usable divisor. Callers that
+    /// normalise by lot size must refuse a zero and say so; defaulting it to 1
+    /// would rank that contract by raw units and put it at the top of a board
+    /// whose whole purpose is to compare contracts fairly.
+    pub lot_size: u32,
 }
 
 impl MasterRow {
@@ -284,6 +299,15 @@ const COL_EXPIRY: &str = "SM_EXPIRY_DATE";
 const COL_STRIKE: &str = "STRIKE_PRICE";
 const COL_OPTION_TYPE: &str = "OPTION_TYPE";
 const COL_UNDERLYING_SYMBOL: &str = "UNDERLYING_SYMBOL";
+/// `LOT_SIZE` — the contract multiplier (market lot).
+///
+/// OPTIONAL like the rest of this group, so a header carrying only the six
+/// join columns stays a valid master. Dhan serves it
+/// (`docs/dhan-ref/09-instrument-master.md`: "LOT_SIZE / SEM_LOT_UNITS — Lot
+/// size (trading multiple)"), and until 2026-09-07 this parser resolved every
+/// other derivative column and dropped this one.
+const COL_LOT_SIZE: &str = "LOT_SIZE";
+const COL_MTF_LEVERAGE: &str = "MTF_LEVERAGE";
 
 /// Days in `month` of `year`, Gregorian.
 ///
@@ -374,6 +398,107 @@ pub fn parse_strike_paise(value: &str) -> i64 {
     let paise = paise as i64;
     paise
 }
+
+/// `LOT_SIZE` as a whole contract multiplier, or `0` when the field is not
+/// one.
+///
+/// # Why this is not `parse::<u32>()`
+///
+/// Because the vendor does not send an integer. MEASURED against the live
+/// `api-scrip-master-detailed.csv` on 2026-09-09: every row's `LOT_SIZE` reads
+/// `1.0`, `75.0`, `250.0` — a DECIMAL string, exactly like the sibling
+/// `STRIKE_PRICE` column this module already parses through `f64`. A direct
+/// `"75.0".parse::<u32>()` is an `Err`, so the integer parse collapsed EVERY
+/// contract in the master to the absent sentinel.
+///
+/// That was not a cosmetic loss. `lot_size` is the denominator of the ranking
+/// sort key (`window_lots_milli = delta_units * 1000 / lot_size`), and a leg
+/// with no lot size is refused outright by `legs_from_artifact`. So a zero
+/// here emptied the contract-to-underlying map, which left `owner_of` with no
+/// answer for any tick, which left the volume leaderboard with nothing to
+/// observe — and the top-volume ranking produced not one row, all session,
+/// with every counter reading healthy. Measured on the box the same day:
+/// 115,052 artifact rows, every one `z:0`; 113,746 option legs refused;
+/// `mapped_contracts: 0`.
+///
+/// The unit test that guarded this column passed throughout, because its
+/// fixtures were written as `75` and `250`. A fixture that does not carry the
+/// vendor's own shape proves nothing about the vendor.
+///
+/// # Why a fractional lot is refused rather than truncated
+///
+/// A lot size is a count of units in one contract; `75.5` is not one. Rounding
+/// or truncating it would silently mis-scale that contract's rank against
+/// every other contract for the life of the artifact, and a wrong lot size is
+/// worse than an absent one — absent is refused loudly at the map build, wrong
+/// is believed. Only a value whose fraction is exactly zero is a lot size.
+#[must_use]
+pub fn parse_lot_size(value: &str) -> u32 {
+    let trimmed = value.trim();
+    // The integer form first, so the common path never touches floating point
+    // and a value beyond `u32` is refused rather than rounded into range.
+    if let Ok(whole) = trimmed.parse::<u32>() {
+        return whole;
+    }
+    let Ok(units) = trimmed.parse::<f64>() else {
+        return 0;
+    };
+    // Rejects NaN, both infinities, zero and every negative in one test: none
+    // of them is a number of units in a contract.
+    if !units.is_finite() || units <= 0.0 {
+        return 0;
+    }
+    // `fract()` alone misses a fraction below `f64` resolution:
+    // `75.000000000000001` rounds to exactly 75.0. The decimal text decides.
+    if units.fract() != 0.0 || !decimal_text_is_whole(trimmed) {
+        return 0;
+    }
+    if units > f64::from(u32::MAX) {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    // APPROVED: bounded above by the `u32::MAX` check, below by the `<= 0.0`
+    // guard, and whole by the `fract()` check — the cast is exact.
+    let units = units as u32;
+    units
+}
+
+/// Whether a decimal number's TEXT is a whole number, read digit by digit so
+/// no `f64` rounding can hide a fraction (`75.000000000000001` is not whole).
+///
+/// Takes an optional sign, digits with at most one `.`, and an optional
+/// `e`/`E` exponent. Text it cannot read as that shape returns `false`.
+/// O(text length), no allocation; runs only on the cold CSV build.
+// O(1) EXEMPT: begin — one pass over one CSV cell, cold path
+fn decimal_text_is_whole(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], &unsigned[at + 1..]),
+        None => (unsigned, "0"),
+    };
+    let Ok(exponent) = exponent.parse::<i64>() else {
+        return false;
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !integer
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    // The decimal point sits after `integer.len() + exponent` digits of
+    // `integer ++ fraction`; whole means every digit after it is zero.
+    let point = i64::try_from(integer.len())
+        .unwrap_or(i64::MAX)
+        .saturating_add(exponent);
+    integer
+        .bytes()
+        .chain(fraction.bytes())
+        .enumerate()
+        .all(|(index, digit)| i64::try_from(index).unwrap_or(i64::MAX) < point || digit == b'0')
+}
+// O(1) EXEMPT: end
 
 /// `numerator / denominator` as an exact `f64`, with no lossy cast.
 ///
@@ -467,6 +592,26 @@ pub fn split_csv_line(line: &str, out: &mut Vec<String>) {
 /// owned `String` per FIELD (~26 on the real master), and each retained row
 /// keeps five more. Cold path — see the module header.
 pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
+    Ok(parse_detailed_master(csv)?.rows)
+}
+
+/// Rows and the optional MTF terms from the same Dhan master response.
+#[derive(Debug)]
+pub struct DetailedMaster {
+    /// The existing instrument universe, including non-equities.
+    pub rows: Vec<MasterRow>,
+    /// Published multipliers keyed by NSE cash equity security ID. Zero is a
+    /// reported zero, 1x is a published term, and an absent ID is unknown.
+    // APPROVED: parse_detailed_master filters NSE/E/EQ/EQUITY before every insertion.
+    pub mtf_leverage_by_security_id: HashMap<u64, f64>,
+}
+
+/// Parses the daily master and retains Dhan's MTF_LEVERAGE column for NSE EQ
+/// equities in the same pass. A missing optional column leaves the terms empty.
+///
+/// # Errors
+/// Returns the same whole-file errors as [`parse_master_csv`].
+pub fn parse_detailed_master(csv: &str) -> Result<DetailedMaster, MasterParseError> {
     let csv = csv.strip_prefix('\u{feff}').unwrap_or(csv);
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
     let header = lines.next().ok_or(MasterParseError::Empty)?;
@@ -515,6 +660,14 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
     let i_strike = opt_col(COL_STRIKE);
     let i_leg = opt_col(COL_OPTION_TYPE);
     let i_underlying = opt_col(COL_UNDERLYING_SYMBOL);
+    let i_lot = opt_col(COL_LOT_SIZE);
+    let i_mtf = opt_col(COL_MTF_LEVERAGE).filter(|_| {
+        upper
+            .iter()
+            .filter(|name| *name == COL_MTF_LEVERAGE)
+            .count()
+            == 1
+    });
 
     // `widest` bounds the mandatory columns ONLY. An optional column that
     // lands beyond a short row is read as absent for that row, never as a bad
@@ -526,6 +679,7 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
         .unwrap_or(0);
 
     let mut rows = Vec::new();
+    let mut mtf_terms = HashMap::new();
     let mut bad = 0usize;
     let mut total = 0usize;
     for line in lines {
@@ -542,7 +696,7 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             bad += 1;
             continue;
         };
-        rows.push(MasterRow {
+        let row = MasterRow {
             security_id,
             // Uppercased at parse so every downstream comparison is already
             // case-normalised; ISIN is defined uppercase but vendors drift.
@@ -570,7 +724,32 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             underlying_symbol: i_underlying
                 .and_then(|i| fields.get(i))
                 .map_or_else(String::new, |v| v.trim().to_uppercase()),
-        });
+            // Absent, blank, non-numeric, negative and fractional all collapse
+            // to the same 0 sentinel: none of them is a lot size, and
+            // distinguishing them here would only move the refusal to a caller
+            // that has less context about why the row is unusable. The vendor
+            // sends this column as a DECIMAL (`75.0`), so the parse goes
+            // through `parse_lot_size`, never a bare integer parse.
+            lot_size: i_lot
+                .and_then(|i| fields.get(i))
+                .map_or(0, |v| parse_lot_size(v)),
+        };
+        if let Some(column) = i_mtf
+            && row.class == InstrumentClass::Equity
+            && row.is_nse_cash_equity()
+            && security_id != 0
+            && !row.isin.is_empty()
+        {
+            let leverage = fields
+                .get(column)
+                .and_then(|field| parse_mtf_leverage(field));
+            // A repeated SID cannot establish a unique equity identity.
+            mtf_terms
+                .entry(security_id)
+                .and_modify(|v| *v = None)
+                .or_insert(leverage);
+        }
+        rows.push(row);
     }
 
     let bad_fraction = ratio(bad, total);
@@ -583,7 +762,23 @@ pub fn parse_master_csv(csv: &str) -> Result<Vec<MasterRow>, MasterParseError> {
             min: MIN_PLAUSIBLE_MASTER_ROWS,
         });
     }
-    Ok(rows)
+    Ok(DetailedMaster {
+        rows,
+        mtf_leverage_by_security_id: mtf_terms
+            .into_iter()
+            .filter_map(|(id, value)| value.map(|v| (id, v)))
+            .collect(),
+    })
+}
+
+fn parse_mtf_leverage(field: &str) -> Option<f64> {
+    let decimal = field.trim();
+    if !decimal.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let value = decimal.parse::<f64>().ok()?;
+    let reported_zero = decimal.bytes().all(|b| b == b'0' || b == b'.');
+    (value.is_finite() && (value >= 1.0 || reported_zero)).then_some(value)
 }
 
 /// One NSE index constituent, as read from a niftyindices list.
@@ -857,6 +1052,56 @@ mod tests {
     const HEADER: &str = "SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES";
 
     #[test]
+    fn parse_detailed_master_keeps_only_unambiguous_reported_nse_cash_equity_mtf_terms() {
+        let header = format!("{HEADER},Instrument,Mtf_Leverage");
+        let body = master_with(
+            &header,
+            &[
+                "1,INE1,ONE,NSE,E,EQ,EQUITY,1.00",
+                "2,INE2,TWO,NSE,E,EQ,EQUITY,0.00",
+                "3,INE3,THREE,NSE,E,EQ,EQUITY, 3.57 ",
+                "3,INE3,THREE,BSE,E,EQ,EQUITY,4.00",
+                "4,INE4,FOUR,NSE,E,BE,EQUITY,3.00",
+                "5,INE5,FIVE,NSE,D,EQ,FUTSTK,3.00",
+                "6,INE6,SIX,NSE,E,EQ,EQUITY,NaN",
+                "7,INE7,SEVEN,NSE,E,EQ,EQUITY,",
+                "8,INE8,EIGHT,NSE,E,EQ,EQUITY,-2",
+                "9,INE9,NINE,NSE,E,EQ,EQUITY,4.0",
+                "9,INEX,OTHER,NSE,E,EQ,EQUITY,0",
+                "10,INE10,TEN,NSE,E,EQ,EQUITY",
+                "11,INE11,ELEVEN,NSE,E,EQ,EQUITY,0.4",
+                "12,,MISSING ISIN,NSE,E,EQ,EQUITY,3",
+                "13,INE13,THIRTEEN,NSE,E,EQ,INDEX,3",
+                "14,INE14,FOURTEEN,NSE,E,EQ,EQUITY,1e2",
+                "0,INE0,ZERO SID,NSE,E,EQ,EQUITY,2",
+            ],
+        );
+        let parsed = parse_detailed_master(&body).unwrap();
+        assert_eq!(
+            parsed.mtf_leverage_by_security_id,
+            HashMap::from([(1, 1.0), (2, 0.0), (3, 3.57)])
+        );
+        assert_eq!(parse_master_csv(&body).unwrap(), parsed.rows);
+        let legacy = master_with(HEADER, &["1,INE1,ONE,NSE,E,EQ"]);
+        let ambiguous = master_with(
+            &format!("{header},MTF_LEVERAGE"),
+            &["1,INE1,ONE,NSE,E,EQ,EQUITY,1,3"],
+        );
+        assert!(
+            parse_detailed_master(&ambiguous)
+                .unwrap()
+                .mtf_leverage_by_security_id
+                .is_empty()
+        );
+        assert!(
+            parse_detailed_master(&legacy)
+                .unwrap()
+                .mtf_leverage_by_security_id
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_parse_master_csv_reads_columns_by_name_not_position() {
         // The vendor has already reordered and added columns once (the
         // 2026-07-14 live crawl). A positional parser would read the wrong
@@ -1016,6 +1261,7 @@ mod tests {
             strike_paise: 0,
             option_leg: OptionLeg::None,
             underlying_symbol: String::new(),
+            lot_size: 0,
         };
         assert!(base.is_nse_cash_equity());
         // BSE also lists series EQ — a constituent resolved there is a
@@ -1081,18 +1327,165 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000, "24500 rupees is 2,450,000 paise");
         assert_eq!(r.option_leg, OptionLeg::Call);
         assert_eq!(r.underlying_symbol, "NIFTY");
+        // The header above carries no `LOT_SIZE`, so this row reports the
+        // absent sentinel rather than a guess.
+        assert_eq!(r.lot_size, 0);
+    }
+
+    #[test]
+    fn test_lot_size_is_read_from_the_detailed_master_column() {
+        // `LOT_SIZE` is the DETAILED master's own column name
+        // (`docs/dhan-ref/09-instrument-master.md`), and the detailed CSV is
+        // what this lane downloads — so this is the real header, not a
+        // convenient one.
+        let header = format!(
+            "{HEADER},INSTRUMENT,SM_EXPIRY_DATE,STRIKE_PRICE,OPTION_TYPE,UNDERLYING_SYMBOL,LOT_SIZE"
+        );
+        let body = master_with(
+            &header,
+            &[
+                "44311,,NIFTY28AUG2524500CE,NSE,D,,OPTIDX,2026-08-28,24500.000000,CE,NIFTY,75",
+                "55001,,RELIANCE28AUG253000CE,NSE,D,,OPTSTK,2026-08-28,3000.000000,CE,RELIANCE,250",
+            ],
+        );
+        // Per contract, not one figure for the file: two real contracts on the
+        // same day carry genuinely different multipliers, and a single shared
+        // default would rank one of them in the wrong unit.
+        assert_eq!(rows_by_id(&body, 44311).lot_size, 75);
+        assert_eq!(rows_by_id(&body, 55001).lot_size, 250);
+    }
+
+    #[test]
+    fn test_every_unusable_lot_size_collapses_to_the_absent_sentinel() {
+        let header = format!("{HEADER},INSTRUMENT,LOT_SIZE");
+        let body = master_with(
+            &header,
+            &[
+                "1,,BLANK,NSE,D,,OPTSTK,",
+                "2,,TEXT,NSE,D,,OPTSTK,NA",
+                "3,,NEGATIVE,NSE,D,,OPTSTK,-75",
+                "4,,ZERO,NSE,D,,OPTSTK,0",
+                "5,,ZERODECIMAL,NSE,D,,OPTSTK,0.0",
+                "6,,FRACTIONAL,NSE,D,,OPTSTK,75.5",
+                "7,,NAN,NSE,D,,OPTSTK,NaN",
+                "8,,INFINITE,NSE,D,,OPTSTK,inf",
+                "9,,PADDED,NSE,D,,OPTSTK,  75  ",
+            ],
+        );
+        // Blank, non-numeric, negative, zero, an exact-zero decimal, a
+        // FRACTIONAL value, NaN and infinity are all the SAME answer — we do
+        // not know this contract's multiplier — and every one must land on 0
+        // so the single downstream refusal covers them all.
+        //
+        // The fractional case is the one worth stating: `75.5` is not a count
+        // of units in a contract, and truncating it to 75 would silently
+        // mis-scale that contract's rank against every other contract for the
+        // life of the artifact. A wrong lot size is worse than an absent one —
+        // absent is refused loudly at the map build, wrong is believed.
+        for id in [1_u64, 2, 3, 4, 5, 6, 7, 8] {
+            assert_eq!(rows_by_id(&body, id).lot_size, 0, "id {id}");
+        }
+        // Padding is NOT unusable — the parser trims, as it does elsewhere.
+        assert_eq!(rows_by_id(&body, 9).lot_size, 75);
+    }
+
+    #[test]
+    fn the_vendors_own_decimal_lot_size_shape_is_read_not_refused() {
+        // MEASURED against `images.dhan.co/api-data/api-scrip-master-detailed.csv`
+        // on 2026-09-09: the live file writes `LOT_SIZE` as `1.0`, never `1`.
+        //
+        // Until this test existed the parser used `parse::<u32>()`, which is
+        // an `Err` on every one of those, so EVERY contract in the master read
+        // as having no lot size. The consequence was not cosmetic: the ranking
+        // sort key divides by the lot size, and a leg without one is refused
+        // at the contract-to-underlying map build — so the map published
+        // empty, no tick could be attributed to an underlying, and the
+        // top-volume ranking produced zero rows all session while every
+        // counter read healthy (box, 2026-09-09: 115,052 artifact rows all
+        // carrying lot size 0; 113,746 option legs refused; map size 0).
+        //
+        // The test that guarded this column was green throughout, because its
+        // fixtures were `75` and `250`. A fixture that does not carry the
+        // vendor's own shape proves nothing about the vendor, which is why
+        // these values are copied from the live file rather than invented.
+        let header = format!("{HEADER},INSTRUMENT,LOT_SIZE");
+        let body = master_with(
+            &header,
+            &[
+                "1,,CURRENCYFUT,NSE,D,,FUTCUR,1.0",
+                "2,,NIFTYOPT,NSE,D,,OPTIDX,75.0",
+                "3,,BANKOPT,NSE,D,,OPTIDX,35.0",
+                "4,,STOCKOPT,NSE,D,,OPTSTK,250.0",
+                "5,,INTEGERFORM,NSE,D,,OPTSTK,600",
+            ],
+        );
+        assert_eq!(rows_by_id(&body, 1).lot_size, 1);
+        assert_eq!(rows_by_id(&body, 2).lot_size, 75);
+        assert_eq!(rows_by_id(&body, 3).lot_size, 35);
+        assert_eq!(rows_by_id(&body, 4).lot_size, 250);
+        // The integer form must keep working: the vendor is free to change
+        // back, and a parser that only handled decimals would break the same
+        // way in the other direction.
+        assert_eq!(rows_by_id(&body, 5).lot_size, 600);
+    }
+
+    #[test]
+    fn parse_lot_size_refuses_what_is_not_a_whole_positive_count() {
+        // Direct unit coverage of the helper, so the shape is pinned even if
+        // the CSV fixtures above are ever restructured.
+        assert_eq!(parse_lot_size("75"), 75);
+        assert_eq!(parse_lot_size("75.0"), 75);
+        assert_eq!(parse_lot_size("75.000000"), 75);
+        assert_eq!(parse_lot_size(" 1.0 "), 1);
+        assert_eq!(parse_lot_size("4294967295"), u32::MAX);
+        for bad in [
+            "",
+            "  ",
+            "NA",
+            "-1",
+            "-1.0",
+            "0",
+            "0.0",
+            "75.5",
+            "0.9",
+            "NaN",
+            "inf",
+            "-inf",
+            "1e400",
+            "4294967296",
+            "4294967296.0",
+        ] {
+            assert_eq!(parse_lot_size(bad), 0, "input {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_short_row_reads_lot_size_as_absent_rather_than_failing() {
+        // The optional-column rule this parser already applies everywhere: a
+        // row that ends before an optional column is missing that field, never
+        // a parse error that would drop the whole master and collapse the
+        // universe to the four index fallbacks.
+        let header = format!("{HEADER},INSTRUMENT,SM_EXPIRY_DATE,LOT_SIZE");
+        let body = master_with(&header, &["44311,,NIFTY,NSE,D,,OPTIDX"]);
+        let r = rows_by_id(&body, 44311);
+        assert_eq!(r.lot_size, 0);
+        assert_eq!(
+            r.class,
+            InstrumentClass::IndexOption,
+            "the row still parses"
+        );
     }
 
     #[test]
     fn test_parse_expiry_ymd_accepts_both_vendor_forms_and_refuses_the_rest() {
-        assert_eq!(parse_expiry_ymd("2026-08-28"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 2026_08_28);
-        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 2026_08_28);
+        assert_eq!(parse_expiry_ymd("2026-08-28"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28 14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("2026-08-28T14:30:00"), 20260828);
+        assert_eq!(parse_expiry_ymd("  2026-08-28  "), 20260828);
         // Refusals — every one of these must read as "no expiry", never as a
         // date that could win the nearest-expiry slot.
         assert_eq!(parse_expiry_ymd(""), 0);
@@ -1115,12 +1508,12 @@ mod tests {
         assert_eq!(parse_expiry_ymd("2026-09-31"), 0);
         assert_eq!(parse_expiry_ymd("2026-11-31"), 0);
         // Real dates still pass, leap years included.
-        assert_eq!(parse_expiry_ymd("2026-02-28"), 2026_02_28);
-        assert_eq!(parse_expiry_ymd("2028-02-29"), 2028_02_29, "leap year");
+        assert_eq!(parse_expiry_ymd("2026-02-28"), 20260228);
+        assert_eq!(parse_expiry_ymd("2028-02-29"), 20280229, "leap year");
         assert_eq!(parse_expiry_ymd("2026-02-29"), 0, "not a leap year");
-        assert_eq!(parse_expiry_ymd("2000-02-29"), 2000_02_29, "400-year rule");
+        assert_eq!(parse_expiry_ymd("2000-02-29"), 20000229, "400-year rule");
         assert_eq!(parse_expiry_ymd("1900-02-29"), 0, "100-year rule");
-        assert_eq!(parse_expiry_ymd("2026-12-31"), 2026_12_31);
+        assert_eq!(parse_expiry_ymd("2026-12-31"), 20261231);
     }
 
     #[test]
@@ -1138,7 +1531,7 @@ mod tests {
         );
         let r = rows_by_id(&body, 44311);
         assert_eq!(r.class, InstrumentClass::IndexOption);
-        assert_eq!(r.expiry_ymd, 2026_08_28);
+        assert_eq!(r.expiry_ymd, 20260828);
         assert_eq!(r.strike_paise, 2_450_000);
         assert_eq!(r.option_leg, OptionLeg::Call);
     }
@@ -1155,7 +1548,7 @@ mod tests {
             parse_expiry_ymd("2026-12-31"),
         ];
         days.sort_unstable();
-        assert_eq!(days, [2026_08_28, 2026_09_01, 2026_12_31, 2027_01_01]);
+        assert_eq!(days, [20260828, 20260901, 20261231, 20270101]);
     }
 
     #[test]
@@ -1250,6 +1643,7 @@ mod tests {
             strike_paise: 0,
             option_leg: OptionLeg::None,
             underlying_symbol: String::new(),
+            lot_size: 0,
         }
     }
 

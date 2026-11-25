@@ -78,14 +78,17 @@ pub const RECONNECT_LADDER_CAP_MS: u64 = 30_000;
 pub const RECONNECT_JITTER_STEP_MS: u64 = 25;
 
 /// Number of distinct jitter slots. Equal to the operator-authorized total
-/// connection ceiling (16), so every live connection lands in its own slot and
-/// no two connections ever share a delay.
-pub const RECONNECT_JITTER_SLOTS: u8 = 16;
+/// connection ceiling across both accounts (16 primary + 10 depth-account =
+/// 26, 2026-09-26), so every live connection lands in its own slot and no two
+/// connections ever share a delay. Raising it from 16 moves no primary
+/// socket's stagger: `index % 26 == index % 16` for every index below 16.
+pub const RECONNECT_JITTER_SLOTS: u8 = 26;
 
 /// Largest stagger any connection can receive: `STEP * (SLOTS - 1)`.
 /// Pinned against its factors by
-/// `test_reconnect_jitter_ms_max_constant_matches_step_and_slots`.
-pub const RECONNECT_JITTER_MAX_MS: u64 = 375;
+/// `test_reconnect_jitter_ms_max_constant_matches_step_and_slots`. 375 ms
+/// across the primary account's 16 slots, 625 ms with the depth account's 10.
+pub const RECONNECT_JITTER_MAX_MS: u64 = 625;
 
 /// Upper bound on any value [`damped_reconnect_delay_with_jitter`] can return.
 ///
@@ -383,7 +386,8 @@ pub fn reconnect_delay_ms(attempt: u32) -> u64 {
 
 /// Returns the deterministic per-connection stagger in milliseconds.
 ///
-/// Derived from the connection's GLOBAL index (0..16 across all four pools —
+/// Derived from the connection's GLOBAL index (0..26 across every pool of both
+/// accounts —
 /// see `pool_budget::ConnectionSlot::global_index`), NOT from randomness.
 /// Randomness would make the reconnect schedule untestable and irreproducible
 /// in incident forensics; a fixed derivation gives the same de-synchronisation
@@ -503,10 +507,10 @@ mod tests {
             assert!(
                 seen.insert(jitter),
                 "connection {idx} collided on jitter {jitter}ms — thundering-herd \
-                 prevention requires all 16 to differ"
+                 prevention requires every slot to differ"
             );
         }
-        assert_eq!(seen.len(), 16);
+        assert_eq!(seen.len(), usize::from(RECONNECT_JITTER_SLOTS));
         assert_eq!(
             seen.iter().next_back().copied(),
             Some(RECONNECT_JITTER_MAX_MS)
@@ -515,11 +519,23 @@ mod tests {
 
     #[test]
     fn test_reconnect_jitter_ms_wraps_beyond_slot_count() {
-        // Unreachable in production (the pool budget refuses a 17th socket)
+        // Unreachable in production (the pool budget refuses a 27th socket)
         // but the function must stay total.
-        assert_eq!(reconnect_jitter_ms(16), reconnect_jitter_ms(0));
-        assert_eq!(reconnect_jitter_ms(17), reconnect_jitter_ms(1));
-        assert_eq!(reconnect_jitter_ms(u8::MAX), reconnect_jitter_ms(15));
+        assert_eq!(reconnect_jitter_ms(26), reconnect_jitter_ms(0));
+        assert_eq!(reconnect_jitter_ms(27), reconnect_jitter_ms(1));
+        assert_eq!(reconnect_jitter_ms(u8::MAX), reconnect_jitter_ms(21));
+    }
+
+    #[test]
+    fn test_reconnect_jitter_ms_unchanged_for_the_primary_account_slots() {
+        // 2026-09-26: widening 16 -> 26 slots must not move any primary socket.
+        for idx in 0..16_u8 {
+            assert_eq!(
+                reconnect_jitter_ms(idx),
+                u64::from(idx) * RECONNECT_JITTER_STEP_MS
+            );
+        }
+        assert_eq!(reconnect_jitter_ms(15), 375);
     }
 
     #[test]
@@ -555,8 +571,8 @@ mod tests {
             }
             assert_eq!(
                 seen.len(),
-                16,
-                "attempt {attempt} must yield 16 distinct delays"
+                usize::from(RECONNECT_JITTER_SLOTS),
+                "attempt {attempt} must yield one distinct delay per slot"
             );
         }
     }
@@ -565,8 +581,11 @@ mod tests {
     fn test_damped_reconnect_delay_with_jitter_exact_values_at_the_cap() {
         assert_eq!(healthy_composed_ms(5, 0), 30_000);
         assert_eq!(healthy_composed_ms(5, 1), 30_025);
+        // The last PRIMARY slot keeps its pre-2026-09-26 value; the last slot
+        // overall (the depth account's last depth-200) sets the maximum.
+        assert_eq!(healthy_composed_ms(5, 15), 30_375);
         assert_eq!(
-            healthy_composed_ms(5, 15),
+            healthy_composed_ms(5, RECONNECT_JITTER_SLOTS - 1),
             RECONNECT_DELAY_WITH_JITTER_MAX_MS
         );
     }
@@ -715,7 +734,7 @@ mod tests {
             assert_eq!(d.verdict, FlapVerdict::ShortSession);
             assert!(seen.insert(d.delay_ms), "connection {idx} collided");
         }
-        assert_eq!(seen.len(), 16);
+        assert_eq!(seen.len(), usize::from(RECONNECT_JITTER_SLOTS));
     }
 
     #[test]

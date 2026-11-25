@@ -60,21 +60,60 @@ use tickvault_common::feed_blame::{
 };
 use tickvault_storage::feed_episode_audit_persistence::{
     FeedEpisodeAuditRow, FeedEpisodeAuditWriter, ensure_feed_episode_audit_table,
+    ensure_feed_episode_audit_table_with,
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_GROWW, LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_SESSION_MINUTES,
+    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
 };
-use tickvault_storage::spot_1m_rest_persistence::SPOT_1M_REST_TABLE;
 
-/// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
-/// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
-/// (dead-WS sweep follow-up) — this module is the sole surviving consumer.
+// ---- `SPOT_1M_REST_TABLE` is RETIRED 2026-09-17 ----
+//
+// It was re-homed into this module on 2026-09-16, one day before this,
+// when the per-minute spot-1m REST leg's persistence module went with its
+// writer — the name still had to resolve because the scoreboard's pull
+// digest queried `rest_spot_1m` for a latency fallback.
+//
+// The digest is now retired too (disposition §12.11), so this module has no
+// reader left and the const is dead. `-D warnings` rejects it.
+//
+// The TABLE and every row in it are still RETAINED — `no-rest-except-live-
+// feed-2026-06-27.md` §12.6 forbids deleting them, and the retention sweep
+// still covers `rest_spot_1m` under `DAY_PARTITIONED_TABLES`. What is gone
+// is the last thing that READ it from this process.
+
+/// Reads the single nonnegative LONG returned by a QuestDB count query.
+/// The optional envelope `count` is the number of result rows, even when
+/// the aggregate itself is zero. Older responses omit column metadata or
+/// its type. When supplied, the column must describe the requested count.
 #[must_use]
 pub fn parse_questdb_count(body: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    v.get("dataset")?.get(0)?.get(0)?.as_i64()
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    if response.get("error").is_some()
+        || response.get("count").is_some_and(|n| n.as_u64() != Some(1))
+    {
+        return None;
+    }
+    if let Some(columns) = response.get("columns") {
+        let [column] = columns.as_array()?.as_slice() else {
+            return None;
+        };
+        if !matches!(column.get("name")?.as_str()?, "count" | "count()")
+            || column
+                .get("type")
+                .is_some_and(|ty| ty.as_str() != Some("LONG"))
+        {
+            return None;
+        }
+    }
+    let [row] = response.get("dataset")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let [value] = row.as_array()?.as_slice() else {
+        return None;
+    };
+    value.as_i64().filter(|n| *n >= 0)
 }
 
 /// IST seconds-of-day of the DETERMINISTIC daily-row timestamp (15:45:00).
@@ -706,11 +745,27 @@ pub fn should_keep_degraded_outcome(
 /// boot-synthesized deaths (a real crash day must never skip its restart
 /// floor) and never applies the latch to forced
 /// (`TICKVAULT_SCOREBOARD_NOW`) runs.
+///
+/// # The feed list is derived, never written out
+///
+/// This read `["dhan", "groww"]` until 2026-08-22. `Feed::ALL` had already
+/// become `[Dhan, Truedata]`, and the daily rows are keyed by
+/// `Feed::as_str()`, so the lookup asked for a key production can no longer
+/// contain. `is_some_and` on a missing key is `false`, so the whole predicate
+/// was `false` on every call and the latch was permanently dead -- re-running
+/// an already-vouched day and re-sending the duplicate Telegram card that the
+/// round-5 fix above exists to prevent.
+///
+/// The unit test asserted on `"groww"` keys too, so it stayed green while the
+/// function it covers could not fire. Both are now driven off `Feed::ALL`,
+/// which is what that constant's own doc has always demanded: "Build every
+/// iteration / allowed-list from this -- never a hand-written `[Feed::Dhan]`
+/// literal -- so a future feed cannot be silently dropped from a list."
 #[must_use]
 pub fn catchup_rerun_is_redundant(existing_outcomes: &BTreeMap<String, String>) -> bool {
-    ["dhan", "groww"].iter().all(|feed| {
+    tickvault_common::feed::Feed::ALL.iter().all(|feed| {
         existing_outcomes
-            .get(*feed)
+            .get(feed.as_str())
             .is_some_and(|o| o == "complete" || o == "feed_off")
     })
 }
@@ -1030,57 +1085,18 @@ pub fn parse_minute_set(body: &str) -> Option<HashSet<String>> {
     Some(out)
 }
 
-/// Feed-level minute overlap: `(a_only, b_only, both)`. Pure, O(minutes ≤ 375).
-#[must_use]
-pub fn compute_minute_overlap(a: &HashSet<String>, b: &HashSet<String>) -> (i64, i64, i64) {
-    let both = a.intersection(b).count();
-    let to_i64 = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
-    (
-        to_i64(a.len().saturating_sub(both)),
-        to_i64(b.len().saturating_sub(both)),
-        to_i64(both),
-    )
-}
-
-/// Step 5: stamp each feed's `unique_win_minutes` / `both_minutes` from
-/// the two session minute sets — UNLESS the PARTNER feed was off for the
-/// day, in which case the comparison columns take the `-1` sentinel
-/// (round 5, 2026-07-10 — MEDIUM): exclusive-vs-nothing is not a
-/// measurement, and the running feed's ~375 "unique win" minutes on a
-/// one-horse day flowed straight into the month verdict's headline
-/// `sum(unique_win_minutes)` (the runbook's row-level
-/// `outcome != 'feed_off'` filter removed only the OFF feed's row). The
-/// DB row itself must not carry a fabricated competitive win — the `-1`
-/// is skipped by the runbook's sentinel-guarded sums, and the month SQL
-/// additionally excludes the whole day (day-level subquery, runbook §2).
-/// Pure.
-pub fn apply_minute_overlap_and_feed_off_sentinels(
-    feed_numbers: &mut BTreeMap<&'static str, FeedDayNumbers>,
-    minute_sets: &BTreeMap<&'static str, Option<HashSet<String>>>,
-    feed_off: &BTreeMap<&'static str, bool>,
-) {
-    if let (Some(Some(dhan_set)), Some(Some(groww_set))) =
-        (minute_sets.get("dhan"), minute_sets.get("groww"))
-    {
-        let (dhan_only, groww_only, both) = compute_minute_overlap(dhan_set, groww_set);
-        if let Some(n) = feed_numbers.get_mut("dhan") {
-            n.unique_win_minutes = dhan_only;
-            n.both_minutes = both;
-        }
-        if let Some(n) = feed_numbers.get_mut("groww") {
-            n.unique_win_minutes = groww_only;
-            n.both_minutes = both;
-        }
-    }
-    for (feed, partner) in [("dhan", "groww"), ("groww", "dhan")] {
-        if feed_off.get(partner).copied().unwrap_or(false)
-            && let Some(n) = feed_numbers.get_mut(feed)
-        {
-            n.unique_win_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-            n.both_minutes = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        }
-    }
-}
+// Feed-vs-feed contest math — RETIRED 2026-08-21 (second-feed removal).
+// `compute_minute_overlap` and `apply_minute_overlap_and_feed_off_sentinels`
+// stamped each feed's `unique_win_minutes` / `both_minutes` from the two
+// session minute sets, and blanked them to the sentinel when the PARTNER feed
+// was off. Both are comparative by definition and had already gone
+// unreachable: `minute_sets` and `feed_off` are keyed from `Feed::ALL`, so the
+// removed feed's lookups always missed and neither branch could fire. The two
+// columns therefore already carried the -1 unavailable sentinel every run —
+// which is what they carry now, unchanged, and what the runbook's
+// sentinel-guarded `sum(unique_win_minutes)` already skips. The columns stay
+// in the schema and are still round-tripped from an existing row on a
+// catch-up rerun; nothing computes them while one feed is live.
 
 // Scoreboard PR-D presence-coverage fold — RETIRED 2026-07-18 (stage-4
 // dead-producer sweep): `apply_presence_coverage`,
@@ -1361,6 +1377,86 @@ pub fn should_suppress_episode_overwrite(
     existing_run_partial == Some(false) && new_run_partial
 }
 
+/// Drop reasons registered on startup and required to prove a measured zero.
+pub const WS_AUDIT_DROP_REASONS: [&str; 5] = [
+    "subscription_change",
+    "live_feed_lifecycle",
+    "live_feed_forward",
+    "full",
+    "closed",
+];
+
+#[derive(Default)]
+struct AuditCounterSample {
+    count: u64,
+    seen: bool,
+    invalid: bool,
+}
+
+impl AuditCounterSample {
+    fn observe(&mut self, raw: Option<&str>) {
+        // The local Rust exporter renders integer counter values in base ten.
+        // Accept its exact format so a small positive fraction cannot round to zero.
+        match raw.and_then(|v| v.parse::<u64>().ok()) {
+            Some(n) => {
+                self.count = self.count.saturating_add(n);
+                self.seen = true;
+            }
+            None => self.invalid = true,
+        }
+    }
+
+    fn reading(&self) -> Option<u64> {
+        (self.count > 0 || (self.seen && !self.invalid)).then_some(self.count)
+    }
+}
+
+/// Read the seven boot-seeded series in one pass. A positive count proves a
+/// lower bound even if the exporter omitted or damaged another series.
+fn socket_audit_counters(body: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut drops = AuditCounterSample::default();
+    let mut append = AuditCounterSample::default();
+    let mut flush = AuditCounterSample::default();
+    let mut seen_reasons = [false; WS_AUDIT_DROP_REASONS.len()];
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(metric) = fields.next() else {
+            continue;
+        };
+        match metric {
+            r#"tv_ws_event_audit_write_errors_total{stage="append"}"# => {
+                append.observe(fields.next())
+            }
+            r#"tv_ws_event_audit_write_errors_total{stage="flush"}"# => {
+                flush.observe(fields.next())
+            }
+            _ => {
+                let Some(labels) = metric.strip_prefix("tv_ws_event_audit_dropped_total") else {
+                    continue;
+                };
+                if !labels.is_empty() && !labels.starts_with('{') {
+                    continue;
+                }
+                let reason = labels
+                    .strip_prefix(r#"{reason=""#)
+                    .and_then(|s| s.strip_suffix(r#""}"#));
+                if let Some(index) = WS_AUDIT_DROP_REASONS
+                    .iter()
+                    .position(|&expected| Some(expected) == reason)
+                {
+                    seen_reasons[index] = true;
+                } else {
+                    // An unlabelled or unknown zero cannot certify the seeded reasons.
+                    drops.invalid = true;
+                }
+                drops.observe(fields.next());
+            }
+        }
+    }
+    drops.invalid |= seen_reasons.contains(&false);
+    (drops.reading(), append.reading(), flush.reading())
+}
+
 /// Sum EVERY series of a counter across its label sets (the bare name AND
 /// `name{labels}` lines) from a Prometheus exposition body. Pure. `None`
 /// when the metric is entirely absent (never silently zero).
@@ -1406,6 +1502,10 @@ pub fn parse_prom_counter_sum(body: &str, name: &str) -> Option<u64> {
 pub struct JsonlCodeEvent {
     pub code: String,
     pub reason: Option<String>,
+    /// The `stage` field, when the line carries one (2026-10-11). Read so a
+    /// RESILIENCE-01 line that only reports SSM reachability is not taken
+    /// as dual-instance evidence (see [`RESILIENCE_01_NON_PEER_STAGES`]).
+    pub stage: Option<String>,
     pub ts_ist_nanos: i64,
 }
 
@@ -1444,15 +1544,39 @@ pub fn parse_errors_jsonl_line(line: &str) -> Option<JsonlCodeEvent> {
         .get("reason")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let stage = v
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let ts = v.get("timestamp")?.as_str()?;
     let parsed = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
     let utc_nanos = parsed.timestamp_nanos_opt()?;
     Some(JsonlCodeEvent {
         code,
         reason,
+        stage,
         ts_ist_nanos: utc_nanos.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS),
     })
 }
+
+/// RESILIENCE-01 `stage` values that report SSM reachability, not a peer
+/// (2026-10-11, review of SUP-9). The code is reused for these lines; none
+/// of them means a second instance was seen, so none sets
+/// `resilience_same_day` (which would blame the day's 805s on us as
+/// `dual_instance`). Emitters: `ssm_transport`,
+/// `release_at_shutdown_incomplete` and `release_at_shutdown_skipped` in
+/// `dhan_rest_stack.rs`; `renew_failed`, `renew_failing`, `renew_lapsed` and
+/// `release_at_shutdown_failed` in `tickvault_core::instance_lock`. A
+/// RESILIENCE-01 line with any other stage, or none, still counts.
+const RESILIENCE_01_NON_PEER_STAGES: [&str; 7] = [
+    "ssm_transport",
+    "release_at_shutdown_incomplete",
+    "release_at_shutdown_skipped",
+    "renew_failed",
+    "renew_failing",
+    "renew_lapsed",
+    "release_at_shutdown_failed",
+];
 
 /// Fold parsed events into day-scoped [`CorrelationEvidence`]. Pure.
 #[must_use]
@@ -1471,6 +1595,11 @@ pub fn collect_correlation_evidence(
             continue;
         }
         match ev.code.as_str() {
+            "RESILIENCE-01"
+                if ev
+                    .stage
+                    .as_deref()
+                    .is_some_and(|stage| RESILIENCE_01_NON_PEER_STAGES.contains(&stage)) => {}
             "RESILIENCE-01" | "RESILIENCE-03" => out.resilience_same_day = true,
             "WS-GAP-09" => match ev.reason.as_deref() {
                 Some("bare_dhan_reset") => out.ws_gap9_bare_ts_nanos.push(ev.ts_ist_nanos),
@@ -1749,14 +1878,34 @@ pub fn is_post_close_connect(prior_ts_ist_nanos: i64, connect_ts_ist_nanos: i64)
 
 /// A post-close reconnect gets the CLEAN scheduled-stop carve-out only
 /// when the feed streamed through the session close — its last streamed
-/// session minute is at/after this IST seconds-of-day threshold (15:28;
-/// two minutes of slack for end-of-session tick sparsity). A last
-/// streamed minute BEFORE this is a HOLE before close — a clean 15:30
+/// session minute is at/after this IST seconds-of-day threshold (the
+/// close less two minutes of slack for end-of-session tick sparsity). A
+/// last streamed minute BEFORE this is a HOLE before close — a clean
 /// close cannot leave one, so the death was a REAL in-market crash
 /// (round 4, 2026-07-10: a 15:26 crash whose 429-cooldown reconnect
 /// landed at ~15:31 was carved out, rendered "restarts: 0" and let the
 /// day stamp outcome='complete').
-pub const POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS: i64 = 15 * 3600 + 28 * 60; // 55_680
+///
+/// # 2026-09-03: DERIVED, because the literal drifted
+///
+/// This was `15 * 3600 + 28 * 60` — a hardcoded 15:28, justified in its own
+/// doc as "two minutes of slack" before a 15:30 close. The session close moved
+/// to 15:40 on 2026-08-07 and `MARKET_HOURS_END_SECS_OF_DAY_IST` — **thirty
+/// lines up, in this same file** — moved with it. This did not. So
+/// `is_post_close_reconnect` has been testing against 15:40 while this tested
+/// against 15:28, and the "two minutes of slack" silently became TWELVE.
+///
+/// The direction is the dangerous one: a feed that genuinely crashed at 15:31
+/// and reconnected after 15:40 leaves a NINE-MINUTE hole before the close, and
+/// this threshold called it a clean scheduled stop — restarts rendered 0, the
+/// day stamped `outcome='complete'`. That is precisely the false-OK the
+/// constant was introduced to prevent, reintroduced by a literal that could
+/// not follow the close.
+///
+/// Deriving it is the fix. A subtraction from the close survives the next
+/// move; a second literal would not, and this file has now proven that twice.
+pub const POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS: i64 =
+    MARKET_HOURS_END_SECS_OF_DAY_IST as i64 - 2 * 60;
 
 /// Latest streamed session minute as IST seconds-of-day, parsed from the
 /// opaque minute keys (`YYYY-MM-DDTHH:MM:…` — the ts column stores IST
@@ -2299,7 +2448,7 @@ pub async fn reconcile_process_death_episodes(
                 ),
             }
         }
-        match writer.flush() {
+        match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
             Ok(()) => {
                 flushed = true;
                 break;
@@ -2351,488 +2500,42 @@ pub async fn reconcile_process_death_episodes(
 }
 
 // ---------------------------------------------------------------------------
-// REST 1m pull digest (Groww REST plan PR-5 — operator Quote 2 2026-07-13:
-// "always clearly note within a second — or within how many seconds
-// precisely — we are fetching this live real OHLCV, along with the option
-// chain API"). Aggregates the day's `rest_fetch_audit` per-fetch forensics
-// rows per (feed, leg) — pull outcome counts, rate-limit hits, and the
-// close→data freshness distribution — plus a latency-only fallback from the
-// `spot_1m_rest` per-row `close_to_data_ms` column for feeds whose per-fetch
-// forensics emits have not landed yet (the Dhan spot leg today — its audit
-// emit sites are the flagged follow-up in rest-1m-pipeline-error-codes.md).
-// Pure aggregation, O(day rows ≤ ~3K) — flagged O(N), cold, once per day.
+// The REST 1m pull digest is RETIRED 2026-09-17
 // ---------------------------------------------------------------------------
-
-/// A pull retrieved this many ms (or more) after its minute closed is a
-/// LATE recovery — a later fire's backfill / the post-close sweep repaired
-/// it, not the prompt in-minute ladder (the #1499 semantics split: prompt
-/// ladders finish well inside the minute by construction). Late repairs are
-/// counted separately and EXCLUDED from the prompt freshness distribution
-/// so one 2-hour sweep repair can never skew the "how fast after close"
-/// answer.
-pub const REST_LEG_LATE_RECOVERY_MS: i64 = 60_000;
-
-/// One parsed `rest_fetch_audit` row (the digest's working subset). Pure
-/// data; rows with unexpected shapes are skipped by the parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestFetchLiteRow {
-    pub feed: String,
-    pub leg: String,
-    pub outcome: String,
-    /// Minute close → retrieval ms; `-1` sentinel on non-ok rows.
-    pub close_to_data_ms: i64,
-    /// 429 attempts inside this fetch's ladder.
-    pub rate_limited_count: i64,
-    /// The row's error-class slug (`pre_boot` splits restart-window rows
-    /// out of "never recovered" — Fix E, 2026-07-17); empty when absent.
-    pub error_class: String,
-}
-
-/// One (feed, leg) day aggregate for the scorecard digest. `-1` = that
-/// number has no measurement source (never a fabricated zero — Rule 11).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RestLegDaySummary {
-    /// Wire feed slug (`dhan` / `groww`).
-    pub feed: String,
-    /// Wire leg slug (`spot_1m` / `chain_1m` / `contract_1m`).
-    pub leg: String,
-    /// Fetches whose target minute was retrieved (`outcome='ok'`).
-    pub ok_fetches: i64,
-    /// Fetches that ended without the target minute (every non-ok,
-    /// non-named-gap outcome: empty / error / rate_limited / no_token /
-    /// skipped).
-    pub failed_fetches: i64,
-    /// Finally-unrecovered minutes (`outcome='named_gap'`, every class
-    /// EXCEPT `pre_boot` — Fix E, 2026-07-17).
-    pub named_gaps: i64,
-    /// `named_gap` rows classed `pre_boot` — minutes from before this
-    /// process started (audit bookkeeping, never a pull failure).
-    pub pre_boot_gaps: i64,
-    /// Sum of 429 attempts across the day's fetches.
-    pub rate_limited_hits: i64,
-    /// Ok rows retrieved ≥ [`REST_LEG_LATE_RECOVERY_MS`] after close —
-    /// repaired by a later fire / the sweep, honest real delay.
-    pub late_recovered: i64,
-    /// Prompt-pull close→data distribution (nearest-rank percentiles over
-    /// ok rows below the late threshold); `-1` when no prompt sample.
-    pub close_p50_ms: i64,
-    pub close_p99_ms: i64,
-    pub close_max_ms: i64,
-    /// Prompt samples the distribution is built from; `0` = measured zero
-    /// (counts exist but every pull failed); `-1` = no latency source.
-    pub close_samples: i64,
-}
-
-/// The day's `rest_fetch_audit` rows (the digest's working subset). Micros
-/// literals — the ONLY representation legal in an embedded QuestDB
-/// TIMESTAMP comparison (the module regression lock).
-#[must_use]
-pub fn build_rest_fetch_audit_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_micros(target_ist_day);
-    format!(
-        "select feed, leg, outcome, close_to_data_ms, rate_limited_count, \
-         error_class from rest_fetch_audit where ts >= {start} and ts < {end}"
-    )
-}
-
-/// The day's per-row `spot_1m_rest.close_to_data_ms` values per feed — the
-/// latency-only fallback source for feeds without per-fetch forensics rows
-/// yet (the Dhan spot leg). Only measured (>= 0) values are fetched; the
-/// -1 sentinel rows (unmeasured) never reach the distribution. Micros
-/// literals.
-#[must_use]
-pub fn build_spot1m_close_latency_day_sql(target_ist_day: u64) -> String {
-    let (start, end) = day_bounds_micros(target_ist_day);
-    format!(
-        "select feed, close_to_data_ms from {SPOT_1M_REST_TABLE} \
-         where ts >= {start} and ts < {end} and close_to_data_ms >= 0"
-    )
-}
-
-/// Parse the [`build_rest_fetch_audit_day_sql`] response. Pure; `None` =
-/// unparsable body; rows with unexpected shapes are SKIPPED (best-effort),
-/// never a panic.
-#[must_use]
-pub fn parse_rest_fetch_audit_lite(body: &str) -> Option<Vec<RestFetchLiteRow>> {
-    let rows = parse_dataset(body)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let cols = match row.as_array() {
-            Some(c) if c.len() >= 5 => c,
-            _ => continue,
-        };
-        let (Some(feed), Some(leg), Some(outcome)) =
-            (cols[0].as_str(), cols[1].as_str(), cols[2].as_str())
-        else {
-            continue;
-        };
-        out.push(RestFetchLiteRow {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            outcome: outcome.to_string(),
-            close_to_data_ms: cols[3].as_i64().unwrap_or(-1),
-            rate_limited_count: cols[4].as_i64().unwrap_or(0),
-            error_class: cols
-                .get(5)
-                .and_then(|c| c.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        });
-    }
-    Some(out)
-}
-
-/// Parse the [`build_spot1m_close_latency_day_sql`] response into
-/// `(feed, close_to_data_ms)` pairs. Pure; `None` = unparsable body.
-#[must_use]
-pub fn parse_feed_close_latency_rows(body: &str) -> Option<Vec<(String, i64)>> {
-    let rows = parse_dataset(body)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(cols) = row.as_array()
-            && cols.len() >= 2
-            && let (Some(feed), Some(ms)) = (cols[0].as_str(), cols[1].as_i64())
-        {
-            out.push((feed.to_string(), ms));
-        }
-    }
-    Some(out)
-}
-
-/// Nearest-rank percentile over an ASCENDING-sorted slice; `-1` on empty
-/// input (the honest "no sample" sentinel). Pure.
-#[must_use]
-pub fn percentile_nearest_rank(sorted_asc: &[i64], pct: u32) -> i64 {
-    if sorted_asc.is_empty() {
-        return SCOREBOARD_UNAVAILABLE_SENTINEL;
-    }
-    let n = sorted_asc.len();
-    let rank = n
-        .saturating_mul(pct.min(100) as usize)
-        .div_ceil(100)
-        .clamp(1, n);
-    sorted_asc[rank - 1]
-}
-
-/// Fold one leg's prompt-latency samples into the percentile columns.
-fn fill_latency_distribution(s: &mut RestLegDaySummary, mut prompt_ms: Vec<i64>) {
-    prompt_ms.sort_unstable();
-    s.close_samples = i64::try_from(prompt_ms.len()).unwrap_or(i64::MAX);
-    s.close_p50_ms = percentile_nearest_rank(&prompt_ms, 50);
-    s.close_p99_ms = percentile_nearest_rank(&prompt_ms, 99);
-    s.close_max_ms = prompt_ms
-        .last()
-        .copied()
-        .unwrap_or(SCOREBOARD_UNAVAILABLE_SENTINEL);
-}
-
-/// Aggregate the day's per-fetch forensics rows (+ the spot latency
-/// fallback pairs) into per-(feed, leg) digest summaries. Pure,
-/// deterministic order (feed, then leg). Semantics:
-///
-/// - `ok` rows below [`REST_LEG_LATE_RECOVERY_MS`] feed the prompt
-///   freshness distribution; at/above it they count `late_recovered`
-///   (repaired later — the real delay stays honest, out of the prompt
-///   distribution).
-/// - `named_gap` rows count separately (never a "failed fetch" — they are
-///   the finally-unrecovered minutes).
-/// - Every other outcome counts `failed_fetches`; `rate_limited_count`
-///   sums across ALL rows.
-/// - A feed with a `spot_1m` data-table latency row but NO audit rows for
-///   that leg gets a latency-only summary (counts stay `-1` — that source
-///   records no outcomes). The same late split applies (backfilled data
-///   rows carry the real > 60s repair delay per the #1499 semantics).
-#[must_use]
-pub fn aggregate_rest_leg_day(
-    audit_rows: &[RestFetchLiteRow],
-    spot_latency_fallback: &[(String, i64)],
-) -> Vec<RestLegDaySummary> {
-    let mut map: BTreeMap<(String, String), (RestLegDaySummary, Vec<i64>)> = BTreeMap::new();
-    for r in audit_rows {
-        let key = (r.feed.clone(), r.leg.clone());
-        let entry = map.entry(key).or_insert_with(|| {
-            (
-                RestLegDaySummary {
-                    feed: r.feed.clone(),
-                    leg: r.leg.clone(),
-                    ok_fetches: 0,
-                    failed_fetches: 0,
-                    named_gaps: 0,
-                    pre_boot_gaps: 0,
-                    rate_limited_hits: 0,
-                    late_recovered: 0,
-                    close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-                    close_samples: 0,
-                },
-                Vec::new(),
-            )
-        });
-        let (s, prompt) = entry;
-        s.rate_limited_hits = s
-            .rate_limited_hits
-            .saturating_add(r.rate_limited_count.max(0));
-        match r.outcome.as_str() {
-            "ok" => {
-                s.ok_fetches = s.ok_fetches.saturating_add(1);
-                if r.close_to_data_ms >= 0 {
-                    if r.close_to_data_ms >= REST_LEG_LATE_RECOVERY_MS {
-                        s.late_recovered = s.late_recovered.saturating_add(1);
-                    } else {
-                        prompt.push(r.close_to_data_ms);
-                    }
-                }
-            }
-            // Fix E: `pre_boot`-classed rows are restart-window
-            // bookkeeping, never "never recovered" pull failures.
-            "named_gap" if r.error_class == "pre_boot" => {
-                s.pre_boot_gaps = s.pre_boot_gaps.saturating_add(1);
-            }
-            "named_gap" => s.named_gaps = s.named_gaps.saturating_add(1),
-            _ => s.failed_fetches = s.failed_fetches.saturating_add(1),
-        }
-    }
-    // Latency-only fallback: a feed whose spot leg persisted measured
-    // close→data values but wrote NO audit rows (the Dhan spot leg until
-    // its forensics follow-up lands) still answers Quote 2 — with counts
-    // honestly left at the -1 sentinel.
-    let mut fallback: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    for (feed, ms) in spot_latency_fallback {
-        if *ms >= 0 {
-            fallback.entry(feed.clone()).or_default().push(*ms);
-        }
-    }
-    for (feed, values) in fallback {
-        let key = (feed.clone(), "spot_1m".to_string());
-        if map.contains_key(&key) {
-            continue; // the per-fetch forensics source wins
-        }
-        let mut s = RestLegDaySummary {
-            feed,
-            leg: "spot_1m".to_string(),
-            ok_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            failed_fetches: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            named_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            pre_boot_gaps: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            rate_limited_hits: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            late_recovered: 0,
-            close_p50_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_p99_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_max_ms: SCOREBOARD_UNAVAILABLE_SENTINEL,
-            close_samples: 0,
-        };
-        let prompt: Vec<i64> = values
-            .iter()
-            .copied()
-            .filter(|ms| {
-                if *ms >= REST_LEG_LATE_RECOVERY_MS {
-                    s.late_recovered = s.late_recovered.saturating_add(1);
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        fill_latency_distribution(&mut s, prompt);
-        map.insert(key, (s, Vec::new()));
-    }
-    map.into_values()
-        .map(|(mut s, prompt)| {
-            if !prompt.is_empty() {
-                fill_latency_distribution(&mut s, prompt);
-            }
-            s
-        })
-        .collect()
-}
-
-/// Static gauge-label allowlist for the digest's dashboard gauge — metric
-/// labels must never carry unbounded parsed strings. `None` = an
-/// unexpected slug (skipped, defensive).
-#[must_use]
-pub fn rest_leg_gauge_labels(feed: &str, leg: &str) -> Option<(&'static str, &'static str)> {
-    let f = match feed {
-        "dhan" => "dhan",
-        "groww" => "groww",
-        _ => return None,
-    };
-    let l = match leg {
-        "spot_1m" => "spot_1m",
-        "chain_1m" => "chain_1m",
-        "contract_1m" => "contract_1m",
-        _ => return None,
-    };
-    Some((f, l))
-}
-
-/// Map the day summaries into the Telegram card's digest lines. The FOUR
-/// canonical (feed, leg) pairs ALWAYS render — the operator's Quote-2
-/// answer must exist even as an honest "not measured yet" — and any EXTRA
-/// measured pair (the PR-4 contract leg, once its forensics rows land)
-/// lights up automatically after them. Wire slugs are mapped to plain
-/// English here so no slug ever reaches Telegram (commandment 2).
-#[must_use]
-pub fn build_rest_leg_score_lines(
-    summaries: &[RestLegDaySummary],
-) -> Vec<tickvault_core::notification::events::RestLegScoreLine> {
-    use tickvault_core::notification::events::RestLegScoreLine;
-    let feed_display = |f: &str| match f {
-        "dhan" => "Dhan".to_string(),
-        "groww" => "Groww".to_string(),
-        other => other.to_string(),
-    };
-    let leg_display = |l: &str| match l {
-        "spot_1m" => "spot candles".to_string(),
-        "chain_1m" => "option chain".to_string(),
-        "contract_1m" => "option contracts".to_string(),
-        other => other.to_string(),
-    };
-    let to_line = |feed: &str, leg: &str, s: Option<&RestLegDaySummary>| -> RestLegScoreLine {
-        let sent = SCOREBOARD_UNAVAILABLE_SENTINEL;
-        match s {
-            Some(s) => RestLegScoreLine {
-                feed: feed_display(feed),
-                leg: leg_display(leg),
-                ok_fetches: s.ok_fetches,
-                failed_fetches: s.failed_fetches,
-                named_gaps: s.named_gaps,
-                pre_boot_gaps: s.pre_boot_gaps,
-                rate_limited_hits: s.rate_limited_hits,
-                late_recovered: s.late_recovered,
-                close_p50_ms: s.close_p50_ms,
-                close_p99_ms: s.close_p99_ms,
-                close_max_ms: s.close_max_ms,
-                close_samples: s.close_samples,
-            },
-            None => RestLegScoreLine {
-                feed: feed_display(feed),
-                leg: leg_display(leg),
-                ok_fetches: sent,
-                failed_fetches: sent,
-                named_gaps: sent,
-                pre_boot_gaps: sent,
-                rate_limited_hits: sent,
-                late_recovered: sent,
-                close_p50_ms: sent,
-                close_p99_ms: sent,
-                close_max_ms: sent,
-                close_samples: sent,
-            },
-        }
-    };
-    const CANONICAL: [(&str, &str); 4] = [
-        ("dhan", "spot_1m"),
-        ("dhan", "chain_1m"),
-        ("groww", "spot_1m"),
-        ("groww", "chain_1m"),
-    ];
-    let mut out = Vec::with_capacity(summaries.len().max(4));
-    for (feed, leg) in CANONICAL {
-        let s = summaries.iter().find(|s| s.feed == feed && s.leg == leg);
-        out.push(to_line(feed, leg, s));
-    }
-    for s in summaries {
-        if !CANONICAL.contains(&(s.feed.as_str(), s.leg.as_str())) {
-            out.push(to_line(&s.feed, &s.leg, Some(s)));
-        }
-    }
-    // G6 (fix round 2): the F3 not-measured `info!` moved OUT of this
-    // builder into the AGGREGATION path (`log_rest_leg_measurement_gaps`,
-    // called right after `aggregate_rest_leg_day`) — this builder was
-    // only invoked on the telegram-enabled branch of main.rs, so on a
-    // telegram-disabled boot the §2b always-render contract was satisfied
-    // neither on the card nor in logs.
-    out
-}
-
-/// The CANONICAL card pairs whose lines carry MEASURED latency but NO
-/// pull counts (`ok_fetches == -1`, `close_samples > 0`) — the documented
-/// `spot_1m_rest` latency-only fallback source (a forensics-writer outage
-/// window or a pre-2026-07-14 backfill day). These pairs RENDER count-less
-/// on the card (G6, fix round 2) and are logged as latency-only — never
-/// as "not measured" (that log statement was false for exactly this arm).
-#[must_use]
-pub fn latency_only_canonical_rest_pairs(
-    lines: &[tickvault_core::notification::events::RestLegScoreLine],
-) -> Vec<(String, String)> {
-    CANONICAL_DISPLAY
-        .iter()
-        .filter(|(feed, leg)| {
-            let counts_measured = lines
-                .iter()
-                .any(|l| l.feed == *feed && l.leg == *leg && l.ok_fetches >= 0);
-            let latency_measured = lines
-                .iter()
-                .any(|l| l.feed == *feed && l.leg == *leg && l.close_samples > 0);
-            !counts_measured && latency_measured
-        })
-        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
-        .collect()
-}
-
-/// F3 log-side always-render contract, re-homed to the AGGREGATION path
-/// (G6, fix round 2) so it fires even when the scorecard Telegram is
-/// disabled — one truthful `info!` per canonical pair that is either
-/// wholly unmeasured (nothing on the card) or latency-only (renders a
-/// count-less delay segment). See the RULE-CONTRACT TENSION note on
-/// `unmeasured_canonical_rest_pairs`.
-pub fn log_rest_leg_measurement_gaps(summaries: &[RestLegDaySummary]) {
-    let lines = build_rest_leg_score_lines(summaries);
-    for (feed, leg) in unmeasured_canonical_rest_pairs(&lines) {
-        info!(
-            %feed,
-            %leg,
-            "rest-leg digest: {feed}/{leg} not measured — omitted from the \
-             scorecard card per the 2026-07-15 cleanliness directive; the \
-             always-render contract is satisfied in logs pending the \
-             rule-file supersession"
-        );
-    }
-    for (feed, leg) in latency_only_canonical_rest_pairs(&lines) {
-        info!(
-            %feed,
-            %leg,
-            "rest-leg digest: {feed}/{leg} latency measured, pull counts \
-             missing (the spot_1m_rest latency-only fallback source) — \
-             renders a count-less delay segment on the scorecard card"
-        );
-    }
-}
-
-/// The four canonical card pairs (display names) the §2b contract names.
-const CANONICAL_DISPLAY: [(&str, &str); 4] = [
-    ("Dhan", "spot candles"),
-    ("Dhan", "option chain"),
-    ("Groww", "spot candles"),
-    ("Groww", "option chain"),
-];
-
-/// The CANONICAL card pairs (Dhan/Groww × spot candles/option chain) with
-/// NOTHING measured today — no pull counts AND no latency samples. Pure so
-/// the F3 not-measured logging is unit-testable.
-///
-/// G6 (fix round 2): a pair on the documented `spot_1m_rest` latency-only
-/// fallback (`ok_fetches == -1`, `close_samples > 0`) is MEASURED — it was
-/// previously misclassified unmeasured here (a false log statement while
-/// its real latency sat in the same lines vec) and simultaneously dropped
-/// from the card. Latency-only pairs are named separately by
-/// [`latency_only_canonical_rest_pairs`].
-#[must_use]
-pub fn unmeasured_canonical_rest_pairs(
-    lines: &[tickvault_core::notification::events::RestLegScoreLine],
-) -> Vec<(String, String)> {
-    CANONICAL_DISPLAY
-        .iter()
-        .filter(|(feed, leg)| {
-            !lines.iter().any(|l| {
-                l.feed == *feed && l.leg == *leg && (l.ok_fetches >= 0 || l.close_samples > 0)
-            })
-        })
-        .map(|(feed, leg)| ((*feed).to_string(), (*leg).to_string()))
-        .collect()
-}
-
+//
+// ~480 lines: `RestFetchLiteRow`, `RestLegDaySummary`, the two day queries
+// (`build_rest_fetch_audit_day_sql` over `rest_fetch_audit`,
+// `build_spot1m_close_latency_day_sql` over `rest_spot_1m`), their parsers,
+// the percentile filler, `aggregate_rest_leg_day`, the per-leg gauge labels,
+// the score-line builder and the measurement-gap logger.
+//
+// It existed for the operator's 2026-07-13 Quote 2 — "always clearly note
+// within a second, or within how many seconds precisely, we are fetching
+// this live real OHLCV, along with the option chain API" — and it answered
+// that by aggregating the day's per-fetch forensics per (feed, leg).
+//
+// Both tables it read still EXIST and keep their history; what changed is
+// that nothing WRITES them any more. The operator's SOCKETS-ONLY narrowing
+// removed the per-minute spot-1m and option-chain legs
+// (`no-rest-except-live-feed-2026-06-27.md` §12.10), so from that day this
+// arm aggregated zero rows for every target day — two QuestDB queries a
+// day to measure legs that no longer run. §12.11's disposition table names
+// this arm REMOVE for exactly that reason.
+//
+// ⚠ A PRECISION NOTE on §12.9(a), which listed this reader as failing
+// "silent — percentiles emit the `-1` no-sample sentinel, digest renders
+// 'no data'". Measured before cutting: the render is BETTER than that.
+// `render_pulls_per_leg` returns `None` when no leg produced a part, so an
+// empty aggregate OMITS the pulls segment rather than printing a fabricated
+// "0/0 ✅". The removal is still right — a dead subsystem that reads as
+// live is the cost here, not a false green — but the failure mode was
+// milder than recorded, and this file's own §12.9 is the section that
+// corrected §12.8 for imprecision.
+//
+// WHAT IS LOST, stated rather than implied: the scorecard no longer
+// answers "how many seconds after minute close did the pull land", because
+// there is no pull. Nothing replaces it; nothing needs to.
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // The 15:45 IST daily aggregation
 // ---------------------------------------------------------------------------
@@ -2927,7 +2630,6 @@ impl FeedDayNumbers {
 pub struct ScoreboardSummary {
     pub trading_date_ist: String,
     pub dhan: FeedDayNumbers,
-    pub groww: FeedDayNumbers,
     pub session_minutes: i64,
     /// A data SOURCE was unavailable mid-run (read/parse/flush failure) —
     /// distinct from `early_run` so the Telegram footnotes stay honest
@@ -2946,16 +2648,6 @@ pub struct ScoreboardSummary {
     /// stamps the distinct 'feed_off' outcome and the card says "no
     /// contest" instead of declaring a one-horse winner.
     pub dhan_feed_off: bool,
-    /// Groww was switched OFF for the day (round 4, 2026-07-10).
-    pub groww_feed_off: bool,
-    /// REST 1m pull digest aggregates per (feed, leg) — the Quote-2 daily
-    /// answer (Groww REST plan PR-5). Empty on days with no measurable
-    /// pull records (pre-deploy days / read failure — see the flag below).
-    pub rest_legs: Vec<RestLegDaySummary>,
-    /// `true` when the pull-record read/parse failed while building the
-    /// digest — the card carries the honest cause footnote; the rest of
-    /// the scorecard is UNAFFECTED (the digest is additive by design).
-    pub rest_legs_read_failed: bool,
 }
 
 /// RunCatchUp already-ran probe (round 4, 2026-07-10 — LOW): reads the
@@ -2979,6 +2671,111 @@ pub async fn day_already_scored_complete(questdb: &QuestDbConfig, target_ist_day
             parse_existing_daily_outcomes(&body).is_some_and(|m| catchup_rerun_is_redundant(&m))
         }
         None => false,
+    }
+}
+
+/// Logs a QuestDB read or write failure inside one scoreboard attempt (plan
+/// PR AL-2 review, 2026-11-06): the coded `SCOREBOARD-01` error on the final
+/// attempt, `info!` with no code on an earlier one (the attempt is retried
+/// whole, so a transient stall never pages).
+macro_rules! scoreboard_failure {
+    ($final_attempt:expr, $($field:tt)+) => {
+        if $final_attempt {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                $($field)+
+            );
+        } else {
+            info!(will_retry = true, $($field)+);
+        }
+    };
+}
+
+/// Logs a scoreboard FINDING (a keep-better regression, an audit drop): a
+/// real result of data that WAS read, so it is coded on whichever attempt
+/// first sees it, and `info!` on a later attempt that sees it again (one
+/// page per run, not one per retry).
+macro_rules! scoreboard_finding {
+    ($ctx:expr, $($field:tt)+) => {{
+        if $ctx.findings_reported {
+            info!(repeated_on_retry = true, $($field)+);
+        } else {
+            error!(
+                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                $($field)+
+            );
+        }
+        $ctx.findings_logged_this_attempt = true;
+    }};
+}
+
+/// State carried across the attempts of one scoreboard run (plan PR AL-2).
+#[derive(Debug, Default)]
+struct ScoreboardAttempt {
+    /// This attempt is the last one: failures are reported with the code.
+    final_attempt: bool,
+    /// The scoreboard and episode tables were ensured by an earlier attempt.
+    ddl_ok: bool,
+    /// A finding was already logged (coded) by an earlier attempt.
+    findings_reported: bool,
+    /// This attempt logged a finding.
+    findings_logged_this_attempt: bool,
+}
+
+/// How one scoreboard attempt ended.
+#[allow(clippy::large_enum_variant)] // APPROVED: built and moved once per attempt (at most 8 a day), cold path; boxing would add an allocation for nothing.
+enum ScoreboardAttemptEnd {
+    /// A QuestDB read or write failed before the final attempt: retry the
+    /// whole attempt (nothing was written for the day's rows).
+    Retry,
+    /// Finished. `rows_landed` is whether the daily rows reached QuestDB.
+    Finished {
+        result: Result<ScoreboardSummary, String>,
+        rows_landed: bool,
+    },
+}
+
+/// Writes the day's scoreboard rows once (a fresh writer each attempt: one
+/// built while QuestDB was unreachable has no sender and could never flush).
+/// Returns `true` only when at least one row was appended and the flush
+/// landed, so an all-append-failure is never counted `ok` (review
+/// 2026-11-06). A flush failure is reported per [`scoreboard_failure!`].
+/// Cold path, a few rows.
+async fn write_daily_rows_once(
+    questdb: &QuestDbConfig,
+    rows: &[FeedScoreboardDailyRow],
+    final_attempt: bool,
+) -> bool {
+    let mut writer = FeedScoreboardWriter::new(questdb);
+    let mut appended = 0_usize;
+    for row in rows {
+        // An append error is a row-encoding failure, not QuestDB being down.
+        match writer.append_daily_row(row) {
+            Ok(()) => appended += 1,
+            Err(err) => scoreboard_failure!(
+                final_attempt,
+                stage = "daily_append",
+                feed = row.feed,
+                ?err,
+                "SCOREBOARD-01: daily row append failed"
+            ),
+        }
+    }
+    if appended == 0 {
+        return false;
+    }
+    match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
+        Ok(()) => true,
+        Err(err) => {
+            scoreboard_failure!(
+                final_attempt,
+                stage = "daily_flush",
+                ?err,
+                "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
+                 DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
+            );
+            false
+        }
     }
 }
 
@@ -3008,13 +2805,122 @@ pub async fn run_feed_scoreboard(
     boot_reconciled_rows: &[FeedEpisodeAuditRow],
     runtime_enabled_now: Option<(bool, bool)>,
 ) -> Result<ScoreboardSummary, String> {
-    ensure_feed_scoreboard_tables(questdb).await;
-    ensure_feed_episode_audit_table(questdb).await;
+    use crate::ws_connection_rollup::{
+        ROLLUP_RETRY_INTERVAL_SECS, RollupAttemptOutcome, note_rollup_attempt, now_secs_of_day_ist,
+        rollup_attempt_is_final,
+    };
+    // Plan PR AL-2 (2026-11-06, review fixes the same day): only the
+    // same-day run retries, and it retries the WHOLE aggregation (DDL, reads,
+    // build, write), so a retried row is never built from reads that failed.
+    // At most `ROLLUP_MAX_ATTEMPTS` (8) attempts, none starting after 16:20
+    // IST. A past-day backfill (`TICKVAULT_SCOREBOARD_DATE`) makes one
+    // attempt, as before: the operator re-runs it.
+    let retry_until_deadline = is_same_day_run;
+    let mut ctx = ScoreboardAttempt::default();
+    let mut attempts_made = 0_u32;
+    loop {
+        ctx.final_attempt =
+            rollup_attempt_is_final(retry_until_deadline, attempts_made, now_secs_of_day_ist());
+        ctx.findings_logged_this_attempt = false;
+        attempts_made = attempts_made.saturating_add(1);
+        match run_feed_scoreboard_attempt(
+            questdb,
+            metrics_port,
+            target_ist_day,
+            trading_date_label.clone(),
+            forced_early_run,
+            coverage_detail_rows,
+            is_same_day_run,
+            boot_synthesized_deaths,
+            boot_reconciled_rows,
+            runtime_enabled_now,
+            &mut ctx,
+        )
+        .await
+        {
+            ScoreboardAttemptEnd::Finished {
+                result,
+                rows_landed,
+            } => {
+                note_rollup_attempt(if rows_landed {
+                    RollupAttemptOutcome::Ok
+                } else {
+                    RollupAttemptOutcome::GaveUp
+                });
+                return result;
+            }
+            ScoreboardAttemptEnd::Retry => {
+                note_rollup_attempt(RollupAttemptOutcome::Retry);
+                ctx.findings_reported |= ctx.findings_logged_this_attempt;
+                info!(
+                    attempt = attempts_made,
+                    retry_in_secs = ROLLUP_RETRY_INTERVAL_SECS,
+                    "feed_scoreboard: a QuestDB read or write did not succeed — \
+                     retrying the whole aggregation; the coded error is logged \
+                     only if the last attempt before 16:20 IST fails"
+                );
+                tokio::time::sleep(Duration::from_secs(ROLLUP_RETRY_INTERVAL_SECS)).await;
+            }
+        }
+    }
+}
 
-    let client = reqwest::Client::builder()
+/// One attempt of [`run_feed_scoreboard`]: steps 1 to 8d. Returns
+/// [`ScoreboardAttemptEnd::Retry`] (before the final attempt only) when a
+/// QuestDB read or write failed; nothing for the day's daily rows is written
+/// by a retried attempt. Cold path.
+#[allow(clippy::too_many_arguments)] // APPROVED: the run's own argument list plus the attempt state; one caller.
+#[allow(clippy::too_many_lines)] // APPROVED: the existing once-a-day orchestration body, moved unchanged into an attempt.
+async fn run_feed_scoreboard_attempt(
+    questdb: &QuestDbConfig,
+    metrics_port: u16,
+    target_ist_day: u64,
+    trading_date_label: String,
+    forced_early_run: bool,
+    coverage_detail_rows: bool,
+    is_same_day_run: bool,
+    boot_synthesized_deaths: usize,
+    boot_reconciled_rows: &[FeedEpisodeAuditRow],
+    runtime_enabled_now: Option<(bool, bool)>,
+    ctx: &mut ScoreboardAttempt,
+) -> ScoreboardAttemptEnd {
+    let retry_until_deadline = is_same_day_run;
+    let final_attempt = ctx.final_attempt;
+    // Every QuestDB read or write failure below returns `Retry` at once when
+    // this is not the final attempt (before anything else is written), and
+    // logs the coded error only on the final attempt (`scoreboard_failure!`).
+    if !ctx.ddl_ok {
+        // A past-day backfill makes one attempt per statement, as before the
+        // retries existed; the same-day run retries each statement.
+        let ddl_attempts = if retry_until_deadline {
+            SCOREBOARD_DDL_MAX_ATTEMPTS
+        } else {
+            1
+        };
+        let failed = ensure_feed_scoreboard_tables_with(questdb, ddl_attempts, final_attempt)
+            .await
+            .saturating_add(
+                ensure_feed_episode_audit_table_with(questdb, ddl_attempts, final_attempt).await,
+            );
+        if failed == 0 {
+            ctx.ddl_ok = true;
+        } else if !final_attempt {
+            return ScoreboardAttemptEnd::Retry;
+        }
+    }
+
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(SCOREBOARD_HTTP_TIMEOUT_SECS))
         .build()
-        .map_err(|e| format!("HTTP client build failed: {e}"))?;
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ScoreboardAttemptEnd::Finished {
+                result: Err(format!("HTTP client build failed: {e}")),
+                rows_landed: false,
+            };
+        }
+    };
 
     let (day_start, _) = day_bounds_nanos(target_ist_day);
     let trading_date_ist_nanos = day_start;
@@ -3092,24 +2998,32 @@ pub async fn run_feed_scoreboard(
                 Some(body) => match parse_existing_episode_partiality(&body) {
                     Some(map) => map,
                     None => {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "keep_better_read",
                             "SCOREBOARD-01: existing-episode read-back unparsable — \
                              the keep-better guard is OFF this run; a partial-evidence \
                              re-run may overwrite evidence-backed blame"
                         );
+                        // Before the final attempt, stop HERE: step 2 would
+                        // write episode rows without the keep-better guard.
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         HashMap::new()
                     }
                 },
                 None => {
-                    error!(
-                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    scoreboard_failure!(
+                        final_attempt,
                         stage = "keep_better_read",
                         "SCOREBOARD-01: existing-episode read-back failed — the \
                          keep-better guard is OFF this run; a partial-evidence \
                          re-run may overwrite evidence-backed blame"
                     );
+                    if !final_attempt {
+                        return ScoreboardAttemptEnd::Retry;
+                    }
                     HashMap::new()
                 }
             }
@@ -3208,8 +3122,8 @@ pub async fn run_feed_scoreboard(
                                 episode.run_partial,
                             )
                         {
-                            error!(
-                                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                            scoreboard_finding!(
+                                ctx,
                                 stage = "blame_regression",
                                 feed = %episode.feed,
                                 ws_type = %episode.ws_type,
@@ -3237,8 +3151,8 @@ pub async fn run_feed_scoreboard(
                         match writer.append_row(&episode) {
                             Ok(()) => appended += 1,
                             Err(err) => {
-                                error!(
-                                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                                scoreboard_finding!(
+                                    ctx,
                                     stage = "episode_append",
                                     ?err,
                                     "SCOREBOARD-01: episode append failed"
@@ -3248,18 +3162,21 @@ pub async fn run_feed_scoreboard(
                         }
                     }
                 }
-                match writer.flush() {
+                match tickvault_storage::off_worker::off_worker(|| writer.flush()) {
                     Ok(()) => {
                         metrics::counter!("tv_feed_scoreboard_episode_rows_total")
                             .increment(appended);
                     }
                     Err(err) => {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "episode_flush",
                             ?err,
                             "SCOREBOARD-01: episode flush failed (QuestDB down?)"
                         );
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         sources_complete = false;
                     }
                 }
@@ -3268,20 +3185,26 @@ pub async fn run_feed_scoreboard(
                 up_signals = Some(ups);
             }
             None => {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "ws_events_parse",
                     "SCOREBOARD-01: could not parse today's connection events"
                 );
+                if !final_attempt {
+                    return ScoreboardAttemptEnd::Retry;
+                }
                 sources_complete = false;
             }
         },
         None => {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_failure!(
+                final_attempt,
                 stage = "ws_events_read",
                 "SCOREBOARD-01: could not read today's connection events"
             );
+            if !final_attempt {
+                return ScoreboardAttemptEnd::Retry;
+            }
             sources_complete = false;
         }
     }
@@ -3320,22 +3243,28 @@ pub async fn run_feed_scoreboard(
             match exec_query(&client, questdb, &boot_sql).await {
                 Some(body) => {
                     if fold_episode_readback_rows(&mut mem, &body, &skip_keys).is_none() {
-                        error!(
-                            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                        scoreboard_failure!(
+                            final_attempt,
                             stage = "boot_reconciled_parse",
                             "SCOREBOARD-01: boot-reconciled episode read-back \
                              unparsable — restart counts may under-count"
                         );
+                        if !final_attempt {
+                            return ScoreboardAttemptEnd::Retry;
+                        }
                         sources_complete = false;
                     }
                 }
                 None => {
-                    error!(
-                        code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                    scoreboard_failure!(
+                        final_attempt,
                         stage = "boot_reconciled_read",
                         "SCOREBOARD-01: boot-reconciled episode read-back failed \
                          — restart counts may under-count"
                     );
+                    if !final_attempt {
+                        return ScoreboardAttemptEnd::Retry;
+                    }
                     sources_complete = false;
                 }
             }
@@ -3352,8 +3281,8 @@ pub async fn run_feed_scoreboard(
                     None => None,
                 };
             if fallback.is_none() {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "episode_aggregate",
                     "SCOREBOARD-01: episode blame aggregate unavailable — recording sentinels"
                 );
@@ -3366,7 +3295,6 @@ pub async fn run_feed_scoreboard(
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
     let mut feed_numbers: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-    let mut minute_sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let mut n = FeedDayNumbers::unavailable();
@@ -3393,9 +3321,19 @@ pub async fn run_feed_scoreboard(
             n.streaming_minutes = i64::try_from(s.len()).unwrap_or(i64::MAX);
         }
         if n.ticks < 0 || n.instruments < 0 || set.is_none() {
+            // A count read failed (an empty day still answers 0). Before the
+            // final attempt this is retried, never written as -1 sentinels.
+            if !final_attempt {
+                info!(
+                    will_retry = true,
+                    feed = label,
+                    "feed_scoreboard: a tick / instrument / minute count read \
+                     did not answer"
+                );
+                return ScoreboardAttemptEnd::Retry;
+            }
             sources_complete = false;
         }
-        minute_sets.insert(label, set);
         feed_numbers.insert(label, n);
     }
 
@@ -3414,14 +3352,17 @@ pub async fn run_feed_scoreboard(
         {
             Some(Some(existing)) => Some(existing),
             Some(None) | None => {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_failure!(
+                    final_attempt,
                     stage = "outcome_keep_better_read",
                     "SCOREBOARD-01: existing daily-outcome read failed/unparsable \
                      — the daily keep-better guards are OFF this run; a rerun may \
                      erase a 'degraded'/'feed_off' verdict or a measured lag \
                      distribution"
                 );
+                if !final_attempt {
+                    return ScoreboardAttemptEnd::Retry;
+                }
                 None
             }
         }
@@ -3454,11 +3395,11 @@ pub async fn run_feed_scoreboard(
         let ticks = feed_numbers
             .get(label)
             .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, |n| n.ticks);
-        let enabled_now = runtime_enabled_now.map(|(dhan_on, groww_on)| {
+        let enabled_now = runtime_enabled_now.map(|(dhan_on, secondary_on)| {
             if matches!(feed, tickvault_common::feed::Feed::Dhan) {
                 dhan_on
             } else {
-                groww_on
+                secondary_on
             }
         });
         let inferred = up_signals.as_ref().is_some_and(|ups| {
@@ -3479,8 +3420,8 @@ pub async fn run_feed_scoreboard(
             should_keep_feed_off_outcome(m.get(label).map(String::as_str), inferred, ticks)
         });
         if kept {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_finding!(
+                ctx,
                 stage = "outcome_regression",
                 feed = label,
                 "SCOREBOARD-01: this rerun would ERASE the day's existing \
@@ -3500,12 +3441,9 @@ pub async fn run_feed_scoreboard(
         feed_off.insert(label, inferred || kept);
     }
 
-    // 5c. Feed-level unique-win / both minutes from the two minute sets —
-    //     with the `-1` sentinel on the PARTNER's comparison columns on a
-    //     feed-off day (round 5, 2026-07-10 — MEDIUM: exclusive-vs-nothing
-    //     is not a measurement; the phantom ~375 unique minutes skewed the
-    //     month verdict's headline sum).
-    apply_minute_overlap_and_feed_off_sentinels(&mut feed_numbers, &minute_sets, &feed_off);
+    // 5c. Feed-level unique-win / both minutes — RETIRED 2026-08-21 with the
+    //     second feed; see the dated note beside `parse_minute_set`. The two
+    //     columns keep the -1 unavailable sentinel they already carried.
 
     // 5d. Per-instrument presence drain — RETIRED 2026-07-18 (stage-4
     //     dead-producer sweep): the in-memory presence registry was deleted
@@ -3578,8 +3516,8 @@ pub async fn run_feed_scoreboard(
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_lag.as_ref().and_then(|m| m.get(label));
             if fold_existing_lag_keep_better(n, existing) {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_finding!(
+                    ctx,
                     stage = "lag_regression",
                     feed = label,
                     kept_samples = n.lag_samples,
@@ -3607,8 +3545,8 @@ pub async fn run_feed_scoreboard(
         if let Some(n) = feed_numbers.get_mut(label) {
             let existing = existing_coverage.as_ref().and_then(|m| m.get(label));
             if fold_existing_coverage_keep_better(n, existing) {
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+                scoreboard_finding!(
+                    ctx,
                     stage = "coverage_regression",
                     feed = label,
                     "SCOREBOARD-01: this rerun's coverage came from a \
@@ -3621,98 +3559,22 @@ pub async fn run_feed_scoreboard(
         }
     }
 
-    // 6e. REST 1m pull digest (Groww REST plan PR-5 — the operator's
-    //     Quote-2 mandate: "within how many seconds precisely"). Reads the
-    //     day's rest_fetch_audit forensics rows + the spot_1m_rest
-    //     latency-fallback column and aggregates per (feed, leg). ADDITIVE
-    //     + best-effort: a read/parse failure logs SCOREBOARD-01
-    //     (stage=rest_leg_*), flags the card's honest footnote, and NEVER
-    //     touches the episode/coverage/lag sections, the daily rows, or
-    //     the run outcome. Nothing is persisted — the aggregates are
-    //     recomputed from the durable audit table on every run, so
-    //     backfills/reruns are idempotent by construction and no
-    //     keep-better guard is needed (the PR-C conventions apply at
-    //     RENDER time via the -1 sentinels).
-    let mut rest_legs_read_failed = false;
-    let audit_lite: Vec<RestFetchLiteRow> = {
-        let sql = build_rest_fetch_audit_day_sql(target_ist_day);
-        match exec_query(&client, questdb, &sql).await {
-            Some(body) => parse_rest_fetch_audit_lite(&body).unwrap_or_else(|| {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_parse",
-                    "SCOREBOARD-01: the day's rest_fetch_audit body was \
-                     unparsable — the pull digest degrades to the honest \
-                     footnote (the rest of the card is unaffected)"
-                );
-                Vec::new()
-            }),
-            None => {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_read",
-                    "SCOREBOARD-01: the day's rest_fetch_audit rows could not \
-                     be read — the pull digest degrades to the honest \
-                     footnote (the rest of the card is unaffected)"
-                );
-                Vec::new()
-            }
-        }
-    };
-    let spot_latency_fallback: Vec<(String, i64)> = {
-        let sql = build_spot1m_close_latency_day_sql(target_ist_day);
-        match exec_query(&client, questdb, &sql).await {
-            Some(body) => parse_feed_close_latency_rows(&body).unwrap_or_else(|| {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_fallback_parse",
-                    "SCOREBOARD-01: the day's spot candle latency body was \
-                     unparsable — the latency-only fallback lines degrade"
-                );
-                Vec::new()
-            }),
-            None => {
-                rest_legs_read_failed = true;
-                error!(
-                    code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                    stage = "rest_leg_fallback_read",
-                    "SCOREBOARD-01: the day's spot candle latency rows could \
-                     not be read — the latency-only fallback lines degrade"
-                );
-                Vec::new()
-            }
-        }
-    };
-    let rest_legs = aggregate_rest_leg_day(&audit_lite, &spot_latency_fallback);
-    // F3 log-side always-render contract (re-homed here by G6, fix
-    // round 2): fires on EVERY aggregation run — including
-    // telegram-disabled boots, where the card never renders at all.
-    log_rest_leg_measurement_gaps(&rest_legs);
-    // Dashboard gauge (plan PR-5 "+ dashboard gauge") — /metrics-local
-    // (NOT CloudWatch-shipped; the tv_index_futures_selected precedent, so
-    // zero alarm/cost impact), set on SAME-DAY runs only (a backfill's
-    // gauge would misrepresent NOW), static label values only (the bounded
-    // feed/leg allowlist — parsed strings never become label values).
-    if is_same_day_run {
-        for s in &rest_legs {
-            if s.close_p99_ms >= 0
-                && let Some((feed_label, leg_label)) = rest_leg_gauge_labels(&s.feed, &s.leg)
-            {
-                #[allow(clippy::cast_precision_loss)]
-                // APPROVED: display-only gauge of a bounded daily latency.
-                metrics::gauge!(
-                    "tv_rest_leg_close_to_data_p99_ms",
-                    "feed" => feed_label,
-                    "leg" => leg_label
-                )
-                .set(s.close_p99_ms as f64);
-            }
-        }
-    }
-
+    // 6e. The REST 1m pull digest is RETIRED 2026-09-17 with the legs it
+    //     measured. It read the day's `rest_fetch_audit` forensics rows and
+    //     the `rest_spot_1m` latency column, aggregated per (feed, leg), and
+    //     published `tv_rest_leg_close_to_data_p99_ms` on same-day runs.
+    //
+    //     Both tables keep their history; nothing writes them since the
+    //     operator's SOCKETS-ONLY narrowing removed the per-minute spot-1m
+    //     and option-chain legs, so this arm ran two QuestDB queries a day
+    //     to aggregate zero rows. Record + disposition table:
+    //     `no-rest-except-live-feed-2026-06-27.md` §12.10 and §12.11.
+    //
+    //     The `tv_rest_leg_close_to_data_p99_ms` gauge goes with it. It was
+    //     LOCAL `/metrics` only — never EMF-selected, never alarmed (the
+    //     `tv_index_futures_selected` precedent) — so there is no CloudWatch
+    //     filter, alarm or dashboard widget left pointing at a dead
+    //     producer, which is the lockstep §12.10.5 #5 requires.
     // 7. AUDIT-WS-01 under-count cross-check (self-scrape). SCOPED to
     //    same-day runs ONLY (round-2 hostile review 2026-07-10): the
     //    counter is CURRENT-SESSION state — a past-day backfill inheriting
@@ -3721,19 +3583,34 @@ pub async fn run_feed_scoreboard(
     let mut degraded = false;
     if is_same_day_run {
         let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
-        if let Ok(resp) = client.get(&metrics_url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-            && let Some(dropped) = parse_prom_counter_sum(&body, "tv_ws_event_audit_dropped_total")
-            && dropped > 0
-        {
+        let body = match client.get(metrics_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+            _ => None,
+        };
+        // Both single-label writer series are seeded at boot. Rejected appends
+        // lose the event; failed flush attempts may recover on a later retry.
+        let (dropped, append_errors, flush_errors) = body
+            .as_deref()
+            .map_or((None, None, None), socket_audit_counters);
+        if dropped.is_some_and(|n| n > 0) || append_errors.is_some_and(|n| n > 0) {
             degraded = true;
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+            scoreboard_finding!(
+                ctx,
                 stage = "audit_drop_crosscheck",
-                dropped,
-                "SCOREBOARD-01: ws_event_audit dropped rows this session — the \
-                 day's episode counts are a floor, not a truth (outcome=degraded)"
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: ws_event_audit rejected rows this session; the day's episode counts are a lower bound"
+            );
+        } else if (dropped, append_errors, flush_errors) != (Some(0), Some(0), Some(0)) {
+            sources_complete = false;
+            scoreboard_finding!(
+                ctx,
+                stage = "audit_drop_crosscheck",
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: today's socket audit counters are incomplete or include a failed flush whose delivery is unverified"
             );
         }
     }
@@ -3792,8 +3669,8 @@ pub async fn run_feed_scoreboard(
         && let Some(ref existing) = existing_daily
         && should_keep_degraded_outcome(existing, outcome)
     {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
+        scoreboard_finding!(
+            ctx,
             stage = "outcome_regression",
             new_outcome = outcome.as_str(),
             "SCOREBOARD-01: this rerun would ERASE the day's \
@@ -3805,8 +3682,13 @@ pub async fn run_feed_scoreboard(
         outcome = ScoreboardOutcome::Degraded;
     }
 
-    // 8. Write the two daily rows (deterministic ts — re-runs UPSERT).
-    let mut writer = FeedScoreboardWriter::new(questdb);
+    // 8. Write the two daily rows (deterministic ts — re-runs UPSERT). The
+    //    rows are built from THIS attempt's reads and written once by
+    //    `write_daily_rows_once`; a failed write before the final attempt
+    //    retries the whole aggregation (plan PR AL-2, 2026-11-06: the 5 Nov
+    //    rows were lost to one 10 s attempt).
+    let mut daily_rows: Vec<FeedScoreboardDailyRow> =
+        Vec::with_capacity(tickvault_common::feed::Feed::ALL.len());
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
         let n = feed_numbers
@@ -3852,7 +3734,6 @@ pub async fn run_feed_scoreboard(
             lag_samples: n.lag_samples,
             lag_floor_ms: match *feed {
                 tickvault_common::feed::Feed::Dhan => LAG_FLOOR_MS_DHAN,
-                tickvault_common::feed::Feed::Groww => LAG_FLOOR_MS_GROWW,
                 tickvault_common::feed::Feed::Truedata => LAG_FLOOR_MS_TRUEDATA,
             },
             disconnects_market: n.disconnects_market,
@@ -3881,24 +3762,11 @@ pub async fn run_feed_scoreboard(
                 outcome
             },
         };
-        if let Err(err) = writer.append_daily_row(&row) {
-            error!(
-                code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-                stage = "daily_append",
-                feed = label,
-                ?err,
-                "SCOREBOARD-01: daily row append failed"
-            );
-        }
+        daily_rows.push(row);
     }
-    if let Err(err) = writer.flush() {
-        error!(
-            code = ErrorCode::Scoreboard01AggregationDegraded.code_str(),
-            stage = "daily_flush",
-            ?err,
-            "SCOREBOARD-01: daily rows flush failed (QuestDB down?) — the \
-             DEDUP-idempotent TICKVAULT_SCOREBOARD_NOW re-run backfills"
-        );
+    let rows_landed = write_daily_rows_once(questdb, &daily_rows, final_attempt).await;
+    if !rows_landed && !final_attempt {
+        return ScoreboardAttemptEnd::Retry;
     }
 
     // 8b. Per-instrument coverage detail rows (scoreboard PR-D) — config-
@@ -3929,36 +3797,83 @@ pub async fn run_feed_scoreboard(
         );
     }
 
+    // 8c. Per-CONNECTION daily rollup (`ws_connection_daily`), operator
+    //     directive 2026-08-29: "is there a websocket disconnect or reconnect
+    //     happened for ALL the connections ... based on every day we need to
+    //     capture this precisely".
+    //
+    //     The scoreboard row above sums all sixteen connections into ONE row
+    //     per feed, so it cannot answer "did connection 7 drop today?". The
+    //     per-connection evidence has existed since 2026-08-20 in
+    //     `ws_event_audit` + `feed_episode_audit`; this step folds both into
+    //     one row per connection per day so that question is a single keyed
+    //     row read (O(1)) instead of a day-scan-and-group.
+    //
+    //     Best-effort and additive: it writes its OWN table and can never
+    //     fail, degrade or delay the scoreboard verdict computed above. It
+    //     reuses `fold_episode_into_tally` — the SINGLE shared tally rule —
+    //     so it can never disagree with the daily scoreboard about what
+    //     counts as an incident.
+    let _ = crate::ws_connection_rollup::run_ws_connection_rollup(
+        questdb,
+        target_ist_day,
+        trading_date_ist_nanos,
+        &build_episode_day_sql(target_ist_day),
+        retry_until_deadline,
+    )
+    .await;
+
+    // 8d. Per-TABLE disk footprint (`table_storage_daily`), same operator
+    //     directive: auditing, tracking, analysing, easily accessible.
+    //
+    //     Every disk figure this repository quotes is DERIVED — row width
+    //     times an assumed row count — and the 2026-08-28 disk-burn record
+    //     says so in its own words: "no per-table byte metric exists
+    //     anywhere ... nobody can say from telemetry where the 138 GB went".
+    //     QuestDB has known the answer the whole time; this reads it once a
+    //     day and writes one row per table.
+    //
+    //     Best-effort and additive: its own table, result discarded, cannot
+    //     fail or delay the scoreboard verdict. Written to the DATABASE only
+    //     — no CloudWatch metric, so zero recurring cost against a budget
+    //     already above the automatic stop line.
+    let _ = crate::table_storage_rollup::run_table_storage_rollup(questdb, trading_date_ist_nanos)
+        .await;
+
     metrics::counter!("tv_feed_scoreboard_runs_total", "outcome" => outcome.as_str()).increment(1);
 
     let dhan = feed_numbers
         .get("dhan")
         .copied()
         .unwrap_or_else(FeedDayNumbers::unavailable);
-    let groww = feed_numbers
-        .get("groww")
-        .copied()
-        .unwrap_or_else(FeedDayNumbers::unavailable);
     // Total blackout (nothing measured at all) → the caller pages Aborted.
-    if dhan.ticks < 0 && groww.ticks < 0 && tallies.is_none() {
-        return Err("every data source was unreachable — nothing measured".to_string());
+    //
+    // 2026-08-21: the second feed dropped out of this condition with the feed
+    // itself. Its `feed_numbers` lookup always missed, so its `ticks` was the
+    // -1 unavailable sentinel on every run and the `&&` term was already
+    // vacuously true — the check has always been the Dhan-and-no-tallies one
+    // it now says it is.
+    if dhan.ticks < 0 && tallies.is_none() {
+        return ScoreboardAttemptEnd::Finished {
+            result: Err("every data source was unreachable — nothing measured".to_string()),
+            rows_landed,
+        };
     }
-    Ok(ScoreboardSummary {
-        trading_date_ist: trading_date_label,
-        dhan,
-        groww,
-        session_minutes: SCOREBOARD_SESSION_MINUTES,
-        partial_coverage,
-        degraded,
-        early_run: forced_early_run,
-        // Threaded to the card footnote (round 3: the persisted row said
-        // partial while the card rendered no restart caveat).
-        restart_partial: restart_day_floor,
-        dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
-        groww_feed_off: feed_off.get("groww").copied().unwrap_or(false),
-        rest_legs,
-        rest_legs_read_failed,
-    })
+    ScoreboardAttemptEnd::Finished {
+        result: Ok(ScoreboardSummary {
+            trading_date_ist: trading_date_label,
+            dhan,
+            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            partial_coverage,
+            degraded,
+            early_run: forced_early_run,
+            // Threaded to the card footnote (round 3: the persisted row said
+            // partial while the card rendered no restart caveat).
+            restart_partial: restart_day_floor,
+            dhan_feed_off: feed_off.get("dhan").copied().unwrap_or(false),
+        }),
+        rows_landed,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3972,14 +3887,63 @@ mod tests {
 
     #[test]
     fn test_parse_questdb_count() {
-        // Relocated 2026-07-18 with the fn from the retired
-        // tick_conservation_boot module.
         assert_eq!(
-            parse_questdb_count(r#"{"dataset":[[42]],"count":1}"#),
+            parse_questdb_count(
+                r#"{"columns":[{"name":"count","type":"LONG"}],"dataset":[[42]],"count":1}"#
+            ),
             Some(42)
         );
-        assert_eq!(parse_questdb_count(r#"{"dataset":[]}"#), None);
-        assert_eq!(parse_questdb_count("not json"), None);
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[0]],"count":1}"#),
+            Some(0)
+        );
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[9223372036854775807]]}"#),
+            Some(i64::MAX)
+        );
+        // Older responses can name the aggregate without describing its type.
+        for columns in [
+            r#"[{"name":"count"}]"#,
+            r#"[{"name":"count()","type":"LONG"}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), Some(42), "{response}");
+        }
+        for columns in [
+            "null",
+            "{}",
+            "[]",
+            "[null]",
+            r#"[{"name":"count"},{"name":"count"}]"#,
+            r#"[{"type":"LONG"}]"#,
+            r#"[{"name":null}]"#,
+            r#"[{"name":"temperature","type":"LONG"}]"#,
+            r#"[{"name":"temperature","type":"INT"}]"#,
+            r#"[{"name":"count","type":"INT"}]"#,
+            r#"[{"name":"count","type":null}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), None, "{response}");
+        }
+        for invalid in [
+            "not json",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[]]}"#,
+            r#"{"dataset":[[42],[0]]}"#,
+            r#"{"dataset":[[42,0]]}"#,
+            r#"{"dataset":[[null]]}"#,
+            r#"{"dataset":[[-1]]}"#,
+            r#"{"dataset":[[42.0]]}"#,
+            r#"{"dataset":[["42"]]}"#,
+            r#"{"dataset":[[9223372036854775808]]}"#,
+            r#"{"dataset":[[42]],"count":0}"#,
+            r#"{"dataset":[[42]],"count":null}"#,
+            r#"{"dataset":[[42]],"error":"unavailable"}"#,
+            r#"{"error":null,"dataset":[[42]]}"#,
+        ] {
+            assert_eq!(parse_questdb_count(invalid), None, "{invalid}");
+        }
     }
 
     const DAY: u64 = 20_644; // an arbitrary IST day number
@@ -4007,6 +3971,81 @@ mod tests {
             down_secs: 0,
             market_hours,
         }
+    }
+
+    // ---- plan PR AL-2 review (2026-11-06): the whole attempt retries ----
+
+    /// Every QuestDB read or flush failure inside one scoreboard attempt logs
+    /// through `scoreboard_failure!` (coded only on the final attempt) and
+    /// returns `Retry` before the final attempt. Source scan of the attempt
+    /// body, so a new `error!` on a read path is caught.
+    #[test]
+    fn every_questdb_failure_in_the_attempt_is_quiet_until_the_final_attempt() {
+        let src = include_str!("feed_scoreboard_boot.rs");
+        let body = src
+            .split_once("async fn run_feed_scoreboard_attempt(")
+            .expect("the attempt exists")
+            .1;
+        let body = body
+            .split_once("\n#[cfg(test)]")
+            .map_or(body, |(head, _)| head);
+        for stage in [
+            "keep_better_read",
+            "episode_flush",
+            "ws_events_parse",
+            "ws_events_read",
+            "boot_reconciled_parse",
+            "boot_reconciled_read",
+            "outcome_keep_better_read",
+        ] {
+            let needle = format!("stage = \"{stage}\"");
+            let mut found = 0;
+            for (at, _) in body.match_indices(&needle) {
+                found += 1;
+                let before = &body[at.saturating_sub(120)..at];
+                assert!(
+                    before.contains("scoreboard_failure!("),
+                    "{stage}: must log through scoreboard_failure!"
+                );
+                let after: String = body[at..].chars().take(900).collect();
+                assert!(
+                    after.contains("if !final_attempt {")
+                        && after.contains("return ScoreboardAttemptEnd::Retry;"),
+                    "{stage}: must return Retry before the final attempt"
+                );
+            }
+            assert!(found > 0, "{stage}: stage not found in the attempt");
+        }
+        // No coded error is written directly in the attempt any more.
+        assert!(
+            !body.contains("code = ErrorCode::Scoreboard01AggregationDegraded"),
+            "a direct coded error in the attempt would page on a non-final attempt"
+        );
+    }
+
+    #[test]
+    fn test_scoreboard_finding_is_coded_once_across_attempts() {
+        let mut ctx = ScoreboardAttempt::default();
+        scoreboard_finding!(ctx, stage = "test_finding", "a finding");
+        assert!(ctx.findings_logged_this_attempt);
+        // The run loop carries it forward after a retried attempt.
+        ctx.findings_reported |= ctx.findings_logged_this_attempt;
+        ctx.findings_logged_this_attempt = false;
+        scoreboard_finding!(ctx, stage = "test_finding", "the same finding again");
+        assert!(ctx.findings_reported && ctx.findings_logged_this_attempt);
+    }
+
+    #[tokio::test]
+    async fn test_write_daily_rows_once_never_reports_landed_without_a_row() {
+        // Review 2026-11-06: zero appended rows is never counted `ok`.
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        assert!(!write_daily_rows_once(&cfg, &[], false).await);
+        assert!(!write_daily_rows_once(&cfg, &[], true).await);
     }
 
     #[test]
@@ -4250,19 +4289,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_minute_overlap() {
-        let a: HashSet<String> = ["09:15", "09:16", "09:17"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let b: HashSet<String> = ["09:16", "09:17", "09:18", "09:19"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        assert_eq!(compute_minute_overlap(&a, &b), (1, 2, 2));
-    }
-
-    #[test]
     fn test_parse_minute_set_from_exec_body() {
         let body =
             r#"{"dataset":[["2026-07-10T09:15:00.000000Z"],["2026-07-10T09:16:00.000000Z"]]}"#;
@@ -4293,28 +4319,100 @@ mod tests {
         assert_eq!(parse_errors_jsonl_line("not json"), None);
     }
 
+    /// Regression (2026-10-11, review of SUP-9): a RESILIENCE-01 line that
+    /// only reports SSM reachability must not set `resilience_same_day`,
+    /// which would blame every 805 of the day on us as `dual_instance`.
+    #[test]
+    fn test_ssm_reachability_resilience_01_is_not_dual_instance_evidence() {
+        let line = r#"{"timestamp":"2026-07-10T05:05:00Z","code":"RESILIENCE-01","stage":"renew_failing","message":"x"}"#;
+        let ev = parse_errors_jsonl_line(line).expect("parses");
+        assert_eq!(ev.stage.as_deref(), Some("renew_failing"));
+        // 2026-07-10T05:05Z + 5:30 = IST day 20_644.
+        let corr = collect_correlation_evidence(&[ev], 20_644, true);
+        assert!(
+            !corr.resilience_same_day,
+            "renew_failing is SSM reachability, not a peer"
+        );
+        for stage in RESILIENCE_01_NON_PEER_STAGES {
+            let ev = JsonlCodeEvent {
+                code: "RESILIENCE-01".to_string(),
+                reason: None,
+                stage: Some(stage.to_string()),
+                ts_ist_nanos: day_ts(40_000),
+            };
+            let corr = collect_correlation_evidence(&[ev], DAY, true);
+            assert!(!corr.resilience_same_day, "{stage} is not peer evidence");
+        }
+        // A peer stage, no stage, and RESILIENCE-03 with a listed stage all
+        // still count.
+        for (code, stage) in [
+            ("RESILIENCE-01", Some("already_held")),
+            ("RESILIENCE-01", Some("renew_contention")),
+            ("RESILIENCE-01", None),
+            ("RESILIENCE-03", Some("renew_failing")),
+        ] {
+            let ev = JsonlCodeEvent {
+                code: code.to_string(),
+                reason: None,
+                stage: stage.map(str::to_string),
+                ts_ist_nanos: day_ts(40_000),
+            };
+            let corr = collect_correlation_evidence(&[ev], DAY, true);
+            assert!(corr.resilience_same_day, "{code} {stage:?} is evidence");
+        }
+    }
+
+    /// Every listed non-peer stage is still emitted with that exact string
+    /// next to a RESILIENCE-01 code, so the list cannot drift from the
+    /// emitters silently.
+    #[test]
+    fn test_resilience_01_non_peer_stages_match_their_emitters() {
+        let rest_stack = include_str!("dhan_rest_stack.rs");
+        let instance_lock = include_str!("../../core/src/instance_lock.rs");
+        for stage in RESILIENCE_01_NON_PEER_STAGES {
+            let needle = format!("stage = \"{stage}\"");
+            let source = if rest_stack.contains(&needle) {
+                rest_stack
+            } else {
+                instance_lock
+            };
+            // Any occurrence (the first may be in a doc comment) must sit
+            // just after a RESILIENCE-01 code field.
+            let emitted = source.match_indices(&needle).any(|(at, _)| {
+                source[..at]
+                    .rfind("Resilience01DualInstanceDetected")
+                    .is_some_and(|code_at| at - code_at < 400)
+            });
+            assert!(emitted, "stage {stage} is no longer a RESILIENCE-01 line");
+        }
+    }
+
     #[test]
     fn test_collect_correlation_evidence_and_has_overlap_windows() {
         let events = vec![
             JsonlCodeEvent {
                 code: "WS-GAP-09".to_string(),
                 reason: Some("bare_dhan_reset".to_string()),
+                stage: None,
                 ts_ist_nanos: day_ts(40_000),
             },
             JsonlCodeEvent {
                 code: "RESILIENCE-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(41_000),
             },
             JsonlCodeEvent {
                 code: "PROC-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(42_000),
             },
             // Wrong day — excluded.
             JsonlCodeEvent {
                 code: "RESOURCE-01".to_string(),
                 reason: None,
+                stage: None,
                 ts_ist_nanos: day_ts(90_000),
             },
         ];
@@ -5253,6 +5351,7 @@ mod tests {
             let ev = JsonlCodeEvent {
                 code: code.to_string(),
                 reason: Some("bare_dhan_reset".to_string()),
+                stage: None,
                 ts_ist_nanos: day_ts(40_000),
             };
             let out = collect_correlation_evidence(&[ev], DAY, true);
@@ -6290,49 +6389,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_minute_overlap_and_feed_off_sentinels() {
-        // Round-5 MEDIUM: on a feed-off day the PARTNER's comparison
-        // columns take the -1 sentinel — exclusive-vs-nothing is not a
-        // measurement, and the phantom ~375 unique minutes skewed the
-        // month verdict's headline sum.
-        let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
-        let dhan_set: HashSet<String> = [minute(9, 15), minute(9, 16), minute(9, 17)]
-            .into_iter()
-            .collect();
-        let mk = |dhan_set: HashSet<String>, groww_set: HashSet<String>| {
-            let mut nums: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
-            nums.insert("dhan", FeedDayNumbers::unavailable());
-            nums.insert("groww", FeedDayNumbers::unavailable());
-            let mut sets: BTreeMap<&'static str, Option<HashSet<String>>> = BTreeMap::new();
-            sets.insert("dhan", Some(dhan_set));
-            sets.insert("groww", Some(groww_set));
-            (nums, sets)
-        };
-        // Normal dual-feed day: real overlap, no sentinels.
-        let (mut nums, sets) = mk(dhan_set.clone(), [minute(9, 15)].into_iter().collect());
-        let both_on: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", false)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &both_on);
-        assert_eq!(nums["dhan"].unique_win_minutes, 2);
-        assert_eq!(nums["dhan"].both_minutes, 1);
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
-        // Groww-off day: dhan's "3 exclusive minutes vs nothing" is NOT a
-        // measurement — sentinel, never a phantom month-sum win.
-        let (mut nums, sets) = mk(dhan_set, HashSet::new());
-        let groww_off: BTreeMap<&'static str, bool> =
-            [("dhan", false), ("groww", true)].into_iter().collect();
-        apply_minute_overlap_and_feed_off_sentinels(&mut nums, &sets, &groww_off);
-        assert_eq!(
-            nums["dhan"].unique_win_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL,
-            "the RUNNING feed's row on a feed-off day carries no phantom win"
-        );
-        assert_eq!(nums["dhan"].both_minutes, SCOREBOARD_UNAVAILABLE_SENTINEL);
-        // The OFF feed's own measured zeros stay (its row is feed_off and
-        // excluded day-level by the runbook SQL anyway).
-        assert_eq!(nums["groww"].unique_win_minutes, 0);
-    }
-
-    #[test]
     fn test_should_keep_feed_off_outcome_evening_rerun_preserves_no_contest() {
         // Round-5 HIGH (erasure facet) topology: a config-off day stamped
         // feed_off, then a same-day EVENING boot with the feed re-enabled
@@ -6367,25 +6423,53 @@ mod tests {
 
     #[test]
     fn test_last_minute_secs_of_day_and_post_close_reconnect_is_real_death() {
-        // Round-4 MEDIUM: only a feed that streamed through ~15:28 keeps
-        // the scheduled-stop carve-out; a hole before close = a REAL
-        // in-market crash (the 15:26-crash → 15:31-reconnect shape).
+        // Round-4 MEDIUM: only a feed that streamed to within two minutes of
+        // the close keeps the scheduled-stop carve-out; a hole before close =
+        // a REAL in-market crash (the crash → post-close-reconnect shape).
+        //
+        // 2026-09-03: asserted RELATIVE to the close, not against a re-typed
+        // 15:28. The old form hardcoded the boundary on both sides — constant
+        // and test — so when the close moved 15:30 → 15:40 on 2026-08-07 the
+        // test kept passing on a threshold that had become twelve minutes of
+        // slack instead of two. A test that restates the literal it guards
+        // proves only that the literal was copied correctly.
+        let close = i64::from(MARKET_HOURS_END_SECS_OF_DAY_IST);
+        let threshold = POST_CLOSE_CLEAN_STOP_MIN_LAST_MINUTE_SECS;
+        assert_eq!(
+            threshold,
+            close - 120,
+            "the carve-out threshold must stay two minutes before the close"
+        );
+
         let minute = |h: i64, m: i64| format!("2026-07-10T{h:02}:{m:02}:00.000000Z");
-        let set: HashSet<String> = [minute(9, 15), minute(12, 0), minute(15, 27)]
-            .into_iter()
-            .collect();
-        assert_eq!(last_minute_secs_of_day(&set), Some(15 * 3600 + 27 * 60));
+        let last = threshold - 60;
+        let set: HashSet<String> = [
+            minute(9, 15),
+            minute(12, 0),
+            minute(last / 3600, (last % 3600) / 60),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(last_minute_secs_of_day(&set), Some(last));
         assert!(
-            post_close_reconnect_is_real_death(Some(15 * 3600 + 27 * 60)),
-            "last minute 15:27 < 15:28 threshold = real in-market death"
+            post_close_reconnect_is_real_death(Some(threshold - 60)),
+            "a last minute one minute BELOW the threshold is a real in-market death"
         );
         assert!(
-            !post_close_reconnect_is_real_death(Some(15 * 3600 + 28 * 60)),
-            "streamed through 15:28 = the clean scheduled-stop shape"
+            !post_close_reconnect_is_real_death(Some(threshold)),
+            "streamed through the threshold = the clean scheduled-stop shape"
         );
         assert!(
-            !post_close_reconnect_is_real_death(Some(15 * 3600 + 29 * 60)),
-            "streamed through 15:29 keeps the carve-out"
+            !post_close_reconnect_is_real_death(Some(close - 60)),
+            "streamed to one minute before the close keeps the carve-out"
+        );
+        // The BITE: a crash nine minutes before the close must never read as
+        // a clean stop. Under the pre-fix 15:28 literal against a 15:40 close
+        // this exact case was carved out — restarts rendered 0 and the day
+        // stamped outcome='complete' on a genuine in-market death.
+        assert!(
+            post_close_reconnect_is_real_death(Some(close - 9 * 60)),
+            "a nine-minute hole before the close is a crash, not a scheduled stop"
         );
         assert!(
             post_close_reconnect_is_real_death(None),
@@ -6407,15 +6491,30 @@ mod tests {
         // latch permanently dead on single-feed profiles (every day is a
         // feed-off day there) and re-sent a duplicate card every evening
         // boot.
-        let both: BTreeMap<String, String> = [
-            ("dhan".to_string(), "complete".to_string()),
-            ("groww".to_string(), "complete".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        //
+        // 2026-08-22: every key below is derived from `Feed::ALL`. They were
+        // hand-written `"dhan"` / `"groww"` literals, so when `Feed::Groww`
+        // was removed this test kept passing on a key production can no
+        // longer produce -- while the function it covers returned `false` on
+        // every real call. A fixture that agrees with a deleted enum proves
+        // nothing about the code that ships.
+        let feeds: Vec<&str> = tickvault_common::feed::Feed::ALL
+            .iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert!(
+            feeds.len() >= 2,
+            "this test needs at least two feeds to distinguish 'both terminal' \
+             from 'one terminal'"
+        );
+        let (first, second) = (feeds[0], feeds[1]);
+        let both: BTreeMap<String, String> = feeds
+            .iter()
+            .map(|f| ((*f).to_string(), "complete".to_string()))
+            .collect();
         assert!(catchup_rerun_is_redundant(&both));
         let mut single_feed = both.clone();
-        single_feed.insert("groww".to_string(), "feed_off".to_string());
+        single_feed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             catchup_rerun_is_redundant(&single_feed),
             "{{complete, feed_off}} is terminal — the single-feed-profile \
@@ -6423,25 +6522,22 @@ mod tests {
         );
         for worse in ["partial", "degraded"] {
             let mut m = both.clone();
-            m.insert("groww".to_string(), worse.to_string());
+            m.insert(second.to_string(), worse.to_string());
             assert!(
                 !catchup_rerun_is_redundant(&m),
                 "{worse} days must re-run (partial may improve; degraded is \
                  keep-better-protected)"
             );
         }
-        let mixed: BTreeMap<String, String> = [
-            ("dhan".to_string(), "partial".to_string()),
-            ("groww".to_string(), "feed_off".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        let mut mixed = both.clone();
+        mixed.insert(first.to_string(), "partial".to_string());
+        mixed.insert(second.to_string(), "feed_off".to_string());
         assert!(
             !catchup_rerun_is_redundant(&mixed),
             "{{partial, feed_off}} still re-runs — the partial side may improve"
         );
         let mut one = both.clone();
-        one.remove("dhan");
+        one.remove(first);
         assert!(!catchup_rerun_is_redundant(&one), "a missing row re-runs");
         assert!(!catchup_rerun_is_redundant(&BTreeMap::new()));
     }
@@ -6581,395 +6677,35 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // REST 1m pull digest (Groww REST plan PR-5 — operator Quote 2)
-    // -----------------------------------------------------------------------
-
-    fn audit_row(feed: &str, leg: &str, outcome: &str, close_ms: i64, rl: i64) -> RestFetchLiteRow {
-        RestFetchLiteRow {
-            feed: feed.to_string(),
-            leg: leg.to_string(),
-            outcome: outcome.to_string(),
-            close_to_data_ms: close_ms,
-            rate_limited_count: rl,
-            error_class: String::new(),
-        }
-    }
-
-    /// Micros-literal + column-shape regression lock for the two digest
-    /// SQL builders (QuestDB 9.3.5 embeds integer TIMESTAMP literals as
-    /// MICROSECONDS — a nanos literal silently matches nothing).
-    #[test]
-    fn test_rest_leg_digest_sql_builders_use_micros_and_expected_columns() {
-        let (start_micros, end_micros) = day_bounds_micros(DAY);
-        let audit_sql = build_rest_fetch_audit_day_sql(DAY);
-        assert!(audit_sql.contains("from rest_fetch_audit"), "{audit_sql}");
-        for col in [
-            "feed",
-            "leg",
-            "outcome",
-            "close_to_data_ms",
-            "rate_limited_count",
-        ] {
-            assert!(audit_sql.contains(col), "missing {col}: {audit_sql}");
-        }
-        assert!(
-            audit_sql.contains(&format!("ts >= {start_micros}"))
-                && audit_sql.contains(&format!("ts < {end_micros}")),
-            "micros window literals required: {audit_sql}"
-        );
-        let fb_sql = build_spot1m_close_latency_day_sql(DAY);
-        assert!(fb_sql.contains("from rest_spot_1m"), "{fb_sql}");
-        assert!(
-            fb_sql.contains("close_to_data_ms >= 0"),
-            "the -1 sentinel rows must never reach the distribution: {fb_sql}"
-        );
-        assert!(
-            fb_sql.contains(&format!("ts >= {start_micros}"))
-                && fb_sql.contains(&format!("ts < {end_micros}")),
-            "micros window literals required: {fb_sql}"
-        );
-        // Nanos literals must never appear (1000x the micros value).
-        let nanos_start = (DAY as i64) * 86_400 * NANOS_PER_SEC;
-        assert!(!audit_sql.contains(&nanos_start.to_string()), "{audit_sql}");
-        assert!(!fb_sql.contains(&nanos_start.to_string()), "{fb_sql}");
-    }
-
-    #[test]
-    fn test_parse_rest_fetch_audit_lite_and_latency_rows() {
-        let body = r#"{"columns":[],"dataset":[
-            ["groww","spot_1m","ok",1042,0],
-            ["groww","spot_1m","error",-1,2],
-            ["groww","chain_1m","ok",2100,0],
-            ["garbage-shape-row"],
-            [null,"spot_1m","ok",1,0]
-        ]}"#;
-        let rows = parse_rest_fetch_audit_lite(body).expect("parsable");
-        assert_eq!(rows.len(), 3, "bad-shape rows are skipped: {rows:?}");
-        assert_eq!(rows[0], audit_row("groww", "spot_1m", "ok", 1042, 0));
-        assert_eq!(rows[1].rate_limited_count, 2);
-        assert!(parse_rest_fetch_audit_lite("not json").is_none());
-        assert!(parse_rest_fetch_audit_lite(r#"{"no":"dataset"}"#).is_none());
-
-        let fb = parse_feed_close_latency_rows(
-            r#"{"columns":[],"dataset":[["dhan",1900],["dhan",61000],["bad"],["groww",120]]}"#,
-        )
-        .expect("parsable");
-        assert_eq!(
-            fb,
-            vec![
-                ("dhan".to_string(), 1900),
-                ("dhan".to_string(), 61000),
-                ("groww".to_string(), 120)
-            ]
-        );
-        assert!(parse_feed_close_latency_rows("nope").is_none());
-    }
-
-    #[test]
-    fn test_percentile_nearest_rank_boundaries() {
-        assert_eq!(percentile_nearest_rank(&[], 50), -1, "empty = sentinel");
-        assert_eq!(percentile_nearest_rank(&[7], 50), 7);
-        assert_eq!(percentile_nearest_rank(&[7], 99), 7);
-        let v: Vec<i64> = (1..=100).collect();
-        assert_eq!(percentile_nearest_rank(&v, 50), 50);
-        assert_eq!(percentile_nearest_rank(&v, 99), 99);
-        assert_eq!(percentile_nearest_rank(&v, 100), 100);
-        // pct > 100 clamps to the max — never an out-of-bounds panic.
-        assert_eq!(percentile_nearest_rank(&v, 250), 100);
-        let v2 = [10, 20, 30, 40];
-        assert_eq!(percentile_nearest_rank(&v2, 50), 20);
-        assert_eq!(percentile_nearest_rank(&v2, 99), 40);
-    }
-
-    /// The core aggregation semantics: ok-vs-failed-vs-named-gap split,
-    /// the ≥60s late-recovery exclusion from the prompt distribution, and
-    /// the 429 sum across ALL rows.
-    #[test]
-    fn test_aggregate_rest_leg_day_outcome_and_late_split() {
-        let rows = vec![
-            audit_row("groww", "spot_1m", "ok", 1_000, 0),
-            audit_row("groww", "spot_1m", "ok", 2_000, 1),
-            audit_row("groww", "spot_1m", "ok", 3_000, 0),
-            // Late repair (the sweep's honest >60s delay) — counted, NOT
-            // in the prompt distribution.
-            audit_row("groww", "spot_1m", "ok", 7_200_000, 0),
-            audit_row("groww", "spot_1m", "empty", -1, 0),
-            audit_row("groww", "spot_1m", "rate_limited", -1, 3),
-            audit_row("groww", "spot_1m", "named_gap", -1, 0),
-            audit_row("groww", "chain_1m", "ok", 2_100, 0),
-        ];
-        let out = aggregate_rest_leg_day(&rows, &[]);
-        assert_eq!(out.len(), 2);
-        let spot = out
-            .iter()
-            .find(|s| s.leg == "spot_1m")
-            .expect("spot summary");
-        assert_eq!(spot.feed, "groww");
-        assert_eq!(spot.ok_fetches, 4, "late repairs still count ok");
-        assert_eq!(spot.failed_fetches, 2, "empty + rate_limited");
-        assert_eq!(spot.named_gaps, 1, "gaps are NOT failed fetches");
-        assert_eq!(spot.rate_limited_hits, 4, "429s sum across all rows");
-        assert_eq!(spot.late_recovered, 1);
-        assert_eq!(spot.close_samples, 3, "the late repair is excluded");
-        assert_eq!(spot.close_p50_ms, 2_000);
-        assert_eq!(spot.close_p99_ms, 3_000);
-        assert_eq!(spot.close_max_ms, 3_000);
-        let chain = out
-            .iter()
-            .find(|s| s.leg == "chain_1m")
-            .expect("chain summary");
-        assert_eq!((chain.ok_fetches, chain.close_p50_ms), (1, 2_100));
-        // Empty day → empty vec (the card omits the section honestly).
-        assert!(aggregate_rest_leg_day(&[], &[]).is_empty());
-    }
-
-    /// An all-pulls-failed key keeps its measured counts with the -1
-    /// latency sentinels + a measured-zero sample count — never a
-    /// fabricated distribution (Rule 11).
-    #[test]
-    fn test_aggregate_rest_leg_day_zero_ok_sentinels() {
-        let rows = vec![
-            audit_row("groww", "chain_1m", "error", -1, 0),
-            audit_row("groww", "chain_1m", "no_token", -1, 0),
-        ];
-        let out = aggregate_rest_leg_day(&rows, &[]);
-        let s = &out[0];
-        assert_eq!((s.ok_fetches, s.failed_fetches), (0, 2));
-        assert_eq!(s.close_samples, 0, "measured zero, not -1");
-        assert_eq!(
-            (s.close_p50_ms, s.close_p99_ms, s.close_max_ms),
-            (-1, -1, -1)
-        );
-    }
-
-    /// The Dhan spot latency-only fallback: a feed with data-table latency
-    /// rows but NO audit rows gets a distribution with -1 COUNT sentinels;
-    /// a feed already covered by the audit source is never double-counted.
-    #[test]
-    fn test_aggregate_rest_leg_day_spot_latency_fallback() {
-        let audit = vec![audit_row("groww", "spot_1m", "ok", 1_042, 0)];
-        let fallback = vec![
-            ("dhan".to_string(), 1_900),
-            ("dhan".to_string(), 2_400),
-            ("dhan".to_string(), 100_000), // a backfilled repair — late
-            ("groww".to_string(), 999),    // audit source wins — ignored
-        ];
-        let out = aggregate_rest_leg_day(&audit, &fallback);
-        assert_eq!(out.len(), 2);
-        let dhan = out.iter().find(|s| s.feed == "dhan").expect("dhan spot");
-        assert_eq!(dhan.leg, "spot_1m");
-        assert_eq!(
-            (dhan.ok_fetches, dhan.failed_fetches, dhan.named_gaps),
-            (-1, -1, -1),
-            "the data table records no outcomes — counts stay sentinels"
-        );
-        assert_eq!(dhan.rate_limited_hits, -1);
-        assert_eq!(dhan.late_recovered, 1);
-        assert_eq!(dhan.close_samples, 2);
-        assert_eq!(dhan.close_p50_ms, 1_900);
-        assert_eq!(dhan.close_max_ms, 2_400);
-        let groww = out.iter().find(|s| s.feed == "groww").expect("groww spot");
-        assert_eq!(
-            groww.close_p50_ms, 1_042,
-            "the audit-derived distribution must win over the fallback"
-        );
-    }
-
-    /// The gauge-label allowlist: bounded static values only — a parsed
-    /// slug outside the allowlist is skipped, never a label value.
-    #[test]
-    fn test_rest_leg_gauge_labels_allowlist() {
-        assert_eq!(
-            rest_leg_gauge_labels("dhan", "spot_1m"),
-            Some(("dhan", "spot_1m"))
-        );
-        assert_eq!(
-            rest_leg_gauge_labels("groww", "chain_1m"),
-            Some(("groww", "chain_1m"))
-        );
-        assert_eq!(
-            rest_leg_gauge_labels("groww", "contract_1m"),
-            Some(("groww", "contract_1m"))
-        );
-        assert_eq!(rest_leg_gauge_labels("evil'feed", "spot_1m"), None);
-        assert_eq!(rest_leg_gauge_labels("dhan", "weird_leg"), None);
-    }
-
-    /// The card-line builder: the four canonical pairs ALWAYS render (the
-    /// Quote-2 answer exists even as "not measured yet"), extra measured
-    /// pairs (the PR-4 contract leg) append automatically, and wire slugs
-    /// never leak into the display names (commandment 2).
-    #[test]
-    fn test_build_rest_leg_score_lines_canonical_order_and_extras() {
-        let summaries = vec![
-            RestLegDaySummary {
-                feed: "groww".to_string(),
-                leg: "spot_1m".to_string(),
-                ok_fetches: 1_496,
-                failed_fetches: 4,
-                named_gaps: 0,
-                pre_boot_gaps: 0,
-                rate_limited_hits: 0,
-                late_recovered: 2,
-                close_p50_ms: 1_400,
-                close_p99_ms: 3_200,
-                close_max_ms: 6_200,
-                close_samples: 1_494,
-            },
-            RestLegDaySummary {
-                feed: "groww".to_string(),
-                leg: "contract_1m".to_string(),
-                ok_fetches: 10,
-                failed_fetches: 0,
-                named_gaps: 0,
-                pre_boot_gaps: 0,
-                rate_limited_hits: 0,
-                late_recovered: 0,
-                close_p50_ms: 900,
-                close_p99_ms: 1_500,
-                close_max_ms: 1_600,
-                close_samples: 10,
-            },
-        ];
-        let lines = build_rest_leg_score_lines(&summaries);
-        let names: Vec<(String, String)> = lines
-            .iter()
-            .map(|l| (l.feed.clone(), l.leg.clone()))
-            .collect();
-        assert_eq!(
-            names,
-            vec![
-                ("Dhan".to_string(), "spot candles".to_string()),
-                ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "spot candles".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option contracts".to_string()),
-            ]
-        );
-        // The measured pair carries its numbers; an absent pair carries
-        // the honest -1 sentinels everywhere.
-        let groww_spot = &lines[2];
-        assert_eq!(groww_spot.ok_fetches, 1_496);
-        assert_eq!(groww_spot.close_p99_ms, 3_200);
-        let dhan_chain = &lines[1];
-        assert_eq!(dhan_chain.ok_fetches, -1);
-        assert_eq!(dhan_chain.close_samples, -1);
-        // Empty summaries still render the four canonical placeholders.
-        assert_eq!(build_rest_leg_score_lines(&[]).len(), 4);
-    }
-
-    #[test]
-    fn test_unmeasured_canonical_rest_pairs_names_only_sentinel_pairs() {
-        // F3 (2026-07-15 fix round): the card suppresses unmeasured pairs,
-        // so the honest not-measured signal moves to the logs — this pure
-        // helper names exactly the canonical pairs with no measured pull
-        // source (the §2b always-render contract's log-side leg).
-        let summaries = vec![RestLegDaySummary {
-            feed: "groww".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: 1_496,
-            failed_fetches: 4,
-            named_gaps: 0,
-            pre_boot_gaps: 0,
-            rate_limited_hits: 0,
-            late_recovered: 2,
-            close_p50_ms: 1_400,
-            close_p99_ms: 3_200,
-            close_max_ms: 6_200,
-            close_samples: 1_494,
-        }];
-        let lines = build_rest_leg_score_lines(&summaries);
-        assert_eq!(
-            unmeasured_canonical_rest_pairs(&lines),
-            vec![
-                ("Dhan".to_string(), "spot candles".to_string()),
-                ("Dhan".to_string(), "option chain".to_string()),
-                ("Groww".to_string(), "option chain".to_string()),
-            ]
-        );
-        // Every canonical pair measured → nothing to log.
-        let all = ["spot_1m", "chain_1m"];
-        let full: Vec<RestLegDaySummary> = ["dhan", "groww"]
-            .iter()
-            .flat_map(|f| {
-                all.iter().map(|l| RestLegDaySummary {
-                    feed: (*f).to_string(),
-                    leg: (*l).to_string(),
-                    ok_fetches: 5,
-                    failed_fetches: 0,
-                    named_gaps: 0,
-                    pre_boot_gaps: 0,
-                    rate_limited_hits: 0,
-                    late_recovered: 0,
-                    close_p50_ms: 900,
-                    close_p99_ms: 1_500,
-                    close_max_ms: 1_600,
-                    close_samples: 5,
-                })
-            })
-            .collect();
-        let lines = build_rest_leg_score_lines(&full);
-        assert!(unmeasured_canonical_rest_pairs(&lines).is_empty());
-        // Empty build → all four pairs named.
-        assert_eq!(
-            unmeasured_canonical_rest_pairs(&build_rest_leg_score_lines(&[])).len(),
-            4
-        );
-    }
-
-    #[test]
-    fn test_latency_only_pair_is_measured_not_unmeasured() {
-        // G6 (fix round 2): the documented spot_1m_rest latency-only
-        // fallback (counts -1, latency measured) must classify MEASURED —
-        // logging it "not measured" was a false statement during exactly
-        // the forensics-writer-outage window the fallback exists for. It
-        // is named separately as latency-only instead.
-        let summaries = vec![RestLegDaySummary {
-            feed: "dhan".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: -1,
-            failed_fetches: -1,
-            named_gaps: -1,
-            pre_boot_gaps: -1,
-            rate_limited_hits: -1,
-            late_recovered: -1,
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-        }];
-        let lines = build_rest_leg_score_lines(&summaries);
-        let unmeasured = unmeasured_canonical_rest_pairs(&lines);
-        assert!(
-            !unmeasured.contains(&("Dhan".to_string(), "spot candles".to_string())),
-            "a latency-only pair must never be logged 'not measured': {unmeasured:?}"
-        );
-        // The other three canonical pairs stay honestly unmeasured.
-        assert_eq!(unmeasured.len(), 3);
-        // ...and the latency-only classifier names exactly this pair.
-        assert_eq!(
-            latency_only_canonical_rest_pairs(&lines),
-            vec![("Dhan".to_string(), "spot candles".to_string())]
-        );
-        // A counts-measured pair is never latency-only.
-        let counted = vec![RestLegDaySummary {
-            feed: "dhan".to_string(),
-            leg: "spot_1m".to_string(),
-            ok_fetches: 735,
-            failed_fetches: 0,
-            named_gaps: 0,
-            pre_boot_gaps: 0,
-            rate_limited_hits: 0,
-            late_recovered: 0,
-            close_p50_ms: 1_100,
-            close_p99_ms: 1_800,
-            close_max_ms: 5_000,
-            close_samples: 372,
-        }];
-        let lines = build_rest_leg_score_lines(&counted);
-        assert!(latency_only_canonical_rest_pairs(&lines).is_empty());
-    }
+    // ---- the REST 1m pull-digest test block is RETIRED 2026-09-17 ----
+    //
+    // TEN tests plus the `audit_row` fixture, covering the digest end to
+    // end: the two day-query SQL builders (micros-vs-nanos literal lock),
+    // both row parsers, `percentile_nearest_rank`, `aggregate_rest_leg_day`
+    // (outcome/late split, zero-ok sentinels, the spot latency fallback),
+    // the bounded gauge-label allowlist, `build_rest_leg_score_lines`
+    // canonical ordering, and the unmeasured / latency-only classifiers.
+    //
+    // Every production function they exercised was removed with the digest
+    // itself, because nothing writes `rest_fetch_audit` or `rest_spot_1m`
+    // after the operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10, disposition §12.11).
+    //
+    // THREE rules they encoded are NOT retired and outlive them:
+    //
+    //   1. QuestDB 9.3.5 embeds integer TIMESTAMP literals as MICROSECONDS.
+    //      A nanos literal silently matches NOTHING — it does not error, it
+    //      returns an empty set, which reads exactly like a quiet day. Any
+    //      future day-window query builder needs its own micros lock.
+    //   2. A gauge's label VALUES must come from a bounded allowlist, never
+    //      from a row's `feed`/`leg` column, or a vendor typo mints a new
+    //      time series (and, on a CloudWatch-shipped metric, a new bill).
+    //   3. `percentile_nearest_rank` on an EMPTY sample returns the `-1`
+    //      not-measured sentinel, never 0 — the omit-never-fabricate rule.
+    //
+    // WHAT THIS LEAVES UNWATCHED, stated rather than implied: nothing in
+    // this crate now pins rule 1 or rule 2, because this module has no
+    // remaining day-window query and no remaining labelled gauge.
 
     // MERGE RESOLVED 2026-07-15: the FEED-GAP-01 dangling-close sweep
     // tests died here with their production fns (the gap-episode

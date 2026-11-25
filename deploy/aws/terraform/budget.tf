@@ -7,6 +7,32 @@
 # (e.g., terminate a rogue stress test) before the bill arrives. The 100%
 # actual alarm is the hard "we crossed the budget" signal.
 #
+# ⚠ CORRECTED 2026-09-06 — the header paragraph immediately below is STALE in
+# every figure, and it is written in the PRESENT TENSE, so it reads as current
+# configuration rather than as history. The dated OPERATOR RULING entries
+# further down are accurate and are kept verbatim per house convention; only
+# this banner is added.
+#
+#   claim in the header below   |  live value (read 2026-09-06)
+#   ----------------------------|--------------------------------------------
+#   r8g.large                   |  r8g.xlarge (Quote 15, FINALISED)
+#   30 GB EBS                   |  600 GB gp3, 6000 IOPS, 500 MiB/s
+#   270-hr ceiling              |  08:30-17:30 IST weekdays (~198 hrs)
+#   "Limit set to $55"          |  limit_amount = "150"  (line ~187 of this file)
+#   "~$29.10 pre-GST"           |  September forecast $142.24
+#
+# The live EBS line alone is measured by usage type at
+# $88.92/mo — 66% of the $135.00 automatic-stop line, before any compute. Full
+# measured breakdown and the kill-switch state (both actions STANDBY and ARMED,
+# not EXECUTION_FAILURE as several rule files still claim) are recorded in
+# .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md, same date.
+#
+# The lockstep this header describes is REAL and INTACT: budget.tf limit_amount,
+# budget-guards.tf BUDGET_KILL_USD and budget_digest.rs BUDGET_USD are all 150,
+# pinned by crates/aws-lambdas/tests/budget_ceiling_lockstep_guard.rs. Only the
+# prose went stale — which is the same failure this repository has now recorded
+# four times, and the reason the banner is here instead of a silent edit.
+#
 # USD vs INR: AWS Budgets uses USD internally (pre-GST). Config: r8g.large,
 # 270-hr ceiling, 30 GB EBS, +EIP = ~$29.10 pre-GST (~₹2,919/mo incl. 18%
 # GST). Limit set to $55 (raised 2026-06-30 from $25) for honest headroom over
@@ -146,7 +172,93 @@ resource "aws_budgets_budget" "tv_monthly" {
   #     2. budget-guards.tf   BUDGET_KILL_USD               (injected into the guard Lambda)
   #     3. budget_digest.rs   BUDGET_USD                    (the "% of stop-budget" the operator reads)
   #     4. hard_stop_guard.rs DEFAULT_BUDGET_KILL_USD       (env-missing FALLBACK; must be >= this)
-  limit_amount      = "130"
+  # 2026-08-25 OPERATOR RULING (Quote 19) — LIMIT RAISED $130 -> $150.
+  # Operator verbatim (typed directly in-session, typos preserved):
+  #   "see evn if budget ened to be icnreased little bit extra also do it dude but i
+  #    just need the O(1) workign solution always dude okay?"
+  #   "even if we need to reach the max 150 usd also let su gfo ahead dude but ensure
+  #    to achieve alwyas O(1) dude okay?"
+  # Recorded in daily-universe-scope-expansion-2026-05-27.md as an authorization that
+  #   was deliberately NOT SPENT at the time — the EBS throughput raise it was offered
+  #   for was held pending a measurement. This change spends a different, much smaller
+  #   part of it, and says so rather than quietly inheriting the headroom.
+  #
+  # WHY NOW: at $130 the AUTOMATIC STOP_EC2_INSTANCES action fires at 90% = $117.00,
+  #   and a maximal month on the current configuration projects $118.28 (22 weekdays
+  #   x $4.06 + 8 weekend days x $2.48, from the MEASURED daily series — Aug 21 was
+  #   the first full weekday after the 300 GB grow). So the guard was already
+  #   $1.28 BELOW a normal high-side month: on a busy month it would switch the
+  #   trading box off mid-session, which is the 2026-07-31 failure mode caused by the
+  #   guard rather than by the spend. The six `*-not-invoked` alarms added in this
+  #   same change add ~$0.60/mo, taking the projection to ~$118.88 and making the
+  #   overlap worse, not better.
+  # At $150 the 90% line sits at $135.00 — $16.12 clear of the projection, and the
+  #   widest real margin this account has had since the ceiling ladder began.
+  # STILL A REAL GUARD, not a rubber stamp: $150 is the operator's stated HARD
+  #   MAXIMUM, so the ceiling and the cap now coincide instead of the ceiling sitting
+  #   ABOVE the cap (which is the gap Quote 18 recorded — a budget that would permit
+  #   a month the operator had forbidden before it acted at all). That gap closes here.
+  # The sub-₹1,000/mo TARGET is breached ~11x and the downward ratchet ladder stays
+  #   PAUSED — recorded honestly, not silently dropped.
+  #
+  # WHAT THIS DOES NOT FIX, restated because four dated sections now carry it: the
+  #   two AWS-NATIVE budget actions were last seen in EXECUTION_FAILURE (2026-07-31)
+  #   and `budgets:DescribeBudgetActionsForBudget` is AccessDenied for the agent
+  #   identity, so whether THEY fire is still Unknown. What IS now established, and
+  #   what those sections overstated, is that this account has a SECOND, independent
+  #   kill-switch that does not depend on them at all — `tv_hard_stop_guard`, hourly,
+  #   in our own code, with ec2:StopInstances scoped to the prod box. See the dated
+  #   correction block in budget-guards.tf. Raising a ceiling still does
+  #   not repair a native action; it no longer follows that no switch fires.
+  #
+  # 2026-09-23 (operator Quote 23, daily-universe §0): $150 -> $225 for
+  #   SEPTEMBER 2026 ONLY. Measured live: actual $141.36, forecast $188.45, so a
+  #   $150 line would stop the box ~24-25 Sep and hard_stop_guard would disable
+  #   the morning start for the rest of the month. 90% of $225 = $202.50 clears
+  #   the forecast. From October the EFFECTIVE kill line is clamped back to $150
+  #   in hard_stop_guard::effective_budget_kill_usd (UTC billing month), and a
+  #   scheduled 1-Oct PR reverts this limit so the native 80%/100% notifications
+  #   and the 90%/100% actions return to percentages of $150.
+  #
+  # 2026-10-01 (audit PR30b, the scheduled revert Quote 23 named): $225 -> $150.
+  #   September is over, so the standing ceiling is back in all four lockstep
+  #   sites. The native 90% STOP_EC2_INSTANCES line is $135.00 again, BELOW the
+  #   code kill line of $150; aws-budget.md records the October projection
+  #   (~$150 pre-tax) and that an operator lever is needed to stay under it.
+  # 2026-10-13 (operator Quote 30, daily-universe §0): $150 -> $170 so AWS
+  #   stays at or under ₹15,000 a month (≈$170 at an Assumed ~₹88/USD).
+  #   Measured: October 1-12 = $71.80, projection ~$173-175 at the old
+  #   config, so the old native 90% stop ($135) would have stopped the box
+  #   around 23 Oct. The 90% early-stop action below is REMOVED in the same
+  #   change: the one native stop is at 100% = $170, matching the hourly
+  #   guard's line. Disk IOPS 6000 -> 3000 (variables.tf) brings the October
+  #   projection to ~$165 (Assumed).
+  # 2026-10-28 (operator Quote 45, daily-universe §0): $170 -> $185 for
+  #   OCTOBER 2026 only (Budgets API: $157.18 spent, $175.88 forecast). The
+  #   Lambda clamps November onward to $75 in code; this native stop moves
+  #   to $75 on or after 1 November.
+  # 2026-11-02 (operator Quotes 37 and 45, daily-universe §0): the
+  # October-only allowance has expired. Apply the already-authorized $75
+  # standing native line; the historical Lambda/digest settings remain $185
+  # and their unchanged UTC-month clamp already enforces $75 from November
+  # (superseded for November 2026 only by the 2026-11-11 entry below).
+  # 2026-11-11 (operator Quote 52, daily-universe §0): $75 -> $90 for
+  #   NOVEMBER 2026 only (about $21 of the month was two disks attached to
+  #   nothing; the owner deletes them in the console). The Lambda clamps
+  #   November 2026 to $90 and December onward to $75 in code; this native
+  #   stop goes back to "75" on or after 1 December (the lockstep guard
+  #   fails the build from December while it still reads 90).
+  # 2026-11-11 (operator Quote 54, daily-universe §0, owner card "Cap ₹5,500"):
+  #   from 1 December 2026 the standing line is $62 a month, GST included
+  #   (about ₹5,500), replacing $75. The Lambda clamps December onward to $62
+  #   in code now; this native stop stays "90" until the end of November and
+  #   moves to "62" (not "75") in a follow-up change on or after 1 December,
+  #   never before (the lockstep guard requires exactly "62" from December).
+  # 2026-11-14 (operator Quote 59, daily-universe §0, owner card "$140
+  #   (Recommended)"): November 2026 only, $90 -> $140, so the box keeps running
+  #   ($60.83 spent by 14 Nov, AWS forecast $126). From 1 December this native
+  #   stop moves to "62" exactly as Quote 54 set (follow-up on or after 1 Dec).
+  limit_amount      = "140"
   limit_unit        = "USD"
   time_unit         = "MONTHLY"
   time_period_start = "2026-05-01_00:00"
@@ -299,10 +411,22 @@ data "aws_iam_policy_document" "budget_action_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}::automation-definition/AWS-StopEC2Instance:*"]
   }
   # Stop the tv-app box ONLY (ARN-scoped, like the killswitch Lambda).
+  # Until 2026-10-04 this statement carried resources = ["*"] beside this
+  # same comment, so the role could stop ANY instance in the account. The
+  # stop is now pinned to the tv-app ARN with the killswitch's own form.
   statement {
     sid       = "StopTvAppOnly"
     effect    = "Allow"
-    actions   = ["ec2:StopInstances", "ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
+    actions   = ["ec2:StopInstances"]
+    resources = ["arn:aws:ec2:${var.aws_region}:*:instance/${aws_instance.tv_app.id}"]
+  }
+  # The automation polls the instance state while it stops. EC2 Describe
+  # calls do not support resource-level permissions, so they stay on "*";
+  # they are read-only.
+  statement {
+    sid       = "DescribeForStopAutomation"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"]
     resources = ["*"]
   }
   # SSM Automation passes this same role onward.
@@ -347,29 +471,8 @@ resource "aws_budgets_budget_action" "stop_at_100" {
   }
 }
 
-# 90% ACTUAL — early stop so the box never even reaches 100% under a runaway.
-resource "aws_budgets_budget_action" "stop_at_90" {
-  budget_name        = aws_budgets_budget.tv_monthly.name
-  action_type        = "RUN_SSM_DOCUMENTS"
-  approval_model     = "AUTOMATIC"
-  execution_role_arn = aws_iam_role.budget_action.arn
-  notification_type  = "ACTUAL"
-
-  action_threshold {
-    action_threshold_type  = "PERCENTAGE"
-    action_threshold_value = 90
-  }
-
-  definition {
-    ssm_action_definition {
-      action_sub_type = "STOP_EC2_INSTANCES"
-      region          = var.aws_region
-      instance_ids    = [aws_instance.tv_app.id]
-    }
-  }
-
-  subscriber {
-    address           = var.operator_email
-    subscription_type = "EMAIL"
-  }
-}
+# 2026-10-13 (operator Quote 30): the 90% ACTUAL early-stop action
+# (`stop_at_90`) is REMOVED. At $170 it would stop the box at $153, about
+# ₹13,500, below the owner's ₹15,000 line. The one native stop is
+# `stop_at_100` above. Re-adding a native stop below 100% needs a fresh dated
+# quote (Quote 30 REJECT list).

@@ -51,8 +51,9 @@ use crate::time::IST_OFFSET_SECS;
 /// own terraform disproves):
 ///   1. the NSE-holiday gate (tickvault-holiday-gate.service) — the
 ///      common case;
-///   2. the hourly hard-stop-guard's in-window budget breach_stop (its
-///      hourly cron's 03:00 UTC tick IS 08:30 IST; budget-guards.tf) and
+///   2. the hourly hard-stop-guard's budget breach_stop (since 2026-11-13 it
+///      runs at minute 50, 02:50 UTC = 08:20 IST and 03:50 UTC = 09:20 IST, so
+///      it no longer has a run inside 08:25-08:45; budget-guards.tf) and
 ///      the SNS-driven budget-killswitch — BOTH page in the SAME
 ///      invocation, AFTER stopping (stop-first is their deliberate
 ///      spend-cap ordering), so the operator is normally paged by the
@@ -64,6 +65,20 @@ use crate::time::IST_OFFSET_SECS;
 /// EC2 never self-stops on app FAILURE, and the boot-heartbeat gate
 /// window (08:50-09:10) is the backstop pager for anything this
 /// heuristic misreads. Legacy parity: `HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES`.
+///
+/// 2026-10-20: this 08:25 is the same instant the app's holiday gate starts
+/// its stop window (`holiday_gate::SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST`,
+/// which is `shutdown_class::HOLIDAY_GATE_STOP_WINDOW_START_SECS_OF_DAY_IST`).
+/// The gate stops only when its own clock reads 08:25 or later, so a gate
+/// stop is on a box launched at or after about 08:25 and reads here as the
+/// holiday self-stop. The two instants differ by a few seconds: this Lambda
+/// reads the EC2 launch time, the gate reads its clock later in the same boot
+/// (after systemd reaches its unit). A launch in the last seconds before
+/// 08:25 whose gate runs after 08:25 is stopped yet reads here as launched
+/// before the floor, so it pages as "box not running"; the scheduled 08:30
+/// start is never that close. Pinned from the app side by
+/// `holiday_gate_window_start_matches_the_readiness_lambdas_floor` (crates/app/tests/host_tuning_boot_wiring_guard.rs),
+/// which source-scans this exact line: move all three together.
 pub const HOLIDAY_SELF_STOP_EARLIEST_IST_MINUTES: u32 = 8 * 60 + 25;
 
 pub const DEFAULT_BOOT_LOOKBACK_MINUTES: i64 = 10;
@@ -257,7 +272,7 @@ async fn instance_state(
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!(error = %e, "describe_instances failed");
+            error!(code = "LAMBDA-AWS-01", error = %e, "describe_instances failed");
             return ("unknown".to_string(), None, true);
         }
     };
@@ -324,7 +339,7 @@ async fn boot_metric_seen(
     {
         Ok(resp) => resp,
         Err(e) => {
-            error!(error = %e, "get_metric_data failed");
+            error!(code = "LAMBDA-AWS-01", error = %e, "get_metric_data failed");
             return (false, true);
         }
     };
@@ -385,7 +400,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
                     .await
                     .map(|_| ())
                     .map_err(|e| {
-                        error!(error = %e, "sns publish FAILED - raising so the Errors alarm pages");
+                        error!(code = "LAMBDA-NOTIFY-01", error = %e, "sns publish FAILED - raising so the Errors alarm pages");
                         e.to_string()
                     })
             }

@@ -5,7 +5,7 @@ paths:
   - "crates/app/src/depth_dynamic_pipeline_v2.rs"
   - "crates/core/src/instrument/subscription_planner.rs"
   - "crates/app/src/main.rs"
-  - "crates/core/src/pipeline/volume_monotonicity_guard.rs"
+  - "crates/core/src/pipeline/volume_monotonicity_guard.rs"  # ⚠ CORRECTED 2026-11-15: deleted 2026-07-17 with the dead Dhan tick chain; NOT ENFORCED
   - "crates/core/src/parser/quote.rs"
   - "crates/app/src/boot_smoke_test.rs"
   - "crates/core/src/instrument/phase2_readiness_check.rs"
@@ -73,6 +73,9 @@ case where someone bypasses the unit tests).
 > in the sweep); the code can no longer fire. Historical audit below.
 
 > **[ARCHIVED 2026-07-20]** VOLUME-MONO-01 body (emit site deleted 2026-07-17; variant retained; historical audit) — moved verbatim to `docs/rules-archive/wave-5-error-codes-archive.md` (context-size incident; content unchanged).
+
+> **⚠ RETIRED 2026-10-22 (plan item 62, operator Quote 34).** The `Volume01MonotonicityBreach` variant is removed: the volume leaderboard that had emitted it again since 2026-09-06 was deleted with `top_volume`. The code string stays here as history; the crossref allowlists it.
+
 > **[ARCHIVED 2026-07-20]** DEPTH200-SMOKE-01 + PHASE2-READY-01 (subsystems deleted — depth-200 feeds 2026-05-19, Phase 2 dispatcher 2026-05-19; ErrorCode variants no longer exist; historical audit) — moved verbatim to `docs/rules-archive/wave-5-error-codes-archive.md` (context-size incident; content unchanged).
 ## Cross-references
 

@@ -1,18 +1,18 @@
-//! Dhan+Groww same-instrument coexistence regression — ROW-LEVEL proof.
+//! Dhan+TrueData same-instrument coexistence regression — ROW-LEVEL proof.
 //!
 //! Binding operator mandate (`.claude/rules/project/security-id-uniqueness.md`
 //! feed-in-key override 2026-06-28 + `.claude/rules/project/data-integrity.md`
-//! "feed-in-key EVERYWHERE" + the daily-universe locks): a Dhan row and a Groww
+//! "feed-in-key EVERYWHERE" + the daily-universe locks): a Dhan row and a TrueData
 //! row for the SAME instrument MUST coexist as DISTINCT rows because `feed` is
 //! part of the `instrument_lifecycle` DEDUP key
 //! (`DEDUP_KEY_INSTRUMENT_LIFECYCLE` = `ts, security_id, exchange_segment, feed`).
 //!
 //! PR-C's existing F5 test
-//! (`shared_master_writer::tests::test_regression_dhan_and_groww_same_id_distinct_under_composite_key`)
+//! (`shared_master_writer::tests::test_regression_dhan_and_truedata_same_id_distinct_under_composite_key`)
 //! proves abstract HashSet tuple distinctness with hardcoded literals; the
 //! `dedup_segment_meta_guard` pins the DEDUP-key STRING. This test closes the
-//! gap between them: it builds TWO REAL `InstrumentLifecycleRow` structs (one
-//! `feed = "dhan"`, one `feed = "groww"`) with IDENTICAL `security_id` +
+//! gap between them: it builds TWO row identities (one
+//! `feed = "dhan"`, one `feed = "truedata"`) with IDENTICAL `security_id` +
 //! `exchange_segment` + designated `ts`, projects the DEDUP-key columns from
 //! each, and asserts (1) the full key tuples are DISTINCT (both survive UPSERT)
 //! and (2) the same rows WOULD collide if `feed` were dropped from the key —
@@ -24,13 +24,24 @@
 //! `InstrumentLifecycleRow`) now compile unconditionally, and keeping the
 //! dead predicate would have silently compiled this LIVE operator-mandate
 //! ratchet to an EMPTY binary forever (Rule-11 false-OK class).
+//!
+//! **2026-10-28 (owner Quote 44):** the daily lifecycle writer and its row
+//! struct `InstrumentLifecycleRow` were deleted; both tables are frozen
+//! history. The identity columns a row carried are now the test-local
+//! `LifecycleIdentity`, and the frozen table's DEDUP key is still pinned
+//! here, so a change to the key constant still fails this test.
+//!
+//! **Honest scope since then:** with no row struct left, the row-level half
+//! of this proof is now a model built inside the test itself, so it can no
+//! longer catch a writer that drops `feed` from what it writes (there is no
+//! writer). What still bites is the pin on `DEDUP_KEY_INSTRUMENT_LIFECYCLE`:
+//! removing `feed` from the frozen table's key constant fails this file.
 
 #![cfg(test)]
 
 use tickvault_common::feed::Feed;
 use tickvault_storage::instrument_lifecycle_persistence::{
-    DEDUP_KEY_INSTRUMENT_LIFECYCLE, InstrumentLifecycleRow, LIFECYCLE_FEED_DHAN, LifecycleState,
-    lifecycle_designated_ts_nanos,
+    DEDUP_KEY_INSTRUMENT_LIFECYCLE, lifecycle_designated_ts_nanos,
 };
 
 /// The DEDUP-key column set for one lifecycle row, projected from the row +
@@ -53,8 +64,8 @@ struct LifecycleDedupKeyNoFeed {
     exchange_segment: String,
 }
 
-impl<'a> From<&InstrumentLifecycleRow<'a>> for LifecycleDedupKey {
-    fn from(row: &InstrumentLifecycleRow<'a>) -> Self {
+impl<'a> From<&LifecycleIdentity<'a>> for LifecycleDedupKey {
+    fn from(row: &LifecycleIdentity<'a>) -> Self {
         Self {
             ts: lifecycle_designated_ts_nanos(),
             security_id: row.security_id,
@@ -64,8 +75,8 @@ impl<'a> From<&InstrumentLifecycleRow<'a>> for LifecycleDedupKey {
     }
 }
 
-impl<'a> From<&InstrumentLifecycleRow<'a>> for LifecycleDedupKeyNoFeed {
-    fn from(row: &InstrumentLifecycleRow<'a>) -> Self {
+impl<'a> From<&LifecycleIdentity<'a>> for LifecycleDedupKeyNoFeed {
+    fn from(row: &LifecycleIdentity<'a>) -> Self {
         Self {
             ts: lifecycle_designated_ts_nanos(),
             security_id: row.security_id,
@@ -74,44 +85,29 @@ impl<'a> From<&InstrumentLifecycleRow<'a>> for LifecycleDedupKeyNoFeed {
     }
 }
 
-/// Build one real `InstrumentLifecycleRow` for the given identity + feed,
-/// filling every other field with deterministic sentinels. Private + test-only
-/// (no new `pub fn` — the pub-fn ratchet must stay unchanged).
+/// The identity columns an `instrument_lifecycle` row carried (the frozen
+/// table's DEDUP key minus the pinned designated `ts`). Test-local: the row
+/// struct was deleted with the writer (Quote 44).
+struct LifecycleIdentity<'a> {
+    security_id: i64,
+    exchange_segment: &'a str,
+    feed: &'a str,
+}
+
 fn lifecycle_row<'a>(
     security_id: i64,
     exchange_segment: &'a str,
     feed: &'a str,
-) -> InstrumentLifecycleRow<'a> {
-    InstrumentLifecycleRow {
-        last_update_ts_nanos: 0,
+) -> LifecycleIdentity<'a> {
+    LifecycleIdentity {
         security_id,
         exchange_segment,
-        exchange_id: "NSE",
-        instrument_type: "EQUITY",
-        symbol_name: "SENTINEL",
-        display_name: "Sentinel Instrument",
-        underlying_security_id: 0,
-        underlying_symbol: "",
-        lot_size: 1,
-        tick_size: 0.05,
-        expiry_date_nanos: 0,
-        strike_price: 0.0,
-        option_type: "",
-        lifecycle_state: LifecycleState::Active,
-        lifecycle_state_locked: false,
-        first_seen_date_nanos: 0,
-        last_seen_date_nanos: 0,
-        last_active_date_nanos: 0,
-        expired_date_nanos: 0,
-        prev_symbol_chain: "",
-        source_csv_sha256: "",
-        dry_run: false,
         feed,
     }
 }
 
 #[test]
-fn test_dhan_and_groww_lifecycle_rows_coexist_under_feed_in_key() {
+fn test_dhan_and_truedata_lifecycle_rows_coexist_under_feed_in_key() {
     // Sanity-pin the DEDUP-key column order this test projects against, so a
     // future re-order of `DEDUP_KEY_INSTRUMENT_LIFECYCLE` is caught here too.
     assert_eq!(
@@ -123,27 +119,30 @@ fn test_dhan_and_groww_lifecycle_rows_coexist_under_feed_in_key() {
     const SECURITY_ID: i64 = 11536;
     const SEGMENT: &str = "NSE_EQ";
 
-    let dhan_row = lifecycle_row(SECURITY_ID, SEGMENT, LIFECYCLE_FEED_DHAN);
-    let groww_row = lifecycle_row(SECURITY_ID, SEGMENT, Feed::Groww.as_str());
+    let dhan_row = lifecycle_row(SECURITY_ID, SEGMENT, Feed::Dhan.as_str());
+    let truedata_row = lifecycle_row(SECURITY_ID, SEGMENT, Feed::Truedata.as_str());
 
     // Guard the premise: the two rows really do share id + segment + designated
     // `ts`, and differ ONLY in `feed`.
     assert_eq!(
-        dhan_row.security_id, groww_row.security_id,
+        dhan_row.security_id, truedata_row.security_id,
         "same security_id"
     );
     assert_eq!(
-        dhan_row.exchange_segment, groww_row.exchange_segment,
+        dhan_row.exchange_segment, truedata_row.exchange_segment,
         "same exchange_segment"
     );
     assert_eq!(dhan_row.feed, "dhan");
-    assert_eq!(groww_row.feed, "groww");
-    assert_ne!(dhan_row.feed, groww_row.feed, "feed is the discriminator");
+    assert_eq!(truedata_row.feed, "truedata");
+    assert_ne!(
+        dhan_row.feed, truedata_row.feed,
+        "feed is the discriminator"
+    );
 
     // (1) FULL DEDUP key (incl. feed): the two rows are DISTINCT → both survive
-    // the UPSERT (a Dhan observation and a Groww observation coexist).
+    // the UPSERT (a Dhan observation and a TrueData observation coexist).
     let dhan_key = LifecycleDedupKey::from(&dhan_row);
-    let groww_key = LifecycleDedupKey::from(&groww_row);
+    let groww_key = LifecycleDedupKey::from(&truedata_row);
     assert_ne!(
         dhan_key, groww_key,
         "with `feed` in the key, the two feeds' rows are DISTINCT and BOTH survive"
@@ -153,7 +152,7 @@ fn test_dhan_and_groww_lifecycle_rows_coexist_under_feed_in_key() {
     assert!(full_keys.insert(dhan_key), "dhan row inserts");
     assert!(
         full_keys.insert(groww_key),
-        "groww row inserts as a DISTINCT row (feed differs)"
+        "truedata row inserts as a DISTINCT row (feed differs)"
     );
     assert_eq!(
         full_keys.len(),
@@ -166,7 +165,7 @@ fn test_dhan_and_groww_lifecycle_rows_coexist_under_feed_in_key() {
     // for both (constant `lifecycle_designated_ts_nanos`), so this is a true
     // collision-but-for-feed, not an artifact of differing timestamps.
     let dhan_key_no_feed = LifecycleDedupKeyNoFeed::from(&dhan_row);
-    let groww_key_no_feed = LifecycleDedupKeyNoFeed::from(&groww_row);
+    let groww_key_no_feed = LifecycleDedupKeyNoFeed::from(&truedata_row);
     assert_eq!(
         dhan_key_no_feed, groww_key_no_feed,
         "WITHOUT `feed`, the two rows share the same (ts, security_id, \

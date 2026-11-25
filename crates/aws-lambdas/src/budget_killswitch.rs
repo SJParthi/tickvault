@@ -11,6 +11,8 @@
 //! Environment variables (set by Terraform — unchanged from the legacy runtime):
 //!   EC2_INSTANCE_ID  — instance to stop on budget breach
 //!   ALERTS_TOPIC_ARN — operator's tv_alerts SNS topic for Telegram
+//!   BUDGET_STOP_PARAM — the budget-stop latch (audit PR30); written after
+//!                       the stop so nothing restarts the box this month
 //!   LOG_LEVEL        — INFO (default) / DEBUG / WARNING
 //!
 //! Parity notes: every pure helper mirrors its `_snake_case` legacy
@@ -118,7 +120,11 @@ pub fn format_alert_payload(
          \x20 1. Inspect AWS Cost Explorer for the runaway cost source.\n\
          \x20 2. Fix the underlying issue (rogue stress test, unintended\n\
          \x20    resource, exchange-rate spike, etc).\n\
-         \x20 3. Restart via AWS Console or `aws ec2 start-instances`.\n\
+         \x20 3. Delete the budget-stop latch:\n\
+         \x20    `aws ssm delete-parameter --name /tickvault-guard/<env>/budget-stop-month`,\n\
+         \x20    then turn the 8:30 AM start back on (the hourly guard keeps it off\n\
+         \x20    while the stop holds): `aws events enable-rule --name tv-<env>-daily-start`,\n\
+         \x20    then restart via AWS Console or `aws ec2 start-instances`.\n\
          \x20 4. Charter aws-budget.md §6: EIP + EBS continue to accrue at\n\
          \x20    ~Rs 0.51/hour while stopped (vs Rs 1.90/hour running)."
     );
@@ -138,14 +144,42 @@ pub fn truncate_subject(subject: &str) -> String {
 /// (checked in this order) BEFORE any AWS client is built.
 pub fn guard_config(instance_id: &str, topic_arn: &str) -> Result<(), Value> {
     if instance_id.is_empty() {
-        error!("EC2_INSTANCE_ID env var is empty — cannot stop instance");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "EC2_INSTANCE_ID env var is empty — cannot stop instance"
+        );
         return Err(json!({"ok": false, "reason": "missing EC2_INSTANCE_ID"}));
     }
     if topic_arn.is_empty() {
-        error!("ALERTS_TOPIC_ARN env var is empty — cannot send operator alert");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "ALERTS_TOPIC_ARN env var is empty — cannot send operator alert"
+        );
         return Err(json!({"ok": false, "reason": "missing ALERTS_TOPIC_ARN"}));
     }
     Ok(())
+}
+
+/// Bound on the kill-switch's latch write (audit PR30). The stop and the
+/// page matter more than the latch; a slow SSM call must not hold them.
+const LATCH_WRITE_TIMEOUT_SECS: u64 = 5;
+
+/// The page line reporting the budget-stop latch write (audit PR30):
+/// `Ok(month)` when the latch was written, `Err(reason)` when it was not.
+/// The stop has already happened either way; a failed write only means the
+/// 8:45 AM rescue may restart the box, which the hourly guard stops again.
+pub fn latch_note(result: Result<&str, &str>) -> String {
+    match result {
+        Ok(month) => format!(
+            "\n\nBudget-stop latch set for {month} (UTC billing month): the 8:45 AM \
+rescue, the autopilot and the terraform apply will not restart the box until \
+the next billing month starts."
+        ),
+        Err(reason) => format!(
+            "\n\n⚠ could NOT write the budget-stop latch ({reason}) — the 8:45 AM \
+rescue may restart the box tomorrow; the hourly guard stops it again."
+        ),
+    }
 }
 
 /// Render the success return value — legacy parity:
@@ -199,7 +233,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .send()
         .await
         .map_err(|e| {
-            error!(error = %e, "ec2:StopInstances failed — instance may still be running");
+            error!(code = "LAMBDA-AWS-02", error = %e, "ec2:StopInstances failed — instance may still be running");
             e
         })?;
     let state_changes: Vec<StateTransition> = stop_result
@@ -219,7 +253,41 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
         .collect();
     info!(transitions = state_changes.len(), "ec2 stop requested");
 
-    let payload = format_alert_payload(&instance_id, &state_changes, &budget_context);
+    // Audit PR30: latch the stop for its UTC billing month. Written AFTER
+    // the stop, bounded by a timeout so a slow SSM call can never hold the
+    // page back, and a failure is reported in the page, never fatal. The
+    // month is dated `KILLSWITCH_NOTIFICATION_LAG_HOURS` back, so a late
+    // notification for the month that just ended never latches the new one.
+    let latch_param = std::env::var("BUDGET_STOP_PARAM")
+        .unwrap_or_else(|_| crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string());
+    let month = crate::budget_stop_latch::killswitch_billing_month(chrono::Utc::now());
+    let latch = tokio::time::timeout(
+        std::time::Duration::from_secs(LATCH_WRITE_TIMEOUT_SECS),
+        crate::clients::ssm(&config)
+            .put_parameter()
+            .name(&latch_param)
+            .value(&month)
+            .r#type(aws_sdk_ssm::types::ParameterType::String)
+            .overwrite(true)
+            .send(),
+    )
+    .await;
+    let note = match latch {
+        Ok(Ok(_)) => latch_note(Ok(&month)),
+        Ok(Err(e)) => {
+            // The full SDK error goes to the log only; the page names the
+            // outcome, never AWS internals.
+            error!(code = "LAMBDA-AWS-02", error = %e, param = %latch_param, "ssm:PutParameter for the budget-stop latch failed");
+            latch_note(Err("SSM refused the write; see the Lambda log"))
+        }
+        Err(_) => {
+            error!(code = "LAMBDA-AWS-02", param = %latch_param, timeout_secs = LATCH_WRITE_TIMEOUT_SECS, "ssm:PutParameter for the budget-stop latch timed out");
+            latch_note(Err("the SSM write timed out"))
+        }
+    };
+
+    let mut payload = format_alert_payload(&instance_id, &state_changes, &budget_context);
+    payload.message.push_str(&note);
     let publish = sns
         .publish()
         .topic_arn(&topic_arn)
@@ -231,7 +299,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
             // EC2 is already stopped (good!) but the operator may not know —
             // the Lambda self-error alarm in TF catches this and pages via
             // the same tv_alerts pipe.
-            error!(error = %e, "sns:Publish to operator alerts topic failed");
+            error!(code = "LAMBDA-NOTIFY-01", error = %e, "sns:Publish to operator alerts topic failed");
             e
         })?;
     info!(message_id = ?publish.message_id(), "operator alert published");
@@ -244,6 +312,14 @@ mod tests {
     use super::*;
 
     // ---- ExtractBudgetMessage (legacy: 3 tests) ----
+
+    #[test]
+    fn test_latch_note_reports_both_outcomes() {
+        let ok = latch_note(Ok("2026-09"));
+        assert!(ok.contains("Budget-stop latch set for 2026-09"));
+        let failed = latch_note(Err("AccessDenied"));
+        assert!(failed.contains("could NOT write the budget-stop latch (AccessDenied)"));
+    }
 
     #[test]
     fn test_empty_event_returns_placeholder() {
@@ -305,6 +381,28 @@ mod tests {
     fn test_payload_renders_state_transition() {
         let out = format_alert_payload("i-cafe", &one_transition("i-cafe"), "ctx");
         assert!(out.message.contains("i-cafe: running -> stopping"));
+    }
+
+    /// Audit B2 review (2026-11-13): the hourly guard now keeps the 8:30 AM
+    /// start rule disabled while this month's stop holds, so deleting the
+    /// latch alone no longer brings the box back next morning. The page must
+    /// name both steps, latch first.
+    #[test]
+    fn test_regression_recovery_steps_name_the_latch_and_the_start_rule() {
+        let out = format_alert_payload("i-abc", &one_transition("i-abc"), "ctx");
+        let delete = out
+            .message
+            .find("aws ssm delete-parameter --name /tickvault-guard/<env>/budget-stop-month")
+            .expect("latch delete step");
+        let enable = out
+            .message
+            .find("aws events enable-rule --name tv-<env>-daily-start")
+            .expect("start rule step");
+        let restart = out
+            .message
+            .find("aws ec2 start-instances")
+            .expect("restart step");
+        assert!(delete < enable && enable < restart, "{}", out.message);
     }
 
     #[test]

@@ -26,14 +26,25 @@
 
 use std::path::PathBuf;
 
-/// The five `/exec` completeness-probe files.
-const PROBE_FILES: [&str; 5] = [
-    "rest_candle_fold.rs",
-    "tf_consistency_boot.rs",
-    "market_ram_store_boot.rs",
-    "spot_crossverify_boot.rs",
-    "groww_spot_1m_boot.rs",
-];
+/// The `/exec` completeness-probe files.
+///
+/// ⚠ 2026-09-17: `market_ram_store_boot.rs` LEAVES this list. Its only
+/// `/exec` probe was the one-shot chain-day rehydrate, removed on
+/// 2026-09-16 when the per-minute option-chain REST leg — the sole WRITER
+/// of the table it read — went with the operator's SOCKETS-ONLY narrowing
+/// (`no-rest-except-live-feed-2026-06-27.md` §12.10). `ram_store_wiring_
+/// guard.rs` records the same retirement from the other side.
+///
+/// The removal left this guard FAILING (2 of 4 tests red) against a file
+/// with nothing to pin — a guard demanding a convention from code that no
+/// longer exists. Removing the entry is the fix; loosening the assertion to
+/// "present OR absent" would be the vacuous-guard shape this repository has
+/// now recorded eight times.
+///
+/// The ARITY is deliberately spelled `2` rather than inferred: a file
+/// silently dropping out of a probe list is exactly how a convention stops
+/// being enforced without anyone noticing.
+const PROBE_FILES: [&str; 2] = ["rest_candle_fold.rs", "tf_consistency_boot.rs"];
 
 fn app_src(file: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -89,7 +100,7 @@ fn banned_needles() -> [&'static str; 3] {
 /// Positive pins: every probe site fetches `cap + 1`.
 #[test]
 fn probe_sites_fetch_limit_plus_one() {
-    let pins: [(&str, &[&str]); 5] = [
+    let pins: [(&str, &[&str]); 2] = [
         (
             "rest_candle_fold.rs",
             &["let fetch_limit = limit.saturating_add(1);"],
@@ -102,12 +113,8 @@ fn probe_sites_fetch_limit_plus_one() {
                 "TF_VERIFY_DISCOVERY_ROW_LIMIT.saturating_add(1)",
             ],
         ),
-        ("market_ram_store_boot.rs", &["limit.saturating_add(1)"]),
-        ("spot_crossverify_boot.rs", &["SPOT_XVERIFY_ROW_LIMIT + 1"]),
-        (
-            "groww_spot_1m_boot.rs",
-            &["GROWW_SPOT1M_PRE_BOOT_READ_CAP + 1"],
-        ),
+        // 2026-09-17: the `market_ram_store_boot.rs` entry is REMOVED with
+        // its probe — see the `PROBE_FILES` note above.
     ];
     for (file, needles) in pins {
         let prod = stripped_production(file);
@@ -125,7 +132,7 @@ fn probe_sites_fetch_limit_plus_one() {
 /// Positive pins: every probe parser flags strictly OVER the cap.
 #[test]
 fn probe_sites_flag_strictly_over_limit() {
-    let pins: [(&str, &[&str]); 5] = [
+    let pins: [(&str, &[&str]); 2] = [
         (
             "rest_candle_fold.rs",
             &["let truncated = dataset.len() > limit;"],
@@ -134,15 +141,8 @@ fn probe_sites_flag_strictly_over_limit() {
             "tf_consistency_boot.rs",
             &["let truncated = rows.len() > limit;"],
         ),
-        (
-            "market_ram_store_boot.rs",
-            &["let truncated = dataset.len() > limit;"],
-        ),
-        (
-            "spot_crossverify_boot.rs",
-            &["let truncated = rows.len() > limit;"],
-        ),
-        ("groww_spot_1m_boot.rs", &["if rows.len() > cap {"]),
+        // 2026-09-17: the `market_ram_store_boot.rs` entry is REMOVED with
+        // its probe — see the `PROBE_FILES` note above.
     ];
     for (file, needles) in pins {
         let prod = stripped_production(file);

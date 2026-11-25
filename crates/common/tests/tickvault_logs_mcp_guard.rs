@@ -177,6 +177,16 @@ fn launcher_exists_executable_and_rust_only() {
         "launcher must exec the prebuilt binary via `exec \"$BIN\"` (in CODE, \
          not a comment)"
     );
+    // 2026-09-27 (audit PR29b): a stale prebuilt binary ran old code after a
+    // fix was checked out. The launcher only takes the prebuilt path when no
+    // crate file, Cargo.toml or Cargo.lock is newer than the binary.
+    assert!(
+        code.contains(
+            "find crates/tickvault-logs-mcp Cargo.toml Cargo.lock -type f -newer \"$BIN\""
+        ),
+        "launcher must skip a prebuilt binary older than its sources (in CODE, \
+         not a comment)"
+    );
     assert!(
         code.contains("exec cargo run --release -q -p tickvault-logs-mcp"),
         "launcher must fall back to `exec cargo run --release` \

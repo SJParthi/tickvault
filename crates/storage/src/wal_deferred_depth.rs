@@ -1,0 +1,1561 @@
+//! Deferred-depth marks — the record of which captured frames had their
+//! order-book rows SKIPPED by the ingest shed, so their raw WAL segments are
+//! kept until those rows are written back (plan item 45a, 2026-09-29).
+//!
+//! # Why this exists
+//!
+//! The ingest shed (`tickvault_common::ingest_shed`) stops the QuestDB depth
+//! write when the database falls behind or the disk runs short. The frame is
+//! already durable in the capture-at-receipt WAL at that point, so the shed
+//! was meant to drop the DATABASE write and never the capture. It dropped both:
+//! nothing recorded that the frame's depth rows were missing, the depth
+//! acknowledgements that followed moved the applied watermark past it, and the
+//! WAL prunes then deleted the segment after its retention window. MEASURED on
+//! the live box 2026-09-29: 5,792,427 inline-depth packets shed by 10:08 IST,
+//! every one of them lost for good two to three days later.
+//!
+//! Operator, 2026-09-29: "neevr ever anythign shodul be fucking missed dude
+//! okay?" (`websocket-connection-scope-lock.md` "2026-09-29 — ZERO LOSS").
+//!
+//! # Why a separate table and not `note_unapplied`
+//!
+//! `wal_applied_watermark::note_unapplied` marks a whole ~4.6-minute bucket as
+//! unapplied, and the next boot re-folds EVERY segment overlapping such a
+//! bucket — ticks, candles and depth. A shed that lasts a session would mark
+//! the whole ~25 GB day, and the next boot would replay all of it: the
+//! 2026-09-29 morning flood, every day. These marks do one thing only: they
+//! keep the segment from both prunes. The after-close pass writes back ONLY
+//! the depth component the shed skipped, then clears the mark.
+//!
+//! # Shape
+//!
+//! A fixed, direct-mapped table of [`DEFERRED_BUCKETS`] slots keyed by
+//! `capture_seq >> DEFERRED_BUCKET_SHIFT` (the same bucket width as the
+//! unapplied table). Each slot holds its bucket id and a bitmask of which
+//! depth kinds were shed in it ([`ShedDepth`]). The hot path is
+//! [`DeferredDepth::note_shed`]: one relaxed load in the common case (the
+//! bucket is already marked for that kind), at most one CAS and one
+//! `fetch_or` when a bucket is marked for the first time. No allocation, no
+//! lock, no I/O.
+//!
+//! A slot already holding a DIFFERENT bucket is a collision. The table cannot
+//! record the mark, so it sets `overflowed` and remembers the highest sequence
+//! it failed to record. While overflowed, every range reads as deferred (the
+//! prunes keep everything): the failure direction is "keep more", never
+//! "delete". `2048 × 4.6 min ≈ 6.5 days` of marks fit before two buckets can
+//! share a slot.
+//!
+//! **⚠ CORRECTED 2026-10-20 (PR W review round 4) — the collision horizon
+//! for marks taken in trading hours is about 13 days, not 6.5.** Two bucket
+//! ids share a slot when they differ by a multiple of 2048, i.e. by a
+//! multiple of `2048 × 2^38 ns = 562,949.95 s = 6 d 12 h 22 min`. One such
+//! step moves the time of day by 12 h 22 min, so a shed in the session
+//! (09:00–15:40 IST, 6 h 40 min wide) cannot land on a mark taken in an
+//! earlier session one step back. Two steps, `1,125,899.91 s = 13 d 0 h
+//! 45 min`, move it by 45 minutes: a shed at 10:00 collides with a mark
+//! taken at 09:15 thirteen days earlier, if that mark is still in the table
+//! (the after-close pass clears marks every evening; a carried or stuck
+//! bucket is what stays).
+//!
+//! **⚠ CHANGED 2026-10-27 (plan item W2) — the overflow honours its height.**
+//! Until this change, while overflowed,
+//! [`DeferredDepthSnapshot::kinds_in_range`] returned [`SHED_DEPTH_ALL`] for
+//! EVERY range and ignored `overflow_high_seq`, so one collision pinned every
+//! segment written after it. Every sequence the table fails to record is at
+//! or below `overflow_high_seq` (the top of the bucket it could not hold), so
+//! a range whose low end is ABOVE the height now reads its marks as usual;
+//! a range at or below it, or one whose start is unknown, still reads
+//! [`SHED_DEPTH_ALL`]. The prune's segment lookup
+//! ([`DeferredDepthSnapshot::segment_is_deferred`]) passes the segment's
+//! first record LESS one reorder slack as the low end, so a record reordered
+//! below the first is still covered. An unknown height (`0`, or `u64::MAX`
+//! from a rejected marks file with nothing on disk to bound it) taints every
+//! range as before, and merging an unknown height with a known one stays
+//! unknown. The height is already in the file header, so it survives a
+//! restart. The after-close pass sweeps only the segments that can reach at
+//! or below the height (`deferred_depth_pass.rs`), so the newest segment,
+//! open or unbounded, no longer stops it clearing an overflow from earlier
+//! in the session. **Honest limits:** a snapshot taken while an earlier
+//! overflow is set can read the earlier, lower height for a collision that
+//! lands after it (the same race as any mark made after the prune's
+//! snapshot); an unknown height still never clears through the pass,
+//! because the newest segment has no upper bound.
+//!
+//! Persistence mirrors `applied.tvaw`: a CRC-checked file beside the segments,
+//! written tmp + rename at most once a second from the writer threads, bound
+//! to the WAL directory by a path tag so a file copied in from elsewhere is
+//! rejected. A rejected or absent file seeds nothing. Marks newer than the
+//! last successful persist are lost if the process dies — normally under a
+//! second, but longer while persists are failing (full disk) or while no
+//! writer thread is completing batches. The file is fsynced before the
+//! rename, so a host crash cannot leave a renamed-but-empty file.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use tracing::{error, warn};
+
+use crate::wal_applied_watermark::{crc32_ieee, dir_tag_of, wall_nanos, write_fresh};
+
+/// The marks file, beside the `*.wal` segments. Not a `.wal`, so the segment
+/// glob and the prunes never see it.
+pub const DEFERRED_DEPTH_FILE: &str = "deferred_depth.tvdd";
+/// Written first, then renamed over the live file.
+pub const DEFERRED_DEPTH_TMP: &str = "deferred_depth.tvdd.tmp";
+const DEFERRED_MAGIC: [u8; 4] = *b"TVDD";
+const DEFERRED_VERSION: u8 = 1;
+
+/// `capture_seq >> DEFERRED_BUCKET_SHIFT` is a bucket id — the same width as
+/// `wal_applied_watermark::UNAPPLIED_BUCKET_SHIFT` (≈4.6 minutes), so one
+/// segment (~1.6 min) overlaps at most two buckets.
+pub const DEFERRED_BUCKET_SHIFT: u32 = crate::wal_applied_watermark::UNAPPLIED_BUCKET_SHIFT;
+/// Slots in the direct-mapped table: `2048 × 4.6 min ≈ 6.5 days` of marked
+/// buckets before two can collide. A full shed session marks ~85.
+pub const DEFERRED_BUCKETS: usize = 2048;
+/// Persist at most this often.
+pub const DEFERRED_PERSIST_INTERVAL_NANOS: u64 = 1_000_000_000;
+
+/// magic | version | flags | pad | overflow_high_seq | persisted_at | dir_tag
+const HEADER_LEN: usize = 4 + 1 + 1 + 2 + 8 + 8 + 8;
+/// Per slot: bucket id (8) + kinds (1) + pad (7).
+const SLOT_LEN: usize = 16;
+const BODY_LEN: usize = DEFERRED_BUCKETS * SLOT_LEN;
+/// The whole file: header + slots + crc32.
+pub const DEFERRED_DEPTH_LEN: usize = HEADER_LEN + BODY_LEN + 4;
+
+const FLAG_OVERFLOWED: u8 = 0b01;
+
+/// Counter: the marks file could not be written.
+pub const DEFERRED_PERSIST_FAILED_COUNTER: &str = "tv_wal_deferred_depth_persist_failed_total";
+/// Counter: a marks file was present but rejected.
+pub const DEFERRED_INVALID_COUNTER: &str = "tv_wal_deferred_depth_invalid_total";
+
+/// Which depth write a shed skipped. A bitmask so one slot can carry both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShedDepth {
+    /// The five order-book levels inside a Full-mode main-feed packet.
+    Inline = 0b01,
+    /// A dedicated depth-20 or depth-200 frame.
+    Dedicated = 0b10,
+}
+
+/// Both kinds — what an overflowed table, or an unknown range, must assume.
+pub const SHED_DEPTH_ALL: u8 = ShedDepth::Inline as u8 | ShedDepth::Dedicated as u8;
+
+/// A point-in-time copy of the marks. ~32 KiB, cold path only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredDepthSnapshot {
+    pub overflowed: bool,
+    /// Upper bound on every sequence the table failed to record.
+    pub overflow_high_seq: u64,
+    pub persisted_at_nanos: u64,
+    /// See `wal_applied_watermark::AppliedSnapshot::dir_tag`.
+    pub dir_tag: u64,
+    /// `(bucket_id, kinds)` per slot; `(0, _)` is empty.
+    pub slots: Vec<(u64, u8)>,
+}
+
+impl Default for DeferredDepthSnapshot {
+    fn default() -> Self {
+        Self {
+            overflowed: false,
+            overflow_high_seq: 0,
+            persisted_at_nanos: 0,
+            dir_tag: 0,
+            slots: vec![(0, 0); DEFERRED_BUCKETS], // APPROVED: cold snapshot, fixed size
+        }
+    }
+}
+
+impl DeferredDepthSnapshot {
+    /// The depth kinds shed anywhere in `[lo, hi]` (inclusive, capture
+    /// sequences). `hi = None` means the range's end is unknown (the newest
+    /// segment, or an unreadable successor): every mark at or after `lo`
+    /// counts. `lo == 0` means the start is unknown too: any mark counts.
+    /// While overflowed, a range that starts at or below the overflow height
+    /// (or whose start is unknown) reads as [`SHED_DEPTH_ALL`]; a range that
+    /// starts above it reads its marks as usual, because every sequence the
+    /// table failed to record is at or below the height (plan item W2,
+    /// 2026-10-27). An unknown height ([`Self::overflow_height`] `None`)
+    /// taints every range, as before.
+    ///
+    /// O(DEFERRED_BUCKETS): every slot is visited. Cold prune path.
+    #[must_use]
+    pub fn kinds_in_range(&self, lo: u64, hi: Option<u64>) -> u8 {
+        if self.overflowed {
+            match self.overflow_height() {
+                Some(height) if lo > height => {}
+                _ => return SHED_DEPTH_ALL,
+            }
+        }
+        let lo_id = lo >> DEFERRED_BUCKET_SHIFT;
+        let hi_id = hi.map(|h| h >> DEFERRED_BUCKET_SHIFT);
+        let mut kinds = 0u8;
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, cold prune path
+        for &(id, k) in &self.slots {
+            if id == 0 || k == 0 {
+                continue;
+            }
+            let after_lo = lo == 0 || id >= lo_id;
+            let before_hi = hi_id.is_none_or(|h| id <= h);
+            if after_lo && before_hi {
+                kinds |= k;
+            }
+        }
+        kinds
+    }
+
+    /// The highest sequence an overflow can have failed to record, when it
+    /// is known. `None` when the table is not overflowed, or when the height
+    /// is unknown: `0` (a file that set the flag without a height) or
+    /// `u64::MAX` (a rejected marks file with nothing on disk to bound it).
+    /// An unknown height taints every range. O(1).
+    #[must_use]
+    pub const fn overflow_height(&self) -> Option<u64> {
+        if !self.overflowed || is_unknown_height(self.overflow_high_seq) {
+            None
+        } else {
+            Some(self.overflow_high_seq)
+        }
+    }
+
+    /// Whether any depth in `[lo, hi]` is still waiting to be written back.
+    #[must_use]
+    pub fn range_is_deferred(&self, lo: u64, hi: Option<u64>) -> bool {
+        self.kinds_in_range(lo, hi) != 0
+    }
+
+    /// Whether a WAL segment whose first record is `first` and whose range
+    /// ends at `hi` (the next segment's first less one; `None` when unknown)
+    /// can hold depth still waiting to be written back. The marks are per
+    /// frame and carry no reorder slack, so the lookup reaches one
+    /// `REPLAY_REORDER_SLACK_SEQ` below `first` (a record can sit up to the
+    /// slack below the segment's first, PR W review round 4) and one above
+    /// `hi` (a record written just before the rotation can sit up to the
+    /// slack above the next segment's first, round 5). `first == 0` (an
+    /// unreadable first record) counts any mark. O(DEFERRED_BUCKETS), cold
+    /// prune path.
+    #[must_use]
+    pub fn segment_is_deferred(&self, first: u64, hi: Option<u64>) -> bool {
+        use crate::wal_applied_watermark::{reorder_reach_hi, reorder_reach_lo};
+        self.range_is_deferred(reorder_reach_lo(first), hi.map(reorder_reach_hi))
+    }
+
+    /// Every marked bucket, oldest first — the after-close pass's work list.
+    #[must_use]
+    pub fn marked_buckets(&self) -> Vec<(u64, u8)> {
+        let mut out: Vec<(u64, u8)> = self
+            .slots
+            .iter()
+            .copied()
+            .filter(|&(id, k)| id != 0 && k != 0)
+            .collect(); // APPROVED: cold after-close work list
+        out.sort_unstable_by_key(|&(id, _)| id); // O(1) EXEMPT: cold, at most DEFERRED_BUCKETS
+        out
+    }
+
+    /// Whether nothing is waiting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.overflowed && self.slots.iter().all(|&(id, k)| id == 0 || k == 0)
+    }
+
+    /// The on-disk form: header, slots, CRC-32 over both.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0u8; DEFERRED_DEPTH_LEN]; // APPROVED: once-a-second persist, cold path
+        out[0..4].copy_from_slice(&DEFERRED_MAGIC);
+        out[4] = DEFERRED_VERSION;
+        out[5] = if self.overflowed { FLAG_OVERFLOWED } else { 0 };
+        out[8..16].copy_from_slice(&self.overflow_high_seq.to_le_bytes());
+        out[16..24].copy_from_slice(&self.persisted_at_nanos.to_le_bytes());
+        out[24..32].copy_from_slice(&self.dir_tag.to_le_bytes());
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, cold persist path
+        for (i, &(id, kinds)) in self.slots.iter().take(DEFERRED_BUCKETS).enumerate() {
+            let at = HEADER_LEN + i * SLOT_LEN;
+            out[at..at + 8].copy_from_slice(&id.to_le_bytes());
+            out[at + 8] = kinds;
+        }
+        let crc = crc32_ieee(&out[..HEADER_LEN + BODY_LEN]);
+        out[HEADER_LEN + BODY_LEN..].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Parses the on-disk form. `None` on any shape or checksum failure.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != DEFERRED_DEPTH_LEN
+            || bytes[0..4] != DEFERRED_MAGIC
+            || bytes[4] != DEFERRED_VERSION
+        {
+            return None;
+        }
+        let expected = u32::from_le_bytes(bytes[HEADER_LEN + BODY_LEN..].try_into().ok()?);
+        if crc32_ieee(&bytes[..HEADER_LEN + BODY_LEN]) != expected {
+            return None;
+        }
+        let mut slots = vec![(0u64, 0u8); DEFERRED_BUCKETS]; // APPROVED: boot-time load
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, boot-time load
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let at = HEADER_LEN + i * SLOT_LEN;
+            let id = u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?);
+            if id > MAX_BUCKET_ID {
+                return None; // no capture sequence can produce it
+            }
+            let kinds = bytes[at + 8] & SHED_DEPTH_ALL;
+            *slot = (id, kinds);
+        }
+        Some(Self {
+            overflowed: bytes[5] & FLAG_OVERFLOWED != 0,
+            overflow_high_seq: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            persisted_at_nanos: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+            dir_tag: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
+            slots,
+        })
+    }
+
+    /// Reads and validates `<wal_dir>/deferred_depth.tvdd`. Absent or
+    /// rejected → `None`. See [`Self::load_file`] for the distinction, which
+    /// only the boot bind needs.
+    #[must_use]
+    pub fn load(wal_dir: &Path) -> Option<Self> {
+        match Self::load_file(wal_dir) {
+            MarksFile::Loaded(snap) => Some(snap),
+            MarksFile::Absent | MarksFile::Rejected => None,
+        }
+    }
+
+    /// Reads `<wal_dir>/deferred_depth.tvdd`, telling an absent file (a first
+    /// boot, or nothing ever shed) from a present-but-unusable one (torn,
+    /// corrupt, wrong size or type, or written beside another directory).
+    #[must_use]
+    pub fn load_file(wal_dir: &Path) -> MarksFile {
+        let path = wal_dir.join(DEFERRED_DEPTH_FILE);
+        // Size and type BEFORE reading: a FIFO, a device or an oversized file
+        // at this path must never hang or exhaust the prune or the boot.
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarksFile::Absent,
+            Err(_) => return MarksFile::Rejected,
+        };
+        let bytes = if meta.is_file() && meta.len() == DEFERRED_DEPTH_LEN as u64 {
+            match std::fs::read(&path) {
+                Ok(bytes) => bytes, // APPROVED: boot-time load, cold path
+                Err(_) => return MarksFile::Rejected,
+            }
+        } else {
+            Vec::new() // APPROVED: rejected below as the wrong shape
+        };
+        match Self::from_bytes(&bytes) {
+            Some(snap) if snap.dir_tag == dir_tag_of(wal_dir) => MarksFile::Loaded(snap),
+            _ => {
+                metrics::counter!(DEFERRED_INVALID_COUNTER).increment(1);
+                MarksFile::Rejected
+            }
+        }
+    }
+}
+
+/// What [`DeferredDepthSnapshot::load_file`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarksFile {
+    Absent,
+    Loaded(DeferredDepthSnapshot),
+    /// Present but unusable: the marks it held are unknown.
+    Rejected,
+}
+
+impl DeferredDepthSnapshot {
+    /// ORs `other` into `self`: a mark in either is kept. Two different
+    /// buckets in one slot cannot both be held, so that case overflows —
+    /// towards keeping everything, never towards dropping a mark.
+    pub fn absorb(&mut self, other: &Self) {
+        if other.overflowed {
+            self.raise_overflow_height(other.overflow_high_seq);
+        }
+        // The highest bucket of `other` this table cannot hold, if any.
+        let mut lost_top: Option<u64> = None;
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, cold prune path
+        for (mine, &(id, kinds)) in self.slots.iter_mut().zip(other.slots.iter()) {
+            if id == 0 || kinds == 0 {
+                continue;
+            }
+            if mine.0 == 0 || mine.1 == 0 {
+                *mine = (id, kinds);
+            } else if mine.0 == id {
+                mine.1 |= kinds;
+            } else {
+                // `other`'s bucket is the one not held: the height covers it.
+                lost_top = Some(lost_top.map_or(bucket_top(id), |t| t.max(bucket_top(id))));
+            }
+        }
+        if let Some(top) = lost_top {
+            self.raise_overflow_height(top);
+        }
+    }
+
+    /// Sets the overflow and raises its height to cover `height`. An unknown
+    /// height on either side stays unknown (`u64::MAX`): merging it with a
+    /// known one must never turn "every range" into "ranges up to here".
+    /// O(1).
+    fn raise_overflow_height(&mut self, height: u64) {
+        let self_unknown = self.overflowed && is_unknown_height(self.overflow_high_seq);
+        self.overflow_high_seq = if self_unknown || is_unknown_height(height) {
+            u64::MAX
+        } else {
+            self.overflow_high_seq.max(height)
+        };
+        self.overflowed = true;
+    }
+}
+
+/// Whether an overflow height says nothing about where the lost marks are:
+/// `0` (the flag set with no height) or `u64::MAX` (nothing bounded it).
+const fn is_unknown_height(height: u64) -> bool {
+    height == 0 || height == u64::MAX
+}
+
+/// What the WAL prunes must respect: the process marks OR the file beside
+/// `wal_dir`. The file is read too so that a process whose marks never bound
+/// (or a rejected in-RAM seed) still protects what an earlier session
+/// recorded. Cold prune path.
+#[must_use]
+pub fn prune_view(wal_dir: &Path) -> DeferredDepthSnapshot {
+    let mut snap = deferred_depth().snapshot();
+    if let Some(disk) = DeferredDepthSnapshot::load(wal_dir) {
+        snap.absorb(&disk);
+    }
+    snap
+}
+
+/// The largest bucket id a `u64` capture sequence can produce.
+const MAX_BUCKET_ID: u64 = u64::MAX >> DEFERRED_BUCKET_SHIFT;
+
+/// The highest sequence inside bucket `id`. Total: an impossible id maps to
+/// `u64::MAX` rather than overflowing (release builds abort on overflow).
+const fn bucket_top(id: u64) -> u64 {
+    if id >= MAX_BUCKET_ID {
+        u64::MAX
+    } else {
+        ((id + 1) << DEFERRED_BUCKET_SHIFT) - 1
+    }
+}
+
+const fn slot_of(bucket_id: u64) -> usize {
+    (bucket_id % DEFERRED_BUCKETS as u64) as usize
+}
+
+/// The process-wide marks table.
+pub struct DeferredDepth {
+    ids: [AtomicU64; DEFERRED_BUCKETS],
+    kinds: [AtomicU8; DEFERRED_BUCKETS],
+    overflowed: AtomicBool,
+    overflow_high_seq: AtomicU64,
+    /// Sheds of a frame with no sequence (a v1-era record). Nothing can be
+    /// kept for it by sequence; counted so the gap is visible.
+    unrecordable: AtomicU64,
+    last_persist_nanos: AtomicU64,
+    paths: OnceLock<(PathBuf, PathBuf)>,
+    persist_lock: Mutex<()>,
+    dir_tag: AtomicU64,
+    /// Set on every change; a persist with nothing changed is skipped, so an
+    /// idle table is not rewritten every second.
+    dirty: AtomicBool,
+    /// Edge latch for the persist-failure warning: one line per episode, not
+    /// one a second on a full disk.
+    persist_failing: AtomicBool,
+}
+
+static DEFERRED: DeferredDepth = DeferredDepth::new();
+
+/// The one process-global marks table.
+#[must_use]
+pub fn deferred_depth() -> &'static DeferredDepth {
+    &DEFERRED
+}
+
+/// The table a failed depth rescue marks (plan item PR RD, RD-3,
+/// 2026-11-08). In production it IS [`deferred_depth`], the table the prunes
+/// and the after-close pass read (pinned by the app's
+/// `test_lost_depth_marks_is_the_process_table_in_production`). Under this
+/// crate's own unit tests it is a separate static: many of them fail depth
+/// rescues on purpose, and their marks in the process table would make every
+/// test that prunes through [`prune_view`] keep segments it expects deleted.
+#[cfg(not(test))]
+#[must_use]
+pub fn lost_depth_marks() -> &'static DeferredDepth {
+    &DEFERRED
+}
+
+/// See the production [`lost_depth_marks`]: this crate's unit tests mark a
+/// table of their own.
+#[cfg(test)]
+#[must_use]
+pub fn lost_depth_marks() -> &'static DeferredDepth {
+    static LOST_FOR_UNIT_TESTS: DeferredDepth = DeferredDepth::new();
+    &LOST_FOR_UNIT_TESTS
+}
+
+impl DeferredDepth {
+    /// A fresh, unbound instance for tests that must not share the global.
+    #[must_use]
+    pub const fn new_for_tests() -> Self {
+        Self::new()
+    }
+
+    const fn new() -> Self {
+        Self {
+            ids: [const { AtomicU64::new(0) }; DEFERRED_BUCKETS],
+            kinds: [const { AtomicU8::new(0) }; DEFERRED_BUCKETS],
+            overflowed: AtomicBool::new(false),
+            overflow_high_seq: AtomicU64::new(0),
+            unrecordable: AtomicU64::new(0),
+            last_persist_nanos: AtomicU64::new(0),
+            paths: OnceLock::new(),
+            persist_lock: Mutex::new(()),
+            dir_tag: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+            persist_failing: AtomicBool::new(false),
+        }
+    }
+
+    /// Binds to the WAL directory and seeds RAM from the file there. First
+    /// caller wins, like `AppliedWatermark::bind`.
+    pub fn bind(&self, wal_dir: &Path) {
+        let set = self
+            .paths
+            .set((
+                wal_dir.join(DEFERRED_DEPTH_FILE),
+                wal_dir.join(DEFERRED_DEPTH_TMP),
+            ))
+            .is_ok();
+        if set {
+            self.dir_tag.store(dir_tag_of(wal_dir), Ordering::Release);
+            match DeferredDepthSnapshot::load_file(wal_dir) {
+                MarksFile::Loaded(snap) => self.seed(&snap),
+                MarksFile::Absent => {}
+                MarksFile::Rejected => self.adopt_rejected_file(wal_dir),
+            }
+        }
+    }
+
+    /// A marks file exists but cannot be read: the marks it held are unknown.
+    /// Seeding nothing would let the first persist overwrite it with an EMPTY
+    /// table a second later and unprotect every shed segment. Instead the
+    /// file is moved aside for inspection and the table starts OVERFLOWED up
+    /// to the highest sequence on disk, so every segment is kept until the
+    /// after-close pass has swept them all.
+    fn adopt_rejected_file(&self, wal_dir: &Path) {
+        let path = wal_dir.join(DEFERRED_DEPTH_FILE);
+        let aside = wal_dir.join(format!("{DEFERRED_DEPTH_FILE}.rejected.{}", wall_nanos())); // APPROVED: boot-time, once
+        let moved = std::fs::rename(&path, &aside).is_ok();
+        let high = crate::ws_frame_spill::highest_frame_seq_on_disk(wal_dir);
+        self.overflow_high_seq
+            .fetch_max(if high == 0 { u64::MAX } else { high }, Ordering::AcqRel);
+        self.overflowed.store(true, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+            source = "deferred_depth_marks_rejected",
+            path = %path.display(),
+            moved_aside = moved,
+            aside = %aside.display(),
+            "the record of order-book rows skipped under load could not be read — every WAL \
+             segment is now kept until the after-close pass has swept them all. Nothing is \
+             deleted; the unreadable file was moved aside for inspection."
+        );
+    }
+
+    /// Loads a snapshot into RAM: marks are OR-ed in, never removed.
+    pub fn seed(&self, snap: &DeferredDepthSnapshot) {
+        if snap.overflowed {
+            // An unknown height (0 included) is seeded as `u64::MAX`, so a
+            // stale known height already in RAM cannot narrow it. The height
+            // is raised BEFORE the flag is set, as in `note_overflow`.
+            let height = if is_unknown_height(snap.overflow_high_seq) {
+                u64::MAX
+            } else {
+                snap.overflow_high_seq
+            };
+            self.overflow_high_seq.fetch_max(height, Ordering::AcqRel);
+            self.overflowed.store(true, Ordering::Release);
+        }
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, boot-time seed
+        for &(id, kinds) in &snap.slots {
+            if id == 0 || kinds == 0 {
+                continue;
+            }
+            self.mark(id, kinds);
+        }
+    }
+
+    /// Records that the depth rows of the frame at `seq` were shed. HOT PATH:
+    /// called from the frame drain on every shed frame.
+    ///
+    /// O(1), zero allocation. The common case — the bucket is already marked
+    /// for this kind — is two atomic loads (Acquire, then Relaxed) and a
+    /// compare. Called once per shed PACKET on the inline arm.
+    #[inline]
+    pub fn note_shed(&self, seq: u64, kind: ShedDepth) {
+        let id = seq >> DEFERRED_BUCKET_SHIFT;
+        if id == 0 {
+            self.unrecordable.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let slot = slot_of(id);
+        let bit = kind as u8;
+        if self.ids[slot].load(Ordering::Acquire) == id
+            && self.kinds[slot].load(Ordering::Relaxed) & bit != 0
+        {
+            return;
+        }
+        if !self.mark(id, bit) {
+            self.note_overflow(id);
+        }
+    }
+
+    /// Records that the depth rows of a whole capture range `[lo, hi]` landed
+    /// nowhere (the ILP write failed AND the spill rescue failed), so the
+    /// after-close pass must write them back from the WAL (plan item PR RD,
+    /// RD-3, 2026-11-08). Every bucket the range touches is marked for BOTH
+    /// depth kinds: a failed batch does not say which kind it held, and
+    /// keeping more is the safe side.
+    ///
+    /// `true` only when every bucket is now held by its own slot. `false`,
+    /// and the caller must hold the WAL segment as a loss, when the range has
+    /// no usable start (`lo == 0`, a sequence-less batch, or a bucket id of
+    /// 0), is inverted, spans more buckets than the table holds (nothing is
+    /// marked then), or any bucket collided with another in its slot (that
+    /// bucket is recorded as an overflow, which still keeps every segment at
+    /// or below it: keep more).
+    ///
+    /// O(buckets in the range), at most [`DEFERRED_BUCKETS`]; a rescue
+    /// FAILURE path only, never per tick.
+    #[must_use]
+    pub fn defer_lost_range(&self, lo: u64, hi: u64) -> bool {
+        if lo == 0 || hi < lo {
+            return false;
+        }
+        let lo_id = lo >> DEFERRED_BUCKET_SHIFT;
+        let hi_id = hi >> DEFERRED_BUCKET_SHIFT;
+        if lo_id == 0 || hi_id - lo_id >= DEFERRED_BUCKETS as u64 {
+            return false;
+        }
+        let mut every_bucket_held = true;
+        // O(1) EXEMPT: at most DEFERRED_BUCKETS iterations, rescue-failure path
+        for id in lo_id..=hi_id {
+            if !self.mark(id, SHED_DEPTH_ALL) {
+                self.note_overflow(id);
+                every_bucket_held = false;
+            }
+        }
+        every_bucket_held
+    }
+
+    /// Records that bucket `id` could not be held: every range now reads as
+    /// deferred until a complete sweep covers it.
+    fn note_overflow(&self, id: u64) {
+        self.overflow_high_seq
+            .fetch_max(bucket_top(id), Ordering::AcqRel);
+        self.overflowed.store(true, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Sets `bits` on bucket `id`, claiming an empty slot. `false` when the
+    /// slot holds a different bucket. The kinds are written BEFORE the id is
+    /// published on a fresh claim, so a reader that sees the id also sees at
+    /// least those bits.
+    fn mark(&self, id: u64, bits: u8) -> bool {
+        let marked = self.mark_inner(id, bits);
+        if marked {
+            self.dirty.store(true, Ordering::Release);
+        }
+        marked
+    }
+
+    fn mark_inner(&self, id: u64, bits: u8) -> bool {
+        let slot = slot_of(id);
+        let current = self.ids[slot].load(Ordering::Acquire);
+        if current == id {
+            self.kinds[slot].fetch_or(bits, Ordering::AcqRel);
+            return true;
+        }
+        if current == 0 {
+            self.kinds[slot].fetch_or(bits, Ordering::AcqRel);
+            match self.ids[slot].compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) if now == id => return true,
+                Err(_) => {}
+            }
+        } else if self.ids[slot].load(Ordering::Acquire) == id {
+            self.kinds[slot].fetch_or(bits, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+
+    /// Clears `done` bits from bucket `id` once the after-close pass has
+    /// written those rows back and they are acknowledged. The slot is freed
+    /// when no bits remain. A bucket re-marked meanwhile keeps its new bits.
+    pub fn clear(&self, id: u64, done: u8) {
+        let slot = slot_of(id);
+        if self.ids[slot].load(Ordering::Acquire) != id {
+            return;
+        }
+        let before = self.kinds[slot].fetch_and(!done, Ordering::AcqRel);
+        self.dirty.store(true, Ordering::Release);
+        if before & !done == 0 {
+            // Free the slot only if nothing re-marked it in between; a
+            // failed CAS means another bucket or a re-mark owns it now.
+            let freed = self.ids[slot]
+                .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            if freed && self.kinds[slot].load(Ordering::Acquire) != 0 {
+                // A shed landed between the fetch_and and the CAS: put the id
+                // back so its bits are not orphaned. If another bucket took
+                // the slot first, the bits cannot be attributed: fail towards
+                // keeping everything.
+                let bits = self.kinds[slot].load(Ordering::Acquire);
+                if !self.mark(id, bits) {
+                    self.note_overflow(id);
+                }
+            }
+        }
+    }
+
+    /// Clears the overflow flag. Only the after-close pass calls this, after
+    /// a complete sweep of every segment at or below `overflow_high_seq`.
+    pub fn clear_overflow_through(&self, covered_seq: u64) {
+        if covered_seq >= self.overflow_high_seq.load(Ordering::Acquire) {
+            self.overflowed.store(false, Ordering::Release);
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Sheds that could not be recorded because the frame had no sequence.
+    #[must_use]
+    pub fn unrecordable_total(&self) -> u64 {
+        self.unrecordable.load(Ordering::Relaxed)
+    }
+
+    /// Current RAM state. Cold path.
+    #[must_use]
+    pub fn snapshot(&self) -> DeferredDepthSnapshot {
+        let mut slots = vec![(0u64, 0u8); DEFERRED_BUCKETS]; // APPROVED: cold snapshot
+        // O(1) EXEMPT: fixed DEFERRED_BUCKETS iterations, cold path
+        for (i, slot) in slots.iter_mut().enumerate() {
+            *slot = (
+                self.ids[i].load(Ordering::Acquire),
+                self.kinds[i].load(Ordering::Acquire),
+            );
+        }
+        DeferredDepthSnapshot {
+            overflowed: self.overflowed.load(Ordering::Acquire),
+            overflow_high_seq: self.overflow_high_seq.load(Ordering::Acquire),
+            persisted_at_nanos: 0,
+            dir_tag: self.dir_tag.load(Ordering::Acquire),
+            slots,
+        }
+    }
+
+    /// Persists when at least [`DEFERRED_PERSIST_INTERVAL_NANOS`] has passed.
+    /// Cheap when not due: one load and one compare.
+    pub fn persist_if_due(&self, now_nanos: u64) -> bool {
+        if !self.dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        let last = self.last_persist_nanos.load(Ordering::Acquire);
+        if now_nanos < last.saturating_add(DEFERRED_PERSIST_INTERVAL_NANOS) {
+            return false;
+        }
+        if self
+            .last_persist_nanos
+            .compare_exchange(last, now_nanos, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.persist_now();
+        true
+    }
+
+    /// [`Self::persist_if_due`] against the wall clock.
+    pub fn persist_if_due_now(&self) -> bool {
+        self.persist_if_due(wall_nanos())
+    }
+
+    /// Writes the current state to the bound file (tmp + rename). Unbound →
+    /// nothing. A failure is counted and warned, never propagated.
+    pub fn persist_now(&self) {
+        let _written = self.persist_locked(false);
+    }
+
+    /// [`Self::persist_now`] that WAITS for a persist already in flight
+    /// instead of skipping, writes even when nothing changed, and says
+    /// whether the file now holds every mark made before the call. A replay
+    /// confirm that leaves depth rows to the after-close pass (plan item
+    /// PR RD, RD-3) archives the WAL segment only after this returns `true`:
+    /// marks that died with the process would leave the archived segment
+    /// unprotected. `false` when unbound or when the write failed (counted
+    /// and warned as in [`Self::persist_now`]). Cold path: once per replay
+    /// confirm that deferred depth.
+    #[must_use]
+    pub fn persist_checked(&self) -> bool {
+        self.persist_locked(true)
+    }
+
+    /// The shared persist. `wait` takes the lock blocking (the confirm path)
+    /// instead of skipping when another thread is writing.
+    fn persist_locked(&self, wait: bool) -> bool {
+        let Some((path, tmp)) = self.paths.get() else {
+            return false;
+        };
+        let _guard = if wait {
+            // A panic mid-persist poisons the lock; the file it guards is
+            // still written tmp + rename, so carry on rather than go silent.
+            self.persist_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        } else {
+            match self.persist_lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
+        };
+        // Cleared BEFORE the snapshot: a change racing the write re-sets it
+        // and is written next time.
+        self.dirty.store(false, Ordering::Release);
+        let mut snap = self.snapshot();
+        snap.persisted_at_nanos = wall_nanos();
+        let bytes = snap.to_bytes();
+        let written = write_fresh(tmp, &bytes).and_then(|()| std::fs::rename(tmp, path));
+        if let Err(err) = written {
+            self.dirty.store(true, Ordering::Release);
+            metrics::counter!(DEFERRED_PERSIST_FAILED_COUNTER).increment(1);
+            if self.persist_failing.swap(true, Ordering::AcqRel) {
+                return false; // already reported this episode
+            }
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                source = "deferred_depth_persist_failed",
+                path = %path.display(),
+                error = %err,
+                "WAL deferred-depth marks could not be persisted — the RAM marks are kept; \
+                 a crash before the next successful persist would lose the newest marks"
+            );
+            return false;
+        }
+        if self.persist_failing.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                path = %path.display(),
+                "WAL deferred-depth marks are persisting again"
+            );
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seq(secs: u64) -> u64 {
+        ((1_780_000_000 + secs) * 1_000_000_000) >> 17 << 17
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tv-deferred-{tag}-{}-{}",
+            std::process::id(),
+            wall_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_fresh_table_defers_nothing() {
+        let d = DeferredDepth::new_for_tests();
+        let snap = d.snapshot();
+        assert!(snap.is_empty());
+        assert!(!snap.range_is_deferred(seq(0), Some(seq(10_000))));
+        assert!(snap.marked_buckets().is_empty());
+    }
+
+    #[test]
+    fn shed_inline_records_a_deferred_depth_mark() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(100))),
+            ShedDepth::Inline as u8
+        );
+        assert_eq!(
+            snap.marked_buckets(),
+            vec![(seq(100) >> DEFERRED_BUCKET_SHIFT, ShedDepth::Inline as u8)]
+        );
+    }
+
+    #[test]
+    fn both_kinds_in_one_bucket_share_a_slot() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(101), ShedDepth::Dedicated);
+        d.note_shed(seq(102), ShedDepth::Inline);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(102))),
+            SHED_DEPTH_ALL
+        );
+        assert_eq!(snap.marked_buckets().len(), 1);
+    }
+
+    #[test]
+    fn a_range_outside_every_mark_is_not_deferred() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(10_000), ShedDepth::Inline);
+        let snap = d.snapshot();
+        // A range a full hour before the mark.
+        assert!(!snap.range_is_deferred(seq(6_000), Some(seq(6_300))));
+        // A range a full hour after it.
+        assert!(!snap.range_is_deferred(seq(14_000), Some(seq(14_300))));
+        // An open-ended range starting after it.
+        assert!(!snap.range_is_deferred(seq(14_000), None));
+    }
+
+    #[test]
+    fn an_unknown_range_end_keeps_every_later_mark() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(10_000), ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        assert!(snap.range_is_deferred(seq(9_000), None));
+        assert!(
+            snap.range_is_deferred(0, None),
+            "an unknown start keeps any mark"
+        );
+    }
+
+    #[test]
+    fn a_zero_sequence_is_counted_not_marked() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(0, ShedDepth::Inline);
+        assert_eq!(d.unrecordable_total(), 1);
+        assert!(d.snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_colliding_bucket_overflows_towards_keeping_everything() {
+        let d = DeferredDepth::new_for_tests();
+        let a = seq(100);
+        // Same slot, a different bucket: DEFERRED_BUCKETS buckets later.
+        let b = a + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        d.note_shed(a, ShedDepth::Inline);
+        d.note_shed(b, ShedDepth::Inline);
+        let snap = d.snapshot();
+        assert!(snap.overflowed);
+        assert!(snap.overflow_high_seq >= b);
+        // Every range now reads as deferred, including one nowhere near a mark.
+        assert_eq!(snap.kinds_in_range(seq(1), Some(seq(2))), SHED_DEPTH_ALL);
+        // Clearing below the lost mark does not lift the flag; covering it does.
+        d.clear_overflow_through(a);
+        assert!(d.snapshot().overflowed);
+        d.clear_overflow_through(b | ((1 << DEFERRED_BUCKET_SHIFT) - 1));
+        assert!(!d.snapshot().overflowed);
+    }
+
+    #[test]
+    fn deferred_mark_clears_only_the_done_kind() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(100), ShedDepth::Dedicated);
+        let id = seq(100) >> DEFERRED_BUCKET_SHIFT;
+        d.clear(id, ShedDepth::Inline as u8);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(100))),
+            ShedDepth::Dedicated as u8
+        );
+        d.clear(id, ShedDepth::Dedicated as u8);
+        assert!(
+            d.snapshot().is_empty(),
+            "the slot is freed once no kind remains"
+        );
+        // A cleared bucket can be marked again.
+        d.note_shed(seq(100), ShedDepth::Inline);
+        assert!(!d.snapshot().is_empty());
+    }
+
+    #[test]
+    fn clearing_a_bucket_the_slot_no_longer_holds_is_a_no_op() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.clear(12345, SHED_DEPTH_ALL);
+        assert!(!d.snapshot().is_empty());
+    }
+
+    #[test]
+    fn deferred_marks_roundtrip_is_crc_checked() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(5_000), ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        let bytes = snap.to_bytes();
+        assert_eq!(bytes.len(), DEFERRED_DEPTH_LEN);
+        assert_eq!(DeferredDepthSnapshot::from_bytes(&bytes), Some(snap));
+        let mut flipped = bytes.clone();
+        flipped[HEADER_LEN + 3] ^= 0x01;
+        assert_eq!(
+            DeferredDepthSnapshot::from_bytes(&flipped),
+            None,
+            "bit flip"
+        );
+        assert_eq!(
+            DeferredDepthSnapshot::from_bytes(&bytes[..20]),
+            None,
+            "short"
+        );
+        let mut bad = bytes;
+        bad[0] = b'X';
+        assert_eq!(DeferredDepthSnapshot::from_bytes(&bad), None, "magic");
+    }
+
+    #[test]
+    fn deferred_marks_persist_and_reload_on_disk() {
+        let dir = scratch("persist");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.persist_now();
+        let loaded = DeferredDepthSnapshot::load(&dir).expect("file written and accepted");
+        assert!(loaded.range_is_deferred(seq(100), Some(seq(100))));
+        // A second instance bound to the same dir seeds the mark.
+        let e = DeferredDepth::new_for_tests();
+        e.bind(&dir);
+        assert!(e.snapshot().range_is_deferred(seq(100), Some(seq(100))));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_marks_file_from_another_directory_is_rejected() {
+        let a = scratch("dir-a");
+        let b = scratch("dir-b");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&a);
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.persist_now();
+        std::fs::copy(a.join(DEFERRED_DEPTH_FILE), b.join(DEFERRED_DEPTH_FILE)).expect("copy");
+        assert!(DeferredDepthSnapshot::load(&b).is_none());
+        drop(std::fs::remove_dir_all(&a));
+        drop(std::fs::remove_dir_all(&b));
+    }
+
+    /// A torn or corrupt marks file must never become an EMPTY table: the
+    /// bind moves it aside and keeps every segment until a full sweep.
+    #[test]
+    fn a_rejected_marks_file_keeps_everything_and_is_moved_aside() {
+        let dir = scratch("rejected");
+        std::fs::write(dir.join(DEFERRED_DEPTH_FILE), b"torn").unwrap();
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        let snap = d.snapshot();
+        assert!(snap.overflowed, "unknown marks => keep everything");
+        assert_eq!(snap.kinds_in_range(seq(1), Some(seq(2))), SHED_DEPTH_ALL);
+        assert!(!dir.join(DEFERRED_DEPTH_FILE).exists(), "moved aside");
+        let aside = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().contains(".rejected."));
+        assert!(aside, "kept for inspection");
+        // A clearing without a full sweep must not lift it.
+        d.clear_overflow_through(0);
+        assert!(d.snapshot().overflowed);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// An absent file is a first boot: nothing is kept.
+    #[test]
+    fn an_absent_marks_file_is_not_an_overflow() {
+        let dir = scratch("absent");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        assert!(d.snapshot().is_empty());
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A forged id that no sequence can produce is rejected at load rather
+    /// than overflowing the arithmetic (release builds abort on overflow).
+    #[test]
+    fn an_impossible_bucket_id_rejects_the_file() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        let mut bytes = d.snapshot().to_bytes();
+        let at = HEADER_LEN;
+        bytes[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let crc = crc32_ieee(&bytes[..HEADER_LEN + BODY_LEN]);
+        bytes[HEADER_LEN + BODY_LEN..].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(DeferredDepthSnapshot::from_bytes(&bytes), None);
+        assert_eq!(bucket_top(u64::MAX), u64::MAX, "total, never overflows");
+    }
+
+    #[test]
+    fn persist_if_due_writes_at_most_once_per_interval() {
+        let dir = scratch("due");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        assert!(
+            !d.persist_if_due(DEFERRED_PERSIST_INTERVAL_NANOS),
+            "nothing changed: nothing to write"
+        );
+        d.note_shed(seq(100), ShedDepth::Inline);
+        assert!(d.persist_if_due(DEFERRED_PERSIST_INTERVAL_NANOS));
+        d.note_shed(seq(9_000), ShedDepth::Inline);
+        assert!(
+            !d.persist_if_due(DEFERRED_PERSIST_INTERVAL_NANOS + 1),
+            "inside the interval"
+        );
+        assert!(d.persist_if_due(3 * DEFERRED_PERSIST_INTERVAL_NANOS));
+        assert!(
+            !d.persist_if_due(5 * DEFERRED_PERSIST_INTERVAL_NANOS),
+            "clean again after the write"
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn marked_buckets_are_oldest_first() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(20_000), ShedDepth::Inline);
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(9_000), ShedDepth::Dedicated);
+        let ids: Vec<u64> = d
+            .snapshot()
+            .marked_buckets()
+            .iter()
+            .map(|&(id, _)| id)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        assert_eq!(ids.len(), 3);
+    }
+
+    // Named per public fn, so each is pinned by a test that says what it proves.
+
+    #[test]
+    fn test_kinds_in_range_reports_only_the_kinds_inside_the_range() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.note_shed(seq(20_000), ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(100))),
+            ShedDepth::Inline as u8
+        );
+        assert_eq!(
+            snap.kinds_in_range(seq(20_000), Some(seq(20_000))),
+            ShedDepth::Dedicated as u8
+        );
+        assert_eq!(
+            snap.kinds_in_range(seq(100), Some(seq(20_000))),
+            SHED_DEPTH_ALL
+        );
+        assert_eq!(snap.kinds_in_range(seq(5_000), Some(seq(5_100))), 0);
+    }
+
+    #[test]
+    fn test_range_is_deferred_only_where_a_mark_falls() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(10_000), ShedDepth::Inline);
+        let snap = d.snapshot();
+        assert!(snap.range_is_deferred(seq(9_990), Some(seq(10_010))));
+        assert!(!snap.range_is_deferred(seq(1_000), Some(seq(1_100))));
+    }
+
+    /// PR W review rounds 4 and 5: a segment's lookup reaches one reorder
+    /// slack below its first record and one above its range end, because a
+    /// shed depth frame can sit in a segment up to the slack on either side
+    /// of its range, across a bucket boundary. Unknown ends count any mark.
+    #[test]
+    fn test_segment_is_deferred_reaches_one_slack_each_side() {
+        let slack = crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ;
+        let boundary = ((seq(10_000) >> DEFERRED_BUCKET_SHIFT) + 1) << DEFERRED_BUCKET_SHIFT;
+        // Upper side: the mark is just above the boundary, the segment's
+        // range ends just below it.
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(boundary + (1 << 17), ShedDepth::Inline);
+        let snap = d.snapshot();
+        let first = boundary - 5 * slack;
+        assert!(!snap.range_is_deferred(first, Some(boundary - slack / 2)));
+        assert!(snap.segment_is_deferred(first, Some(boundary - slack / 2)));
+        assert!(!snap.segment_is_deferred(first, Some(boundary - 2 * slack)));
+        assert!(snap.segment_is_deferred(first, None), "unknown end");
+        // Lower side: the mark is just below the boundary, the segment's
+        // first record just above it.
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(boundary - slack / 2, ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        let last = boundary + 5 * slack;
+        assert!(!snap.range_is_deferred(boundary + 1, Some(last)));
+        assert!(snap.segment_is_deferred(boundary + 1, Some(last)));
+        assert!(!snap.segment_is_deferred(boundary + 2 * slack, Some(last)));
+        assert!(snap.segment_is_deferred(0, Some(last)), "unknown start");
+    }
+
+    #[test]
+    fn test_load_file_tells_absent_loaded_and_rejected_apart() {
+        let dir = scratch("load-file");
+        assert!(matches!(
+            DeferredDepthSnapshot::load_file(&dir),
+            MarksFile::Absent
+        ));
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        d.note_shed(seq(100), ShedDepth::Inline);
+        d.persist_now();
+        match DeferredDepthSnapshot::load_file(&dir) {
+            MarksFile::Loaded(snap) => assert_eq!(
+                snap.kinds_in_range(seq(100), Some(seq(100))),
+                ShedDepth::Inline as u8
+            ),
+            _ => panic!("a freshly persisted file must load"),
+        }
+        std::fs::write(dir.join(DEFERRED_DEPTH_FILE), b"torn").expect("write");
+        assert!(matches!(
+            DeferredDepthSnapshot::load_file(&dir),
+            MarksFile::Rejected
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    /// A mark recorded by an earlier session (only on disk) still protects
+    /// its segments through the prune view.
+    #[test]
+    fn test_prune_view_includes_the_marks_file_on_disk() {
+        let dir = scratch("prune-view");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        d.note_shed(seq(3_000), ShedDepth::Dedicated);
+        d.persist_now();
+        let view = prune_view(&dir);
+        assert_ne!(
+            view.kinds_in_range(seq(3_000), Some(seq(3_000))) & ShedDepth::Dedicated as u8,
+            0
+        );
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn test_deferred_depth_is_one_process_global() {
+        assert!(std::ptr::eq(deferred_depth(), deferred_depth()));
+    }
+
+    #[test]
+    fn test_note_shed_marks_the_bucket_of_its_sequence() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(seq(500), ShedDepth::Dedicated);
+        assert_eq!(
+            d.snapshot().marked_buckets(),
+            vec![(
+                seq(500) >> DEFERRED_BUCKET_SHIFT,
+                ShedDepth::Dedicated as u8
+            )]
+        );
+    }
+
+    #[test]
+    fn test_clear_overflow_through_lifts_only_once_the_lost_mark_is_covered() {
+        let d = DeferredDepth::new_for_tests();
+        let a = seq(100);
+        let b = a + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        d.note_shed(a, ShedDepth::Inline);
+        d.note_shed(b, ShedDepth::Inline);
+        d.clear_overflow_through(b - 1);
+        assert!(d.snapshot().overflowed);
+        d.clear_overflow_through(u64::MAX);
+        assert!(!d.snapshot().overflowed);
+    }
+
+    #[test]
+    fn test_unrecordable_total_counts_each_zero_sequence() {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(0, ShedDepth::Inline);
+        d.note_shed(0, ShedDepth::Dedicated);
+        d.note_shed(seq(1), ShedDepth::Inline);
+        assert_eq!(d.unrecordable_total(), 2);
+    }
+
+    // --- Plan item W2 (2026-10-27): the overflow honours its height -------
+
+    /// `bucket_top` of the bucket holding `seq`.
+    fn top_of(seq: u64) -> u64 {
+        bucket_top(seq >> DEFERRED_BUCKET_SHIFT)
+    }
+
+    /// One bucket width in sequence units.
+    const BUCKET: u64 = 1 << DEFERRED_BUCKET_SHIFT;
+
+    /// A collision that loses the shed at `lost`: an older bucket in the
+    /// same slot (one table length back) is marked first, so the newer one
+    /// cannot be held and the height is the top of `lost`'s bucket.
+    fn table_losing(lost: u64) -> DeferredDepth {
+        let d = DeferredDepth::new_for_tests();
+        d.note_shed(lost - (DEFERRED_BUCKETS as u64) * BUCKET, ShedDepth::Inline);
+        d.note_shed(lost, ShedDepth::Inline);
+        d
+    }
+
+    #[test]
+    fn test_overflow_taints_only_ranges_at_or_below_its_height() {
+        use crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ as SLACK;
+        let lost = seq(100);
+        let d = table_losing(lost);
+        // A later shed, three buckets up, is held normally.
+        let later = lost + 3 * BUCKET;
+        d.note_shed(later, ShedDepth::Dedicated);
+        let snap = d.snapshot();
+        let height = top_of(lost);
+        assert!(snap.overflowed);
+        assert_eq!(snap.overflow_height(), Some(height));
+        // At or below the height, or an unknown start: everything.
+        assert_eq!(snap.kinds_in_range(lost, Some(lost)), SHED_DEPTH_ALL);
+        assert_eq!(snap.kinds_in_range(height, Some(height)), SHED_DEPTH_ALL);
+        assert_eq!(
+            snap.kinds_in_range(0, Some(height + BUCKET)),
+            SHED_DEPTH_ALL
+        );
+        // Above the height: only the marks that are really there.
+        assert_eq!(snap.kinds_in_range(height + 1, Some(later - BUCKET)), 0);
+        assert_eq!(
+            snap.kinds_in_range(height + 1, None),
+            ShedDepth::Dedicated as u8,
+            "only the later mark, not every kind"
+        );
+        // The prune's lookup keeps the reorder slack below a first record:
+        // a segment starting within one slack above the height still holds
+        // whatever the overflow lost.
+        assert!(snap.segment_is_deferred(height + SLACK / 2, Some(height + 2 * SLACK)));
+        assert!(!snap.segment_is_deferred(height + 2 * SLACK, Some(height + 3 * SLACK)));
+        // ... and one slack above a range end: a segment ending within one
+        // slack below the later mark's bucket still reads it.
+        let later_lo = (later >> DEFERRED_BUCKET_SHIFT) << DEFERRED_BUCKET_SHIFT;
+        assert!(snap.segment_is_deferred(height + 2 * SLACK, Some(later_lo - SLACK / 2)));
+    }
+
+    #[test]
+    fn test_unknown_overflow_height_still_taints_every_range() {
+        for unknown in [0, u64::MAX] {
+            let snap = DeferredDepthSnapshot {
+                overflowed: true,
+                overflow_high_seq: unknown,
+                ..Default::default()
+            };
+            assert_eq!(snap.overflow_height(), None, "{unknown} is unknown");
+            assert_eq!(
+                snap.kinds_in_range(seq(9_000), Some(seq(9_001))),
+                SHED_DEPTH_ALL
+            );
+            assert!(snap.segment_is_deferred(u64::MAX - 1, None));
+            // Merging with a known height stays unknown, either way round.
+            let mut known = table_losing(seq(100)).snapshot();
+            known.absorb(&snap);
+            assert_eq!(known.overflow_height(), None);
+            let mut other = snap.clone();
+            other.absorb(&table_losing(seq(100)).snapshot());
+            assert_eq!(other.overflow_height(), None);
+            // Seeding RAM that holds a stale known height keeps it unknown.
+            let ram = table_losing(seq(100));
+            ram.seed(&snap);
+            assert_eq!(ram.snapshot().overflow_height(), None);
+        }
+        // Not overflowed: no height at all, whatever the field holds.
+        let clean = DeferredDepthSnapshot {
+            overflow_high_seq: seq(5),
+            ..Default::default()
+        };
+        assert_eq!(clean.overflow_height(), None);
+        assert_eq!(clean.kinds_in_range(0, None), 0);
+    }
+
+    #[test]
+    fn test_reloaded_overflow_height_round_trips_through_the_file() {
+        let dir = scratch("w2-height");
+        let lost = seq(100);
+        let d = table_losing(lost);
+        d.bind(&dir);
+        d.persist_now();
+        let loaded = DeferredDepthSnapshot::load(&dir).expect("written");
+        assert_eq!(loaded.overflow_height(), Some(top_of(lost)));
+        let fresh = DeferredDepth::new_for_tests();
+        fresh.bind(&dir);
+        let snap = fresh.snapshot();
+        assert_eq!(snap.overflow_height(), Some(top_of(lost)), "seeded at boot");
+        assert_eq!(snap.kinds_in_range(lost, Some(lost)), SHED_DEPTH_ALL);
+        assert!(
+            !snap.range_is_deferred(top_of(lost) + 1, Some(top_of(lost) + BUCKET)),
+            "above the reloaded height nothing is tainted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    proptest::proptest! {
+        /// Plan item W2: whatever collides, whatever order the sheds land
+        /// in, and whether the table is read from RAM, from its file, or
+        /// merged with another table, every segment that can hold a shed
+        /// frame (its range widened by one reorder slack each side, as the
+        /// writer can reorder) reads as deferred for that frame's kind. So
+        /// no prune can delete a segment holding a marked frame.
+        #[test]
+        fn proptest_a_collision_never_lets_a_prune_drop_a_marked_frame(
+            sheds in proptest::collection::vec(
+                (
+                    0u64..4,
+                    0u64..6,
+                    // Half land in the last two slacks of their bucket, so a
+                    // cut just above can sit in the NEXT bucket.
+                    proptest::prop_oneof![0u64..BUCKET, (BUCKET - 2_000_000_000)..BUCKET],
+                    proptest::bool::ANY,
+                ),
+                1..24,
+            ),
+            cuts in proptest::collection::vec(0u64..(24 * BUCKET), 1..12),
+            // Cuts within two reorder slacks of a shed, either side, so the
+            // slack reach is exercised (a uniform cut almost never lands there).
+            near in proptest::collection::vec(
+                (proptest::prelude::any::<usize>(), 0u64..4_000_000_000),
+                0..8,
+            ),
+            through_file in proptest::bool::ANY,
+            merged in proptest::bool::ANY,
+        ) {
+            use crate::wal_applied_watermark::REPLAY_REORDER_SLACK_SEQ as SLACK;
+            let base = (seq(0) >> DEFERRED_BUCKET_SHIFT) + 1;
+            let span = DEFERRED_BUCKETS as u64;
+            // Bucket ids up to three table lengths apart, so slots collide.
+            let shed_seqs: Vec<(u64, ShedDepth)> = sheds
+                .iter()
+                .map(|&(lap, offset, within, dedicated)| {
+                    let id = base + lap * span + offset;
+                    let kind = if dedicated { ShedDepth::Dedicated } else { ShedDepth::Inline };
+                    ((id << DEFERRED_BUCKET_SHIFT) + within, kind)
+                })
+                .collect();
+            let d = DeferredDepth::new_for_tests();
+            let other = DeferredDepth::new_for_tests();
+            for (i, &(s, kind)) in shed_seqs.iter().enumerate() {
+                if merged && i % 2 == 1 { other.note_shed(s, kind) } else { d.note_shed(s, kind) }
+            }
+            let mut snap = d.snapshot();
+            if through_file {
+                snap = DeferredDepthSnapshot::from_bytes(&snap.to_bytes()).expect("round trip");
+            }
+            if merged {
+                snap.absorb(&other.snapshot());
+            }
+            // Segment boundaries over every lap the sheds can reach.
+            let mut firsts: Vec<u64> = cuts
+                .iter()
+                .flat_map(|&c| (0..4).map(move |lap| ((base + lap * span) << DEFERRED_BUCKET_SHIFT) + c))
+                .collect();
+            for &(pick, delta) in &near {
+                let (s, _) = shed_seqs[pick % shed_seqs.len()];
+                firsts.push((s + delta).saturating_sub(2 * SLACK));
+            }
+            firsts.sort_unstable();
+            firsts.dedup();
+            for (i, &first) in firsts.iter().enumerate() {
+                let hi = firsts.get(i + 1).map(|&n| n - 1);
+                for &(s, kind) in &shed_seqs {
+                    let reaches = s.saturating_add(SLACK) >= first
+                        && hi.is_none_or(|h| s <= h.saturating_add(SLACK));
+                    if reaches {
+                        let lo = crate::wal_applied_watermark::reorder_reach_lo(first);
+                        let hi_reach = hi.map(crate::wal_applied_watermark::reorder_reach_hi);
+                        proptest::prop_assert!(
+                            snap.kinds_in_range(lo, hi_reach) & kind as u8 != 0,
+                            "shed {s} in segment [{first}, {hi:?}] lost"
+                        );
+                        proptest::prop_assert!(snap.segment_is_deferred(first, hi));
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- PR RD (RD-3, 2026-11-08): a lost depth range is deferred --------
+
+    /// A lost range marks EVERY bucket it touches, for both kinds, and says
+    /// so; the segment then reads as deferred.
+    #[test]
+    fn test_defer_lost_range_marks_every_bucket_both_kinds() {
+        let d = DeferredDepth::new_for_tests();
+        let lo = seq(100);
+        let hi = lo + (2u64 << DEFERRED_BUCKET_SHIFT);
+        assert!(d.defer_lost_range(lo, hi));
+        let snap = d.snapshot();
+        let marked = snap.marked_buckets();
+        assert_eq!(marked.len(), 3, "lo, middle and hi buckets: {marked:?}");
+        assert!(marked.iter().all(|&(_, k)| k == SHED_DEPTH_ALL));
+        assert!(snap.segment_is_deferred(lo, Some(hi)));
+        assert!(!snap.overflowed);
+    }
+
+    /// A range that cannot be held is refused, so the caller holds the
+    /// segment: no start, inverted, too wide (nothing marked), or a bucket
+    /// another bucket owns (overflow recorded: keep more).
+    #[test]
+    fn test_defer_lost_range_refuses_what_it_cannot_hold() {
+        let d = DeferredDepth::new_for_tests();
+        assert!(!d.defer_lost_range(0, seq(10)), "sequence-less batch");
+        assert!(!d.defer_lost_range(5, 9), "bucket id 0");
+        assert!(!d.defer_lost_range(seq(10), seq(5)), "inverted");
+        let wide = seq(10) + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        assert!(!d.defer_lost_range(seq(10), wide), "wider than the table");
+        assert!(d.snapshot().is_empty(), "none of those marked anything");
+
+        // Two buckets DEFERRED_BUCKETS apart share a slot.
+        let first = seq(10);
+        let twin = first + ((DEFERRED_BUCKETS as u64) << DEFERRED_BUCKET_SHIFT);
+        assert!(d.defer_lost_range(first, first));
+        assert!(!d.defer_lost_range(twin, twin), "slot collision");
+        let snap = d.snapshot();
+        assert!(snap.overflowed, "the collision keeps more, never less");
+        assert!(snap.segment_is_deferred(twin, Some(twin)));
+    }
+
+    /// Under this crate's unit tests a failed rescue marks its own table, never
+    /// the process table the prunes read.
+    #[test]
+    fn test_lost_depth_marks_is_not_the_process_table_under_unit_tests() {
+        assert!(!std::ptr::eq(lost_depth_marks(), deferred_depth()));
+        assert!(std::ptr::eq(lost_depth_marks(), lost_depth_marks()));
+    }
+
+    /// `persist_checked` writes the marks and reports it; unbound or a failed
+    /// write reports `false`.
+    #[test]
+    fn test_persist_checked_reports_whether_the_marks_reached_the_file() {
+        let unbound = DeferredDepth::new_for_tests();
+        assert!(unbound.defer_lost_range(seq(100), seq(100)));
+        assert!(!unbound.persist_checked(), "unbound: nothing persisted");
+
+        let dir = scratch("persist-checked");
+        let d = DeferredDepth::new_for_tests();
+        d.bind(&dir);
+        assert!(d.defer_lost_range(seq(200), seq(200)));
+        assert!(d.persist_checked());
+        let disk = DeferredDepthSnapshot::load(&dir).expect("the marks file loads");
+        assert!(disk.segment_is_deferred(seq(200), Some(seq(201))));
+        // Clean and still `true`: the confirm path writes regardless of dirty.
+        assert!(d.persist_checked());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !d.persist_checked(),
+            "the directory is gone: the write fails"
+        );
+    }
+}

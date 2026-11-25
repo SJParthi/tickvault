@@ -53,26 +53,31 @@ This is the gold-standard source. Operator should download this PDF and base `co
 GET https://www.nseindia.com/api/holiday-master?type=trading
 ```
 
-**Required HTTP headers (NSE has bot detection):**
+**Required HTTP headers (NSE has bot detection)** — and the cookie warm-up, which
+is mandatory or the API answers 401/403. Shown as `curl` because this repository
+is Rust-and-bash only (`.claude/rules/project/rust-only-forever-lock-2026-07-19.md`);
+the ritual is the same in any client:
 
-```python
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
-    "Referer": "https://www.nseindia.com/",
-}
-```
+```bash
+JAR="$(mktemp)"; trap 'rm -f "$JAR"' EXIT
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ...'
+ACCEPT='text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 
-**Required cookie warmup** (or you get 401/403):
+# Warm up the cookie jar on two ordinary pages FIRST — the API is only
+# reachable once NSE has issued session cookies to a browser-shaped client.
+for warm in '' '/option-chain'; do
+  curl -sS --max-time 10 -c "$JAR" -b "$JAR" \
+    -A "$UA" -H "Accept: $ACCEPT" \
+    -H 'Accept-Language: en-US,en;q=0.9,en-IN;q=0.8' \
+    -H 'Referer: https://www.nseindia.com/' \
+    -o /dev/null "https://www.nseindia.com${warm}"
+done
 
-```python
-import requests
-s = requests.Session()
-s.get("https://www.nseindia.com", headers=headers, timeout=10)
-s.get("https://www.nseindia.com/option-chain", headers=headers, timeout=10)
-data = s.get("https://www.nseindia.com/api/holiday-master?type=trading",
-             headers=headers, timeout=10).json()
+curl -sS --max-time 10 -c "$JAR" -b "$JAR" \
+  -A "$UA" -H "Accept: $ACCEPT" \
+  -H 'Accept-Language: en-US,en;q=0.9,en-IN;q=0.8' \
+  -H 'Referer: https://www.nseindia.com/' \
+  'https://www.nseindia.com/api/holiday-master?type=trading'
 ```
 
 **Response shape:** `{"CM": [...], "FO": [...], "CD": [...], "CO": [...]}` — segments keyed by code; each value is a list of `{"tradingDate": "DD-MMM-YYYY", "weekDay": "...", "description": "..."}` records.

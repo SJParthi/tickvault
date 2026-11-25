@@ -1,0 +1,313 @@
+# emergency-fs-recover.yml — one-off recovery of a prod box whose ROOT FILESYSTEM
+# is 100% full and therefore unreachable over SSM.
+#
+# Authorization: operator Quote 21 (2026-09-05, "Yes wipe") + Quote 22
+# (2026-09-05, "go ahead ddude" for the 500 -> 600 GB grow), both recorded in
+# .claude/rules/project/daily-universe-scope-expansion-2026-05-27.md BEFORE
+# this file was written.
+#
+# ⚠ CHANGED 2026-10-09 (stress audit RO-1) — THIS WORKFLOW NO LONGER DELETES
+# OR DROPS ANY MARKET DATA. Quotes 21 and 22 are SPENT (they authorized one
+# deletion, on 2026-09-05). Quote 28 (2026-09-29, "yes approve all steps",
+# approving the zero-loss plan after Quote 27: "nothign shdou lneevr ever be
+# missed or removed or deleted") forbids deleting a raw WAL segment with no
+# verified S3 copy and dropping ticks, depth, candles, spill or quarantine
+# data without a verified copy. Until 2026-10-09 this file still ran
+# `rm -rf` on ws_wal, spill and dlq and dropped ticks, market_depth and every
+# candles_<tf>, none of it checked against an S3 copy. Those steps are
+# REMOVED. What is left is non-destructive: stop the app, vacuum the system
+# journal and the package cache, grow the partition and filesystem to the
+# volume's size, bring docker and QuestDB back, restore app enablement. If the
+# root is full of DATA, grow the volume first (grow-ebs-volume.yml) and then
+# run this to extend the filesystem; deleting captured data needs a fresh
+# dated operator quote naming the data, recorded in the rule file first.
+# Pinned by crates/common/tests/github_workflow_guard.rs
+# (no_workflow_deletes_market_data_without_a_verified_copy).
+#
+# WHY THIS EXISTS (measured, not assumed)
+# ------------------------------------------------------------------------
+# grow-ebs-volume.yml grew vol-0c6ab6e593e39d8c8 500 -> 600 GB at 21:39 UTC on
+# 2026-09-04 (run 33922073677) while the box was stopped, and deferred the
+# filesystem half to "cloud-init growpart + resizefs on EVERY boot". The box
+# was then started at 21:40 UTC and the CloudWatch agent's own
+# `disk_used_percent` read **100** from the first minute of that boot — the
+# filesystem did NOT follow the volume on that boot. The SSM agent cannot
+# register on a 100%-full root, so every SSM-based path (deploy-aws.yml,
+# operator-control, grow-ebs-volume.yml step 5) is dead by construction. The
+# automation identity (`claude-code-agent`) is denied ModifyVolume /
+# DetachVolume / AttachVolume / ModifyInstanceAttribute / GetConsoleOutput,
+# and the dev sandbox has no route to port 22.
+#
+# The CI credentials + a GitHub runner DO have a route: port 22 is open on the
+# box's security group and Amazon Linux 2023 ships EC2 Instance Connect, so a
+# runner can push a 60-second SSH key via `ec2-instance-connect
+# send-ssh-public-key` and run the recovery over SSH. That is what this does.
+#
+# FIRST LIVE RUN (33925272407, 2026-09-04 22:23 UTC) — what it proved and what
+# it got wrong, so the next reader trusts the file for the right reasons:
+#   * the SSH route works: key pushed, script ran, SSM registered ~2 min later;
+#   * deleting spill (64 GB) + ws_wal (43 GB) freed 107 GB on the spot;
+#   * growpart FAILED ("partition-number must be a number") because the
+#     partition suffix was extracted as "0n1p1"; fixed below. Run by hand with
+#     "1" the same two commands took the filesystem 500 -> 600 GB in seconds;
+#   * docker.service was DEAD on that boot (dockerd could not dial containerd
+#     after the disk-full boot), so QuestDB never answered and the drop loop
+#     ran over an EMPTY table list — a silent no-op. Fixed below: containerd is
+#     restarted, docker is reset-failed + started, and a QuestDB that never
+#     answers now FAILS the run instead of reporting nothing to drop.
+#
+# WHAT IT DOES ON THE BOX (in order; every step fails loudly)
+#   1. record enabled/disabled state, then stop + disable tickvault for recovery
+#   2. vacuum the system journal and the package cache (no market data)
+#   3. growpart + xfs_growfs so the grown volume is actually usable
+#   4. restart containerd + docker and bring QuestDB up (nothing is dropped)
+#   5. restart the SSM agent and print df; on success or error restore the
+#      original enablement without starting tickvault. An intentional disable
+#      stays disabled. Unknown states refuse before stopping the app.
+#
+# It never stops the instance and never touches the volume, the budget, or
+# any table. (Before 2026-10-09 step 2 deleted the WAL/spill/DLQ backlog and
+# step 4 dropped the market-data tables; see the note at the top.)
+# Dispatch requires typing the exact instance id, and every input flows
+# through env: (never template-interpolated into run:).
+
+name: emergency-fs-recover
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_instance_id:
+        description: 'Type the EXACT prod instance id (i-...) to confirm.'
+        required: true
+      force_market_hours:
+        description: 'Type "yes" to run INSIDE 09:00-15:45 IST Mon-Fri. Default refuses: this stops the app mid-session.'
+        required: false
+        default: 'no'
+      force_disk_check:
+        description: 'Type "yes" to run even when the root filesystem is under 95% used. Default refuses: a not-full disk means this is the wrong tool.'
+        required: false
+        default: 'no'
+
+concurrency:
+  group: emergency-fs-recover
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    name: Recover a full root filesystem over EC2 Instance Connect
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check the mutation credentials exist at all
+        env:
+          HAS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_KEY" != "true" ] || [ "$HAS_SECRET" != "true" ]; then
+            echo "::error::AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY are not set."
+            exit 1
+          fi
+
+      # Operator sweep row 28 (2026-09-08): this workflow stops the app.
+      # Dispatched inside the session by mistake it ends the trading day.
+      # (Until 2026-10-09 it also deleted the WAL/spill backlog and dropped the
+      # market-data tables; both are removed, see the note at the top.) deploy-aws.yml has
+      # refused the same window since 2026-07-04; this mirrors that guard exactly
+      # (09:00-15:45 IST = 03:30-10:15 UTC, Mon-Fri) behind an explicit override.
+      # 2026-10-30 (owner: "go ahead and fix the muhurat risk dude"): the
+      # calendar's Muhurat dates (config/base.toml, the one source) make the
+      # whole IST date a capture day for the check below. Sparse: one file.
+      - name: Read the NSE calendar's Muhurat dates
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: config/base.toml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Refuse to run inside the trading session unless forced
+        env:
+          FORCE: ${{ inputs.force_market_hours }}
+        run: |
+          set -euo pipefail
+          HHMM=$(date -u +%H%M); DOW=$(date -u +%u); MUHURAT=no; grep -A1 -xF '[[trading.muhurat_trading_dates]]' config/base.toml | grep -qxF "date = \"$(TZ=Asia/Kolkata date +%F)\"" && MUHURAT=yes
+          if [ "$MUHURAT" = "yes" ] || { [ "$DOW" -le 5 ] && [ "$HHMM" -ge 0330 ] && [ "$HHMM" -lt 1015 ]; }; then
+            if [ "$FORCE" = "yes" ]; then
+              echo "::warning::running INSIDE 09:00-15:45 IST on operator override — the app will stop"
+            else
+              echo "::error::BLOCK: it is $(TZ='Asia/Kolkata' date +'%H:%M IST') on a weekday — this recovery stops the app. Re-run with force_market_hours=yes only if the box is already dead."
+              exit 1
+            fi
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0 (commit)
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Resolve the box and make sure it is running
+        id: box
+        env:
+          CONFIRM: ${{ inputs.confirm_instance_id }}
+        run: |
+          set -euo pipefail
+          IID=$(aws ec2 describe-instances --filters Name=tag:Name,Values=tv-prod-app \
+                --query 'Reservations[].Instances[].InstanceId' --output text)
+          if [ "$IID" != "$CONFIRM" ]; then
+            echo "::error::confirm_instance_id '$CONFIRM' does not match the tv-prod-app instance '$IID' — refusing."
+            exit 1
+          fi
+          STATE=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].State.Name' --output text)
+          echo "instance $IID is $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances --instance-ids "$IID" >/dev/null
+            echo "started"
+          fi
+          for _ in $(seq 1 40); do
+            STATE=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].State.Name' --output text)
+            [ "$STATE" = "running" ] && break
+            sleep 5
+          done
+          [ "$STATE" = "running" ] || { echo "::error::instance did not reach running (state=$STATE)"; exit 1; }
+          IP=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+          AZ=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].Placement.AvailabilityZone' --output text)
+          echo "iid=$IID" >> "$GITHUB_OUTPUT"
+          echo "ip=$IP"   >> "$GITHUB_OUTPUT"
+          echo "az=$AZ"   >> "$GITHUB_OUTPUT"
+          echo "public ip $IP in $AZ"
+          SG=$(aws ec2 describe-instances --instance-ids "$IID" --query 'Reservations[].Instances[].SecurityGroups[0].GroupId' --output text)
+          echo "sg=$SG" >> "$GITHUB_OUTPUT"
+
+      # Audit PR36c (2026-10-03, owner: "security yes"): port 22 is no longer
+      # open to the internet (terraform's operator_cidr is empty by default),
+      # and this recovery is the one path that NEEDS ssh, because a full disk
+      # stops the SSM agent. So it opens 22 to THIS runner's address only, for
+      # the length of the run, and the `always()` step below closes it again.
+      # Before 2026-10-03 the whole internet had it permanently.
+      - name: Open SSH to this runner only, for this run
+        id: ssh_open
+        env:
+          SG: ${{ steps.box.outputs.sg }}
+        run: |
+          set -euo pipefail
+          RUNNER_IP=$(curl -fsS --retry 3 https://checkip.amazonaws.com | tr -d '[:space:]')
+          [[ "$RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::could not read this runner's public address ('$RUNNER_IP')"; exit 1; }
+          echo "cidr=${RUNNER_IP}/32" >> "$GITHUB_OUTPUT"
+          OUT=$(aws ec2 authorize-security-group-ingress --group-id "$SG" \
+                  --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${RUNNER_IP}/32,Description=emergency-fs-recover-run}]" 2>&1) \
+            || case "$OUT" in *InvalidPermission.Duplicate*) echo "rule already present";; *) echo "::error::could not open port 22 to ${RUNNER_IP}/32: $OUT"; exit 1;; esac
+          echo "port 22 open to ${RUNNER_IP}/32 on $SG for this run"
+
+      - name: Write the on-box recovery script
+        env:
+          FORCE_DISK: ${{ inputs.force_disk_check }}
+        run: |
+          set -euo pipefail
+          cat > recover.sh <<'EOS'
+          set -u
+          echo "=== 0. before ==="; df -B1G / | tail -1
+          # Precondition (2026-09-08): this script is for a FULL root. On a box
+          # whose disk is fine it would still stop and disable the app, so it
+          # refuses unless the disk is actually full or the operator forced it.
+          # Exit 3 is the "refused" code the caller treats as terminal (never
+          # retried as an sshd-not-ready failure).
+          USED_PCT=$(df --output=pcent / | tail -1 | tr -dc '0-9')
+          if [ "${USED_PCT:-0}" -lt 95 ] && [ "__FORCE_DISK__" != "yes" ]; then
+            echo "REFUSED: root is ${USED_PCT:-?}% used, not full — this recovery stops and disables the app. Re-run with force_disk_check=yes if you really mean it."
+            exit 3
+          fi
+          # Preserve stop-app's intentional disable and runtime-only enablement.
+          APP_ENABLED_RC=0; APP_ENABLED=$(sudo systemctl is-enabled tickvault 2>/dev/null) || APP_ENABLED_RC=$?
+          case "$APP_ENABLED:$APP_ENABLED_RC" in enabled:0|disabled:1) APP_ENABLE_ARGS=();; enabled-runtime:0) APP_ENABLE_ARGS=(--runtime);; *) echo "REFUSED: tickvault enablement could not be classified safely"; exit 3;; esac
+          # Exit 4 is terminal: a retry must not adopt a failed disable as its baseline.
+          restore_app_enabled() {
+            rc=$?
+            if [ "$APP_ENABLED" != disabled ] && ! sudo systemctl enable "${APP_ENABLE_ARGS[@]}" tickvault; then echo "FAILED: could not restore tickvault enablement"; rc=4; fi
+            RESTORED_RC=0; RESTORED=$(sudo systemctl is-enabled tickvault 2>/dev/null) || RESTORED_RC=$?
+            [ "$RESTORED:$RESTORED_RC" = "$APP_ENABLED:$APP_ENABLED_RC" ] || { echo "FAILED: tickvault enablement restoration was not confirmed"; rc=4; }
+            exit "$rc"
+          }
+          trap restore_app_enabled EXIT
+          sudo systemctl stop tickvault || true
+          sudo systemctl disable "${APP_ENABLE_ARGS[@]}" tickvault || true
+          # Sizes are printed so the operator can see what fills the disk; the
+          # WAL, spill and DLQ are KEPT (no verified S3 copy is checked here).
+          sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/dlq /opt/tickvault/data/ws_wal /opt/tickvault/data/spill-hold 2>/dev/null || true
+          sudo journalctl --vacuum-size=200M || true
+          sudo dnf clean all >/dev/null 2>&1 || true
+          sync
+          echo "AFTER-VACUUM"; df -B1G / | tail -1
+          ROOT=$(findmnt -no SOURCE /); DISK=$(lsblk -no PKNAME "$ROOT")
+          # Only the TRAILING digits are the partition number: /dev/nvme0n1p1 -> "1".
+          # The first live run used 's/[^0-9]*//' and got "0n1p1", which growpart
+          # rejected — the filesystem stayed at its old size while the run said OK.
+          PART=$(lsblk -no KNAME "$ROOT" | sed 's/.*[^0-9]//')
+          case "$PART" in ''|*[!0-9]*) echo "FAILED: could not derive a numeric partition number from $ROOT"; exit 1;; esac
+          sudo growpart "/dev/$DISK" "$PART" || echo "growpart-nochange"
+          FSTYPE=$(findmnt -no FSTYPE /)
+          if [ "$FSTYPE" = xfs ]; then sudo xfs_growfs -d / ; else sudo resize2fs "$ROOT"; fi
+          echo "AFTER-GROW"; df -B1G / | tail -1
+          # After a disk-full boot dockerd could not dial containerd (first live run);
+          # restarting containerd and clearing docker's failed state fixed it.
+          sudo systemctl restart containerd || true
+          sudo systemctl reset-failed docker docker.socket 2>/dev/null || true
+          sudo systemctl start docker || true
+          sleep 5
+          sudo docker start tv-questdb >/dev/null 2>&1 || true
+          up=0
+          for i in $(seq 1 90); do curl -fsS 'http://127.0.0.1:9000/exec?query=SELECT%201' >/dev/null 2>&1 && { up=1; break; }; sleep 2; done
+          if [ "$up" != 1 ]; then echo "FAILED: QuestDB never answered on :9000"; sudo docker ps -a; exit 1; fi
+          sudo systemctl restart amazon-ssm-agent || true
+          sleep 5; systemctl is-active amazon-ssm-agent || true
+          echo "FINAL"; df -h / | tail -1
+          EOS
+          sed -i "s/__FORCE_DISK__/$([ "$FORCE_DISK" = yes ] && echo yes || echo no)/" recover.sh
+
+      - name: Push a 60-second key via EC2 Instance Connect and run the recovery
+        env:
+          IID: ${{ steps.box.outputs.iid }}
+          IP: ${{ steps.box.outputs.ip }}
+          AZ: ${{ steps.box.outputs.az }}
+        run: |
+          set -uo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f eic_key
+          ok=0
+          for attempt in $(seq 1 30); do
+            OUT=$(aws ec2-instance-connect send-ssh-public-key --instance-id "$IID" --availability-zone "$AZ" \
+                    --instance-os-user ec2-user --ssh-public-key file://eic_key.pub 2>&1)
+            if ! echo "$OUT" | grep -q '"Success": true'; then
+              echo "::error::send-ssh-public-key failed: $OUT"
+              case "$OUT" in *UnauthorizedOperation*|*AccessDenied*) exit 1;; esac
+              sleep 10; continue
+            fi
+            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
+                   -i eic_key ec2-user@"$IP" 'bash -s' < recover.sh; rc=$?
+            if [ "$rc" -eq 0 ]; then ok=1; break; fi
+            if [ "$rc" -eq 3 ] || [ "$rc" -eq 4 ]; then
+              echo "::error::the on-box safety precondition refused or enablement restoration was unconfirmed; review the reason above. No further SSH attempts will run."
+              exit 1
+            fi
+            echo "ssh attempt $attempt did not complete — sshd may still be starting; retrying in 15s"
+            sleep 15
+          done
+          rm -f eic_key eic_key.pub
+          [ "$ok" = 1 ] || { echo "::error::recovery script never ran to completion"; exit 1; }
+
+      - name: Close the run's SSH opening again
+        if: always() && steps.ssh_open.outputs.cidr != ''
+        env:
+          SG: ${{ steps.box.outputs.sg }}
+          CIDR: ${{ steps.ssh_open.outputs.cidr }}
+        run: |
+          set -uo pipefail
+          if aws ec2 revoke-security-group-ingress --group-id "$SG" --protocol tcp --port 22 --cidr "$CIDR"; then
+            echo "port 22 closed to $CIDR"
+          else
+            echo "::error::could not close port 22 to $CIDR on $SG; the next terraform apply removes it, or revoke it by hand"
+            exit 1
+          fi

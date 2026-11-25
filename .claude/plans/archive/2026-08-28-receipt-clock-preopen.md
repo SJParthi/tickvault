@@ -1,0 +1,809 @@
+# Implementation Plan: Receipt-clock OHLCV, 09:00 candles, per-minute ATM re-fit, percentage columns
+
+**Status:** VERIFIED (2026-09-06 — every item checked; see the honesty note below)
+
+> **⚠ What VERIFIED rests on here, and what it does NOT.**
+>
+> `plan-verify.sh` reports `PASS: No active implementation plan` for this file,
+> and that PASS is **VACUOUS**: the hook hardcodes
+> `PLAN_FILE=".claude/plans/active-plan.md"` and never globs `active-plan-*.md`,
+> so it has not inspected a single item here. Recorded rather than cited,
+> because leaning on it would be exactly the accidental-pass class this plan's
+> own items were corrected for.
+>
+> The asymmetry is worth naming for a future session: `plan-gate.sh` (the
+> design-first wall) DOES scan every `active-plan*.md`, while `plan-verify.sh`
+> reads only the singular name. So a multi-file plan is GATED on entry and
+> UNVERIFIED on exit. Closing that is its own change, not this one.
+>
+> This VERIFIED therefore rests on the per-item evidence recorded in each block
+> — source citations, measured test counts, and bite-proofs — not on the hook.
+**Date:** 2026-08-28
+**Approved by:** Parthiban (operator) — verbatim, this session: *"Yes fox and resolve everything always ensure to start eelvery candles starting at 9 am dude okay"* / *"Meanwhile ensure to achieve this ohlcv based on one and only received at dude okay?"* / *"See clealry ensure whenever the pre marketbope ticks and candles get finished ensure to provide this fucking atm plus minus depths also dude and starting 9.16 am every one minute resubscribe also right dude of current atm and what about pre oopem marketbpercentage change and even percentage change also dude okay?"*
+**Authority:** `.claude/rules/project/websocket-connection-scope-lock.md` § "2026-08-28 — CANDLES FROM 09:00, OHLCV ON THE RECEIPT CLOCK…" (landed before this plan, per the rule-file-first law)
+**Crates touched:** `tickvault-storage`, `tickvault-core`, `tickvault-trading`, `tickvault-app`, `tickvault-common`
+
+---
+
+## Design
+
+Five workstreams. Ordered so each is independently revertible and so the
+prerequisite lands before the change that depends on it.
+
+### W1 — `TVW3`: make `received_at` truthful across replay  *(prerequisite for W2)*
+
+The true receipt instant is stamped in `FrameSink::accept` (`pool_supervisor.rs`)
+**before** the WAL append, then discarded because the WAL record carries only
+`ws_type`, `frame_seq` and the frame bytes. `refold_wal_frames` therefore
+re-stamps with `Utc::now()` — measured to place 9.1% of a session's ticks 9–20
+hours away from their true receipt.
+
+Mint WAL magic `TVW3` = `[magic(4)][ws_type:u8][frame_seq:u64][received_at_nanos:i64][len:u32][frame][crc32:u32]`,
+following the exact precedent by which `TVW2` added `frame_seq` beside `TVW1`.
+Replay accepts all three magics; `TVW1`/`TVW2` records replay with `0`, which the
+persistence layer already maps to NULL — a missing timestamp, never a false one.
+No data migration. Cost: 8 bytes/frame and one clock read per frame.
+
+### W2 — Bucket every candle on `received_at` ✅ SHIPPED 2026-08-28
+
+`AggregatorCell::fold` bucketed on `tick.exchange_timestamp`. It now buckets on
+`fold_clock_ist_secs(exchange_timestamp, received_at_nanos)` — the receipt clock
+with the exchange stamp as fail-soft fallback — and so do the seven other sites
+that must agree with it: the watermark, the stale-trading-day gate, the session
+gate, `last_observed_ts`, `close_ts_ist_secs` at bucket open, the in-bucket close
+guard, and the late-refold close guard.
+
+**The guard is on the DELTA, not on an absolute band, and that is what made W2
+safe to ship BEFORE W1b.** A replayed WAL frame carries a re-stamped `received_at`
+that is a perfectly sane epoch — an absolute plausibility band waves it straight
+through — but its delta against the trade stamp is hours, so it falls back and
+lands in the bar it originally belonged to. That converts W1b from a blocker into
+an accuracy improvement.
+
+**Hot-path shape (O(1), zero-alloc).** `fold_secs` is derived ONCE per tick above
+the timeframe loop and threaded down, exactly like `prices` and
+`cumulative_volume`. An adversarial O(1) audit caught the first draft recomputing
+it 48× per tick — the same hoisting defect this module recorded on 2026-08-10 —
+and the fix is pinned by the module's own stated contract. DHAT re-run with a
+non-zero receipt in the fixture: still zero-alloc.
+
+**⚠ THE HONEST LIMIT, and it is not the one the first draft claimed.** The
+justification originally written into `fold_clock_ist_secs` was the DORMANT
+CONTRACT: a sleepy option's trade stamp is hours old, so bucketing on it files a
+live snapshot into a bar dated hours ago. **That was FALSE.** The delta guard
+refuses any receipt more than `MAX_PLAUSIBLE_RECEIPT_LAG_SECS` (300) past the
+trade, so a stale snapshot falls back and nothing changes for it. The test written
+to demonstrate the claim FAILED, which is how it was caught, and the boundary is
+now pinned as a test rather than asserted in prose
+(`receipt_clock_end_to_end_tests::a_stale_snapshot_still_buckets_on_its_trade_stamp`).
+
+What W2 actually corrects is **delivery lag inside the band** — measured p50 1.4s,
+p99 46s on this feed — which is precisely where a minute boundary gets crossed on
+an ordinary day: a trade printed 09:29:59 and delivered 09:30:01 now files into
+the 09:30 bar a live decision is reading, instead of the 09:29 bar it had already
+left. Widening that scope needs the real receipt carried through the WAL record
+(W1b), because until then a large positive delta is indistinguishable from a
+replay.
+
+**Coverage gap closed in the same change.** Every candle fixture in the workspace
+left `received_at_nanos` at its `Default` 0 — the sentinel — so the whole suite
+had been exercising the FALLBACK and passing "by construction, not by agreement".
+Four end-to-end tests now drive a non-zero receipt through a real fold: the
+minute-boundary case, the stale-snapshot limit, the replay fallback, and close
+ownership by last-received packet.
+
+**One site deliberately NOT moved:** the day-OHLC session gate in
+`day_ohlc_orchestrator.rs`. Moving it admitted pre-open auction prints into day
+HIGH/LOW/CLOSE at the p50 lag — i.e. every trading day — which the 2026-08-25
+scope lock REJECTs explicitly, and dropped genuine 15:29:5x prints at the other
+edge. "Is this a regular-session trade" is a property of the TRADE, so it is
+judged on the trade's clock. Day high/low is a running max/min, which has no clock
+dependence; the ordering that does have one moved to the receipt clock in the
+aggregator, where it belongs.
+
+### W3 — Candle session opens at 09:00
+
+Move `MARKET_OPEN_SECS_OF_DAY_IST` 33_300 → 32_400 in the trading crate only.
+Sever the compile-time assert binding it to `MARKET_OPEN_IST_NANOS`, deliberately
+and with a comment, so the day-OHLC and tick-persistence gates stay at 09:15 and
+the operator's own 2026-08-25 pre-open rule is not breached.
+
+### W4 — Percentage columns
+
+Four columns already exist on every `candles_<tf>` table, are written on every
+row, and all carry `0.0`; the component that computed them was deleted 2026-07-19.
+Both inputs — `prev_day_close` and `session_open` — are already populated per tick
+into the same `LiveCandleState`. Compute at seal time, guarded against a zero or
+non-finite previous close.
+
+### W5 — Per-minute ATM re-fit from 09:16 ✅ ALREADY BUILT AND LIVE — this plan item was WRONG
+
+**This section previously specified work that already exists.** It is corrected
+rather than deleted, because the wrong version is the more useful record: it says
+what happens when a plan is written from a partial read instead of from the code.
+
+The draft read:
+
+> A 60-second timer on the attach task recomputes the ATM ±25 selection, diffs
+> against what was sent, and forwards **only additions** through the existing
+> top-up channel. Never a swap: the transport has no `send_unsubscribe`, the
+> subscribe guard's instrument set is the reconnect replay, and error 805 is a
+> disconnect.
+
+**Every load-bearing claim in that paragraph is false.** Verified in source:
+
+| The draft claimed | Source says |
+|---|---|
+| "the transport has no `send_unsubscribe`" | `crates/core/src/websocket/connection.rs:1243` `send_unsubscribe`, plus `:900` `send_unsubscribe_in_mode` |
+| "the subscribe guard has no removal API" | `pool_supervisor.rs:1405` `SubscribeGuard::try_swap`, `:1492` `SubscribeSwap` |
+| "never a swap" | `pool_supervisor.rs:1559` `LiveSubscriptionCommand::Swap { old, new }`, documented verbatim as "the per-minute at-the-money re-selection" |
+| "a 60-second timer on the attach task" | a dedicated spawned task: `depth_rebalance.rs:1125` `run_depth_rebalance`, spawned from `dhan_feed_stack.rs:6959` |
+| the re-fit is not built | it is built, wired, spawned in production, and edge-triggered |
+
+**What actually runs today**, every minute, for the session:
+
+* `run_depth_rebalance` sleeps to `REBALANCE_OFFSET_SECS = 8` past each minute —
+  not :00, deliberately: a candle seals AT the boundary and the writer needs a
+  moment, so a query at :00 reads the minute before last and the whole loop runs
+  a minute behind the market "a bug that would look exactly like normal
+  operation" (`depth_rebalance.rs:835`).
+* It reloads candidates and movers, then runs `plan_depth20_minute` for the
+  20-level windows and `plan_minute` (`Depth200AtmTracker`) for the deep sockets.
+* **Edge-triggered:** `if decision.is_quiet() { continue; }` with no log line —
+  "~375 of these a session would bury the ones that matter".
+* It runs **off the drain task**, so a slow QuestDB query cannot stall tick
+  decoding.
+* The heartbeat is stamped every iteration including quiet ones, and published by
+  a SEPARATE ticker task, because publishing from the loop would freeze the gauge
+  at its last value if the loop wedged — "a frozen zero reads as perfectly
+  healthy".
+* Counters: `tv_depth_rebalance_age_secs`, `tv_depth_rebalance_swaps_sent_total`,
+  `tv_depth_rebalance_swaps_refused_total`, all pre-registered at 0.
+
+The measured drift figures below remain accurate and remain the reason the loop
+is edge-triggered rather than unconditional: median strike spacing 2.63% of
+price, average intraday drift 0.8 strikes, worst case 6 strikes against a
+25-strike half-window, and 39% of ladders already fully covered — so on a normal
+day it sends nothing, which is exactly what `is_quiet` encodes.
+
+**The lesson, which is the part worth keeping.** This item was written from a
+grep that found no `send_unsubscribe` in the file I happened to open, and the
+conclusion "never a swap" was then built on top of it and carried into a
+published report. One `grep -rn "fn send_unsubscribe" crates/` refutes it. A
+plan item that specifies work already done is not a harmless surplus — it would
+have produced a SECOND re-fit loop racing the first one over the same sockets.
+
+---
+
+## Edge Cases
+
+| # | Case | Handling |
+|---|---|---|
+| E1 | Legacy `TVW1`/`TVW2` record replayed after W1 | `received_at = 0` → NULL, never a synthesized time. Counted separately from live frames. |
+| E2 | Frame received 15:29 yesterday, replayed at tomorrow's boot | Carries yesterday's receipt → targets a bucket sealed a day earlier. Replay runs before sockets open, so it cannot race live traffic; the late policy decides, and the outcome is counted. |
+| E3 | Multi-socket stamp/send interleave | Skew is microseconds; a later-stamped frame can enter the ring first. Within one bucket, so bucketing is unaffected. |
+| E4 | Equity with no pre-open auction print | 09:00–09:14 buckets never open → **no rows**. Not a flat bar. Downstream must read absence as normal. |
+| E5 | Pre-open tick spends `volume_baseline_seeded` | The 09:07 auction print becomes the volume baseline, so its own bar reports 0 volume. Pre-existing behaviour, now reachable 15 minutes earlier. |
+| E6 | `prev_day_close` is 0 or non-finite | Percentage stays `0.0` and increments a refusal counter. Never Inf/NaN. |
+| E7 | ATM re-fit when the ladder is already fully covered (39% of names) | Delta is empty; nothing sent; costs one set-difference. |
+| E8 | Re-fit delta exceeds the per-minute cap | Fails CLOSED — stops adding, counts, logs. Window frozen at its current width, never silently narrowed. |
+| E9 | Aggregator slot ceiling reached mid-session | Existing fail-closed refusal + counter. Re-fit stops adding. |
+| E10 | Top-up channel disarmed on `Disconnected` | Existing bug: `topup = None` is permanent. Must be held for the session or minute 2 is silently ignored. |
+| E11 | Muhurat / delayed open | Every constant here is a fixed IST second. Out of scope for this plan and recorded as an open risk. |
+| E12 | Cross-verify sees pre-open live rows | Must EXCLUDE them, not count them `missing_rest`. |
+
+---
+
+## Failure Modes
+
+| Mode | Blast radius | Detection |
+|---|---|---|
+| `TVW3` writer ships without the replay reader | Replay rejects every new record; WAL frames unrecoverable | CRC/magic mismatch counter; replay-parse ratchet covering all three magics |
+| Clock switched without W1 | Measured: 8.8% of a session misfiled, 4 phantom bars, 4,319 ticks on the wrong day | Ordering guard: W2 must not merge before W1 |
+| Both session gates moved together | Pre-open ticks enter day high/low/close — breaches the 2026-08-25 operator rule | The day-gate tests are explicitly NOT re-blessed; they fail if the gate moves |
+| Cross-verify window widened to 09:00 | Every instrument reports 09:00–09:14 `missing_rest` daily; ground truth destroyed | Its 385-minute asserts are left intact and will fail |
+| Percentage divides by a zero close | Inf/NaN into a stored column, and this codebase has a documented NaN-poisoning incident | Guard + refusal counter + a test feeding 0.0 and non-finite |
+| Re-fit runs on the reader task | Keepalive stalls while subscribing → socket drop → tick loss | Re-fit lives on the attach task; only the delta crosses the channel |
+| Re-fit sends full sets | 230 messages/minute unpaced → error 805 disconnect | Delta-only + 25 ms inter-batch pacing |
+| Slot reuse without cell reset | Foreign volume baseline → the documented 9.2× volume corruption | Not in scope: this plan never releases slots |
+
+---
+
+## Test Plan
+
+| # | Test | Pins |
+|---|---|---|
+| T1 | `tvw3_roundtrip_preserves_received_at` | Write `TVW3`, replay, assert the receipt nanos survive exactly |
+| T2 | `tvw1_and_tvw2_records_replay_with_null_receipt` | Legacy records yield `0`/NULL, never `now()` |
+| T3 | `replay_never_restamps_receipt_with_now` | Source-scan: `refold_wal_frames` contains no `Utc::now()` on the receipt path |
+| T4 | `candles_bucket_on_receipt_not_exchange_time` | A tick whose two clocks straddle a minute boundary lands in the receipt bucket |
+| T5 | `a_replayed_tick_lands_in_its_original_minute` | The regression the whole of W1 exists to prevent |
+| T6 | `candle_session_opens_at_0900` | 09:00:00 accepted, 08:59:59 refused |
+| T7 | `day_ohlc_gate_still_opens_at_0915` | **Must NOT be re-blessed** — proves the two gates were severed |
+| T8 | `crossverify_window_still_starts_at_0915` | Ground truth intact |
+| T9 | `preopen_minute_with_no_ticks_emits_no_row` | Absence is normal, not a synthetic bar |
+| T10 | `pct_change_computed_from_prev_close` | Known inputs → known percentage |
+| T11 | `pct_change_refuses_zero_or_nonfinite_prev_close` | Stays 0.0, counter increments, no Inf/NaN |
+| T12 | `open_gap_pct_is_the_preopen_equilibrium_gap` | Uses `session_open`, not the first traded price |
+| T13 | `atm_refit_sends_only_additions` | Never emits an unsubscribe or a full set |
+| T14 | `atm_refit_fails_closed_at_the_per_minute_cap` | Stops adding, counts, does not narrow |
+| T15 | `atm_refit_does_not_run_on_the_reader_task` | Source-scan: the timer is on the attach task |
+| T16 | `dhat_receipt_bucketing_zero_alloc` | The clock switch adds no hot-path allocation |
+
+Scope: `cargo test -p tickvault-storage -p tickvault-core -p tickvault-trading -p tickvault-app`, escalating to `--workspace` because `tickvault-common` constants move.
+
+---
+
+## Rollback
+
+Each workstream is independently revertible, and W1 is forward-compatible in both
+directions:
+
+- **W1** — replay accepts `TVW1`/`TVW2`/`TVW3`, so reverting the writer leaves
+  every existing record readable. No migration to undo.
+- **W2** — one constant selecting the clock source; revert restores exchange
+  bucketing. Rows already written keep their stamps, so a revert produces a
+  seam in the data, not corruption.
+- **W3** — one constant, 32_400 → 33_300.
+- **W4** — the columns already exist and already carry `0.0`; reverting returns
+  them to `0.0`, which is the current production state.
+- **W5** — config-gated off; the timer simply does not arm.
+
+The riskiest combination is W2 without W1, which is why the ordering is a
+gate rather than a preference.
+
+---
+
+## Observability
+
+| Signal | Kind | Purpose |
+|---|---|---|
+| `tv_wal_records_replayed_total{magic}` | counter | Proves `TVW3` is actually being written and read |
+| `tv_wal_replay_null_receipt_total` | counter | Legacy records replayed with no receipt — should fall to zero within a day |
+| `tv_candle_late_bucket_total{policy}` | counter | Should FLATLINE after W2. A non-zero value means receipt is not monotone — the assumption is violated and we want to know |
+| `tv_candle_preopen_bars_total{segment}` | counter | How much the 09:00 window actually yields, per segment |
+| `tv_pct_refused_total{reason}` | counter | Zero/non-finite previous close |
+| `tv_atm_refit_runs_total{outcome}` | counter | `no_change` / `added` / `capped` — measured expectation is overwhelmingly `no_change` |
+| `tv_atm_refit_strikes_added_total` | counter | Real intraday drift, measured in production rather than modelled |
+
+Dashboard: the three counters that can indicate a broken assumption
+(`late_bucket`, `replay_null_receipt`, `atm_refit{capped}`) go on the operator
+dashboard. Alarms are a separate change and are NOT bundled here — a new pager
+needs its own dated authorization under the noise lock.
+
+---
+
+## Plan Items
+
+- [x] **W1a** `TVW3` WAL record format carries the true receipt time; replay
+      restores it; all three magics accepted; unknown magic is now a CODED
+      error with a counter and an alarm rather than a silent empty replay
+  - Files: `crates/storage/src/ws_frame_spill.rs`,
+    `deploy/aws/terraform/live-lane-alarms.tf`,
+    `crates/common/tests/cloudwatch_app_alarms_wiring.rs`
+  - Tests: T1, T2, T3 — plus 9 new `ws_frame_spill` tests, 3 bite-proven
+  - **Verified 2026-08-28:** `ws_frame_spill` 62 passed / 0 failed
+
+- [x] **W1b** Thread the real receipt through the call chain so `TVW3`
+      actually carries a non-sentinel value
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete when this item
+    still read REMAINING.** The status block below is preserved verbatim
+    because the wrong version is the more useful record -- this is the THIRD
+    item in this plan found already-built (after W5, and after two claims in
+    the W2 research block), and the pattern is identical every time: a status
+    written from a partial read outlives the code that refuted it.
+  - The original text read:
+    > **Honest status: the FORMAT exists and nothing populates it yet.** The
+    > receipt is stamped correctly and early in `FrameSink::accept`, and is
+    > still dropped at `main.rs:897` where the replayed record is turned back
+    > into `(frame_seq, Bytes)`. `append_with_seq_at` has zero production
+    > callers.
+  - **Every load-bearing claim there is now false.** Verified in source
+    2026-09-06:
+
+    | The item claimed | Source says |
+    |---|---|
+    | "`append_with_seq_at` has zero production callers" | `pool_supervisor.rs::accept` calls it, passing `receipt_nanos_from(received_at)` |
+    | "dropped at `main.rs:897` ... turned back into `(frame_seq, Bytes)`" | the replay vector is `(u64, i64, WalEndpoint, Bytes)` -- the `i64` IS the receipt |
+    | "`refold_wal_frames` re-stamps `Utc::now()`" | it destructures `wal_received_at_nanos` per frame and hands THAT to `dispatch_frame` |
+
+  - **The shipped conversion is BETTER than this plan sketched, and the
+    difference matters.** The design below prescribed converting in the WAL
+    writer thread. What shipped is a REFRESHING (wall, instant) anchor
+    (`receipt_nanos_from`) -- which this plan lists under "rejected
+    alternatives" as *"anchoring once at boot ... drifts unboundedly"*. The
+    refresh is what answers that objection, and it carries its own
+    monotonicity guard refusing a backward re-anchor. The rejection was right
+    about the anchor-ONCE form and is superseded for the refreshing one.
+
+  - **What was genuinely missing, and is fixed here: the property had never
+    been EXECUTED.** Both existing guards
+    (`crates/app/tests/wal_receipt_threading_guard.rs`) are SOURCE SCANS, and
+    the round-trip test hand-encodes its record with `encode_v3_record`, so it
+    proves the reader only. Two behavioural tests added:
+    * `a_receipt_written_by_the_real_writer_replays_unchanged` -- real
+      `append_with_seq_at` -> writer thread -> file -> `replay_all`. Bite:
+      writer substitutes the UNKNOWN sentinel -> FAILS.
+    * `a_converted_receipt_lands_on_the_real_wall_clock_not_merely_in_order`
+      -- every prior test of this conversion checked ORDER, and **a constant
+      offset preserves order perfectly**. Bite-proven with the anchor moved
+      back one hour: this test FAILS and both pre-existing order tests still
+      PASS. An hour-wrong anchor was invisible to the entire suite, and for a
+      sentinel-LTT tick that value becomes the row's designated `ts` -- the
+      first column of the `ticks` DEDUP key.
+  - **One site deliberately left on the replay clock, now documented at the
+    site:** `refold_wal_frames``refold_wal_frames`'s `recv_millis``recv_millis`. Its only consumer is the
+    tick-gap detector, which asks a LIVENESS question; feeding it the true
+    historic receipt would report the whole universe as silent on the first
+    sweep after any crash-restart -- a page storm caused by recovery working.
+  - Files: `crates/storage/src/ws_frame_spill.rs` (the writer thread),
+    `crates/core/src/websocket/pool_supervisor.rs` (`WalRingSink::accept` —
+    signature only), `crates/app/src/main.rs` (~:893-897),
+    `crates/app/src/dhan_feed_stack.rs` (`refold_wal_frames`, which re-stamps
+    `Utc::now()` on replay)
+
+  - **⚠ THE OBVIOUS IMPLEMENTATION IS FORBIDDEN, and this is the single most
+    important note in this plan.** The natural move — have `WalRingSink::accept`
+    read `Utc::now()` and pass it to `append_with_seq_at` — **breaks a
+    deliberate, tested safety property**. `pool_supervisor.rs` is banned from
+    reading the wall clock at all, enforced by
+    `test_pool_supervisor_source_never_reads_the_wall_clock`, and the ban is
+    load-bearing rather than stylistic: the supervisor's ladder, its token
+    expiry and its backoff are all monotonic **so that an NTP step cannot
+    expire all sixteen sockets at once**. The file's own doc states the ban is
+    blanket on purpose *"so nobody has to re-litigate it per call site"*.
+    `CapturedFrame::received_at` is therefore an `Instant`, not a wall time,
+    and there is no epoch value at that site to write.
+
+  - **The design that satisfies both constraints** — and it is the pattern the
+    supervisor's own doc already prescribes (*"the consumer derives the
+    wall-clock receipt instant by subtracting `elapsed()` from its own clock
+    read"*):
+    1. `WalRingSink::accept` passes the monotonic `Instant` through to the
+       spill channel. It still never reads the wall clock, so the ban and its
+       test are untouched.
+    2. The **WAL writer thread** — which already runs off the hot path and is
+       already permitted a clock — converts at write time:
+       `receipt_nanos = now_wall - instant.elapsed()`.
+    3. `plausible_receipt_nanos` (already shipped) clamps the result, so a
+       clock step between receipt and write degrades to the `0` sentinel
+       rather than to a confident lie.
+    This costs **zero** additional reads on the capture path, keeps the
+    conversion accurate across a clock step landing between receipt and write,
+    and leaves the NTP-safety property exactly as it is.
+
+  - **Rejected alternatives, recorded so they are not re-proposed:** reading
+    the wall clock in `accept` (breaks the ban); anchoring once at boot to a
+    (wall, instant) pair and adding the delta (survives an NTP step but drifts
+    against it, and a long session drifts unboundedly); serialising the raw
+    `Instant` (meaningless across processes, which is the whole point of the
+    replay path).
+
+- [x] **W2** Candles bucket on `received_at`
+  - **⚠ CORRECTED 2026-09-06: the CODE was already complete, and the research
+    block below is what a correct design note looks like AFTER it shipped.**
+    This is the FOURTH item in this plan found already-built (after W5, W1b,
+    and two claims inside this very block). Same pattern every time: a status
+    line written from a partial read outlives the code that refuted it.
+  - **All five coupled sites verified on `fold_secs` in source 2026-09-06** --
+    the four the research block below names, plus the bucket itself:
+
+    | Site | Reads |
+    |---|---|
+    | bucket (`aggregator_cell`) | `fold_clock_ist_secs(tick.exchange_timestamp, tick.received_at_nanos)` |
+    | watermark advance | `if fold_secs > self.watermark_secs` |
+    | seconds-of-day session gate | `let secs_of_day = fold_secs % 86_400` |
+    | `close_ts_ist_secs` | `close_ts_ist_secs: fold_secs` |
+    | `tick_is_newest` ordering | `fold_secs >= state.close_ts_ist_secs` |
+
+  - **One deliberate deviation from this plan, and the implementation is
+    right.** The block below lists the stale-trading-day gate as MUST-NOT-MOVE.
+    It DOES read `fold_secs` -- and must, because it compares against a
+    watermark that is itself advanced by `fold_secs`. The site says so: *"A
+    packet near midnight whose receipt crosses the day boundary advances the
+    watermark into day D+1 and is then rejected by its own advance as
+    `stale_trading_day`. Comparing like with like removes the shape entirely."*
+    The plan's rule was about not using the RAW receipt; comparing a fold-clock
+    day against a fold-clock watermark is self-consistent, which is the actual
+    requirement.
+  - **The two genuine MUST-NOT-MOVE sites are verified UNMOVED:** `ws_lag_ms`
+    still takes `tick.exchange_timestamp`, and `row_timestamp_ist_nanos` still
+    takes the exchange stamp with the receipt only as the sentinel fallback.
+
+  - **What was genuinely missing, and is fixed here: the COUPLING was
+    unpinned.** The research block calls the split the trap -- *"Moving the
+    bucket clock alone leaves ordering deciding on one clock and bucketing on
+    another"* -- and nothing enforced it. Each site is individually correct on
+    either clock; only their AGREEMENT is the property, and no test asserted
+    it. MEASURED by planting the reverts:
+
+    | Plant | Caught by |
+    |---|---|
+    | `tick_is_newest` back on the exchange stamp | the existing `the_close_is_owned_by_the_last_packet_we_received` -- already covered |
+    | **watermark advance back on the exchange stamp** | **NOTHING. All 1,703 trading lib tests PASSED.** Only the new guard bites |
+    | `ws_lag_ms` moved onto the fold clock | **NOTHING.** New guard bites |
+
+  - **`ws_lag_ms` is the dangerous one and now has its own guard.** The fold
+    clock IS the receipt whenever the receipt is plausible, so feeding it in as
+    the exchange stamp makes `lag = received - received`: every lag collapses
+    to ~0. That is not an error value -- `WsLag::Measured(0.0)` is legal -- so
+    every histogram flattens, the per-connection p99 reads perfect, and
+    `tv-<env>-dhan-worst-socket-deaf` can never fire again. It would erase the
+    MEASURED p50 1.38 s / p99 46.37 s / max 198.69 s this feed actually
+    delivers, and a tidy "move every clock read onto fold_secs" refactor would
+    do it while passing CI.
+  - New guards: `crates/trading/tests/fold_clock_coupling_guard.rs` (5 tests)
+    and `crates/app/tests/ws_lag_clock_guard.rs` (2 tests, one of which
+    DEMONSTRATES the collapse arithmetically rather than arguing it).
+  - Files: `crates/trading/src/candles/aggregator_cell.rs`, `crates/trading/src/candles/multi_tf_aggregator.rs`, `crates/trading/src/candles/tf_index.rs`
+  - Tests: T4, T5, T16
+  - **Research complete 2026-08-28. Three findings that shape the design:**
+    1. `ParsedTick.received_at_nanos` EXISTS (`tick_types.rs:28`) and is
+       **UTC**, not IST. The exchange stamp is IST seconds. Bucketing on the
+       raw field without `+ IST_UTC_OFFSET_NANOS` shifts every bucket by
+       5h30m — the single most likely way to get this wrong.
+    2. The bucketing clock is ONE line — `aggregator_cell.rs:651`
+       `tf.bucket_start(tick.exchange_timestamp)` — but **eleven other sites
+       read the same field**, and four of them must move WITH it or they
+       disagree with the bucket they are guarding: the watermark advance
+       (`multi_tf_aggregator.rs:734`), the session gate (`:783`),
+       `close_ts_ist_secs` (`aggregator_cell.rs:1070`), and the
+       `tick_is_newest` close-ordering guard (`:1211`). Moving the bucket
+       clock alone leaves ordering deciding on one clock and bucketing on
+       another.
+    3. Three sites must NOT move: `ws_lag_ms` (it measures exchange-vs-receipt
+       and becomes identically zero), the QuestDB designated `ts`
+       (`data-integrity.md` — never), and the stale-trading-day gate (it is a
+       question about vendor data validity, not about time).
+  - **Design decision:** a single `fold_clock_ist_secs(tick)` helper —
+    receipt converted to IST when plausible, exchange stamp as the fail-soft
+    fallback — used by the bucket, the session gate and the ordering guards
+    together. A tick is never dropped for having an implausible receipt.
+
+- [x] **W3** Candle session opens 09:00; day-OHLC and cross-verify stay 09:15
+  - Files: `crates/trading/src/candles/tf_index.rs`,
+    `crates/trading/src/candles/multi_tf_aggregator.rs`,
+    `crates/trading/src/candles/aggregator_cell.rs`,
+    `crates/trading/src/in_mem/spot_bar_store.rs`,
+    `crates/app/src/tf_consistency_boot.rs`,
+    `crates/app/src/market_ram_store_boot.rs`,
+    `crates/app/src/rest_candle_fold.rs`,
+    `crates/app/src/depth_rebalance.rs`,
+    `crates/app/src/dhan_live_crossverify.rs`
+  - Tests: T6, T7, T8, T9
+  - **Verified 2026-08-28:** trading lib 1659/0; app lib 1682/0; CI
+    `Test (app)` green across all integration binaries; DHAT + Loom green.
+    Three defects found in the change itself by adversarial sweep and fixed;
+    nine boundary permutations traced and all correct.
+
+- [x] **W4** Compute the four percentage columns at seal time
+  - **ALREADY SHIPPED 2026-08-26 — verified in source, not rebuilt.**
+    `LiveCandleState::stamp_seal_percentages` computes
+    `close_pct_from_prev_day`, `open_pct` and `open_gap_pct` at every one of
+    five seal sites; `change_pct` is derived at row extraction. `pct_change`
+    guards four refusal cases (non-finite baseline, non-positive baseline,
+    non-finite value, non-finite quotient). A source-scan ratchet counts the
+    stamp sites so a sixth seal path cannot ship unstamped.
+  - Residual, disclosed rather than fixed: pre-open bars carry
+    `open_pct = 0.0` because `session_open` is the exchange `day_open`, which
+    is 0 until a regular-session trade prints. Semantically correct — there
+    is no baseline yet — but indistinguishable from "flat" on a chart.
+
+- [x] **W5** Per-minute additive ATM re-fit from 09:16
+      *(ALREADY BUILT AND LIVE — checkbox corrected 2026-09-06)*
+  - **This item was UNCHECKED while the Design section above it said, in bold,
+    "✅ ALREADY BUILT AND LIVE — this plan item was WRONG". The plan
+    contradicted itself, and the two halves had been disagreeing since
+    2026-08-28.** Settled from the CODE rather than from either prose, by
+    symbol rather than by line number (the house rule — a line number in an
+    uncompiled document is a claim with no way to stay true):
+
+    | Symbol the draft said was missing | Occurrences |
+    |---|---|
+    | `send_unsubscribe` (`core/src/websocket/connection.rs`) | 2 |
+    | `SubscribeGuard::try_swap` (`pool_supervisor.rs`) | 1 |
+    | `LiveSubscriptionCommand::Swap` (`pool_supervisor.rs`) | 15 |
+    | `run_depth_rebalance` (`app/src/depth_rebalance.rs`) | 1 |
+    | `is_quiet` (the edge-trigger) | 8 |
+
+    The per-minute cadence is real too: `secs_until_next_rebalance` sleeps to
+    `REBALANCE_OFFSET_SECS = 8` past each minute, and `REBALANCE_HEARTBEAT_SECS`
+    stamps liveness from a separate ticker. Spawned in production from
+    `dhan_feed_stack::spawn_depth_rebalance`, which the attach loop reaches on
+    its only success return.
+
+  - **Why a stale UNCHECKED box is worth a correction and not a silent tick.**
+    An unchecked item is an instruction to a future session to go and build the
+    thing. The Design section already spells out what that costs here: a second
+    re-fit loop racing the first over the same five depth-200 sockets, both
+    issuing `Swap` against one `SubscribeGuard`. That is strictly worse than
+    the surplus work — it is a correctness bug manufactured by a checkbox.
+    Same class as the `day_ohlc_tracker` row this repo records: a stale record
+    does not merely fail to inform, it actively produces false findings.
+
+  - **Scope note, checked rather than assumed.** W5 is the DEPTH-200 ATM
+    re-fit (the operator's 2026-08-26 directive: NIFTY/BANKNIFTY ATM CE/PE,
+    every minute, edge-triggered). It is NOT the main-feed contract top-up,
+    whose separate `CONTRACT_TOPUP_CUTOFF_IST_SECS = 09:30` bound this item's
+    original draft cited. Those are two different mechanisms on two different
+    socket pools, and conflating them is how this box would have been ticked
+    for the wrong reason.
+  - Files: `crates/app/src/dhan_feed_stack.rs`, `crates/core/src/websocket/pool_supervisor.rs`, `crates/common/src/config.rs`, `config/base.toml`
+  - Tests: T13, T14, T15
+  - **Research complete 2026-08-28. What already exists, and what does not:**
+    | Exists | Detail |
+    |---|---|
+    | A retry/top-up loop | `dhan_feed_stack.rs:6146`, 15 s pre-open / 60 s after |
+    | Additive top-up | `top_up_late_contracts:5757` → `try_send(Extend)` |
+    | Unsubscribe on the wire | `connection.rs:1243`, `SwapPlan` at `pool_supervisor.rs:1405` |
+    | **Missing** | **Detail** |
+    | Any re-fit after ~09:30 | `CONTRACT_TOPUP_CUTOFF_IST_SECS = 09:30` (`:5607`) |
+    | Any record of the ATM strike used | no metric, no log field, no artifact column — **drift is invisible** |
+  - **Three constraints the design must respect:**
+    1. The `Extend` path `.await`s the socket write **on the drain task** and
+       is **unbounded** (only `Swap` is capped, by `SWAP_WIRE_BUDGET`). A
+       stalled write blocks the frame drain — i.e. tick loss. Any per-minute
+       path needs a budget of its own.
+    2. Unsubscribe has **zero main-feed callers** (depth only), and
+       `SubscribeGuard`'s instrument set IS the reconnect replay — an
+       unsubscribed instrument silently returns on the next reconnect.
+       Therefore the re-fit is **additive-only**; a swap needs slot release
+       with a full cell reset first, which is its own unit of work.
+    3. **Measured: the re-fit will almost always be a no-op.** Median strike
+       spacing 2.63% of price; average intraday drift 2.20% ≈ **0.8 strikes**
+       against a **25-strike** half-window; worst single underlying 6.0
+       strikes; and for **81 of 210 underlyings (39%)** ±25 already covers the
+       entire ladder. So it must be **delta-driven** — recompute every
+       minute, send only on an actual ATM change — or it is ~375 needless
+       re-subscribes per socket per session on the very feed whose reconnect
+       churn this work is meant to reduce.
+
+---
+
+- [x] **W6** Enforce the session window on the WRITE path — ticks, depth, candles
+  - Files: `crates/common/src/session_window.rs`,
+    `crates/storage/src/tick_persistence.rs`,
+    `crates/storage/src/depth_persistence.rs`,
+    `crates/storage/src/shadow_candle_writer.rs`,
+    `crates/storage/tests/session_window_gate_guard.rs`,
+    `crates/storage/tests/dhat_depth_append_zero_alloc.rs`,
+    `crates/common/tests/loss_counter_visibility_guard.rs`,
+    `crates/common/src/muhurat.rs`,
+    `crates/common/tests/dead_const_ratchet.rs`,
+    `crates/storage/src/tick_spill_replay.rs`
+  - Tests: `session_window_gate_guard` (10, all bite-proven),
+    `session_window` unit (10), `tick_persistence` (66),
+    `depth_persistence` (59), `shadow_candle_writer` (36),
+    `dhat_depth_append_zero_alloc` (1),
+    `dhat_live_ingest_seam::out_of_window_refusal_does_not_allocate_per_tick`,
+    `tick_spill_replay` (37, incl. 3 bite-proven window/band tests),
+    `session_window` Muhurat unit (4), `dead_const_ratchet` (3)
+  - **Why this belongs to W1/W2 and not to a new plan:** W1b/W2 move candles
+    onto the receipt clock; this establishes what the window MEANS on every
+    write path first, so the two clocks are gated by one shared predicate
+    (`session_window::verdict` / `nanos_in_session_window`) instead of three
+    private opinions. `TICK_PERSIST_{START,END}_SECS_OF_DAY_IST` had named
+    this window for months with **no reader on any write path** —
+    `dhan_feed_stack.rs` says so in its own words: *"A row outside the window
+    is written because NOTHING STOPS THE WRITER."*
+
+  - **The three gates, and why each reads what it reads:**
+
+    | Table | Gate reads | Because |
+    |---|---|---|
+    | `ticks` | `row.ts_ist_nanos` AND `row.received_at_ist_nanos` | two genuine clocks; both must be in window |
+    | `market_depth` | `row.ts_nanos` only | depth has exactly ONE clock — its designated `ts` IS the receipt; the depth protocol carries no exchange timestamp field at all |
+    | `candles_<tf>` | `row.timestamp_ist_nanos` only | that is the BUCKET-OPEN instant, never the seal instant |
+
+  - **The last-bar trap, which is the whole design constraint on the candle
+    gate.** A candle row is BUILT at the seal, long after its bucket opens:
+    the M1 bucket opening 15:39:00 seals at watermark 15:40:02
+    (`CATCHUP_LATENESS_MARGIN_SECS = 2`), and `force_seal_all` at close plus
+    the boot recovery drain are later still. A gate testing when the row was
+    built — a wall clock, or a receipt stamp — would discard the final bar of
+    every session, every day, and D1 with it. Pinned by
+    `the_candle_gate_reads_the_bucket_and_never_the_seal_instant` and by
+    `the_final_bucket_of_the_session_is_written_even_though_it_seals_after_1540`.
+
+  - **A refusal is not a loss, and the distinction is load-bearing.** Every
+    refusal arm returns `Ok(())`. An `Err` from these writers is routed by the
+    caller into `note_unapplied` + `tv_{ticks,depth_rows}_dropped_total`, which
+    are ALARMED: returning `Err` would page the operator on every ordinary
+    pre-open row and train the one alarm that reports real loss into noise.
+    It would also hold the applied watermark back forever, since a re-offered
+    frame is refused again.
+
+  - **Two defects found in this work by adversarial review, both fixed:**
+    1. **C1 (severe, in already-pushed code).** `verdict` refused when EITHER
+       clock was out of window, so a 15:39:30 exchange print arriving 15:40:05
+       — inside the measured Dhan p99 delivery lag of 46 s — was silently
+       discarded. `is_refusal` is now narrowed to `TsOutOfWindow` alone, with
+       `is_noteworthy` counting the rest.
+    2. **M1.** A stray duplicate `#[test]` attribute left
+       `is_refusal_and_reason_agree_on_every_variant` with no attribute at all,
+       so it never ran — and it encoded the wrong invariant.
+
+  - **A guard that had stopped guarding, found by bite-proofing.** The first
+    version of the depth refusal assertion asked whether `return Ok(())`
+    appeared anywhere in the refusal region; a planted `Err` in one of three
+    arms PASSED. It now counts one `Ok` per counted arm and bans `return Err`
+    outright. Bite-proven in both directions, as were the depth gate removal,
+    the candle clock swap, the candle `feed` label, and double seeding.
+
+  - **Fixture archaeology, disclosed rather than quietly patched.** Fifteen
+    test fixtures across five modules used timestamps that are not plausible
+    epochs at all — `1` nanosecond, `34_200` (read as 09:30 seconds-of-day but
+    actually **1970-01-01**), `1_700_000_000` (03:43 IST once stamped). They
+    were free until something read them. Two of the repaired tests
+    (`runner_boot_drain_reports_pending_honestly_when_db_is_down`,
+    `real_rescue_path_end_to_end_is_recovered`) had begun reporting three
+    commits against a dead database — they were measuring the new band check,
+    not the database. Bases are now named constants with the arithmetic shown.
+
+  - **Observability.** Three counters —
+    `tv_{ticks,depth_rows,candle_rows}_out_of_window_refused_total` — each
+    labelled by reason, seeded at 0 beside their handles (one seed site, so it
+    cannot fall behind the reason vocabulary; the previous two-site version
+    already listed only two of three reasons), and logged by a throttled
+    power-of-two `warn!` carrying the true running total. Deliberately NOT
+    EMF-shipped: they measure the gate WORKING, so a series would chart normal
+    behaviour rather than a defect, and each name costs ~$0.30/mo against a
+    September forecast of $130.39 with the automatic `STOP_EC2_INSTANCES` line
+    at $135.00 — $4.61 of margin, and the noise lock's standing rule is that
+    the next addition arrives with a LEVER, not a cost note. All three are
+    allowlisted in `loss_counter_visibility_guard` with that reasoning stated.
+
+  - **Allocation.** All handles are pre-resolved; `note()` scans three
+    `&'static str` and increments. The macro form allocated ONCE PER TICK on
+    the drain task — DHAT measured 10,010 blocks over 10,000 ticks against a
+    ceiling of 500, caught by CI on 2026-09-05. The candle counter carries no
+    `feed` label for the same reason: `row.feed` varies per row there, and a
+    non-literal label value drops `metrics::counter!` to its allocating arm.
+
+  - **Two residuals this item DISCLOSED, both now CLOSED (2026-09-05).** The
+    paragraph that stood here flagged them "unfixed, rather than discovered
+    later". They are fixed in the same plan item rather than deferred, because
+    each one made the gate a claim rather than an enforcement.
+
+    1. **`tick_spill_replay::replay_spill_dir` bypassed every gate.** It POSTs
+       raw ILP bytes straight at QuestDB, so any spill file written by a
+       pre-gate binary re-introduced exactly the rows the writers now refuse —
+       the gate held on the live path and leaked on the recovery path.
+       `retain_lines_in_open_window` now filters each chunk line-by-line
+       against the SAME `session_window::row_is_in_an_open_window` predicate.
+
+       **It fails OPEN, and that half is the one that costs data if it is
+       wrong.** A crash-torn tail ends mid-timestamp (`... ltp=1.0 17160237`);
+       that prefix parses cleanly as an integer and, read as nanoseconds,
+       lands in 1970 — out of window by any measure. Judging on the window
+       alone would DELETE a captured tick because a crash cut its stamp short.
+       So a value is judged only when its magnitude says it really is an epoch
+       (`MIN_PLAUSIBLE_EXCHANGE_TS_SECS ..= MAX_PLAUSIBLE_EXCHANGE_TS_SECS` —
+       the aggregator's own band, so there is one definition of "real market
+       timestamp" in the workspace, not a second one invented here). Anything
+       below the band is POSTed and QuestDB decides, which is the module's
+       pre-existing torn-tail contract, unchanged.
+
+       **A pre-existing test caught something the new tests did not.**
+       `replay_spill_dir_keeps_the_file_when_questdb_is_unreachable` uses the
+       fixture `ticks value=1i 1`. Under the first (window-only) version every
+       line was filtered out, the chunk went empty, the POST was skipped — and
+       an all-refused CLOSED file is then truncated like any other. The test
+       reported `files_failed = 0` where it expects 1, i.e. a file the database
+       never received was being treated as drained and emptied. The band fixes
+       that case too, because `1` is not a plausible epoch.
+
+       Also corrected: `refused_bytes` were inflating
+       `tv_tick_spill_replayed_bytes_total`, which now reports
+       `accepted − refused_bytes`; and the refusal `warn!` claimed "the bytes
+       stay on disk until the file ages out", which is FALSE — a fully-refused
+       closed file IS truncated, deliberately, because leaving it would
+       re-refuse the same bytes every round forever. The message says so now.
+
+       Bite-proven: disabling the band fails exactly three tests
+       (`a_torn_timestamp_is_kept_because_its_magnitude_is_not_an_epoch`,
+       `an_unparseable_or_torn_line_is_kept_never_dropped`,
+       `replay_spill_dir_keeps_the_file_when_questdb_is_unreachable`);
+       restoring it returns 37/37.
+
+    2. **Muhurat would have been refused across all 26 tables.**
+       `MUHURAT_PERSIST_{START,END}_SECS_OF_DAY_IST` (18:00–19:30 IST) sat in
+       `dead_const_ratchet`'s allowlist, and `muhurat::current()` had **zero
+       production readers** — the flag was WRITE-ONLY for months. Its module
+       header named two consumers to justify itself: `should_connect_ws`
+       (zero occurrences anywhere in the repo) and `run_tick_processor`
+       (deleted 2026-07-17). Shipping the gate on top of that would have
+       silently discarded an entire Diwali session.
+
+       `nanos_in_any_open_window(ist_nanos, muhurat_active)` is the pure
+       predicate; `row_is_in_an_open_window` is the global-reading wrapper the
+       three writers call. `verdict` is split the same way — a pure
+       `verdict_in(ts, rx, muhurat_active)` plus a wrapper — so no test
+       depends on the boot `OnceLock`. Both constants leave the dead-const
+       allowlist in the same change. Four tests pin it, including that the two
+       windows never overlap (so a row is never ambiguous) and that the flag
+       only ever WIDENS the accepted set.
+
+  - **One claim in this item was too broad and is corrected.** "A late closing
+    print is kept" is true of `ticks` and FALSE of candles. The candle gate
+    reads the bucket-open instant, but the FOLD chooses that bucket via
+    `tf_index::fold_clock_ist_secs`, which prefers the RECEIPT stamp within
+    ±300 s. So a 15:39:30 exchange print delivered at 15:40:05 lands in
+    `ticks` and is absent from the 15:39 bar — the two paths disagree, by
+    design of two different clocks. Reconciling them is W1b/W2, which is
+    blocked. Recorded here rather than repaired, and the table in
+    `session_window.rs` now shows both clocks side by side.
+
+  - **The candle gate cannot fire today, and says so.** `bucket_start` clamps
+    to `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:00) and the fold's own window
+    is byte-identical to the persist window, so no reachable input produces an
+    out-of-window candle row. It is defence in depth across a crate boundary —
+    the writer is a public API that cannot see the fold's invariants — not
+    enforcement, and the source records that distinction rather than letting a
+    future reader believe a counter at zero is proof of anything.
+
+## Scenarios
+
+| # | Scenario | Expected |
+|---|---|---|
+| 1 | Normal session, no spill | Candles identical to today (measured: 0 of 83,871 ticks change bucket) |
+| 2 | Disk saturates, frames spill and replay | Ticks land in their ORIGINAL minute, not at 18:00/20:00/05:00 |
+| 3 | Boot replays yesterday's WAL | Bars stamped yesterday; late policy decides; counted |
+| 4 | Equity with no pre-open print | No rows 09:00–09:14; one bar at the auction print |
+| 5 | Index from 09:00 | Full coverage across every emitted timeframe |
+| 6 | Stock with a zero previous close | Percentages stay 0.0; refusal counted; no NaN |
+| 7 | Quiet day, ATM does not drift | Re-fit sends nothing, 375 times |
+| 8 | Stock gaps 15% intraday | Re-fit adds ~6 strikes, inside cap and inside slot headroom |
+| 9 | Slot ceiling reached | Re-fit stops adding, counts, logs; existing subscriptions unaffected |
+| 10 | W2 merged without W1 | Blocked by the ordering gate; if forced, scenario 2 regresses to the measured 8.8% loss |
+
+---
+
+## Per-Item Guarantee Matrix
+
+Per `.claude/rules/project/per-wave-guarantee-matrix.md`. Applies to every
+workstream W1–W5 in this plan.
+
+### 15-row "100% everything" matrix
+
+| Demand | Proof artefact for THIS plan | Status |
+|---|---|---|
+| 100% code coverage | `quality/crate-coverage-thresholds.toml` per-crate floors; coverage delta ≥ 0 on the PR | enforced by CI |
+| 100% audit coverage | WAL replay outcome counters + the coded rollback error (W1); `rest_fetch_audit` unchanged | W1 partial |
+| 100% testing coverage | T1–T16 in the Test Plan above; the 22 categories apply to storage/core/trading/app | 6 of 16 written |
+| 100% code checks | banned-pattern, pub-fn-test, pub-fn-wiring, plan-verify, secret-scan, fmt, clippy | green |
+| 100% code performance | DHAT zero-alloc on the fold (T16); the TVW3 append adds 8 bytes on an already-moved struct, no allocation | T16 pending |
+| 100% monitoring | the 7 counters in Observability above | 2 of 7 written |
+| 100% logging | every refusal path carries `code = ErrorCode::…`; the rollback path gains one (W1 defect 2) | in progress |
+| 100% alerting | deliberately NOT bundled — a new pager needs its own dated authorization under the noise lock | stated, not built |
+| 100% security | no secret touches this path; the WAL carries frame bytes only | n/a |
+| 100% security hardening | the receipt is banded like the exchange timestamp (W1 defect 4), so a corrupt value cannot become a designated timestamp | in progress |
+| 100% bugs fixing | adversarial agent pass run BEFORE the code shipped; 2 CRITICAL + 1 MEDIUM found in my own TVW3 work and being fixed | done, fixes in progress |
+| 100% scenarios covering | 10 scenarios in the Scenarios table; rollback added as #11 | in progress |
+| 100% functionalities covering | every new pub fn has a test or a TEST-EXEMPT naming a real test (verified: both named tests now exist and pass) | done for W1 |
+| 100% code review | adversarial pass before impl (done) and after the diff (pending) | half |
+| 100% extreme check | bite-proofs: 3 run on TVW3, each observed to FAIL with the fix reverted, then restored | done for W1 |
+
+### 7-row resilience matrix
+
+| Demand | Honest envelope for THIS plan | Per-item proof |
+|---|---|---|
+| Zero ticks lost | W1 makes replayed ticks land in their ORIGINAL minute instead of the replay minute. Bounded: it cannot recover a frame the WAL never received | T1, T5; bite-proven |
+| WS never disconnects | Untouched. W5 must not send subscribes on the reader task, because the keepalive is only emitted while it polls | T15 |
+| Never slow/locked/hanged | TVW3 adds 8 bytes and no allocation to the append; the extra clock read is on the caller, not this path | T16 (DHAT) |
+| QuestDB never fails | Untouched. The receipt reaches `received_at`, never the dedup key | existing dedup guard |
+| O(1) latency | Append O(1) zero-alloc; replay parse O(bytes), boot only; percentages O(1); the ATM re-fit is O(strikes)/minute OFF the drain — flagged, not claimed O(1) | stated honestly above |
+| Uniqueness + dedup | `received_at` is deliberately NOT in any DEDUP key — it is re-stamped on replay today, which is why it would create duplicate rows. W1 does not change that | `DEDUP_KEY_TICKS` unchanged |
+| Real-time proof | the 7 counters above; the three that can indicate a broken assumption go on the operator dashboard | 2 of 7 written |
+
+### Honest 100% claim
+
+100% inside the tested envelope, with ratcheted regression coverage: the TVW3
+record round-trips a caller-supplied receipt exactly, rejects a truncated v3
+tail without panicking, detects a receipt-byte flip by CRC, and accounts its own
+on-disk size — each bite-proven by reverting the fix and observing the guard
+fail. v1 and v2 segments still replay, with the sentinel rather than a
+synthesized timestamp. **NOT claimed:** that the receipt reaches the database —
+the two stamping sites are not yet wired, so on the box today every v3 record
+carries the sentinel; that a rollback to a pre-v3 binary is safe (it is not, and
+the fix is in this plan); or that any workstream beyond W1 exists in code.

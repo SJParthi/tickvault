@@ -36,6 +36,7 @@ mod i_p0_03_expired_contract_awareness {
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -68,6 +69,7 @@ mod i_p0_03_expired_contract_awareness {
             order_id: "TERM-1".to_owned(),
             correlation_id: "corr-term".to_owned(),
             security_id: 99999, // Could be an expired contract
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -106,6 +108,7 @@ mod i_p0_03_expired_contract_awareness {
                 order_id: format!("TERM-{:?}", status),
                 correlation_id: "corr-t".to_owned(),
                 security_id: 52432,
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
                 order_type: OrderType::Limit,
                 product_type: ProductType::Intraday,
@@ -327,8 +330,11 @@ mod oms_state_machine {
     fn parse_unknown_returns_none() {
         assert_eq!(parse_order_status("UNKNOWN"), None);
         assert_eq!(parse_order_status(""), None);
-        assert_eq!(parse_order_status("traded"), None); // case-sensitive
-        assert_eq!(parse_order_status("pending"), None);
+        // "traded" / "pending" were asserted None here (case-sensitive) until
+        // 2026-10-11; audit INP-7 made matching ignore ASCII case, because the
+        // vendor spells statuses in mixed case ("Cancelled").
+        assert_eq!(parse_order_status("traded"), Some(OrderStatus::Traded));
+        assert_eq!(parse_order_status("Pending"), Some(OrderStatus::Pending));
         assert_eq!(parse_order_status("FILLED"), None);
         assert_eq!(parse_order_status(" TRADED"), None); // leading whitespace
     }
@@ -352,6 +358,7 @@ mod oms_reconciliation {
             order_id: order_id.to_owned(),
             correlation_id: "corr-test".to_owned(),
             security_id: 100,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -1128,6 +1135,7 @@ mod oms_dry_run_gate {
         let mut oms = make_oms();
         let request = PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
@@ -1152,6 +1160,7 @@ mod oms_dry_run_gate {
         let mut oms = make_oms();
         let make_request = || PlaceOrderRequest {
             security_id: 52432,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Market,
             product_type: ProductType::Intraday,

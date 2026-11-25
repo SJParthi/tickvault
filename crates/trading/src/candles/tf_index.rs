@@ -23,6 +23,14 @@
 //! per-instrument `[Mutex<LiveCandleState>; TF_COUNT]`, the ILP
 //! `[Sender; TF_COUNT]` writer, the audit-table `timeframe` SYMBOL column)
 //! breaks silently.
+//!
+//! ⚠ **HISTORY — the set is NINE frames since 2026-09-19** (`TF_COUNT = 9`:
+//! `M1 M3 M5 M15 S1 S3 S5 M30 M60`, ordinals 0..=8; `D1` is gone and `10m`
+//! is a view over `candles_1m`). The "21 timeframes", "`candles_1d`" and
+//! "ordinals frozen at 1m…1d 0..=4" text above describes the C3 era; the
+//! ordinals were RENUMBERED on 2026-09-19 (see [`TF_COUNT`]). Since
+//! 2026-09-22 the set is TEN: `M10` was appended at ordinal 9 when the
+//! operator retired every view, and `candles_10m` became a real table.
 
 /// Number of timeframes the live candle engine derives. Pinned here so
 /// the per-instrument slot array and the storage-side sender array
@@ -54,13 +62,256 @@
 /// stale doc manufacturing a false finding (see the O(1) table in
 /// CLAUDE.md). The claim is retained above rather than deleted, per house
 /// convention, so the correction is auditable.
-pub const TF_COUNT: usize = 24;
+///
+/// ⚠ **BOTH blocks above are HISTORY: the set is NINE, not 24, since
+/// 2026-09-19.** Every second-scale frame they argue about except `S1`,
+/// `S3` and `S5` is gone, along with `D1` and `M2`, on the operator's
+/// directive (`websocket-connection-scope-lock.md`, "THE FOLD COLLAPSES TO
+/// NINE FRAMES"): *"dude these shodu lnot even be considered or derived or
+/// calcualted anywhere dude okay?Not written anywhere 2s 4s 6s 10s 15s 30s
+/// 2m 1d"*. The surviving nine are `M1 M3 M5 M15 S1 S3 S5 M30 M60`; `10m`
+/// stays a VIEW over `candles_1m` rather than a tenth fold frame.
+///
+/// ⚠ **SUPERSEDED 2026-09-22 — the set is TEN.** The operator ruled "NO
+/// VIEWS ANYWHERE" (*"why the fuck candle 10 m is a view bro it should be
+/// the real table right"*), so `M10` became a native fold frame, APPENDED at
+/// ordinal 9. Appending renumbers nothing, so the spill format stays at 4:
+/// a v4 record never carries ordinal 9, and ordinal 9 now decodes as `M10`
+/// rather than being refused. Record in `websocket-connection-scope-lock.md`
+/// "2026-09-22 (SECOND) — NO VIEWS ANYWHERE".
+///
+/// **Ordinals RENUMBERED with that change**, which is why
+/// `SEAL_SPILL_FORMAT_VERSION` moved 3 → 4 in the same commit: the spill
+/// record stores the frame as a raw ordinal byte, `S1` was 5 and is now 4,
+/// and a byte in range decodes silently into the wrong frame rather than
+/// failing. A record older than 4 is REFUSED rather than reinterpreted.
+///
+/// ⚠ **CHANGED 2026-10-22 (plan item 62) — the set is EIGHT.** `S3` and `S5`
+/// are removed (operator Quote 34, 2026-10-21: *"remvoe candles 3s and 5s"*;
+/// `websocket-connection-scope-lock.md` "2026-10-21 (EVENING) — CANDLES_3S,
+/// CANDLES_5S AND TOP_VOLUME ARE REMOVED"). The survivors are `M1 M3 M5 M15
+/// S1 M30 M60 M10` at ordinals 0..=7; `M30` moved 7 -> 5, `M60` 8 -> 6 and
+/// `M10` 9 -> 7, so `SEAL_SPILL_FORMAT_VERSION` moved 5 -> 6 and a version-5
+/// record is refused (kept on disk), never decoded into the wrong frame.
+pub const TF_COUNT: usize = 8;
 
 /// 09:15:00 IST expressed as seconds-of-day (`9*3600 + 15*60`).
 /// The NSE regular trading session opens at 09:15:00 — every candle
 /// bucket grid is anchored here so the first candle of every timeframe
 /// starts exactly at the market open.
+///
+/// **STILL LIVE after the 2026-08-28 grid move**, and the reason matters:
+/// the candle GRID now anchors at 09:00, but the question "which bar owns the
+/// exchange's official day open/high/low?" is still answered by the MARKET
+/// open. See `is_days_first_session_bucket` in `aggregator_cell.rs`.
 pub(crate) const MARKET_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// 09:00:00 IST expressed as seconds-of-day (`9*3600`).
+///
+/// **THE CANDLE GRID ANCHOR — deliberately NOT the market open.**
+///
+/// Added 2026-08-28 under the dated operator authorization in
+/// `websocket-connection-scope-lock.md` ("CANDLES FROM 09:00"). The NSE
+/// pre-open call auction runs 09:00-09:12 (order collection, then matching),
+/// and its equilibrium price IS the 09:15 open — the exchange does not
+/// discover a second one. Anchoring the candle grid at 09:15 therefore threw
+/// away the twelve minutes in which that price is actually formed, which is
+/// the one window where knowing the open EARLY has value: it is what makes an
+/// ATM +/-25 option window computable at 09:13 instead of guessed from
+/// yesterday's close.
+///
+/// **This is NOT `MARKET_OPEN_SECS_OF_DAY_IST` and must never be conflated
+/// with it.** That constant means "the exchange is open for trading" and
+/// still gates orders, risk, the day-OHLC tracker and every market-hours
+/// alarm window at 09:15. This one means "we are recording candles". The two
+/// answer different questions and the pin test below asserts BOTH values
+/// independently, plus the ordering between them, so neither can silently
+/// absorb the other.
+///
+/// Grid consequence, stated because it is a real behavioural change and not
+/// a no-op. The offset between the two anchors is 900 s, so a frame's grid
+/// is UNCHANGED exactly when `900 % seconds_per_bucket == 0`. **NINE of the
+/// 24 frames move, not three** — an earlier draft of this comment said
+/// "2m/30m/60m" and was wrong by omission, which is worth recording because
+/// the omitted one is the loudest:
+///
+/// | moves | why |
+/// |---|---|
+/// | **D1 (86_400 s)** | `bucket_start` returns `session_open` for the daily bar, so **every daily candle's `ts` moves 09:15 -> 09:00** |
+/// | 2m (120), 30m (1800), 60m (3600) | 900 is not a multiple of any of them |
+/// | 7s, 8s, 11s, 13s, 14s | live — see the correction below |
+///
+/// **CORRECTED before this shipped:** the row above first read "GDF-gated,
+/// zero rows today — latent, not live". That is true of the `spot_bar_store`
+/// RAM rings, which allocate capacity-1 placeholders for second-scale frames,
+/// and it is FALSE of the candle tables. `AggregatorCell` folds `TfIndex::ALL`
+/// with no `is_second_scale` filter, so all 24 frames write real
+/// `candles_<tf>` rows on the live Dhan lane. Those five grids therefore move
+/// for real, not latently. The distinction matters because "latent" is how a
+/// reader decides not to check something.
+///
+/// Unchanged: 1s, 2s, 3s, 5s, 6s, 9s, 10s, 12s, 15s, 20s, 30s, 1m, 3m, 5m,
+/// 15m (900 divides all of them).
+///
+/// Clock-aligned is the more conventional answer and is what every external
+/// chart shows, but it IS a change, and it is why this must land BEFORE a
+/// session opens rather than during one.
+///
+/// **THREE CONSEQUENCES BEYOND THE GRID, found by an adversarial boundary
+/// sweep and disclosed rather than discovered later.**
+///
+/// 1. **D1/M30/M60 high and low now include pre-open auction prints.** Those
+///    buckets SPAN 09:00-09:15, so the fold widens their range with auction
+///    LTPs, which can sit outside the exchange's regular-session day high/low.
+///    The `day_ohlc_tracker` stays 09:15-gated (2026-08-25 scope lock), so the
+///    D1 candle and the day-OHLC tracker CAN now legitimately disagree on high
+///    and low. Both are correct for their own question; anything comparing
+///    them must not treat the difference as an error.
+/// 2. **Pre-open bars persist `open_pct = 0.0`.** `session_open` is the
+///    exchange's `day_open`, which is 0 during the auction because no trade
+///    has printed, and `pct_change` correctly refuses a non-positive baseline.
+///    So ~15 bars per instrument per day carry a zero that means "no session
+///    open exists yet" but is indistinguishable from "flat". Semantically
+///    right, and worth knowing before reading a pre-open chart.
+/// 3. **A counter changes shape.** Roughly 400,000 ticks per session move
+///    from `refused(out_of_session)` to `folded`. Any baseline or alarm
+///    threshold derived from that counter's historical value is now measuring
+///    a different population.
+///
+/// A fourth, and it is a PRE-EXISTING hole this change WIDENS rather than
+/// creates. `WsFrameSpill::replay_all` is not day-scoped, and at replay time
+/// the aggregator's watermark is 0 — so the stale-trading-day gate
+/// (`exchange_timestamp / 86_400 < watermark / 86_400`) always passes on the
+/// first replayed frame. A stale frame therefore reaches the SESSION gate as
+/// its only remaining defence. Previously a stale frame stamped in
+/// [09:00, 09:15) was refused there; now it folds and opens a bucket dated on
+/// a closed day. The exposure grows from 22,500 s of the day to 23,400 s —
+/// about 4% wider, on a hole that already existed for the other 22,500. Not
+/// introduced here, not fixed here, and recorded so it is not rediscovered as
+/// new: the real fix is day-scoping the replay or seeding the watermark from
+/// the staged frames, both outside this change.
+///
+/// One more, recorded because it is correct only by arithmetic coincidence:
+/// `tf_consistency_boot::is_on_grid` re-anchors to 09:00 and therefore
+/// re-classifies rows written on the OLD grid. It survives because that
+/// verifier covers M3/M5/M15 only, and 900 divides all three. Adding any
+/// frame where `900 % S != 0` to it — M2, M30, M60 — would make every
+/// historical row report `OffGridTs`.
+///
+/// **The mid-session hazard, precisely.** The `candles_<tf>` DEDUP key is
+/// `(ts, security_id, segment, feed)` — it carries no grid identity. So a
+/// restart onto the new grid mid-session does NOT collide and does NOT gap:
+/// it leaves BOTH rows. A 10:20 restart on 30m keeps the old complete
+/// `ts=09:45` bar and adds a new `ts=10:00` bar holding only 10:20-10:30.
+/// Nothing detects this — `tf_consistency` recomputes M3/M5/M15, which are
+/// exactly the frames whose grids did NOT move. That is a process control,
+/// not a mechanism, and it is stated plainly rather than implied: deploy this
+/// between sessions.
+///
+/// **⚠ REVERSED 2026-10-05 — the grid is back on the MARKET OPEN (09:15).**
+/// Operator: "only startin g 9.15 am timestamps aloen only shodul be
+/// considered … why are you even considering this pre open auction price".
+/// The pre-open bar was the 09:15 bar's predecessor, so the 09:15 bar was
+/// signed against the auction price (ADANIENT: −51,051 stored where the
+/// broker's chart shows +45.81K). Ticks before 09:15 are refused by the fold
+/// again (`out_of_session`); the raw `ticks` rows are still written, because
+/// tick persistence has no window gate. The value now EQUALS
+/// [`MARKET_OPEN_SECS_OF_DAY_IST`]; the two names stay separate so a future
+/// grid change touches one constant. Everything above describes the
+/// 2026-08-28 to 2026-10-05 grid and is kept as history.
+pub(crate) const CANDLE_SESSION_OPEN_SECS_OF_DAY_IST: u32 = 33_300;
+
+/// IST is UTC+05:30. A receipt instant is UTC; `exchange_timestamp` is
+/// already IST (never add the offset to it — see `data-integrity.md`).
+///
+/// Retained after the 2026-09-18 ts-bucketing directive because the two
+/// clock-INDEPENDENT day gates in `multi_tf_aggregator` still compare the
+/// fold day against the RECEIPT day, and that comparison needs the offset.
+pub(crate) const IST_UTC_OFFSET_SECS: i64 = 19_800;
+
+/// The clock the candle grid buckets on: **the exchange stamp, and nothing
+/// else**.
+///
+/// # The directive
+///
+/// Operator, 2026-09-18: *"as of now to set the rpecise ohlcv we used the
+/// recived at right dude but now we have a catch bro which is see we need to
+/// use this ts dude nowhere hereafetr we hsodu luse received at to define our
+/// ohlcv dude okay? our only apporach si to use this ts to set our ohlcv
+/// everyhwere dude okay even volume also ddue okay?"* — recorded with its
+/// full contract in `websocket-connection-scope-lock.md`, section
+/// "2026-09-18 (SECOND) — OHLCV AND VOLUME BUCKET ON THE EXCHANGE `ts`".
+///
+/// This REVERSES the 2026-08-28 receipt-clock directive, which the same rule
+/// file records as itself a reversal of a measurement. The measurement is
+/// what decided it, and it is worth restating because it argues FOR this
+/// change rather than merely permitting it — production, 2026-08-27, NIFTY:
+///
+/// | | exchange clock (`ts`) | receipt clock |
+/// |---|---|---|
+/// | session minutes present | **385 / 385** | 351 / 385 |
+/// | bars matching the vendor's own tape | **382 (99.2%)** | 321 (83.4%) |
+/// | phantom bars outside market hours | **0** | 4 |
+/// | ticks filed on the WRONG DAY | **0** | 4,319 |
+/// | ticks that would change MINUTE on the LIVE path | — | **0 of 83,871** |
+///
+/// # What this function no longer does, stated exactly
+///
+/// Until 2026-09-18 this was a DELTA-BOUNDED HYBRID: it preferred the receipt
+/// when the receipt sat within `[-10 s, +300 s]` of the trade stamp, and fell
+/// back to the trade stamp outside that band. So a dormant snapshot, a
+/// replayed WAL frame, a clock step and a UTC/IST mix-up ALREADY bucketed on
+/// `ts`; the only population the hybrid moved was a live tick whose delivery
+/// lag crossed a bucket boundary.
+///
+/// **That correction is what this directive deletes, and nothing else.** The
+/// last row of the table above is the measured size of it on the live path:
+/// zero of 83,871 ticks changed minute, because Dhan stamps whole seconds and
+/// we receive inside the same second. The population it genuinely moved is a
+/// trade printed at 09:29:59 and delivered at 09:30:01, which the hybrid filed
+/// into 09:30 and this files into 09:29 — the bar the exchange says it belongs
+/// to, and the bar the vendor's own tape puts it in.
+///
+/// # What this REPAIRS, which is larger than what it costs
+///
+/// The tick writer's session gate (`session_window::classify`) has always
+/// keyed on the exchange stamp alone. The fold keyed on the hybrid. So for a
+/// band of prints — an exchange stamp inside the window with a receipt past
+/// it, and its converse — a tick was written to `ticks` and absent from every
+/// candle, or folded into a candle while the row was refused. That divergence
+/// is recorded at length in `session_window.rs` and is now **structurally
+/// impossible**: both paths read one clock.
+///
+/// # What still reads the RECEIPT, deliberately
+///
+/// - `ws_lag_ms` measures exchange-versus-receipt. Folding one into the other
+///   makes it identically zero, which is why
+///   `crates/app/tests/ws_lag_clock_guard.rs` exists and why this function
+///   cannot be handed a receipt at all any more — the signature is the guard.
+/// - The two day gates in `MultiTfAggregator::consume_tick`
+///   (`stale_trading_day` / `future_trading_day`) compare the fold day against
+///   the RECEIPT day. They are UNCHANGED: their question is "is the vendor's
+///   stamp from a different trading day than the one we are living in", which
+///   needs both clocks by construction.
+/// - `received_at` remains a stored column on every tick row.
+///
+/// # Why this is still a function and not an inlined field read
+///
+/// It is the ONE named site that answers "which clock buckets a candle". A
+/// bare `tick.exchange_timestamp` at fourteen call sites answers it fourteen
+/// times, and the next directive would have to find all fourteen. The
+/// single-argument signature is itself the mechanical guarantee: a receipt
+/// cannot reach the fold clock, because there is nowhere to put it.
+///
+/// # Complexity
+///
+/// O(1) time, O(1) space, zero allocation, zero branches — the identity, which
+/// the optimiser removes entirely. Safe to call per tick and per timeframe.
+#[inline]
+#[must_use]
+pub const fn fold_clock_ist_secs(exchange_timestamp: u32) -> u32 {
+    exchange_timestamp
+}
 
 /// 15:30:00 IST expressed as seconds-of-day (`15*3600 + 30*60`).
 /// The NSE regular session closes at 15:30:00 — the candle window is
@@ -93,115 +344,78 @@ pub enum TfIndex {
     M5 = 2,
     /// 15-minute candles (900 s).
     M15 = 3,
-    /// 1-day candles (86_400 s — UTC-aligned arithmetic; the
-    /// IST-midnight rollover task force-seals open bars at IST 00:00
-    /// every trading day so the UTC boundary does not produce stale
-    /// candles in practice).
-    D1 = 4,
-    // -- Second-scale frames (C3, operator directive 2026-07-21) ------
-    // APPENDED after D1 so every pre-existing seal-spill ordinal
-    // (0..=4) stays byte-stable (SEAL_SPILL_FORMAT_VERSION stays 1).
-    // WAS "STRUCTURAL ONLY: all 16 frames are GDF-feed-gated — ZERO rows
-    // until the GDF 1s live feed lands (separate lane)". CORRECTED
-    // 2026-08-19: the Dhan live lane was revived (2026-08-09) and switched
-    // on (2026-08-11), and the fold has no feed gate, so these frames carry
-    // real rows today. The REST 1m cadence fold half of that sentence still
-    // holds — a 1-minute vendor bar cannot open a sub-minute bucket.
+    // -- The three surviving second-scale frames ----------------------
+    // Sixteen second-scale frames were appended here on 2026-07-21 and
+    // fifteen of them — plus `D1` at the old ordinal 4 and `M2` at 21 —
+    // were REMOVED on 2026-09-19 by the operator's nine-frame directive
+    // (`websocket-connection-scope-lock.md`, "THE FOLD COLLAPSES TO NINE
+    // FRAMES"). The removal is what forced the ordinal renumbering below
+    // and the SEAL_SPILL_FORMAT_VERSION 3 -> 4 bump that goes with it:
+    // `S1` was ordinal 5 and is now 4, so an old spill record replayed
+    // against this table would decode into the WRONG frame silently.
     /// 1-second candles (1 s). Live on the Dhan tick lane since 2026-08-11.
-    S1 = 5,
-    /// 2-second candles (2 s). Live on the Dhan tick lane since 2026-08-11.
-    S2 = 6,
-    /// 3-second candles (3 s). Live on the Dhan tick lane since 2026-08-11.
-    S3 = 7,
-    /// 4-second candles (4 s). Live on the Dhan tick lane since 2026-08-11.
-    S4 = 8,
-    /// 5-second candles (5 s). Live on the Dhan tick lane since 2026-08-11.
-    S5 = 9,
-    /// 6-second candles (6 s). Live on the Dhan tick lane since 2026-08-11.
-    S6 = 10,
-    /// 7-second candles (7 s). Live on the Dhan tick lane since 2026-08-11.
-    S7 = 11,
-    /// 8-second candles (8 s). Live on the Dhan tick lane since 2026-08-11.
-    S8 = 12,
-    /// 9-second candles (9 s). Live on the Dhan tick lane since 2026-08-11.
-    S9 = 13,
-    /// 10-second candles (10 s). Live on the Dhan tick lane since 2026-08-11.
-    S10 = 14,
-    /// 11-second candles (11 s). Live on the Dhan tick lane since 2026-08-11.
-    S11 = 15,
-    /// 12-second candles (12 s). Live on the Dhan tick lane since 2026-08-11.
-    S12 = 16,
-    /// 13-second candles (13 s). Live on the Dhan tick lane since 2026-08-11.
-    S13 = 17,
-    /// 14-second candles (14 s). Live on the Dhan tick lane since 2026-08-11.
-    S14 = 18,
-    /// 15-second candles (15 s). Live on the Dhan tick lane since 2026-08-11.
-    S15 = 19,
-    /// 30-second candles (30 s). Live on the Dhan tick lane since 2026-08-11.
-    S30 = 20,
-    // -- Minute frames completing the operator's 13-frame set ---------
-    // APPENDED after S30 (2026-08-10) so every pre-existing ordinal
-    // (0..=20) stays byte-stable and SEAL_SPILL_FORMAT_VERSION stays 1.
-    //
-    // WHY these three and not others: operator Quote 13 (2026-08-08,
-    // `daily-universe-scope-expansion-2026-05-27.md` §0) specifies
-    // thirteen current-day timeframes — 1s/5s/10s/15s/30s, then
-    // 1m/2m/3m/5m/15m/30m/60m, then 1d. Ten of the thirteen already
-    // existed; M2, M30 and M60 did NOT, so three of the frames the
-    // r8g.xlarge upgrade was bought to serve were literally
-    // unrepresentable. These are the missing three.
-    //
-    // Unlike the second-scale block above, these are NOT structural
-    // placeholders: the minute-scale frames are derivable from the
-    // existing tick and REST-fold paths the moment a producer exists.
-    /// 2-minute candles (120 s).
-    M2 = 21,
+    S1 = 4,
+    // `S3` (was 5) and `S5` (was 6) were REMOVED on 2026-10-22 (plan item 62,
+    // operator Quote 34: "remvoe candles 3s and 5s"). Every frame after them
+    // renumbered (M30 7 -> 5, M60 8 -> 6, M10 9 -> 7), which is why
+    // `SEAL_SPILL_FORMAT_VERSION` moved 5 -> 6 in the same change.
+    // -- The two surviving appended minute frames ---------------------
     /// 30-minute candles (1_800 s).
-    M30 = 22,
-    /// 60-minute candles (3_600 s). NOTE the 09:15 IST session anchor
-    /// means the final 60m bucket of a regular session is PARTIAL —
-    /// the grid runs 09:15/10:15/…/15:15, so the last bar covers
-    /// 15:15–15:30 (15 minutes), not a full hour. Same for M30's
-    /// 15:15–15:30 bucket. That is a property of anchoring to the open
-    /// rather than to the hour, and it is deliberate: a bar that starts
-    /// at the open is comparable across days, one that starts at 09:00
-    /// is not.
-    M60 = 23,
+    M30 = 5,
+    /// 60-minute candles (3_600 s). The grid is anchored at the CANDLE
+    /// session open, `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = **09:00 IST**
+    /// (see [`Self::bucket_start`]), so it runs 09:00/10:00/…/15:00. The
+    /// first bar therefore includes the 09:00–09:15 pre-open auction, and
+    /// the last bar of a regular session holds only 15:00–15:30 of trading,
+    /// not a full hour. M30 runs 09:00/09:30/…, so its 15:00 bar is full.
+    ///
+    /// ⚠ CORRECTED 2026-09-22: this doc said the grid was anchored at 09:15
+    /// and ran 09:15/10:15/…/15:15. The code has anchored at 09:00 since the
+    /// 2026-08-28 pre-open directive; only this comment still described the
+    /// old grid.
+    M60 = 6,
+    /// 10-minute candles (600 s). **APPENDED 2026-09-22** at the END of the
+    /// ordinal range (operator: *"why the fuck candle 10 m is a view bro it
+    /// should be the real table right"* — `websocket-connection-scope-lock.md`,
+    /// "NO VIEWS ANYWHERE"). Until then `candles_10m` was a VIEW over
+    /// `candles_1m`.
+    ///
+    /// It is appended rather than inserted beside the other minute frames on
+    /// purpose: the seal spill stores the frame as a raw ordinal byte, so an
+    /// append leaves every record already on disk decoding to the frame it was
+    /// written for, and no spill-format bump is needed. Inserting it would
+    /// renumber `S1`..`M60` and silently misfile every rescued bar.
+    ///
+    /// Grid: anchored at the 09:00 candle session open like `M30`/`M60`, so it
+    /// runs 09:00, 09:10, … 15:20; the regular session's last 10m bar is
+    /// `[15:20, 15:30)`.
+    M10 = 7,
 }
 
 impl TfIndex {
-    /// All 21 timeframes in ORDINAL (seal-spill append) order: the 5
-    /// legacy frames (1m/3m/5m/15m/1d) first, then the 16 GDF-gated
-    /// second-scale frames (1s..15s, 30s) appended by C3 — so the
-    /// array is deliberately NOT globally seconds-ascending. The index
-    /// of each entry equals its [`Self::as_ordinal`] value, which the
-    /// hot-path `[Mutex<LiveCandleState>; TF_COUNT]` array indexing
-    /// relies on.
+    /// All TEN timeframes in ORDINAL order: the 4 minute frames that
+    /// have held ordinals 0..=3 since the beginning, then the 3 surviving
+    /// second-scale frames, then M30 and M60, then M10 (appended
+    /// 2026-09-22) — so the array is
+    /// deliberately NOT globally seconds-ascending. The index of each
+    /// entry equals its [`Self::as_ordinal`] value, which the hot-path
+    /// `[Mutex<LiveCandleState>; TF_COUNT]` array indexing relies on.
+    ///
+    /// 2026-09-19: was 24 entries. `M1`..`M15` kept their ordinals; every
+    /// other survivor renumbered, because `ALL` is indexed BY ordinal and
+    /// [`Self::from_ordinal`] is its inverse, so the ordinals must stay
+    /// contiguous `0..TF_COUNT`. There is no arrangement that removes the
+    /// old ordinal 4 and leaves the rest where they were — which is
+    /// exactly why the spill format version moved with it.
     pub const ALL: [TfIndex; TF_COUNT] = [
         TfIndex::M1,
         TfIndex::M3,
         TfIndex::M5,
         TfIndex::M15,
-        TfIndex::D1,
         TfIndex::S1,
-        TfIndex::S2,
-        TfIndex::S3,
-        TfIndex::S4,
-        TfIndex::S5,
-        TfIndex::S6,
-        TfIndex::S7,
-        TfIndex::S8,
-        TfIndex::S9,
-        TfIndex::S10,
-        TfIndex::S11,
-        TfIndex::S12,
-        TfIndex::S13,
-        TfIndex::S14,
-        TfIndex::S15,
-        TfIndex::S30,
-        TfIndex::M2,
         TfIndex::M30,
         TfIndex::M60,
+        TfIndex::M10,
     ];
 
     /// Returns the ordinal (`0..TF_COUNT`) used to index the
@@ -225,26 +439,10 @@ impl TfIndex {
             1 => Some(Self::M3),
             2 => Some(Self::M5),
             3 => Some(Self::M15),
-            4 => Some(Self::D1),
-            5 => Some(Self::S1),
-            6 => Some(Self::S2),
-            7 => Some(Self::S3),
-            8 => Some(Self::S4),
-            9 => Some(Self::S5),
-            10 => Some(Self::S6),
-            11 => Some(Self::S7),
-            12 => Some(Self::S8),
-            13 => Some(Self::S9),
-            14 => Some(Self::S10),
-            15 => Some(Self::S11),
-            16 => Some(Self::S12),
-            17 => Some(Self::S13),
-            18 => Some(Self::S14),
-            19 => Some(Self::S15),
-            20 => Some(Self::S30),
-            21 => Some(Self::M2),
-            22 => Some(Self::M30),
-            23 => Some(Self::M60),
+            4 => Some(Self::S1),
+            5 => Some(Self::M30),
+            6 => Some(Self::M60),
+            7 => Some(Self::M10),
             _ => None,
         }
     }
@@ -260,26 +458,10 @@ impl TfIndex {
             Self::M3 => "candles_3m",
             Self::M5 => "candles_5m",
             Self::M15 => "candles_15m",
-            Self::D1 => "candles_1d",
             Self::S1 => "candles_1s",
-            Self::S2 => "candles_2s",
-            Self::S3 => "candles_3s",
-            Self::S4 => "candles_4s",
-            Self::S5 => "candles_5s",
-            Self::S6 => "candles_6s",
-            Self::S7 => "candles_7s",
-            Self::S8 => "candles_8s",
-            Self::S9 => "candles_9s",
-            Self::S10 => "candles_10s",
-            Self::S11 => "candles_11s",
-            Self::S12 => "candles_12s",
-            Self::S13 => "candles_13s",
-            Self::S14 => "candles_14s",
-            Self::S15 => "candles_15s",
-            Self::S30 => "candles_30s",
-            Self::M2 => "candles_2m",
             Self::M30 => "candles_30m",
             Self::M60 => "candles_60m",
+            Self::M10 => "candles_10m",
         }
     }
 
@@ -313,95 +495,21 @@ impl TfIndex {
             Self::M3 => 180,
             Self::M5 => 300,
             Self::M15 => 900,
-            Self::D1 => 86_400,
             Self::S1 => 1,
-            Self::S2 => 2,
-            Self::S3 => 3,
-            Self::S4 => 4,
-            Self::S5 => 5,
-            Self::S6 => 6,
-            Self::S7 => 7,
-            Self::S8 => 8,
-            Self::S9 => 9,
-            Self::S10 => 10,
-            Self::S11 => 11,
-            Self::S12 => 12,
-            Self::S13 => 13,
-            Self::S14 => 14,
-            Self::S15 => 15,
-            Self::S30 => 30,
-            Self::M2 => 120,
             Self::M30 => 1_800,
             Self::M60 => 3_600,
+            Self::M10 => 600,
         }
     }
 
-    /// True for the 16 GDF-gated second-scale frames (bucket < 60 s:
-    /// 1s..=15s + 30s). These frames are STRUCTURAL until the GDF 1s live
-    /// feed lands (separate lane) — ZERO rows are written today, the REST
-    /// 1m cadence folds only the 5-frame minute/day set, and the RAM store
-    /// allocates them as capacity-1 placeholders (never full session rings).
+    /// True for the second-scale frames (bucket < 60 s). Since 2026-09-19 that
+    /// is THREE — `S1`, `S3`, `S5` — and all three EMIT rows from the live
+    /// Dhan fold. (Until 2026-09-22 this doc said "the 16 GDF-gated frames …
+    /// ZERO rows are written today", which described the 24-frame era.)
     #[inline]
     #[must_use]
     pub const fn is_second_scale(self) -> bool {
         self.seconds_per_bucket() < 60
-    }
-
-    /// True for the THIRTEEN timeframes the operator actually asked for.
-    ///
-    /// Operator, 2026-08-08 (verbatim, typos preserved — the same quote the
-    /// r8g.xlarge was sized against, `daily-universe-scope-expansion` Quote 13):
-    ///
-    /// > "current day ticks secodns multiple seocdns tiemframes liek 1 seocnd
-    /// > 5 seconds 10 15 30 seocnds dude nad then even mintue level tiemframes
-    /// > liek 1,2,3,5,15,30,60 and 1 dya also"
-    ///
-    /// That is `S1 S5 S10 S15 S30` + `M1 M2 M3 M5 M15 M30 M60` + `D1` = 13.
-    ///
-    /// # Why this exists
-    ///
-    /// The enum carries **24** variants, so **eleven** second-scale frames —
-    /// `S2 S3 S4 S6 S7 S8 S9 S11 S12 S13 S14` — are neither requested nor used
-    /// by anything. Before this gate the live lane sealed all 24 on every fold,
-    /// so those eleven wrote rows to disk every bucket, for nobody.
-    ///
-    /// The plan item that flagged this proposed gating **all sixteen**
-    /// second-scale frames off, citing the disk cost. That would have been
-    /// wrong in the opposite direction: it deletes `S1 S5 S10 S15 S30`, which
-    /// are five of the thirteen the operator explicitly requested and the
-    /// reason the 32 GiB instance was bought. Gating exactly the eleven
-    /// unrequested frames removes most of the cost while removing none of the
-    /// capability — the requirement and the disk concern were never actually
-    /// in conflict, only the two framings of the fix were.
-    ///
-    /// # Scope
-    ///
-    /// This gates ROW EMISSION, not folding. The aggregator still keeps its
-    /// `[_; TF_COUNT]` slots and ordinals, so nothing here changes the array
-    /// layout, the audit-table `timeframe` symbols, or ordinal decoding —
-    /// deleting variants would cascade through all of that for no benefit.
-    ///
-    /// Changing this set needs a fresh dated operator quote, exactly like the
-    /// constants it derives from; `tf_index_operator_set_is_thirteen` pins it.
-    #[inline]
-    #[must_use]
-    pub const fn is_operator_requested(self) -> bool {
-        matches!(
-            self,
-            Self::S1
-                | Self::S5
-                | Self::S10
-                | Self::S15
-                | Self::S30
-                | Self::M1
-                | Self::M2
-                | Self::M3
-                | Self::M5
-                | Self::M15
-                | Self::M30
-                | Self::M60
-                | Self::D1
-        )
     }
 
     /// Short display name (`"1m"`, `"3m"`, ..., `"1d"`). Stable across
@@ -414,38 +522,35 @@ impl TfIndex {
             Self::M3 => "3m",
             Self::M5 => "5m",
             Self::M15 => "15m",
-            Self::D1 => "1d",
             Self::S1 => "1s",
-            Self::S2 => "2s",
-            Self::S3 => "3s",
-            Self::S4 => "4s",
-            Self::S5 => "5s",
-            Self::S6 => "6s",
-            Self::S7 => "7s",
-            Self::S8 => "8s",
-            Self::S9 => "9s",
-            Self::S10 => "10s",
-            Self::S11 => "11s",
-            Self::S12 => "12s",
-            Self::S13 => "13s",
-            Self::S14 => "14s",
-            Self::S15 => "15s",
-            Self::S30 => "30s",
-            Self::M2 => "2m",
             Self::M30 => "30m",
             Self::M60 => "60m",
+            Self::M10 => "10m",
         }
     }
 
     /// Aligns a tick's IST-second timestamp to the start of its
     /// containing bucket for this timeframe.
     ///
-    /// Buckets are anchored to the **09:15:00 IST market open**, NOT to
-    /// the epoch — so every timeframe's first candle of the day starts
-    /// exactly at 09:15 (a 15m bucket is `[09:15,09:30)`; the first
-    /// bucket of every frame starts at the open). A tick at or
-    /// before the open anchors to the first bucket; the aggregator's
-    /// market-hours gate keeps genuine pre-open ticks out anyway.
+    /// Buckets are anchored to the **CANDLE SESSION open**,
+    /// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` = **09:00:00 IST**, NOT to the
+    /// epoch — so every timeframe's first candle of the day starts exactly at
+    /// 09:00 (a 15m bucket is `[09:00,09:15)`). A tick at or before that
+    /// anchor falls in the first bucket.
+    ///
+    /// ⚠ This paragraph read "the **09:15:00 IST market open** … a 15m bucket
+    /// is `[09:15,09:30)`" until 2026-09-18, and the two lines of code
+    /// immediately below it have anchored on 09:00 since the 2026-08-28
+    /// pre-open directive. The inline comment there recorded the move; this
+    /// doc block, which is what a reader and `cargo doc` actually see, did
+    /// not — so the function's own documentation contradicted its body for
+    /// three weeks, and it contradicted it about the exact quantity
+    /// (`ts` bucket boundaries) that decides which candle a tick lands in.
+    ///
+    /// The last sentence of the old text is also gone rather than reworded:
+    /// it said the market-hours gate "keeps genuine pre-open ticks out
+    /// anyway", which the same 2026-08-28 directive reversed — pre-open ticks
+    /// from 09:00 are now deliberately folded.
     ///
     /// `tick_ist_secs` MUST be the IST epoch second derived from the
     /// WS LTT field (NEVER `Utc::now()` per `data-integrity.md`).
@@ -470,13 +575,45 @@ impl TfIndex {
     #[inline]
     #[must_use]
     pub const fn bucket_start(self, tick_ist_secs: u32) -> u32 {
-        let secs = self.seconds_per_bucket();
-        let day_start = (tick_ist_secs / 86_400) * 86_400;
-        let market_open = day_start.saturating_add(MARKET_OPEN_SECS_OF_DAY_IST);
-        if tick_ist_secs <= market_open {
-            return market_open;
+        // One arm per frame, so each division below is by a COMPILE-TIME
+        // constant: the compiler turns it into a multiply and a shift instead
+        // of a hardware divide (about 25 cycles each on x86). The fold calls
+        // this several times per timeframe per tick (plan ITEM DT, 2026-10-30).
+        // The arithmetic is unchanged: `bucket_start_every` is the old body.
+        match self {
+            Self::M1 => bucket_start_every(tick_ist_secs, const { Self::M1.seconds_per_bucket() }),
+            Self::M3 => bucket_start_every(tick_ist_secs, const { Self::M3.seconds_per_bucket() }),
+            Self::M5 => bucket_start_every(tick_ist_secs, const { Self::M5.seconds_per_bucket() }),
+            Self::M15 => {
+                bucket_start_every(tick_ist_secs, const { Self::M15.seconds_per_bucket() })
+            }
+            Self::S1 => bucket_start_every(tick_ist_secs, const { Self::S1.seconds_per_bucket() }),
+            Self::M30 => {
+                bucket_start_every(tick_ist_secs, const { Self::M30.seconds_per_bucket() })
+            }
+            Self::M60 => {
+                bucket_start_every(tick_ist_secs, const { Self::M60.seconds_per_bucket() })
+            }
+            Self::M10 => {
+                bucket_start_every(tick_ist_secs, const { Self::M10.seconds_per_bucket() })
+            }
         }
-        market_open.saturating_add(((tick_ist_secs - market_open) / secs) * secs)
+    }
+
+    /// Start of the day's first SESSION bucket of this frame (the bucket that
+    /// holds the 09:15 market open), as seconds after 00:00 of the day.
+    ///
+    /// A per-frame constant, read from a table built at compile time from
+    /// [`Self::bucket_start`] itself, so it cannot disagree with the grid.
+    /// `aggregator_cell::is_days_first_session_bucket` adds it to a day start
+    /// instead of re-deriving the bucket per call (plan ITEM DT).
+    ///
+    /// # Complexity
+    /// O(1) — one array read.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn first_session_bucket_offset(self) -> u32 {
+        FIRST_SESSION_BUCKET_OFFSET[self.as_ordinal()]
     }
 
     /// Returns the (exclusive) bucket-end for a given bucket-start.
@@ -492,6 +629,38 @@ impl TfIndex {
     }
 }
 
+/// The body of [`TfIndex::bucket_start`] for one bucket width. Always
+/// inlined, so every caller passes a constant `secs` and the divide becomes
+/// a multiply. Saturating for the reasons on [`TfIndex::bucket_start`].
+#[inline(always)]
+const fn bucket_start_every(tick_ist_secs: u32, secs: u32) -> u32 {
+    let day_start = (tick_ist_secs / 86_400) * 86_400;
+    // 2026-08-28: anchored on the CANDLE session open (09:00), not the
+    // market open (09:15) — see CANDLE_SESSION_OPEN_SECS_OF_DAY_IST.
+    let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+    if tick_ist_secs <= session_open {
+        return session_open;
+    }
+    session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
+}
+
+/// Per frame, [`TfIndex::bucket_start`] of the 09:15 open on day 0, i.e. the
+/// offset from 00:00 of the bucket holding the market open. Built at compile
+/// time from the grid function itself. See
+/// [`TfIndex::first_session_bucket_offset`].
+const FIRST_SESSION_BUCKET_OFFSET: [u32; TF_COUNT] = {
+    let mut table = [0u32; TF_COUNT];
+    let mut ord = 0;
+    while ord < TF_COUNT {
+        table[ord] = match TfIndex::from_ordinal(ord) {
+            Some(tf) => tf.bucket_start(MARKET_OPEN_SECS_OF_DAY_IST),
+            None => 0,
+        };
+        ord += 1;
+    }
+    table
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -499,6 +668,58 @@ impl TfIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The directive, stated as an equality: the fold clock IS the exchange
+    /// stamp, and the receipt has no way to influence it.
+    ///
+    /// ## What this replaced (2026-09-18)
+    ///
+    /// Five tests pinned the delta-bounded hybrid: a live receipt one second
+    /// late winning the bucket, a nine-hour replay stamp falling back, the
+    /// `[-10 s, +300 s]` boundary on both sides, the absent-receipt sentinel,
+    /// and the UTC/IST mix-up failing closed. Every one of them pinned a
+    /// behaviour that no longer exists, and four of the five pinned a FALLBACK
+    /// that is now the only path — so they would have passed unchanged while
+    /// proving nothing. They are replaced rather than deleted, because a value
+    /// nothing pins is a value a refactor can change in silence.
+    #[test]
+    fn the_fold_clock_is_the_exchange_stamp_and_nothing_else() {
+        // The shapes the old hybrid treated differently, now all identical:
+        // an ordinary mid-session second, the second a live receipt would have
+        // moved (delivery lag across a minute boundary), a replayed frame's
+        // stamp, and the arithmetic extremes.
+        for exch in [
+            0_u32,
+            1,
+            1_779_362_677,       // ~11:24 IST, the old fixture
+            1_779_362_677 + 300, // the old lag bound
+            1_779_362_677 - 10,  // the old lead bound
+            u32::MAX,
+        ] {
+            assert_eq!(
+                fold_clock_ist_secs(exch),
+                exch,
+                "operator directive 2026-09-18: OHLCV and volume bucket on the \
+                 exchange `ts`. Any transformation here — a receipt, a clamp, \
+                 a blend — re-opens the `ticks`-versus-candle divergence that \
+                 `session_window.rs` records, because the tick writer's gate \
+                 reads the exchange stamp alone."
+            );
+        }
+    }
+
+    /// It is `const`, and that is load-bearing rather than decoration.
+    ///
+    /// A `const fn` cannot read a clock, cannot allocate, and cannot call a
+    /// non-const helper — so the compiler itself now refuses the entire class
+    /// of change this directive forbids. The identity is evaluated at compile
+    /// time wherever the stamp is known, and inlined to nothing where it is
+    /// not: O(1) is not a claim here, it is the absence of code.
+    #[test]
+    fn the_fold_clock_is_evaluated_at_compile_time() {
+        const FOLDED: u32 = fold_clock_ist_secs(1_779_362_677);
+        assert_eq!(FOLDED, 1_779_362_677);
+    }
 
     /// Session-constant drift pin (operator directive 2026-07-03): the
     /// trading-crate seconds-of-day session constants that gate the candle
@@ -513,6 +734,16 @@ mod tests {
         use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
 
         assert_eq!(MARKET_OPEN_SECS_OF_DAY_IST, 33_300, "09:15:00 IST");
+        // 2026-10-05: the candle grid is back on the market open (09:15);
+        // the 2026-08-28 pre-open window (09:00-09:15) is retired.
+        assert_eq!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, 33_300,
+            "09:15:00 IST - candles start at the market open, no pre-open bar"
+        );
+        assert_eq!(
+            CANDLE_SESSION_OPEN_SECS_OF_DAY_IST, MARKET_OPEN_SECS_OF_DAY_IST,
+            "no pre-open capture window"
+        );
         assert_eq!(
             MARKET_CLOSE_SECS_OF_DAY_IST, 56_400,
             "15:40:00 IST (exclusive) — NSE CAS change 2026-08-03"
@@ -530,38 +761,41 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_all_has_twenty_four_distinct_variants() {
+    fn test_tf_index_all_has_eight_distinct_variants() {
         let mut seen = std::collections::HashSet::new();
         for tf in TfIndex::ALL {
             assert!(seen.insert(tf), "duplicate variant in TfIndex::ALL: {tf:?}");
         }
         assert_eq!(TfIndex::ALL.len(), TF_COUNT);
-        assert_eq!(TF_COUNT, 24);
+        // 2026-10-22 (plan item 62): S3 and S5 removed, 10 -> 8.
+        assert_eq!(TF_COUNT, 8);
     }
 
-    /// C3 (2026-07-21): the 16 second-scale frames are APPENDED after
-    /// D1 so every pre-existing seal-spill ordinal (0..=4) stays
-    /// stable — `ALL` is therefore ordinal-ordered, NOT globally
-    /// seconds-ascending. This pin is strictly stronger than the old
-    /// ascending check: it pins the EXACT seconds sequence, and each
-    /// ordinal block stays strictly ascending within itself.
+    /// The ordinal sequence is NOT globally seconds-ascending, and since the
+    /// 2026-09-19 nine-frame collapse it is not two blocks either — it is
+    /// three: the original minute block `M1 M3 M5 M15`, the second-scale
+    /// survivors `S1 S3 S5` that C3 appended after it on 2026-07-21, and
+    /// `M30 M60` appended on 2026-08-10. The collapse removed fifteen frames
+    /// from the MIDDLE of that sequence and closed the gaps, so every
+    /// surviving ordinal above `M15` MOVED.
+    ///
+    /// This pin is the EXACT seconds sequence, and that is what makes such a
+    /// move fail the build: a round-trip test is structurally blind to a
+    /// renumbering, because `from_ordinal(n).as_ordinal() == n` holds under
+    /// ANY consistent table.
     #[test]
     fn test_tf_index_ordinal_order_pins_exact_seconds_sequence() {
         let secs: Vec<u32> = TfIndex::ALL
             .iter()
             .map(|tf| tf.seconds_per_bucket())
             .collect();
-        // Appended 2026-08-10: M2/M30/M60 (120/1800/3600) complete the
-        // operator's thirteen frames. They land at the END of the
-        // second-scale block, which keeps that block strictly ascending —
-        // the property the windows() check below relies on.
-        let expected: Vec<u32> = [60_u32, 180, 300, 900, 86_400]
-            .into_iter()
-            .chain(1..=15)
-            .chain([30, 120, 1_800, 3_600])
-            .collect();
+        // 2026-09-22: `M10` (600 s) APPENDED at ordinal 9 — a fourth block of
+        // one, since it sits after `M60` rather than inside the minute block.
+        // 2026-10-22 (plan item 62): `S3` and `S5` removed; the second-scale
+        // block is `S1` alone and everything after it moved down by two.
+        let expected: Vec<u32> = vec![60, 180, 300, 900, 1, 1_800, 3_600, 600];
         assert_eq!(secs, expected, "ordinal seconds sequence drifted");
-        for block in [&secs[..5], &secs[5..]] {
+        for block in [&secs[..4], &secs[4..5], &secs[5..7], &secs[7..]] {
             for window in block.windows(2) {
                 assert!(
                     window[0] < window[1],
@@ -604,46 +838,41 @@ mod tests {
     }
 
     #[test]
-    fn test_tf_index_ordinals_are_append_only_literal_pins() {
+    fn test_tf_index_ordinals_are_literal_pins() {
+        // RENAMED from `..._append_only_literal_pins` on 2026-09-19, because
+        // the append-only property it asserted is exactly what the nine-frame
+        // collapse broke. Fifteen frames were REMOVED from the middle of the
+        // table and the gaps closed, so `S1` moved 5 → 4, `S5` 9 → 6, `M30`
+        // 22 → 7 and `M60` 23 → 8. A byte already on disk therefore decodes
+        // into a DIFFERENT frame, silently — every retired ordinal is still IN
+        // RANGE for the nine-entry table, so refusal-past-the-end cannot catch
+        // it. That is why `SEAL_SPILL_FORMAT_VERSION` went 3 → 4 in the same
+        // change: the version refusal is the guarantee, and these literals are
+        // what stop the table moving again without one.
         assert_eq!(TfIndex::M1 as u8, 0);
         assert_eq!(TfIndex::M3 as u8, 1);
         assert_eq!(TfIndex::M5 as u8, 2);
         assert_eq!(TfIndex::M15 as u8, 3);
-        assert_eq!(TfIndex::D1 as u8, 4);
-        assert_eq!(TfIndex::S1 as u8, 5);
-        assert_eq!(TfIndex::S2 as u8, 6);
-        assert_eq!(TfIndex::S3 as u8, 7);
-        assert_eq!(TfIndex::S4 as u8, 8);
-        assert_eq!(TfIndex::S5 as u8, 9);
-        assert_eq!(TfIndex::S6 as u8, 10);
-        assert_eq!(TfIndex::S7 as u8, 11);
-        assert_eq!(TfIndex::S8 as u8, 12);
-        assert_eq!(TfIndex::S9 as u8, 13);
-        assert_eq!(TfIndex::S10 as u8, 14);
-        assert_eq!(TfIndex::S11 as u8, 15);
-        assert_eq!(TfIndex::S12 as u8, 16);
-        assert_eq!(TfIndex::S13 as u8, 17);
-        assert_eq!(TfIndex::S14 as u8, 18);
-        assert_eq!(TfIndex::S15 as u8, 19);
-        assert_eq!(TfIndex::S30 as u8, 20);
-        // Appended 2026-08-10 to complete the operator's thirteen frames
-        // (Quote 13). ADD NEW FRAMES BELOW THIS LINE ONLY — inserting one
-        // above silently re-maps every already-spilled ordinal.
-        assert_eq!(TfIndex::M2 as u8, 21);
-        assert_eq!(TfIndex::M30 as u8, 22);
-        assert_eq!(TfIndex::M60 as u8, 23);
-        // The pinned block above must cover EVERY variant: a new appended
-        // frame that nobody pinned would slip through otherwise.
+        assert_eq!(TfIndex::S1 as u8, 4);
+        // 2026-10-22 (plan item 62): `S3` (5) and `S5` (6) REMOVED, so M30
+        // 7 -> 5, M60 8 -> 6 and M10 9 -> 7, and SEAL_SPILL_FORMAT_VERSION
+        // moved 5 -> 6 with them.
+        assert_eq!(TfIndex::M30 as u8, 5);
+        assert_eq!(TfIndex::M60 as u8, 6);
+        assert_eq!(TfIndex::M10 as u8, 7);
+        // The pinned block above must cover EVERY variant: a frame added or
+        // removed without a pin here would slip through otherwise.
         assert_eq!(
-            TF_COUNT, 24,
-            "a frame was added — pin its literal ordinal above"
+            TF_COUNT, 8,
+            "a frame was added or removed — pin its literal ordinal above, \
+             and bump SEAL_SPILL_FORMAT_VERSION if any existing one moved"
         );
         // …and the seconds are pinned per-ordinal too, so a variant cannot be
         // re-pointed at a different bucket size while keeping its ordinal.
         assert_eq!(TfIndex::M1.seconds_per_bucket(), 60);
-        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
         assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
-        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+        assert_eq!(TfIndex::M10.seconds_per_bucket(), 600);
+        assert_eq!(TfIndex::M60.seconds_per_bucket(), 3_600);
     }
     #[test]
     fn test_tf_index_ordinal_round_trip() {
@@ -675,28 +904,13 @@ mod tests {
             "candles_3m",
             "candles_5m",
             "candles_15m",
-            "candles_1d",
+            // The second-scale block: 1s only since 2026-10-22 (plan item 62
+            // removed candles_3s and candles_5s).
             "candles_1s",
-            "candles_2s",
-            "candles_3s",
-            "candles_4s",
-            "candles_5s",
-            "candles_6s",
-            "candles_7s",
-            "candles_8s",
-            "candles_9s",
-            "candles_10s",
-            "candles_11s",
-            "candles_12s",
-            "candles_13s",
-            "candles_14s",
-            "candles_15s",
-            "candles_30s",
-            // Appended 2026-08-10 with M2/M30/M60 — the three frames of the
-            // operator's thirteen that previously had no enum variant.
-            "candles_2m",
             "candles_30m",
             "candles_60m",
+            // APPENDED 2026-09-22 (was a VIEW over candles_1m until then).
+            "candles_10m",
         ];
         assert_eq!(names, expected);
         // No `_shadow` suffix anywhere — these are first-class tables.
@@ -750,13 +964,16 @@ mod tests {
 
     #[test]
     fn test_tf_index_display_names_unique_and_stable() {
+        // The nine names in ORDINAL order (2026-09-19 collapse). The three
+        // blocks are the enum's own layout: the four legacy minute frames,
+        // then the second-scale frames, then the two long minute frames.
         let mut seen = std::collections::HashSet::new();
-        let expected = [
-            "1m", "3m", "5m", "15m", "1d", "1s", "2s", "3s", "4s", "5s", "6s", "7s", "8s", "9s",
-            "10s", "11s", "12s", "13s", "14s", "15s",
-            "30s", // Appended 2026-08-10 (operator Quote 13's thirteen frames).
-            "2m", "30m", "60m",
-        ];
+        let expected = ["1m", "3m", "5m", "15m", "1s", "30m", "60m", "10m"];
+        assert_eq!(
+            expected.len(),
+            TF_COUNT,
+            "the expected-name list must name every frame"
+        );
         for (idx, tf) in TfIndex::ALL.iter().enumerate() {
             let name = tf.display_name();
             assert_eq!(
@@ -773,49 +990,57 @@ mod tests {
         assert_eq!(TfIndex::M3.seconds_per_bucket(), 180);
         assert_eq!(TfIndex::M5.seconds_per_bucket(), 300);
         assert_eq!(TfIndex::M15.seconds_per_bucket(), 900);
-        assert_eq!(TfIndex::D1.seconds_per_bucket(), 86_400);
-        // Second-scale frames (C3): S1..S15 are 1..=15 s, S30 is 30 s.
-        for ord in 5..=19_usize {
-            let tf = TfIndex::from_ordinal(ord).expect("second-scale ordinal");
-            assert_eq!(
-                tf.seconds_per_bucket(),
-                u32::try_from(ord - 4).expect("fits"),
-                "S-frame seconds drifted at ordinal {ord}"
-            );
-        }
-        assert_eq!(TfIndex::S30.seconds_per_bucket(), 30);
+        assert_eq!(TfIndex::M30.seconds_per_bucket(), 1_800);
+        assert_eq!(TfIndex::M60.seconds_per_bucket(), 3_600);
+        assert_eq!(TfIndex::M10.seconds_per_bucket(), 600);
+        // The one surviving second-scale frame (2026-10-22, plan item 62).
+        assert_eq!(TfIndex::S1.seconds_per_bucket(), 1);
         // Every minute-class TF is a whole number of minutes.
-        for tf in [TfIndex::M1, TfIndex::M3, TfIndex::M5, TfIndex::M15] {
-            assert_eq!(tf.seconds_per_bucket() % 60, 0);
-        }
-    }
-
-    #[test]
-    fn test_tf_index_second_scale_gate_is_exactly_the_16_gdf_frames() {
-        // GDF-gate predicate: exactly the 16 sub-minute frames (S1..S15 +
-        // S30) are second-scale; the legacy 5-frame live set is NOT.
-        let second_scale: Vec<TfIndex> = TfIndex::ALL
-            .into_iter()
-            .filter(|tf| tf.is_second_scale())
-            .collect();
-        assert_eq!(second_scale.len(), 16, "second-scale frame count drifted");
         for tf in [
             TfIndex::M1,
             TfIndex::M3,
             TfIndex::M5,
             TfIndex::M15,
-            TfIndex::D1,
+            TfIndex::M30,
+            TfIndex::M60,
+            TfIndex::M10,
         ] {
-            assert!(!tf.is_second_scale(), "{tf:?} wrongly GDF-gated");
+            assert_eq!(tf.seconds_per_bucket() % 60, 0);
+        }
+    }
+
+    #[test]
+    fn test_tf_index_second_scale_gate_is_exactly_the_one_second_frame() {
+        // `is_second_scale` is a SECONDS predicate (`< 60`), never an
+        // ordinal range — which is why it survived the 2026-09-19 collapse
+        // untouched while the ordinals moved under it. Before the collapse
+        // this test named sixteen frames and asserted `as_ordinal() >= 5`;
+        // both were true of the 24-frame table and neither is true now
+        // (S1 is ordinal 4), so the assertion is stated as the SET instead.
+        let second_scale: Vec<TfIndex> = TfIndex::ALL
+            .into_iter()
+            .filter(|tf| tf.is_second_scale())
+            .collect();
+        assert_eq!(
+            second_scale,
+            vec![TfIndex::S1],
+            "the second-scale set is exactly 1s since 2026-10-22 (plan item 62)"
+        );
+        for tf in [
+            TfIndex::M1,
+            TfIndex::M3,
+            TfIndex::M5,
+            TfIndex::M15,
+            TfIndex::M30,
+            TfIndex::M60,
+            TfIndex::M10,
+        ] {
+            assert!(!tf.is_second_scale(), "{tf:?} wrongly reads as sub-minute");
         }
         for tf in second_scale {
             assert!(
                 tf.seconds_per_bucket() < 60,
                 "{tf:?} gated but not sub-minute"
-            );
-            assert!(
-                tf.as_ordinal() >= 5,
-                "{tf:?} gated frame in legacy ordinals"
             );
         }
     }
@@ -823,9 +1048,10 @@ mod tests {
     #[test]
     fn test_tf_index_bucket_start_aligns_to_seconds_per_bucket() {
         // An in-window IST tick (~11:24 IST). Buckets anchor to the
-        // 09:15:00 market open, NOT the epoch.
+        // 09:15:00 CANDLE session open (2026-10-05: back from 09:00), NOT
+        // the epoch.
         let tick = 1_779_362_677_u32;
-        let market_open = (tick / 86_400) * 86_400 + 33_300;
+        let session_open = (tick / 86_400) * 86_400 + 33_300;
         for tf in TfIndex::ALL {
             let bucket = tf.bucket_start(tick);
             let secs = tf.seconds_per_bucket();
@@ -835,9 +1061,9 @@ mod tests {
                 tf.display_name()
             );
             assert_eq!(
-                (bucket - market_open) % secs,
+                (bucket - session_open) % secs,
                 0,
-                "bucket_start not anchored to 09:15 for {}",
+                "bucket_start not anchored to 09:00 for {}",
                 tf.display_name()
             );
             assert!(
@@ -880,7 +1106,9 @@ mod tests {
 
     /// `Ord` sorts by the `repr(u8)` discriminant = the seal-spill
     /// APPEND order (C3) — which is exactly `ALL`'s order. Deliberately
-    /// NOT seconds order: D1 (ordinal 4) precedes S1 (ordinal 5).
+    /// NOT seconds order: M15 (ordinal 3, 900 s) precedes S1 (ordinal 4, 1 s)
+    /// (2026-09-22: this read "D1 (ordinal 4) precedes S1 (ordinal 5)", the
+    /// pre-2026-09-19 numbering; D1 no longer exists).
     #[test]
     fn test_tf_index_total_ordering_matches_ordinal_append_order() {
         let mut sorted = TfIndex::ALL.to_vec();
@@ -888,71 +1116,175 @@ mod tests {
         assert_eq!(sorted, TfIndex::ALL);
     }
 
-    /// The operator-requested set is EXACTLY the thirteen of Quote 13.
+    /// `TfIndex::ALL` IS exactly the ten native frames the operator asked
+    /// for — the nine of 2026-09-18 plus `M10`, which was a view until the
+    /// 2026-09-22 "NO VIEWS ANYWHERE" ruling — no more, no fewer, and each
+    /// named individually.
     ///
-    /// Both halves are named individually rather than counted. A count alone
-    /// would pass if a requested frame were swapped for an unrequested one,
-    /// and that is precisely the mistake available here: eleven unrequested
-    /// second-scale variants sit immediately adjacent to the five wanted ones
-    /// (`S4`/`S5`/`S6`, `S14`/`S15`), so an off-by-one in either direction is
-    /// a plausible edit that a length check would wave through.
+    /// ## Why every frame is named rather than counted
+    ///
+    /// A count alone would pass if one frame were swapped for another, and
+    /// that is precisely the mistake available here: the second-scale
+    /// variants sit adjacent to one another (`S1`/`S3`/`S5`), so an
+    /// off-by-one in either direction is a plausible edit a length check
+    /// would wave through.
+    ///
+    /// ## Why this pins the ENUM and no longer a predicate
+    ///
+    /// Until 2026-09-19 the enum carried 24 variants and a predicate
+    /// (`is_operator_requested`) decided which of them emitted rows; this
+    /// test pinned that predicate's answer across four blocks — the nine
+    /// requested, the four withdrawn on 2026-09-18, `D1` (withdrawn
+    /// 2026-08-25 for a DIFFERENT reason — the operator ruled a day bar must
+    /// never be derived from the internal fold at all), and ten that were
+    /// never asked for.
+    ///
+    /// The 2026-09-19 directive DELETED those fifteen variants outright
+    /// (`TF_COUNT` 24 -> 9), so the predicate became tautologically true and
+    /// went with them. The guarantee it carried now belongs to the enum: a
+    /// frame cannot be emitted-but-unwanted, because an unwanted frame has
+    /// no variant to be. Restoring any of the fifteen means re-adding a
+    /// variant, which fails this test by name.
+    ///
+    /// The four-way split is NOT reproduced here, deliberately: "asked for,
+    /// then withdrawn" and "never asked for" are different facts about
+    /// variants that no longer exist, and the historical record of which was
+    /// which lives in the dated rule-file sections, not in a test over an
+    /// enum that cannot express them. What a reader needs from THIS test is
+    /// the live set.
     #[test]
-    fn tf_index_operator_set_is_thirteen() {
-        let requested: Vec<TfIndex> = TfIndex::ALL
-            .iter()
-            .copied()
-            .filter(|tf| tf.is_operator_requested())
-            .collect();
-
+    fn tf_index_all_is_the_operators_eight() {
+        // 2026-10-22 (plan item 62, Quote 34): 3s and 5s removed, 10 -> 8.
         assert_eq!(
-            requested.len(),
-            13,
-            "operator Quote 13 (2026-08-08) names exactly 13 timeframes; found \
-             {}. Changing this set needs a fresh dated quote.",
-            requested.len()
+            TfIndex::ALL.len(),
+            8,
+            "operator directive 2026-09-18 named eleven entries: `ticks` (not \
+             a candle frame) and ten candle frames. `10m` was a VIEW over \
+             candles_1m until 2026-09-22, when the operator ruled 'NO VIEWS \
+             ANYWHERE' and it became the tenth native frame, APPENDED at \
+             ordinal 9. Found {}. Changing this set needs a fresh dated quote.",
+            TfIndex::ALL.len()
         );
 
-        // The thirteen that must emit rows.
-        for tf in [
-            TfIndex::S1,
-            TfIndex::S5,
-            TfIndex::S10,
-            TfIndex::S15,
-            TfIndex::S30,
-            TfIndex::M1,
-            TfIndex::M2,
-            TfIndex::M3,
-            TfIndex::M5,
-            TfIndex::M15,
-            TfIndex::M30,
-            TfIndex::M60,
-            TfIndex::D1,
+        assert_eq!(
+            TfIndex::ALL,
+            [
+                TfIndex::M1,
+                TfIndex::M3,
+                TfIndex::M5,
+                TfIndex::M15,
+                TfIndex::S1,
+                TfIndex::M30,
+                TfIndex::M60,
+                TfIndex::M10,
+            ],
+            "TfIndex::ALL must be exactly the operator's eight, in ordinal \
+             order. `ALL` is indexed BY ordinal and `from_ordinal` is its \
+             inverse, so the order is load-bearing, not cosmetic."
+        );
+
+        // The retired names, asserted as ABSENT by table name rather than by
+        // variant — a deleted variant cannot be named in Rust, so this is the
+        // only form the guarantee can take here.
+        let live: Vec<&str> = TfIndex::ALL.iter().map(|tf| tf.table_name()).collect();
+        for retired in [
+            "candles_1d",
+            "candles_2s",
+            "candles_4s",
+            "candles_6s",
+            "candles_7s",
+            "candles_8s",
+            "candles_9s",
+            "candles_10s",
+            "candles_11s",
+            "candles_12s",
+            "candles_13s",
+            "candles_14s",
+            "candles_15s",
+            "candles_30s",
+            "candles_2m",
+            // 2026-10-22 (plan item 62, Quote 34). Archive-only: retention
+            // keeps copying their partitions, nothing creates or drops them.
+            "candles_3s",
+            "candles_5s",
         ] {
             assert!(
-                tf.is_operator_requested(),
-                "{tf:?} is one of the operator's thirteen and must emit rows"
+                !live.contains(&retired),
+                "{retired} was retired by the 2026-09-19 directive — \
+                 restoring it needs a fresh dated quote, and its DROP entry \
+                 in shadow_persistence::RETIRED_CANDLE_TABLES would have to \
+                 move with it"
             );
         }
+    }
 
-        // The eleven that exist but were never asked for.
-        for tf in [
-            TfIndex::S2,
-            TfIndex::S3,
-            TfIndex::S4,
-            TfIndex::S6,
-            TfIndex::S7,
-            TfIndex::S8,
-            TfIndex::S9,
-            TfIndex::S11,
-            TfIndex::S12,
-            TfIndex::S13,
-            TfIndex::S14,
-        ] {
-            assert!(
-                !tf.is_operator_requested(),
-                "{tf:?} was never requested — emitting it writes rows to disk \
-                 every bucket for nobody"
+    /// The pre-2026-10-30 body of `bucket_start`, dividing by a width read at
+    /// run time (`black_box` keeps the compiler from folding it). The
+    /// constant-divisor form must agree with it on every input.
+    fn bucket_start_by_runtime_width(tf: TfIndex, tick_ist_secs: u32) -> u32 {
+        let secs = std::hint::black_box(tf.seconds_per_bucket());
+        let day_start = (tick_ist_secs / 86_400) * 86_400;
+        let session_open = day_start.saturating_add(CANDLE_SESSION_OPEN_SECS_OF_DAY_IST);
+        if tick_ist_secs <= session_open {
+            return session_open;
+        }
+        session_open.saturating_add(((tick_ist_secs - session_open) / secs) * secs)
+    }
+
+    /// Regression (plan ITEM DT, 2026-10-30): the constant-divisor
+    /// `bucket_start` equals the runtime-width body at the edges of the
+    /// `u32` range, around every session boundary of a day, and on a dense
+    /// sweep of one trading day.
+    #[test]
+    fn test_bucket_start_constant_divisor_matches_runtime_width_at_edges() {
+        let day = 1_779_321_600u32;
+        let mut inputs: Vec<u32> = vec![0, 1, 59, 60, 86_399, 86_400, u32::MAX, u32::MAX - 1];
+        let last_day = (u32::MAX / 86_400) * 86_400;
+        for base in [0u32, day, last_day] {
+            for off in [
+                0u32, 1, 32_399, 32_400, 33_299, 33_300, 33_301, 55_799, 55_800, 86_399,
+            ] {
+                inputs.push(base.saturating_add(off));
+            }
+        }
+        for secs in 0..86_400u32 {
+            inputs.push(day + secs);
+        }
+        for tf in TfIndex::ALL {
+            for &t in &inputs {
+                assert_eq!(
+                    tf.bucket_start(t),
+                    bucket_start_by_runtime_width(tf, t),
+                    "{tf:?} at {t}"
+                );
+            }
+        }
+    }
+
+    /// The first-session table holds the grid's own bucket for 09:15 on day 0.
+    #[test]
+    fn test_first_session_bucket_offset_is_the_grid_bucket_of_the_open() {
+        for tf in TfIndex::ALL {
+            assert_eq!(
+                tf.first_session_bucket_offset(),
+                tf.bucket_start(MARKET_OPEN_SECS_OF_DAY_IST),
+                "{tf:?}"
             );
+            assert!(tf.first_session_bucket_offset() < 86_400, "{tf:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20_000))]
+        /// Any `u32` instant, any frame: the constant-divisor form equals the
+        /// runtime-width body.
+        #[test]
+        fn proptest_bucket_start_constant_divisor_matches_runtime_width(
+            t in proptest::prelude::any::<u32>(),
+            ord in 0usize..TF_COUNT,
+        ) {
+            let tf = TfIndex::from_ordinal(ord).unwrap_or(TfIndex::M1);
+            proptest::prop_assert_eq!(tf.bucket_start(t), bucket_start_by_runtime_width(tf, t));
         }
     }
 }

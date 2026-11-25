@@ -140,16 +140,36 @@ resource "aws_iam_role_policy" "github_deploy" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # 2026-09-02: the SSM MIRROR of main HEAD, written every 30 minutes by
+        # postmerge-catchup.yml so the deploy-watchdog's provenance comparison
+        # survives the absence of /tickvault/<env>/operator/github-token.
+        #
+        # Deliberately a SEPARATE statement from the binary-git-sha grant
+        # above, and deliberately NOT written by deploy-aws.yml: that workflow
+        # writes GITHUB_SHA, which IS main HEAD at deploy time, so a mirror
+        # written there would always equal binary-git-sha and the staleness
+        # signal could never go red. The mirror must advance when MAIN
+        # advances, deploy or no deploy.
+        Effect   = "Allow"
+        Action   = ["ssm:PutParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/desired-git-sha"
+      },
+      {
         # NSE-holiday intentional-stop marker (2026-07-07 round-3 review
         # fix): aws-autopilot.sh reads /tickvault/<env>/holiday-stop-date
-        # (stamped by deploy/aws/holiday-gate.sh before its holiday
+        # (stamped by the holiday gate before its holiday
         # self-stop) so its every-15-min up-window self-start never fights
         # the intentional holiday stop — the pre-fix boot/stop war could
         # bracket the 09:20 IST alarm-gate sample and restore the holiday
         # false page. Read-only, scoped to exactly that one parameter.
-        Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+        # Audit PR30 (2026-09-27): plus the budget-stop latch, read the same
+        # way so the self-start never undoes a budget stop.
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date",
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault-guard/${var.environment}/budget-stop-month",
+        ]
       },
       {
         # LOG-INGESTION-SMOKE (deploy-aws.yml): after the verified swap, the

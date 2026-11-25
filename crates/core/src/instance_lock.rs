@@ -54,17 +54,22 @@
 //!   * Heartbeat: every 30s the owner re-issues `PutParameter` with a
 //!     refreshed `last_heartbeat_unix`. Two missed renewals still leave
 //!     30s of headroom before another instance considers the slot stale.
+//!     **⚠ CORRECTED 2026-10-11 (review of SUP-9):** not with the 20 s
+//!     renewal timeout. The second failure can end at +80 s (10 s of
+//!     headroom), and the third renewal starts at the +90 s tick, the TTL
+//!     boundary itself, so it races a peer's staleness check. See
+//!     `spawn_instance_lock_heartbeat`.
 //!   * Release: `GetParameter` + ownership check + `DeleteParameter`.
 //!     A foreign holder is left alone (logged at WARN, not ERROR).
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use aws_sdk_ssm::Client as SsmClient;
 use aws_sdk_ssm::types::ParameterType;
 use serde::{Deserialize, Serialize};
-use tickvault_common::error_code::ErrorCode;
+use tickvault_common::error_code::{ErrorCode, Severity};
 use tickvault_common::sanitize::sanitize_ilp_symbol;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -77,6 +82,11 @@ pub const INSTANCE_LOCK_TTL_SECS: u64 = 90;
 
 /// Heartbeat interval — 1/3 of the TTL. Two missed renewals still leave
 /// 30 seconds of headroom before the lock is considered stale.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of SUP-9):** true only when a failure
+/// is instant. With [`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`] (20 s), two
+/// timed-out renewals end at +80 s, 10 s before the TTL, and the third
+/// renewal starts at +90 s, the TTL boundary itself.
 pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 /// Tolerated skew, in seconds, between the ACQUIRER's wall clock and the
@@ -90,6 +100,48 @@ pub const INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 /// is trustworthy. 5 s is generous for NTP-disciplined hosts (typical
 /// offsets are sub-100 ms) while still catching a real step.
 pub const INSTANCE_LOCK_MAX_CLOCK_SKEW_SECS: u64 = 5;
+
+/// Settle time, in seconds, between a stale-TAKEOVER put and its read-back
+/// (2026-10-01, R7).
+///
+/// SSM has no compare-and-swap, so two booting peers that both read the
+/// same stale value would both overwrite it and both return `Acquired`.
+/// This borrows Fischer's mutual-exclusion timing: a contender whose own
+/// get→put window exceeded [`INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS`] does
+/// not trust its write, and every other contender's put therefore lands
+/// inside a 5 s window — so after waiting 10 s the stored value is final
+/// and exactly one contender reads itself back. Cold path only (boot);
+/// renewal never settles.
+pub const INSTANCE_LOCK_TAKEOVER_SETTLE_SECS: u64 = 10;
+
+/// Longest get→put window, in seconds, after which a takeover write is not
+/// trusted even if it reads back as ours (2026-10-01, R7). Must stay
+/// strictly below [`INSTANCE_LOCK_TAKEOVER_SETTLE_SECS`] or the settle no
+/// longer covers a racing contender's put.
+pub const INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS: u64 = 5;
+
+/// Local bound, in seconds, on one heartbeat renewal (2026-10-11, audit
+/// SUP-9). The SSM client has no operation timeout of its own, so a hung
+/// renewal used to stall the heartbeat with no log line at all. 20 s is
+/// below the 30 s heartbeat interval, so one renewal can never overlap the
+/// next tick, and a renewal that times out is counted as a failure.
+pub const INSTANCE_LOCK_RENEW_TIMEOUT_SECS: u64 = 20;
+
+/// Consecutive renewal failures (errors or timeouts) after which the
+/// heartbeat logs ONE coded RESILIENCE-01 `error!` (2026-10-11, audit
+/// SUP-9). 2 failures × 30 s = 60 s, plus the 20 s timeout = 80 s, still
+/// inside the 90 s TTL, so the line lands before a peer can see the lock
+/// stale. Edge-latched: once per failure episode; a success re-arms it.
+pub const INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR: u32 = 2;
+
+// The renewal bound must leave the next tick free, and the escalation must
+// land before a peer can judge the lock stale.
+const _: () = assert!(INSTANCE_LOCK_RENEW_TIMEOUT_SECS < INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
+const _: () = assert!(
+    (INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR as u64) * INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS
+        + INSTANCE_LOCK_RENEW_TIMEOUT_SECS
+        < INSTANCE_LOCK_TTL_SECS
+);
 
 /// SSM Parameter path prefix. Full path is `{prefix}/{env}/instance-lock`
 /// so dev / sandbox / prod cannot stomp on each other.
@@ -314,6 +366,80 @@ pub enum AcquireOutcome {
     AlreadyHeld { holder: String },
 }
 
+/// Verdict of a lock WRITE checked by reading it back (2026-10-01, R7).
+///
+/// SSM `PutParameter` is not conditional, so a write can silently clobber
+/// a peer's, or be clobbered by one right after. Two numbers SSM already
+/// returns make both visible: every successful put bumps the parameter
+/// version by exactly 1, so `put version == read version + 1` proves no
+/// one wrote between our read and our put, and a read-back carrying our
+/// host at our put version proves no one wrote after it. This NARROWS the
+/// race; it cannot close it (no fencing token — see the runbook's honest
+/// limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// Our value is stored at our put version and nothing landed between
+    /// our read and our put.
+    Held,
+    /// Our value is stored at our put version, but someone else wrote
+    /// between our read and our put (we overwrote it). We still hold —
+    /// the interloper's own read-back sees our host and yields — but it is
+    /// counted and logged.
+    HeldAfterContention,
+    /// Someone wrote after our put (foreign host or a newer version), or
+    /// the parameter was deleted. We do not hold.
+    Lost,
+    /// The versions do not let us decide (absent, non-monotonic, or a
+    /// read-back older than our own put). Never treated as held.
+    Inconclusive,
+}
+
+impl WriteVerdict {
+    /// Short stable label for logs.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::HeldAfterContention => "held_after_contention",
+            Self::Lost => "lost",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+/// Classifies a lock write from the version we READ before it, the version
+/// our PUT returned, and the `(host_id, version)` read back after it
+/// (`None` = the parameter is gone). Pure, O(1) (2026-10-01, R7).
+///
+/// A read-back older than our own put is `Inconclusive`, never `Held`:
+/// SSM `GetParameter` read-after-write consistency is not documented as
+/// strong, so a lagging read proves nothing either way.
+#[must_use]
+pub fn classify_write(
+    read_v: i64,
+    put_v: i64,
+    post: Option<(&str, i64)>,
+    ours: &str,
+) -> WriteVerdict {
+    // Versions absent (the SDK reads 0 when the field is missing), or not
+    // increasing — SSM versions only ever grow, so a put version at or
+    // below what we read means the numbers cannot be trusted.
+    if read_v <= 0 || put_v <= 0 || put_v <= read_v {
+        return WriteVerdict::Inconclusive;
+    }
+    match post {
+        // Deleted after our put.
+        None => WriteVerdict::Lost,
+        // Read-back older than our own write: a lagging read.
+        Some((_, v)) if v < put_v => WriteVerdict::Inconclusive,
+        // Someone wrote after us.
+        Some((h, v)) if h != ours || v != put_v => WriteVerdict::Lost,
+        // Ours at our version, but a write landed between read and put.
+        Some(_) if put_v != read_v.saturating_add(1) => WriteVerdict::HeldAfterContention,
+        Some(_) => WriteVerdict::Held,
+    }
+}
+
 /// Returns current Unix seconds since epoch. Wall-clock — the lock TTL
 /// tolerates a few seconds of skew between hosts so monotonic clocks
 /// would be wrong here.
@@ -337,17 +463,28 @@ pub async fn try_acquire_instance_lock(
     env: &str,
     host_id: &str,
 ) -> Result<AcquireOutcome> {
-    try_acquire_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+    try_acquire_lock_at_path(
+        ssm,
+        &compute_instance_lock_path(env),
+        host_id,
+        Duration::from_secs(INSTANCE_LOCK_TAKEOVER_SETTLE_SECS),
+    )
+    .await
 }
 
 /// Shared acquire body — the SSM `PutParameter(overwrite=false)` atomic
 /// claim + stale-takeover + fail-closed evaluation, against an explicit
 /// parameter path. Private so the public surface stays the two thin
 /// wrappers above.
+///
+/// `settle` is the wait between a stale-takeover put and its read-back
+/// (2026-10-01, R7): the public wrapper passes
+/// [`INSTANCE_LOCK_TAKEOVER_SETTLE_SECS`]; tests pass `Duration::ZERO`.
 async fn try_acquire_lock_at_path(
     ssm: &SsmClient,
     path: &str,
     host_id: &str,
+    settle: Duration,
 ) -> Result<AcquireOutcome> {
     let now = now_unix_secs();
     let value = LockValue::new(host_id, now);
@@ -357,7 +494,7 @@ async fn try_acquire_lock_at_path(
     // parameter already exists. This is the SSM equivalent of Redis
     // SET NX.
     match put_parameter(ssm, path, &payload, false).await {
-        Ok(()) => {
+        Ok(_) => {
             info!(
                 target: "tickvault::instance_lock",
                 path = %path,
@@ -377,8 +514,10 @@ async fn try_acquire_lock_at_path(
         }
     }
 
-    // Step 2 — read the existing holder.
-    let raw = match get_parameter(ssm, path).await {
+    // Step 2 — read the existing holder. The version and the read instant
+    // feed the takeover's write check (2026-10-01, R7).
+    let read_at = Instant::now();
+    let (raw, read_v) = match get_parameter_versioned(ssm, path).await {
         Ok(Some(value)) => value,
         Ok(None) => {
             // Rare race: the previous holder's parameter was deleted
@@ -471,18 +610,32 @@ async fn try_acquire_lock_at_path(
                  verify time sync (the lock has no fencing token, so a forward step \
                  is observable here but not preventable)"
             );
-            put_parameter(ssm, path, &payload, true)
-                .await
-                .with_context(|| {
-                    format!("PutParameter(overwrite=true) takeover failed for path={path}")
-                })?;
+            let outcome =
+                write_and_verify(ssm, path, &payload, host_id, read_v, read_at, settle).await?;
+            if outcome == AcquireOutcome::Acquired {
+                info!(
+                    target: "tickvault::instance_lock",
+                    path = %path,
+                    host_id = %host_id,
+                    "RESILIENCE-01 lock acquired (stale takeover)"
+                );
+            }
+            Ok(outcome)
+        }
+        Ok((existing, LockFreshness::Fresh { .. })) if existing.host_id == host_id => {
+            // OUR OWN value (R7 review, 2026-10-01): a host id carries this
+            // process's pid and boot random, so only this process wrote it,
+            // on an earlier attempt whose takeover could not be verified.
+            // Reading it as a live peer would spend the boot loop's patience
+            // and page a dual instance against ourselves. Re-write and
+            // re-verify it exactly like a takeover.
             info!(
                 target: "tickvault::instance_lock",
                 path = %path,
                 host_id = %host_id,
-                "RESILIENCE-01 lock acquired (stale takeover)"
+                "instance lock holds this process's own earlier write — re-verifying"
             );
-            Ok(AcquireOutcome::Acquired)
+            write_and_verify(ssm, path, &payload, host_id, read_v, read_at, settle).await
         }
         Ok((existing, LockFreshness::Fresh { .. })) => Ok(AcquireOutcome::AlreadyHeld {
             holder: existing.host_id,
@@ -525,11 +678,19 @@ pub async fn renew_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> R
 }
 
 /// Shared ownership-checked renewal body against an explicit parameter path.
+///
+/// Since 2026-10-01 (R7) the put is checked by reading it back and
+/// classifying the versions with [`classify_write`]: `Held` → `Ok(true)`;
+/// `HeldAfterContention` → counted + coded `error!`, still `Ok(true)` (the
+/// stored value is ours, so the interloper's own read-back yields);
+/// `Lost` → `Ok(false)`; `Inconclusive` → `Err` so the heartbeat takes its
+/// existing transient-retry path and never reports "held" on a read it
+/// cannot trust. Renewal does NOT settle — see the runbook's honest limit.
 async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<bool> {
-    let raw = get_parameter(ssm, path).await.with_context(|| {
+    let raw = get_parameter_versioned(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during renewal")
     })?;
-    let Some(raw_value) = raw else {
+    let Some((raw_value, read_v)) = raw else {
         // Lock vanished mid-session. Treat as lost ownership.
         return Ok(false);
     };
@@ -547,12 +708,164 @@ async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Resul
         last_heartbeat_unix: now,
     };
     let payload = refreshed.to_json()?;
-    put_parameter(ssm, path, &payload, true)
+    let put_v = put_parameter(ssm, path, &payload, true)
         .await
         .with_context(|| {
             format!("PutParameter(overwrite=true) failed for path={path} during renewal")
         })?;
-    Ok(true)
+    let post = get_parameter_versioned(ssm, path).await.with_context(|| {
+        format!("GetParameter read-back failed for instance lock path={path} during renewal")
+    })?;
+    let post_host = post.as_ref().map(|(raw, v)| (stored_host_id(raw), *v));
+    let verdict = classify_write(
+        read_v,
+        put_v,
+        post_host.as_ref().map(|(h, v)| (h.as_str(), *v)),
+        host_id,
+    );
+    match verdict {
+        WriteVerdict::Held => Ok(true),
+        WriteVerdict::HeldAfterContention => {
+            metrics::counter!("tv_instance_lock_contention_total", "stage" => "renew").increment(1);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                stage = "renew_contention",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "RESILIENCE-01: instance-lock renewal overwrote a write that landed \
+                 between our read and our put — another process wrote the lock \
+                 parameter. Our value is stored, so we still hold it; the other \
+                 writer's read-back sees our host and must yield. Find the other \
+                 process"
+            );
+            Ok(true)
+        }
+        WriteVerdict::Lost => Ok(false),
+        WriteVerdict::Inconclusive => Err(anyhow!(
+            "instance-lock read-back inconclusive read_v={read_v} put_v={put_v} \
+             post_v={} path={path} (during renewal)",
+            post_host.as_ref().map_or(0, |(_, v)| *v)
+        )),
+    }
+}
+
+/// The `host_id` stored in a raw lock value, or an empty string when the
+/// value is not valid lock JSON (2026-10-01, R7). An empty host never
+/// equals ours, so a corrupt read-back classifies as `Lost`.
+fn stored_host_id(raw: &str) -> String {
+    LockValue::from_json(raw)
+        .map(|l| l.host_id)
+        .unwrap_or_default()
+}
+
+/// Stale-TAKEOVER write with a settled read-back (2026-10-01, R7).
+///
+/// Puts our value, refuses to trust it if our own get→put window exceeded
+/// [`INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS`], waits `settle`, reads back
+/// and classifies with [`classify_write`]. Fails CLOSED: `Lost` reports the
+/// holder actually stored, `Inconclusive` reports an unverified takeover;
+/// both return `AlreadyHeld` so the boot loop retries instead of minting.
+async fn write_and_verify(
+    ssm: &SsmClient,
+    path: &str,
+    payload: &str,
+    host_id: &str,
+    read_v: i64,
+    read_at: Instant,
+    settle: Duration,
+) -> Result<AcquireOutcome> {
+    let put_v = put_parameter(ssm, path, payload, true)
+        .await
+        .with_context(|| format!("PutParameter(overwrite=true) takeover failed for path={path}"))?;
+    let window = read_at.elapsed();
+    tokio::time::sleep(settle).await;
+    let post = get_parameter_versioned(ssm, path)
+        .await
+        .with_context(|| format!("GetParameter takeover read-back failed for path={path}"))?;
+    let post_host = post.as_ref().map(|(raw, v)| (stored_host_id(raw), *v));
+    let verdict = if window > Duration::from_secs(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS) {
+        WriteVerdict::Inconclusive
+    } else {
+        classify_write(
+            read_v,
+            put_v,
+            post_host.as_ref().map(|(h, v)| (h.as_str(), *v)),
+            host_id,
+        )
+    };
+    match verdict {
+        WriteVerdict::Held => Ok(AcquireOutcome::Acquired),
+        WriteVerdict::HeldAfterContention => {
+            metrics::counter!("tv_instance_lock_contention_total", "stage" => "takeover")
+                .increment(1);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                stage = "takeover_contention",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "RESILIENCE-01: stale takeover overwrote a write that landed between \
+                 our read and our put — another process is taking the lock at the \
+                 same time. Our value survived the settle, so we hold it; the other \
+                 process must yield"
+            );
+            Ok(AcquireOutcome::Acquired)
+        }
+        WriteVerdict::Lost => {
+            let holder = post_host.map(|(h, _)| h).unwrap_or_default();
+            warn!(
+                target: "tickvault::instance_lock",
+                stage = "takeover_lost",
+                path = %path,
+                host_id = %host_id,
+                holder = %holder,
+                read_v,
+                put_v,
+                verdict = verdict.as_str(),
+                "stale takeover lost the race — another process's write landed after \
+                 ours; not holding the lock"
+            );
+            Ok(AcquireOutcome::AlreadyHeld { holder })
+        }
+        WriteVerdict::Inconclusive => {
+            warn!(
+                target: "tickvault::instance_lock",
+                stage = "takeover_unverified",
+                path = %path,
+                host_id = %host_id,
+                read_v,
+                put_v,
+                window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                max_window_secs = INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS,
+                verdict = verdict.as_str(),
+                "stale takeover could not be verified (get→put window too long or the \
+                 read-back versions do not prove ownership) — failing closed, not \
+                 holding the lock"
+            );
+            // An Err, not AlreadyHeld (R7 review, 2026-10-01): the boot loop's
+            // AlreadyHeld arm spends its bounded patience and pages
+            // DualInstanceDetected, which an unverifiable read is not. The
+            // transport-retry arm re-runs the acquire, and the own-write arm
+            // re-verifies the value this attempt may have left stored.
+            Err(anyhow!(
+                "stale takeover unverified for path={path} (read_v={read_v} \
+                 put_v={put_v}); not holding the lock, retrying"
+            ))
+        }
+    }
 }
 
 /// Releases the instance lock IFF this process still owns it.
@@ -563,10 +876,25 @@ async fn renew_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Resul
 /// have expired naturally — that's not an alertable condition.
 // TEST-EXEMPT: end-to-end behaviour requires a real AWS SSM endpoint.
 pub async fn release_instance_lock(ssm: &SsmClient, env: &str, host_id: &str) -> Result<()> {
-    release_lock_at_path(ssm, &compute_instance_lock_path(env), host_id).await
+    release_lock_at_path(ssm, &compute_instance_lock_path(env), host_id)
+        .await
+        .map(|_| ())
 }
 
-async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<()> {
+/// What an ownership-checked release found (CONC-4 review, 2026-10-11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseFound {
+    /// Our parameter was deleted.
+    Deleted,
+    /// No parameter was there.
+    AlreadyGone,
+    /// Another process holds the lock; left intact.
+    HeldByOther,
+    /// The value could not be read as a lock; left intact, so it stays in SSM.
+    Unparseable,
+}
+
+async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Result<ReleaseFound> {
     let raw = get_parameter(ssm, path).await.with_context(|| {
         format!("GetParameter failed for instance lock path={path} during release")
     })?;
@@ -576,7 +904,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
             path = %path,
             "instance lock already gone at release time"
         );
-        return Ok(());
+        return Ok(ReleaseFound::AlreadyGone);
     };
     let existing = match LockValue::from_json(&raw_value) {
         Ok(v) => v,
@@ -587,7 +915,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
                 error = %err,
                 "instance-lock SSM value is not valid JSON at release time; leaving it alone"
             );
-            return Ok(());
+            return Ok(ReleaseFound::Unparseable);
         }
     };
     if existing.host_id != host_id {
@@ -599,7 +927,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
             "instance lock held by another process at release time \
              (heartbeat likely raced TTL expiry); leaving foreign lock intact"
         );
-        return Ok(());
+        return Ok(ReleaseFound::HeldByOther);
     }
     ssm.delete_parameter()
         .name(path)
@@ -611,7 +939,7 @@ async fn release_lock_at_path(ssm: &SsmClient, path: &str, host_id: &str) -> Res
         path = %path,
         "instance lock released cleanly"
     );
-    Ok(())
+    Ok(ReleaseFound::Deleted)
 }
 
 /// Overwrites the instance lock UNCONDITIONALLY — the operator escape
@@ -668,6 +996,255 @@ pub async fn force_takeover_instance_lock(ssm: &SsmClient, env: &str, host_id: &
     Ok(())
 }
 
+/// Consecutive-failure count for the heartbeat's renewals (2026-10-11,
+/// audit SUP-9). O(1), no allocation.
+///
+/// Also keeps the START instant of the last successful renewal (2026-10-11,
+/// review of SUP-9): the count alone understates how long the lock has gone
+/// without a renewal when ticks run late, so the lapse past the TTL is judged
+/// on time. `None` means no success is known yet, and no lapse is judged.
+#[derive(Debug, Default)]
+struct RenewFailureTracker {
+    consecutive: u32,
+    escalated: bool,
+    last_success: Option<tokio::time::Instant>,
+    lapsed: bool,
+}
+
+impl RenewFailureTracker {
+    /// A tracker whose last successful write is `acquired_at` (the lock was
+    /// just acquired when the heartbeat starts).
+    fn starting_at(acquired_at: tokio::time::Instant) -> Self {
+        Self {
+            last_success: Some(acquired_at),
+            ..Self::default()
+        }
+    }
+
+    /// Returns the seconds since the last successful renewal exactly once
+    /// per failure episode: the first time they reach
+    /// [`INSTANCE_LOCK_TTL_SECS`], when a booting peer can judge the lock
+    /// stale. Measured from the START of that renewal, which is no later
+    /// than the heartbeat it stored, so it errs early. A success re-arms it.
+    fn lapse_edge(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        let last = self.last_success?;
+        let elapsed_secs = now.saturating_duration_since(last).as_secs();
+        if self.lapsed || elapsed_secs < INSTANCE_LOCK_TTL_SECS {
+            return None;
+        }
+        self.lapsed = true;
+        Some(elapsed_secs)
+    }
+    /// Records one failed renewal. Returns `true` exactly once per failure
+    /// episode: when the count first reaches
+    /// [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`].
+    fn on_failure(&mut self) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if !self.escalated && self.consecutive >= INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR {
+            self.escalated = true;
+            return true;
+        }
+        false
+    }
+
+    /// Records one successful renewal that started at `started`. Returns the
+    /// failure count it ends, if any, and re-arms both latches.
+    fn on_success(&mut self, started: tokio::time::Instant) -> Option<u32> {
+        let ended = (self.consecutive > 0).then_some(self.consecutive);
+        self.consecutive = 0;
+        self.escalated = false;
+        self.lapsed = false;
+        self.last_success = Some(started);
+        ended
+    }
+}
+
+/// What the heartbeat loop does after one tick.
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatStep {
+    Continue,
+    Exit,
+}
+
+/// One heartbeat tick: runs `renew` under
+/// [`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`] and acts on the verdict
+/// (2026-10-11, audit SUP-9).
+///
+/// - `Ok(true)`: renewed. Logs once at INFO when it ends a failure run.
+/// - `Ok(false)`: lost. Clears `held_flag` first (the RESILIENCE-03 mint
+///   tripwire), logs RESILIENCE-01, returns `Exit`.
+/// - `Err` or timeout: counted on `tv_instance_lock_renew_failed_total`
+///   and the consecutive gauge; the failure that reaches
+///   [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`] logs one RESILIENCE-01
+///   `error!` (`stage = "renew_failing"`), the others a coded `warn!`.
+///   `held_flag` is NOT touched: the self-fence is an operator trade-off
+///   (dual-instance-lock runbook §3.6), not taken here.
+/// - Once the time since the last successful renewal STARTED reaches
+///   [`INSTANCE_LOCK_TTL_SECS`] (a booting peer may now take the lock), one
+///   more RESILIENCE-01 `error!` (`stage = "renew_lapsed"`), once per
+///   failure episode.
+///
+/// Both `error!` lines reuse the RESILIENCE-01 code for an SSM reachability
+/// problem, NOT a dual-instance detection: the lock is still held and no
+/// peer has been seen. Their `severity` field is therefore `high`, not the
+/// code's `critical`, and the feed scoreboard does not count these stages
+/// as dual-instance evidence (`feed_scoreboard_boot`).
+///
+/// A renewal cancelled by the timeout may still land its put on the server.
+/// If a peer took the lock in the meantime, our next read-back sees a
+/// foreign holder (`Ok(false)`) and the heartbeat exits. Cold path, once
+/// per 30 s, O(1).
+async fn heartbeat_tick<Fut>(
+    renew: Fut,
+    tracker: &mut RenewFailureTracker,
+    held_flag: &std::sync::atomic::AtomicBool,
+    env: &str,
+    host_id: &str,
+) -> HeartbeatStep
+where
+    Fut: Future<Output = Result<bool>>,
+{
+    let started = tokio::time::Instant::now();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(INSTANCE_LOCK_RENEW_TIMEOUT_SECS), renew).await;
+    let (reason, err) = match outcome {
+        Ok(Ok(true)) => {
+            if let Some(failed_attempts) = tracker.on_success(started) {
+                info!(
+                    target: "tickvault::instance_lock",
+                    stage = "renew_recovered",
+                    env = %env,
+                    host_id = %host_id,
+                    failed_attempts,
+                    "instance-lock renewal succeeded again after {failed_attempts} \
+                     failed attempt(s)"
+                );
+            }
+            metrics::gauge!("tv_instance_lock_renew_consecutive_failures").set(0.0);
+            return HeartbeatStep::Continue;
+        }
+        Ok(Ok(false)) => {
+            // Flip BEFORE logging so the mint tripwire (RESILIENCE-03) is
+            // armed at the earliest possible instant.
+            held_flag.store(false, std::sync::atomic::Ordering::Release);
+            error!(
+                target: "tickvault::instance_lock",
+                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                severity = ErrorCode::Resilience01DualInstanceDetected
+                    .severity()
+                    .as_str(),
+                env = %env,
+                host_id = %host_id,
+                "instance lock lost — another process now holds the lock; \
+                 heartbeat task exiting; token mint is now REFUSED \
+                 (RESILIENCE-03 tripwire armed)"
+            );
+            return HeartbeatStep::Exit;
+        }
+        Ok(Err(err)) => ("error", err),
+        Err(_elapsed) => (
+            "timeout",
+            anyhow!("renewal did not finish within {INSTANCE_LOCK_RENEW_TIMEOUT_SECS}s"),
+        ),
+    };
+    metrics::counter!("tv_instance_lock_renew_failed_total", "reason" => reason).increment(1);
+    let escalate = tracker.on_failure();
+    let consecutive = tracker.consecutive;
+    metrics::gauge!("tv_instance_lock_renew_consecutive_failures").set(f64::from(consecutive));
+    // `{:#}` prints the whole anyhow chain, so the SDK cause (DNS, connect,
+    // AccessDenied, throttling) reaches the log, not only the outer context.
+    // Cold path, once per 30 s: the allocation is fine.
+    let error_chain = format!("{err:#}");
+    if escalate {
+        // RESILIENCE-01 is reused for SSM reachability; this is NOT a
+        // dual-instance detection, so the severity is `high`, not the
+        // code's `critical` (see `heartbeat_tick` docs).
+        error!(
+            target: "tickvault::instance_lock",
+            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+            severity = Severity::High.as_str(),
+            stage = "renew_failing",
+            env = %env,
+            host_id = %host_id,
+            reason,
+            consecutive,
+            interval_secs = INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS,
+            ttl_secs = INSTANCE_LOCK_TTL_SECS,
+            error = %error_chain,
+            "instance-lock renewal has failed {consecutive} times in a row (SSM \
+             reachability, not a peer); a peer may see the lock stale after \
+             {INSTANCE_LOCK_TTL_SECS}s; this process still holds its flag (no \
+             self-fence, runbook section 3.6)"
+        );
+    } else {
+        warn!(
+            target: "tickvault::instance_lock",
+            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+            stage = "renew_failed",
+            env = %env,
+            host_id = %host_id,
+            reason,
+            consecutive,
+            error = %error_chain,
+            "instance-lock renewal failed; will retry on next heartbeat tick"
+        );
+    }
+    if let Some(secs_since_renewal) = tracker.lapse_edge(tokio::time::Instant::now()) {
+        error!(
+            target: "tickvault::instance_lock",
+            code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+            severity = Severity::High.as_str(),
+            stage = "renew_lapsed",
+            env = %env,
+            host_id = %host_id,
+            reason,
+            consecutive,
+            secs_since_renewal,
+            ttl_secs = INSTANCE_LOCK_TTL_SECS,
+            error = %error_chain,
+            "instance-lock renewal has not succeeded for {secs_since_renewal}s, at or \
+             past the {INSTANCE_LOCK_TTL_SECS}s TTL: a booting peer may now take the \
+             lock over; this process still holds its flag (no self-fence, runbook \
+             section 3.6)"
+        );
+    }
+    HeartbeatStep::Continue
+}
+
+/// How the heartbeat task ended (CONC-4 review, 2026-10-11). Until this date
+/// the task returned `()`, so the shutdown release counted "the task ended"
+/// as "the lock was released", including a failed `DeleteParameter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeartbeatExit {
+    /// Shutdown: our SSM parameter was deleted.
+    Released,
+    /// Shutdown: there was nothing of ours to delete (already gone, or held
+    /// by another process).
+    NothingToRelease,
+    /// Shutdown: the release failed (SSM error, or a value that is not a
+    /// lock), so the parameter may still be in SSM until the TTL clears it.
+    ReleaseFailed,
+    /// No shutdown: a renewal saw another holder and the task exited.
+    LostOwnership,
+}
+
+/// Set by the heartbeat's shutdown arm just before it clears the held flag
+/// (CONC-4 review, 2026-10-11). Process-wide: one heartbeat per process.
+static RELEASED_AT_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once the heartbeat has given the lock up because this process is
+/// stopping, not because a peer took it. The RESILIENCE-03 mint tripwire
+/// reads it so a renewal that lands during the last seconds of a clean stop
+/// refuses the mint without paging "another instance holds the lock".
+///
+/// # Complexity
+/// O(1): one atomic load.
+#[must_use]
+pub fn lock_released_at_shutdown() -> bool {
+    RELEASED_AT_SHUTDOWN.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Spawns the instance-lock heartbeat task.
 ///
 /// The returned `JoinHandle` is held by the boot code so a clean shutdown
@@ -687,22 +1264,39 @@ pub async fn force_takeover_instance_lock(ssm: &SsmClient, env: &str, host_id: &
 /// MUST observe the exit (e.g. via a watchdog or by treating lock-loss
 /// as a HALT signal).
 ///
-/// Heartbeat transient errors: an SSM API error during renewal is logged
-/// at WARN and the loop continues. With a 30 s heartbeat interval against
-/// a 90 s TTL, two consecutive transient failures still leave 30 s of
-/// headroom before another instance considers the slot stale.
-// TEST-EXEMPT: real SSM endpoint required for the GetParameter /
-// PutParameter round trip; the renew_instance_lock /
-// release_instance_lock functions the task delegates to are themselves
-// TEST-EXEMPT for the same reason. The cancellation + exit path is small
-// enough to verify by inspection.
+/// Heartbeat transient errors (changed 2026-10-11, audit SUP-9): each
+/// renewal runs under [`INSTANCE_LOCK_RENEW_TIMEOUT_SECS`]; an SSM error or
+/// a timeout is counted (`tv_instance_lock_renew_failed_total{reason}`,
+/// `tv_instance_lock_renew_consecutive_failures`, local Prometheus only),
+/// logged as a coded RESILIENCE-01 `warn!`, and the loop continues. The
+/// failure that reaches [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`]
+/// logs one RESILIENCE-01 `error!` (`stage = "renew_failing"`, log sink
+/// only, no page) per failure episode. `held_flag` stays true on a
+/// failure: the self-fence is an operator trade-off (runbook §3.6). With a
+/// 30 s heartbeat against a 90 s TTL, two consecutive failures still leave
+/// 30 s of headroom before another instance considers the slot stale. See
+/// `heartbeat_tick`.
+///
+/// **⚠ CORRECTED 2026-10-11 (review of SUP-9) — the "30 s of headroom"
+/// sentence above is wrong in the reassuring direction.** With the 20 s
+/// renewal timeout, the second failure can end at +80 s (30 + 20 + 30),
+/// which leaves 10 s, not 30 s. The third renewal starts at the +90 s tick,
+/// which is the TTL boundary itself (a peer judges age > 90 s stale), so it
+/// races a peer's staleness check rather than landing with room to spare.
+/// The const assert on [`INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR`] only
+/// guarantees the `renew_failing` line lands before the TTL; the
+/// `renew_lapsed` line marks the moment the TTL is reached.
+///
+/// Covered by `test_instance_lock_heartbeat_shutdown_releases_and_exits` and
+/// `test_instance_lock_heartbeat_pages_and_exits_on_lost_ownership` (both
+/// against a loopback SSM stub), and by the `heartbeat_tick` tests.
 pub fn spawn_instance_lock_heartbeat(
     ssm: Arc<SsmClient>,
     env: String,
     host_id: String,
     shutdown: Arc<Notify>,
     held_flag: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<HeartbeatExit> {
     let interval = Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
     tokio::spawn(async move {
         info!(
@@ -717,6 +1311,15 @@ pub fn spawn_instance_lock_heartbeat(
         // First tick fires immediately — skip it so we don't redundantly
         // re-write the parameter that try_acquire just put.
         ticker.tick().await;
+        // Seeded with the spawn instant: the lock was acquired just before
+        // the heartbeat is spawned. If boot spawned it later, the first
+        // `renew_lapsed` is judged late by that gap.
+        let mut tracker = RenewFailureTracker::starting_at(tokio::time::Instant::now());
+        // First-sample baseline: both series exist at 0 before any failure.
+        metrics::gauge!("tv_instance_lock_renew_consecutive_failures").set(0.0);
+        metrics::counter!("tv_instance_lock_renew_failed_total", "reason" => "error").increment(0);
+        metrics::counter!("tv_instance_lock_renew_failed_total", "reason" => "timeout")
+            .increment(0);
         loop {
             tokio::select! {
                 () = shutdown.notified() => {
@@ -726,53 +1329,46 @@ pub fn spawn_instance_lock_heartbeat(
                     );
                     // We are about to give the lock up — refuse any
                     // further mint from this process (fail-closed;
-                    // RESILIENCE-03 tripwire).
+                    // RESILIENCE-03 tripwire). The shutdown latch goes
+                    // first, so a mint refused from here on reads as a
+                    // stopping process, not a peer (CONC-4 review).
+                    RELEASED_AT_SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
                     held_flag.store(false, std::sync::atomic::Ordering::Release);
-                    if let Err(err) = release_instance_lock(&ssm, &env, &host_id).await {
-                        warn!(
-                            target: "tickvault::instance_lock",
-                            error = %err,
-                            "instance-lock release on shutdown failed (slot will be \
-                             considered stale within {}s by the next booting instance)",
-                            INSTANCE_LOCK_TTL_SECS
-                        );
-                    }
-                    return;
-                }
-                _ = ticker.tick() => {
-                    match renew_instance_lock(&ssm, &env, &host_id).await {
-                        Ok(true) => {
-                            // Successful renewal — silent to avoid every-30s
-                            // log chatter. SELFTEST-01 already provides the
-                            // daily positive ping.
+                    let path = compute_instance_lock_path(&env);
+                    return match release_lock_at_path(&ssm, &path, &host_id).await {
+                        Ok(ReleaseFound::Deleted) => HeartbeatExit::Released,
+                        Ok(ReleaseFound::AlreadyGone | ReleaseFound::HeldByOther) => {
+                            HeartbeatExit::NothingToRelease
                         }
-                        Ok(false) => {
-                            // Flip BEFORE logging so the mint tripwire
-                            // (RESILIENCE-03) is armed at the earliest
-                            // possible instant.
-                            held_flag.store(false, std::sync::atomic::Ordering::Release);
-                            error!(
-                                target: "tickvault::instance_lock",
-                                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
-                                severity = ErrorCode::Resilience01DualInstanceDetected
-                                    .severity()
-                                    .as_str(),
-                                env = %env,
-                                host_id = %host_id,
-                                "instance lock lost — another process now holds the lock; \
-                                 heartbeat task exiting; token mint is now REFUSED \
-                                 (RESILIENCE-03 tripwire armed)"
-                            );
-                            return;
-                        }
+                        Ok(ReleaseFound::Unparseable) => HeartbeatExit::ReleaseFailed,
                         Err(err) => {
                             warn!(
                                 target: "tickvault::instance_lock",
+                                code = ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                                stage = "release_at_shutdown_failed",
                                 error = %err,
-                                "transient instance-lock renewal failure; will retry on \
-                                 next heartbeat tick"
+                                "instance-lock release on shutdown failed (slot will be \
+                                 considered stale within {}s by the next booting instance)",
+                                INSTANCE_LOCK_TTL_SECS
                             );
+                            HeartbeatExit::ReleaseFailed
                         }
+                    };
+                }
+                _ = ticker.tick() => {
+                    // A successful renewal is silent (SELFTEST-01 gives the
+                    // daily positive ping); a lost lock exits; a failure or
+                    // a renewal past its timeout is counted and retried.
+                    let step = heartbeat_tick(
+                        renew_instance_lock(&ssm, &env, &host_id),
+                        &mut tracker,
+                        &held_flag,
+                        &env,
+                        &host_id,
+                    )
+                    .await;
+                    if step == HeartbeatStep::Exit {
+                        return HeartbeatExit::LostOwnership;
                     }
                 }
             }
@@ -785,8 +1381,12 @@ pub fn spawn_instance_lock_heartbeat(
 // surface stays small and the error mapping is centralised).
 // ---------------------------------------------------------------------------
 
-async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool) -> Result<()> {
-    ssm.put_parameter()
+/// Puts the lock value and returns the parameter VERSION SSM assigned to
+/// this write (2026-10-01, R7: read by [`classify_write`]; the SDK reads 0
+/// when the field is absent, which classifies as `Inconclusive`).
+async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool) -> Result<i64> {
+    let out = ssm
+        .put_parameter()
         .name(path)
         .value(value)
         .r#type(ParameterType::String)
@@ -802,16 +1402,24 @@ async fn put_parameter(ssm: &SsmClient, path: &str, value: &str, overwrite: bool
         // in the chain. Pinned by
         // `test_try_acquire_instance_lock_already_held_by_fresh_peer`.
         .map_err(|err| anyhow!("{}", aws_sdk_ssm::error::DisplayErrorContext(&err)))?;
-    Ok(())
+    Ok(out.version())
 }
 
+/// Value-only read — a thin wrapper over [`get_parameter_versioned`] for
+/// the paths that make no write decision (release, force takeover).
 async fn get_parameter(ssm: &SsmClient, path: &str) -> Result<Option<String>> {
+    Ok(get_parameter_versioned(ssm, path).await?.map(|(v, _)| v))
+}
+
+/// Reads the lock value together with its parameter VERSION (2026-10-01,
+/// R7). `Ok(None)` = the parameter is absent; the version reads 0 when SSM
+/// omits it.
+async fn get_parameter_versioned(ssm: &SsmClient, path: &str) -> Result<Option<(String, i64)>> {
     let result = ssm.get_parameter().name(path).send().await;
     match result {
         Ok(out) => Ok(out
             .parameter()
-            .and_then(|p| p.value())
-            .map(|v| v.to_string())),
+            .and_then(|p| p.value().map(|v| (v.to_string(), p.version())))),
         Err(err) => {
             // DisplayErrorContext (fix 2026-07-04): same as put_parameter —
             // the bare Display hid "ParameterNotFound", so an absent
@@ -940,6 +1548,296 @@ mod tests {
             INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS * 3 <= INSTANCE_LOCK_TTL_SECS,
             "heartbeat must allow at least two retries before TTL expiry"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Renewal failure counting + escalation (2026-10-11, audit SUP-9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_renew_failure_tracker_escalates_once_at_threshold() {
+        let mut tracker = RenewFailureTracker::default();
+        let mut escalations = 0;
+        for attempt in 1..=10u32 {
+            let escalated = tracker.on_failure();
+            if escalated {
+                escalations += 1;
+                assert_eq!(attempt, INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR);
+            }
+            assert_eq!(tracker.consecutive, attempt);
+        }
+        assert_eq!(escalations, 1, "escalation is edge-latched per episode");
+    }
+
+    #[test]
+    fn test_renew_failure_tracker_success_resets_and_rearms() {
+        let mut tracker = RenewFailureTracker::default();
+        assert_eq!(
+            tracker.on_success(tokio::time::Instant::now()),
+            None,
+            "no failure run to end"
+        );
+        for _ in 0..INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR {
+            tracker.on_failure();
+        }
+        assert_eq!(
+            tracker.on_success(tokio::time::Instant::now()),
+            Some(INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR)
+        );
+        assert_eq!(tracker.consecutive, 0);
+        // A new episode escalates again.
+        let escalated: Vec<bool> = (0..INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR)
+            .map(|_| tracker.on_failure())
+            .collect();
+        assert_eq!(escalated.last(), Some(&true));
+        assert_eq!(escalated.iter().filter(|e| **e).count(), 1);
+    }
+
+    #[test]
+    fn test_renew_failure_tracker_saturates() {
+        let mut tracker = RenewFailureTracker {
+            consecutive: u32::MAX,
+            escalated: true,
+            ..RenewFailureTracker::default()
+        };
+        assert!(!tracker.on_failure());
+        assert_eq!(tracker.consecutive, u32::MAX);
+    }
+
+    #[test]
+    fn test_renew_failures_escalate_before_the_ttl_lapses() {
+        let worst_case_escalation_secs = u64::from(INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR)
+            * INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS
+            + INSTANCE_LOCK_RENEW_TIMEOUT_SECS;
+        assert!(
+            worst_case_escalation_secs < INSTANCE_LOCK_TTL_SECS,
+            "escalation at {worst_case_escalation_secs}s must land before the \
+             {INSTANCE_LOCK_TTL_SECS}s TTL"
+        );
+        assert!(
+            INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR >= 2,
+            "one blip must not escalate"
+        );
+    }
+
+    #[test]
+    fn test_renew_timeout_is_below_the_heartbeat_interval() {
+        assert!(INSTANCE_LOCK_RENEW_TIMEOUT_SECS < INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS);
+        assert!(INSTANCE_LOCK_RENEW_TIMEOUT_SECS > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_tick_counts_a_hung_renewal_as_a_failure() {
+        let mut tracker = RenewFailureTracker::default();
+        let held = AtomicBool::new(true);
+        let started = tokio::time::Instant::now();
+        // Outer bound: if the timeout wrapper inside heartbeat_tick were
+        // removed, this fails fast instead of hanging the test job.
+        let step = tokio::time::timeout(
+            Duration::from_secs(INSTANCE_LOCK_RENEW_TIMEOUT_SECS * 2),
+            heartbeat_tick(
+                std::future::pending::<Result<bool>>(),
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            ),
+        )
+        .await
+        .expect("heartbeat_tick must bound a hung renewal by its own timeout");
+        assert_eq!(step, HeartbeatStep::Continue);
+        assert_eq!(
+            tracker.consecutive, 1,
+            "a hung renewal is a counted failure"
+        );
+        assert!(held.load(Ordering::Acquire), "no self-fence on a failure");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(INSTANCE_LOCK_RENEW_TIMEOUT_SECS),
+            "the renewal is cut off at the local timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_second_failure_escalates_and_success_recovers() {
+        let mut tracker = RenewFailureTracker::default();
+        let held = AtomicBool::new(true);
+        for _ in 0..INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR {
+            let step = heartbeat_tick(
+                async { Err(anyhow!("ssm unreachable")) },
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            )
+            .await;
+            assert_eq!(step, HeartbeatStep::Continue);
+        }
+        assert_eq!(
+            tracker.consecutive,
+            INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR
+        );
+        assert!(tracker.escalated, "the threshold failure escalates");
+        assert!(held.load(Ordering::Acquire));
+
+        let step = heartbeat_tick(async { Ok(true) }, &mut tracker, &held, "test", "host-a").await;
+        assert_eq!(step, HeartbeatStep::Continue);
+        assert_eq!(tracker.consecutive, 0);
+        assert!(!tracker.escalated, "a success re-arms the escalation");
+        assert!(held.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_lost_clears_flag_and_exits() {
+        let mut tracker = RenewFailureTracker::default();
+        let held = AtomicBool::new(true);
+        let step = heartbeat_tick(async { Ok(false) }, &mut tracker, &held, "test", "host-a").await;
+        assert_eq!(step, HeartbeatStep::Exit);
+        assert!(
+            !held.load(Ordering::Acquire),
+            "lock loss arms the mint tripwire"
+        );
+    }
+
+    /// A `Write` sink the heartbeat log-capture tests log into.
+    #[derive(Clone, Default)]
+    struct HeartbeatLogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for HeartbeatLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HeartbeatLogSink {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(
+                &self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .into_owned()
+        }
+
+        /// Installs a thread-local subscriber writing into this sink. The
+        /// current-thread test runtime polls `heartbeat_tick` on this thread.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            crate::test_support::keep_callsite_interest_shared();
+            tracing::subscriber::set_default(subscriber)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_tick_threshold_failure_logs_error_others_warn() {
+        let sink = HeartbeatLogSink::default();
+        let _guard = sink.install();
+        let mut tracker = RenewFailureTracker::default();
+        let held = AtomicBool::new(true);
+        let attempts = INSTANCE_LOCK_RENEW_FAILURES_BEFORE_ERROR + 2;
+        for _ in 0..attempts {
+            heartbeat_tick(
+                async { Err(anyhow!("dns lookup failed").context("GetParameter failed")) },
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            )
+            .await;
+        }
+        let out = sink.text();
+        let failing: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("renew_failing"))
+            .collect();
+        assert_eq!(failing.len(), 1, "one escalation per episode:\n{out}");
+        assert!(failing[0].contains("ERROR"), "{}", failing[0]);
+        assert!(failing[0].contains("RESILIENCE-01"), "{}", failing[0]);
+        assert!(
+            failing[0].contains("severity=\"high\""),
+            "an SSM blip is not a critical dual-instance detection: {}",
+            failing[0]
+        );
+        assert!(
+            failing[0].contains("dns lookup failed"),
+            "the whole error chain reaches the log, not only the outer context: {}",
+            failing[0]
+        );
+        let failed: Vec<&str> = out.lines().filter(|l| l.contains("renew_failed")).collect();
+        assert_eq!(
+            failed.len() as u32,
+            attempts - 1,
+            "every other failure is a warning:\n{out}"
+        );
+        for line in &failed {
+            assert!(line.contains("WARN"), "{line}");
+        }
+        assert!(
+            !out.contains("renew_lapsed"),
+            "no lapse without a known last success:\n{out}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_heartbeat_tick_logs_renew_lapsed_once_at_the_ttl() {
+        let sink = HeartbeatLogSink::default();
+        let _guard = sink.install();
+        let mut tracker = RenewFailureTracker::starting_at(tokio::time::Instant::now());
+        let held = AtomicBool::new(true);
+        let ticks_to_ttl = INSTANCE_LOCK_TTL_SECS / INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS;
+        for tick in 1..=ticks_to_ttl + 1 {
+            tokio::time::advance(Duration::from_secs(INSTANCE_LOCK_HEARTBEAT_INTERVAL_SECS)).await;
+            heartbeat_tick(
+                async { Err(anyhow!("ssm unreachable")) },
+                &mut tracker,
+                &held,
+                "test",
+                "host-a",
+            )
+            .await;
+            assert_eq!(
+                tracker.lapsed,
+                tick >= ticks_to_ttl,
+                "lapse latches at the tick that reaches the TTL (tick {tick})"
+            );
+        }
+        let out = sink.text();
+        let lapsed: Vec<&str> = out.lines().filter(|l| l.contains("renew_lapsed")).collect();
+        assert_eq!(lapsed.len(), 1, "edge-latched once per episode:\n{out}");
+        assert!(lapsed[0].contains("ERROR"), "{}", lapsed[0]);
+        assert!(lapsed[0].contains("severity=\"high\""), "{}", lapsed[0]);
+        assert!(held.load(Ordering::Acquire), "no self-fence on a lapse");
+
+        // A success re-arms the lapse latch from that renewal's start.
+        heartbeat_tick(async { Ok(true) }, &mut tracker, &held, "test", "host-a").await;
+        assert!(!tracker.lapsed);
+        assert_eq!(tracker.lapse_edge(tokio::time::Instant::now()), None);
+        tokio::time::advance(Duration::from_secs(INSTANCE_LOCK_TTL_SECS)).await;
+        assert_eq!(
+            tracker.lapse_edge(tokio::time::Instant::now()),
+            Some(INSTANCE_LOCK_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn test_renew_failure_tracker_lapse_needs_a_known_success() {
+        let mut tracker = RenewFailureTracker::default();
+        let far_later =
+            tokio::time::Instant::now() + Duration::from_secs(10 * INSTANCE_LOCK_TTL_SECS);
+        assert_eq!(tracker.lapse_edge(far_later), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1530,7 +2428,34 @@ mod tests {
     }
 
     fn put_ok_response() -> (u16, String) {
-        (200, r#"{"Version":1}"#.to_string())
+        put_ok_v(1)
+    }
+
+    /// A successful PutParameter that assigned version `v` (R7 write check).
+    fn put_ok_v(v: i64) -> (u16, String) {
+        (200, serde_json::json!({ "Version": v }).to_string())
+    }
+
+    /// A GetParameter returning `value` at version `v` (R7 write check).
+    fn get_v(value: &str, v: i64) -> (u16, String) {
+        (
+            200,
+            serde_json::json!({
+                "Parameter": {
+                    "Name": "/tickvault/testenv/instance-lock",
+                    "Type": "String",
+                    "Value": value,
+                    "Version": v
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn lock_json(host: &str, heartbeat_unix: u64) -> String {
+        LockValue::new(host, heartbeat_unix)
+            .to_json()
+            .expect("serialise lock value")
     }
 
     fn parameter_already_exists_response() -> (u16, String) {
@@ -1606,21 +2531,349 @@ mod tests {
     #[tokio::test]
     async fn test_try_acquire_instance_lock_stale_takeover() {
         // Put rejected → Get returns a holder whose heartbeat is ancient
-        // → stale takeover via PutParameter(overwrite=true) → Acquired.
-        let stale = LockValue::new("dead-host", 1)
-            .to_json()
-            .expect("serialise stale holder");
+        // → stale takeover via PutParameter(overwrite=true) → read-back
+        // (R7, 2026-10-01) confirms ours at our put version → Acquired.
+        // The private body is called with a zero settle so the test does
+        // not wait the production 10 s.
+        let stale = lock_json("dead-host", 1);
+        let ours = lock_json("host-a", now_unix_secs());
         let (url, _stub) = start_ssm_stub(vec![
             parameter_already_exists_response(),
-            get_parameter_response(&stale),
-            put_ok_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&ours, 4),
         ])
         .await;
         let ssm = stub_ssm_client(&url);
-        let outcome = try_acquire_instance_lock(&ssm, "testenv", "host-a")
-            .await
-            .expect("stale takeover path");
+        let outcome = try_acquire_lock_at_path(
+            &ssm,
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("stale takeover path");
         assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    // -----------------------------------------------------------------------
+    // R7 (2026-10-01) — write verdicts: the pure classifier, and the renew /
+    // takeover paths that read their own write back.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_write_held_when_read_back_is_ours_at_next_version() {
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Held
+        );
+    }
+
+    #[test]
+    fn test_classify_write_gap_is_held_after_contention() {
+        // put 7 after reading 5: one write landed between our read and put.
+        assert_eq!(
+            classify_write(5, 7, Some(("host-a", 7)), "host-a"),
+            WriteVerdict::HeldAfterContention
+        );
+    }
+
+    #[test]
+    fn test_classify_write_foreign_or_newer_read_back_is_lost() {
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 7)), "host-a"),
+            WriteVerdict::Lost
+        );
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 6)), "host-a"),
+            WriteVerdict::Lost
+        );
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 7)), "host-a"),
+            WriteVerdict::Lost
+        );
+    }
+
+    #[test]
+    fn test_classify_write_deleted_after_put_is_lost() {
+        assert_eq!(classify_write(5, 6, None, "host-a"), WriteVerdict::Lost);
+    }
+
+    #[test]
+    fn test_classify_write_lagging_read_back_is_inconclusive() {
+        assert_eq!(
+            classify_write(5, 6, Some(("host-a", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        // A lagging read is inconclusive even when it names a peer.
+        assert_eq!(
+            classify_write(5, 6, Some(("peer", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn test_classify_write_absent_or_non_monotonic_versions_are_inconclusive() {
+        assert_eq!(
+            classify_write(0, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(5, 0, Some(("host-a", 0)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(-1, 6, Some(("host-a", 6)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        // A put version at or below the read version cannot happen on SSM.
+        assert_eq!(
+            classify_write(5, 5, Some(("host-a", 5)), "host-a"),
+            WriteVerdict::Inconclusive
+        );
+        assert_eq!(
+            classify_write(i64::MAX, i64::MAX, None, "host-a"),
+            WriteVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn test_write_verdict_labels_are_stable() {
+        assert_eq!(WriteVerdict::Held.as_str(), "held");
+        assert_eq!(
+            WriteVerdict::HeldAfterContention.as_str(),
+            "held_after_contention"
+        );
+        assert_eq!(WriteVerdict::Lost.as_str(), "lost");
+        assert_eq!(WriteVerdict::Inconclusive.as_str(), "inconclusive");
+    }
+
+    #[test]
+    fn test_takeover_settle_covers_the_max_window() {
+        const {
+            assert!(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS < INSTANCE_LOCK_TAKEOVER_SETTLE_SECS);
+        }
+        assert_eq!(INSTANCE_LOCK_TAKEOVER_SETTLE_SECS, 10);
+        assert_eq!(INSTANCE_LOCK_TAKEOVER_MAX_WINDOW_SECS, 5);
+    }
+
+    #[tokio::test]
+    async fn test_renew_true_when_read_back_confirms() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("renew against stub");
+        assert!(renewed);
+    }
+
+    #[tokio::test]
+    async fn test_renew_false_when_peer_writes_after_our_put() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&peer, 7)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("lost-race renewal is Ok(false), not Err");
+        assert!(!renewed, "a write after ours = lost ownership");
+    }
+
+    #[tokio::test]
+    async fn test_renew_true_after_clobbering_interleaved_write() {
+        // put version 7 after reading 5 — a peer wrote version 6 in between
+        // and we overwrote it. Our value is stored: still held (counted +
+        // RESILIENCE-01 `renew_contention`).
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(7), get_v(&ours, 7)]).await;
+        let renewed = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect("contention renewal");
+        assert!(renewed);
+    }
+
+    #[tokio::test]
+    async fn test_renew_err_when_read_back_lags() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) =
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 5)]).await;
+        let err = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect_err("a lagging read-back must never read as held");
+        assert!(
+            format!("{err:#}").contains("inconclusive"),
+            "error must say inconclusive: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renew_err_when_read_back_fails() {
+        // Get + put served, the read-back finds the stub closed → Err with
+        // the renewal context (transient-retry path, never "held").
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6)]).await;
+        let err = renew_instance_lock(&stub_ssm_client(&url), "testenv", "host-a")
+            .await
+            .expect_err("failed read-back must Err");
+        assert!(
+            format!("{err:#}").contains("read-back"),
+            "error must name the read-back: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_lost_race_reports_peer() {
+        let stale = lock_json("dead-host", 1);
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&peer, 5),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("lost takeover is an outcome, not Err");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: "peer".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_after_contention_is_acquired() {
+        // Read 3, our put lands at 5: someone wrote 4 in between, and our
+        // value survived the settle → Acquired (counted + RESILIENCE-01).
+        let stale = lock_json("dead-host", 1);
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(5),
+            get_v(&ours, 5),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("contention takeover");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    #[tokio::test]
+    async fn test_takeover_unverified_when_read_back_lags() {
+        let stale = lock_json("dead-host", 1);
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+            get_v(&stale, 3),
+        ])
+        .await;
+        let err = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("an unverified takeover is a transient Err, never held or a peer");
+        assert!(
+            format!("{err:#}").contains("takeover unverified"),
+            "error must say the takeover is unverified: {err:#}"
+        );
+    }
+
+    /// R7 review (2026-10-01): an earlier attempt of THIS process left its
+    /// own value stored (an unverified takeover). The next attempt must not
+    /// read it as a live peer — that spends the boot loop's patience and
+    /// pages a dual instance against ourselves. It re-verifies instead.
+    #[tokio::test]
+    async fn test_own_fresh_value_is_reverified_not_read_as_a_peer() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&ours, 4),
+            put_ok_v(5),
+            get_v(&ours, 5),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("own value re-verifies");
+        assert_eq!(outcome, AcquireOutcome::Acquired);
+    }
+
+    /// The same own-value arm still refuses when a peer wrote after us.
+    #[tokio::test]
+    async fn test_own_fresh_value_lost_to_a_later_peer_write_is_already_held() {
+        let ours = lock_json("host-a", now_unix_secs());
+        let peer = lock_json("peer", now_unix_secs());
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&ours, 4),
+            put_ok_v(5),
+            get_v(&peer, 6),
+        ])
+        .await;
+        let outcome = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect("lost is an outcome");
+        assert_eq!(
+            outcome,
+            AcquireOutcome::AlreadyHeld {
+                holder: "peer".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_takeover_read_back_transport_error_is_err() {
+        // The takeover put is served, the read-back finds the stub closed:
+        // Err (the boot loop's transport-retry path), never Acquired.
+        let stale = lock_json("dead-host", 1);
+        let (url, _stub) = start_ssm_stub(vec![
+            parameter_already_exists_response(),
+            get_v(&stale, 3),
+            put_ok_v(4),
+        ])
+        .await;
+        let err = try_acquire_lock_at_path(
+            &stub_ssm_client(&url),
+            &compute_instance_lock_path("testenv"),
+            "host-a",
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("unreadable takeover must not acquire");
+        assert!(
+            format!("{err:#}").contains("takeover read-back"),
+            "error must name the takeover read-back: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -1712,7 +2965,7 @@ mod tests {
             .to_json()
             .expect("serialise our value");
         let (url, _stub) =
-            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+            start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
         let ssm = stub_ssm_client(&url);
         let renewed = renew_instance_lock(&ssm, "testenv", "host-a")
             .await
@@ -1855,8 +3108,7 @@ mod tests {
         let ours = LockValue::new("host-a", now_unix_secs())
             .to_json()
             .expect("serialise our value");
-        let (url2, _s2) =
-            start_ssm_stub(vec![get_parameter_response(&ours), put_ok_response()]).await;
+        let (url2, _s2) = start_ssm_stub(vec![get_v(&ours, 5), put_ok_v(6), get_v(&ours, 6)]).await;
         assert!(
             renew_instance_lock(&stub_ssm_client(&url2), "testenv", "host-a")
                 .await
@@ -1919,13 +3171,76 @@ mod tests {
             Arc::clone(&held),
         );
         shutdown.notify_one();
-        tokio::time::timeout(Duration::from_secs(30), handle)
+        let exit = tokio::time::timeout(Duration::from_secs(30), handle)
             .await
             .expect("heartbeat must exit promptly on shutdown")
             .expect("heartbeat task must not panic");
+        assert_eq!(exit, HeartbeatExit::Released, "our parameter was deleted");
         assert!(
             !held.load(Ordering::Acquire),
             "held_flag must flip false on shutdown"
+        );
+        assert!(lock_released_at_shutdown());
+    }
+
+    /// CONC-4 review (2026-10-11): the heartbeat reports what its shutdown
+    /// release found, so the caller never counts a release that did not
+    /// happen as `released`.
+    #[tokio::test]
+    async fn test_instance_lock_heartbeat_shutdown_reports_a_release_that_did_not_delete() {
+        for (response, expected) in [
+            (
+                get_parameter_response("not a lock value"),
+                HeartbeatExit::ReleaseFailed,
+            ),
+            (
+                get_parameter_absent_response(),
+                HeartbeatExit::NothingToRelease,
+            ),
+        ] {
+            let (url, _stub) = start_ssm_stub(vec![response]).await;
+            let shutdown = Arc::new(Notify::new());
+            let held = Arc::new(AtomicBool::new(true));
+            let handle = spawn_instance_lock_heartbeat(
+                Arc::new(stub_ssm_client(&url)),
+                "testenv".to_string(),
+                "host-a".to_string(),
+                Arc::clone(&shutdown),
+                Arc::clone(&held),
+            );
+            shutdown.notify_one();
+            let exit = tokio::time::timeout(Duration::from_secs(30), handle)
+                .await
+                .expect("heartbeat must exit promptly on shutdown")
+                .expect("heartbeat task must not panic");
+            assert_eq!(exit, expected);
+            assert!(!held.load(Ordering::Acquire));
+        }
+    }
+
+    /// CONC-4 review (2026-10-11): the shutdown latch is set by the
+    /// heartbeat's shutdown arm only; a lost lock does not set it. Process
+    /// wide, so this checks only the direction a parallel test cannot undo.
+    #[test]
+    fn test_lock_released_at_shutdown_is_set_only_by_the_shutdown_arm() {
+        let src = include_str!("instance_lock.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert_eq!(
+            prod.matches("RELEASED_AT_SHUTDOWN.store(true").count(),
+            1,
+            "exactly one store, in the shutdown arm"
+        );
+        let arm = prod
+            .find("() = shutdown.notified() =>")
+            .expect("shutdown arm");
+        let store = prod.find("RELEASED_AT_SHUTDOWN.store(true").expect("store");
+        let held = prod[arm..]
+            .find("held_flag.store(false")
+            .map(|i| i + arm)
+            .expect("held flag cleared in the arm");
+        assert!(
+            arm < store && store < held,
+            "latch set before the held flag"
         );
     }
 
@@ -1943,8 +3258,9 @@ mod tests {
             .to_json()
             .expect("serialise foreign value");
         let (url, _stub) = start_ssm_stub(vec![
-            get_parameter_response(&ours),
-            put_ok_response(),
+            get_v(&ours, 5),
+            put_ok_v(6),
+            get_v(&ours, 6),
             get_parameter_response(&foreign),
         ])
         .await;
@@ -1958,10 +3274,11 @@ mod tests {
             Arc::clone(&shutdown),
             Arc::clone(&held),
         );
-        tokio::time::timeout(Duration::from_secs(3600), handle)
+        let exit = tokio::time::timeout(Duration::from_secs(3600), handle)
             .await
             .expect("heartbeat must exit after losing ownership")
             .expect("heartbeat task must not panic");
+        assert_eq!(exit, HeartbeatExit::LostOwnership);
         assert!(
             !held.load(Ordering::Acquire),
             "held_flag must flip false when ownership is lost"

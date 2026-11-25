@@ -8,7 +8,7 @@ use std::hint::black_box;
 use chrono::NaiveDate;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+use tickvault_common::config::{MuhuratTradingEntry, NseHolidayEntry, TradingConfig};
 use tickvault_common::trading_calendar::TradingCalendar;
 
 /// Builds a realistic TradingCalendar with 15 holidays (typical NSE year).
@@ -83,9 +83,10 @@ fn build_calendar() -> TradingCalendar {
                 name: "Christmas".to_string(),
             },
         ],
-        muhurat_trading_dates: vec![NseHolidayEntry {
+        muhurat_trading_dates: vec![MuhuratTradingEntry {
             date: "2026-11-08".to_string(),
             name: "Diwali 2026".to_string(),
+            ..Default::default()
         }],
         nse_mock_trading_dates: vec![],
     };

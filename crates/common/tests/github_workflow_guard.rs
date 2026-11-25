@@ -11,8 +11,10 @@
 //!   1. workflow file exists
 //!   2. triggers on push to main with `deploy/aws/terraform/**` path filter
 //!   3. has both terraform-plan and terraform-apply jobs
-//!   4. uses pinned `hashicorp/setup-terraform@v4` action
-//!   5. uses pinned `aws-actions/configure-aws-credentials@v4` action
+//!   4. uses pinned `hashicorp/setup-terraform` v4 action
+//!   5. uses pinned `aws-actions/configure-aws-credentials` v6.3.0 action
+//!      (2026-10-09: both are pinned to a 40-character commit SHA with the
+//!      tag as a trailing comment, not to the movable tag itself)
 //!   6. has the market-hours guard job
 //!   7. has `aws sns publish` for both success and failure notify paths
 //!   8. injects S3 backend bucket name via `-backend-config="bucket=tv-terraform-state-`
@@ -113,11 +115,11 @@ fn r3b_has_preflight_job_that_gates_downstream_on_bootstrap_secrets() {
 #[test]
 fn r4_uses_pinned_setup_terraform_action() {
     let body = read(WORKFLOW);
-    must_contain(
-        &body,
-        "hashicorp/setup-terraform@v4",
-        "setup-terraform pinned action",
-    );
+    // 2026-10-09 (stress audit RO-5/SEC-2): was `must_contain("…@v4")`. A tag
+    // can be moved by whoever controls the action's repository, and this job
+    // holds production credentials, so the pin is now a commit SHA with the
+    // tag kept as a comment.
+    assert_pinned_to_sha_with_tag(&body, "hashicorp/setup-terraform", "v4");
     must_contain(
         &body,
         "terraform_version: 1.9.8",
@@ -128,11 +130,30 @@ fn r4_uses_pinned_setup_terraform_action() {
 #[test]
 fn r5_uses_pinned_configure_aws_credentials_action() {
     let body = read(WORKFLOW);
-    must_contain(
-        &body,
-        "aws-actions/configure-aws-credentials@v4",
-        "configure-aws-credentials pinned action",
-    );
+    // 2026-10-09: SHA form, same reason as r4.
+    assert_pinned_to_sha_with_tag(&body, "aws-actions/configure-aws-credentials", "v6.3.0");
+}
+
+/// Every `uses: <action>@…` line in `body` names a 40-character commit SHA
+/// and carries `# <tag>` as its trailing comment; at least one such line
+/// exists.
+fn assert_pinned_to_sha_with_tag(body: &str, action: &str, tag: &str) {
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|l| uses_value(l).is_some_and(|v| v.starts_with(&format!("{action}@"))))
+        .collect();
+    assert!(!lines.is_empty(), "{action}: no `uses:` line found");
+    for line in lines {
+        let value = uses_value(line).unwrap_or_default();
+        assert!(
+            is_full_sha_ref(value),
+            "{action}: must be pinned to a 40-character commit SHA: {line:?}"
+        );
+        assert!(
+            line.contains(&format!("# {tag}")),
+            "{action}: the pin must carry `# {tag}` so a reader sees the version: {line:?}"
+        );
+    }
 }
 
 #[test]
@@ -444,4 +465,1064 @@ fn r17_ci_test_matrix_runs_integration_tests_not_just_lib() {
          in crates/*/tests/ and lets them rot silently until the post-merge \
          Coverage & Perf job (#988 root cause). Run the full per-crate suite."
     );
+}
+
+/// Audit PR36a (2026-09-27): the operator console key was published to the
+/// alerts topic as `${URL}#key=${KEY}`, and that topic also delivers to email
+/// and SMS, so the key sat in plaintext mail and text history. `add-mask`
+/// only hides the Actions log. No workflow may put the key, or a `#key=`
+/// link, into any published message, and the portal step must not read the
+/// stored key at all.
+#[test]
+fn r20_no_workflow_publishes_the_operator_key() {
+    let dir = repo_root().join(".github/workflows");
+    let mut scanned = 0usize;
+    for entry in fs::read_dir(&dir).expect("workflows dir readable") {
+        let path = entry.expect("dir entry").path();
+        let is_yaml = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml") | Some("yaml")
+        );
+        if !is_yaml {
+            continue;
+        }
+        scanned += 1;
+        let body = fs::read_to_string(&path).expect("workflow readable");
+        let name = path.display();
+        assert!(
+            !body.contains("#key="),
+            "{name}: builds a #key= link; the operator key must never be sent (audit PR36a)"
+        );
+        let hits = published_message_key_leaks(&body);
+        assert!(
+            hits.is_empty(),
+            "{name}: published-message secret references: {hits:?}"
+        );
+    }
+    assert!(scanned > 0, "no workflow files scanned");
+    assert!(
+        secret_holding_vars(&read(WORKFLOW)).contains(&"TOK".to_string()),
+        "the alias scan must find the real control-secret reader, not pass vacuously"
+    );
+
+    let body = read(WORKFLOW);
+    let start = body
+        .find("- name: Send the operator-portal link to Telegram")
+        .expect("portal link step present");
+    let rest = &body[start + 1..];
+    let step = &rest[..rest.find("\n      - name:").unwrap_or(rest.len())];
+    assert!(
+        !step.contains("--with-decryption"),
+        "the portal step must not read the stored operator key"
+    );
+    must_contain(
+        step,
+        "The key is never sent in a message.",
+        "portal message tells the operator where the key is instead",
+    );
+    // Rotation (owner chose "Rotate after fix", 2026-09-27): only the exact
+    // word "rotate" overwrites the stored key, and a failed overwrite fails
+    // the step instead of reporting success.
+    must_contain(step, "rotate_console_key", "rotation is a manual input");
+    must_contain(
+        step,
+        "[ \"$ROTATE_CONSOLE_KEY\" = \"rotate\" ]",
+        "rotation needs the exact word",
+    );
+    must_contain(step, "--overwrite", "rotation replaces the stored key");
+    must_contain(
+        step,
+        "console key rotation FAILED",
+        "a failed rotation is loud",
+    );
+    // Security review (PR36a): the first-time save and the key itself are
+    // checked too, so neither an empty key nor a failed save is reported as
+    // a live portal.
+    must_contain(
+        step,
+        "[ ${#KEY} -ne 40 ]",
+        "a key is stored only after its length is checked",
+    );
+    must_contain(
+        step,
+        "console key generation FAILED",
+        "an empty or short key is loud",
+    );
+    must_contain(
+        step,
+        "console key creation FAILED",
+        "a failed first-time save is loud",
+    );
+    must_contain(
+        step,
+        "could not read the stored key; the old key is still in place",
+        "a rotation that fell into the create branch is not reported as done",
+    );
+    let rotate_input = body
+        .find("      rotate_console_key:")
+        .expect("rotate_console_key dispatch input declared");
+    assert!(
+        body[rotate_input..].contains("default: ''"),
+        "rotation defaults to off"
+    );
+}
+
+/// Audit PR36b (2026-09-27): a manual deploy could be started from any
+/// branch and reach the prod environment, shipping a commit that never
+/// passed All Green. The deploy workflow's preflight refuses a manual run
+/// that is not on main or whose commit has no successful All Green (its own,
+/// or the head of the pull request squash-merged as it), fail-closed on any
+/// API error, and reports whether the prod environment has a
+/// deployment-branch rule (the barrier a branch cannot delete).
+#[test]
+fn r21_manual_deploy_needs_main_and_all_green() {
+    let body = read(DEPLOY_AWS_WORKFLOW);
+    let start = body
+        .find("- name: Refuse a manual or tag deploy of a commit that did not pass All Green")
+        .expect("manual-deploy gate step present");
+    let pre = &body[..start];
+    assert!(
+        pre.rfind("\n  preflight:") > pre.rfind("\n  build:"),
+        "the gate sits in the preflight job, before the build"
+    );
+    let rest = &body[start + 1..];
+    let step = &rest[..rest.find("\n      - name:").unwrap_or(rest.len())];
+    must_contain(
+        step,
+        "if: github.event_name == 'workflow_dispatch'",
+        "the gate runs on every manual run",
+    );
+    must_contain(
+        step,
+        "[ \"$RUN_REF\" != \"refs/heads/main\" ]",
+        "only main can be deployed by hand",
+    );
+    // Audit PR36c (2026-10-03): a pushed v*.*.* tag runs the same gate, and
+    // its commit must already be on main.
+    must_contain(
+        step,
+        "if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')",
+        "the gate runs on every manual run AND every tag run",
+    );
+    must_contain(
+        step,
+        "compare/main...${RUN_SHA}",
+        "a tag's commit is compared with main",
+    );
+    must_contain(
+        step,
+        "identical|behind)",
+        "only a commit already on main (main's head or an ancestor) passes",
+    );
+    must_contain(step, "check_name=All%20Green", "reads the All Green check");
+    must_contain(
+        step,
+        ".app.slug == \"github-actions\"",
+        "only an All Green posted by GitHub Actions counts",
+    );
+    must_contain(
+        step,
+        ".merge_commit_sha == \\\"${RUN_SHA}\\\"",
+        "the pull request must be the one merged as this commit",
+    );
+    must_contain(step, "could not read", "an API failure refuses the deploy");
+    assert!(
+        !step.contains("continue-on-error"),
+        "the gate must be able to fail the run"
+    );
+    let job = &body[pre.rfind("\n  preflight:").expect("preflight job")..];
+    let job = &job[..job.find("\n  build:").expect("build job after preflight")];
+    must_contain(job, "checks: read", "preflight may read check runs");
+    must_contain(
+        job,
+        "pull-requests: read",
+        "preflight may read pull requests",
+    );
+    must_contain(
+        job,
+        "- name: Report whether the prod environment is limited to main",
+        "the prod environment's branch rule is reported on every run",
+    );
+    must_contain(
+        job,
+        "prod environment accepts runs from ANY branch",
+        "a missing branch rule is a visible warning",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Mutation lane (audit H2, 2026-10-06). The weekly full sweep is ~18-hour
+// class and the job was capped at 60 minutes, so it could never finish. The
+// sweep is sharded and each shard gets GitHub's long job timeout; a push run
+// mutates only the changed lines.
+// ---------------------------------------------------------------------------
+
+const MUTATION_WORKFLOW: &str = ".github/workflows/mutation.yml";
+
+#[test]
+fn mutation_weekly_sweep_is_sharded_with_a_timeout_it_can_finish_in() {
+    let wf = read(MUTATION_WORKFLOW);
+    must_contain(
+        &wf,
+        "fromJSON('[0, 1, 2, 3, 4, 5, 6, 7]')",
+        "mutation sweep shard matrix",
+    );
+    must_contain(
+        &wf,
+        "MUTATION_SHARDS: ${{ github.event_name == 'push' && 1 || 8 }}",
+        "mutation shard count matches the matrix",
+    );
+    must_contain(
+        &wf,
+        "--shard \"${{ matrix.shard }}/${MUTATION_SHARDS}\"",
+        "cargo mutants runs one shard per job",
+    );
+    must_contain(
+        &wf,
+        "timeout-minutes: ${{ github.event_name == 'push' && 60 || 350 }}",
+        "scheduled shards get the long timeout",
+    );
+    must_contain(
+        &wf,
+        "fail-fast: false",
+        "one shard's result never cancels the others",
+    );
+    must_contain(
+        &wf,
+        "name: mutation-results-shard-${{ matrix.shard }}",
+        "each shard uploads its own results",
+    );
+    assert!(
+        !wf.contains("    timeout-minutes: 60\n"),
+        "a flat 60-minute cap on the mutation job is back; the weekly sweep cannot finish in it"
+    );
+}
+
+#[test]
+fn mutation_push_run_mutates_only_the_changed_lines() {
+    let wf = read(MUTATION_WORKFLOW);
+    for (needle, label) in [
+        (
+            "git diff \"$before\" HEAD -- crates/core crates/trading crates/common > mutants.diff",
+            "push run diff is limited to the critical crates",
+        ),
+        (
+            "echo \"in_diff=--in-diff mutants.diff\" >> \"$GITHUB_OUTPUT\"",
+            "push run passes the diff to cargo mutants",
+        ),
+        (
+            "${{ steps.changed.outputs.in_diff }}",
+            "cargo mutants receives the in-diff argument",
+        ),
+        (
+            "--in-place",
+            "the unmutated baseline keeps .git (2026-10-04)",
+        ),
+    ] {
+        assert!(
+            wf.contains(needle),
+            "{label}: expected to contain {needle:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cargo-careful runner disk (2026-10-06, the issue #1836 class). The weekly
+// run and its re-run died linking with "Free space left: 0 MB" and an lld
+// "Bus error". The job now carries the sanitizer jobs' three disk measures.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn careful_job_frees_runner_disk_and_drops_dependency_debug_info() {
+    let wf = read(".github/workflows/safety.yml");
+    let start = wf.find("\n  careful:\n").expect("careful job present");
+    let end = wf[start..]
+        .find("\n  sanitizer-asan:\n")
+        .map(|i| start + i)
+        .expect("asan job follows careful");
+    let job = &wf[start..end];
+    for (needle, label) in [
+        (
+            "Free runner disk space",
+            "frees the preinstalled toolchains",
+        ),
+        (
+            "sudo rm -rf /usr/share/dotnet",
+            "the cleanup actually removes something",
+        ),
+        (
+            "CARGO_PROFILE_DEV_DEBUG: line-tables-only",
+            "line tables for our crates",
+        ),
+        (
+            "CARGO_RESOLVER_FEATURE_UNIFICATION: workspace",
+            "one feature set for every -p",
+        ),
+        (
+            "Report runner disk (issue 1836)",
+            "df after the build either way",
+        ),
+    ] {
+        assert!(
+            job.contains(needle),
+            "careful job {label}: expected {needle:?}"
+        );
+    }
+    let no_dep_debug = job
+        .matches("--config 'profile.dev.package.\"*\".debug=false'")
+        .count();
+    assert_eq!(
+        no_dep_debug, 2,
+        "both careful cargo calls (build and test) must drop dependency debug info, else the test step relinks with full debug info"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Nightly full-workspace run (2026-10-11). The 2026-10-10 run had 3.25 GB
+// free, below the seal spill's 4 GiB free-disk floor, so storage tests failed;
+// then `gh issue create` failed because its labels did not exist, so the
+// failure opened no issue.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nightly_frees_disk_before_checkout_and_creates_its_issue_labels() {
+    let wf = read(".github/workflows/full-test-nightly.yml");
+    let free = wf
+        .find("Free runner disk space")
+        .expect("nightly frees the preinstalled toolchains");
+    let checkout = wf.find("- name: Checkout").expect("checkout step present");
+    assert!(
+        free < checkout,
+        "disk is freed before the checkout and build"
+    );
+    assert!(
+        wf.contains("sudo rm -rf /usr/share/dotnet"),
+        "the cleanup actually removes something"
+    );
+    for label in ["nightly-regression", "auto-triage"] {
+        let create = wf
+            .find(&format!("gh label create {label} --force"))
+            .unwrap_or_else(|| panic!("label {label} is created before use"));
+        let issue = wf.find("gh issue create").expect("issue step present");
+        assert!(create < issue, "label {label} exists before the issue");
+    }
+}
+
+/// 2026-11-06 (PR CI, CI-1/CI-2): eight nights failed on "No space left on
+/// device" while linking test binaries with full debug info, the aarch64
+/// runner was shut down mid-compile, and each failure opened a NEW issue
+/// that never named the failing test.
+#[test]
+fn nightly_builds_without_debug_info_and_keeps_one_issue() {
+    let wf = read(".github/workflows/full-test-nightly.yml");
+    for var in [
+        "CARGO_PROFILE_DEV_DEBUG: \"0\"",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
+    ] {
+        assert_eq!(
+            wf.matches(var).count(),
+            2,
+            "both nightly jobs (x86 and aarch64) set {var}"
+        );
+    }
+    assert_eq!(
+        wf.matches("trap 'echo \"=== df -h after the build ===\"; df -h /' EXIT")
+            .count(),
+        2,
+        "both test steps print free disk after the build, even when it fails"
+    );
+    assert!(
+        !wf.contains("run: cargo check"),
+        "the duplicate check step is gone (cargo test builds the same targets)"
+    );
+    assert!(
+        wf.contains("grep -m 60 -E 'FAILED|panicked|error\\[|No space left'"),
+        "the issue body leads with the lines that name the failure"
+    );
+    let search = wf
+        .find("in:title \"nightly regression: full-workspace\"")
+        .expect("the x86 job looks for its open issue first");
+    let comment = wf
+        .find("gh issue comment \"$num\"")
+        .expect("an open issue is commented on");
+    let create = wf
+        .find("--title \"nightly regression: full-workspace tests failing\"")
+        .expect("one fixed title, no commit in it");
+    assert!(
+        search < comment && comment < create,
+        "search, then comment, then create only when none is open"
+    );
+    assert!(
+        !wf.contains("full-workspace test failed @"),
+        "no per-commit title: each night would open a new issue"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stress audit 2026-10-09: RO-5/SEC-2 (action pins), OPS-2 (reset-failed),
+// RO-1 (no market-data deletion in a workflow).
+// ---------------------------------------------------------------------------
+
+/// Every workflow file under `.github/workflows/`, as `(path, text)`.
+fn workflow_files() -> Vec<(String, String)> {
+    let dir = repo_root().join(".github/workflows");
+    let mut out: Vec<(String, String)> = fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {} failed: {e}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yml" || x == "yaml"))
+        .map(|p| {
+            let rel = format!(
+                ".github/workflows/{}",
+                p.file_name().unwrap_or_default().to_string_lossy()
+            );
+            let text = fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+            (rel, text)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The value of a `uses:` key on this line (`- uses: x` or `uses: x`), with
+/// quotes and any trailing ` # comment` removed. `None` for every other line,
+/// comment lines included.
+fn uses_value(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let t = t.strip_prefix("- ").map_or(t, str::trim_start);
+    let v = t.strip_prefix("uses:")?.trim();
+    let v = v.split(" #").next().unwrap_or(v).trim();
+    Some(v.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// `owner/repo[/path]@<40 lowercase hex>`.
+fn is_full_sha_ref(value: &str) -> bool {
+    let Some((name, git_ref)) = value.rsplit_once('@') else {
+        return false;
+    };
+    !name.is_empty()
+        && git_ref.len() == 40
+        && git_ref
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Remote actions still allowed on a tag or branch, as `action@ref`.
+///
+/// SHRINK-ONLY: entries may be removed, never added, and
+/// [`UNPINNED_ACTION_CEILING`] may only be lowered. Empty since 2026-10-09:
+/// every remote action resolved to a commit with `git ls-remote`.
+const UNPINNED_ACTION_ALLOWLIST: &[&str] = &[];
+
+/// Upper bound on [`UNPINNED_ACTION_ALLOWLIST`]. May only go down.
+const UNPINNED_ACTION_CEILING: usize = 0;
+
+/// The `uses:` lines across `files` that name a remote action by anything
+/// other than a full commit SHA (a `docker://` image needs an `@sha256:`
+/// digest), minus the allowlist. Local `./` actions are ours and exempt.
+fn unpinned_action_lines(files: &[(String, String)], allow: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, text) in files {
+        for (i, line) in text.lines().enumerate() {
+            let Some(v) = uses_value(line) else {
+                continue;
+            };
+            if v.starts_with("./") || allow.contains(&v) {
+                continue;
+            }
+            let pinned = match v.strip_prefix("docker://") {
+                Some(image) => image.contains("@sha256:"),
+                None => is_full_sha_ref(v),
+            };
+            if !pinned {
+                out.push(format!("{path}:{}: {v}", i + 1));
+            }
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-09 — actions holding production credentials (AWS keys,
+// the GitHub token) were pinned to movable tags, so whoever could move the
+// tag could run code with those credentials.
+#[test]
+#[allow(clippy::absurd_extreme_comparisons)] // APPROVED: the ceiling is 0 today, so `len() <= CEILING` reads as `is_empty()`; it is written against the constant so the check follows the ceiling it names.
+fn test_regression_every_remote_action_is_pinned_to_a_commit_sha() {
+    assert!(
+        UNPINNED_ACTION_ALLOWLIST.len() <= UNPINNED_ACTION_CEILING,
+        "the unpinned-action allowlist may only shrink"
+    );
+    let files = workflow_files();
+    assert!(files.len() > 5, "found only {} workflows", files.len());
+    let used: usize = files
+        .iter()
+        .map(|(_, t)| t.lines().filter(|l| uses_value(l).is_some()).count())
+        .sum();
+    assert!(
+        used > 50,
+        "found only {used} `uses:` lines; the scan is broken"
+    );
+    let bad = unpinned_action_lines(&files, UNPINNED_ACTION_ALLOWLIST);
+    assert!(
+        bad.is_empty(),
+        "remote actions must be pinned to a 40-character commit SHA with the tag as \
+         a trailing comment (resolve it with `git ls-remote <repo> refs/tags/<tag>` \
+         and use the peeled `^{{}}` commit for an annotated tag):\n{}",
+        bad.join("\n")
+    );
+    for entry in UNPINNED_ACTION_ALLOWLIST {
+        assert!(
+            files
+                .iter()
+                .any(|(_, t)| t.lines().any(|l| uses_value(l) == Some(*entry))),
+            "allowlist entry {entry} is no longer used: remove it"
+        );
+    }
+}
+
+#[test]
+fn unpinned_action_scan_bites() {
+    let wf = |t: &str| vec![("w.yml".to_string(), t.to_string())];
+    let sha = "3d3c42e5aac5ba805825da76410c181273ba90b1";
+    assert_eq!(
+        unpinned_action_lines(&wf("      - uses: actions/checkout@v7\n"), &[]).len(),
+        1
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: \"a/b@main\"  # note\n"), &[]).len(),
+        1
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: a/b@3d3c42e5aac5\n"), &[]).len(),
+        1,
+        "a short SHA is not a pin"
+    );
+    assert_eq!(
+        unpinned_action_lines(&wf("        uses: docker://alpine:3\n"), &[]).len(),
+        1
+    );
+    assert!(
+        unpinned_action_lines(
+            &wf(&format!(
+                "      - uses: actions/checkout@{sha} # v7.0.1\n        uses: ./local\n      # uses: x/y@v1\n"
+            )),
+            &[]
+        )
+        .is_empty()
+    );
+    assert!(unpinned_action_lines(&wf("  uses: a/b@v1\n"), &["a/b@v1"]).is_empty());
+}
+
+// Regression: 2026-10-09 — the normal deploy swap restarted the app without
+// `systemctl reset-failed` first, so a unit that had crash-looped into its
+// start limit refused the restart and the FIX could not be deployed; the
+// rollback then reinstalled the crashing binary.
+#[test]
+fn test_regression_deploy_swap_resets_a_failed_unit_before_restarting() {
+    let wf = read(DEPLOY_AWS_WORKFLOW);
+    let lines: Vec<&str> = wf.lines().collect();
+    let restart = lines
+        .iter()
+        .position(|l| {
+            !l.trim_start().starts_with('#')
+                && l.contains("\"systemctl restart tickvault --no-block")
+        })
+        .expect("deploy-aws.yml must restart the app with --no-block");
+    let from = restart.saturating_sub(DEPLOY_RESET_FAILED_WINDOW_LINES);
+    let reset = lines[from..restart].iter().any(|l| {
+        !l.trim_start().starts_with('#') && l.contains("systemctl reset-failed tickvault")
+    });
+    assert!(
+        reset,
+        "deploy-aws.yml must run `systemctl reset-failed tickvault` in the {} SSM \
+         command(s) before `systemctl restart tickvault --no-block`",
+        DEPLOY_RESET_FAILED_WINDOW_LINES
+    );
+}
+
+// Regression: 2026-10-09 — the same missing `reset-failed` sat on the two
+// other workflow paths that restart the app (the instance downsize and the
+// operator restart / IP-change buttons in aws-control). A crash-locked unit
+// refused each of those restarts too.
+#[test]
+fn test_regression_every_workflow_restart_resets_a_failed_unit_first() {
+    let mut missing = Vec::new();
+    let mut restarts = 0usize;
+    for (rel, text) in workflow_files() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            // The app unit only: `tickvault-host-tuning` is a different unit.
+            let Some(at) = line
+                .match_indices("systemctl restart tickvault")
+                .find_map(|(at, m)| {
+                    let next = line[at + m.len()..].chars().next();
+                    (!next.is_some_and(|c| c == '-' || c.is_ascii_alphanumeric())).then_some(at)
+                })
+            else {
+                continue;
+            };
+            restarts += 1;
+            let same_line = line[..at].contains("systemctl reset-failed tickvault");
+            let from = i.saturating_sub(DEPLOY_RESET_FAILED_WINDOW_LINES);
+            let before = lines[from..i].iter().any(|l| {
+                !l.trim_start().starts_with('#') && l.contains("systemctl reset-failed tickvault")
+            });
+            if !same_line && !before {
+                missing.push(format!("{rel}:{}", i + 1));
+            }
+        }
+    }
+    assert!(
+        restarts >= WORKFLOW_APP_RESTART_FLOOR,
+        "expected at least {WORKFLOW_APP_RESTART_FLOOR} workflow app restarts, found {restarts}"
+    );
+    assert!(
+        missing.is_empty(),
+        "every workflow `systemctl restart tickvault` must follow \
+         `systemctl reset-failed tickvault` (same command or the {} before it): {missing:?}",
+        DEPLOY_RESET_FAILED_WINDOW_LINES
+    );
+}
+
+/// Workflow lines that restart the app today (deploy, downsize, two in
+/// aws-control). A floor, so a rename that hides them fails loudly.
+const WORKFLOW_APP_RESTART_FLOOR: usize = 4;
+
+/// How many lines before the restart the reset may sit (the marker element
+/// sits directly before it today).
+const DEPLOY_RESET_FAILED_WINDOW_LINES: usize = 2;
+
+/// Non-comment lines of `text` that delete raw capture, spill or dead-letter
+/// data with `rm`, or drop or truncate a market-data table (named, or through
+/// a shell variable).
+fn market_data_deletions(text: &str) -> Vec<String> {
+    const RAW_DIRS: &[&str] = &["ws_wal", "spill", "dlq"];
+    const TABLES: &[&str] = &["ticks", "market_depth", "candles", "top_volume"];
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let words: Vec<&str> = t.split_whitespace().collect();
+        let rm_with_flags = words
+            .windows(2)
+            .any(|w| w[0] == "rm" && w[1].starts_with('-'));
+        if rm_with_flags && RAW_DIRS.iter().any(|d| t.contains(d)) {
+            out.push(format!("{}: {t}", i + 1));
+            continue;
+        }
+        let upper = t.to_ascii_uppercase();
+        let drops = upper.contains("DROP TABLE") || upper.contains("TRUNCATE TABLE");
+        if drops && (TABLES.iter().any(|n| t.contains(n)) || t.contains('$')) {
+            out.push(format!("{}: {t}", i + 1));
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-09 — emergency-fs-recover.yml ran `rm -rf` on ws_wal,
+// spill and dlq and dropped ticks, market_depth and every candles_<tf> with
+// no verified S3 copy. Quotes 21/22 are spent and Quote 28 (2026-09-29)
+// forbids deleting captured market data without a verified copy.
+#[test]
+fn test_regression_no_workflow_deletes_market_data_without_a_verified_copy() {
+    let mut bad = Vec::new();
+    for (path, text) in workflow_files() {
+        for hit in market_data_deletions(&text) {
+            bad.push(format!("{path}:{hit}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a workflow deletes captured market data. Quote 28 (2026-09-29) forbids it \
+         without a verified copy; a deletion needs a fresh dated operator quote in \
+         daily-universe-scope-expansion-2026-05-27.md first:\n{}",
+        bad.join("\n")
+    );
+}
+
+#[test]
+fn market_data_deletion_scan_bites() {
+    for line in [
+        "sudo rm -rf /opt/tickvault/data/spill /opt/tickvault/data/dlq",
+        "  sudo rm -rf /opt/tickvault/data/ws_wal",
+        "sudo rm -f /opt/tickvault/data/spill-hold/*.ilp",
+        r#"R=$(q "DROP TABLE IF EXISTS $t")"#,
+        r#"curl ... "query=DROP TABLE ticks""#,
+        r#"q "truncate table candles_1m""#,
+    ] {
+        assert_eq!(market_data_deletions(line).len(), 1, "{line}");
+    }
+    for line in [
+        "# sudo rm -rf /opt/tickvault/data/ws_wal (history)",
+        "rm -rf scripts/groww-sidecar",
+        "- NEVER run `git reset --hard`, `rm -rf`, `DROP TABLE`, or",
+        "sudo du -sBG /opt/tickvault/data/spill /opt/tickvault/data/ws_wal",
+    ] {
+        assert!(market_data_deletions(line).is_empty(), "{line}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deep audit SEC-7 (2026-10-12): no dispatch input pasted into a run script.
+// ---------------------------------------------------------------------------
+
+/// `(line number, text)` of every line that belongs to a `run:` script in a
+/// workflow: the value of a one-line `run: x`, or every line of a `run: |` /
+/// `run: >` block scalar (lines indented deeper than the key, blanks kept).
+fn run_script_lines(text: &str) -> Vec<(usize, &str)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim_start();
+        let t = t.strip_prefix("- ").map_or(t, str::trim_start);
+        if let Some(value) = t.strip_prefix("run:") {
+            let v = value.trim();
+            if v.starts_with('|') || v.starts_with('>') {
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let l = lines[j];
+                    let li = l.len() - l.trim_start().len();
+                    if !l.trim().is_empty() && li <= indent {
+                        break;
+                    }
+                    out.push((j + 1, l));
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            out.push((i + 1, line));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Lines across `files` where a run script pastes a dispatch input inline.
+fn inputs_interpolated_into_run(files: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, text) in files {
+        for (n, line) in run_script_lines(text) {
+            let squeezed: String = line.split_whitespace().collect();
+            if squeezed.contains("${{github.event.inputs.") || squeezed.contains("${{inputs.") {
+                out.push(format!("{path}:{n}: {}", line.trim()));
+            }
+        }
+    }
+    out
+}
+
+// Regression: 2026-10-12 (deep audit SEC-7) — `confirm_market_hours`, a free
+// string, was written as `"${{ github.event.inputs.confirm_market_hours }}"`
+// inside three run scripts. GitHub pastes the value into the script before
+// bash parses it, so a value such as `yes"; curl ...; "` ran on a runner
+// holding deploy credentials. Inputs reach a script through `env:` only.
+#[test]
+fn r_no_dispatch_input_interpolated_into_run_script() {
+    let files = workflow_files();
+    assert!(files.len() > 20, "only {} workflows found", files.len());
+    let scanned: usize = files.iter().map(|(_, t)| run_script_lines(t).len()).sum();
+    assert!(
+        scanned > 1_000,
+        "only {scanned} run lines found; the scan is broken"
+    );
+    let hits = inputs_interpolated_into_run(&files);
+    assert!(
+        hits.is_empty(),
+        "a run script pastes a dispatch input inline (expression injection): {hits:?}. \
+         Pass it through the step's `env:` and read the variable instead."
+    );
+}
+
+#[test]
+fn r_dispatch_input_scan_bites() {
+    let bad = (
+        "x.yml".to_string(),
+        [
+            "jobs:",
+            "  a:",
+            "    steps:",
+            "      - name: s",
+            "        env:",
+            "          OK: ${{ github.event.inputs.confirm }}",
+            "        with:",
+            "          prompt: ${{ inputs.instruction }}",
+            "        run: |",
+            "          echo start",
+            "",
+            "          if [ \"${{ github.event.inputs.confirm_market_hours }}\" = \"yes\" ]; then",
+            "            exit 0",
+            "          fi",
+            "      - run: echo ${{ inputs.x }}",
+            "      - name: after",
+            "        if: github.event.inputs.action == 'status'",
+        ]
+        .join("\n"),
+    );
+    let hits = inputs_interpolated_into_run(&[bad]);
+    assert_eq!(
+        hits.len(),
+        2,
+        "expected the block-scalar and one-line hits: {hits:?}"
+    );
+    assert!(hits[0].starts_with("x.yml:12:"), "{hits:?}");
+    assert!(hits[1].starts_with("x.yml:15:"), "{hits:?}");
+}
+
+/// Exercise the workflow's actual GNU sed command on an inert template.
+/// No recovery command runs: only a temporary file is rewritten. The GitHub
+/// runner is Linux, where the workflow's `sed -i` syntax is supported.
+#[cfg(target_os = "linux")]
+#[test]
+fn emergency_fs_recover_normalises_force_disk_input() {
+    let workflow = read(".github/workflows/emergency-fs-recover.yml");
+    let commands: Vec<&str> = run_script_lines(&workflow)
+        .into_iter()
+        .map(|(_, line)| line.trim())
+        .filter(|line| line.starts_with("sed -i ") && line.contains("__FORCE_DISK__"))
+        .collect();
+    assert_eq!(commands.len(), 1, "expected one FORCE_DISK substitution");
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tv-force-disk-input-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).unwrap();
+    let cases = [
+        ("$(touch force-input-executed)", "no"),
+        ("yes", "yes"),
+        ("no", "no"),
+        ("", "no"),
+        ("YES", "no"),
+        (" yes", "no"),
+        ("yes\n", "no"),
+        ("`touch force-input-executed`", "no"),
+        ("\"; touch force-input-executed; #", "no"),
+        ("yes/; printf injected; #", "no"),
+        ("yes&__FORCE_DISK__", "no"),
+        ("yes\nFORCE_DISK=yes", "no"),
+    ];
+    let mut results = Vec::new();
+    for (input, expected) in cases {
+        fs::write(
+            dir.join("recover.sh"),
+            "before\nflag=\"__FORCE_DISK__\"\nafter\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-euo", "pipefail", "-c"])
+            .arg(commands[0])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("FORCE_DISK", input)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let rewritten = fs::read_to_string(dir.join("recover.sh")).unwrap();
+        results.push((input, expected, output.status.success(), rewritten));
+    }
+    let executed = dir.join("force-input-executed").exists();
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(!executed, "FORCE_DISK input must never execute a command");
+    for (input, expected, success, rewritten) in results {
+        assert!(success, "normalization must succeed for {input:?}");
+        assert_eq!(
+            rewritten,
+            format!("before\nflag=\"{expected}\"\nafter\n"),
+            "only exact yes may enable the disk-check override: {input:?}"
+        );
+    }
+}
+
+/// Join the conventional backslash continuations used by these workflows.
+/// This is a source-pattern guard, not a shell parser or complete dataflow analysis.
+fn joined_shell_lines(body: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            current.push_str(head);
+            current.push(' ');
+        } else {
+            current.push_str(trimmed);
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Names directly assigned from the literal control-secret SSM read. This
+/// intentionally does not claim to trace aliases through arbitrary commands.
+fn secret_holding_vars(body: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in joined_shell_lines(body) {
+        if !(line.contains("aws ssm get-parameter") && line.contains("control-secret")) {
+            continue;
+        }
+        let Some(at) = ["=$(", "=\"$("]
+            .iter()
+            .filter_map(|pattern| line.find(pattern))
+            .min()
+        else {
+            continue;
+        };
+        let head = &line[..at];
+        let start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        let name = &head[start..];
+        if name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && !names.iter().any(|existing| existing == name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Conservative lexical reference detection: quoting/escaping can produce a
+/// false positive, but a longer variable name does not count as this name.
+fn references_shell_variable(line: &str, name: &str) -> bool {
+    [format!("${name}"), format!("${{{name}")]
+        .iter()
+        .any(|needle| {
+            line.match_indices(needle).any(|(i, _)| {
+                line[i + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+            })
+        })
+}
+
+/// Preserve the existing KEY/LINK rule and additionally reject direct
+/// control-secret reader names in conventional, possibly continued messages.
+fn published_message_key_leaks(body: &str) -> Vec<String> {
+    let is_message = |line: &str| line.contains("--message") || line.contains("MESSAGE=");
+    let mut hits = Vec::new();
+    for (i, line) in body.lines().enumerate() {
+        if is_message(line)
+            && (line.contains("KEY}") || line.contains("$KEY") || line.contains("LINK}"))
+        {
+            hits.push(format!("{}: {line}", i + 1));
+        }
+    }
+    let names = secret_holding_vars(body);
+    for line in joined_shell_lines(body) {
+        if is_message(&line)
+            && names
+                .iter()
+                .any(|name| references_shell_variable(&line, name))
+        {
+            hits.push(format!("direct control-secret reader in a message: {line}"));
+        }
+    }
+    hits
+}
+
+#[test]
+fn published_secret_alias_guard_catches_renamed_and_continued_readers() {
+    for name in ["TOK", "SESSION_CONSOLE", "_console9"] {
+        let read = format!(
+            "if ! {name}=$(aws ssm get-parameter \\\n  --name /tickvault/prod/operator/control-secret --with-decryption); then exit 1; fi\n"
+        );
+        assert_eq!(secret_holding_vars(&read), [name]);
+        for reference in [
+            format!("${name}"),
+            format!("${{{name}}}"),
+            format!("${{{name}:-fallback}}"),
+            format!("${{{name}:0:8}}"),
+            format!("${{{name}//x/y}}"),
+        ] {
+            let source = format!("{read}aws sns publish \\\n --message \"{reference}\"\n");
+            assert_eq!(
+                published_message_key_leaks(&source).len(),
+                1,
+                "alias={name}"
+            );
+            let assignment = format!("{read}MESSAGE=\"{reference}\"\n");
+            assert_eq!(
+                published_message_key_leaks(&assignment).len(),
+                1,
+                "alias={name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn published_secret_alias_guard_accepts_safe_references_and_ignores_longer_names() {
+    let assignment_source = "TOK=$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret --with-decryption)\n";
+    for safe in [
+        "aws sns publish --message \"$TOKEN_COUNT\"",
+        "MESSAGE=\"${TOK_COUNT}\"",
+        "MESSAGE=\"$TOK_COUNT\"",
+        "printf 'Authorization: Bearer %s' \"$TOK\" > header",
+        "# MESSAGE=\"$TOK\"",
+        "aws sns publish --message \"paste your device key from Parameter Store\"",
+    ] {
+        assert!(published_message_key_leaks(&format!("{assignment_source}{safe}\n")).is_empty());
+    }
+    assert!(
+        secret_holding_vars("# TOK=$(aws ssm get-parameter --name control-secret)\n").is_empty()
+    );
+    let quoted = "TOK=\"$(aws ssm get-parameter --name /tickvault/prod/operator/control-secret --with-decryption)\"\n";
+    assert_eq!(secret_holding_vars(quoted), ["TOK"]);
+    assert!(published_message_key_leaks(&format!("{quoted}MESSAGE=\"$TOKEN_COUNT\"\n")).is_empty());
+    let real = read(WORKFLOW);
+    assert!(secret_holding_vars(&real).contains(&"TOK".to_string()));
+    assert!(published_message_key_leaks(&real).is_empty());
+}
+
+#[test]
+fn published_secret_alias_guard_catches_double_quoted_command_substitutions() {
+    for name in ["TOK", "SESSION_CONSOLE", "_console9"] {
+        let source = format!(
+            "{name}=\"$(aws ssm get-parameter \\\n+              --name /tickvault/prod/operator/control-secret --with-decryption)\"\n"
+        );
+        assert_eq!(secret_holding_vars(&source), [name]);
+        for reference in [format!("${name}"), format!("${{{name}}}")] {
+            assert_eq!(
+                published_message_key_leaks(&format!(
+                    "{source}aws sns publish --message \"{reference}\"\n"
+                ))
+                .len(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn published_secret_alias_guard_retains_legacy_key_and_link_rejections() {
+    for body in [
+        "aws sns publish --message \"$KEY\"",
+        "MESSAGE=\"${KEY}\"",
+        "aws sns publish --message \"${LINK}\"",
+    ] {
+        assert_eq!(published_message_key_leaks(body).len(), 1);
+    }
 }

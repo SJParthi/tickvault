@@ -9,6 +9,7 @@
 //! The harness counts every NETWORK-VISIBLE Telegram action:
 //!   - `NewBubble` (sendMessage — a fresh chat bubble)
 //!   - `Edit`      (editMessageText — in-place, no push notification)
+//!
 //! and every SNS-SMS leg, exactly where the shell fires them.
 
 #![allow(clippy::arithmetic_side_effects)] // APPROVED: test code

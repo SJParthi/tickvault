@@ -17,8 +17,8 @@
 //!   3. Revert the weekday-only schedule (MON-FRI) back to daily (Mon-Sun).
 //!   4. Flip `enable_eip` default to true (no orders for 3 months → no Dhan
 //!      static-IP need → EIP off saves ~₹430/mo).
-//!   5. Change the EBS default away from 200 GB (operator Quote 16, 2026-08-19;
-//!      was 100 per Quote 13, and 50/30 before that).
+//!   5. Change the EBS default away from 500 GB (operator Quote 20, 2026-09-02;
+//!      was 200 per Quote 16, 100 per Quote 13, and 50/30 before that).
 //!
 //! Each assertion fails the build with an operator-readable message so the next
 //! session (or Cowork task) cannot regress the locked config by accident.
@@ -63,6 +63,8 @@ fn code_only(s: &str) -> String {
 
 const MAIN_TF: &str = "deploy/aws/terraform/main.tf";
 const VARIABLES_TF: &str = "deploy/aws/terraform/variables.tf";
+/// The app and Lambda log export to S3 (2026-10-11, DA-11; noise lock §2.10-a).
+const LOG_EXPORT_TF: &str = "deploy/aws/terraform/log-export.tf";
 
 /// The running box must NEVER be stop-protected — the daily auto-stop cron and
 /// the upgrade script both need ec2:StopInstances. (`disable_api_stop = true`
@@ -130,10 +132,10 @@ fn deploy_instance_ignores_type_and_user_data_to_prevent_replace() {
 }
 
 /// Weekday-only schedule (trading days). Mon-Fri crons, not Mon-Sun.
-/// IST 08:30 start = 03:00 UTC; IST 17:30 stop = 12:00 UTC (operator widened
-/// the window to 08:30-17:30 on 2026-08-08 — Quote 14, "make it as 8.30 till
-/// 5.30 pm"; supersedes the 2026-06-05 08:30-16:30 narrowing, which itself
-/// superseded the 2026-06-02 08:00-17:00 widening).
+/// IST 08:30 start = 03:00 UTC; IST 16:30 stop = 11:00 UTC (operator Quote 37,
+/// 2026-10-21, plan item 64; the window was 08:30-17:30 from 2026-08-08 under
+/// Quote 14, which superseded the 2026-06-05 08:30-16:30 narrowing, which
+/// itself superseded the 2026-06-02 08:00-17:00 widening).
 #[test]
 fn deploy_schedule_is_weekday_only() {
     let body = read(MAIN_TF);
@@ -142,15 +144,15 @@ fn deploy_schedule_is_weekday_only() {
         "main.tf daily_start must be `cron(0 3 ? * MON-FRI *)` (08:30 IST, Mon-Fri)."
     );
     assert!(
-        body.contains("cron(0 12 ? * MON-FRI *)"),
-        "main.tf daily_stop must be `cron(0 12 ? * MON-FRI *)` (17:30 IST, Mon-Fri)."
+        body.contains("cron(0 11 ? * MON-FRI *)"),
+        "main.tf daily_stop must be `cron(0 11 ? * MON-FRI *)` (16:30 IST, Mon-Fri)."
     );
-    // Inverted pin: the retired 16:30 IST stop must not return silently — it
-    // would kill the box a full hour before the operator expects it.
+    // Inverted pin: the retired 17:30 IST stop must not return silently — it
+    // would bill an extra hour and the hard-stop guard would stop it at 17:05.
     assert!(
-        !body.contains("cron(0 11 ? * MON-FRI *)"),
-        "the 16:30 IST stop cron is retired (operator widened to 17:30 IST, \
-         2026-08-08 Quote 14)."
+        !body.contains("cron(0 12 ? * MON-FRI *)"),
+        "the 17:30 IST stop cron is retired (operator moved the stop back to 16:30 IST, \
+         2026-10-21 Quote 37)."
     );
     assert!(
         !body.contains("MON-SUN") && !body.contains("* * ? * * *"),
@@ -184,61 +186,221 @@ fn deploy_eip_is_enabled_by_default() {
     );
 }
 
-/// EBS FRESH-PROVISION default is 200 GB (operator Quote 16, 2026-08-19 —
-/// "Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?"). Raised
-/// from the Quote 13 default of 100 after r8gd.xlarge was proposed and
-/// REJECTED: r8gd.xlarge has the SAME 32 GiB of RAM, and its local NVMe is
-/// wiped on every instance stop while this box stops nightly — it would have
-/// cost ~25% more per hour to delete each day. EBS survives the stop.
+/// EBS FRESH-PROVISION default is 600 GB (operator Quote 22, 2026-09-05 —
+/// "See you have the enife access to Aws and db everywhere so you directly
+/// check evryhrinf and go ahead ddude", given against a message that named
+/// the 500 -> 600 grow, its +$9.12/mo permanent cost and the one-way door as
+/// the ONLY way the Quote 21 fresh-start wipe can run: the box booted onto
+/// 20 KB free on 2026-09-04, the SSM agent never registered on the 2026-09-05
+/// 02:53 IST boot, and `claude-code-agent` is DENIED ModifyVolume /
+/// DetachVolume / AttachVolume / ModifyInstanceAttribute, so
+/// `grow-ebs-volume.yml` with the CI credentials is the sole route).
 ///
-/// Quote 13 rationale, still current for the sizing itself (2026-08-08 —
-/// sized for the 13-timeframe current-day workload WITH raw-tick retention:
-/// ticks ~44-141 GB/mo (Assumed 25-80 M rows/day) + 13 sparse timeframes
-/// ~61 GB/mo, held ~30 days with S3 archival beyond). Supersedes the
-/// 2026-07-15 20 GB downsize pre-stage.
+/// The previous version of this doc ends with "600 GB would push the
+/// forecast past the $135 STOP_EC2_INSTANCES action line". That is now the
+/// situation, deliberately and on the record: read live 2026-09-04 the
+/// September forecast was ALREADY $137.50, above the line, before this grow,
+/// and ~$147 with it. `limit_amount` is NOT raised (Quote 19 caps it at $150
+/// and the operator has not addressed it); the open risk was stated to him.
 ///
-/// 100 and NOT 250 deliberately: gp3 grows online in one command and can NEVER
-/// shrink, so the small side is the only reversible direction. If real tick
-/// volume lands at the top of the Assumed range, grow it live.
+/// --- Quote 20 record (2026-09-02), retained verbatim below ---
+/// The 500 GB default was set by operator Quote 20, 2026-09-02 —
+/// the operator asked "isnatnce upgrade or disk upgrade needed?" and then
+/// authorized "whatevr is needed and recommended go ahead dude okay? i just
+/// need the workign finalsied solution dude okay?" against a reply that named
+/// the grow, priced it at +$18.24/mo, and stated the one-way door).
+///
+/// Raised from the Quote 19 default of 300, which bought exactly SIX DAYS.
+/// The `tv_spill_dir_free_bytes` daily MINIMUM, read live from CloudWatch:
+///
+///   2026-08-24   0.0 GB   <- the disk-full halt Quote 19 answered
+///   2026-08-31   7.2 GB
+///   2026-09-01   2.4 GB
+///   2026-09-02   153.2 GB at 15:44 IST, then the app died and stopped
+///                publishing, so that minimum is an artifact of the outage
+///                rather than a healthy day
+///
+/// The shape of the failure is the part worth recording. 2026-09-01 booted at
+/// ~309.6 GB free and ended at 2.4 GB — **~307 GB in ONE session** against the
+/// ~309.6 GB a 300 GiB volume presents after filesystem overhead. The
+/// overnight archival is NOT broken: it reclaims the whole session every
+/// night, which is precisely why the volume boots healthy and dies by close.
+/// The defect is that one session no longer fits with any room to spare, and
+/// a ~2 GB margin is not a margin. `tv-prod-disk-fill-rate-high` was FIRING at
+/// **135.7 %/day against a threshold of 4.0** when this was written.
+///
+/// Only SIZE is exhausted, so the Quote 17 I/O provisioning is NOT reverted to
+/// fund it — the same discipline Quote 19 applied. Measured peaks are
+/// unchanged: IOPS 1,168 of 6,000 (19%), throughput 107 MB/s of 500 MiB/s
+/// (21%).
+///
+/// What 500 GB buys, stated honestly: a 500 GiB volume presents ~524 GB, which
+/// is ~217 GB of margin (~70% headroom) against the measured session, versus
+/// ~2 GB today. That is a fix for the MARGIN and NOT for the BURN — at
+/// ~307 GB/session the volume is still ~59% consumed every day, and the
+/// structural driver is depth at ~80% of the payload (§2.3o-i of
+/// dhan-rest-only-noise-lock-2026-07-14.md measures `market_depth` at 24x the
+/// tick row volume). A third grow is not the answer; reducing the depth
+/// payload is.
+///
+/// The INSTANCE was deliberately NOT changed in the same breath, and the
+/// measurements argue against it: process RSS across the whole trading session
+/// was 0.29-1.54 GiB, flat, then jumped to 15.54 GiB inside ONE five-minute
+/// bucket at 16:05 IST on a WAL replay of 151 segments / 2,309,027 frames /
+/// 22,248,540 depth rows. That is a bounded burst with a code cause, not a
+/// capacity shortfall. CPU averaged 12-13% on 4 vCPU with one 67.9% peak.
 ///
 /// This is a FRESH-PROVISION default only — `root_block_device[0].volume_size`
 /// sits in the instance's `lifecycle.ignore_changes`, so `terraform apply`
-/// never touches the live volume. History: 10 -> 30 -> [50 approved 2026-07-13,
-/// never physically applied, live verified 30 GiB on 2026-07-19] -> 20 target
-/// (2026-07-15) -> 100 (2026-08-08).
+/// never touches the live volume; the live grow runs through
+/// `.github/workflows/grow-ebs-volume.yml`, which exists because
+/// `user/claude-code-agent` cannot perform `ec2:ModifyVolume`. History:
+/// 10 -> 30 -> [50 approved 2026-07-13, never applied; live verified 30 GiB
+/// 2026-07-19] -> 20 target (2026-07-15) -> 100 (2026-08-08) -> 200
+/// (2026-08-19) -> 300 (2026-08-25) -> 500 (2026-09-02) -> 600 (2026-09-05)
+/// -> 150 (2026-10-21, Quotes 32/33: a fresh 150 GB root on the 2026-10-22
+/// rebuild; the 600 ceiling stays while the live root is still 600 GB).
 #[test]
-fn deploy_ebs_default_is_200gb() {
+fn deploy_ebs_default_is_150gb() {
     let vars = squish(&read(VARIABLES_TF));
     assert!(
         vars.contains("variable \"ebs_gp3_size_gb\""),
         "variables.tf must declare `ebs_gp3_size_gb`."
     );
     assert!(
-        vars.contains("type = number default = 200"),
-        "ebs_gp3_size_gb must default to 200 GB (operator Quote 16, 2026-08-19 — \
-         'Grow gp3 100 -> 200 GB yes even icnrease this also dude okay?', given \
-         after r8gd.xlarge was proposed and rejected: its local NVMe is WIPED on \
-         every stop and this box stops nightly, so it would delete the day; EBS \
-         survives the stop. Raised from the Quote 13 default of 100)."
+        vars.contains("type = number default = 150 "),
+        "ebs_gp3_size_gb must default to 150 GB (operator Quotes 32/33, 2026-10-21: \
+         the rebuilt root; history: 600 GB, operator Quote 22, 2026-09-05 \
+         — the grow that lets the Quote 21 fresh-start wipe be executed at all \
+         on a box that booted onto 20 KB free. Raised from the Quote 20 \
+         default of 500, which lasted two days)."
     );
-    // 200 is now BOTH the default and the validation ceiling, so the next grow
-    // cannot be a drive-by: it needs a validation edit, its own dated quote,
-    // AND a budget-ceiling raise (+100 GB = +$9.12/mo leaves only $7.28 under
-    // the $100 kill line, whose AUTOMATIC action stops the prod box).
+    // Until 2026-10-21 600 was BOTH the default and the validation ceiling; the
+    // ceiling stays 600 (the live root until the rebuild), so the next grow
+    // cannot be a drive-by: it needs a validation edit AND its own dated
+    // quote. It also needs a LEVER and not merely a cost note — read live on
+    // 2026-09-02, limit_amount is $150, the 90% STOP_EC2_INSTANCES action line
+    // is $135.00, the September forecast is $114.01, and this grow takes it to
+    // $132.25. That is $2.75 of margin against an AUTOMATIC stop of the
+    // trading box. The levers are the already-approved Quote 10 Elastic IP
+    // release (-$3.60/mo) or an operator decision; a ceiling edit cannot help
+    // because Quote 19 caps limit_amount at $150, already the live value.
+    // 2026-11-13 (audit B2): the ceiling is 150, the rebuilt root. Quote 51
+    // (2026-11-07) rules no bigger disk, so the default sits AT the ceiling
+    // again and a grow is a deliberate, quoted decision, not a drive-by.
     assert!(
-        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 200"),
-        "the 10-200 GB validation range must stay — with the default AT the \
-         ceiling it is what makes a further grow a deliberate, quoted decision \
-         rather than a one-character edit."
+        vars.contains("var.ebs_gp3_size_gb >= 10 && var.ebs_gp3_size_gb <= 150"),
+        "the 10-150 GB validation range must stay (Quote 51: no bigger disk); \
+         with the default AT the ceiling it is what makes a further grow a \
+         deliberate, quoted decision rather than a one-character edit."
     );
-    // Inverted pin: 250+ is NOT the safe direction. gp3 grows online and can
-    // never shrink, so over-provisioning is the irreversible mistake and pays
-    // for unused disk every month until an instance recreate.
+    // Inverted pin, unchanged in spirit: gp3 grows online and can never
+    // shrink, so over-provisioning is the irreversible mistake and pays for
+    // unused disk every month until an instance recreate. 600 was chosen
+    // because 100 GB is what a boot needs to let SSM in and the wipe run, and
+    // NOT higher: 700 GB would add another $9.12/mo on top of a forecast that
+    // already sits above the $135 automatic-stop line.
+    // NOTE: the trailing space is load-bearing — `squish` collapses the file to
+    // one string, and `ebs_gp3_iops` defaulted to 6000 until 2026-10-13 (3000 since Quote 30), so a bare "default = 600"
+    // would match it; the 700 pin below has no such collision but keeps the
+    // trailing space for the same reason. Caught by running it.
     assert!(
-        !vars.contains("type = number default = 250"),
+        !vars.contains("type = number default = 700 "),
         "do not over-provision the fresh volume — gp3 grows online in one \
-         command but can NEVER shrink, so 100 GB is chosen as the reversible \
-         side. Grow it live if measured tick volume demands it."
+         command but can NEVER shrink. 600 GB is the Quote 22 ceiling; 700 GB \
+         would add $9.12/mo against a forecast already above the $135 \
+         STOP_EC2_INSTANCES action line. Grow it live if measured volume \
+         demands it, with its own dated quote and a lever."
+    );
+}
+
+/// Audit B2 finding 11 (2026-11-13): the volume-grow workflow defaulted to
+/// 600 GB and accepted up to 600, so a dispatch meant to change only IOPS or
+/// throughput grew the 150 GB root by 450 GB (about +$41 a month, permanent:
+/// gp3 never shrinks). Quote 51 (2026-11-07) rules no bigger disk. The
+/// default must be the live 150 GB and the guard must refuse anything above
+/// it; IOPS and throughput stay changeable.
+#[test]
+fn grow_ebs_workflow_defaults_to_150_and_refuses_a_bigger_disk() {
+    let wf = read(".github/workflows/grow-ebs-volume.yml");
+    let squished = squish(&wf);
+    assert!(
+        squished.contains("target_size_gb: description:")
+            && squished.contains("required: true default: '150' target_iops:"),
+        "target_size_gb must default to '150' (the rebuilt root, Quotes 32/33)"
+    );
+    assert!(
+        !squished.contains("default: '600'"),
+        "a 600 GB default grows the disk 4x on a dispatch meant for IOPS"
+    );
+    assert!(
+        wf.contains("if [ \"$TARGET\" -gt 150 ]; then"),
+        "the size guard must refuse anything above 150 GB (Quote 51)"
+    );
+    assert!(
+        !wf.contains("-gt 600"),
+        "the old 600 GB ceiling must not come back without a dated owner quote"
+    );
+    // Audit B2 review: the two other grow routes stop at the same 150 GB, so
+    // the three cannot drift apart again (the script allowed 200 and the
+    // Terraform validation 600 after the workflow was lowered).
+    let script = read("scripts/aws-upgrade-instance.sh");
+    assert!(
+        script.contains("[ \"$EBS_SIZE\" -le 150 ]"),
+        "aws-upgrade-instance.sh --ebs-size must refuse anything above 150 GB"
+    );
+    assert!(
+        !script.contains("[ \"$EBS_SIZE\" -le 200 ]"),
+        "the script's old 200 GB ceiling must not come back"
+    );
+    let vars = read(VARIABLES_TF);
+    assert!(
+        vars.contains("var.ebs_gp3_size_gb <= 150"),
+        "the Terraform validation must stop at 150 GB too"
+    );
+    // Audit B2 follow-up (2026-11-13): IOPS and throughput are held at the
+    // quoted values on all three routes, like size. Quote 30 (2026-10-13)
+    // rejects IOPS above 3,000 without a fresh dated quote and Quotes 32/33
+    // (2026-10-21) set throughput to 125; the old 16000 / 1000 ceilings let
+    // one dispatch add about $100 a month at list price, past the $62 line.
+    assert!(wf.contains("if [ \"$WANT_IOPS\" -lt 3000 ] || [ \"$WANT_IOPS\" -gt 3000 ]; then"));
+    assert!(wf.contains("if [ \"$WANT_TP\" -lt 125 ] || [ \"$WANT_TP\" -gt 125 ]; then"));
+    for wide in ["-gt 16000", "-gt 1000 ]"] {
+        assert!(
+            !wf.contains(wide),
+            "workflow ceiling {wide} is above the quoted value"
+        );
+    }
+    assert!(script.contains("[ \"$EBS_IOPS\" -le 3000 ]"));
+    assert!(script.contains("[ \"$EBS_THROUGHPUT\" -le 125 ]"));
+    assert!(!script.contains("-le 16000"));
+    assert!(!script.contains("[ \"$EBS_THROUGHPUT\" -le 1000 ]"));
+    assert!(vars.contains("var.ebs_gp3_iops <= 3000"));
+    assert!(vars.contains("var.ebs_gp3_throughput <= 125"));
+}
+
+/// Audit B2 review (2026-11-13): the hard-stop guard's stopped-box budget
+/// hold must disable the daily-start rule BEFORE that rule fires. EventBridge
+/// gives no order between two rules firing in the same minute, so the guard
+/// runs at minute 50: its 02:50 UTC run (08:20 IST) comes ten minutes before
+/// the 03:00 UTC (08:30 IST) start. On minute 0 the two raced, and a start
+/// that won ran the box into the session until the next hourly breach stop.
+#[test]
+fn hard_stop_guard_runs_before_the_daily_start_in_the_same_hour() {
+    let guards = read("deploy/aws/terraform/budget-guards.tf");
+    let start = guards
+        .find("resource \"aws_cloudwatch_event_rule\" \"tv_hard_stop_guard\"")
+        .expect("hard-stop guard schedule rule");
+    let block = &guards[start..];
+    let end = block.find("\n}").expect("rule block end");
+    let block = &block[..end];
+    assert!(
+        block.contains("schedule_expression = \"cron(50 * * * ? *)\""),
+        "the hard-stop guard must run hourly at minute 50, before the 03:00 UTC daily start: {block}"
+    );
+    assert!(
+        read(MAIN_TF).contains("cron(0 3 ? * MON-FRI *)"),
+        "the daily start this ordering assumes is 03:00 UTC"
     );
 }
 
@@ -299,6 +461,7 @@ fn _assert_exists(rel: &str) {
 fn deploy_terraform_files_exist() {
     _assert_exists(MAIN_TF);
     _assert_exists(VARIABLES_TF);
+    _assert_exists(LOG_EXPORT_TF);
 }
 
 const UPGRADE_SCRIPT: &str = "scripts/aws-upgrade-instance.sh";
@@ -330,27 +493,29 @@ const DOCKER_COMPOSE: &str = "deploy/docker/docker-compose.yml";
 #[test]
 fn deploy_questdb_mem_limit_tracks_locked_instance_type() {
     // The locked type per `daily-universe-scope-expansion-2026-05-27.md` §7
-    // (operator Quote 13, 2026-08-08). Changing the instance REQUIRES changing
+    // (operator Quotes 32/33, 2026-10-21; was r8g.xlarge / 12g under Quote 13,
+    // 2026-08-08). Changing the instance REQUIRES changing
     // this pair, which is what forces the compose + script sizing to move too.
-    const LOCKED_INSTANCE_TYPE: &str = "r8g.xlarge";
-    const LOCKED_QDB_MEM: &str = "12g";
+    const LOCKED_INSTANCE_TYPE: &str = "r8g.large";
+    const LOCKED_QDB_MEM: &str = "6g";
 
     let compose = read(DOCKER_COMPOSE);
     assert!(
         compose.contains(&format!("${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}")),
         "docker-compose.yml must default the QuestDB mem_limit to \
          `${{QDB_MEM_LIMIT:-{LOCKED_QDB_MEM}}}` for the locked \
-         {LOCKED_INSTANCE_TYPE} (operator Quote 13, 2026-08-08). §7 Rule 2 \
-         budgets QuestDB at 8-16 GB of the 32 GiB host."
+         {LOCKED_INSTANCE_TYPE} (operator Quotes 32/33, 2026-10-21): the deploy \
+         formula, 4/10 of the 16 GiB host."
     );
     // The stale-ceiling pin: the values sized for the retired 4 GiB / 16 GiB
-    // hosts must not reappear as the DEFAULT on the 32 GiB box.
+    // hosts must not reappear as the DEFAULT (6g is 4/10 of 16 GiB, the deploy
+    // formula; 4g was the 2026-07 r8g.large value, under it).
     for stale in ["${QDB_MEM_LIMIT:-1g}", "${QDB_MEM_LIMIT:-4g}"] {
         assert!(
             !compose.contains(stale),
             "docker-compose.yml still defaults QuestDB to `{stale}` — that is a \
-             retired smaller-host ceiling (t4g.medium 4 GiB / r8g.large 16 GiB). \
-             On the locked {LOCKED_INSTANCE_TYPE} (32 GiB) it caps QuestDB at a \
+             retired smaller-host ceiling (t4g.medium 4 GiB / the 2026-07 r8g.large 4g). \
+             On the locked {LOCKED_INSTANCE_TYPE} (16 GiB) it caps QuestDB at a \
              fraction of the host and makes the upgrade unreachable."
         );
     }
@@ -438,7 +603,7 @@ fn deploy_status_check_alarms_have_auto_recover_action() {
     );
 }
 
-const HOLIDAY_GATE_SH: &str = "deploy/aws/holiday-gate.sh";
+const HOLIDAY_GATE_RS: &str = "crates/app/src/holiday_gate.rs";
 const HOLIDAY_GATE_UNIT: &str = "deploy/systemd/tickvault-holiday-gate.service";
 const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 
@@ -450,34 +615,75 @@ const USER_DATA_TFTPL: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 /// real trading day.
 #[test]
 fn holiday_gate_is_wired_and_fail_open() {
-    // 1. The app exposes the exit-code gate the script reads.
+    // 1. The app exposes the legacy exit-code CLI through its owning module.
     let main = read("crates/app/src/main.rs");
+    let gate = read(HOLIDAY_GATE_RS);
     assert!(
-        main.contains("fn trading_day_gate_exit_code")
+        gate.contains("pub fn trading_day_gate_exit_code(")
+            && main.contains("use tickvault_app::holiday_gate::trading_day_gate_exit_code;")
+            && main.contains("trading_day_gate_exit_code(calendar.is_trading_day(today_ist))")
             && main.contains("--check-trading-day")
             && main.contains("run_trading_day_gate"),
         "main.rs must expose the --check-trading-day gate (exit 0=trading / 75=holiday)"
     );
 
-    // 2. The shell gate: override marker, fail-open on missing binary, stops the
-    //    box ONLY on the definitive 75 verdict, IMDSv2 token-required.
-    let sh = read(HOLIDAY_GATE_SH);
+    // 2. The gate itself (a shell script until 2026-10-01, audit D6c; now the
+    //    app's `holiday-gate` subcommand): override marker, stops the box ONLY
+    //    on the definitive 75 verdict, IMDSv2 token-required, fail-open.
     assert!(
-        sh.contains("ALLOW_HOLIDAY_RUN"),
+        gate.contains("ALLOW_HOLIDAY_RUN"),
         "gate must honour the /opt/tickvault/ALLOW_HOLIDAY_RUN override marker"
     );
+    // 2026-10-20: the gate stops ONLY on a weekday NSE holiday at a boot
+    // inside the scheduled-start window; a weekend, a Muhurat or mock
+    // session, an unreadable calendar or any other boot hour starts the app.
+    // Until this date it stopped on the exit-75 verdict, which covers
+    // weekends, so an enabled gate would have stopped every weekend deploy.
     assert!(
-        sh.contains("ec2 stop-instances") && sh.contains("-ne 75"),
-        "gate must self-stop ONLY on the exit-75 verdict (fail-open on `-ne 75`)"
+        gate.contains("CalendarDay::WeekdayHoliday => {")
+            && gate.contains("if in_scheduled_start_window(now_ist.num_seconds_from_midnight()) {")
+            && gate.contains("CalendarDay::Weekend => Verdict::Start(")
+            && gate.contains("CalendarDay::Unreadable => Verdict::Start(")
+            && gate.contains("pub const SCHEDULED_START_WINDOW_START_SECS_OF_DAY_IST")
+            && gate.contains(".stop_instances()"),
+        "gate must self-stop ONLY on a weekday NSE holiday inside the scheduled \
+         start window (every other verdict or boot hour starts the app)"
     );
     assert!(
-        sh.contains("X-aws-ec2-metadata-token"),
+        !gate.contains("HOLIDAY_EXIT => Verdict::Stop,"),
+        "gate must not stop on the bare exit-75 verdict again: 75 includes weekends"
+    );
+    // 2026-10-20 (second review round): a second start on a day the gate
+    // already stopped the box is let through. The gate reads its own marker
+    // and decides BEFORE it re-stamps the marker and stops; a failed read
+    // stops, as before.
+    let second_start = gate
+        .find("match decide_second_start(&marker_read, &today_ist) {")
+        .expect("the gate must check its own marker for a second start today");
+    let put = gate
+        .find(".put_parameter()")
+        .expect("the gate stamps the marker before the stop");
+    assert!(
+        gate.contains("let marker_read = read_holiday_marker(&ssm, &marker).await;")
+            && second_start < put
+            && put < gate.find(".stop_instances()").unwrap_or(0),
+        "the gate must read its marker and honour a same-day second start \
+         BEFORE it re-stamps the marker and stops"
+    );
+    assert!(
+        gate.contains("X-aws-ec2-metadata-token"),
         "gate must use IMDSv2 (token-required) to resolve the instance-id"
     );
-    // Fail-open evidence: missing binary and non-75 codes exit 0.
     assert!(
-        sh.contains("fail-open"),
+        gate.contains("fail-open"),
         "gate must document + implement the fail-open default (never stop on uncertainty)"
+    );
+    assert!(
+        main.contains("holiday_gate::is_invocation(&cli_args)")
+            && main.contains("holiday_gate::run(holiday_gate_calendar_day)")
+            && main.contains("fn load_gate_trading_calendar()"),
+        "main.rs must dispatch `tickvault holiday-gate` to the gate with the same \
+         layered calendar `--check-trading-day` loads"
     );
 
     // 3. Dedicated oneshot unit ordered BEFORE the app (NOT an ExecStartPre on
@@ -490,6 +696,11 @@ fn holiday_gate_is_wired_and_fail_open() {
     assert!(
         unit.contains("SuccessExitStatus=0 1"),
         "the holiday verdict (exit 1) must be a success status for the oneshot"
+    );
+    assert!(
+        unit.contains("ExecStart=-/opt/tickvault/bin/tickvault-host holiday-gate"),
+        "the gate must run the subcommand from the rollback-proof `tickvault-host` copy, \
+         fail-open (leading `-`) when that copy does not exist yet"
     );
 
     // 4. First-boot user-data installs + enables the gate unit.
@@ -510,4 +721,102 @@ fn holiday_gate_is_wired_and_fail_open() {
         tf.contains("ec2:ResourceTag/Name"),
         "ec2:StopInstances must be tag-scoped to tv-<env>-app (avoids the role->instance cycle)"
     );
+}
+
+/// 2026-10-20: on a weekday NSE holiday the deploy chain must not undo the
+/// holiday gate's stop. Every dispatcher (the deploy-watchdog Lambda,
+/// `deploy-aws-after-close.yml`, `postmerge-catchup.yml`) ends in
+/// `deploy-aws.yml` by workflow_dispatch, which sets SHOULD_BE_UP=yes and
+/// self-starts a stopped box. So (a) `deploy-aws.yml` reads the gate's
+/// holiday-stop marker and skips green BEFORE `start-instances`, and (b) the
+/// watchdog reads the same marker before it dispatches, with the IAM grant
+/// and the env var to do it.
+#[test]
+fn deploy_chain_does_not_restart_a_box_the_holiday_gate_stopped() {
+    let wf = read(".github/workflows/deploy-aws.yml");
+    let marker = wf
+        .find("--name \"/tickvault/prod/holiday-stop-date\"")
+        .expect("deploy-aws.yml must read the holiday-stop marker");
+    let compare = wf
+        .find("[ \"$HSTOP\" = \"$(TZ='Asia/Kolkata' date +%F)\" ]")
+        .expect("deploy-aws.yml must compare the marker with today's IST date");
+    let skip = wf
+        .find("echo \"DEPLOY_SKIP_REASON=holiday_stop\" >> \"$GITHUB_ENV\"")
+        .expect("deploy-aws.yml must skip with DEPLOY_SKIP_REASON=holiday_stop");
+    let start = wf
+        .find("aws ec2 start-instances --region \"$REGION\" --instance-ids \"$IID\"")
+        .expect("deploy-aws.yml self-starts a stopped box");
+    assert!(
+        marker < compare && compare < skip && skip < start,
+        "deploy-aws.yml must read and honour the holiday-stop marker BEFORE it \
+         starts a stopped box"
+    );
+
+    // Scoped to `handle`'s body: the Lambda's own test module quotes both
+    // strings in a source-scan assertion, so a whole-file `contains` would
+    // pass even with the production read deleted (2026-10-20 review fix).
+    let watchdog = read("crates/aws-lambdas/src/deploy_watchdog.rs");
+    let handle = deploy_watchdog_handle_body(&watchdog);
+    assert!(
+        handle.contains("crate::start_watchdog::holiday_stop_is_today(")
+            && handle.contains("\"skipped\": \"holiday_stop\""),
+        "the deploy-watchdog's `handle` must reuse the start-watchdog's marker \
+         read and skip the dispatch on a holiday-stop day"
+    );
+    let tf = squish(&code_only(&read(
+        "deploy/aws/terraform/deploy-watchdog-lambda.tf",
+    )));
+    assert!(
+        tf.contains("parameter/tickvault/${var.environment}/holiday-stop-date")
+            && tf.contains(
+                "HOLIDAY_STOP_PARAM = \"/tickvault/${var.environment}/holiday-stop-date\""
+            ),
+        "the deploy-watchdog Lambda must be granted, and told, the holiday-stop \
+         marker parameter"
+    );
+}
+
+/// The body of `pub async fn handle(` in the deploy-watchdog source: from its
+/// signature to its closing `}` at column 0, and never past the test module
+/// (cut at `#[cfg(test)]` too, belt and braces). The Lambda's test module
+/// quotes the marker strings in its own source-scan assertion, so a check
+/// scoped to this body cannot be satisfied by that string literal
+/// (2026-10-20 review fix).
+fn deploy_watchdog_handle_body(src: &str) -> &str {
+    let start = src
+        .find("pub async fn handle(")
+        .expect("deploy_watchdog.rs must define `pub async fn handle(`");
+    let body = &src[start..];
+    let body = &body[..body.find("#[cfg(test)]").unwrap_or(body.len())];
+    &body[..body.find("\n}\n").map_or(body.len(), |end| end + 2)]
+}
+
+/// Bite check for [`deploy_watchdog_handle_body`]: a source whose `handle`
+/// lost the marker read, but whose test module still quotes both strings,
+/// passes a whole-file `contains` and fails the scoped one.
+#[test]
+fn deploy_watchdog_handle_scope_bites_on_a_test_module_literal() {
+    let fake = "pub async fn handle(event: Value) -> Result<Value, Error> {\n    \
+                let dispatched = dispatch_deploy(&http);\n    Ok(json!({}))\n}\n\n\
+                #[cfg(test)]\nmod tests {\n    \
+                // handle read crate::start_watchdog::holiday_stop_is_today( and\n    \
+                // returned \"skipped\": \"holiday_stop\" before the dispatch\n}\n";
+    // The whole file satisfies the old, unscoped check.
+    assert!(
+        fake.contains("crate::start_watchdog::holiday_stop_is_today(")
+            && fake.contains("\"skipped\": \"holiday_stop\"")
+    );
+    let handle = deploy_watchdog_handle_body(fake);
+    assert!(handle.starts_with("pub async fn handle("));
+    assert!(handle.ends_with("\n}"));
+    assert!(handle.contains("dispatch_deploy("));
+    assert!(
+        !handle.contains("holiday_stop_is_today(") && !handle.contains("holiday_stop"),
+        "the scoped body must not reach the test module's string literal"
+    );
+    // And the real file: the scoped body ends before the test module.
+    let real = read("crates/aws-lambdas/src/deploy_watchdog.rs");
+    let body = deploy_watchdog_handle_body(&real);
+    assert!(!body.contains("#[cfg(test)]") && !body.contains("mod tests"));
+    assert!(body.contains("dispatch_deploy("));
 }

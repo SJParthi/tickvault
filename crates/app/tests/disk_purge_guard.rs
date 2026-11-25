@@ -118,7 +118,7 @@ fn a_config_asking_for_a_smaller_window_cannot_reach_below_the_floor() {
         pressure_hot_days: 0,
         ..tickvault_common::config::PartitionRetentionConfig::default()
     };
-    let applied = tickvault_app::disk_pressure_boot::pressure_config(&cfg);
+    let applied = tickvault_app::disk_pressure_boot::pressure_config(&cfg, false);
     assert_eq!(applied.market_data_hot_days, 2);
     assert_eq!(applied.depth_hot_days, 2);
 }

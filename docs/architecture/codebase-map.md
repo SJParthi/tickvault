@@ -3,6 +3,14 @@
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > S6-Step8 (2026-04-14): The Tech Stack Bible was deleted. The single source of truth for all dependency versions is the workspace root `Cargo.toml` `[workspace.dependencies]` block.
 > Updated: 2026-03-17 (~2,439 tests).
+>
+> **⚠ CORRECTED 2026-11-15 (audit repo-5):** this map is a 2026-03-17
+> snapshot and is NOT current. Many files it lists are gone (for example
+> `tick_processor.rs`, `candle_aggregator.rs`, `candle_persistence.rs` and
+> `valkey_cache.rs`), and no function named `ensure_tick_table_dedup_keys`
+> exists today (the `ticks` key is set by `tick_persistence::ensure_ticks_table`).
+> For the real layout read the CODEBASE STRUCTURE section of `CLAUDE.md` and
+> `ls crates/`. The old text is kept as history.
 
 ## File Tree
 
@@ -77,7 +85,7 @@ tickvault/
 │   ├── storage/src/                    # Persistence layer
 │   │   ├── lib.rs                      # Re-exports: instrument_persistence, tick_persistence, candle_persistence
 │   │   ├── instrument_persistence.rs   # QuestDB ILP writer (4 tables)
-│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys()
+│   │   ├── tick_persistence.rs        # QuestDB ILP writer for ticks table + ensure_tick_table_dedup_keys() (⚠ CORRECTED 2026-11-15: no such fn; the key is set by ensure_ticks_table)
 │   │   ├── candle_persistence.rs      # QuestDB ILP writer for candles_1m table
 │   │   ├── materialized_views.rs      # QuestDB materialized views (candle aggregation)
 │   │   └── valkey_cache.rs            # Valkey (Redis) cache for rkyv-serialized instrument data
@@ -241,7 +249,7 @@ TickPersistenceWriter::new(config: &QuestDbConfig) -> Result<Self>
 TickPersistenceWriter::append_tick(&mut self, tick: &ParsedTick) -> Result<()>
 TickPersistenceWriter::flush_if_needed(&mut self) -> Result<()>
 TickPersistenceWriter::force_flush(&mut self) -> Result<()>
-ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> ()
+ensure_tick_table_dedup_keys(config: &QuestDbConfig) -> () // ⚠ CORRECTED 2026-11-15: no such fn; see tick_persistence::ensure_ticks_table
 instrument_persistence::persist_instrument_snapshot(universe, questdb_config) -> Result<()>
 ```
 
@@ -333,3 +341,25 @@ CRITICAL: Quote vs Full diverge at offset 34. Prices are f32 in rupees (NOT pais
 - **Observability**: Prometheus metrics + OpenTelemetry tracing
 - **Valkey cache**: rkyv-serialized instrument cache for zero-copy deserialization
 - **Trading crate**: OMS state machine, order types, position tracking (86 tests)
+
+## Dev host vs prod behaviour (added 2026-10-12, deep audit CR-1)
+
+The same code runs on a developer machine and on the production box, but a
+few paths read the host and so behave differently. This is the one list of
+them. A Linux container on a Mac (Docker Desktop) takes the Linux paths and
+sees the Docker VM, not the Mac; a native `cargo run` on macOS takes the
+non-Linux paths.
+
+| Path (symbol) | Production (Linux box) | Dev host | Where it is tested |
+|---|---|---|---|
+| Socket reader core pin (`reader_runtime::resolve_ws_reader_core_for_process`) | worker threads pinned to one allowed core with `sched_setaffinity` | non-Linux: `ReaderCorePlan::Unsupported`, nothing pinned | unit tests run on Linux CI runners |
+| Frame ring byte budget (`dhan_feed_stack::ring_bytes_for_ram`) | a share of `/proc/meminfo` total RAM, clamped | non-Linux or unreadable: the floor `FRAME_RING_MAX_BYTES` | pure function tested across the whole input range |
+| Kernel receive-queue sampler (`kernel_rx_queue_sampler`) | reads `/proc/self/fd` and `/proc/net/tcp{,6}` once a second | no `/proc`: nothing to sample | parser unit tests on Linux CI |
+| Resource monitor (`resource_monitor`) | reads `/proc/self/{fd,limits,status}` | no `/proc`: those readings are absent | unit tests on Linux CI |
+| QuestDB core set (`TV_QDB_CPUSET` in `deploy/docker/docker-compose.yml`) | default `2,3` on the 4-core box | a host with fewer than 4 cores must set `TV_QDB_CPUSET`, or Docker refuses to create the container | not tested; documented in the compose file |
+
+**Honest limit:** the systemd unit's limits (its cgroup, allowed CPUs and
+memory ceilings) are applied only on the production box. No CI job boots the
+app under that unit, so a limit that is wrong for the app is first seen on the
+box. A CI runner with systemd that boots under the real unit is a possible
+follow-up, not built.

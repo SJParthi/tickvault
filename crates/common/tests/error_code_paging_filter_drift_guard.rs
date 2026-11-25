@@ -681,7 +681,13 @@ fn prod_has_error_level_needle(prod_compact: &str, needle: &str) -> bool {
     let mut search_from = 0usize;
     while let Some(rel) = prod_compact[search_from..].find(needle) {
         let idx = search_from + rel;
-        let window_start = idx.saturating_sub(800);
+        // 800 BYTES back, then forward to a character boundary: slicing
+        // inside a multi-byte character (an en dash in a nearby comment)
+        // panicked (2026-09-30).
+        let mut window_start = idx.saturating_sub(800);
+        while !prod_compact.is_char_boundary(window_start) {
+            window_start += 1;
+        }
         let window = &prod_compact[window_start..idx];
         let mut last: Option<(usize, &str)> = None;
         for opener in OPENERS {
@@ -1014,6 +1020,21 @@ fn synth_detect(src: &str, variant: &str) -> bool {
 }
 
 #[test]
+fn needle_window_never_slices_inside_a_multi_byte_character() {
+    // 2026-09-30: an en dash (3 bytes) 800 bytes before the needle put
+    // the window start inside it and the guard panicked. The filler length
+    // walks the 800-byte cut across the dash, so two runs straddle it.
+    let needle = "ErrorCode::Proc01OomKillDetected.code_str()";
+    for filler in 784..=789 {
+        let prod = format!("\u{2013}{}error!(code={needle},\"x\");", "b".repeat(filler));
+        assert!(
+            prod_has_error_level_needle(&prod, needle),
+            "filler {filler}"
+        );
+    }
+}
+
+#[test]
 fn synthetic_emit_detector_ignores_comments_and_test_regions() {
     // Needle in a line comment, a block comment, or a #[cfg(test)]
     // module must not count; a real rustfmt-wrapped error! emit must.
@@ -1243,5 +1264,255 @@ fn every_alarm_description_fits_the_aws_ceiling_with_its_suffix() {
          the first sentence and the concrete next action are what has to \
          survive.",
         over.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EVERY alarm_description in EVERY .tf file fits the AWS ceiling
+// (2026-08-25 — found by an adversarial sweep for the NEXT apply-lane freeze.)
+//
+// `every_alarm_description_fits_the_aws_ceiling_with_its_suffix` above reads
+// ONE file: error-code-alarms.tf. A sweep of the other 33 found the three
+// longest descriptions in the whole tree sitting in `live-lane-alarms.tf`,
+// unguarded — the worst at 1014 of 1024 characters. TEN characters of
+// headroom, in the file under the most active editing this week.
+//
+// Why this matters more than a lint: AWS rejects an over-length description at
+// PutMetricAlarm — APPLY time, after merge. `terraform plan` passes it. That is
+// precisely how #1805 froze the entire apply lane for hours, and how every
+// change merged behind it sat undeployed. An eleven-character reword of one
+// alarm would do it again.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_alarm_description_in_every_tf_file_fits_the_aws_ceiling() {
+    const AWS_ALARM_DESCRIPTION_MAX: usize = 1024;
+    // `${var.environment}` renders to "prod" (4) but is 20 characters of
+    // source. Interpolations therefore SHRINK on render, so measuring the
+    // source length is conservative in the safe direction.
+    const WARN_BAND: usize = 900;
+
+    let dir = workspace_root().join("deploy/aws/terraform");
+    let mut checked = 0usize;
+    let mut worst = (0usize, String::new());
+    let mut over: Vec<String> = Vec::new();
+    let mut tight: Vec<String> = Vec::new();
+
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("terraform dir must exist")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("tf"))
+        .collect();
+    files.sort();
+
+    for path in &files {
+        let body = std::fs::read_to_string(path).expect("readable .tf");
+        let stripped = strip_hcl_comments(&body);
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+
+        for (idx, line) in stripped.lines().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("alarm_description") {
+                continue;
+            }
+            // Only single-line literal descriptions; an interpolated-only or
+            // heredoc form is skipped rather than mis-measured.
+            let Some(open) = t.find('"') else { continue };
+            let Some(close) = t.rfind('"') else { continue };
+            if close <= open {
+                continue;
+            }
+            let len = t[open + 1..close].len();
+            checked += 1;
+            let where_ = format!("{file}:{}", idx + 1);
+            if len > worst.0 {
+                worst = (len, where_.clone());
+            }
+            if len > AWS_ALARM_DESCRIPTION_MAX {
+                over.push(format!("{where_} = {len} chars"));
+            } else if len > WARN_BAND {
+                tight.push(format!("{where_} = {len} chars"));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 40,
+        "only {checked} alarm_description literals found across {} .tf files — \
+         this guard would be near-vacuous. Did the parser or the layout change?",
+        files.len()
+    );
+
+    assert!(
+        over.is_empty(),
+        "alarm_description over AWS's {AWS_ALARM_DESCRIPTION_MAX}-character ceiling:\n  {}\n\n\
+         PutMetricAlarm REJECTS these at APPLY time and `terraform plan` does NOT — \
+         so this would merge green and then freeze the whole apply lane, leaving \
+         every later change undeployed (the #1805 failure, verbatim). Shorten it.",
+        over.join("\n  ")
+    );
+
+    // Not a failure — a deliberate, visible record of how close the tree is
+    // running, so the next reword is made with the number in view.
+    println!(
+        "alarm_description: {checked} checked across {} files, worst {} at {}, \
+         {} in the {}+ band: {}",
+        files.len(),
+        worst.0,
+        worst.1,
+        tight.len(),
+        WARN_BAND,
+        if tight.is_empty() {
+            "none".to_string()
+        } else {
+            tight.join(", ")
+        }
+    );
+}
+
+/// ADDED 2026-09-17 — the header's stated inventory must EQUAL the file's.
+///
+/// `error-code-alarms.tf` opens with a long dated running-total chain, and on
+/// 2026-09-16 the sockets-only narrowing deleted four per-minute REST-leg
+/// filters without touching it. The header went on reading "17 filters + 17
+/// alarms … 15 + 15", and separately described all four deleted filters in the
+/// PRESENT tense, for a file that by then had 5 standalone filters and 4
+/// standalone alarms. Both were annotated the next day.
+///
+/// **Annotating it is not the fix.** A hand-written count in a comment is a
+/// claim, and this repository has now recorded four constraints that expired
+/// while still being quoted (the user-data byte budget, the $130 ceiling, the
+/// September forecast, the AccessDenied budget-action flag). So this guard
+/// does NOT pin the numbers — it RECOMPUTES both sides and compares, which is
+/// the only form that cannot go stale:
+///
+///   - it counts the real `resource` blocks and the real live map entries;
+///   - it parses the three figures out of the header's MEASURED paragraph;
+///   - it fails when they disagree, naming which one moved.
+///
+/// So adding or retiring an alarm fails HERE until the header moves with it.
+/// That is deliberate: the header is the first thing a reader meets, and the
+/// cost of updating one paragraph is far below the cost of a reader budgeting
+/// work against an inventory that has not been true for a month.
+///
+/// Bite-proof: change any of the three numbers in the header, or add an alarm
+/// resource without touching it, and this test fails naming the mismatch.
+#[test]
+fn the_header_inventory_matches_what_the_file_actually_declares() {
+    const TF: &str = "deploy/aws/terraform/error-code-alarms.tf";
+    let raw = read(TF);
+
+    // ---- side A: what the file actually declares -------------------------
+    //
+    // Counted on RAW text with a column-0 anchor, deliberately NOT on the
+    // comment-stripped body: `strip_hcl_comments` would also erase a
+    // commented-out `# resource "…"` line, and a resource that is commented
+    // out is exactly the thing that must not be counted. The column-0 anchor
+    // is what excludes it, and the self-check below proves the anchor matches
+    // something at all.
+    let filter_resources = raw
+        .lines()
+        .filter(|l| l.starts_with(r#"resource "aws_cloudwatch_log_metric_filter""#))
+        .count();
+    let alarm_resources = raw
+        .lines()
+        .filter(|l| l.starts_with(r#"resource "aws_cloudwatch_metric_alarm""#))
+        .count();
+    let map_entries = live_tf_entries().len();
+
+    // Parser self-check. A scan that silently matches nothing would make every
+    // assertion below vacuous — the failure mode this file has already found
+    // three times in other guards on this branch.
+    assert!(
+        filter_resources > 0 && alarm_resources > 0 && map_entries > 0,
+        "parser self-check FAILED: counted {filter_resources} filter resources, \
+         {alarm_resources} alarm resources and {map_entries} map entries in {TF}. \
+         A zero here means the anchors stopped matching (an `hcl fmt` reflow, a \
+         rename, a move) — fix the SCAN, never the numbers in the header, or \
+         this guard certifies an inventory it never read."
+    );
+
+    // ---- side B: what the header says ------------------------------------
+    //
+    // Anchored on the MEASURED paragraph specifically, not on the historical
+    // running-total chain above it. That chain is the AUDIT TRAIL of what each
+    // dated change added or retired and is deliberately never updated; pinning
+    // it would force a rewrite of history on every alarm change.
+    let measured = raw.split("MEASURED 2026-09-17").nth(1).unwrap_or_else(|| {
+        panic!(
+            "{TF} no longer carries the `MEASURED 2026-09-17` header paragraph. \
+                 It is the ONLY part of the header this guard reads, and it exists so \
+                 the file's opening comment states a current inventory rather than a \
+                 stale one. Restore it (or re-anchor this guard on its replacement) — \
+                 do not delete the guard."
+        )
+    });
+    // Bound the window so a later dated paragraph cannot be read as this one.
+    let measured = measured.split("re-count with").next().unwrap_or(measured);
+    let measured_lower = measured.to_lowercase();
+
+    let stated = |needle: &str| -> usize {
+        let at = measured_lower.find(needle).unwrap_or_else(|| {
+            panic!(
+                "the MEASURED paragraph in {TF} no longer states a count for \
+                 `{needle}`. The paragraph's whole purpose is to name the current \
+                 inventory, so a missing figure is a real gap — add it back rather \
+                 than loosening this guard."
+            )
+        });
+        // The number sits immediately before the phrase it counts.
+        let head = &measured[..at];
+        let digits: String = head
+            .chars()
+            .rev()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits
+            .chars()
+            .rev()
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| {
+                panic!(
+                    "could not read the number preceding `{needle}` in the MEASURED \
+                     paragraph of {TF} — expected a plain decimal immediately before it."
+                )
+            })
+    };
+
+    let said_filters = stated("standalone `aws_cloudwatch_log_metric_filter`");
+    let said_alarms = stated("standalone `aws_cloudwatch_metric_alarm`");
+    let said_entries = stated("live");
+
+    // ---- compare ---------------------------------------------------------
+    let mut drift: Vec<String> = Vec::new();
+    if said_filters != filter_resources {
+        drift.push(format!(
+            "log_metric_filter resources: header says {said_filters}, file declares {filter_resources}"
+        ));
+    }
+    if said_alarms != alarm_resources {
+        drift.push(format!(
+            "metric_alarm resources: header says {said_alarms}, file declares {alarm_resources}"
+        ));
+    }
+    if said_entries != map_entries {
+        drift.push(format!(
+            "error_code_alerts entries: header says {said_entries}, file declares {map_entries}"
+        ));
+    }
+
+    assert!(
+        drift.is_empty(),
+        "{TF}'s header inventory has drifted from the file:\n  {}\n\n\
+         You almost certainly added or retired an alarm. Update the MEASURED \
+         paragraph at the top of that file to the real figures — the header is the \
+         first thing a reader meets, and a stale inventory there sends the next \
+         session to build a pager that already exists (or to trust one that does \
+         not). Do NOT edit the historical running-total chain above it; that is the \
+         audit trail of what each dated change did, and it is correct as written.",
+        drift.join("\n  ")
     );
 }

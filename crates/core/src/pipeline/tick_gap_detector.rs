@@ -89,6 +89,10 @@
 //!   construction; when they are full the detector **fails closed** (refuses
 //!   and counts) rather than growing, so allocation on this path is
 //!   impossible by construction rather than merely unlikely.
+//! * [`TickGapDetector::observe_tracked`] — the same update for an
+//!   instrument that already holds a slot; it never assigns one. **O(1)**
+//!   average, allocation-free. A WAL replay uses it so frames from earlier
+//!   sessions cannot fill the table ahead of the live subscribe set.
 //! * [`TickGapDetector::scan_silence`] — **O(n) in tracked instruments, NOT
 //!   O(1)**. Stated plainly rather than relabelled. The constraint is that a
 //!   silence sweep is inherently a question about every instrument at once,
@@ -161,6 +165,34 @@ pub const DEFAULT_SPARSE_BASELINE_MILLIS: u64 = 30_000;
 /// conflated, so large deltas are normal.
 pub const DEFAULT_VOLUME_JUMP_MULTIPLIER: u64 = 20;
 
+/// Live lane (plan PR AL-5, 2026-11-06): an `NSE_FNO` contract seeded or
+/// first seen (whichever came first) in the last this-many milliseconds does
+/// not count toward `RISK-GAP-03` ([`SilenceReport::warming_up`]); its
+/// verdict is still reported raw. Indices and cash stocks never warm up, so
+/// the dead-class rollup is not delayed after a mid-session restart.
+/// Measured 5 and 6 Nov: the ~09:08 IST late attach of ~22,000 stock options
+/// paged `RISK-GAP-03` at ~09:17 for 97 sparse contracts whose cadence had
+/// been learned from the first few post-subscribe packets.
+pub const LIVE_ATTACH_WARMUP_MILLIS: u64 = 600_000;
+
+/// Live lane (plan PR AL-5): the learned cadence of an `NSE_FNO` contract is
+/// floored at this many milliseconds when its silence is judged, so its
+/// silence ceiling is at least 10 × 60 s = 600 s, and a contract that has
+/// ticked is judged sparse on the floored cadence
+/// ([`SilenceReport::alarm_sparse`]).
+///
+/// MEASURED live 2026-11-06 (10:00 to 11:00 IST, about 10,329 stock option
+/// contracts, ticks plus repeat quotes): median 207 packets an hour (about
+/// 17 s apart), p10 107 an hour (about 34 s), and the quietest contracts sent
+/// 2 packets in the whole hour. A silence ceiling cannot be set below those
+/// gaps, and the learned cadence only learns a long gap when the packet
+/// ending it arrives. So in the live lane a stock option that has ticked
+/// NEVER counts toward `RISK-GAP-03` through silence; only a seeded option
+/// that sends nothing at all (not even its subscribe snapshot) past the
+/// warmup still counts. The raw `sparse` flag keeps the learned cadence for
+/// the class rollup.
+pub const LIVE_FNO_CADENCE_FLOOR_MILLIS: u64 = 60_000;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -178,6 +210,12 @@ pub struct DetectorConfig {
     pub sparse_baseline_millis: u64,
     /// Multiple of the learned volume delta that raises a suspected gap.
     pub volume_jump_multiplier: u64,
+    /// An `NSE_FNO` contract seeded within this many milliseconds of a scan
+    /// is reported `Warming`, whatever its other state. `0` = off.
+    pub attach_warmup_millis: u64,
+    /// Floor applied to an `NSE_FNO` contract's learned cadence when its
+    /// silence ceiling is computed. `0` = off.
+    pub fno_cadence_floor_millis: u64,
 }
 
 impl Default for DetectorConfig {
@@ -188,7 +226,54 @@ impl Default for DetectorConfig {
             baseline_warmup_samples: DEFAULT_BASELINE_WARMUP_SAMPLES,
             sparse_baseline_millis: DEFAULT_SPARSE_BASELINE_MILLIS,
             volume_jump_multiplier: DEFAULT_VOLUME_JUMP_MULTIPLIER,
+            attach_warmup_millis: 0,
+            fno_cadence_floor_millis: 0,
         }
+    }
+}
+
+impl DetectorConfig {
+    /// The live Dhan lane's tunables (plan PR AL-5, 2026-11-06): the defaults
+    /// plus a [`LIVE_ATTACH_WARMUP_MILLIS`] warmup after each seed and a
+    /// [`LIVE_FNO_CADENCE_FLOOR_MILLIS`] cadence floor, both for `NSE_FNO`
+    /// contracts only. Index (`IDX_I`) and cash (`NSE_EQ`) instruments are
+    /// judged exactly as by [`Default`], from their first scan.
+    #[must_use]
+    pub fn live_lane() -> Self {
+        Self {
+            attach_warmup_millis: LIVE_ATTACH_WARMUP_MILLIS,
+            fno_cadence_floor_millis: LIVE_FNO_CADENCE_FLOOR_MILLIS,
+            ..Self::default()
+        }
+    }
+
+    /// The learned cadence used to judge `segment`'s silence: the raw
+    /// cadence, floored at [`Self::fno_cadence_floor_millis`] for `NSE_FNO`.
+    /// O(1), pure.
+    #[must_use]
+    pub fn judged_cadence_millis(&self, segment: ExchangeSegment, learned_millis: u64) -> u64 {
+        if segment == ExchangeSegment::NseFno {
+            learned_millis.max(self.fno_cadence_floor_millis)
+        } else {
+            learned_millis
+        }
+    }
+
+    /// `true` while an `NSE_FNO` contract seeded at `attached_millis` is still
+    /// inside its warmup at `now_millis`. Only `NSE_FNO` warms up: the
+    /// 2026-11-06 pages were late-attached stock options, while an index or a
+    /// cash stock left unjudged for 10 minutes would delay the dead-class
+    /// rollup after a mid-session restart. O(1), pure.
+    #[must_use]
+    pub fn in_attach_warmup(
+        &self,
+        segment: ExchangeSegment,
+        attached_millis: Option<u64>,
+        now_millis: u64,
+    ) -> bool {
+        segment == ExchangeSegment::NseFno
+            && attached_millis
+                .is_some_and(|at| now_millis.saturating_sub(at) < self.attach_warmup_millis)
     }
 }
 
@@ -541,18 +626,32 @@ pub struct SilenceReport {
     pub verdict: SilenceVerdict,
     /// Legitimately-sparse instrument (far-month option, INDIA VIX class).
     /// Excluded from alarm counting; visibility retained (§36.4 precedent).
+    /// Read from the RAW learned cadence.
     pub sparse: bool,
+    /// Inside the live lane's attach warmup (an `NSE_FNO` contract seeded or
+    /// first seen in the last [`LIVE_ATTACH_WARMUP_MILLIS`]; plan PR AL-5).
+    /// Gates only [`Self::counts_toward_alarm`]; `verdict` is not rewritten.
+    pub warming_up: bool,
+    /// [`Self::sparse`] judged on the cadence the silence ceiling uses (the
+    /// `NSE_FNO` floor in the live lane) for an instrument that has ticked.
+    /// Gates only [`Self::counts_toward_alarm`]. Equal to `sparse` under the
+    /// default config.
+    pub alarm_sparse: bool,
 }
 
 impl SilenceReport {
-    /// True when this report should increment an operator-facing alarm count.
+    /// True when this report should increment an operator-facing alarm count
+    /// (RISK-GAP-03).
     ///
     /// Sparse instruments are visible but never counted — that exclusion is
     /// what keeps the detector from crying wolf on legitimately quiet
-    /// contracts.
+    /// contracts. A contract inside its attach warmup is not counted either.
+    /// Both are read from the alarm-only fields; `verdict` and `sparse` stay
+    /// raw for the other readers (subscribe reconcile, the class rollup).
     #[must_use]
     pub fn counts_toward_alarm(self) -> bool {
-        !self.sparse
+        !self.alarm_sparse
+            && !self.warming_up
             && matches!(
                 self.verdict,
                 SilenceVerdict::Exceeded | SilenceVerdict::NeverTicked
@@ -581,10 +680,19 @@ struct InstrumentState {
     volume_delta_ewma: u64,
     /// Intervals contributed (not ticks — the first tick yields no interval).
     samples: u32,
+    /// `recv_monotonic_millis` of the last tick whose cumulative volume
+    /// ROSE (a trade), 0 = none seen. Read by the depth-200 cross-feed
+    /// silence check (scope lock 2026-10-10).
+    last_trade_millis: u64,
+    /// Monotonic millis of whichever came first: the seed that registered
+    /// this instrument, or its first packet. Never moved after it is set.
+    /// Drives [`DetectorConfig::attach_warmup_millis`] (plan PR AL-5).
+    attached_millis: Option<u64>,
 }
 
 impl InstrumentState {
     const EMPTY: Self = Self {
+        attached_millis: None,
         key: (0, ExchangeSegment::IdxI),
         used: false,
         last_ltt: None,
@@ -594,6 +702,7 @@ impl InstrumentState {
         interval_ewma_millis: 0,
         volume_delta_ewma: 0,
         samples: 0,
+        last_trade_millis: 0,
     };
 }
 
@@ -655,6 +764,11 @@ impl TickGapDetector {
                 let state = &mut self.slots[slot as usize];
                 if state.samples == 0 && state.last_ltt.is_none() {
                     state.last_seen_millis = now_millis;
+                    // The FIRST seed starts the attach warmup; a re-seed of a
+                    // still-silent instrument never restarts it.
+                    if state.attached_millis.is_none() {
+                        state.attached_millis = Some(now_millis);
+                    }
                 }
                 true
             }
@@ -666,8 +780,25 @@ impl TickGapDetector {
     ///
     /// **O(1) average, allocation-free.** One hash lookup plus an in-place
     /// slot mutation.
+    #[inline]
     pub fn observe(&mut self, obs: TickObservation) -> TickAssessment {
-        let Some(slot) = self.slot_for(obs.key) else {
+        // The tracked case first, exactly as `observe_tracked` takes it; slot
+        // assignment and refusal are out of line (plan ITEM DT, 2026-10-30:
+        // the bench measured `observe` on a tracked instrument at about
+        // twice `observe_tracked` for the same work).
+        if let Some(&slot) = self.index.get(&obs.key) {
+            return self.observe_slot(slot, obs);
+        }
+        self.observe_untracked(obs)
+    }
+
+    /// [`Self::observe`] for an instrument with no slot yet: assigns one, or
+    /// refuses (counted) when the table is full. O(1) average.
+    #[cold]
+    #[inline(never)]
+    fn observe_untracked(&mut self, obs: TickObservation) -> TickAssessment {
+        // `observe` has just missed the index, so no second probe.
+        let Some(slot) = self.assign_slot(obs.key) else {
             return TickAssessment {
                 ltt: LttVerdict::FirstSight,
                 volume: VolumeVerdict::FirstSight,
@@ -675,7 +806,31 @@ impl TickGapDetector {
                 refused: true,
             };
         };
+        self.observe_slot(slot, obs)
+    }
 
+    /// Records one tick ONLY if its instrument already holds a slot; never
+    /// assigns a new one. Returns `None` for an untracked instrument, and
+    /// that is NOT counted as a refusal: nothing the caller subscribed was
+    /// turned away.
+    ///
+    /// For a write-ahead-log replay (added 2026-10-28). A replay folds frames
+    /// from earlier sessions, so with [`Self::observe`] every contract of
+    /// every replayed day took a slot it never gave back, and the live
+    /// contracts seeded after the replay found the table full. The
+    /// subscribe set is what the detector watches; a replayed tick may
+    /// refresh an instrument already in it, never add one.
+    ///
+    /// **O(1) average, allocation-free.** One hash lookup, then the same
+    /// in-place update as [`Self::observe`].
+    pub fn observe_tracked(&mut self, obs: TickObservation) -> Option<TickAssessment> {
+        let slot = *self.index.get(&obs.key)?;
+        Some(self.observe_slot(slot, obs))
+    }
+
+    /// The in-place update shared by [`Self::observe`] and
+    /// [`Self::observe_tracked`]. O(1), allocation-free.
+    fn observe_slot(&mut self, slot: u32, obs: TickObservation) -> TickAssessment {
         let warmup = self.config.baseline_warmup_samples;
         let multiplier = self.config.volume_jump_multiplier;
         let state = &mut self.slots[slot as usize];
@@ -690,6 +845,15 @@ impl TickGapDetector {
             warm,
         );
         let oi = classify_oi(state.last_oi, obs.open_interest);
+
+        // Plan PR AL-5 review (2026-11-06): the attach warmup starts at the
+        // FIRST of the contract's seed or its first packet. A contract that
+        // ticks before its seed step (the 09:08 late attach delivers packets
+        // before the idle arm reaches its batch) used to get no warmup at all,
+        // because `seed` only stamps a still-silent slot. One compare, O(1).
+        if state.attached_millis.is_none() && state.last_ltt.is_none() {
+            state.attached_millis = Some(obs.recv_monotonic_millis);
+        }
 
         // Interval baseline. The first tick after seeding yields no interval,
         // so `samples` counts intervals rather than ticks.
@@ -707,6 +871,11 @@ impl TickGapDetector {
             state.volume_delta_ewma = ewma_update(state.volume_delta_ewma, u64::from(delta));
         }
 
+        // A trade: the cumulative volume rose since the last tick. The first
+        // tick (no previous volume) is a snapshot, never evidence of a trade.
+        if matches!(state.last_volume, Some(previous) if obs.volume > previous) {
+            state.last_trade_millis = state.last_trade_millis.max(obs.recv_monotonic_millis);
+        }
         state.last_ltt = Some(obs.ltt_epoch_secs);
         state.last_volume = Some(obs.volume);
         state.last_oi = Some(obs.open_interest);
@@ -732,28 +901,117 @@ impl TickGapDetector {
     where
         F: FnMut(SilenceReport),
     {
-        for state in self.slots.iter().take(self.next_slot as usize) {
+        self.scan_silence_slots(now_millis, |_slot, report| sink(report));
+    }
+
+    /// [`Self::scan_silence`], also handing the sink each report's slot index
+    /// in this detector's dense slot table (2026-11-17).
+    ///
+    /// The slot lets a caller keep its own per-instrument state in a dense
+    /// array indexed by slot instead of a hash probe per report: the drain's
+    /// subscribe reconcile does this (`ReconcileSweep::note_at_slot`). A slot
+    /// is stable while the instrument stays tracked and is reassigned only by
+    /// [`Self::reset_session`], so a caller MUST check the report's key
+    /// against what it cached at that slot before trusting the cache.
+    ///
+    /// Same loop, same reports, same order as `scan_silence` (which wraps
+    /// this): **O(n) in tracked instruments**, zero allocation, one extra
+    /// `u32` per report. It is [`Self::scan_silence_slot_range`] over every
+    /// tracked slot, so there is one copy of the loop body.
+    pub fn scan_silence_slots<F>(&self, now_millis: u64, sink: F)
+    where
+        F: FnMut(u32, SilenceReport),
+    {
+        let _ = self.scan_silence_slot_range(now_millis, 0, self.next_slot, self.next_slot, sink);
+    }
+
+    /// One slice of [`Self::scan_silence_slots`] (plan item US1-D,
+    /// 2026-11-24). Visits the slots in `[from, stop)` in ascending order,
+    /// where `stop = min(end, tracked slots, from + count)`, and hands the
+    /// sink the same `(slot, report)` pairs the full scan hands out for those
+    /// slots. Returns where it stopped: `stop`, or `from` when the range is
+    /// empty. The caller is done once the return value is at least
+    /// `min(end, tracked slots)`.
+    ///
+    /// Called over consecutive ranges with the same `now_millis` and no
+    /// change to the detector in between, the joined output equals one full
+    /// scan (proptest
+    /// `proptest_scan_silence_slot_range_chunks_equal_the_full_scan`).
+    ///
+    /// **O(stop - from)** per call, zero allocation, no virtual dispatch.
+    pub fn scan_silence_slot_range<F>(
+        &self,
+        now_millis: u64,
+        from: u32,
+        end: u32,
+        count: u32,
+        mut sink: F,
+    ) -> u32
+    where
+        F: FnMut(u32, SilenceReport),
+    {
+        let stop = end.min(self.next_slot).min(from.saturating_add(count));
+        if from >= stop {
+            return from;
+        }
+        // `stop <= next_slot <= slots.len()`, so the range is always in
+        // bounds; the empty fallback can never be reached.
+        let range = self.slots.get(from as usize..stop as usize).unwrap_or(&[]);
+        for (offset, state) in range.iter().enumerate() {
             if !state.used {
                 continue;
             }
+            // `offset < stop - from`, which fits a `u32`, so the conversion
+            // always fits; the saturating fallback can never be reached.
+            let slot = from.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
             let silent_millis = now_millis.saturating_sub(state.last_seen_millis);
-            let (verdict, expected_millis) = classify_silence(
-                state.interval_ewma_millis,
+            // Plan PR AL-5: an NSE_FNO cadence is floored before it is
+            // judged, and a freshly seeded instrument is not judged at all.
+            // Two compares, no allocation; the scan stays O(n).
+            let judged_cadence = self
+                .config
+                .judged_cadence_millis(state.key.1, state.interval_ewma_millis);
+            let (classified, expected_millis) = classify_silence(
+                judged_cadence,
                 state.samples,
                 silent_millis,
                 state.last_ltt.is_some(),
                 &self.config,
             );
-            sink(SilenceReport {
-                key: state.key,
-                silent_millis,
-                expected_millis,
-                baseline_millis: state.interval_ewma_millis,
-                samples: state.samples,
-                verdict,
-                sparse: state.interval_ewma_millis >= self.config.sparse_baseline_millis,
-            });
+            // The verdict stays RAW: subscribe reconcile and the dead-class
+            // rollup read it, and a never-ticked contract rewritten to
+            // `Warming` read there as healthy (review, 2026-11-06). The warmup
+            // and the floored sparse flag only gate the page
+            // (`counts_toward_alarm`).
+            let warming_up =
+                self.config
+                    .in_attach_warmup(state.key.1, state.attached_millis, now_millis);
+            let sparse = state.interval_ewma_millis >= self.config.sparse_baseline_millis;
+            // A contract that has ticked is judged sparse on its FLOORED
+            // cadence: the EWMA learns a long gap only when the packet ending
+            // it arrives, so a contract that bursts and then sends 1 to 3
+            // packets an hour (measured live 2026-11-06) would otherwise read
+            // as a 3 s instrument that went silent. A never-ticked contract
+            // keeps the raw flag, so a dead stream still counts.
+            let alarm_sparse = sparse
+                || (state.last_ltt.is_some()
+                    && judged_cadence >= self.config.sparse_baseline_millis);
+            sink(
+                slot,
+                SilenceReport {
+                    key: state.key,
+                    silent_millis,
+                    expected_millis,
+                    baseline_millis: state.interval_ewma_millis,
+                    samples: state.samples,
+                    verdict: classified,
+                    sparse,
+                    warming_up,
+                    alarm_sparse,
+                },
+            );
         }
+        stop
     }
 
     /// Clears all learned state for a new session, retaining capacity.
@@ -768,6 +1026,19 @@ impl TickGapDetector {
         }
         self.next_slot = 0;
         self.refused_count = 0;
+    }
+
+    /// When `key` last traded (its cumulative volume rose), in the
+    /// observation's `recv_monotonic_millis` clock. `None` for an untracked
+    /// instrument or one not seen trading this session. One hash probe, never
+    /// assigns a slot. O(1) average.
+    #[must_use]
+    pub fn last_trade_millis(&self, key: InstrumentKey) -> Option<u64> {
+        let slot = *self.index.get(&key)?;
+        self.slots
+            .get(slot as usize)
+            .map(|state| state.last_trade_millis)
+            .filter(|millis| *millis > 0)
     }
 
     /// Number of instruments currently tracked. O(1).
@@ -800,6 +1071,13 @@ impl TickGapDetector {
         if let Some(slot) = self.index.get(&key) {
             return Some(*slot);
         }
+        self.assign_slot(key)
+    }
+
+    /// Assigns the next free slot to `key`, which the caller has just found
+    /// absent from the index; `None` (counted) when the table is full. One
+    /// insert, O(1) average, never grows either structure.
+    fn assign_slot(&mut self, key: InstrumentKey) -> Option<u32> {
         if (self.next_slot as usize) >= self.slots.len() {
             self.refused_count = self.refused_count.saturating_add(1);
             return None;
@@ -850,6 +1128,346 @@ mod tests {
         }
     }
 
+    // ---- plan PR AL-5 (2026-11-06): attach warmup and NSE_FNO cadence floor ----
+
+    const STOCK_OPTION: InstrumentKey = (52_175, ExchangeSegment::NseFno);
+    const CASH_STOCK: InstrumentKey = (2_885, ExchangeSegment::NseEquity);
+
+    fn verdict_of(d: &TickGapDetector, key: InstrumentKey, now: u64) -> Option<SilenceReport> {
+        let mut found = None;
+        d.scan_silence(now, |r| {
+            if r.key == key {
+                found = Some(r);
+            }
+        });
+        found
+    }
+
+    #[test]
+    fn test_live_lane_config_keeps_the_defaults_and_adds_the_two_al5_tunables() {
+        let live = DetectorConfig::live_lane();
+        let base = DetectorConfig::default();
+        assert_eq!(live.attach_warmup_millis, LIVE_ATTACH_WARMUP_MILLIS);
+        assert_eq!(live.fno_cadence_floor_millis, LIVE_FNO_CADENCE_FLOOR_MILLIS);
+        assert_eq!(
+            DetectorConfig {
+                attach_warmup_millis: 0,
+                fno_cadence_floor_millis: 0,
+                ..live
+            },
+            base,
+            "every other tunable is the default"
+        );
+        assert_eq!(
+            base.attach_warmup_millis, 0,
+            "the default config is unchanged"
+        );
+        assert_eq!(base.fno_cadence_floor_millis, 0);
+    }
+
+    #[test]
+    fn test_judged_cadence_millis_floors_only_nse_fno() {
+        let live = DetectorConfig::live_lane();
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseFno, 25_000),
+            60_000
+        );
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseFno, 90_000),
+            90_000
+        );
+        assert_eq!(live.judged_cadence_millis(ExchangeSegment::IdxI, 200), 200);
+        assert_eq!(
+            live.judged_cadence_millis(ExchangeSegment::NseEquity, 1_500),
+            1_500
+        );
+    }
+
+    #[test]
+    fn test_in_attach_warmup_ends_after_ten_minutes() {
+        let live = DetectorConfig::live_lane();
+        let fno = ExchangeSegment::NseFno;
+        assert!(live.in_attach_warmup(fno, Some(1_000), 1_000));
+        assert!(live.in_attach_warmup(fno, Some(1_000), 1_000 + LIVE_ATTACH_WARMUP_MILLIS - 1));
+        assert!(!live.in_attach_warmup(fno, Some(1_000), 1_000 + LIVE_ATTACH_WARMUP_MILLIS));
+        assert!(
+            !live.in_attach_warmup(fno, None, 5),
+            "no recorded start means no warmup"
+        );
+        assert!(
+            !DetectorConfig::default().in_attach_warmup(fno, Some(1_000), 1_000),
+            "warmup off by default"
+        );
+    }
+
+    #[test]
+    fn test_in_attach_warmup_never_applies_to_an_index_or_a_cash_stock() {
+        let live = DetectorConfig::live_lane();
+        for segment in [ExchangeSegment::IdxI, ExchangeSegment::NseEquity] {
+            assert!(
+                !live.in_attach_warmup(segment, Some(1_000), 1_000),
+                "{segment:?} must be judged from its first scan (dead-class rollup)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_regression_a_late_attached_sparse_option_is_not_judged_for_ten_minutes() {
+        // Regression: 2026-11-06 — the 09:08 late attach paged RISK-GAP-03 at
+        // ~09:17 for sparse stock options with a cadence learned from the
+        // first post-subscribe packets.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let attach = 1_000_000;
+        assert!(d.seed(STOCK_OPTION, attach));
+        // A burst: nine packets 3 s apart, then silence.
+        for i in 1..=9_u32 {
+            let t = attach + u64::from(i) * 3_000;
+            d.observe(obs(STOCK_OPTION, 1_000 + i, i * 100, 500, t));
+        }
+        let last = attach + 27_000;
+        // 9 minutes after the attach and 8.5 minutes quiet: warming, so not
+        // counted; the verdict itself is reported raw.
+        let r = verdict_of(&d, STOCK_OPTION, attach + 540_000).expect("tracked");
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm());
+        // Past the warmup: judged against the 60 s floor, so 10 × 60 s = 600 s.
+        let r = verdict_of(&d, STOCK_OPTION, attach + 610_000).expect("tracked");
+        assert!(!r.warming_up);
+        assert_eq!(
+            r.expected_millis, 600_000,
+            "the floor, not the 3 s burst, sets the ceiling"
+        );
+        assert_eq!(
+            r.verdict,
+            SilenceVerdict::Live,
+            "583 s quiet is within 600 s"
+        );
+        let r = verdict_of(&d, STOCK_OPTION, last + 600_001).expect("tracked");
+        assert_eq!(
+            r.verdict,
+            SilenceVerdict::Exceeded,
+            "the raw verdict still reports the stall (reconcile reads it)"
+        );
+        assert!(
+            !r.sparse,
+            "the raw sparse flag reads the learned 3 s cadence"
+        );
+        assert!(
+            r.alarm_sparse,
+            "judged on the 60 s floor, a stock option that ticked is sparse"
+        );
+        assert!(
+            !r.counts_toward_alarm(),
+            "a burst-then-quiet stock option never pages RISK-GAP-03"
+        );
+    }
+
+    #[test]
+    fn test_regression_a_contract_that_ticks_before_its_seed_still_gets_the_warmup() {
+        // Regression: 2026-11-06 review — a contract whose first packet came
+        // before its seed step never had its warmup start, because `seed`
+        // only stamps a still-silent slot.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let first = 2_000_000;
+        d.observe(obs(STOCK_OPTION, 5_000, 100, 10, first));
+        assert!(d.seed(STOCK_OPTION, first + 30_000), "seed after the tick");
+        let r = verdict_of(&d, STOCK_OPTION, first + 60_000).expect("tracked");
+        assert!(r.warming_up, "the warmup starts at the first packet");
+        // It ends 10 minutes after the FIRST of the two, not after the seed.
+        let r = verdict_of(&d, STOCK_OPTION, first + LIVE_ATTACH_WARMUP_MILLIS).expect("tracked");
+        assert!(!r.warming_up);
+        // An index first seen by a packet still never warms up.
+        d.observe(obs(NIFTY, 5_000, 0, 0, first));
+        let r = verdict_of(&d, NIFTY, first + 1).expect("tracked");
+        assert!(!r.warming_up);
+    }
+
+    #[test]
+    fn test_warmup_never_rewrites_the_raw_verdict_for_reconcile_and_the_class_rollup() {
+        // Review, 2026-11-06: rewriting NeverTicked to Warming made subscribe
+        // reconcile and the dead-class rollup read a dead subscribe as healthy.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        let r = verdict_of(&d, STOCK_OPTION, 60_000).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked, "raw verdict kept");
+        assert!(!r.sparse);
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm(), "only the page is held back");
+    }
+
+    #[test]
+    fn test_a_one_packet_per_40_minutes_contract_never_counts_toward_risk_gap_03() {
+        // MEASURED live 2026-11-06 10:00-11:00 IST: the quietest stock options
+        // sent 1 to 3 packets in the whole hour.
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        const FORTY_MIN: u64 = 40 * 60_000;
+        assert!(d.seed(STOCK_OPTION, 0));
+        let mut t = 0;
+        for i in 0..12_u32 {
+            t = u64::from(i) * FORTY_MIN;
+            d.observe(obs(STOCK_OPTION, 30_000 + i * 2_400, 100 + i, 10, t));
+            // Every scan between packets, at every point in the gap.
+            for probe in [t + 1, t + 600_001, t + FORTY_MIN - 1] {
+                let r = verdict_of(&d, STOCK_OPTION, probe).expect("tracked");
+                assert!(!r.counts_toward_alarm(), "packet {i}, probe {probe}: {r:?}");
+            }
+        }
+        // Its own cadence is learned as sparse.
+        let r = verdict_of(&d, STOCK_OPTION, t + 1).expect("tracked");
+        assert!(r.samples >= DEFAULT_BASELINE_WARMUP_SAMPLES);
+        assert!(r.sparse, "the learned 40-minute cadence is sparse");
+        // Even hours of silence after that do not count.
+        let r = verdict_of(&d, STOCK_OPTION, t + 6 * FORTY_MIN).expect("tracked");
+        assert!(!r.counts_toward_alarm());
+    }
+
+    #[test]
+    fn test_a_contract_that_only_sent_its_subscribe_snapshot_never_counts() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        d.observe(obs(STOCK_OPTION, 30_000, 0, 10, 5_000));
+        for probe in [
+            60_000,
+            LIVE_ATTACH_WARMUP_MILLIS + 1,
+            3_600_000,
+            6 * 3_600_000,
+        ] {
+            let r = verdict_of(&d, STOCK_OPTION, probe).expect("tracked");
+            assert_ne!(r.verdict, SilenceVerdict::NeverTicked, "it did tick");
+            assert!(!r.counts_toward_alarm(), "probe {probe}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn test_index_and_cash_stocks_are_judged_as_before_from_the_first_scan() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        let mut base = TickGapDetector::with_capacity(4, DetectorConfig::default());
+        for det in [&mut d, &mut base] {
+            assert!(det.seed(NIFTY, 0));
+            assert!(det.seed(CASH_STOCK, 0));
+            warm_up(det, NIFTY, 1_000, 20);
+            warm_up(det, CASH_STOCK, 2_000, 20);
+        }
+        // Inside what would be an option's warmup, and well after it: an index
+        // and a cash stock read exactly as under the default config.
+        for now in [100_000, LIVE_ATTACH_WARMUP_MILLIS + 100_000] {
+            for key in [NIFTY, CASH_STOCK] {
+                let live = verdict_of(&d, key, now).expect("tracked");
+                let default = verdict_of(&base, key, now).expect("tracked");
+                assert_eq!(live, default, "{key:?} unchanged by the live-lane tunables");
+            }
+        }
+        // A seeded index that never ticks reports at once, as before (the
+        // dead-class rollup reads this).
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(NIFTY, 0));
+        let r = verdict_of(&d, NIFTY, 60_000).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked);
+    }
+
+    #[test]
+    fn test_a_never_ticked_option_still_reports_after_the_warmup() {
+        let mut d = TickGapDetector::with_capacity(4, DetectorConfig::live_lane());
+        assert!(d.seed(STOCK_OPTION, 0));
+        let r = verdict_of(&d, STOCK_OPTION, 60_000).expect("tracked");
+        assert!(r.warming_up);
+        assert!(!r.counts_toward_alarm());
+        let r = verdict_of(&d, STOCK_OPTION, LIVE_ATTACH_WARMUP_MILLIS + 1).expect("tracked");
+        assert_eq!(r.verdict, SilenceVerdict::NeverTicked);
+        assert!(!r.alarm_sparse, "a dead stream keeps the raw (false) flag");
+        assert!(
+            r.counts_toward_alarm(),
+            "a subscribe that never took still counts"
+        );
+    }
+
+    #[test]
+    fn last_trade_millis_moves_only_on_a_volume_increase() {
+        let mut d = detector();
+        assert_eq!(d.last_trade_millis(NIFTY), None, "untracked reads None");
+        // First observation seeds the volume baseline: not a trade.
+        d.observe(obs(NIFTY, 1_000, 100, 500, 1_000));
+        assert_eq!(d.last_trade_millis(NIFTY), None, "the seed is not a trade");
+        // Volume rises: a trade at 2_000.
+        d.observe(obs(NIFTY, 1_001, 150, 500, 2_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // Same volume (a book or quote-only update): unchanged.
+        d.observe(obs(NIFTY, 1_002, 150, 600, 3_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // A lower volume (counter restart or stale copy): unchanged.
+        d.observe(obs(NIFTY, 1_003, 10, 600, 4_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        // A later increase moves it forward.
+        d.observe(obs(NIFTY, 1_004, 200, 600, 5_000));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(5_000));
+        // An older receipt instant never moves it backward.
+        d.observe(obs(NIFTY, 1_005, 300, 600, 4_500));
+        assert_eq!(d.last_trade_millis(NIFTY), Some(5_000));
+        // Another instrument is independent.
+        assert_eq!(d.last_trade_millis(BANKNIFTY), None);
+    }
+
+    /// MEASUREMENT (not a CI gate -- `#[ignore]`d, run on demand):
+    /// what does the 30-second `scan_silence` sweep actually cost at the
+    /// authorized 25,000-instrument ceiling?
+    ///
+    /// CLAUDE.md's O(1) table records this path as O(n) in tracked instruments
+    /// and closes with "Still UNMEASURED at the 25,000 target". It is the last
+    /// row in that table making an unmeasured cost claim, and an unmeasured
+    /// cost claim is indistinguishable from an unbounded one to the next
+    /// reader. This turns it into a number.
+    ///
+    /// RESULT, 2026-08-22, `--release`, x86 dev container:
+    ///
+    /// ```text
+    /// scan_silence: 25000 instruments, 69.78us (2.8 ns/instrument),
+    ///               0.0002% of the 30s cadence
+    /// ```
+    ///
+    /// So the O(n) is real and the constant is negligible: at the authorized
+    /// ceiling the sweep costs ~70 microseconds against a 30-second interval.
+    /// The row stays BOUNDED rather than becoming GUARANTEED because the shape
+    /// is still linear -- doubling the universe doubles the cost, and only the
+    /// measurement says how much headroom that leaves.
+    ///
+    /// Ignored rather than asserted for the same reason as the aggregator's
+    /// sweep harness: a wall-clock bound on a shared CI runner is a flake, and
+    /// a flaky gate is worse than none. Not measured on the prod r8g.xlarge
+    /// (Graviton4); this is an order-of-magnitude answer.
+    ///
+    ///     cargo test -p tickvault-core --release --lib \
+    ///       scan_silence_sweep_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "measurement harness, not a gate — see doc comment"]
+    #[allow(clippy::print_stdout)] // APPROVED: plan item 12b preserves calibration output; this ignored harness's printed timing is its result.
+    fn scan_silence_sweep_cost_at_the_authorized_ceiling() {
+        const N: usize = 25_000;
+        let mut d = TickGapDetector::with_capacity(N, DetectorConfig::default());
+        // Seed every slot AND drive each past warmup, so the sweep classifies
+        // real baselines rather than short-circuiting on unwarmed state --
+        // the shape the live lane actually presents after the open.
+        for sid in 0..N as u64 {
+            let key = (sid, ExchangeSegment::NseEquity);
+            assert!(d.seed(key, 0), "seed {sid} must fit the 25,000 ceiling");
+            for i in 1..=4u32 {
+                d.observe(obs(key, 1_000 + i, i * 100, 500, u64::from(i) * 1_000));
+            }
+        }
+        assert_eq!(d.tracked_instruments(), N, "every slot must be occupied");
+
+        let mut seen = 0usize;
+        let t0 = std::time::Instant::now();
+        d.scan_silence(60_000, |_| seen += 1);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(seen, N, "the sweep must report on every tracked instrument");
+        println!(
+            "scan_silence: {N} instruments, {elapsed:?} ({:.1} ns/instrument), \
+             {:.4}% of the 30s cadence",
+            elapsed.as_nanos() as f64 / N as f64,
+            elapsed.as_secs_f64() / 30.0 * 100.0
+        );
+    }
     // -- classify_ltt --------------------------------------------------------
 
     #[test]
@@ -1488,6 +2106,217 @@ mod tests {
             d.scan_silence(u64::MAX, |_| n += 1);
             prop_assert_eq!(n, d.tracked_instruments());
         }
+
+        /// `scan_silence_slots` (2026-11-17) hands out exactly the reports
+        /// `scan_silence` does, in the same order, and each with the slot the
+        /// detector's own index holds for that key. Exercised across a session
+        /// reset (which reassigns slots), seeds, refusals past capacity and the
+        /// same id in two segments.
+        #[test]
+        fn proptest_scan_silence_slots_equals_scan_silence(
+            ops in prop::collection::vec(
+                (0u8..4, 0u64..12, 0u8..3, any::<u32>(), 0u32..10_000, 0u64..5_000_000),
+                0..300,
+            ),
+            now in 0u64..6_000_000,
+        ) {
+            let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+            let segments = [ExchangeSegment::IdxI, ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
+            let check = |d: &TickGapDetector, now: u64| -> Result<(), TestCaseError> {
+                let mut plain = Vec::new();
+                d.scan_silence(now, |r| plain.push(r));
+                let mut slotted = Vec::new();
+                d.scan_silence_slots(now, |slot, r| slotted.push((slot, r)));
+                prop_assert_eq!(plain.len(), slotted.len());
+                let mut previous: Option<u32> = None;
+                for (p, (slot, s)) in plain.iter().zip(slotted.iter()) {
+                    prop_assert_eq!(p, s);
+                    prop_assert_eq!(d.index.get(&s.key).copied(), Some(*slot));
+                    prop_assert!(previous.is_none_or(|prev| prev < *slot));
+                    prop_assert!((*slot as usize) < d.capacity());
+                    previous = Some(*slot);
+                }
+                Ok(())
+            };
+            for (op, sid, seg, ltt, vol, millis) in ops {
+                let key = (sid, segments[usize::from(seg)]);
+                match op {
+                    0 => {
+                        let _ = d.seed(key, millis);
+                    }
+                    1 | 2 => {
+                        let _ = d.observe(obs(key, ltt, vol, vol, millis));
+                    }
+                    _ => {
+                        check(&d, now)?;
+                        if sid % 4 == 0 {
+                            d.reset_session();
+                        }
+                    }
+                }
+            }
+            check(&d, now)?;
+        }
+
+        /// `scan_silence_slot_range` (plan item US1-D, 2026-11-24): scanning
+        /// in chunks of any size from 1 to past the slot count, each chunk
+        /// starting where the last one stopped, gives exactly the
+        /// `(slot, report)` sequence one `scan_silence_slots` call gives.
+        /// The detector holds seeded never-ticked slots, slots still warming,
+        /// live ones and (at a late `now`) exceeded ones, and runs across a
+        /// session reset. An `end` past the slot count is clamped.
+        #[test]
+        fn proptest_scan_silence_slot_range_chunks_equal_the_full_scan(
+            ops in prop::collection::vec(
+                (0u8..5, 0u64..10, 0u8..3, any::<u32>(), 0u32..10_000, 0u64..5_000_000),
+                0..400,
+            ),
+            now in 0u64..50_000_000,
+            chunk in 1u32..=18,
+            end_past in any::<bool>(),
+        ) {
+            const CAPACITY: usize = 16;
+            let mut d = TickGapDetector::with_capacity(CAPACITY, DetectorConfig::live_lane());
+            let segments = [ExchangeSegment::IdxI, ExchangeSegment::NseEquity, ExchangeSegment::NseFno];
+            for (op, sid, seg, ltt, vol, millis) in ops {
+                let key = (sid, segments[usize::from(seg)]);
+                match op {
+                    0 => {
+                        let _ = d.seed(key, millis);
+                    }
+                    1..=3 => {
+                        let _ = d.observe(obs(key, ltt, vol, vol, millis));
+                    }
+                    _ => {
+                        if sid == 0 {
+                            d.reset_session();
+                        }
+                    }
+                }
+            }
+            let mut full = Vec::new();
+            d.scan_silence_slots(now, |slot, r| full.push((slot, r)));
+
+            let tracked = u32::try_from(d.tracked_instruments()).unwrap_or(u32::MAX);
+            let end = if end_past { u32::MAX } else { tracked };
+            let mut chunked = Vec::new();
+            let mut from = 0u32;
+            let mut calls = 0u32;
+            loop {
+                let next = d.scan_silence_slot_range(now, from, end, chunk, |slot, r| {
+                    chunked.push((slot, r));
+                });
+                calls += 1;
+                if next >= tracked {
+                    prop_assert_eq!(next, tracked);
+                    break;
+                }
+                // A non-zero chunk always makes progress, by exactly the chunk.
+                prop_assert_eq!(next, from + chunk);
+                from = next;
+                prop_assert!(calls as usize <= CAPACITY + 1);
+            }
+            prop_assert_eq!(full, chunked);
+        }
+    }
+
+    #[test]
+    fn test_scan_silence_slot_range_clamps_end_to_next_slot() {
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        for sid in 0..3 {
+            assert!(d.seed((sid, ExchangeSegment::NseFno), 1_000));
+        }
+        let mut seen = Vec::new();
+        // An end and a count far past the three tracked slots stop at 3.
+        let next = d.scan_silence_slot_range(60_000, 0, u32::MAX, u32::MAX, |slot, r| {
+            seen.push((slot, r.key.0));
+        });
+        assert_eq!(next, 3);
+        assert_eq!(seen, vec![(0, 0), (1, 1), (2, 2)]);
+        // An end below the slot count stops at the end.
+        seen.clear();
+        let next = d.scan_silence_slot_range(60_000, 0, 2, 100, |slot, r| {
+            seen.push((slot, r.key.0));
+        });
+        assert_eq!(next, 2);
+        assert_eq!(seen, vec![(0, 0), (1, 1)]);
+        // A start at or past the clamped end visits nothing and returns it.
+        let mut n = 0;
+        assert_eq!(
+            d.scan_silence_slot_range(60_000, 3, u32::MAX, 10, |_, _| n += 1),
+            3
+        );
+        assert_eq!(
+            d.scan_silence_slot_range(60_000, 7, u32::MAX, 10, |_, _| n += 1),
+            7
+        );
+        assert_eq!(n, 0);
+    }
+
+    /// The random proptest above is not certain to build every verdict in
+    /// one case, so this pins one detector that holds all four (never
+    /// ticked, warming, live, exceeded) and checks every chunk size.
+    #[test]
+    fn test_scan_silence_slot_range_chunks_cover_every_verdict() {
+        let seg = ExchangeSegment::NseEquity;
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        assert!(d.seed((1, seg), 0));
+        let _ = d.observe(obs((2, seg), 1, 1, 1, 0));
+        for i in 0..20u32 {
+            let millis = u64::from(i) * 1_000;
+            let _ = d.observe(obs((3, seg), i + 1, i + 1, i + 1, millis));
+            let _ = d.observe(obs((4, seg), i + 1, i + 1, i + 1, millis));
+        }
+        for i in 0..20u32 {
+            let millis = 500_000 + u64::from(i) * 1_000;
+            let _ = d.observe(obs((3, seg), 100 + i, 100 + i, 100 + i, millis));
+        }
+        let now = 520_000;
+        let mut full = Vec::new();
+        d.scan_silence_slots(now, |slot, r| full.push((slot, r)));
+        let verdicts: Vec<_> = full.iter().map(|(_, r)| (r.key.0, r.verdict)).collect();
+        assert_eq!(
+            verdicts,
+            vec![
+                (1, SilenceVerdict::NeverTicked),
+                (2, SilenceVerdict::Warming),
+                (3, SilenceVerdict::Live),
+                (4, SilenceVerdict::Exceeded),
+            ]
+        );
+        for chunk in 1..=6u32 {
+            let mut chunked = Vec::new();
+            let mut from = 0;
+            while from < 4 {
+                from = d.scan_silence_slot_range(now, from, u32::MAX, chunk, |slot, r| {
+                    chunked.push((slot, r));
+                });
+            }
+            assert_eq!(full, chunked, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn test_scan_silence_slot_range_zero_count_returns_from() {
+        let mut d = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        for sid in 0..4 {
+            assert!(d.seed((sid, ExchangeSegment::NseEquity), 1_000));
+        }
+        let mut n = 0;
+        for from in 0..6 {
+            assert_eq!(
+                d.scan_silence_slot_range(60_000, from, u32::MAX, 0, |_, _| n += 1),
+                from
+            );
+        }
+        assert_eq!(n, 0);
+        // An empty detector returns the start too, whatever the count.
+        let empty = TickGapDetector::with_capacity(8, DetectorConfig::live_lane());
+        assert_eq!(
+            empty.scan_silence_slot_range(60_000, 0, u32::MAX, 5, |_, _| n += 1),
+            0
+        );
+        assert_eq!(n, 0);
     }
 
     // ======================================================================
@@ -1597,8 +2426,21 @@ mod tests {
             samples: 32,
             verdict,
             sparse,
+            warming_up: false,
+            alarm_sparse: sparse,
         };
         assert!(report(SilenceVerdict::Exceeded, false).counts_toward_alarm());
+        // Plan PR AL-5: the alarm-only fields gate the page by themselves.
+        let warming = SilenceReport {
+            warming_up: true,
+            ..report(SilenceVerdict::NeverTicked, false)
+        };
+        assert!(!warming.counts_toward_alarm());
+        let floored = SilenceReport {
+            alarm_sparse: true,
+            ..report(SilenceVerdict::Exceeded, false)
+        };
+        assert!(!floored.counts_toward_alarm());
         assert!(report(SilenceVerdict::NeverTicked, false).counts_toward_alarm());
         // The far-month / INDIA VIX case: visible in the sweep, never paging.
         assert!(!report(SilenceVerdict::Exceeded, true).counts_toward_alarm());
@@ -1606,6 +2448,54 @@ mod tests {
         // Healthy verdicts never count regardless of sparseness.
         assert!(!report(SilenceVerdict::Live, false).counts_toward_alarm());
         assert!(!report(SilenceVerdict::Warming, false).counts_toward_alarm());
+    }
+
+    #[test]
+    fn test_observe_tracked_never_assigns_a_slot_and_never_counts_a_refusal() {
+        let mut d = TickGapDetector::with_capacity(2, DetectorConfig::default());
+        assert!(
+            d.observe_tracked(obs(NIFTY, 1_000, 1, 0, 0)).is_none(),
+            "an untracked instrument is skipped"
+        );
+        assert_eq!(d.tracked_instruments(), 0, "no slot was assigned");
+        assert_eq!(d.refused_count(), 0, "a skip is not blindness");
+
+        assert!(d.seed(NIFTY, 500));
+        let first = d.observe_tracked(obs(NIFTY, 1_000, 1, 0, 1_000));
+        assert!(matches!(first, Some(a) if !a.was_refused()));
+        let second = d.observe_tracked(obs(NIFTY, 1_001, 5, 0, 2_000));
+        assert!(
+            matches!(second, Some(a) if matches!(a.volume, VolumeVerdict::Advanced { delta: 4 })),
+            "a tracked instrument gets the same update as observe"
+        );
+        assert_eq!(d.last_trade_millis(NIFTY), Some(2_000));
+        assert_eq!(d.tracked_instruments(), 1);
+    }
+
+    /// REGRESSION (live 2026-10-28): the WAL replay folded frames from earlier
+    /// sessions through `observe`, every replayed contract took a slot for the
+    /// rest of the process, and the live contracts seeded after it were
+    /// refused. A replay of the authorized ceiling's worth of foreign keys
+    /// must leave room for the whole live universe (20,519 on 28 Oct).
+    #[test]
+    fn test_observe_tracked_replay_cannot_starve_the_live_universe_of_20519() {
+        const CEILING: usize = tickvault_common::constants::MAX_DAILY_UNIVERSE_SIZE;
+        const LIVE_UNIVERSE: u64 = 20_519;
+        let mut d = TickGapDetector::with_capacity(CEILING, DetectorConfig::default());
+        // A replay of prior-day keys, none of them in today's subscribe set.
+        for sid in 1_000_000..1_000_000 + CEILING as u64 {
+            let key = (sid, ExchangeSegment::NseFno);
+            assert!(d.observe_tracked(obs(key, 1_000, 1, 0, 0)).is_none());
+        }
+        assert_eq!(d.tracked_instruments(), 0);
+        for sid in 0..LIVE_UNIVERSE {
+            assert!(
+                d.seed((sid, ExchangeSegment::NseFno), 1_000),
+                "live instrument {sid} refused a slot"
+            );
+        }
+        assert_eq!(d.refused_count(), 0);
+        assert_eq!(d.tracked_instruments(), LIVE_UNIVERSE as usize);
     }
 
     #[test]
@@ -1646,5 +2536,109 @@ mod tests {
         assert_eq!((d.tracked_instruments(), d.refused_count()), (2, 0));
         d.observe(obs((99, ExchangeSegment::IdxI), 1_000, 1, 0, 0));
         assert_eq!((d.tracked_instruments(), d.refused_count()), (2, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Old-vs-new equality (plan ITEM DT, 2026-10-30). `observe` now probes the
+    // index itself and assigns or refuses out of line; `reference_observe` is
+    // the body it replaced, driven side by side over random operation
+    // sequences. The reference reaches assignment and refusal through
+    // `slot_for`, which shares `assign_slot` with the new path, so this pins
+    // `observe`'s own routing (hit, assign, refuse); what `assign_slot` does is
+    // pinned by the refusal-count and capacity tests above.
+    // -----------------------------------------------------------------------
+
+    fn reference_observe(d: &mut TickGapDetector, obs: TickObservation) -> TickAssessment {
+        let Some(slot) = d.slot_for(obs.key) else {
+            return TickAssessment {
+                ltt: LttVerdict::FirstSight,
+                volume: VolumeVerdict::FirstSight,
+                oi: OiVerdict::FirstSight,
+                refused: true,
+            };
+        };
+        d.observe_slot(slot, obs)
+    }
+
+    fn assert_same_state(a: &TickGapDetector, b: &TickGapDetector) {
+        assert_eq!(a.slots, b.slots);
+        assert_eq!(a.index.len(), b.index.len());
+        for (key, slot) in &a.index {
+            assert_eq!(b.index.get(key), Some(slot));
+        }
+        assert_eq!(a.next_slot, b.next_slot);
+        assert_eq!(a.refused_count, b.refused_count);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Observe(u8, u32, u32, u32, u64),
+        ObserveTracked(u8, u32, u32, u32, u64),
+        Seed(u8, u64),
+        Reset,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        // Small key space and a capacity of 4 so the table fills and refuses.
+        let key = 0u8..8;
+        prop_oneof![
+            8 => (key.clone(), 0u32..20, 0u32..50, 0u32..5, 0u64..10_000)
+                .prop_map(|(k, l, v, o, m)| Op::Observe(k, l, v, o, m)),
+            2 => (key.clone(), 0u32..20, 0u32..50, 0u32..5, 0u64..10_000)
+                .prop_map(|(k, l, v, o, m)| Op::ObserveTracked(k, l, v, o, m)),
+            2 => (key, 0u64..10_000).prop_map(|(k, m)| Op::Seed(k, m)),
+            1 => Just(Op::Reset),
+        ]
+    }
+
+    fn op_key(k: u8) -> InstrumentKey {
+        // Two segments share each id, so the composite key is exercised.
+        let segment = if k.is_multiple_of(2) {
+            ExchangeSegment::NseFno
+        } else {
+            ExchangeSegment::NseEquity
+        };
+        (u64::from(k / 2), segment)
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_observe_matches_the_previous_body(ops in proptest::collection::vec(op(), 1..200)) {
+            let mut new = TickGapDetector::with_capacity(4, DetectorConfig::default());
+            let mut old = TickGapDetector::with_capacity(4, DetectorConfig::default());
+            for op in ops {
+                match op {
+                    Op::Observe(k, l, v, o, m) => {
+                        let obs = obs(op_key(k), l, v, o, m);
+                        prop_assert_eq!(new.observe(obs), reference_observe(&mut old, obs));
+                    }
+                    Op::ObserveTracked(k, l, v, o, m) => {
+                        let obs = obs(op_key(k), l, v, o, m);
+                        prop_assert_eq!(new.observe_tracked(obs), old.observe_tracked(obs));
+                    }
+                    Op::Seed(k, m) => {
+                        prop_assert_eq!(new.seed(op_key(k), m), old.seed(op_key(k), m));
+                    }
+                    Op::Reset => {
+                        new.reset_session();
+                        old.reset_session();
+                    }
+                }
+                assert_same_state(&new, &old);
+            }
+        }
+    }
+
+    #[test]
+    fn test_observe_refusal_at_capacity_matches_the_previous_body() {
+        let mut new = TickGapDetector::with_capacity(1, DetectorConfig::default());
+        let mut old = TickGapDetector::with_capacity(1, DetectorConfig::default());
+        for (key, ltt) in [(NIFTY, 1), (BANKNIFTY, 2), (BANKNIFTY, 3), (NIFTY, 4)] {
+            let o = obs(key, ltt, ltt, 0, u64::from(ltt));
+            assert_eq!(new.observe(o), reference_observe(&mut old, o));
+            assert_same_state(&new, &old);
+        }
+        assert_eq!(new.refused_count(), 2);
+        assert_eq!(new.tracked_instruments(), 1);
     }
 }

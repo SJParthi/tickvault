@@ -7,10 +7,12 @@ use std::sync::OnceLock;
 
 use metrics::Counter;
 use tickvault_common::constants::{
-    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, RESPONSE_CODE_DISCONNECT,
-    RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER, RESPONSE_CODE_MARKET_DEPTH,
-    RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE,
-    RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DISCONNECT_PACKET_SIZE,
+    FULL_QUOTE_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE,
+    QUOTE_OFFSET_LTT, QUOTE_PACKET_SIZE, RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL,
+    RESPONSE_CODE_INDEX_TICKER, RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS,
+    RESPONSE_CODE_OI, RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
+    TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
 };
 
 // PR #4 (2026-05-19): DEEP_DEPTH_HEADER_SIZE retired alongside the
@@ -27,7 +29,7 @@ use super::oi::parse_oi_packet;
 use super::previous_close::parse_previous_close_packet;
 use super::quote::parse_quote_packet;
 use super::ticker::parse_ticker_packet;
-use super::types::{ParseError, ParsedFrame};
+use super::types::{PacketHeader, ParseError, ParsedFrame};
 
 // O(1) hot-path Counter handles. The `metrics::counter!()` macro with
 // labels allocates a Vec<Label> per invocation; caching the resolved
@@ -163,19 +165,147 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
     // path zero-allocation (Principle #1) — see `dispatcher_counter`.
     dispatcher_counter(header.response_code).increment(1);
 
+    dispatch_parsed_header(raw, header, received_at_nanos, true)
+}
+
+/// [`dispatch_frame`] without its per-packet response-code counter.
+///
+/// For a caller that counts packets itself in batches through
+/// [`count_packets_by_response_code`] (the live main-feed drain counts one
+/// run of equal codes per frame, plan ITEM DT sub-µs drain, 2026-10-30): a
+/// `metrics` counter increment is an atomic read-modify-write once a recorder
+/// is installed, and the drain paid one per packet. The parse is identical.
+/// To keep the totals, the caller counts exactly the packets `dispatch_frame`
+/// would have: every input of at least `BINARY_HEADER_SIZE` bytes, whatever
+/// the parse result (the unknown-code counter is still incremented here, as
+/// `dispatch_frame` does). The drain only dispatches packets sized by
+/// [`main_feed_packet_len`], every one of which is at least that long
+/// (`test_every_main_feed_packet_size_has_a_header`).
+///
+/// # Performance
+/// O(1) — header parse + single packet parse. No heap allocation.
+#[inline]
+pub fn dispatch_frame_uncounted(
+    raw: &[u8],
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
+    let header = parse_header(raw)?;
+    dispatch_parsed_header(raw, header, received_at_nanos, true)
+}
+
+/// [`dispatch_frame_uncounted`] for a frame whose receipt is NOT a WAL stamp
+/// (the live drain's `now - queued` fallback). Identical parse; the Dhan
+/// trade-time correction is never applied (scope lock 2026-11-20, kept by the
+/// 2026-11-21 rule: "never applied to a frame without a WAL receipt stamp"),
+/// because a replay of that record would carry no receipt and could not
+/// reproduce the decision. Each Ticker, Quote or Full packet left raw this way
+/// is counted on `tv_dhan_ltt_unstamped_total` (local `/metrics` only).
+///
+/// # Performance
+/// O(1) — header parse + single packet parse. No heap allocation.
+#[inline]
+// TEST-EXEMPT: covered by test_dispatch_frame_uncounted_parses_like_dispatch_frame and core/tests ltt_correction_dispatch
+pub fn dispatch_frame_uncounted_unstamped(
+    raw: &[u8],
+    received_at_nanos: i64,
+) -> Result<ParsedFrame, ParseError> {
+    let header = parse_header(raw)?;
+    dispatch_parsed_header(raw, header, received_at_nanos, false)
+}
+
+/// The Last Trade Time exactly as Dhan sent it in a Ticker, Quote or Full
+/// packet (before any correction), or `None` for any other packet or a short
+/// one. The live drain's trade-time detector votes on this raw value.
+///
+/// # Performance
+/// O(1): one code read and one fixed-offset `u32` read. No allocation.
+#[must_use]
+#[inline]
+pub fn raw_last_trade_time(packet: &[u8]) -> Option<u32> {
+    let offset = match *packet.first()? {
+        RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => TICKER_OFFSET_LTT,
+        RESPONSE_CODE_QUOTE | RESPONSE_CODE_FULL => QUOTE_OFFSET_LTT,
+        _ => return None,
+    };
+    let bytes: [u8; 4] = packet
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Applies the Dhan trade-time correction to one parsed tick. The ONLY place a
+/// trade time is corrected: every consumer reads the tick after this.
+///
+/// ⚠ CHANGED 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+/// 2026-11-20 00:00 IST"): for a WAL-stamped frame the correction is a pure
+/// function of `(raw, receipt)`: receipts before the cutover are unchanged,
+/// from it exactly +19,800 s under the band and the receipt + 5 s cap. A frame
+/// with no WAL receipt stamp is never corrected and is counted
+/// (`tv_dhan_ltt_unstamped_total`). O(1), no allocation; one compare before the
+/// cutover. Called from the Ticker, Quote and Full arms of
+/// `dispatch_parsed_header`, pinned by
+/// `test_apply_ltt_correction_sits_in_all_three_dispatcher_arms`.
+///
+/// The refusal and unstamped counters count DISPATCHES, not distinct packets:
+/// the live drain, a WAL refold or catch-up, the after-close depth pass and the
+/// offline live-fill replay all dispatch through here, so a packet dispatched
+/// again by one of them is counted again. Read them as "refusals seen".
+// DHAN-LTT: correction threaded through the dispatcher (guard pinned).
+#[inline]
+fn apply_ltt_correction(
+    tick: &mut tickvault_common::tick_types::ParsedTick,
+    received_at_nanos: i64,
+    wal_stamped: bool,
+) {
+    if wal_stamped {
+        tick.exchange_timestamp = tickvault_storage::ltt_correction::corrected_ltt(
+            tick.exchange_timestamp,
+            tick.exchange_segment_code,
+            received_at_nanos,
+        );
+    } else {
+        tickvault_storage::ltt_correction::note_unstamped();
+    }
+}
+
+/// Adds `packets` to the `tv_packets_by_response_code` series of `code`, the
+/// same series [`dispatch_frame`] increments by one per packet.
+///
+/// # Performance
+/// O(1): one `OnceLock` read and one counter increment, no allocation.
+#[inline]
+pub fn count_packets_by_response_code(code: u8, packets: u64) {
+    if packets > 0 {
+        dispatcher_counter(code).increment(packets);
+    }
+}
+
+/// The body shared by [`dispatch_frame`] and [`dispatch_frame_uncounted`]:
+/// everything after the header parse and the packet count.
+#[inline]
+fn dispatch_parsed_header(
+    raw: &[u8],
+    header: PacketHeader,
+    received_at_nanos: i64,
+    wal_stamped: bool,
+) -> Result<ParsedFrame, ParseError> {
     match header.response_code {
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
-            let tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
+            let mut tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::Tick(tick))
         }
         // PR #4 (2026-05-19): RESPONSE_CODE_MARKET_DEPTH (v1 legacy, code 3)
         // arm retired — v1 is deprecated in v2 (replaced by Full code 8).
         RESPONSE_CODE_QUOTE => {
-            let tick = parse_quote_packet(raw, &header, received_at_nanos)?;
+            let mut tick = parse_quote_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::Tick(tick))
         }
         RESPONSE_CODE_FULL => {
-            let (tick, depth) = parse_full_packet(raw, &header, received_at_nanos)?;
+            let (mut tick, depth) = parse_full_packet(raw, &header, received_at_nanos)?;
+            apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);
             Ok(ParsedFrame::TickWithDepth(tick, depth))
         }
         RESPONSE_CODE_OI => {
@@ -274,6 +404,115 @@ pub fn dispatch_depth_packet<'b>(
     };
     depth_dispatcher_counter(code).increment(1);
     Ok(packet)
+}
+
+/// Byte length of the main-feed packet starting at `bytes`, from its response
+/// code. `None` for an unknown code or a header too short to classify.
+///
+/// The header carries its own message length at bytes 1..3, but that field is
+/// vendor-supplied: trusting it would let a malformed length walk the parser
+/// off the end of one packet and into the middle of the next. The code -> size
+/// table is ours and is fixed by the protocol.
+///
+/// This lives in `core` rather than beside its caller because TWO walks depend
+/// on agreeing byte-for-byte: the frame drain that decodes packets, and
+/// [`crate::websocket::connection::classify_frame`], which walks the same bytes
+/// looking for a stacked disconnect. When those two disagree, the drain decodes
+/// a disconnect the classifier never saw -- which is exactly the defect the
+/// 2026-08-25 audit found. One function makes them agree by construction.
+#[must_use]
+pub fn main_feed_packet_len(bytes: &[u8]) -> Option<usize> {
+    let code = *bytes.first()?;
+    let size = match code {
+        // Code 1 and code 2 are the SAME 16-byte ticker packet, and
+        // `dispatch_frame` accepts them in ONE arm. Code 1 was missing from
+        // this table until 2026-08-26, so a frame whose first packet was an
+        // INDEX ticker walked no further: the drain counted `unparseable`,
+        // abandoned the WHOLE remaining frame, and `stacked_disconnect_reason`
+        // returned `None` -- putting an 804 back out of reach behind exactly
+        // the shape the walk was built to see through. Latent rather than
+        // live only because IDX_I subscribes in Quote mode today; the
+        // 2026-08-21 scope-lock names `Ticker` as the next value to try if
+        // Dhan refuses Quote for indices, which is one config line away from
+        // discarding every index frame.
+        RESPONSE_CODE_INDEX_TICKER => TICKER_PACKET_SIZE,
+        RESPONSE_CODE_TICKER => TICKER_PACKET_SIZE,
+        RESPONSE_CODE_QUOTE => QUOTE_PACKET_SIZE,
+        RESPONSE_CODE_OI => OI_PACKET_SIZE,
+        RESPONSE_CODE_PREVIOUS_CLOSE => PREVIOUS_CLOSE_PACKET_SIZE,
+        RESPONSE_CODE_MARKET_STATUS => MARKET_STATUS_PACKET_SIZE,
+        RESPONSE_CODE_FULL => FULL_QUOTE_PACKET_SIZE,
+        RESPONSE_CODE_DISCONNECT => DISCONNECT_PACKET_SIZE,
+        _ => return None,
+    };
+    Some(size)
+}
+
+/// The reason code of a disconnect packet STACKED anywhere inside a main-feed
+/// frame, found by walking the packet boundaries rather than scanning bytes.
+///
+/// A Dhan frame stacks packets, so a disconnect can arrive with data ahead of
+/// it -- and until 2026-08-25 that shape was invisible: the classifier compared
+/// the WHOLE frame length against 10 and called anything else data, so a
+/// `[quote][disconnect 804]` frame was handed to the drain, which decoded the
+/// disconnect and folded it into an untyped "non-tick" count. The reason code
+/// reached no log, no metric and no classifier. 804 means the subscribe set
+/// exceeds the per-connection cap, and the repo already rules it Fatal
+/// precisely because retrying re-sends the identical over-limit set forever and
+/// can earn a 805 block -- so the one code that must never be retried was the
+/// one being retried blind.
+///
+/// Structural, not a byte scan: a value of 50 inside a quote packet's payload
+/// is never at a packet boundary and so is never read as a code. An unwalkable
+/// frame yields `None` and stays data, keeping the fail-safe direction the
+/// classifier already documents.
+///
+/// O(packets per frame), no allocation.
+#[must_use]
+pub fn stacked_disconnect_reason(frame: &[u8], max_packets: u32) -> Option<u16> {
+    let mut offset = 0usize;
+    let mut packets = 0u32;
+    let mut found: Option<u16> = None;
+    while offset < frame.len() {
+        // Count the packet BEFORE reading it, as the depth walk does
+        // (`stacked_depth_disconnect_reason`): a frame of exactly
+        // `max_packets` packets is walked whole. The old `>=` after the read
+        // gave up on the last packet of such a frame, so a disconnect stacked
+        // last in a 70,000-packet frame was never seen.
+        packets = packets.saturating_add(1);
+        if packets > max_packets {
+            return None;
+        }
+        let rest = frame.get(offset..)?;
+        let len = main_feed_packet_len(rest)?;
+        let end = offset.checked_add(len)?;
+        if end > frame.len() {
+            // A trailing partial packet: refuse to guess at its contents.
+            return None;
+        }
+        if found.is_none() && rest.first().copied() == Some(RESPONSE_CODE_DISCONNECT) {
+            // `try_into` rather than `raw[0]`/`raw[1]`: this module carries
+            // `deny(clippy::indexing_slicing)` under `not(test)`, and it is
+            // right to. A panic in a parser reading vendor bytes is the one
+            // failure a feed cannot absorb, so the reason code is read through
+            // a fallible conversion that yields `None` instead.
+            let raw: [u8; 2] = rest.get(len.checked_sub(2)?..len)?.try_into().ok()?;
+            found = Some(u16::from_le_bytes(raw));
+        }
+        offset = end;
+    }
+    // The WHOLE frame must walk cleanly before a disconnect inside it counts.
+    //
+    // An earlier draft returned as soon as it saw a code-50 packet at offset
+    // 0, and two existing tests caught it: a 16-byte frame whose first byte
+    // happens to be 50 is a valid 10-byte disconnect plus six bytes that
+    // resolve to nothing, and honouring that would park a healthy socket on a
+    // reason read out of random data. Requiring the frame to walk end to end
+    // means a fabricated disconnect needs the peer to send an entirely
+    // well-formed frame that genuinely contains one -- which is the fail-safe
+    // direction `classify_frame` already documents, preserved rather than
+    // traded away for the stacked case.
+    found
 }
 
 #[cfg(test)]
@@ -839,5 +1078,379 @@ mod depth_dispatch_tests {
             depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_BID),
             depth_dispatcher_counter(DEEP_DEPTH_FEED_CODE_ASK)
         ));
+    }
+}
+
+/// The stacked-disconnect walk (2026-08-25). Its own module because it is a
+/// MAIN-FEED concern and the module above is the depth dispatcher's.
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)] // APPROVED: fixed protocol offsets
+mod stacked_disconnect_tests {
+    use super::*;
+    // ---- stacked disconnect (2026-08-25) --------------------------------
+    //
+    // The classifier compared the WHOLE frame length against 10 and called
+    // anything else data, so a disconnect stacked behind a data packet was
+    // handed to the drain as ordinary traffic and its reason code reached no
+    // log, no metric and no classifier. These pin the walk that fixed it.
+
+    /// A 10-byte main-feed disconnect packet for `reason`.
+    fn disc(reason: u16) -> Vec<u8> {
+        let mut p = vec![0u8; DISCONNECT_PACKET_SIZE];
+        p[0] = RESPONSE_CODE_DISCONNECT;
+        let r = reason.to_le_bytes();
+        p[DISCONNECT_PACKET_SIZE - 2] = r[0];
+        p[DISCONNECT_PACKET_SIZE - 1] = r[1];
+        p
+    }
+
+    /// One well-formed packet of `code`, zero-filled after the code byte.
+    fn packet(code: u8) -> Vec<u8> {
+        let len = main_feed_packet_len(&[code]).expect("known code");
+        let mut p = vec![0u8; len];
+        p[0] = code;
+        p
+    }
+
+    #[test]
+    fn a_disconnect_alone_is_still_found() {
+        assert_eq!(stacked_disconnect_reason(&disc(804), 70_000), Some(804));
+    }
+
+    #[test]
+    fn a_disconnect_stacked_behind_data_is_found() {
+        // THE regression. Before the fix this frame was classified `Data`,
+        // the drain folded the disconnect into an untyped "non-tick" count,
+        // and 804 -- the one code the repo rules Fatal because retrying
+        // re-sends the identical over-limit subscribe set forever -- was
+        // retried blind.
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(804));
+    }
+
+    #[test]
+    fn a_disconnect_behind_several_packets_is_found() {
+        let mut frame = packet(RESPONSE_CODE_TICKER);
+        frame.extend_from_slice(&packet(RESPONSE_CODE_FULL));
+        frame.extend_from_slice(&packet(RESPONSE_CODE_OI));
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(805));
+    }
+
+    #[test]
+    fn a_pure_data_frame_yields_no_disconnect() {
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&packet(RESPONSE_CODE_FULL));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn a_byte_50_inside_a_payload_is_not_read_as_a_code() {
+        // The whole reason this walks packet boundaries instead of scanning
+        // for the byte: a quote packet's payload is free to contain 50, and a
+        // scan would park a healthy socket on a reason invented from a price.
+        let mut p = packet(RESPONSE_CODE_QUOTE);
+        for b in p.iter_mut().skip(1) {
+            *b = RESPONSE_CODE_DISCONNECT;
+        }
+        assert_eq!(stacked_disconnect_reason(&p, 70_000), None);
+    }
+
+    #[test]
+    fn an_unknown_code_stops_the_walk_rather_than_guessing() {
+        let mut frame = vec![99u8, 0, 0, 0];
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn a_trailing_partial_packet_is_refused_not_guessed() {
+        let mut frame = packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&disc(804)[..6]); // truncated disconnect
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), None);
+    }
+
+    #[test]
+    fn the_packet_cap_bounds_the_walk() {
+        let mut frame = Vec::new();
+        for _ in 0..5 {
+            frame.extend_from_slice(&packet(RESPONSE_CODE_TICKER));
+        }
+        frame.extend_from_slice(&disc(804));
+        // Within the cap it is found; below it the walk stops first.
+        assert_eq!(stacked_disconnect_reason(&frame, 70_000), Some(804));
+        assert_eq!(stacked_disconnect_reason(&frame, 3), None);
+    }
+
+    #[test]
+    fn test_regression_packet_cap_walks_a_frame_of_exactly_the_cap() {
+        // A frame of exactly `max_packets` packets with the disconnect last:
+        // the old `>=` gave up on that last packet and lost the code.
+        let mut frame = Vec::new();
+        for _ in 0..3 {
+            frame.extend_from_slice(&packet(RESPONSE_CODE_TICKER));
+        }
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 4), Some(805));
+        assert_eq!(stacked_disconnect_reason(&frame, 3), None);
+    }
+
+    #[test]
+    fn test_regression_packet_cap_at_the_production_ceiling() {
+        // 69,999 tickers then an 805: exactly `MAX_PACKETS_PER_FRAME` packets.
+        let cap = tickvault_common::constants::MAX_PACKETS_PER_FRAME;
+        let one = packet(RESPONSE_CODE_TICKER);
+        let mut frame = Vec::with_capacity(one.len() * cap as usize + 10);
+        for _ in 1..cap {
+            frame.extend_from_slice(&one);
+        }
+        frame.extend_from_slice(&disc(805));
+        assert_eq!(stacked_disconnect_reason(&frame, cap), Some(805));
+        // One packet past the cap is refused, as the depth walk refuses it.
+        frame.extend_from_slice(&one);
+        assert_eq!(stacked_disconnect_reason(&frame, cap), None);
+    }
+
+    #[test]
+    fn an_empty_frame_yields_nothing() {
+        assert_eq!(stacked_disconnect_reason(&[], 70_000), None);
+    }
+
+    #[test]
+    fn every_documented_main_feed_code_has_a_length() {
+        for code in [
+            RESPONSE_CODE_INDEX_TICKER,
+            RESPONSE_CODE_TICKER,
+            RESPONSE_CODE_QUOTE,
+            RESPONSE_CODE_OI,
+            RESPONSE_CODE_PREVIOUS_CLOSE,
+            RESPONSE_CODE_MARKET_STATUS,
+            RESPONSE_CODE_FULL,
+            RESPONSE_CODE_DISCONNECT,
+        ] {
+            assert!(
+                main_feed_packet_len(&[code]).is_some(),
+                "code {code} has no length; the walk would stop on it"
+            );
+        }
+        assert_eq!(main_feed_packet_len(&[99]), None);
+        assert_eq!(main_feed_packet_len(&[]), None);
+    }
+
+    /// The enumeration above is a readable smoke test and CANNOT be the
+    /// guard: it is a hand-written list, and a hand-written list is exactly
+    /// how `RESPONSE_CODE_INDEX_TICKER` (code 1) went missing from
+    /// `main_feed_packet_len` while `dispatch_frame` accepted it — the list in
+    /// the test omitted the same code the table omitted, so it agreed with the
+    /// bug. This sweeps the WHOLE byte space and derives the expectation from
+    /// `dispatch_frame` itself, so the two can never disagree again no matter
+    /// which codes are added or removed.
+    ///
+    /// The contract, in one line: a code the dispatcher will DECODE must have
+    /// a length the walk can STEP by. Anything else strands the rest of the
+    /// frame — the drain abandons it, and a stacked disconnect inside it is
+    /// never seen.
+    #[test]
+    fn every_code_the_dispatcher_accepts_has_a_walkable_length() {
+        // Long enough for the widest packet (FULL, 162 B) so a dispatchable
+        // code can never be misread as "unknown" merely for being truncated.
+        let mut buf = [0u8; 256];
+        for code in 0u8..=255 {
+            buf[0] = code;
+            let dispatchable = !matches!(
+                dispatch_frame(&buf, 0),
+                Err(ParseError::UnknownResponseCode(_))
+            );
+            let walkable = main_feed_packet_len(&buf).is_some();
+            assert_eq!(
+                dispatchable, walkable,
+                "code {code}: dispatch_frame accepts it = {dispatchable}, but \
+                 main_feed_packet_len knows a length = {walkable}. These must \
+                 agree — a decodable packet with no length stops the walk and \
+                 abandons the rest of the frame; a length for a code nothing \
+                 decodes steps the walk over bytes no parser has validated."
+            );
+        }
+    }
+
+    /// The bite: code 1 specifically, because that is the one that was wrong,
+    /// and because it is one config line from being live. The 2026-08-21
+    /// scope-lock names `Ticker` as the next `IDX_I_FEED_MODE` value to try if
+    /// Dhan refuses Quote for indices — at which point every one of ~119 index
+    /// frames would arrive as code 1.
+    #[test]
+    fn an_index_ticker_leading_a_frame_does_not_hide_a_stacked_disconnect() {
+        let mut frame = packet(RESPONSE_CODE_INDEX_TICKER);
+        frame.extend_from_slice(&disc(804));
+        assert_eq!(
+            stacked_disconnect_reason(&frame, 70_000),
+            Some(804),
+            "an 804 behind an index ticker must still be seen — 804 is Fatal \
+             and retrying it can earn an 805 account block"
+        );
+        assert_eq!(
+            main_feed_packet_len(&[RESPONSE_CODE_INDEX_TICKER]),
+            Some(TICKER_PACKET_SIZE)
+        );
+    }
+}
+
+/// `dispatch_frame_uncounted` is `dispatch_frame` minus its packet count
+/// (plan ITEM DT, sub-µs drain, 2026-10-30): the two must parse every input
+/// to the same result, or the drain that switched to the uncounted one would
+/// fold different ticks.
+#[cfg(test)]
+mod uncounted_dispatch_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A packet of a known code and its exact size, with arbitrary body bytes.
+    fn known_packet() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just((RESPONSE_CODE_INDEX_TICKER, TICKER_PACKET_SIZE)),
+            Just((RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE)),
+            Just((RESPONSE_CODE_QUOTE, QUOTE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_OI, OI_PACKET_SIZE)),
+            Just((RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE)),
+            Just((RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE)),
+            Just((RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE)),
+        ]
+        .prop_flat_map(|(code, size)| {
+            proptest::collection::vec(any::<u8>(), size).prop_map(move |mut bytes| {
+                bytes[0] = code;
+                bytes
+            })
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn test_dispatch_frame_uncounted_parses_like_dispatch_frame(
+            bytes in prop_oneof![known_packet(), proptest::collection::vec(any::<u8>(), 0..200)],
+            received_at_nanos in any::<i64>(),
+        ) {
+            let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
+            let uncounted = format!("{:?}", dispatch_frame_uncounted(&bytes, received_at_nanos));
+            prop_assert_eq!(&counted, &uncounted);
+        }
+
+        /// Before the 2026-11-20 00:00 IST cutover (old WAL, receipt 0,
+        /// negatives) the stamped and unstamped paths give the same bytes for
+        /// every generated frame (scope lock 2026-11-21).
+        #[test]
+        fn test_pre_cutover_stamped_dispatch_matches_unstamped(
+            bytes in prop_oneof![known_packet(), proptest::collection::vec(any::<u8>(), 0..200)],
+            received_at_nanos in i64::MIN
+                ..tickvault_storage::ltt_correction::DHAN_LTT_UTC_FROM_RECEIPT_NANOS,
+        ) {
+            let counted = format!("{:?}", dispatch_frame(&bytes, received_at_nanos));
+            let unstamped =
+                format!("{:?}", dispatch_frame_uncounted_unstamped(&bytes, received_at_nanos));
+            prop_assert_eq!(counted, unstamped);
+        }
+
+        #[test]
+        fn test_raw_last_trade_time_reads_the_parsed_ltt_of_every_tick_packet(
+            bytes in known_packet(),
+        ) {
+            let parsed = dispatch_frame_uncounted_unstamped(&bytes, 0);
+            match (raw_last_trade_time(&bytes), parsed) {
+                (Some(raw), Ok(ParsedFrame::Tick(t) | ParsedFrame::TickWithDepth(t, _))) => {
+                    prop_assert_eq!(raw, t.exchange_timestamp);
+                }
+                (None, Ok(ParsedFrame::Tick(_) | ParsedFrame::TickWithDepth(..))) => {
+                    prop_assert!(false, "a tick packet must have a raw trade time");
+                }
+                (Some(_), _) => prop_assert!(false, "only tick packets have a trade time"),
+                (None, _) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_raw_last_trade_time_refuses_short_and_empty_packets() {
+        assert_eq!(raw_last_trade_time(&[]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_TICKER; 15]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_QUOTE; 17]), None);
+        assert_eq!(raw_last_trade_time(&[RESPONSE_CODE_OI; 12]), None);
+        let mut ticker = vec![0u8; TICKER_PACKET_SIZE];
+        ticker[0] = RESPONSE_CODE_INDEX_TICKER;
+        ticker[TICKER_OFFSET_LTT..TICKER_OFFSET_LTT + 4]
+            .copy_from_slice(&1_795_152_600u32.to_le_bytes());
+        assert_eq!(raw_last_trade_time(&ticker), Some(1_795_152_600));
+    }
+
+    /// The drain counts every packet it dispatches, which matches the
+    /// counted `dispatch_frame` only while every size `main_feed_packet_len`
+    /// returns holds a full header (`parse_header` counts nothing shorter).
+    #[test]
+    fn test_every_main_feed_packet_size_has_a_header() {
+        let mut known = 0;
+        for code in 0..=u8::MAX {
+            if let Some(size) = main_feed_packet_len(&[code]) {
+                known += 1;
+                assert!(
+                    size >= tickvault_common::constants::BINARY_HEADER_SIZE,
+                    "code {code}: size {size} is shorter than the header"
+                );
+            }
+        }
+        assert_eq!(known, 8, "the eight main-feed codes the walk knows");
+    }
+
+    #[test]
+    fn test_count_packets_by_response_code_with_any_code_or_zero_never_panics() {
+        // No recorder: the handles are no-ops; this pins that every code,
+        // known or not, and a zero count are accepted without a panic.
+        for code in 0..=u8::MAX {
+            count_packets_by_response_code(code, 0);
+            count_packets_by_response_code(code, 3);
+        }
+    }
+
+    /// The correction must sit in the Ticker, Quote and Full arms of
+    /// `dispatch_parsed_header`, each arm calling `apply_ltt_correction`
+    /// with the arm's own tick before it is returned (scope lock 2026-11-21).
+    #[test]
+    fn test_apply_ltt_correction_sits_in_all_three_dispatcher_arms() {
+        let src = include_str!("dispatcher.rs");
+        let body_start = src
+            .find("fn dispatch_parsed_header(")
+            .expect("dispatch_parsed_header exists");
+        let body = &src[body_start..];
+        let body = &body[..body.find("\n}\n").expect("function end")];
+        for (arm, parse) in [
+            (
+                "RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER =>",
+                "parse_ticker_packet(",
+            ),
+            ("RESPONSE_CODE_QUOTE =>", "parse_quote_packet("),
+            ("RESPONSE_CODE_FULL =>", "parse_full_packet("),
+        ] {
+            let at = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("arm {arm} missing"));
+            let rest = &body[at + arm.len()..];
+            let arm_end = rest.find("        RESPONSE_CODE_").unwrap_or(rest.len());
+            let arm_body = &rest[..arm_end];
+            let p = arm_body
+                .find(parse)
+                .unwrap_or_else(|| panic!("{arm}: no {parse}"));
+            let c = arm_body
+                .find("apply_ltt_correction(&mut tick, received_at_nanos, wal_stamped);")
+                .unwrap_or_else(|| panic!("{arm}: no apply_ltt_correction"));
+            let ok = arm_body.find("Ok(ParsedFrame::").expect("arm returns");
+            assert!(
+                p < c && c < ok,
+                "{arm}: parse, correct, return in that order"
+            );
+        }
+        assert_eq!(
+            body.matches("apply_ltt_correction(").count(),
+            3,
+            "exactly the three tick arms"
+        );
     }
 }

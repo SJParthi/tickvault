@@ -40,14 +40,94 @@
 //! - Boot wiring + Prometheus counters.
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use questdb::ingress::{Sender, TableName};
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{info, warn};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_trading::candles::BufferedSeal;
 
+use crate::delay_render::render_delay_into;
 use crate::shadow_seal_columns::ShadowSealRow;
+use crate::tick_ilp::{
+    IlpLine, RawIlpSender, TickIlpEncoder, TickIlpError, TickIlpSender, TickRowBuffer,
+};
+
+// The ILP column names every candle row writes, one constant each, so the
+// row writer can skip questdb-rs's per-call name check (see
+// `ShadowCandleWriter::write_row`). `CANDLE_ILP_COLUMN_NAMES` lists them all;
+// a test runs the library's own check over that list.
+const COL_FEED: &str = "feed";
+const COL_SEGMENT: &str = "segment";
+const COL_CONTRACT: &str = "contract";
+const COL_SECURITY_ID: &str = "security_id";
+const COL_OPEN: &str = "open";
+const COL_HIGH: &str = "high";
+const COL_LOW: &str = "low";
+const COL_CLOSE: &str = "close";
+const COL_VOLUME: &str = "volume";
+const COL_OI: &str = "oi";
+const COL_TICK_COUNT: &str = "tick_count";
+const COL_PERCENTAGE_CHANGE: &str = "percentage_change";
+const COL_OPEN_PERCENTAGE_CHANGE: &str = "open_percentage_change";
+const COL_TOTAL_BUY_QTY: &str = "total_buy_qty";
+const COL_TOTAL_SELL_QTY: &str = "total_sell_qty";
+const COL_OPEN_LATENCY: &str = "open_latency";
+const COL_OPEN_LATENCY_NS: &str = "open_latency_ns";
+const COL_CLOSE_LATENCY: &str = "close_latency";
+const COL_CLOSE_LATENCY_NS: &str = "close_latency_ns";
+const COL_WINDOW_SPAN_LATENCY: &str = "window_span_latency";
+const COL_WINDOW_SPAN_LATENCY_NS: &str = "window_span_latency_ns";
+
+/// Bytes reserved in the candle ILP buffer when a writer is built: one full
+/// drain cycle (`SEAL_MAX_DRAIN_PER_CYCLE` in `main.rs`, 16,384 seals) of the
+/// largest realistic row (measured by
+/// `test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows`), with
+/// headroom (548 bytes x 16,384 = 8.6 MiB measured 2026-10-30, so about 17%).
+/// Resident from construction, since it is written once. Before this the
+/// buffer started at zero capacity and doubled
+/// inside `append_seal` on the first large drain.
+pub const CANDLE_ILP_BUFFER_PRESIZE_BYTES: usize = 10 * 1024 * 1024;
+
+/// One placeholder value written to fill the buffer once at construction.
+const PRESIZE_FILL_VALUE_BYTES: usize = 4_096;
+
+/// Reserves [`CANDLE_ILP_BUFFER_PRESIZE_BYTES`] in `buffer`, writes it once
+/// with placeholder rows and clears them, so neither the growth nor the
+/// first-touch page faults of those bytes land on the per-seal append.
+/// `Buffer::clear` keeps the capacity, and every flush and discard clears, so
+/// a row no larger than the measured one never regrows the buffer below a full
+/// drain. Placeholder rows are never flushed: the buffer is cleared here,
+/// before the writer exists. Cold: once per writer, a few milliseconds.
+/// Whether a failed flush is worth a reconnect and a resend of the same
+/// bytes: the library's `SocketError` class exactly as before
+/// (`ilp_flush_reconnect::is_connection_error`), or our sender's transport
+/// failure. A server refusal or a malformed buffer would fail again. O(1).
+fn flush_error_is_connection(err: &TickIlpError) -> bool {
+    match err {
+        TickIlpError::Library(e) => crate::ilp_flush_reconnect::is_connection_error(e),
+        TickIlpError::Send(e) => e.retryable,
+        TickIlpError::Encoder(_) => false,
+    }
+}
+
+fn presized_buffer(encoder: TickIlpEncoder) -> TickRowBuffer {
+    let mut buffer = TickRowBuffer::new(encoder);
+    buffer.reserve(CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+    let fill = "0".repeat(PRESIZE_FILL_VALUE_BYTES);
+    while buffer.len() + PRESIZE_FILL_VALUE_BYTES * 2 <= buffer.capacity() {
+        let written = buffer
+            .table("tv_presize")
+            .and_then(|()| buffer.column_str("p", fill.as_str()))
+            .and_then(|()| buffer.at_nanos(0));
+        if written.is_err() {
+            break;
+        }
+    }
+    buffer.clear();
+    buffer
+}
 
 /// Build the questdb-rs **ILP-over-HTTP** connection conf string for a given
 /// host + HTTP port.
@@ -91,11 +171,35 @@ use crate::shadow_seal_columns::ShadowSealRow;
 ///   wraps the cycle in `block_in_place` on the production multi-thread
 ///   runtime (see `seal_writer_loop.rs`) so even that bounded block never
 ///   pins a tokio worker's other tasks.
+///
+/// **⚠ CORRECTED 2026-10-26 (audit PR L, L2) — the "~30s" above was true at
+/// 1,024 seals per cycle and stopped being true at 16,384.** The conf did not
+/// set `request_min_throughput`, so questdb-rs used its 100 KiB/s default and
+/// added `bytes / 102,400` seconds to every attempt: at the 16,384-seal cap
+/// (about 6.5 MB at an Assumed 400 B per row) that is about 64 s more per
+/// attempt, about 69 s per attempt and about 4.6 minutes for the four
+/// attempts of one failed cycle. That outlived the 45 s shutdown drain and
+/// main's 75 s join, so main gave up and the seals still in memory were not
+/// counted. The conf now pins
+/// `request_min_throughput=[`SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC`]`
+/// (4 MiB/s): the extension at the cap is about 1.6 s, one attempt about
+/// 6.6 s and one failed cycle about 27 s, inside the 45 s drain budget
+/// (pinned by `test_regression_one_failed_flush_cycle_fits_the_shutdown_drain_budget`).
 fn build_ilp_conf_string(host: &str, http_port: u16) -> String {
     format!(
-        "http::addr={host}:{http_port};protocol_version=1;retry_timeout={SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS};request_timeout={SEAL_FLUSH_REQUEST_TIMEOUT_MS};"
+        "http::addr={host}:{http_port};protocol_version=1;retry_timeout={SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS};request_timeout={SEAL_FLUSH_REQUEST_TIMEOUT_MS};request_min_throughput={SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC};"
     )
 }
+
+/// Slowest send rate, in bytes per second, a seal flush accepts before the
+/// attempt times out (audit PR L, L2). questdb-rs adds `bytes / this` seconds
+/// to [`SEAL_FLUSH_REQUEST_TIMEOUT_MS`] for each attempt. 4 MiB/s is far below
+/// what the box's local QuestDB takes (same host), and keeps the extension at
+/// the 16,384-seal cap near 1.6 s instead of about 64 s at the library's
+/// 100 KiB/s default. A slower server makes the attempt fail sooner; the
+/// seals then go to the spill and replay later, so the cost of a false
+/// timeout is a replay, never a loss.
+const SEAL_FLUSH_REQUEST_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 
 /// Per-request HTTP timeout for one seal-flush POST, in milliseconds
 /// (questdb-rs conf-string durations are milliseconds). Bounds a single
@@ -103,6 +207,28 @@ fn build_ilp_conf_string(host: &str, http_port: u16) -> String {
 /// still fails in milliseconds. 5s is generous for a ≤1024-row (~256 KB)
 /// LAN batch.
 const SEAL_FLUSH_REQUEST_TIMEOUT_MS: u64 = 5_000;
+
+/// The error [`ShadowCandleWriter::flush`] returns while the candle tables are
+/// not yet confirmed keyed (audit PR31a). A distinct type so the seal drain can
+/// tell this expected, already-logged refusal from a database failure and not
+/// repeat a coded `error!` on every 100 ms cycle; the seals still take the
+/// rescue path either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandleTablesNotKeyed;
+
+impl std::fmt::Display for CandleTablesNotKeyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shadow flush: candle tables not yet keyed — refused, rows retained")
+    }
+}
+
+impl std::error::Error for CandleTablesNotKeyed {}
+
+/// Latches the one coded `error!` a refused (not-yet-keyed) flush writes, so a
+/// session whose candle DDL never succeeds logs the cause once rather than on
+/// every 100 ms drain cycle. The seals themselves are counted by the rescue path.
+static CANDLE_UNKEYED_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// questdb-rs INTERNAL retry budget, in milliseconds. Pinned to 0 —
 /// disabled — because [`ShadowCandleWriter::flush`]'s bounded
@@ -123,6 +249,113 @@ const SEAL_FLUSH_ILP_RETRY_TIMEOUT_MS: u64 = 0;
 // Value unchanged ("dhan") → DEDUP key + replay-stability byte-identical.
 pub const CANDLE_FEED_DHAN: &str = tickvault_common::feed::Feed::Dhan.as_str();
 
+/// Counter for candle rows refused by the session-window gate.
+///
+/// A REFUSAL, not a loss. `tv_dhan_feed_seals_dropped_total` means "a sealed
+/// candle was discarded and is gone", and it feeds AGGREGATOR-DROP-01; this
+/// means "a bar whose BUCKET falls outside 09:00-15:39:59 IST, which we
+/// declined to write".
+pub const CANDLE_OUT_OF_WINDOW_COUNTER: &str = "tv_candle_rows_out_of_window_refused_total";
+
+/// The two reason labels the candle gate reports.
+///
+/// # Why `bucket_` and not `ts_` or `arrival_`
+///
+/// A candle's `ts` is its BUCKET-OPEN instant (`shadow_seal_columns.rs` sets
+/// `timestamp_ist_nanos = bucket_start_ist_secs * 1e9`), not an event time and
+/// not an arrival time. Saying `ts_out_of_window` would invite the reader to
+/// look for a tick clock that does not exist here.
+///
+/// # ⚠ Why the gate reads the BUCKET and NEVER a seal or receipt clock
+///
+/// This is the trap an adversarial review was commissioned to find, and it is
+/// real. A bucket cannot be sealed before its last second has elapsed: the
+/// 15:39 one-minute bar has exclusive end 15:40:00, and `catch_up_seal` only
+/// releases it once the watermark passes `bucket_end + CATCHUP_LATENESS_MARGIN`
+/// = **15:40:02** — two seconds PAST the window's exclusive end. The close-time
+/// `force_seal_all` runs later still, after every socket sender is dropped, and
+/// the boot recovery drain replays spilled seals the NEXT MORNING.
+///
+/// So a gate on any seal or receipt clock would have silently discarded the
+/// FINAL BAR of every emitted timeframe, every session, plus every rescued bar
+/// — while reporting success. Gating the bucket is safe by construction:
+/// `TfIndex::bucket_start` anchors every bucket at
+/// `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (09:15 since 2026-10-05) and is monotone within the
+/// day, so the first emitted bucket is 09:15:00 and the last one-minute bucket
+/// opens at 15:39:00 — both inside the window at its inclusive and exclusive
+/// edges respectively.
+///
+/// That anchoring also disposes of a second worry: a DAILY bar does NOT stamp
+/// midnight. `bucket_start` returns the session open for D1, so its `ts` is
+/// 09:00:00 IST and it would pass this gate — which matters because D1 could
+/// be re-enabled by a future dated quote.
+pub const CANDLE_OUT_OF_WINDOW_REASONS: [&str; 2] =
+    ["bucket_out_of_window", "bucket_out_of_plausible_band"];
+
+/// Pre-resolved candle refusal counters.
+///
+/// # Why no `feed` label, unlike every sibling loss counter
+///
+/// `ShadowCandleWriter` is the FEED-AGNOSTIC write boundary by design — its
+/// own doc says so, and `row.feed` is stamped verbatim from whichever seal
+/// arrived, with no match on it anywhere. The writer therefore has no feed of
+/// its own to bind a handle to, and resolving one PER ROW is exactly the
+/// allocating-arm mistake that cost 10,010 blocks over 10,000 ticks on the
+/// tick path on 2026-09-05.
+///
+/// The trade is deliberate and cheap here: this counter is a TRIPWIRE that
+/// should read zero forever (a bucket outside the session is not a thing the
+/// aggregator can currently produce), so per-feed attribution buys nothing,
+/// while a per-row allocation on the seal path would be a real regression.
+#[derive(Debug)]
+struct CandleOutOfWindowCounters {
+    bucket_out: metrics::Counter,
+    band: metrics::Counter,
+}
+
+impl CandleOutOfWindowCounters {
+    fn new() -> Self {
+        let make = |reason: &'static str| {
+            let c = metrics::counter!(CANDLE_OUT_OF_WINDOW_COUNTER, "reason" => reason);
+            // Seed at 0: the CloudWatch agent drops the first sample of a
+            // series it has never seen, so an unseeded counter publishes
+            // nothing on the one sample that matters.
+            c.increment(0);
+            c
+        };
+        Self {
+            bucket_out: make(CANDLE_OUT_OF_WINDOW_REASONS[0]),
+            band: make(CANDLE_OUT_OF_WINDOW_REASONS[1]),
+        }
+    }
+
+    /// Allocation-free: pick a pre-resolved handle, increment, log on a power
+    /// of two. The `warn!` sits beside the increment for the same readability
+    /// reason recorded on the tick path.
+    fn note(&self, reason: &'static str) {
+        let counter = if reason == CANDLE_OUT_OF_WINDOW_REASONS[0] {
+            &self.bucket_out
+        } else {
+            &self.band
+        };
+        counter.increment(1);
+
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let total = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if total.is_power_of_two() {
+            warn!(
+                reason,
+                refused_total = total,
+                "a candle row was REFUSED by the session-window gate and not \
+                 written. This should read ZERO in normal operation: every \
+                 bucket the aggregator opens is anchored at 09:00 IST and \
+                 monotone within the day, so a refusal here means a bucket \
+                 was built from a clock nobody expected."
+            );
+        }
+    }
+}
+
 /// ILP writer for the 21 plain `candles_<tf>` tables.
 ///
 /// Single producer (the async writer task is the sole owner) —
@@ -131,14 +364,35 @@ pub struct ShadowCandleWriter {
     /// Production sender. `None` when QuestDB is unreachable; the
     /// writer task retries connection in a throttled loop. This
     /// slice only flips it from `Some → None` on flush failure.
-    sender: Option<Sender>,
+    sender: Option<TickIlpSender>,
     /// In-memory ILP wire-format buffer. Filled by `append_seal`,
-    /// drained by `flush`. Reused across batches to avoid alloc.
-    buffer: Buffer,
+    /// drained by `flush`. Reused across batches to avoid alloc. The
+    /// library's or ours, matching `sender` (`[tick_storage]
+    /// own_ilp_encoder`, default off).
+    buffer: TickRowBuffer,
+    /// Which encoder `buffer` and every rebuilt sender use, fixed at
+    /// construction.
+    encoder: TickIlpEncoder,
+    /// QuestDB host and HTTP port for rebuilding our own sender. `None` on a
+    /// test writer (nothing to reconnect to).
+    own_endpoint: Option<(String, u16)>,
     /// Number of seals appended since the last successful flush. Used
     /// by the writer task to drive batch-size-based flush triggers
     /// and by tests to verify append behaviour.
     pending_count: usize,
+    /// Reused render buffer for the three human-readable delay columns
+    /// (`open_latency`, `close_latency`, `window_span_latency`).
+    ///
+    /// A `format!` per column per row would be THREE fresh allocations on
+    /// every candle appended — the 60,660-per-sweep defect this codebase has
+    /// already fixed once on the sibling `top_volume` writer. `render_delay_into`
+    /// clears and writes into a caller-owned `String`, so the allocation is
+    /// paid once for the life of the writer and reused for every row.
+    delay_scratch: String,
+    /// Pre-resolved session-window refusal counters. See
+    /// [`CANDLE_OUT_OF_WINDOW_REASONS`] for why this gate reads the BUCKET
+    /// and never a seal clock.
+    out_of_window: CandleOutOfWindowCounters,
     /// Retained for the reconnect logic. Finding S2 (HIGH): the ILP
     /// conf string is wrapped in `SecretString` because it carries
     /// the QuestDB endpoint and (in conf-string-auth deployments)
@@ -147,39 +401,64 @@ pub struct ShadowCandleWriter {
     /// Read by `reconnect()` (the broken-pipe recovery path) — no
     /// longer dead since the candle-writer reconnect landed 2026-06-30.
     ilp_conf_string: SecretString,
+    /// The "candle tables are keyed" latch this writer obeys before it sends a
+    /// row (audit PR31a, 2026-09-27). Always the process-wide
+    /// [`crate::shadow_persistence::CANDLE_TABLES_KEYED`] outside this
+    /// module's own tests, which point it at a local flag so a test elsewhere
+    /// that runs the ensure cannot change what they measure.
+    keyed: &'static std::sync::atomic::AtomicBool,
 }
 
 impl ShadowCandleWriter {
+    /// Production constructor with the library encoder and sender. See
+    /// [`Self::new_with_encoder`].
+    ///
+    /// # Errors
+    /// Never today: an unreachable QuestDB constructs a disconnected writer.
+    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+        Self::new_with_encoder(config, TickIlpEncoder::Library)
+    }
+
     /// Production constructor. Connects to QuestDB via **ILP-over-HTTP**
     /// (per-flush server ACK — see [`build_ilp_conf_string`] for the
-    /// 2026-07-06 silent-candle-persist rationale).
+    /// 2026-07-06 silent-candle-persist rationale), with the encoder
+    /// `[tick_storage] own_ilp_encoder` picks (default: the library).
     ///
-    /// `Sender::from_conf` with `http::` does not dial at construction, so
-    /// this normally succeeds with `sender = Some`; an unreachable QuestDB
-    /// surfaces at `flush()` as `Err` and routes through the reconnect +
-    /// rescue chain. If construction itself fails the writer still
-    /// constructs with `sender = None` and reconnects lazily on flush.
-    pub fn new(config: &QuestDbConfig) -> Result<Self> {
+    /// Neither sender dials at construction, so this normally succeeds with
+    /// `sender = Some`; an unreachable QuestDB surfaces at `flush()` as `Err`
+    /// and routes through the reconnect + rescue chain. If construction
+    /// itself fails the writer still constructs with `sender = None` and
+    /// reconnects lazily on flush.
+    ///
+    /// # Errors
+    /// Never today: an unreachable QuestDB constructs a disconnected writer.
+    pub fn new_with_encoder(config: &QuestDbConfig, encoder: TickIlpEncoder) -> Result<Self> {
         let conf_string = build_ilp_conf_string(&config.host, config.http_port);
-        let (sender, buffer) = match Sender::from_conf(&conf_string) {
-            Ok(s) => {
-                let b = s.new_buffer();
-                (Some(s), b)
-            }
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "shadow candle writer: QuestDB unreachable at startup — will buffer locally until reconnect"
-                );
-                (None, Buffer::new(ProtocolVersion::V1))
-            }
-        };
-        Ok(Self {
-            sender,
-            buffer,
+        let mut writer = Self::disconnected(encoder, SecretString::from(conf_string));
+        writer.own_endpoint = Some((config.host.clone(), config.http_port)); // APPROVED: once per writer
+        if let Err(err) = writer.reconnect() {
+            warn!(
+                ?err,
+                ?encoder,
+                "shadow candle writer: QuestDB unreachable at startup — will buffer locally until reconnect"
+            );
+        }
+        Ok(writer)
+    }
+
+    /// A writer with no sender and an empty presized buffer.
+    fn disconnected(encoder: TickIlpEncoder, ilp_conf_string: SecretString) -> Self {
+        Self {
+            sender: None,
+            buffer: presized_buffer(encoder),
+            encoder,
+            own_endpoint: None,
             pending_count: 0,
-            ilp_conf_string: SecretString::from(conf_string),
-        })
+            delay_scratch: String::new(),
+            ilp_conf_string,
+            out_of_window: CandleOutOfWindowCounters::new(),
+            keyed: &crate::shadow_persistence::CANDLE_TABLES_KEYED,
+        }
     }
 
     /// Test constructor — disconnected writer with an empty buffer.
@@ -189,12 +468,25 @@ impl ShadowCandleWriter {
     #[must_use]
     // TEST-EXEMPT: test-only construction helper used by every test in this module (lazy-connect, append, row-count, byte-content, multi-TF dispatch, I-P1-11 isolation, flush-disconnected). Separate name-matched test would be redundant.
     pub fn for_test() -> Self {
-        Self {
-            sender: None,
-            buffer: Buffer::new(ProtocolVersion::V1),
-            pending_count: 0,
-            ilp_conf_string: SecretString::from(String::new()),
-        }
+        Self::for_test_with_encoder(TickIlpEncoder::Library)
+    }
+
+    /// [`Self::for_test`] with a chosen encoder (the `seal_path` bench and
+    /// the encoder identity tests).
+    #[must_use]
+    pub fn for_test_with_encoder(encoder: TickIlpEncoder) -> Self {
+        Self::disconnected(encoder, SecretString::from(String::new()))
+    }
+
+    /// Test-only: obey `keyed` instead of the process-wide latch, so a test
+    /// can hold the gate shut regardless of any other test running the ensure.
+    #[cfg(test)]
+    pub(crate) fn with_keyed_for_test(
+        mut self,
+        keyed: &'static std::sync::atomic::AtomicBool,
+    ) -> Self {
+        self.keyed = keyed;
+        self
     }
 
     /// Returns `true` when the writer holds a live ILP `Sender`.
@@ -274,48 +566,259 @@ impl ShadowCandleWriter {
     /// feed anywhere in this method, so a novel feed string flows through
     /// unchanged. `append_seal` is the thin `BufferedSeal` adapter over this.
     pub fn append_row(&mut self, row: &ShadowSealRow) -> Result<()> {
+        // ---- SESSION-WINDOW GATE (BUCKET clock only) ---------------------
+        //
+        // Returns Ok(()) on refusal: the caller escalates an Err to the seal
+        // spill/DLQ tier and AGGREGATOR-DROP-01, so an Err here would report
+        // a deliberate refusal as lost data and page on it.
+        //
+        // Reads `row.timestamp_ist_nanos`, which is the BUCKET-OPEN instant --
+        // never the seal instant. See CANDLE_OUT_OF_WINDOW_REASONS for the
+        // proof that gating any seal clock would discard the final bar of
+        // every session.
+        //
+        // ## ⚠ HONEST STATUS, established 2026-09-05 by an adversarial sweep:
+        // ## this gate is DEFENCE IN DEPTH, not enforcement. It cannot fire today.
+        //
+        // Two upstream facts make every bucket that reaches this writer
+        // in-window by construction:
+        //   * `tf_index::bucket_start` CLAMPS the bucket-open to
+        //     `CANDLE_SESSION_OPEN_SECS_OF_DAY_IST` (33_300 = 09:15), so no
+        //     bucket can open earlier -- including D1, which stamps 09:15
+        //     rather than midnight; and
+        //   * `MultiTfAggregator::consume` refuses the tick outright
+        //     (`out_of_session`) unless its fold clock is inside
+        //     `[CANDLE_SESSION_OPEN.., MARKET_CLOSE_SECS_OF_DAY_IST)` =
+        //     `[09:15, 15:40)` -- inside the persist window.
+        //
+        // So a folded bar's `timestamp_ist_nanos` is always >= 09:15 and always
+        // < 15:40, and this check cannot refuse one. It is kept anyway, at two
+        // integer compares per seal, because the redundancy is the point: the
+        // fold window is a `trading`-crate constant and this is a `storage`
+        // writer, and the day someone widens one the other still holds the
+        // operator's rule. What must NOT happen is this comment reading as
+        // though candles were previously unguarded and are now guarded -- they
+        // were guarded, one layer up, by a different crate.
+        {
+            let secs = row.timestamp_ist_nanos.div_euclid(1_000_000_000);
+            let in_band = u32::try_from(secs).is_ok_and(|s| {
+                (tickvault_trading::candles::multi_tf_aggregator::MIN_PLAUSIBLE_EXCHANGE_TS_SECS
+                    ..=tickvault_trading::candles::multi_tf_aggregator::MAX_PLAUSIBLE_EXCHANGE_TS_SECS)
+                    // O(1) EXEMPT: RangeInclusive::contains on a const range is two integer compares, not a scan
+                    .contains(&s)
+            });
+            if !in_band {
+                self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[1]);
+                return Ok(());
+            }
+            if !tickvault_common::session_window::row_is_in_an_open_window(row.timestamp_ist_nanos)
+            {
+                self.out_of_window.note(CANDLE_OUT_OF_WINDOW_REASONS[0]);
+                return Ok(());
+            }
+        }
+        // One sealed bar is ~20 ILP calls, and several of them validate their
+        // input (the timestamp in `at` last of all). A failure part-way used
+        // to leave a HALF row in the buffer: every later `table()` then
+        // failed on the unfinished line and the next flush sent — or was
+        // refused for — a malformed row, so one bad bar could take every
+        // good bar batched with it down too (audit PR31). The marker drops
+        // only the bad row, as `TopVolumeRowWriter::append_row` does. Both
+        // calls are O(1) and allocation-free.
+        //
+        // Neither failure below clears the buffer. Clearing would silently
+        // drop the good rows already batched, which the caller counts as
+        // written. Returning `Err` instead sends this seal down the caller's
+        // rescue path, and a buffer left mid-row fails its next flush, whose
+        // own recovery rescues every popped seal before it discards.
         self.buffer
+            .set_marker()
+            .context("candle append: the buffer is mid-row, so no marker can be set")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // table the app publishes once per day. One ArcSwap load + one hash
+        // probe per SEALED BAR, zero allocation (the name is borrowed out of
+        // the snapshot). Written only when the table knows this exact
+        // `(security_id, segment)`; otherwise the symbol is OMITTED and the
+        // column reads NULL — never a guessed name.
+        let labels = crate::candle_contract_labels::candle_contract_labels();
+        let contract = labels.get(&(row.security_id, row.segment)).map(|n| &**n);
+        match Self::write_row(&mut self.buffer, &mut self.delay_scratch, row, contract) {
+            Ok(()) => {
+                self.buffer.clear_marker();
+                self.pending_count += 1;
+                Ok(())
+            }
+            Err(err) => {
+                // Cannot fail: the marker was set just above. If it ever did,
+                // the half row stays, the next flush fails on it, and that
+                // flush's recovery rescues every popped seal (see above).
+                match self.buffer.rewind_to_marker() {
+                    Ok(()) => Err(err),
+                    Err(rewind_err) => Err(err.context(format!(
+                        "candle append: rewinding the half-written row also failed: {rewind_err}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Serialise one row into `buffer`. Split out of [`Self::append_row`] so
+    /// the caller can wrap it in a marker and drop a half-written row.
+    ///
+    /// `contract` is the option's name from the day's table, looked up by the
+    /// caller (`None` omits the symbol, so the column reads NULL).
+    ///
+    /// # Cost (owner directive 2026-10-30: per-seal work under 1 µs at p99)
+    /// Written once over [`IlpLine`], so the library buffer and our own
+    /// encoder (`[tick_storage] own_ilp_encoder`, default off, #2163's
+    /// `OwnIlpBuffer`) write the same columns in the same order. Every column
+    /// name is one of the `COL_*` constants (listed in
+    /// `CANDLE_ILP_COLUMN_NAMES`) and goes in unchecked: questdb-rs otherwise
+    /// re-validates the name character by character on every call, which a
+    /// split-out bench measured at about 530 ns of a 1.38 µs row (22 names:
+    /// 2 symbols and 20 columns). A production row writes 2 or 3 symbols
+    /// (`contract` when the day's table names the bar) and 12 or 18 columns
+    /// (the six delay columns only with receipt stamps), from 21 constants.
+    /// The names are validated once, by
+    /// `test_every_candle_ilp_column_name_passes_the_questdb_check`, and every
+    /// key the row writes is re-checked by the old-vs-new proptests. The table
+    /// name is still validated per row: [`Self::append_row`] is public and
+    /// takes any row. The bytes are identical to the validated form through
+    /// either encoder (`proptest_write_row_is_byte_identical_to_the_validated_form`,
+    /// `proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form`).
+    /// Measured 2026-10-31 (x86 dev container, `seal_path` bench, one
+    /// `Instant` pair per sample): library p99 1.5 to 1.7 µs, ours p99 780 to
+    /// 825 ns, median 390 to 480 ns.
+    fn write_row<B: IlpLine>(
+        buffer: &mut B,
+        delay_scratch: &mut String,
+        row: &ShadowSealRow,
+        contract: Option<&str>,
+    ) -> Result<()> {
+        // The table name is still validated per row: `append_row` is public
+        // and takes any row, and both encoders write the name as given.
+        TableName::new(row.table_name)
+            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?;
+        buffer
             .table(row.table_name)
-            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
-            // Feed-provenance label (operator 2026-06-19, "same tables + feed
-            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Groww`
-            // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
-            // writer stamps whichever feed produced the seal, never a hardcoded
-            // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
-            // for the same minute/instrument never collide. Zero-alloc `&'static str`.
-            .symbol("feed", row.feed)
-            .with_context(|| "candle append: symbol(feed) failed")?
-            .symbol("segment", row.segment)
-            .with_context(|| "candle append: symbol(segment) failed")?
-            .column_i64("security_id", row.security_id)
-            .with_context(|| "candle append: column_i64(security_id) failed")?
-            .column_f64("open", row.open)
-            .with_context(|| "candle append: column_f64(open) failed")?
-            .column_f64("high", row.high)
-            .with_context(|| "candle append: column_f64(high) failed")?
-            .column_f64("low", row.low)
-            .with_context(|| "candle append: column_f64(low) failed")?
-            .column_f64("close", row.close)
-            .with_context(|| "candle append: column_f64(close) failed")?
-            .column_i64("volume", row.volume)
-            .with_context(|| "candle append: column_i64(volume) failed")?
-            .column_i64("oi", row.oi)
-            .with_context(|| "candle append: column_i64(oi) failed")?
-            .column_i64("tick_count", row.tick_count)
-            .with_context(|| "candle append: column_i64(tick_count) failed")?
-            .column_f64("close_pct_from_prev_day", row.close_pct_from_prev_day)
-            .with_context(|| "candle append: column_f64(close_pct_from_prev_day) failed")?
-            // §31 Option 2: % change vs the official 09:15 session open.
-            .column_f64("open_pct", row.open_pct)
-            .with_context(|| "candle append: column_f64(open_pct) failed")?
-            // Operator request 2026-06-02: headline day change % + opening gap %.
-            .column_f64("change_pct", row.change_pct)
-            .with_context(|| "candle append: column_f64(change_pct) failed")?
-            .column_f64("open_gap_pct", row.open_gap_pct)
-            .with_context(|| "candle append: column_f64(open_gap_pct) failed")?
-            .at(TimestampNanos::new(row.timestamp_ist_nanos))
+            .with_context(|| format!("candle append: table({}) failed", row.table_name))?;
+        // Feed-provenance label (operator 2026-06-19, "same tables + feed
+        // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Truedata`
+        // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
+        // writer stamps whichever feed produced the seal, never a hardcoded
+        // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
+        // for the same minute/instrument never collide. Zero-alloc `&'static str`.
+        buffer
+            .symbol(COL_FEED, row.feed)
+            .with_context(|| "candle append: symbol(feed) failed")?;
+        buffer
+            .symbol(COL_SEGMENT, row.segment)
+            .with_context(|| "candle append: symbol(segment) failed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`). It
+        // must sit here, among the symbols: ILP rejects a symbol after the
+        // first column.
+        if let Some(name) = contract {
+            buffer
+                .symbol(COL_CONTRACT, name)
+                .with_context(|| "candle append: symbol(contract) failed")?;
+        }
+        // Tripwire (2026-09-26 audit fix PR2). The fold refuses non-finite
+        // prices before they reach a bar and `pct_change` maps a bad baseline
+        // to 0, so this should never fire. If an upstream guard regresses,
+        // QuestDB silently stores NaN/±inf as NULL — this makes that visible
+        // instead of silent. Six float compares per sealed bar; the counter is
+        // touched only on a hit.
+        let nonfinite = count_nonfinite_candle_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(CANDLE_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
+        }
+        // The bar's headline move is `percentage_change` (close vs YESTERDAY's
+        // close, renamed from `change_pct` 2026-09-19); `open_percentage_change`
+        // is close vs TODAY's 09:15 session open. The book totals are the
+        // vendor's PENDING order-book totals at the bar's last packet (resting
+        // orders, not executed volume), written unconditionally, `0` included.
+        buffer
+            .column_i64(COL_SECURITY_ID, row.security_id)
+            .with_context(|| "candle append: column_i64(security_id) failed")?;
+        for (name, value) in [
+            (COL_OPEN, row.open),
+            (COL_HIGH, row.high),
+            (COL_LOW, row.low),
+            (COL_CLOSE, row.close),
+        ] {
+            buffer
+                .column_f64(name, value)
+                .with_context(|| format!("candle append: column_f64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_VOLUME, row.volume),
+            (COL_OI, row.oi),
+            (COL_TICK_COUNT, row.tick_count),
+        ] {
+            buffer
+                .column_i64(name, value)
+                .with_context(|| format!("candle append: column_i64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_PERCENTAGE_CHANGE, row.change_pct),
+            (COL_OPEN_PERCENTAGE_CHANGE, row.open_pct),
+        ] {
+            buffer
+                .column_f64(name, value)
+                .with_context(|| format!("candle append: column_f64({name}) failed"))?;
+        }
+        for (name, value) in [
+            (COL_TOTAL_BUY_QTY, row.total_buy_qty),
+            (COL_TOTAL_SELL_QTY, row.total_sell_qty),
+        ] {
+            buffer
+                .column_i64(name, value)
+                .with_context(|| format!("candle append: column_i64({name}) failed"))?;
+        }
+        // The three receipt-delay pairs. Each is `Option`: a seal that came
+        // back through the disk spill tier carries no receipt stamps (the
+        // 128-byte record is byte-full and cannot hold them), and a bucket
+        // whose ticks all arrived with no receipt clock has none either. In
+        // both cases BOTH halves of the pair are omitted, so the row reads
+        // NULL rather than claiming a zero delay — `Some(0)` is a REAL
+        // reading (a single-tick bucket has a zero span) and must stay
+        // distinguishable from "unknown".
+        //
+        // `render_delay_into` clears and writes into the caller-owned
+        // scratch, so the three columns cost ZERO allocations per row — a
+        // `format!` here would be three fresh allocations on every candle
+        // appended.
+        //
+        // The `_ns` twin is NOT optional garnish: text sorted descending
+        // puts "1 second" after "4 nanoseconds", the exact reverse of the
+        // true order, so every ORDER BY must use the exact column.
+        let scratch = delay_scratch;
+        for (readable, exact, value) in [
+            (COL_OPEN_LATENCY, COL_OPEN_LATENCY_NS, row.open_latency_ns),
+            (
+                COL_CLOSE_LATENCY,
+                COL_CLOSE_LATENCY_NS,
+                row.close_latency_ns,
+            ),
+            (
+                COL_WINDOW_SPAN_LATENCY,
+                COL_WINDOW_SPAN_LATENCY_NS,
+                row.window_span_latency_ns,
+            ),
+        ] {
+            if let Some(nanos) = value {
+                render_delay_into(scratch, nanos);
+                buffer
+                    .column_str(readable, scratch.as_str())
+                    .with_context(|| format!("candle append: column_str({readable}) failed"))?;
+                buffer
+                    .column_i64(exact, nanos)
+                    .with_context(|| format!("candle append: column_i64({exact}) failed"))?;
+            }
+        }
+        buffer
+            .at_nanos(row.timestamp_ist_nanos)
             .with_context(|| "candle append: at(TimestampNanos) failed")?;
-        self.pending_count += 1;
         Ok(())
     }
 
@@ -340,8 +843,8 @@ impl ShadowCandleWriter {
     /// - flush returns a CONNECTION error (broken pipe / reset / not-connected ⇒
     ///   `ErrorCode::SocketError`): drop the sender, reconnect, re-flush the SAME
     ///   buffer (RETAINED — questdb `flush` only `buf.clear()`s on `Ok`), bounded
-    ///   to [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES`] with
-    ///   [`crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
+    ///   to [`crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES`] with
+    ///   [`crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS`] backoff.
     ///   Replay is idempotent — `candles_1m` DEDUP `(ts, security_id, segment,
     ///   feed)` collapses any partially-written row, never a double candle.
     /// - flush returns a NON-connection error (`InvalidName`, server reject, etc.):
@@ -364,12 +867,32 @@ impl ShadowCandleWriter {
             self.pending_count = 0;
             return Ok(());
         }
+        // Audit PR31a (2026-09-27): refuse until every candle table has been
+        // created WITH its DEDUP key. An ILP row reaching a missing table makes
+        // QuestDB auto-create it keyless, and every replayed bar then duplicates
+        // into it for the life of the table. The buffer and `pending_count` are
+        // left untouched, so the caller rescues these seals to the disk spill
+        // exactly as it does for an unreachable database.
+        if !self.keyed.load(std::sync::atomic::Ordering::Acquire) {
+            if !CANDLE_UNKEYED_REFUSAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                        .code_str(),
+                    pending = self.pending_count,
+                    "candle writer: refusing to send — the candle tables are not yet \
+                     confirmed to carry their DEDUP key, and a row sent now could \
+                     auto-create one without it. Seals go to the disk spill until the \
+                     ensure succeeds (logged once per process)."
+                );
+            }
+            return Err(anyhow::Error::new(CandleTablesNotKeyed));
+        }
         let mut reconnected = false;
-        for attempt in 0..=crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+        for attempt in 0..=crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
             if self.sender.is_none()
                 && let Err(err) = self.reconnect()
             {
-                if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                if attempt == crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
                     return Err(err).context("shadow flush: reconnect to QuestDB failed");
                 }
                 metrics::counter!("tv_shadow_candle_reconnect_attempts_total").increment(1);
@@ -414,10 +937,10 @@ impl ShadowCandleWriter {
                     // Drop the broken sender so the next iteration reconnects. The
                     // buffer is RETAINED (questdb `flush` does not clear it on err).
                     self.sender = None;
-                    if !crate::groww_persistence::is_connection_error(&err) {
+                    if !flush_error_is_connection(&err) {
                         return Err(err).context("shadow flush: ILP send failed (non-connection)");
                     }
-                    if attempt == crate::groww_persistence::GROWW_FLUSH_RECONNECT_MAX_RETRIES {
+                    if attempt == crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES {
                         return Err(err)
                             .context("shadow flush: ILP send failed after reconnect retries");
                     }
@@ -445,8 +968,19 @@ impl ShadowCandleWriter {
                 "shadow reconnect: no ILP conf (disconnected test writer)"
             ));
         }
-        let new_sender =
-            Sender::from_conf(conf).context("shadow reconnect: ILP sender rebuild failed")?;
+        let new_sender = match (self.encoder, &self.own_endpoint) {
+            (TickIlpEncoder::Library, _) => Sender::from_conf(conf)
+                .map(TickIlpSender::Library)
+                .context("shadow reconnect: ILP sender rebuild failed")?,
+            (TickIlpEncoder::Own, Some((host, port))) => RawIlpSender::new(host, *port)
+                .map(TickIlpSender::Own)
+                .map_err(|err| anyhow::anyhow!("shadow reconnect: own ILP sender: {err}"))?,
+            (TickIlpEncoder::Own, None) => {
+                return Err(anyhow::anyhow!(
+                    "shadow reconnect: own ILP sender has no endpoint (disconnected test writer)"
+                ));
+            }
+        };
         self.sender = Some(new_sender);
         Ok(())
     }
@@ -477,7 +1011,7 @@ impl ShadowCandleWriter {
     /// Synchronous: the seal-writer drain runs on its own task and the total
     /// across retries is tiny.
     fn backoff_sleep(attempt: usize) {
-        if let Some(&ms) = crate::groww_persistence::GROWW_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
+        if let Some(&ms) = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS.get(attempt) {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }
     }
@@ -487,12 +1021,544 @@ impl ShadowCandleWriter {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Counter for float columns of a sealed candle that were non-finite at write
+/// time (QuestDB would store them as NULL). Expected to stay at zero.
+pub const CANDLE_NONFINITE_COLUMNS_COUNTER: &str = "tv_candle_nonfinite_columns_total";
+
+/// How many of a sealed bar's float columns (OHLC plus the two percentage
+/// columns) are NaN or infinite. O(1): six compares.
+#[must_use]
+pub fn count_nonfinite_candle_floats(row: &ShadowSealRow) -> u64 {
+    [
+        row.open,
+        row.high,
+        row.low,
+        row.close,
+        row.change_pct,
+        row.open_pct,
+    ]
+    .iter()
+    .filter(|v| !v.is_finite())
+    .count() as u64
+}
+
 #[cfg(test)]
 mod tests {
+    /// Audit PR31a: tests that exercise `flush` past the keyed gate hold it
+    /// OPEN through this flag, so they reach the reconnect path they prove
+    /// whatever order the ensure tests run in.
+    static KEYED_FOR_TESTS: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
     use super::*;
+    use crate::tick_ilp::OwnIlpBuffer;
+    use questdb::ingress::{Buffer, ProtocolVersion, TimestampNanos};
     use tickvault_common::constants::{EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_EQ};
     use tickvault_common::feed::Feed;
     use tickvault_trading::candles::{LiveCandleState, TfIndex};
+
+    /// Every column name a candle row can write. The questdb-rs check runs over
+    /// this list in a test, never per row.
+    const CANDLE_ILP_COLUMN_NAMES: [&str; 21] = [
+        COL_FEED,
+        COL_SEGMENT,
+        COL_CONTRACT,
+        COL_SECURITY_ID,
+        COL_OPEN,
+        COL_HIGH,
+        COL_LOW,
+        COL_CLOSE,
+        COL_VOLUME,
+        COL_OI,
+        COL_TICK_COUNT,
+        COL_PERCENTAGE_CHANGE,
+        COL_OPEN_PERCENTAGE_CHANGE,
+        COL_TOTAL_BUY_QTY,
+        COL_TOTAL_SELL_QTY,
+        COL_OPEN_LATENCY,
+        COL_OPEN_LATENCY_NS,
+        COL_CLOSE_LATENCY,
+        COL_CLOSE_LATENCY_NS,
+        COL_WINDOW_SPAN_LATENCY,
+        COL_WINDOW_SPAN_LATENCY_NS,
+    ];
+
+    /// The row writer as it was before 2026-10-30, verbatim except that the
+    /// contract name arrives as an argument: every column name goes through
+    /// questdb-rs's per-call check. The reference the fast form is held to.
+    fn write_row_validated_reference(
+        buffer: &mut Buffer,
+        delay_scratch: &mut String,
+        row: &ShadowSealRow,
+        contract: Option<&str>,
+    ) -> Result<()> {
+        let buf = buffer
+            .table(row.table_name)
+            .with_context(|| format!("candle append: invalid table name {}", row.table_name))?
+            // Feed-provenance label (operator 2026-06-19, "same tables + feed
+            // column"). Sourced from the SEAL's feed (`Feed::Dhan` / `Feed::Truedata`
+            // via `row.feed = seal.feed.as_str()`) — the ONE feed-parameterized
+            // writer stamps whichever feed produced the seal, never a hardcoded
+            // constant. Part of the DEDUP key so a Dhan candle and a Groww candle
+            // for the same minute/instrument never collide. Zero-alloc `&'static str`.
+            .symbol("feed", row.feed)
+            .with_context(|| "candle append: symbol(feed) failed")?
+            .symbol("segment", row.segment)
+            .with_context(|| "candle append: symbol(segment) failed")?;
+        // `contract` — the option's NAME (`NIFTY-25Sep2026-24500-CE`), from the
+        // table the app publishes once per day. One ArcSwap load + one hash
+        // probe per SEALED BAR, zero allocation (the name is borrowed out of
+        // the snapshot). Written only when the table knows this exact
+        // `(security_id, segment)`; otherwise the symbol is OMITTED and the
+        // column reads NULL — never a guessed name. It must sit here, among
+        // the symbols: ILP rejects a symbol after the first column.
+        if let Some(name) = contract {
+            buf.symbol("contract", name)
+                .with_context(|| "candle append: symbol(contract) failed")?;
+        }
+        // Tripwire (2026-09-26 audit fix PR2). The fold refuses non-finite
+        // prices before they reach a bar and `pct_change` maps a bad baseline
+        // to 0, so this should never fire. If an upstream guard regresses,
+        // QuestDB silently stores NaN/±inf as NULL — this makes that visible
+        // instead of silent. Six float compares per sealed bar; the counter is
+        // touched only on a hit.
+        let nonfinite = count_nonfinite_candle_floats(row);
+        if nonfinite > 0 {
+            metrics::counter!(CANDLE_NONFINITE_COLUMNS_COUNTER).increment(nonfinite);
+        }
+        let buf = buf
+            .column_i64("security_id", row.security_id)
+            .with_context(|| "candle append: column_i64(security_id) failed")?
+            .column_f64("open", row.open)
+            .with_context(|| "candle append: column_f64(open) failed")?
+            .column_f64("high", row.high)
+            .with_context(|| "candle append: column_f64(high) failed")?
+            .column_f64("low", row.low)
+            .with_context(|| "candle append: column_f64(low) failed")?
+            .column_f64("close", row.close)
+            .with_context(|| "candle append: column_f64(close) failed")?
+            .column_i64("volume", row.volume)
+            .with_context(|| "candle append: column_i64(volume) failed")?
+            .column_i64("oi", row.oi)
+            .with_context(|| "candle append: column_i64(oi) failed")?
+            .column_i64("tick_count", row.tick_count)
+            .with_context(|| "candle append: column_i64(tick_count) failed")?
+            // The bar's headline move: close vs YESTERDAY's close. Renamed
+            // from `change_pct` 2026-09-19. Its byte-identical twin
+            // `close_pct_from_prev_day` is GONE — both were filled from the
+            // same `state.close_pct_from_prev_day`, so one name survives and
+            // the struct field keeps its original name.
+            .column_f64("percentage_change", row.change_pct)
+            .with_context(|| "candle append: column_f64(percentage_change) failed")?
+            // Close vs TODAY's 09:15 session open. Renamed from `open_pct`.
+            .column_f64("open_percentage_change", row.open_pct)
+            .with_context(|| "candle append: column_f64(open_percentage_change) failed")?
+            // The vendor's PENDING order-book totals at this bar's last
+            // observed packet — resting orders, NOT executed volume. Written
+            // unconditionally, `0` included: the fold has already applied the
+            // last-non-zero rule, so a `0` here means the whole bar saw no
+            // book, which is a fact worth storing rather than a gap.
+            .column_i64("total_buy_qty", row.total_buy_qty)
+            .with_context(|| "candle append: column_i64(total_buy_qty) failed")?
+            .column_i64("total_sell_qty", row.total_sell_qty)
+            .with_context(|| "candle append: column_i64(total_sell_qty) failed")?;
+        // The three receipt-delay pairs. Each is `Option`: a seal that came
+        // back through the disk spill tier carries no receipt stamps (the
+        // 128-byte record is byte-full and cannot hold them), and a bucket
+        // whose ticks all arrived with no receipt clock has none either. In
+        // both cases BOTH halves of the pair are omitted, so the row reads
+        // NULL rather than claiming a zero delay — `Some(0)` is a REAL
+        // reading (a single-tick bucket has a zero span) and must stay
+        // distinguishable from "unknown".
+        //
+        // `render_delay_into` is the same renderer the `top_volume` writer
+        // uses, reused rather than duplicated so the two tables can never
+        // drift into different wording. It clears and writes into the
+        // caller-owned scratch, so the three columns cost ZERO allocations
+        // per row — a `format!` here would be three fresh allocations on
+        // every candle appended.
+        //
+        // The `_ns` twin is NOT optional garnish: text sorted descending
+        // puts "1 second" after "4 nanoseconds", the exact reverse of the
+        // true order, so every ORDER BY must use the exact column.
+        let scratch = delay_scratch;
+        for (readable, exact, value) in [
+            ("open_latency", "open_latency_ns", row.open_latency_ns),
+            ("close_latency", "close_latency_ns", row.close_latency_ns),
+            (
+                "window_span_latency",
+                "window_span_latency_ns",
+                row.window_span_latency_ns,
+            ),
+        ] {
+            if let Some(nanos) = value {
+                render_delay_into(scratch, nanos);
+                buf.column_str(readable, scratch.as_str())
+                    .with_context(|| format!("candle append: column_str({readable}) failed"))?;
+                buf.column_i64(exact, nanos)
+                    .with_context(|| format!("candle append: column_i64({exact}) failed"))?;
+            }
+        }
+        buf.at(TimestampNanos::new(row.timestamp_ist_nanos))
+            .with_context(|| "candle append: at(TimestampNanos) failed")?;
+        Ok(())
+    }
+
+    /// Composite-key-free fixtures for the old-vs-new row checks.
+    const TABLES: [&str; 3] = ["candles_1m", "candles_15m", "candles_60m"];
+    const SEGMENTS: [&str; 4] = ["IDX_I", "NSE_EQ", "NSE_FNO", "UNKNOWN"];
+    const FEEDS: [&str; 3] = ["dhan", "truedata", "a novel,feed=x"];
+
+    fn row_bytes(
+        write: fn(&mut Buffer, &mut String, &ShadowSealRow, Option<&str>) -> Result<()>,
+        rows: &[(ShadowSealRow, Option<String>)],
+    ) -> (Vec<u8>, Option<String>) {
+        let mut buffer = Buffer::new(ProtocolVersion::V1);
+        let mut scratch = String::from("left over from an earlier row");
+        for (row, contract) in rows {
+            if let Err(err) = write(&mut buffer, &mut scratch, row, contract.as_deref()) {
+                // A refused value (a negative designated timestamp, say) leaves a
+                // half row: stop here, and compare the bytes so far and the error.
+                return (buffer.as_bytes().to_vec(), Some(format!("{err:#}")));
+            }
+        }
+        (buffer.as_bytes().to_vec(), None)
+    }
+
+    #[test]
+    fn test_every_candle_ilp_column_name_passes_the_questdb_check() {
+        for name in CANDLE_ILP_COLUMN_NAMES {
+            assert!(
+                questdb::ingress::ColumnName::new(name).is_ok(),
+                "{name} fails questdb-rs's column-name check, so it must not go \
+                 in through new_unchecked"
+            );
+        }
+        let mut sorted = CANDLE_ILP_COLUMN_NAMES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            CANDLE_ILP_COLUMN_NAMES.len(),
+            "a name is listed twice"
+        );
+        for tf in TfIndex::ALL {
+            assert!(
+                questdb::ingress::TableName::new(tf.table_name()).is_ok(),
+                "{} fails the table-name check",
+                tf.table_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_row_passes_only_named_constants_to_the_unchecked_names() {
+        // Bite for the list above: a literal handed to `column(` would skip
+        // both the per-call check and the one-time test.
+        let src = include_str!("shadow_candle_writer.rs");
+        let start = src
+            .find("    fn write_row(")
+            .expect("write_row is in this file");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("write_row ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("column(COL_"),
+            "the scan found no column( calls"
+        );
+        assert!(
+            !body.contains("column(\""),
+            "write_row hands a string literal to the unchecked column(): use a \
+             COL_ constant listed in CANDLE_ILP_COLUMN_NAMES"
+        );
+    }
+
+    #[test]
+    fn test_write_row_is_byte_identical_to_the_validated_form_on_fixed_rows() {
+        let seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, TfIndex::M1, 33_300, 22_500.5);
+        let mut full = ShadowSealRow::from_buffered_seal(&seal);
+        full.open_latency_ns = Some(-1_500_000);
+        full.close_latency_ns = Some(0);
+        full.window_span_latency_ns = Some(i64::MAX);
+        let mut bare = full;
+        bare.open_latency_ns = None;
+        bare.close_latency_ns = None;
+        bare.window_span_latency_ns = None;
+        let rows = vec![
+            (full, Some("NIFTY-25Nov2026-24500-CE".to_string())),
+            (bare, None),
+            (
+                full,
+                Some("a name, with=spaces\\and \"quotes\"".to_string()),
+            ),
+        ];
+        let new = row_bytes(ShadowCandleWriter::write_row, &rows);
+        let old = row_bytes(write_row_validated_reference, &rows);
+        assert!(new.1.is_none(), "fixed rows must write: {:?}", new.1);
+        assert!(!new.0.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&new.0),
+            String::from_utf8_lossy(&old.0)
+        );
+        assert_eq!(new.1, old.1);
+    }
+
+    /// Review fix 2026-10-30 (PR #2143): the candle buffer started at zero
+    /// capacity and doubled inside `append_seal` on the first large drain.
+    /// Bites: without `presized_buffer` the capacity is 0.
+    #[test]
+    fn test_candle_ilp_buffer_presize_covers_a_full_drain_of_full_rows() {
+        const FULL_DRAIN_SEALS: usize = 16_384; // main.rs SEAL_MAX_DRAIN_PER_CYCLE
+        let mut writer = ShadowCandleWriter::for_test();
+        assert!(writer.buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+        assert_eq!(writer.buffer.len(), 0, "placeholder rows must be cleared");
+        assert_eq!(writer.buffer.row_count(), 0);
+        assert_eq!(writer.pending_count, 0);
+        let start_capacity = writer.buffer.capacity();
+        // A full row: every delay column set, the longest one i64::MIN, and a
+        // long contract name.
+        let seal = mk_seal(
+            1_234_567,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            33_300,
+            22_500.5,
+        );
+        let mut row = ShadowSealRow::from_buffered_seal(&seal);
+        row.open_latency_ns = Some(i64::MIN);
+        row.close_latency_ns = Some(i64::MIN);
+        row.window_span_latency_ns = Some(i64::MIN);
+        let name = "BANKNIFTY-30Dec2026-100000-CE-padded-to-sixty-characters-xx";
+        let mut one = Buffer::new(ProtocolVersion::V1);
+        let mut scratch = String::new();
+        ShadowCandleWriter::write_row(&mut one, &mut scratch, &row, Some(name))
+            .expect("full row writes");
+        assert!(
+            one.len() * FULL_DRAIN_SEALS <= CANDLE_ILP_BUFFER_PRESIZE_BYTES,
+            "a full row is {} bytes, so a full drain needs {} bytes, over the {} presize",
+            one.len(),
+            one.len() * FULL_DRAIN_SEALS,
+            CANDLE_ILP_BUFFER_PRESIZE_BYTES
+        );
+        for _ in 0..FULL_DRAIN_SEALS {
+            ShadowCandleWriter::write_row(&mut writer.buffer, &mut scratch, &row, Some(name))
+                .expect("full row writes");
+        }
+        assert_eq!(
+            writer.buffer.capacity(),
+            start_capacity,
+            "a full drain of full rows regrew the presized buffer"
+        );
+    }
+
+    #[test]
+    fn test_presized_buffer_keeps_capacity_through_clear_and_writes_no_rows() {
+        for encoder in [TickIlpEncoder::Library, TickIlpEncoder::Own] {
+            let buffer = presized_buffer(encoder);
+            assert!(buffer.capacity() >= CANDLE_ILP_BUFFER_PRESIZE_BYTES);
+            assert!(buffer.is_empty());
+            assert_eq!(buffer.row_count(), 0);
+        }
+        let mut writer = ShadowCandleWriter::for_test();
+        let capacity = writer.buffer.capacity();
+        let seal = mk_seal(13, EXCHANGE_SEGMENT_IDX_I, TfIndex::M1, 33_300, 22_500.5);
+        writer.append_seal(&seal).expect("append");
+        writer.discard_pending();
+        assert_eq!(writer.buffer.capacity(), capacity);
+    }
+
+    fn arb_latency() -> impl proptest::strategy::Strategy<Value = Option<i64>> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(None),
+            any::<i64>().prop_map(Some),
+            (-300_000_000_000_i64..300_000_000_000).prop_map(Some),
+        ]
+    }
+
+    fn arb_f64() -> impl proptest::strategy::Strategy<Value = f64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<f64>(),
+            (-1_000_000.0_f64..1_000_000.0)
+                .prop_map(tickvault_common::price_precision::round_to_2dp),
+            Just(0.0),
+            Just(-0.0),
+            Just(f64::NAN),
+            Just(f64::INFINITY),
+        ]
+    }
+
+    fn arb_row() -> impl proptest::strategy::Strategy<Value = (ShadowSealRow, Option<String>)> {
+        use proptest::prelude::*;
+        let prices = (
+            arb_f64(),
+            arb_f64(),
+            arb_f64(),
+            arb_f64(),
+            arb_f64(),
+            arb_f64(),
+        );
+        let ints = (
+            any::<i64>(),
+            any::<i64>(),
+            any::<i64>(),
+            any::<i64>(),
+            any::<i64>(),
+            any::<i64>(),
+        );
+        let labels = (
+            0..TABLES.len(),
+            0..SEGMENTS.len(),
+            0..FEEDS.len(),
+            any::<i64>(),
+        );
+        let delays = (arb_latency(), arb_latency(), arb_latency());
+        let contract = proptest::option::of("[ -~]{0,40}");
+        (prices, ints, labels, delays, contract).prop_map(
+            |(
+                (o, h, l, c, chg, opct),
+                (sid, vol, oi, tc, buy, sell),
+                (t, s, f, ts),
+                (d1, d2, d3),
+                contract,
+            )| {
+                (
+                    ShadowSealRow {
+                        table_name: TABLES[t],
+                        timestamp_ist_nanos: ts,
+                        security_id: sid,
+                        segment: SEGMENTS[s],
+                        feed: FEEDS[f],
+                        open: o,
+                        high: h,
+                        low: l,
+                        close: c,
+                        volume: vol,
+                        oi,
+                        tick_count: tc,
+                        close_pct_from_prev_day: chg,
+                        open_pct: opct,
+                        change_pct: chg,
+                        open_gap_pct: 0.0,
+                        total_buy_qty: buy,
+                        total_sell_qty: sell,
+                        open_latency_ns: d1,
+                        close_latency_ns: d2,
+                        window_span_latency_ns: d3,
+                    },
+                    contract,
+                )
+            },
+        )
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2_048))]
+        #[test]
+        fn proptest_write_row_is_byte_identical_to_the_validated_form(
+            rows in proptest::collection::vec(arb_row(), 1..8)
+        ) {
+            let new = row_bytes(ShadowCandleWriter::write_row, &rows);
+            let old = row_bytes(write_row_validated_reference, &rows);
+            proptest::prop_assert_eq!(new, old);
+        }
+
+        /// Our own encoder (#2163's `OwnIlpBuffer`, `[tick_storage]
+        /// own_ilp_encoder`) writes the same candle bytes as the validated
+        /// library writer, row for row, including the bytes before a refused
+        /// value; only the error text differs, so only refused-or-not is
+        /// compared there.
+        #[test]
+        fn proptest_own_encoder_candle_rows_are_byte_identical_to_the_validated_form(
+            rows in proptest::collection::vec(arb_row(), 1..8)
+        ) {
+            let (own_bytes, own_refused) = own_row_bytes(&rows);
+            let (old_bytes, old_error) = row_bytes(write_row_validated_reference, &rows);
+            proptest::prop_assert_eq!(own_bytes, old_bytes);
+            proptest::prop_assert_eq!(own_refused, old_error.is_some());
+        }
+    }
+
+    /// [`row_bytes`] through our own encoder: the bytes and whether a row was
+    /// refused.
+    fn own_row_bytes(rows: &[(ShadowSealRow, Option<String>)]) -> (Vec<u8>, bool) {
+        let mut buffer = OwnIlpBuffer::new();
+        let mut scratch = String::from("left over from an earlier row");
+        for (row, contract) in rows {
+            if ShadowCandleWriter::write_row(&mut buffer, &mut scratch, row, contract.as_deref())
+                .is_err()
+            {
+                return (buffer.as_bytes().to_vec(), true);
+            }
+        }
+        (buffer.as_bytes().to_vec(), false)
+    }
+
+    /// The own-encoder writer appends the same bytes as the library writer
+    /// for the same seals, and refuses a mid-row buffer the same way.
+    #[test]
+    fn test_own_encoder_writer_appends_the_same_bytes_as_the_library_writer() {
+        let mut library = ShadowCandleWriter::for_test();
+        let mut own = ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own);
+        for i in 0..40u32 {
+            let seal = mk_seal(
+                u64::from(13 + i),
+                EXCHANGE_SEGMENT_IDX_I,
+                TfIndex::M1,
+                1_716_023_700 + i * 60,
+                22_500.5 + f64::from(i) * 0.05,
+            );
+            library.append_seal(&seal).expect("library append");
+            own.append_seal(&seal).expect("own append");
+        }
+        assert_eq!(own.buffer_bytes(), library.buffer_bytes());
+        assert_eq!(own.buffer_row_count(), library.buffer_row_count());
+        assert_eq!(own.pending_count(), 40);
+        own.discard_pending();
+        assert_eq!(own.buffer_byte_count(), 0);
+    }
+
+    /// Only a transport failure is worth a reconnect, for either encoder.
+    #[test]
+    fn test_flush_error_is_connection_matches_each_encoder() {
+        let socket = questdb::Error::new(questdb::ErrorCode::SocketError, "Broken pipe");
+        assert!(flush_error_is_connection(&TickIlpError::Library(socket)));
+        let refused = questdb::Error::new(questdb::ErrorCode::ServerFlushError, "bad row");
+        assert!(!flush_error_is_connection(&TickIlpError::Library(refused)));
+        assert!(!flush_error_is_connection(&TickIlpError::Encoder("x")));
+        let transport = crate::tick_ilp::RawSendError {
+            message: "connection reset".to_owned(),
+            status: None,
+            retryable: true,
+        };
+        assert!(flush_error_is_connection(&TickIlpError::Send(transport)));
+        let rejected = crate::tick_ilp::RawSendError {
+            message: "400".to_owned(),
+            status: Some(400),
+            retryable: false,
+        };
+        assert!(!flush_error_is_connection(&TickIlpError::Send(rejected)));
+    }
+
+    /// A disconnected own-encoder writer cannot reconnect (no endpoint): the
+    /// flush fails and keeps the rows for the rescue tier.
+    #[test]
+    fn test_own_encoder_test_writer_flush_fails_and_keeps_rows() {
+        let mut w = ShadowCandleWriter::for_test_with_encoder(TickIlpEncoder::Own)
+            .with_keyed_for_test(&KEYED_FOR_TESTS);
+        let seal = mk_seal(
+            13,
+            EXCHANGE_SEGMENT_IDX_I,
+            TfIndex::M1,
+            1_716_023_700,
+            22_500.5,
+        );
+        w.append_seal(&seal).expect("append");
+        assert!(w.flush().is_err());
+        assert_eq!(w.pending_count(), 1);
+        assert!(w.buffer_byte_count() > 0);
+    }
 
     fn mk_seal_feed(
         sid: u64,
@@ -513,8 +1579,8 @@ mod tests {
         state.oi = 50_000;
         state.tick_count = 5;
         state.close_pct_from_prev_day = 1.5;
-        state.oi_pct_from_prev_day = -0.2;
-        state.volume_pct_from_prev_day = 12.3;
+        state.total_buy_qty = 89_600;
+        state.total_sell_qty = 4_800;
         BufferedSeal::new(sid, seg, tf, state, feed)
     }
 
@@ -576,7 +1642,7 @@ mod tests {
         let conf = build_ilp_conf_string("tv-questdb", 9000);
         assert_eq!(
             conf,
-            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;"
+            "http::addr=tv-questdb:9000;protocol_version=1;retry_timeout=0;request_timeout=5000;request_min_throughput=4194304;"
         );
         assert!(
             conf.starts_with("http::addr="),
@@ -603,6 +1669,35 @@ mod tests {
         assert_eq!(SEAL_FLUSH_REQUEST_TIMEOUT_MS, 5_000);
     }
 
+    /// Regression: 2026-10-26 (audit PR L, L2) — with no
+    /// `request_min_throughput` in the conf, questdb-rs added `bytes / 102,400`
+    /// seconds per attempt, so one failed cycle at the 16,384-seal cap took
+    /// about 4.6 minutes, past the 45 s shutdown drain. Bites: with the
+    /// library default (102,400 B/s) the bound below is about 277 s.
+    #[test]
+    fn test_regression_one_failed_flush_cycle_fits_the_shutdown_drain_budget() {
+        const MAX_SEALS_PER_CYCLE: u64 = 16_384; // main.rs SEAL_MAX_DRAIN_PER_CYCLE
+        const ASSUMED_BYTES_PER_ROW: u64 = 400;
+        let conf = build_ilp_conf_string("tv-questdb", 9000);
+        let throughput: u64 = conf
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("request_min_throughput="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(102_400); // questdb-rs 6.1.0 default when unset
+        let batch_bytes = MAX_SEALS_PER_CYCLE * ASSUMED_BYTES_PER_ROW;
+        let attempts = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_MAX_RETRIES as u64 + 1;
+        let per_attempt_ms = SEAL_FLUSH_REQUEST_TIMEOUT_MS + batch_bytes * 1_000 / throughput;
+        let backoff_ms: u64 = crate::ilp_flush_reconnect::ILP_FLUSH_RECONNECT_BACKOFF_MS
+            .iter()
+            .sum();
+        let cycle_ms = attempts * per_attempt_ms + backoff_ms;
+        assert!(
+            cycle_ms < crate::seal_writer_loop::FINAL_DRAIN_BUDGET_SECS * 1_000,
+            "one failed flush cycle can block {cycle_ms} ms, past the {} s shutdown drain",
+            crate::seal_writer_loop::FINAL_DRAIN_BUDGET_SECS
+        );
+    }
+
     #[test]
     fn test_discard_pending_clears_buffer_and_pending_for_clean_next_cycle() {
         // Poison-buffer recovery contract (2026-07-06 hostile-review fix):
@@ -610,10 +1705,10 @@ mod tests {
         // the writer's retained ILP buffer, so a server-rejected row can never
         // replay forever and the buffer can never grow across cycles toward
         // the questdb-rs 100 MiB max_buf_size cliff.
-        let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
-        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("append");
         assert!(w.flush().is_err(), "disconnected flush fails");
         assert_eq!(
@@ -627,7 +1722,7 @@ mod tests {
         assert_eq!(w.buffer_row_count(), 0);
         // The next cycle starts clean: a fresh append contains ONLY the new
         // row's bytes — no poisoned replay of the failed batch.
-        w.append_seal(&mk_seal(51, 0, TfIndex::M1, 1_716_002_100, 300.0))
+        w.append_seal(&mk_seal(51, 0, TfIndex::M1, 1_716_024_900, 300.0))
             .expect("append after discard");
         assert_eq!(w.pending_count(), 1);
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -640,12 +1735,34 @@ mod tests {
     #[test]
     fn test_append_seal_increments_pending_count() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
-        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_001_500, 200.0))
+        w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0))
             .expect("append");
         assert_eq!(w.pending_count(), 2);
+    }
+
+    /// Audit PR31: a buffer left mid-row must never be cleared by the next
+    /// append, because that would silently drop good rows the caller already
+    /// counts as buffered. The append returns `Err` (the caller's rescue path
+    /// takes that seal) and the good row stays.
+    #[test]
+    fn test_append_row_on_a_mid_row_buffer_errs_without_dropping_good_rows() {
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
+            .expect("good row");
+        // Force the buffer into the state a part-way failure used to leave.
+        w.buffer.table("candles_1m").expect("start a line");
+        let before = w.buffer_bytes().to_vec();
+        let err = w.append_seal(&mk_seal(25, 0, TfIndex::M1, 1_716_024_300, 200.0));
+        assert!(err.is_err(), "a mid-row buffer refuses the append");
+        assert_eq!(w.pending_count(), 1, "the good row is still counted");
+        assert_eq!(
+            w.buffer_bytes(),
+            &before[..],
+            "nothing cleared, nothing added"
+        );
     }
 
     #[test]
@@ -656,7 +1773,7 @@ mod tests {
                 u64::from(13 + i),
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i,
+                1_716_023_700 + i,
                 100.0 + i as f64,
             );
             w.append_seal(&s).expect("append");
@@ -669,7 +1786,7 @@ mod tests {
     fn test_append_seal_writes_bytes_to_the_buffer() {
         let mut w = ShadowCandleWriter::for_test();
         assert_eq!(w.buffer_byte_count(), 0);
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert!(
             w.buffer_byte_count() > 0,
@@ -680,7 +1797,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_target_table_name_for_m1() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_bytes();
         let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
@@ -701,7 +1818,7 @@ mod tests {
         // the dispatch contract end-to-end.
         for tf in TfIndex::ALL {
             let mut w = ShadowCandleWriter::for_test();
-            w.append_seal(&mk_seal(13, 0, tf, 1_716_000_900, 100.0))
+            w.append_seal(&mk_seal(13, 0, tf, 1_716_023_700, 100.0))
                 .expect("append");
             let bytes = w.buffer_bytes();
             let s = std::str::from_utf8(bytes).expect("ILP wire format is utf-8");
@@ -721,7 +1838,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -739,7 +1856,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -753,28 +1870,29 @@ mod tests {
 
     #[test]
     fn test_append_seal_stamps_feed_from_seal_not_hardcoded() {
-        // ONE feed-parameterized writer: a `Feed::Groww` seal MUST stamp
-        // `feed=groww` (NOT the old hardcoded `feed=dhan`), so the SAME
-        // append_seal path serves both feeds and Groww candles never collide
-        // with Dhan candles under the (ts, security_id, segment, feed) DEDUP key.
+        // ONE feed-parameterized writer: a non-Dhan seal MUST stamp ITS OWN
+        // feed label, never the old hardcoded `feed=dhan`, so the same
+        // append_seal path serves every feed and their candles can never
+        // collide under the (ts, security_id, segment, feed) DEDUP key.
+        // Probed with Groww until 2026-08-21; TrueData is the non-Dhan feed now.
         let mut w = ShadowCandleWriter::for_test();
         w.append_seal(&mk_seal_feed(
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
-            Feed::Groww,
+            Feed::Truedata,
         ))
         .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(
-            s.contains("feed=groww"),
-            "Groww seal must stamp feed=groww (the writer is feed-parameterized), got {s}"
+            s.contains("feed=truedata"),
+            "a TrueData seal must stamp feed=truedata (the writer is feed-parameterized), got {s}"
         );
         assert!(
             !s.contains("feed=dhan"),
-            "a Groww seal must NOT stamp feed=dhan, got {s}"
+            "a non-Dhan seal must NOT stamp feed=dhan, got {s}"
         );
     }
 
@@ -789,7 +1907,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append idx_i");
@@ -797,7 +1915,7 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_NSE_EQ,
             TfIndex::M1,
-            1_716_001_500,
+            1_716_024_300,
             200.0,
         ))
         .expect("append nse_eq");
@@ -810,7 +1928,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_security_id() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         // ILP int columns format: `security_id=13i`
@@ -823,7 +1941,7 @@ mod tests {
     #[test]
     fn test_append_seal_buffer_contains_ohlc_values() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         // OHLC are f64 fields written as ILP doubles; questdb-rs emits
@@ -835,33 +1953,86 @@ mod tests {
         assert!(s.contains("close="), "close column missing in {s}");
     }
 
+    /// Does the ILP line carry `name` as a field of its OWN, rather than as the
+    /// tail of a longer field name?
+    ///
+    /// Load-bearing since the 2026-09-19 rename: `open_percentage_change=`
+    /// CONTAINS `percentage_change=`, so a plain `contains` would report the
+    /// renamed column as present when only its open-variant sibling was
+    /// written. ILP separates fields with `,` (or a space before the first),
+    /// so the character before the name must not be part of an identifier.
+    fn has_ilp_field(line: &str, name: &str) -> bool {
+        let needle = format!("{name}=");
+        let mut from = 0usize;
+        while let Some(rel) = line[from..].find(&needle) {
+            let at = from + rel;
+            let prev_is_identifier = line[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !prev_is_identifier {
+                return true;
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
     #[test]
-    fn test_append_seal_buffer_writes_close_pct_only() {
-        // PR-4b (2026-05-28): the 11-column schema writes
-        // `close_pct_from_prev_day` but NOT the oi/volume pct columns —
-        // spot has no OI and indices no volume, so those stay dropped.
+    fn test_append_seal_buffer_writes_the_two_renamed_pct_columns_only() {
+        // 2026-09-19 schema reset. The wire carries exactly two percentage
+        // columns, both renamed: `percentage_change` (was `change_pct`) and
+        // `open_percentage_change` (was `open_pct`).
+        //
+        // The removal half is the half that matters. ILP AUTO-CREATES any
+        // column a writer names, so a single leftover append silently
+        // re-creates `close_pct_from_prev_day` or `open_gap_pct` on a fresh
+        // table — undoing the reset with nothing failing. `oi_pct` and
+        // `volume_pct` were never written (spot has no OI, indices no volume)
+        // and are kept here as the original PR-4b assertion.
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
         assert!(
-            s.contains("close_pct_from_prev_day="),
-            "close_pct MUST be written in {s}"
+            has_ilp_field(s, "percentage_change"),
+            "percentage_change MUST be written in {s}"
         );
         assert!(
-            !s.contains("oi_pct_from_prev_day"),
-            "oi_pct must NOT be written in {s}"
+            has_ilp_field(s, "open_percentage_change"),
+            "open_percentage_change MUST be written in {s}"
         );
-        assert!(
-            !s.contains("volume_pct_from_prev_day"),
-            "volume_pct must NOT be written in {s}"
-        );
+        for gone in [
+            "close_pct_from_prev_day",
+            "open_gap_pct",
+            "change_pct",
+            "open_pct",
+            "oi_pct_from_prev_day",
+            "volume_pct_from_prev_day",
+        ] {
+            assert!(
+                !has_ilp_field(s, gone),
+                "`{gone}` must NOT be written — ILP auto-creates the column in {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_test_has_ilp_field_is_boundary_aware() {
+        // Bite-proof for the helper above: without the boundary check the
+        // removal loop passes vacuously and the presence check reports a
+        // column that was never written.
+        let line = "candles_1m,feed=dhan open_percentage_change=0.4 123";
+        assert!(has_ilp_field(line, "open_percentage_change"));
+        assert!(!has_ilp_field(line, "percentage_change"));
+        assert!(has_ilp_field("a percentage_change=1", "percentage_change"));
     }
 
     #[test]
     fn test_append_seal_buffer_contains_volume_oi_tickcount_columns() {
         let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
         assert!(s.contains("volume="), "volume column missing in {s}");
@@ -881,7 +2052,7 @@ mod tests {
         // empty-Ok never masks a real persist failure. A flush WITH pending rows on
         // a disconnected writer still Errs — see
         // `test_flush_returns_err_when_disconnected_with_pending_rows`.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         let result = w.flush();
         assert!(
             result.is_ok(),
@@ -889,10 +2060,68 @@ mod tests {
         );
     }
 
+    /// Audit PR31a: a flush before the candle tables are confirmed keyed sends
+    /// NOTHING and keeps every row for the rescue path; once the latch is set
+    /// the same flush reaches the network arm. A local flag, not the global one,
+    /// because another test in this crate runs the ensure against a mock that
+    /// accepts everything and would flip the global under this one.
+    #[test]
+    fn test_flush_refuses_until_the_candle_tables_are_keyed() {
+        static LOCAL_KEYED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let mut w = ShadowCandleWriter::for_test();
+        w.keyed = &LOCAL_KEYED;
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
+            .expect("append");
+        let before = w.buffer_bytes().to_vec();
+
+        let err = w.flush().expect_err("an unkeyed flush must be refused");
+        assert!(
+            format!("{err:#}").contains("not yet keyed"),
+            "the refusal must name its cause: {err:#}"
+        );
+        assert_eq!(w.pending_count(), 1, "the refused row stays counted");
+        assert_eq!(
+            w.buffer_bytes(),
+            before.as_slice(),
+            "the refused row stays buffered"
+        );
+
+        LOCAL_KEYED.store(true, std::sync::atomic::Ordering::Release);
+        let err = w
+            .flush()
+            .expect_err("disconnected, so the network arm still fails");
+        assert!(
+            !format!("{err:#}").contains("not yet keyed"),
+            "once keyed the flush must get past the gate: {err:#}"
+        );
+    }
+
+    /// Every constructor obeys the ONE process-wide latch the ensure sets.
+    #[test]
+    fn test_every_candle_writer_obeys_the_process_wide_keyed_latch() {
+        let w = ShadowCandleWriter::for_test();
+        assert!(std::ptr::eq(
+            w.keyed,
+            &crate::shadow_persistence::CANDLE_TABLES_KEYED
+        ));
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let w = ShadowCandleWriter::new(&cfg).expect("lazy construction");
+        assert!(std::ptr::eq(
+            w.keyed,
+            &crate::shadow_persistence::CANDLE_TABLES_KEYED
+        ));
+    }
+
     #[test]
     fn test_flush_returns_err_when_disconnected_with_pending_rows() {
-        let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         assert_eq!(w.pending_count(), 1);
         let result = w.flush();
@@ -915,7 +2144,7 @@ mod tests {
                 u64::from(13 + i),
                 0,
                 TfIndex::M1,
-                1_716_000_900 + i,
+                1_716_023_700 + i,
                 100.0 + i as f64,
             );
             w.append_seal(&s).expect("append");
@@ -935,12 +2164,12 @@ mod tests {
         // reconnect attempts (for_test writer has an empty conf → reconnect fails)
         // must RETAIN the buffered candles + pending so drain_once can rescue them
         // to spill/DLQ AND a later cycle re-attempts — no silent candle loss.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         w.append_seal(&mk_seal(
             13,
             EXCHANGE_SEGMENT_IDX_I,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
         ))
         .expect("append");
@@ -969,8 +2198,8 @@ mod tests {
         // subsequent flush attempt (reconnect + replay each cycle), so the
         // moment QuestDB comes back the backlog commits. Proven here by two
         // consecutive failed flushes both retaining the identical buffer.
-        let mut w = ShadowCandleWriter::for_test();
-        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_000_900, 100.0))
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, 1_716_023_700, 100.0))
             .expect("append");
         let bytes = w.buffer_byte_count();
         assert!(w.flush().is_err(), "first flush fails (no conf)");
@@ -985,7 +2214,7 @@ mod tests {
     #[test]
     fn test_shadow_writer_empty_buffer_flush_is_noop_ok() {
         // An empty buffer flush is a no-op Ok — no reconnect attempt, no error.
-        let mut w = ShadowCandleWriter::for_test();
+        let mut w = ShadowCandleWriter::for_test().with_keyed_for_test(&KEYED_FOR_TESTS);
         assert!(w.flush().is_ok(), "empty flush must be Ok (no-op)");
     }
 
@@ -994,7 +2223,7 @@ mod tests {
         // The candle writer reuses the SAME `is_connection_error` classifier as the
         // Groww tick writer, so broken-pipe / reset → retry, structural → no retry.
         // (Proving the classifier wiring without a live QuestDB.)
-        use crate::groww_persistence::is_connection_error;
+        use crate::ilp_flush_reconnect::is_connection_error;
         let socket = questdb::Error::new(
             questdb::ErrorCode::SocketError,
             "Could not flush buffer: Broken pipe (os error 32)",
@@ -1025,7 +2254,7 @@ mod tests {
         let mut w = ShadowCandleWriter::for_test();
         let novel_row = ShadowSealRow {
             table_name: TfIndex::M1.table_name(),
-            timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
             security_id: 4242,
             segment: "NSE_EQ",
             feed: "future_test_feed",
@@ -1040,6 +2269,11 @@ mod tests {
             open_pct: 0.4,
             change_pct: 1.5,
             open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
         };
         w.append_row(&novel_row).expect("append novel-feed row");
         let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1052,7 +2286,7 @@ mod tests {
             "the candle path must stamp the ARBITRARY feed verbatim (feed-agnostic), got {s}"
         );
         assert!(
-            !s.contains("feed=dhan") && !s.contains("feed=groww"),
+            !s.contains("feed=dhan") && !s.contains("feed=truedata"),
             "a novel-feed candle must NOT be relabelled to a known feed, got {s}"
         );
     }
@@ -1069,7 +2303,7 @@ mod tests {
                 13,
                 EXCHANGE_SEGMENT_NSE_EQ,
                 TfIndex::M1,
-                1_716_000_900,
+                1_716_023_700,
                 100.0,
                 *feed,
             ))
@@ -1090,12 +2324,12 @@ mod tests {
     }
 
     #[test]
-    fn test_candle_writer_covers_all_21_tf_tables_for_arbitrary_feed() {
+    fn test_candle_writer_covers_every_tf_table_for_arbitrary_feed() {
         // OPERATOR SCOPE CLARIFICATION 2026-06-30: the candle path must cover
         // EVERY timeframe table, not just candles_1m — and for ANY feed. Drive one
-        // seal for EVERY TfIndex::ALL (all 21 TFs) tagged an ARBITRARY novel feed
+        // seal for EVERY TfIndex::ALL (every live frame) tagged an ARBITRARY novel feed
         // and assert each lands in its OWN candles_<tf> table tagged with that feed.
-        // Proves: one common writer → all 21 TF tables, feed stamped verbatim, no
+        // Proves: one common writer → every TF table, feed stamped verbatim, no
         // per-TF and no per-feed branch.
         let novel_feed = "future_test_feed";
         let mut seen_tables = std::collections::HashSet::new();
@@ -1103,7 +2337,7 @@ mod tests {
             let mut w = ShadowCandleWriter::for_test();
             let row = ShadowSealRow {
                 table_name: tf.table_name(),
-                timestamp_ist_nanos: 1_716_000_900_i64 * 1_000_000_000,
+                timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
                 security_id: 4242,
                 segment: "NSE_EQ",
                 feed: novel_feed,
@@ -1118,6 +2352,11 @@ mod tests {
                 open_pct: 0.4,
                 change_pct: 1.5,
                 open_gap_pct: 0.2,
+                total_buy_qty: 89_600,
+                total_sell_qty: 4_800,
+                open_latency_ns: None,
+                close_latency_ns: None,
+                window_span_latency_ns: None,
             };
             w.append_row(&row).expect("append per-TF row");
             let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
@@ -1132,14 +2371,19 @@ mod tests {
             );
             seen_tables.insert(table);
         }
-        // All 21 distinct candle tables were exercised.
+        // Every live candle table was exercised — derived from the enum, so
+        // it cannot go stale the next time TF_COUNT moves.
         assert_eq!(
             seen_tables.len(),
             TfIndex::ALL.len(),
-            "every one of the 21 TF candle tables must be covered"
+            "every live TF candle table must be covered"
         );
+        // Two literal anchors, one per scale, so the derived equality above
+        // cannot be satisfied by a table-name mapping that collapsed the
+        // scales. `candles_1d` stood here until the 2026-09-19 collapse
+        // retired D1; `candles_1s` is the surviving short-scale anchor.
         assert!(seen_tables.contains("candles_1m"));
-        assert!(seen_tables.contains("candles_1d"));
+        assert!(seen_tables.contains("candles_1s"));
     }
 
     #[test]
@@ -1151,9 +2395,9 @@ mod tests {
             13,
             EXCHANGE_SEGMENT_NSE_EQ,
             TfIndex::M1,
-            1_716_000_900,
+            1_716_023_700,
             100.0,
-            Feed::Groww,
+            Feed::Truedata,
         );
         let row = ShadowSealRow::from_buffered_seal(&seal);
 
@@ -1166,6 +2410,357 @@ mod tests {
             a.buffer_bytes(),
             b.buffer_bytes(),
             "append_seal and append_row must produce identical ILP bytes"
+        );
+    }
+
+    /// THE TRAP, pinned: the final bar of the session must be WRITTEN.
+    ///
+    /// A one-minute bucket opening at 15:39:00 has exclusive end 15:40:00 and
+    /// is only released by `catch_up_seal` once the watermark passes
+    /// 15:40:02 -- two seconds PAST the window's exclusive end. Any gate that
+    /// consulted the seal instant would discard this bar every single
+    /// session, silently, while reporting success. This test is what stops a
+    /// future edit from "tightening" the gate into that.
+    #[test]
+    fn the_final_bucket_of_the_session_is_written_even_though_it_seals_after_1540() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        // 15:39:00 IST -- the last one-minute bucket the session can open.
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 56_340, 100.0))
+            .expect("append");
+        assert_eq!(
+            w.pending_count(),
+            1,
+            "the 15:39 bar seals at ~15:40:02, AFTER the window closes. It is \
+             gated on its BUCKET, which is 15:39:00 and in window, so it must \
+             be written. Gating a seal clock here loses the close every day."
+        );
+    }
+
+    /// The first bucket of the session, at the inclusive edge.
+    #[test]
+    fn the_first_bucket_at_0900_is_written() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 32_400, 100.0))
+            .expect("append");
+        assert_eq!(w.pending_count(), 1, "09:00:00 is IN, inclusively");
+    }
+
+    /// A bucket genuinely outside the session is refused -- as Ok, never Err.
+    ///
+    /// An `Err` would route through the seal spill/DLQ escalation and
+    /// AGGREGATOR-DROP-01, reporting a deliberate refusal as lost data.
+    #[test]
+    fn an_out_of_session_bucket_is_refused_as_ok_never_as_a_loss() {
+        let midnight = 1_715_990_400_u32;
+        let mut w = ShadowCandleWriter::for_test();
+        // 16:00:00 IST -- past the close.
+        assert!(
+            w.append_seal(&mk_seal(13, 0, TfIndex::M1, midnight + 57_600, 100.0))
+                .is_ok(),
+            "a refusal is Ok(()): an Err escalates to the DLQ and pages"
+        );
+        assert_eq!(w.pending_count(), 0, "and nothing reaches the buffer");
+    }
+
+    /// A corrupt far-future bucket whose TIME OF DAY looks in-session.
+    #[test]
+    fn a_far_future_bucket_that_looks_in_window_is_refused() {
+        let mut w = ShadowCandleWriter::for_test();
+        // 2_600_000_000 s is year 2052; its seconds-of-day is 51_200 = 14:13:20.
+        assert_eq!(2_600_000_000_u32 % 86_400, 51_200, "fixture precondition");
+        assert!(
+            w.append_seal(&mk_seal(13, 0, TfIndex::M1, 2_600_000_000, 100.0))
+                .is_ok()
+        );
+        assert_eq!(w.pending_count(), 0, "the band check must refuse it");
+    }
+
+    /// Candle reasons say `bucket_`, because that is the clock being read.
+    #[test]
+    fn every_candle_reason_names_the_bucket_clock_and_is_distinct() {
+        for reason in CANDLE_OUT_OF_WINDOW_REASONS {
+            assert!(
+                reason.starts_with("bucket_"),
+                "{reason} must say bucket: a candle's ts is its bucket-open \
+                 instant, not an event time and not an arrival time"
+            );
+        }
+        assert_ne!(
+            CANDLE_OUT_OF_WINDOW_REASONS[0], CANDLE_OUT_OF_WINDOW_REASONS[1],
+            "two reasons must never share a metric label"
+        );
+    }
+
+    // ---- `contract` (2026-09-22) ----
+
+    fn contract_row(security_id: i64, segment: &'static str) -> ShadowSealRow {
+        ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id,
+            segment,
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 0,
+            total_sell_qty: 0,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        }
+    }
+
+    /// 2026-09-26 audit fix PR2: the tripwire counts exactly the non-finite
+    /// float columns, and a normal bar counts zero.
+    #[test]
+    fn test_count_nonfinite_candle_floats_counts_only_nan_and_inf() {
+        let mut row = contract_row(1, "NSE_EQ");
+        assert_eq!(count_nonfinite_candle_floats(&row), 0);
+        row.open = f64::NAN;
+        row.close = f64::INFINITY;
+        row.open_pct = f64::NEG_INFINITY;
+        assert_eq!(count_nonfinite_candle_floats(&row), 3);
+        // Finite extremes are data, not faults.
+        let mut edge = contract_row(1, "NSE_EQ");
+        edge.high = f64::MAX;
+        edge.low = -0.0;
+        edge.change_pct = f64::MIN_POSITIVE / 2.0;
+        assert_eq!(count_nonfinite_candle_floats(&edge), 0);
+    }
+
+    #[test]
+    fn nonfinite_counter_name_is_pinned() {
+        assert_eq!(
+            CANDLE_NONFINITE_COLUMNS_COUNTER,
+            "tv_candle_nonfinite_columns_total"
+        );
+    }
+
+    fn publish_one(security_id: i64, segment: &'static str, name: &str) {
+        let mut m = crate::candle_contract_labels::CandleContractLabels::default();
+        m.insert((security_id, segment), std::sync::Arc::<str>::from(name));
+        crate::candle_contract_labels::publish_candle_contract_labels(m);
+    }
+
+    /// A contract the day's table knows gets its NAME written, among the
+    /// symbols (ILP refuses a symbol after the first column).
+    #[test]
+    fn a_known_contract_writes_its_name_before_the_first_column() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_001, "NSE_FNO", "NIFTY-25Sep2026-24500-CE");
+        let mut w = ShadowCandleWriter::for_test();
+        w.append_row(&contract_row(9_200_001, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        let name_at = s
+            .find("contract=NIFTY-25Sep2026-24500-CE")
+            .unwrap_or_else(|| panic!("the name must be written, got {s}"));
+        let first_column = s.find(" security_id=").expect("first column");
+        assert!(
+            name_at < first_column,
+            "contract is a SYMBOL and must precede every column, got {s}"
+        );
+    }
+
+    /// Anything the table does not know — a spot, a future, the same id on
+    /// another segment, a table not yet published — writes NO name. NULL,
+    /// never a guess.
+    #[test]
+    fn an_unknown_contract_omits_the_name_rather_than_guessing() {
+        let _g = crate::candle_contract_labels::TEST_PUBLISH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publish_one(9_200_101, "NSE_FNO", "BANKNIFTY-25Sep2026-55000-PE");
+        let mut w = ShadowCandleWriter::for_test();
+        // Same numeric id, different segment (I-P1-11): a different instrument.
+        w.append_row(&contract_row(9_200_101, "NSE_EQ"))
+            .expect("append");
+        // An id the table has never seen.
+        w.append_row(&contract_row(9_200_102, "NSE_FNO"))
+            .expect("append");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            !s.contains("contract="),
+            "an unresolved contract must be OMITTED (NULL), got {s}"
+        );
+        assert_eq!(w.buffer_row_count(), 2, "both rows are still written");
+    }
+
+    // ---- the three delay pairs (2026-09-19, Task #15 step 6) ----
+
+    /// A row that KNOWS its delays emits all six columns, and the readable half
+    /// carries the whole-unit text the operator asked for (Quote D) — never a
+    /// decimal, never a raw nanosecond count on a millisecond-scale delay.
+    #[test]
+    fn a_row_with_known_receipt_stamps_emits_all_six_delay_columns() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            // 123 ms, 4 s, and a zero span — the third is the case a sentinel
+            // would have destroyed: a single-tick bucket really did span zero,
+            // and that is NOT the same fact as "we do not know".
+            open_latency_ns: Some(123_000_000),
+            close_latency_ns: Some(4_000_000_000),
+            window_span_latency_ns: Some(0),
+        };
+        w.append_row(&row).expect("append row with delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        // The exact halves are what any ORDER BY must use.
+        assert!(
+            s.contains("open_latency_ns=123000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("close_latency_ns=4000000000i"),
+            "the exact nanosecond twin must be written as an integer, got {s}"
+        );
+        assert!(
+            s.contains("window_span_latency_ns=0i"),
+            "a genuinely-zero span must be WRITTEN as 0, not omitted, got {s}"
+        );
+
+        // The readable halves are whole units in the right band.
+        assert!(
+            s.contains(r#"open_latency="123 milliseconds""#),
+            "123 ms must render as whole milliseconds, got {s}"
+        );
+        assert!(
+            s.contains(r#"close_latency="4 seconds""#),
+            "4 s must render as whole seconds, plural, got {s}"
+        );
+        assert!(
+            s.contains(r#"window_span_latency="0 nanoseconds""#),
+            "a zero span must render as a real reading, not blank, got {s}"
+        );
+    }
+
+    /// A row that does NOT know its delays emits NOTHING for them. Omitted is
+    /// NULL in QuestDB; a written `0` would claim the fastest possible delivery
+    /// for a bar whose delivery time is unknowable (a spill replay, a REST
+    /// reconstruction). The two cases must never render alike.
+    #[test]
+    fn a_row_with_unknown_receipt_stamps_omits_the_delay_columns_entirely() {
+        let mut w = ShadowCandleWriter::for_test();
+        let row = ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: None,
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        w.append_row(&row).expect("append row without delays");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+
+        for absent in [
+            "open_latency",
+            "open_latency_ns",
+            "close_latency",
+            "close_latency_ns",
+            "window_span_latency",
+            "window_span_latency_ns",
+        ] {
+            assert!(
+                !s.contains(absent),
+                "{absent} must be ABSENT (NULL), never written as zero, got {s}"
+            );
+        }
+        // Non-vacuity: the row itself really was serialised.
+        assert!(
+            s.starts_with("candles_1m,"),
+            "the row must still be written, only its delays omitted, got {s}"
+        );
+        assert!(
+            s.contains("total_sell_qty=4800i"),
+            "the column before the delay block must still be present, got {s}"
+        );
+    }
+
+    /// The scratch buffer is reused across rows, so a stale render must never
+    /// trail into the next one. Two rows through ONE writer, second shorter.
+    #[test]
+    fn the_reused_delay_scratch_never_leaks_one_rows_text_into_the_next() {
+        let mk = |ns: i64| ShadowSealRow {
+            table_name: TfIndex::M1.table_name(),
+            timestamp_ist_nanos: 1_716_023_700_i64 * 1_000_000_000,
+            security_id: 4242,
+            segment: "NSE_FNO",
+            feed: "dhan",
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close: 101.0,
+            volume: 1234,
+            oi: 50_000,
+            tick_count: 5,
+            close_pct_from_prev_day: 1.5,
+            open_pct: 0.4,
+            change_pct: 1.5,
+            open_gap_pct: 0.2,
+            total_buy_qty: 89_600,
+            total_sell_qty: 4_800,
+            open_latency_ns: Some(ns),
+            close_latency_ns: None,
+            window_span_latency_ns: None,
+        };
+        let mut w = ShadowCandleWriter::for_test();
+        // Long text first (19 chars), then the shortest possible (13).
+        w.append_row(&mk(123_000_000)).expect("first");
+        w.append_row(&mk(4)).expect("second");
+        let s = std::str::from_utf8(w.buffer_bytes()).expect("utf8");
+        assert!(
+            s.contains(r#"open_latency="4 nanoseconds""#),
+            "the second row must render its OWN value cleanly, got {s}"
+        );
+        assert!(
+            !s.contains(r#"open_latency="123 milliseconds4 nanoseconds""#),
+            "a missing clear() would append the second render onto the first, got {s}"
         );
     }
 }

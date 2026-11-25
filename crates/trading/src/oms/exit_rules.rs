@@ -54,6 +54,10 @@ pub enum ExitCommand {
     CloseAll {
         /// Dhan security identifier.
         security_id: u64,
+        /// Exchange segment of the position to close. With `security_id` it
+        /// names the instrument (I-P1-11): the close order is sent in this
+        /// segment and closes only the position booked in it.
+        exchange_segment: tickvault_common::types::ExchangeSegment,
         /// Exchange freeze quantity for the close order(s).
         freeze_limit: i64,
     },
@@ -1230,6 +1234,7 @@ mod tests {
         let commands = [
             ExitCommand::CloseAll {
                 security_id: 13,
+                exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 freeze_limit: 1800,
             },
             ExitCommand::PlaceBracket(super_req()),

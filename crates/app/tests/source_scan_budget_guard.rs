@@ -1,0 +1,425 @@
+//! APP SELF-SOURCE-SCAN BUDGET (2026-10-12, deep audit PROOF-13).
+//!
+//! Many app tests read the app's own source with `include_str!("x.rs")` and
+//! assert that some text is present. Those guards are legitimate tripwires
+//! (lock files pin phrases, wiring must exist), but a text guard proves that
+//! code EXISTS, not that it WORKS, and nothing stopped new text guards from
+//! standing in for behaviour tests: `dhan_feed_stack.rs` alone carries about
+//! ninety of them.
+//!
+//! `app_self_source_scans_may_only_shrink` counts, per file under
+//! `crates/app/src`, the `include_str!(...)` calls whose argument names a
+//! `.rs` file, and fails when a file's count passes its budget (or a file not
+//! listed gains one). A new self-scan must remove one elsewhere, or raise the
+//! budget in a reviewed diff whose comment names the behaviour test that
+//! pairs with it. Behaviour tests are preferred.
+//!
+//! HONEST LIMITS: converting the existing scans into behaviour tests is not
+//! done here. Scans that read source through `std::fs::read_to_string` (most
+//! files under `crates/app/tests/`) are not counted; this budget covers the
+//! inline test modules in `src`.
+
+use std::path::{Path, PathBuf};
+
+/// `(file under crates/app/src, include_str! of a .rs file)`, measured
+/// 2026-10-12. Sorted. Counts may only go DOWN; lower a row when a scan is
+/// replaced by a behaviour test.
+const BUDGET: &[(&str, usize)] = &[
+    ("api_token_rotation.rs", 1),
+    ("bin/smoke_test.rs", 1),
+    ("boot_helpers.rs", 1),
+    // 2026-11-14 (owner Quote 60, second review): one wiring scan pinning that
+    // the export loop reads every readiness gate, marks a run for the evening
+    // restart and books each run's end (an endless loop over QuestDB and S3
+    // cannot be staged in a unit test). Paired behaviour tests:
+    // `test_compose_reasons_labels_hard_soft_and_note`,
+    // `test_apply_run_end_books_each_end`,
+    // `test_past_day_forced_two_days_on_and_across_a_weekend`.
+    ("brutex_export_boot.rs", 1),
+    // 2026-10-26 (audit J3): +5 wiring scans, one per audit consumer, pinning
+    // that each starts the audit DDL re-run when its own ensure is refused (a
+    // refusal at the one moment a consumer starts cannot be staged in a unit
+    // test). Paired behaviour tests: `audit_tables_ensure_reads_not_keyed_when_unreachable`,
+    // `test_spawn_audit_ensure_until_keyed_once_starts_once_per_process`.
+    // 2026-11-07 (market_depth_book auto-create fix): 6 -> 7, one wiring scan
+    // pinning that the Dhan lane starts the book DDL re-run when its one boot
+    // ensure is refused (the same can-not-be-staged refusal as J3). Paired
+    // behaviour tests: `market_depth_book_ensure_reads_not_keyed_when_unreachable`,
+    // `ensure_until_keyed_returns_once_every_statement_is_accepted`.
+    // 2026-11-13 (B1): the arming order of the live write gate is a behaviour
+    // test in its own binary (`crates/app/tests/live_write_gate_boot.rs`,
+    // `test_boot_live_ddl_arms_the_write_gate_before_its_first_ensure`), not a
+    // source scan, so this row stays at 7.
+    ("candle_ddl_boot.rs", 7),
+    // 2026-11-12 (plan item LF-6a): one wiring scan pinning that the live
+    // clock poll loop feeds the 1 ms page episode and the probe publishes the
+    // minute column (a 30 s chrony loop cannot be staged in a unit test).
+    // Paired behaviour tests: the `test_observe_*` episode tests and
+    // `test_feed_clock_offset_episode_uses_the_ist_minute_and_window`.
+    ("clock_offset_page.rs", 1),
+    // 1 -> 2 (2026-11-14, owner Quote 60 second review): pins that the repair
+    // loop publishes each run through `record_run` (a revert to a bare
+    // `state.record` left the export gate pending with every test green).
+    // Paired behaviour tests: `test_repair_state_is_set_only_when_the_day_is_over`,
+    // `test_exhausted_repair_with_failures_is_not_clean`.
+    ("contract_name_repair_boot.rs", 2),
+    // 1 -> 2 (2026-11-07, PR AA step 1, owner Quote 51): pins that the daily
+    // loop seeds the quiesce counters before its first pass (the loop cannot
+    // run without QuestDB and S3). Paired behaviour half in the same test:
+    // every `writer` series renders at 0 and a held catch-up counts 1.
+    ("daily_archive_boot.rs", 2),
+    ("daily_task_marker.rs", 2),
+    ("depth200_ranked_steer.rs", 1),
+    ("depth20_track.rs", 1),
+    ("depth_first_packet.rs", 1),
+    ("depth_rebalance.rs", 7),
+    ("depth_subscription_view.rs", 3),
+    // 2026-10-21 (owner: depth switched off): 2 wiring scans (the attach starts
+    // both depth halves done, main stores the switch); paired behaviour test
+    // `test_set_depth_sockets_enabled_round_trips`.
+    ("depth_switch.rs", 2),
+    // 1 -> 2 (2026-10-28, daily expiry check): pins that the attach builds its
+    // candle names from every option row, not the capped ranking table. Paired
+    // behaviour test: `test_option_labels_from_keys_exactly_as_a_candle_row_probes`.
+    ("dhan_contract_universe.rs", 2),
+    ("dhan_depth_universe.rs", 3),
+    // 2026-10-14 (ITEM 57): 90 -> 88; `contract_attach_tests` (3 scans) moved
+    // to its own file, one scan added by `test_live_tick_flush_leaves_depth_to_its_own_cadence`,
+    // which pairs it with a behaviour half on the same ingest.
+    // 2026-10-22 (plan item 62): 88 -> 81; seven top_volume source scans went
+    // with the code they scanned.
+    // 2026-10-26 (audit K3): +1 wiring scan, the tick-gap verdict counters are
+    // counted at ingest, seeded at 0 and never EMF-shipped. Paired behaviour
+    // test: `tick_verdict_counters_move_on_a_backward_ltt_and_a_volume_jump`.
+    // 2026-10-29 (live audit LH-03, LH-05): +2 wiring scans. The landed-rows
+    // INFO line is gated on the confirm (paired behaviour test:
+    // `test_regression_a_flush_that_hands_nothing_off_does_not_busy_spin`), and
+    // the lag class split is reached from the drain and the publish (paired
+    // behaviour test: `test_ws_lag_max_takes_the_largest_and_resets`).
+    // 2026-11-17 (speed fix 4 CI): lowered 84 -> 81; the tally's three scans
+    // moved with `FrameTally` to `frame_tally_tests.rs` (2 there, one fewer).
+    ("dhan_feed_stack.rs", 81),
+    // 2026-11-07 (PR AA step 1, owner Quote 51): 1 wiring scan of the lane,
+    // read by two tests: each catch-up chunk takes the archive quiesce lock
+    // before its refold, and the boot refold takes it and lets go before the
+    // catch-up (the lane's select! loop cannot be driven from a unit test).
+    // Paired behaviour tests: `test_catchup_stops_with_archive_quiesce_reason`,
+    // and in `archive_quiesce` `test_boot_refold_in_session_never_waits_on_quiesce`
+    // and `test_quiesce_writer_waits_behind_queued_archiver`.
+    // 1 -> 2 (2026-11-08, PR AA finding 6): `main.rs` registers the boot
+    // replay before either archive loop spawns, which no unit test can drive.
+    // Paired behaviour tests: `test_boot_replay_intent_only_for_staged_frames`
+    // and, in `archive_quiesce`,
+    // `test_regression_archiver_stands_aside_while_a_replay_is_registered`.
+    ("dhan_feed_stack/catchup_stop.rs", 2),
+    // 2026-11-23 (PR23, close seal): +2 scans in one test,
+    // `test_close_seal_source_scan`, pinning that `close_seal_cutoff` allocates
+    // nothing and loops only over the session slice, that the calendar is
+    // probed only on a day change, and that no drain arm calls
+    // `force_seal_all` (the drain loop cannot be staged in a unit test).
+    // Paired behaviour tests: `test_close_seal_seals_every_open_bar_without_shutdown`,
+    // `test_close_seal_then_shutdown_and_midnight_roll_emit_nothing_more`,
+    // `test_close_seal_never_starts_during_wal_replay`,
+    // `test_crash_after_close_seal_loses_no_bar`.
+    ("dhan_feed_stack/close_seal_tests.rs", 2),
+    ("dhan_feed_stack/contract_attach_tests.rs", 3),
+    // 2026-11-07 (PR AA steps 1 and 2, owner Quote 51): 3 scans. Each bucket
+    // binds the archive quiesce guard through its flush, the floor wait runs
+    // before the first bucket lock, and the all-night depth-partition hold
+    // does not come back (a blocking lock held on a plain thread would stall
+    // every other pass test). Paired behaviour halves in the same tests,
+    // `test_regression_m4_floor_wait_runs_before_the_first_bucket` (the pass
+    // returns at its floor, writing nothing) and
+    // `test_regression_da13d_marks_stay_set_through_the_settle_and_no_all_night_hold`
+    // (the marks stay set through the settle), plus `archive_quiesce`'s
+    // `test_shared_blocking_waits_for_the_archiver_on_a_plain_thread`.
+    // ⚠ CORRECTED 2026-11-11 (PR AA-G review 2): since AA-G (finding 17)
+    // there is no bucket lock. The scans now pin that the lock is taken per
+    // committing flush (`flush_quiesced`, the item-17 scan, which also pins
+    // that the production wrapper skips it only when the sink has nothing
+    // pending), that the late-commit floor is re-read UNDER that lock, and
+    // that the m4 floor wait comes before the first `flush_quiesced` call;
+    // the all-night hold scan is unchanged. Paired behaviour tests for the
+    // per-flush lock: `test_flush_quiesced_with_holds_the_lock_only_for_the_flush`,
+    // `test_flush_quiesced_with_reads_the_floor_under_the_lock`,
+    // `test_flush_quiesced_with_skips_the_lock_when_nothing_is_pending`.
+    // 3 -> 4 (2026-11-11, PR AA-G review): the item-17 scan also pins that
+    // the pass's book writer holds the archive quiesce lock for its in-append
+    // pin-cut commit (`DepthIngest::new_book_only` lives in the lane). Paired
+    // behaviour test in storage:
+    // `test_hold_archive_quiesce_on_pin_cut_holds_the_in_append_commit`.
+    ("dhan_feed_stack/deferred_depth_pass.rs", 4),
+    ("dhan_feed_stack/feed_aux_tests.rs", 1),
+    // 2026-11-21 (scope lock "DHAN LIVE LTT IS UTC EPOCH FROM RECEIPT
+    // 2026-11-20 00:00 IST", noise lock §2.24-a): two wiring scans pinning that
+    // only the scan's A/B loop calls `fire` (so the reversion hold never logs a
+    // second DHAN-FEED-TIME-01 line) and that the scan feeds the guard's page
+    // count into the hold (the 30 s silence arm that calls `scan` cannot be
+    // staged in a unit test). Paired behaviour tests:
+    // `test_regression_2026_11_21_a_reversion_page_holds_its_day_once`,
+    // `test_regression_2026_11_21_a_full_writer_queue_holds_on_the_next_scan`.
+    ("dhan_feed_stack/feed_time_page.rs", 2),
+    // 2026-11-17 (speed fix 4 CI): 2 scans (the tally and the drain), moved
+    // from `dhan_feed_stack.rs` with `FrameTally`; paired behaviour tests:
+    // `test_fix4_counts_equal_the_per_tick_oracle_on_every_class` and
+    // `proptest_fix4_counts_equal_the_per_tick_oracle`.
+    ("dhan_feed_stack/frame_tally_tests.rs", 2),
+    // 2026-10-26 (audit PR M / M4): 1 wiring scan, every dial batch republishes
+    // the reserved-connections gauge (the widen dials long after bring-up and
+    // cannot be staged in a unit test). Paired behaviour test:
+    // `test_regression_reserved_connections_gauge_follows_the_widen`.
+    // 2026-11-12 (plan item LF-6b): one wiring scan pinning that the live
+    // fill tap call sits in the `Folded` arm behind both gates (live socket,
+    // not replaying the WAL). Paired behaviour tests:
+    // `test_with_live_fill_tap_hands_a_folded_live_tick_to_the_chain`,
+    // `test_tap_skips_replayed_frames_wal_refold_and_unfolded_ticks`.
+    // 2026-11-12 (LF-6b review finding 5): a second wiring scan pinning that
+    // the drain's `WriteFailed` arm counts a live fill loss (the staging
+    // append cannot be made to fail from a unit test). Paired behaviour test:
+    // `test_write_failed_tick_moves_drop_seq_note_live_fill_loss`.
+    ("dhan_feed_stack/live_fill_tap_drain_tests.rs", 2),
+    // 2026-11-21 (permanent UTC trade time): one wiring scan pinning that
+    // building the reversion guard registers its two counters at 0 (the
+    // process recorder is global, so the boot order cannot be staged per
+    // test). Paired behaviour test: storage
+    // `test_regression_2026_11_21_counter_labels_come_from_as_str`
+    // (`publish_ltt_counters` publishes every refusal reason and the
+    // unstamped series).
+    ("dhan_feed_stack/ltt_feed.rs", 1),
+    ("dhan_feed_stack/reserved_connections_tests.rs", 1),
+    // 2026-10-28 (DT-small seed queue): 1 wiring scan, the drain's idle arm is
+    // gated on `idle_work_pending()` alone, never the seed latch (the select!
+    // arm guard cannot be driven from a unit test). Paired behaviour half in
+    // the same test, `test_idle_arm_keeps_seeding_queued_batches_after_the_seed_channel_closes`:
+    // idle steps alone seed every queued batch after the sender is dropped.
+    ("dhan_feed_stack/seed_step_tests.rs", 1),
+    // 3 (2026-11-13, audit B3 finding 12): pin that the drain records
+    // drain_frame_post after the hand-offs on every frame kind. Paired behaviour
+    // test (same file): `test_regression_b3_drain_records_the_post_frame_stage_after_the_hand_offs`.
+    ("dhan_feed_stack/tests/b3_post_frame_tests.rs", 3),
+    ("dhan_live_crossverify.rs", 7),
+    ("dhan_live_crossverify_boot.rs", 8),
+    ("dhan_live_universe.rs", 18),
+    ("dhan_rest_stack.rs", 4),
+    // 3 -> 4 (2026-10-28, Quote 44 review): `build_once` cannot run without
+    // the network, so the held-counter emit after the sweep is pinned by
+    // source. Paired behaviour test for the count itself:
+    // `test_sweep_stale_artifacts_in_keeps_an_old_artifact_with_no_verified_copy`.
+    ("dhan_universe.rs", 4),
+    // 7 -> 8 (2026-11-07, PR AA step 4, owner Quote 51): the pressure loop
+    // cannot run without QuestDB and S3, so `test_projected_fill_is_wired_into_the_loop`
+    // pins the wiring by source. Paired behaviour tests for the decisions:
+    // `test_projected_start_needs_min_used_pct_and_the_switch` and
+    // `test_in_session_projected_allows_one_depth_partition`.
+    // 8 -> 9 (2026-11-08, PR AA finding 4 and its recheck):
+    // `test_projected_only_reaches_the_pass_config` pins that the loop's
+    // day-window decision reaches the pass config. Paired behaviour tests:
+    // `test_pressure_day_keeps_candle_day_windows_unless_used_space_drives_the_pass`
+    // and `test_regression_used_space_episode_below_low_water_keeps_the_day_windows`.
+    ("disk_pressure_boot.rs", 9),
+    ("ensure_questdb.rs", 1),
+    // 2026-10-21 (plan ITEM 60): 3 wiring scans (lane budget, main restart arm,
+    // hold supervisor); paired behaviour tests `evening_step_*`,
+    // `test_catchup_allowance_for_only_a_fresh_evening_pending_flag`,
+    // `test_request_self_restart_resolves_a_later_self_restart_requested`.
+    // 3 -> 4 (2026-11-11, noise lock §2.17 note): pins that
+    // `claim_planned_boot` records its verdict for the replay deferral lines
+    // (the claim is a process OnceLock over a real file, so it cannot be
+    // driven from a unit test). Paired behaviour test in storage, in its own
+    // test process so the process flag can be set:
+    // `tests/planned_evening_drain_claim_process.rs`
+    // (`test_the_claim_alone_makes_the_process_a_planned_boot`). ⚠ CORRECTED
+    // 2026-11-11 (review 2): this named
+    // `test_note_planned_evening_drain_claim_and_planned_evening_drain_boot`,
+    // which drives only a private slot and never the process flag.
+    ("evening_drain.rs", 4),
+    // 2026-10-28 (daily expiry check): 5 wiring scans (main spawns the 15:50
+    // check, it runs on its own task never the frame drain, the attach refuses
+    // before it names or dials, every error carries its code). Paired behaviour
+    // tests: `test_check_selected_expiries_refuses_off_expiry_expired_unknown_and_the_stub`,
+    // `test_classify_candle_contracts_all_current_is_clean`,
+    // `test_record_subscribe_expiry_scope_and_subscribe_refused_for_day`.
+    // 5 -> 7 (2026-10-28, expiry check review): +1 the attach feeds every
+    // per-id table from `preferred_option_rows` (the attach needs the network);
+    // paired behaviour tests `test_preferred_option_rows_keeps_one_row_per_key_as_by_key_does`,
+    // `test_preferred_option_rows_maps_a_reused_id_to_the_admissible_underlying`.
+    // +1 the real 15:50 loop keeps the simulated loop's step order (the loop
+    // sleeps until 15:50 and cannot run in a test); paired behaviour test
+    // `test_secs_until_after_checked_day_composed_in_the_daily_loop_checks_every_trading_day_once`.
+    // 7 -> 8 (2026-11-13, audit B3 finding 14): pins that production passes the
+    // wall clock to `spawn_expiry_scope_check_with_clock`. Paired behaviour test:
+    // `test_expiry_scope_check_spawn_runs_a_weekday_and_skips_a_weekend_whatever_the_wall_clock`.
+    ("expiry_scope_check_tests.rs", 8),
+    // 2 -> 3 (2026-11-06, plan PR AL-2 review): pins that every QuestDB
+    // failure site in the ~900-line scoreboard attempt logs through
+    // `scoreboard_failure!` and returns Retry before the final attempt (a new
+    // direct coded `error!` there would page on a non-final attempt; staging
+    // each of seven reads failing in a unit test needs a live QuestDB).
+    // Paired behaviour tests: `test_scoreboard_finding_is_coded_once_across_attempts`,
+    // `test_write_daily_rows_once_never_reports_landed_without_a_row`,
+    // `test_rollup_attempt_is_final_caps_at_eight_attempts_and_the_deadline`.
+    ("feed_scoreboard_boot.rs", 3),
+    ("index_constituency_boot.rs", 1),
+    ("infra.rs", 3),
+    // 2026-10-28 (Quote 44 review, finding 3): 1 doc scan, the module header
+    // must name the real proof-to-sweep bound (`SNAPSHOT_PASS_TIMEOUT_SECS`,
+    // 1,800 s), not "seconds". Paired behaviour half in the same test,
+    // `test_run_bounded_snapshot_pass_bounds_the_gap_between_proof_and_sweep`:
+    // a pass past the bound returns no summary and sweeps nothing.
+    ("instrument_snapshot_upload.rs", 1),
+    // 2026-11-12 (plan item LF-6b): one ordering scan pinning that the
+    // `live_order_events` writer awaits the table's ensure and starts the
+    // disk-tier drain BEFORE it builds the ILP writer (the LF-5 review's
+    // requirement; the order cannot be staged without QuestDB). Paired
+    // behaviour tests: `test_ensure_retry_secs_doubles_to_the_cap`,
+    // `test_flush_on_a_current_thread_runtime_does_not_panic`.
+    // 2026-11-12 (plan item LF-7): 6 scans of the report module's own files
+    // (`test_report_module_places_no_order`: no order call, no broker host, no
+    // object delete, which no behaviour test can prove absent) and 1 of
+    // `main.rs` (the one-line start; paired behaviour test
+    // `test_start_is_none_when_live_fill_is_off`).
+    ("live_fill_report/mod.rs", 7),
+    ("live_order_events_boot.rs", 1),
+    ("log_coalescer.rs", 1),
+    ("main.rs", 3),
+    ("observability.rs", 3),
+    ("oms_wiring.rs", 1),
+    ("order_observability.rs", 1),
+    ("order_runtime.rs", 3),
+    // 2026-11-13 (LF-9 review round 2, finding 11): one wiring scan pinning
+    // that the runtime's live-fill arm republishes only inside
+    // `if changes_orders {` (the arm sits inside the runtime's select loop,
+    // which a unit test cannot drive alone). Paired behaviour test:
+    // `test_handle_live_fill_cmd_asks_for_the_republish_only_after_an_execute`.
+    ("order_runtime_live_fill.rs", 1),
+    ("subsystem_memory.rs", 1),
+    ("tf_consistency_boot.rs", 1),
+    // 2026-10-26 (audit K4): 1 wiring scan, main spawns the daily tick
+    // conservation check and reads the last WAL receipt after claiming the WAL
+    // and before its own writer starts. Paired behaviour tests: the
+    // `test_classify_*` verdict tests and `test_process_down_gap_row_*`.
+    // 1 -> 3 (2026-11-13, audit B3 finding 14): pins that production passes the
+    // wall clock and the daily loop reads only the injected clock. Paired
+    // behaviour test: `test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_calls_for`.
+    ("tick_conservation.rs", 3),
+    ("ws_audit_consumer.rs", 2),
+    ("ws_connection_rollup.rs", 1),
+];
+
+fn app_src() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// Number of `include_str!(...)` calls in `src` whose (balanced) argument
+/// contains a `.rs"` string, i.e. that load a Rust source file.
+fn self_scan_count(src: &str) -> usize {
+    const M: &str = "include_str!(";
+    let mut n = 0;
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(M) {
+        let start = from + rel + M.len();
+        let mut depth = 1usize;
+        let mut end = start;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > start && src[start..end].contains(".rs\"") {
+            n += 1;
+        }
+        from = start;
+    }
+    n
+}
+
+#[test]
+fn app_self_source_scans_may_only_shrink() {
+    let names: Vec<&str> = BUDGET.iter().map(|r| r.0).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(names, sorted, "BUDGET must be sorted and unique");
+
+    let root = app_src();
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+    let mut measured: Vec<(String, usize)> = files
+        .iter()
+        .filter_map(|f| {
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap_or(f)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let n = self_scan_count(&std::fs::read_to_string(f).unwrap_or_default());
+            (n > 0).then_some((rel, n))
+        })
+        .collect();
+    measured.sort();
+    let total: usize = measured.iter().map(|r| r.1).sum();
+    let table: String = measured
+        .iter()
+        .map(|(f, n)| format!("    (\"{f}\", {n}),\n"))
+        .collect();
+    assert!(
+        total > 50,
+        "only {total} self-scans found; the scan is broken\nMeasured now:\n{table}"
+    );
+
+    let over: Vec<String> = measured
+        .iter()
+        .filter(|(f, n)| *n > BUDGET.iter().find(|(b, _)| b == f).map_or(0, |(_, m)| *m))
+        .map(|(f, n)| format!("{f}: {n}"))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "self-source scans grew past their budget: {over:?}. Prefer a behaviour test; \
+         if a text guard is truly needed, remove one elsewhere or raise the budget with \
+         a comment naming its paired behaviour test.\nMeasured now:\n{table}"
+    );
+    let stale: Vec<String> = BUDGET
+        .iter()
+        .filter(|(b, m)| measured.iter().find(|(f, _)| f == b).map_or(0, |(_, n)| *n) < *m)
+        .map(|(b, m)| format!("{b}: budget {m}"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "budget rows above the measured count (lower them in this PR): {stale:?}\n\
+         Measured now:\n{table}"
+    );
+}
+
+#[test]
+fn self_scan_counter_bites() {
+    let src = concat!(
+        "let a = include_str!(\"x.rs\");\n",
+        "let b = include_str!(\n    \"../y.rs\"\n);\n",
+        "let c = include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/z.rs\"));\n",
+        "let d = include_str!(\"data.json\");\n",
+    );
+    assert_eq!(self_scan_count(src), 3);
+}

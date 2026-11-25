@@ -16,11 +16,14 @@
 
 pub mod board;
 pub mod board_page;
-pub mod brutex_crossverify;
 pub mod dashboard_page;
 pub mod debug;
 pub mod feeds;
 pub mod feeds_page;
+pub mod fno_stocks;
 pub mod health;
 pub mod quote;
+pub mod speed_health;
 pub mod stats;
+
+pub mod stock_movers;

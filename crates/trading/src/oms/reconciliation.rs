@@ -13,7 +13,9 @@ use tracing::{error, info, warn};
 
 use tickvault_common::order_types::OrderStatus;
 
-use super::state_machine::parse_order_status;
+use super::state_machine::{
+    UNKNOWN_ORDER_STATUS_COUNTER, UNKNOWN_STATUS_LOG_MAX_CHARS, parse_order_status,
+};
 use super::types::{DhanOrderResponse, ManagedOrder, ReconciliationReport};
 
 /// A single correction to apply from reconciliation.
@@ -65,10 +67,16 @@ pub fn prices_equal_within_paise(a: f64, b: f64) -> bool {
 ///
 /// # Side Effects
 /// Logs ERROR for each mismatch (triggers Telegram alert via tracing).
-pub fn reconcile_orders(
-    oms_orders: &HashMap<String, ManagedOrder>,
+pub fn reconcile_orders<K, S>(
+    oms_orders: &HashMap<K, ManagedOrder, S>,
     dhan_orders: &[DhanOrderResponse],
-) -> (ReconciliationReport, Vec<ReconciliationUpdate>) {
+) -> (ReconciliationReport, Vec<ReconciliationUpdate>)
+where
+    // Generic over the key so the OMS book (`Arc<str>` keys since
+    // 2026-11-23, audit plan PR6) and plain `String` maps both work.
+    K: std::borrow::Borrow<str> + std::hash::Hash + Eq + std::fmt::Display,
+    S: std::hash::BuildHasher,
+{
     let mut report = ReconciliationReport::default();
     let mut updates: Vec<ReconciliationUpdate> = Vec::new();
 
@@ -76,9 +84,22 @@ pub fn reconcile_orders(
         let dhan_status = match parse_order_status(&dhan_order.order_status) {
             Some(status) => status,
             None => {
+                // AUDIT INP-7 (2026-10-11): coded and counted. Still a skip:
+                // the reconcile has no order of its own to flag here. Coded
+                // OMS-GAP-02 because the rule for this skip lives under the
+                // reconciliation gap; that code has no CloudWatch filter.
+                metrics::counter!(UNKNOWN_ORDER_STATUS_COUNTER).increment(1);
+                let shown_status: String = dhan_order
+                    .order_status
+                    .chars()
+                    .take(UNKNOWN_STATUS_LOG_MAX_CHARS)
+                    .collect();
                 warn!(
+                    code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation
+                        .code_str(),
+                    source = "unknown_status_rest",
                     order_id = %dhan_order.order_id,
-                    status = %dhan_order.order_status,
+                    status = %shown_status,
                     "unknown order status from Dhan REST API — skipping"
                 );
                 continue;
@@ -87,7 +108,7 @@ pub fn reconcile_orders(
 
         report.total_checked = report.total_checked.saturating_add(1);
 
-        match oms_orders.get(&dhan_order.order_id) {
+        match oms_orders.get(dhan_order.order_id.as_str()) {
             Some(oms_order) => {
                 let status_mismatch = oms_order.status != dhan_status;
                 // 2026-08-07 (red-team finding #6): this compared prices with
@@ -155,7 +176,7 @@ pub fn reconcile_orders(
         dhan_orders.iter().map(|o| o.order_id.as_str()).collect();
 
     for (order_id, oms_order) in oms_orders {
-        if !oms_order.is_terminal() && !dhan_order_ids.contains(order_id.as_str()) {
+        if !oms_order.is_terminal() && !dhan_order_ids.contains(order_id.borrow()) {
             warn!(
                 order_id = %order_id,
                 oms_status = %oms_order.status.as_str(),
@@ -202,6 +223,7 @@ mod tests {
             order_id: order_id.to_owned(),
             correlation_id: "corr-1".to_owned(),
             security_id: 100,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
             order_type: OrderType::Limit,
             product_type: ProductType::Intraday,

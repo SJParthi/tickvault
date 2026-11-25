@@ -1,0 +1,74 @@
+pub fn classify(x: i32) -> &'static str {
+    if x > 10 {
+        "big"
+    } else if x < 0 {
+        "neg"
+    } else {
+        "small"
+    }
+}
+
+pub fn never_called(v: &[i32]) -> i32 {
+    let mut s = 0;
+    for x in v {
+        s += x;
+    }
+    s
+}
+
+pub fn closures(v: Vec<i32>) -> Vec<i32> {
+    v.into_iter()
+        .filter(|x| *x > 2)
+        .map(|x| {
+            let y = x * 2;
+            y + 1
+        })
+        .collect()
+}
+
+pub fn matcher(o: Option<u8>) -> u8 {
+    match o {
+        Some(0) => 1,
+        Some(n) if n > 5 => n,
+        Some(_) => 2,
+        None => {
+            let z = 3;
+            z
+        }
+    }
+}
+
+pub fn early(x: u32) -> Result<u32, String> {
+    let y = x.checked_sub(1).ok_or_else(|| "under".to_string())?;
+    if y == 7 {
+        return Ok(0);
+    }
+    loop {
+        if y > 3 {
+            break;
+        }
+        return Err(format!("small {y}"));
+    }
+    Ok(y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn t() {
+        assert_eq!(classify(20), "big");
+        assert_eq!(classify(5), "small");
+        assert_eq!(closures(vec![1, 5]), vec![11]);
+        assert_eq!(matcher(Some(9)), 9);
+        assert_eq!(matcher(None), 3);
+        assert_eq!(early(10), Ok(9));
+        assert!(early(0).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn never() {
+        assert_eq!(never_called(&[1]), 1);
+    }
+}

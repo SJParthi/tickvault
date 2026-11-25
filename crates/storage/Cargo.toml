@@ -18,6 +18,7 @@ tokio = { workspace = true }
 # Zero-tick-loss PR-8a (H1): the WS read loop hands the WAL spill a `Bytes`
 # (Arc-refcounted, O(1) clone) instead of a per-frame `Vec<u8>` malloc.
 # Workspace-pinned (same version core/app already use).
+arc-swap = { workspace = true }
 bytes = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -25,7 +26,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
 metrics = { workspace = true }
 questdb-rs = { workspace = true }
 reqwest = { workspace = true }
@@ -44,6 +44,20 @@ flate2 = { workspace = true }
 # Review round 2 (2026-07-13): SHA-256 content identity for the S3
 # reuse/conflict decision (workspace-pinned; the app crate already uses it).
 sha2 = { workspace = true }
+# Deep audit DA-12 (2026-10-12): one `statvfs(2)` call replaces the forked
+# `df` process in `disk_health_watcher::probe_disk_free_bytes`, which the tick
+# and depth rescue paths (the frame drain's inline fallback included) call.
+# Unavoidable for that fix: the standard library has no free-space call.
+# Already a pinned workspace dependency (tickvault-core uses it for the reader
+# affinity), so `Cargo.lock` gains no new package.
+libc = { workspace = true }
+# Deep audit DA-12 (HOT-10): the faster hasher for the per-row contract-label
+# table. Already a pinned workspace dependency (app, core and trading use it),
+# so `Cargo.lock` gains no new package.
+ahash = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { workspace = true }
 
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε
@@ -61,8 +75,30 @@ dhat = { workspace = true }
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[[bench]]
+name = "tick_row_append"
+harness = false
+
 # [[bench]] tick_persistence removed in the stage-2 dead-WS sweep
 # (2026-07-17) with the deleted tick_persistence.rs (the dead tick chain).
 
+# Per-seal cost of the sealed-candle path (owner directive 2026-10-30:
+# every in-memory step under 1 us at p99). Carries its own p99 gate.
+[[bench]]
+name = "seal_path"
+harness = false
+
+# The per-row conservation ledger on the frame drain (plan ITEM DT, side
+# stores, 2026-10-30), with a p99 gate.
+[[bench]]
+name = "tick_conservation_ledger"
+harness = false
+
+# The depth row stage on the frame drain (plan ITEM DT, 2026-10-30), with a
+# p99 gate.
+[[bench]]
+name = "depth_row_append"
+harness = false
+
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "metrics", "questdb-rs", "serde", "serde_json", "thiserror"]
+ignored = ["metrics", "questdb-rs", "serde", "serde_json", "thiserror"]

@@ -19,6 +19,14 @@
 #     (scheduler-independent stale-binary catch + redeploy) and, for
 #     bot-merged (push-suppressed) commits, postmerge-catchup's overnight
 #     deploy-aws backfill.
+#     ⚠ CORRECTED 2026-11-07: there is no overnight catch-up deploy any more.
+#     It self-started the stopped box at weekends, so postmerge-catchup now
+#     dispatches deploy-aws only on an ordinary IST trading day (not Muhurat) between 15:45 and
+#     16:05 IST, beside this file's 15:46 / 16:16 crons. Every "overnight
+#     deploy coverage is postmerge-catchup" line below is stale: a weekend or
+#     overnight bot merge goes live via the deploy-watchdog at box start (it
+#     needs /tickvault/<env>/operator/github-token) or else after the next
+#     trading day's close.
 #   • 10:16 UTC = 15:46 IST → POST-MARKET window, just AFTER the 15:45 IST end of
 #     the no-deploy band (moved from 15:31 so it is no longer blocked by the
 #     guard). ~16 min after NSE close — redeploys anything merged during hours.
@@ -33,6 +41,11 @@
 #     deploy-aws run self-starts a stopped box (workflow_dispatch ⇒
 #     SHOULD_BE_UP=yes in its "Ensure instance running" step) and its final
 #     never-cross step stops the box again once the deploy finishes.
+#     2026-10-20: EXCEPT on a holiday-stop day. When the holiday gate stopped
+#     the box today (`/tickvault/<env>/holiday-stop-date` = today's IST date),
+#     deploy-aws skips green (`DEPLOY_SKIP_REASON=holiday_stop`) instead of
+#     self-starting it; the next weekday's boot is the redeploy (the
+#     deploy-watchdog catches the stale binary on the instance-start event).
 #
 # Idempotent: before dispatching, we compare main's current HEAD against the
 # `head_sha` of the most recent deploy-aws run on main that ACTUALLY DEPLOYED

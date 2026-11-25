@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6d8b5e07e500c2283535ef9e26b28a89867aefb8fe9f8c2874b5d203b0a812b8 # shrinks to ops = [Judge { key: (2, 1), value: 0, kind: 0, mode: 1, note: true, day: 1, at: 0 }, Judge { key: (2, 1), value: 0, kind: 0, mode: 2, note: false, day: 1, at: 0 }]

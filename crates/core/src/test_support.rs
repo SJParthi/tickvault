@@ -2,34 +2,14 @@
 //!
 //! Gated behind `#[cfg(test)]` — never compiled into production binaries.
 
-/// Detects whether tests that assert against a REAL, REACHABLE SSM should run.
-///
-/// Requires BOTH:
-/// 1. an explicit `TICKVAULT_TEST_REAL_SSM=1` opt-in, and
-/// 2. credentials on the machine ([`has_aws_credentials`]).
-///
-/// # Why this exists (2026-08-07)
-///
-/// Six tests previously branched on [`has_aws_credentials`] alone and, when it
-/// returned `true`, asserted `"with real AWS credentials, fetch should
-/// succeed"`. That conflates two different questions:
-///
-/// * *"are credentials present?"* — what `has_aws_credentials` answers, and
-/// * *"is SSM actually reachable, with our parameters in it?"* — what those
-///   assertions actually require.
-///
-/// Any environment holding the first without the second fails them: a CI
-/// sandbox where the tooling exports a stray `AWS_ACCESS_KEY_ID` with no route
-/// to SSM, a developer laptop carrying `~/.aws/credentials` for an unrelated
-/// account, an offline machine, a locked-down VPC. Observed live: all six
-/// panicked in a sandbox purely because the proxy had exported a key.
-///
-/// Requiring an explicit opt-in makes running against live infrastructure a
-/// deliberate act rather than an accident of the ambient environment. Without
-/// the opt-in the tests assert the genuine unit contract — returns `Err`,
-/// never panics — which holds everywhere.
-///
-/// [`has_aws_credentials`]: fn.has_aws_credentials.html
+/// Task-scoped synthetic SSM failure fixtures; no provider configuration or sockets.
+pub(crate) mod ssm;
+
+/// Explicit opt-in helper retained for a separately authorized live integration lane.
+/// Default unit tests use [`ssm`] fixtures regardless of this flag and never
+/// construct the ambient provider chain. Checking this helper after an API call
+/// does not gate that call; any future live test must check before construction.
+/// Requires TICKVAULT_TEST_REAL_SSM=1/true and credential metadata presence.
 pub fn real_ssm_tests_enabled() -> bool {
     matches!(
         std::env::var("TICKVAULT_TEST_REAL_SSM").as_deref(),
@@ -52,6 +32,23 @@ pub fn has_aws_credentials() -> bool {
     }
 
     false
+}
+
+/// Keeps a second `tracing` dispatcher registered for the life of the test
+/// process. Call it before installing a scoped (thread-local) subscriber
+/// whose captured lines a test asserts on.
+///
+/// Why: while exactly one dispatcher is registered, `tracing-core` (0.1.36)
+/// works out a NEW callsite's interest from the default of whichever thread
+/// reaches it first. A test thread with no subscriber caches it as `never`,
+/// and the capturing thread's subscriber then never sees that line (measured
+/// 7 failures in 12,000 runs of two 808 tests). With this anchor alive there
+/// are always at least two dispatchers, so every callsite takes the path that
+/// asks all of them. The anchor is a `NoSubscriber`: it is not a global
+/// default, records nothing and never sees an event.
+pub(crate) fn keep_callsite_interest_shared() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }
 
 // ---------------------------------------------------------------------------
@@ -509,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_opt_in_absent_even_with_credentials() {
+    fn test_real_ssm_tests_enabled_requires_opt_in_even_with_credentials() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -528,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_opt_in_set_but_no_credentials() {
+    fn test_real_ssm_tests_enabled_requires_credentials_after_opt_in() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -544,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_enabled_when_opt_in_and_credentials_both_present() {
+    fn test_real_ssm_tests_enabled_accepts_opt_in_and_credentials_together() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -558,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_accepts_true_and_rejects_other_values() {
+    fn test_real_ssm_tests_enabled_accepts_true_and_rejects_other_values() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -578,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_real_ssm_disabled_when_neither_present() {
+    fn test_real_ssm_tests_enabled_refuses_when_neither_present() {
         let _guard = CredsEnvGuard::acquire();
         // SAFETY: serialized by CredsEnvGuard; restored on Drop.
         unsafe {
@@ -590,6 +587,57 @@ mod tests {
         assert!(
             !real_ssm_tests_enabled(),
             "neither opt-in nor credentials must NOT enable real-SSM tests"
+        );
+    }
+
+    // Regression: 2026-11-14 (nightly flake, two 808 tests in
+    // `pool_supervisor/cov_part1_tests.rs`, 7 failures in 12,000 runs).
+    // A thread with no subscriber reaches a callsite first while this
+    // thread's scoped subscriber is the only registered dispatcher: without
+    // the anchor `tracing-core` caches the callsite as `never` and the line
+    // is lost. Run alone (`--exact`) this fails every time without the anchor.
+    #[test]
+    fn test_keep_callsite_interest_shared_lets_a_scoped_subscriber_see_a_line_a_bare_thread_reached_first()
+     {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut g) = self.0.lock() {
+                    g.extend_from_slice(bytes);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // One callsite, reached first by a thread with no subscriber.
+        fn emit() {
+            tracing::warn!("anchor probe line");
+        }
+
+        keep_callsite_interest_shared();
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            std::thread::spawn(emit)
+                .join()
+                .expect("the bare thread emits and exits");
+            emit();
+        });
+        let logs = buf
+            .0
+            .lock()
+            .map(|g| String::from_utf8_lossy(&g).into_owned())
+            .unwrap_or_default();
+        assert!(
+            logs.contains("anchor probe line"),
+            "the scoped subscriber missed the line: {logs:?}"
         );
     }
 }

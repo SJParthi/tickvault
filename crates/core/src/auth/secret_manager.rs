@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(test))]
 use aws_config::Region;
 use aws_sdk_ssm::Client as SsmClient;
 use secrecy::SecretString;
@@ -14,9 +15,8 @@ use tracing::{info, instrument, warn};
 use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_ACCESS_TOKEN_SECRET, DHAN_CLIENT_ID_SECRET,
     DHAN_CLIENT_SECRET_SECRET, DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET,
-    DHAN_TOTP_SECRET, GROWW_ACCESS_TOKEN_SECRET, QUESTDB_PG_PASSWORD_SECRET,
-    QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GROWW_SERVICE, SSM_QUESTDB_SERVICE,
-    SSM_SECRET_BASE_PATH,
+    DHAN_TOTP_SECRET, QUESTDB_PG_PASSWORD_SECRET, QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE,
+    SSM_QUESTDB_SERVICE, SSM_SECRET_BASE_PATH,
 };
 use tickvault_common::error::ApplicationError;
 
@@ -81,6 +81,10 @@ fn validate_environment(env: &str) -> Result<String, ApplicationError> {
 /// Validates that the environment string contains only alphanumeric
 /// characters and hyphens to prevent path traversal.
 pub fn resolve_environment() -> Result<String, ApplicationError> {
+    #[cfg(test)]
+    if let Some(environment) = crate::test_support::ssm::environment_override() {
+        return Ok(environment);
+    }
     let env = std::env::var("TV_ENVIRONMENT")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -115,6 +119,7 @@ pub fn resolve_environment() -> Result<String, ApplicationError> {
 ///
 /// Uses default AWS SDK configuration — reads credentials from
 /// `~/.aws/credentials` (dev Mac) or IAM role (prod AWS).
+#[cfg(not(test))]
 pub(crate) async fn create_ssm_client() -> SsmClient {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new("ap-south-1"))
@@ -122,6 +127,13 @@ pub(crate) async fn create_ssm_client() -> SsmClient {
         .await;
 
     SsmClient::new(&config)
+}
+
+// Unit tests cannot construct the ambient AWS provider chain. A missing fixture
+// is a test failure, not an implicit permission to read a real account.
+#[cfg(test)]
+pub(crate) async fn create_ssm_client() -> SsmClient {
+    crate::test_support::ssm::scoped_client()
 }
 
 /// Public wrapper around [`create_ssm_client`] for callers outside this
@@ -218,45 +230,6 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
         client_secret,
         totp_secret,
     })
-}
-
-/// Fetches the Groww ACCESS TOKEN from AWS SSM Parameter Store — READ-ONLY
-/// (shared token-minter architecture, operator lock 2026-07-02 —
-/// `.claude/rules/project/groww-shared-token-minter-2026-07-02.md`).
-///
-/// The token at `/tickvault/<env>/groww/access-token` is minted DAILY by the
-/// bruteX-owned `groww-token-minter` Lambda (~06:05 IST, EventBridge);
-/// TickVault is a read-only consumer via IAM role
-/// `groww-token-minter-reader-tickvault` (`ssm:GetParameter` on this ONE
-/// parameter + `kms:Decrypt`, delivered through the default AWS credential
-/// chain). TickVault NEVER mints a Groww token, NEVER reads the
-/// `api-key`/`totp-secret` credential parameters (Lambda-only by IAM design),
-/// and NEVER writes any `/tickvault/*/groww/*` parameter. Only called when the
-/// Groww feed is enabled (`feeds.groww_enabled`); the Dhan path is untouched.
-///
-/// # Errors
-///
-/// Returns `ApplicationError::SecretRetrieval` if the token cannot be fetched.
-#[instrument(skip_all, fields(environment))]
-// TEST-EXEMPT: live AWS SSM fetch — mirrors the TEST-EXEMPT fetch_dhan_credentials; path construction is covered by build_ssm_path tests.
-pub async fn fetch_groww_access_token() -> Result<SecretString, ApplicationError> {
-    let environment = resolve_environment()?;
-    tracing::Span::current().record("environment", environment.as_str());
-
-    let ssm_client = create_ssm_client().await;
-
-    let token_path = build_ssm_path(&environment, SSM_GROWW_SERVICE, GROWW_ACCESS_TOKEN_SECRET);
-
-    info!(
-        token_path = %token_path,
-        "fetching Groww access token from SSM (read-only; minted by the bruteX groww-token-minter Lambda)"
-    );
-
-    let token = fetch_secret(&ssm_client, &token_path).await?;
-
-    info!("Groww access token fetched successfully from SSM");
-
-    Ok(token)
 }
 
 /// Fetches the SHARED Dhan access token from SSM — READ-ONLY, never a mint.
@@ -659,7 +632,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ssm_client_returns_without_panic() {
-        let _client = create_ssm_client().await;
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        fixture
+            .scope(async {
+                let client = create_ssm_client().await;
+                assert_eq!(client.config().region().unwrap().as_ref(), "ap-south-1");
+            })
+            .await;
+        assert!(
+            fixture.requests().is_empty(),
+            "construction must not send a request"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -754,21 +737,15 @@ mod tests {
     /// matching in main.rs.
     #[tokio::test]
     async fn test_fetch_api_bearer_token_errors_without_real_ssm() {
-        let result = fetch_api_bearer_token().await;
-        assert!(
-            result.is_err(),
-            "fetch_api_bearer_token must fail without real SSM connectivity"
-        );
-        match result.err().unwrap() {
-            ApplicationError::SecretRetrieval { path, .. } => {
-                assert!(
-                    path.contains("/api/bearer-token"),
-                    "error path must include /api/bearer-token, got {}",
-                    path
-                );
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_api_bearer_token()).await;
+        match result {
+            Err(ApplicationError::SecretRetrieval { path, .. }) => {
+                assert_eq!(path, "/tickvault/unit-test/api/bearer-token");
             }
-            other => panic!("expected SecretRetrieval error, got {:?}", other),
+            other => panic!("expected synthetic SecretRetrieval error, got {other:?}"),
         }
+        fixture.assert_requests(1, 1, &["/api/bearer-token"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1062,12 +1039,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_secret_returns_error_without_real_ssm() {
-        let ssm_client = create_ssm_client().await;
-        let result = fetch_secret(&ssm_client, "/tickvault/test/nonexistent/secret").await;
-        assert!(
-            result.is_err(),
-            "fetch_secret must fail without real SSM connectivity"
-        );
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture
+            .scope(async {
+                let client = create_ssm_client().await;
+                fetch_secret(&client, "/tickvault/unit-test/nonexistent/secret").await
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        fixture.assert_requests(1, 1, &["/nonexistent/secret"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1076,21 +1059,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_dhan_credentials_returns_error_without_real_ssm() {
-        let result = fetch_dhan_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — SSM is reachable,
-            // so fetch_dhan_credentials succeeds. Validate the happy path.
-            assert!(
-                result.is_ok(),
-                "with real AWS credentials, fetch should succeed"
-            );
-        } else {
-            // CI or machine without AWS credentials — SSM is unreachable.
-            assert!(
-                result.is_err(),
-                "fetch_dhan_credentials must fail without real SSM"
-            );
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_dhan_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(
+            1,
+            3,
+            &[
+                "/dhan/client-id",
+                "/dhan/client-secret",
+                "/dhan/totp-secret",
+            ],
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1246,22 +1230,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_questdb_credentials_returns_error_without_real_ssm() {
-        let result = fetch_questdb_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
-        } else {
-            assert!(result.is_err(), "must fail without real SSM");
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_questdb_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(1, 2, &["/questdb/pg-user", "/questdb/pg-password"]);
     }
 
     #[tokio::test]
     async fn test_fetch_telegram_credentials_returns_error_without_real_ssm() {
-        let result = fetch_telegram_credentials().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            assert!(result.is_ok(), "with real AWS creds, fetch should succeed");
-        } else {
-            assert!(result.is_err(), "must fail without real SSM");
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_telegram_credentials()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        // try_join! may cancel sibling requests after the first failure.
+        fixture.assert_requests(1, 2, &["/telegram/bot-token", "/telegram/chat-id"]);
     }
 
     /// Source-scan ratchet (audit-findings Rule 13):
@@ -1277,11 +1265,23 @@ mod tests {
         let main_rs = std::fs::read_to_string("../app/src/main.rs")
             .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
             .expect("main.rs must be readable");
+        // RETIRED 2026-09-02 (audit finding 13): the `spawn_day_ohlc_tick_consumer(`
+        // pin. That consumer drained the PROCESS tick broadcast, whose only
+        // publisher since PR-C2 (2026-07-14) lived inside `#[cfg(test)]` in
+        // `trading_pipeline.rs` — so for seven weeks main.rs allocated a
+        // 262,144-slot `ParsedTick` ring (~40 MB) and two subscribers that
+        // could never wake. The revived Dhan live lane folds its ticks
+        // internally (`dhan_feed_stack`) and never published to the channel.
+        // The channel, its `SharedInfraHandles` field, both `.subscribe()`s
+        // and the day-OHLC consumer spawn are DELETED together; the pin below
+        // makes sure a subscriber cannot come back without a publisher.
         assert!(
-            main_rs.contains("spawn_day_ohlc_tick_consumer("),
-            "main.rs MUST call `day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer` \
-             from the boot path. Without it, day_open/high/low/close never advance \
-             from the live tick stream."
+            !main_rs.contains("tick_broadcast_sender.subscribe()"),
+            "main.rs subscribes to a process tick broadcast again. That channel \
+             has NO production publisher (2026-09-02 audit finding 13): every \
+             `tick_tx.send` in the workspace sits inside `#[cfg(test)]`. Re-add a \
+             subscriber ONLY together with a real publisher, and re-bless this pin \
+             with a dated note naming it."
         );
         assert!(
             main_rs.contains("spawn_supervised_midnight_reset_task("),
@@ -1394,63 +1394,6 @@ mod tests {
             "main.rs MUST run the boot-time process-death reconciler — without \
              it a mid-session process death leaves NO episode row and the \
              month verdict silently under-counts our own restarts."
-        );
-    }
-
-    /// BRUTEX-XVERIFY (2026-07-12): `main.rs` MUST spawn the BruteX↔TickVault
-    /// daily cross-verify runner
-    /// (`brutex_crossverify_boot::spawn_brutex_crossverify_task`) from the
-    /// process-global boot prefix. PR-C2 (2026-07-13, merged 2026-07-14): the
-    /// FAST crash-recovery arm — this guard's original SECOND spawn path —
-    /// was DELETED with the Dhan live-WS lane, so main.rs has a SINGLE boot
-    /// path and the guard pins EXACTLY 1 call site (the scoreboard-guard
-    /// precedent): a mid-market crash-restart now boots through the same
-    /// prefix, so the day's 15:50 IST cross-verify still fires. The spawn is
-    /// config-gated (`[brutex_crossverify] enabled`, default OFF).
-    /// The boot module must also keep its Telegram emit sites
-    /// (`BrutexCrossverifySummary` on success, `BrutexCrossverifyAborted` on
-    /// the Err/panic arms) — the daily signal must never be silently dropped
-    /// (audit Rule 11).
-    #[test]
-    fn test_brutex_crossverify_is_wired_into_main() {
-        let main_rs = std::fs::read_to_string("../app/src/main.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
-            .expect("main.rs must be readable");
-        assert!(
-            main_rs.contains("brutex_crossverify_boot"),
-            "main.rs MUST reference the brutex_crossverify_boot module — \
-             without it the BruteX cross-verify runner is dead code."
-        );
-        // Call sites (call head only), excluding any fn definition.
-        let spawn_sites: Vec<usize> = main_rs
-            .match_indices("spawn_brutex_crossverify_task(")
-            .map(|(i, _)| i)
-            .filter(|&i| !main_rs[..i].ends_with("fn "))
-            .collect();
-        assert_eq!(
-            spawn_sites.len(),
-            1,
-            "main.rs must call spawn_brutex_crossverify_task( at EXACTLY 1 \
-             site (the process-global boot prefix — single boot path since \
-             PR-C2); found {} call site(s). Without it the runner is dead \
-             code on every boot.",
-            spawn_sites.len()
-        );
-        // The boot module keeps its Telegram emit sites (never a silent day).
-        let boot_rs = std::fs::read_to_string("../app/src/brutex_crossverify_boot.rs")
-            .or_else(|_| std::fs::read_to_string("crates/app/src/brutex_crossverify_boot.rs"))
-            .expect("brutex_crossverify_boot.rs must be readable");
-        assert!(
-            boot_rs.contains("NotificationEvent::BrutexCrossverifySummary {"),
-            "brutex_crossverify_boot.rs MUST emit \
-             `NotificationEvent::BrutexCrossverifySummary` — the daily \
-             operator digest per the 2026-07-12 BRUTEX-XVERIFY directive."
-        );
-        assert!(
-            boot_rs.contains("NotificationEvent::BrutexCrossverifyAborted {"),
-            "brutex_crossverify_boot.rs MUST emit `BrutexCrossverifyAborted` \
-             on the Err/panic arms — the daily signal must never be silently \
-             dropped (audit Rule 11)."
         );
     }
 

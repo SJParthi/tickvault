@@ -9,7 +9,7 @@
 # preserved across the upgrade.
 #
 # This is READY-TO-FIRE TOOLING, not an actual upgrade. The instance-type
-# LOCK is r8g.xlarge everywhere (Terraform validation +
+# LOCK is r8g.large everywhere (Quotes 32/33, 2026-10-21; Terraform validation +
 # instance_type_lock_guard.rs) per operator Quote 13 (2026-08-08, the
 # 13-timeframe + current-day tick-retention sizing) and CONFIRMED FINAL by
 # Quote 15 (2026-08-12, "this is our finalsied instancue ... just sue this
@@ -82,8 +82,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 ENV="${TV_ENV:-prod}"
 REGION="${AWS_REGION:-ap-south-1}"          # ap-south-1 Mumbai per aws-budget.md
-FROM_TYPE="${FROM_TYPE:-t4g.large}"         # the prior locked type to flip FROM (overridable)
-TO_TYPE="${TO_TYPE:-r8g.xlarge}"            # operator lock 2026-08-08 §7 Quote 13 (13-TF + tick retention)
+FROM_TYPE="${FROM_TYPE:-r8g.xlarge}"        # the prior locked type to flip FROM (overridable)
+TO_TYPE="${TO_TYPE:-r8g.large}"             # operator lock 2026-10-21 §7 Quotes 32/33 (was r8g.xlarge, Quote 13)
 # NOTE (2026-08-08): this script does an IN-PLACE stop/modify/start, which can
 # only ever land in the instance's EXISTING availability zone. It therefore
 # CANNOT deliver the multi-AZ escape that Quote 13 also authorizes — if the
@@ -180,15 +180,15 @@ is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 if [ -n "$EBS_SIZE" ]; then
   is_uint "$EBS_SIZE" || die "--ebs-size must be a positive integer (GB)."
-  { [ "$EBS_SIZE" -ge 10 ] && [ "$EBS_SIZE" -le 200 ]; } || die "--ebs-size must be 10–200 GB (matches Terraform ebs_gp3_size_gb range)."
+  { [ "$EBS_SIZE" -ge 10 ] && [ "$EBS_SIZE" -le 150 ]; } || die "--ebs-size must be 10–150 GB (Quote 51: no bigger disk than the 150 GB root)."
 fi
 if [ -n "$EBS_IOPS" ]; then
   is_uint "$EBS_IOPS" || die "--ebs-iops must be a positive integer."
-  { [ "$EBS_IOPS" -ge 3000 ] && [ "$EBS_IOPS" -le 16000 ]; } || die "--ebs-iops must be 3000–16000 (gp3 range; matches Terraform ebs_gp3_iops)."
+  { [ "$EBS_IOPS" -ge 3000 ] && [ "$EBS_IOPS" -le 3000 ]; } || die "--ebs-iops must be 3000 (Quote 30: no IOPS above 3,000 without a fresh dated owner quote)."
 fi
 if [ -n "$EBS_THROUGHPUT" ]; then
   is_uint "$EBS_THROUGHPUT" || die "--ebs-throughput must be a positive integer (MiB/s)."
-  { [ "$EBS_THROUGHPUT" -ge 125 ] && [ "$EBS_THROUGHPUT" -le 1000 ]; } || die "--ebs-throughput must be 125–1000 MiB/s (gp3 range; matches Terraform ebs_gp3_throughput)."
+  { [ "$EBS_THROUGHPUT" -ge 125 ] && [ "$EBS_THROUGHPUT" -le 125 ]; } || die "--ebs-throughput must be 125 MiB/s (Quotes 32/33: a raise needs a fresh dated owner quote)."
 fi
 if [ -n "$QDB_MEM" ]; then
   # STRICT regex anchor — a shell glob ([1-9]*[gGmM]) would let metacharacters
@@ -273,8 +273,8 @@ if [ -z "$QDB_MEM" ]; then
       QDB_MEM="1g"
       ok "Target t4g.medium (4 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the downsize)." ;;
     r8g.large)
-      QDB_MEM="4g"
-      ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
+      QDB_MEM="6g"
+      ok "Target r8g.large (16 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (4/10 of the host, the deploy formula; Quotes 32/33; set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;
     r8g.xlarge)
       QDB_MEM="12g"
       ok "Target r8g.xlarge (32 GiB): defaulting QuestDB mem_limit to ${QDB_MEM} (operator Quote 13, 2026-08-08 — §7 Rule 2 sizes QuestDB at 8-16 GB of the 32 GiB budget; set in repo/deploy/docker/.env at Step 8, coupled to the resize)." ;;

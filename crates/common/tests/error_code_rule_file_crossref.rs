@@ -122,9 +122,56 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     // historical audit per the house banner convention — exactly the
     // WS-GAP-05..09 mechanism.
     "WS-REINJECT-01",
+    // `VOLUME-MONO-01` — variant RETIRED 2026-10-22 (plan item 62, operator
+    // Quote 34): its only emitter, the volume leaderboard's monotonicity
+    // gate, was deleted with `top_volume`. `wave-5-error-codes.md` keeps the
+    // code string as historical audit, the WS-REINJECT-01 mechanism.
+    "VOLUME-MONO-01",
     // GROWW-PUSH-01..04 (Stage 0 stubs, 2026-07-16) were REMOVED from this
     // allowlist when Stage A landed their `GrowwPush0*` ErrorCode variants
     // (the documented Stage-A obligation of the Stage-0 entry).
+    // 2026-08-21 (operator directive — "whqtber is entirely related to groww
+    // feed remove everything entilrey"; the dated authorization is
+    // `websocket-connection-scope-lock.md` §"2026-08-21 (THIRD quote of the
+    // day)"): the Groww ORDER-SIDE families below had their ONLY emit sites
+    // deleted with `crates/trading/src/oms/groww/**`, so their ErrorCode
+    // variants are RETIRED rather than left dangling — a Critical/High
+    // variant with a runbook and no emitter advertises coverage that does
+    // not exist, which is precisely what
+    // `critical_errcode_alarm_coverage_guard` exists to catch (it bit on
+    // GROWW-OCO-02 / GROWW-ORD-03 in CI before this sweep landed).
+    // The rule files + `docs/error-runbooks/groww-{orders,oco,margin,
+    // portfolio,order-push}-error-codes.md` retain the code strings as
+    // historical audit per the house banner convention, so the reverse
+    // check allowlists them here — exactly the WS-GAP-05..09 mechanism.
+    "GROWW-PORT-01",
+    "GROWW-PORT-02",
+    "GROWW-PORT-03",
+    "GROWW-PORT-04",
+    "GROWW-OCO-01",
+    "GROWW-OCO-02",
+    "GROWW-OCO-03",
+    "GROWW-OCO-04",
+    "GROWW-OCO-05",
+    "GROWW-MARG-01",
+    "GROWW-MARG-02",
+    "GROWW-MARG-03",
+    "GROWW-MARG-04",
+    "GROWW-MARG-05",
+    "GROWW-ORD-01",
+    "GROWW-ORD-02",
+    "GROWW-ORD-03",
+    "GROWW-ORD-04",
+    "GROWW-ORD-05",
+    "GROWW-ORD-06",
+    "GROWW-ORD-07",
+    "GROWW-ORD-08",
+    "GROWW-ORD-09",
+    "GROWW-ORD-10",
+    "GROWW-PUSH-01",
+    "GROWW-PUSH-02",
+    "GROWW-PUSH-03",
+    "GROWW-PUSH-04",
 ];
 
 #[test]
@@ -232,6 +279,11 @@ fn load_all_rule_text() -> String {
     // scan the runbook directory alongside the rules tree.
     let runbooks_dir = root.join("docs").join("error-runbooks");
     collect_markdown_contents(&runbooks_dir, &mut combined);
+    // Phase-3 rules-tree diet (2026-09-26): always-loaded rule files over
+    // 15 KB moved verbatim to `docs/claude-rules-full/` (same relative path);
+    // a short summary stub stays at the original `.claude/rules/` path.
+    let full_rules_dir = root.join("docs").join("claude-rules-full");
+    collect_markdown_contents(&full_rules_dir, &mut combined);
     combined
 }
 

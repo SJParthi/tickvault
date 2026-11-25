@@ -216,9 +216,14 @@ const ORDER_UPDATE_EVENTS_COLUMNS: &[(&str, &str)] = &[
 /// NOTE the HTTP-CLIENT-01-class consequence: a failed ensure leaves the
 /// table to be auto-created by the first ILP write WITHOUT dedup (a
 /// duplicate-row window until a later ensure succeeds).
+///
+/// Returns `true` only when the closing `DEDUP ENABLE UPSERT KEYS` answered
+/// 2xx, i.e. the table carries its key whatever created it (audit J3,
+/// 2026-10-26). On `false` the caller re-runs this until it is keyed
+/// (`candle_ddl_boot::DdlTables::OrderSideAudit`).
 // TEST-EXEMPT: live-QuestDB DDL runner (DDL string unit-tested; the 200/500/unreachable arms exercised via the mock-HTTP tokio tests below)
 // FINANCIAL-TEST-EXEMPT: idempotent DDL runner — no financial arithmetic ("order" is the table name)
-pub async fn ensure_order_update_events_table(questdb_config: &QuestDbConfig) {
+pub async fn ensure_order_update_events_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -239,7 +244,7 @@ pub async fn ensure_order_update_events_table(questdb_config: &QuestDbConfig) {
                  table not ensured (first ILP write may auto-create it WITHOUT \
                  dedup — duplicate-row window until the next successful boot)"
             );
-            return;
+            return false;
         }
     };
     let mut statements = vec![order_update_events_create_ddl()];
@@ -254,14 +259,16 @@ pub async fn ensure_order_update_events_table(questdb_config: &QuestDbConfig) {
         "ALTER TABLE {ORDER_UPDATE_EVENTS_TABLE} DEDUP ENABLE UPSERT \
          KEYS({DEDUP_KEY_ORDER_UPDATE_EVENTS});"
     ));
-    for ddl in &statements {
+    let dedup_index = statements.len().saturating_sub(1);
+    let mut keyed = false;
+    for (index, ddl) in statements.iter().enumerate() {
         match client
             .get(&base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => keyed |= index == dedup_index,
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -291,6 +298,7 @@ pub async fn ensure_order_update_events_table(questdb_config: &QuestDbConfig) {
             }
         }
     }
+    keyed
 }
 
 /// ILP-over-HTTP conf — per-flush server ACK (the 2026-07-05
@@ -317,6 +325,14 @@ impl OrderUpdateEventsWriter {
     #[must_use]
     // TEST-EXEMPT: production ILP-connect constructor (lazy-build contract exercised via test_order_update_events_writer_new_is_lazy...); append/flush paths covered via for_test()
     pub fn new(config: &QuestDbConfig) -> Self {
+        // Seed this writer's failure series — see the module note on why a
+        // built handle is not a published sample.
+        for stage in ["ensure_client_build", "ensure_ddl"] {
+            metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => stage)
+                .increment(0);
+        }
+        metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
+            .increment(0);
         let conf = order_update_events_ilp_http_conf(config);
         match Sender::from_conf(&conf) {
             Ok(s) => {
@@ -531,6 +547,27 @@ impl OrderUpdateEventsWriter {
             .at(TimestampNanos::new(r.ts_ist_nanos))
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
+        // COUNTED AT APPEND, NOT AT ACK -- and the name does not say so.
+        //
+        // This increments when the row enters the BUFFER, before any flush. A
+        // failed flush discards the batch, so on a bad day this reads a number
+        // of rows the table does not contain. That is not hypothetical: on
+        // 2026-08-25 a disk-full session left this at 6 with the table EMPTY,
+        // and the operator found out by asking why his order was missing.
+        //
+        // The truth is derivable and the arithmetic is the point:
+        //   acked = <this> - <the *_rows_discarded_total sibling>
+        // Every failure path routes through `discard_pending`, which counts
+        // what it drops (pinned for every writer in the crate by
+        // `ilp_overflow_bound_guard::every_flushing_writer_declares_its_failure_treatment`),
+        // so the subtraction always closes.
+        //
+        // Deliberately NOT moved to the flush-success arm: this counter carries
+        // a per-row LABEL that a batch-sized increment at ack time cannot
+        // preserve, and re-pointing a live series at a different quantity makes
+        // its history incomparable across the change. Recording what it means
+        // is the honest fix; a second acked series is an operator decision with
+        // its own CloudWatch cost line.
         metrics::counter!("tv_order_update_events_rows_total", "feed" => r.feed.as_str())
             .increment(1);
         Ok(())
@@ -585,7 +622,7 @@ impl OrderUpdateEventsWriter {
     pub fn discard_pending(&mut self) -> usize {
         let dropped = self.pending;
         if dropped > 0 {
-            metrics::counter!("tv_order_update_events_rows_discarded_total")
+            metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
                 .increment(dropped as u64);
         }
         self.buffer.clear();
@@ -923,18 +960,27 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_order_update_events_table_mock_200_completes() {
         let port = spawn_mock_http(MOCK_HTTP_200).await;
-        ensure_order_update_events_table(&mock_cfg(port)).await;
+        assert!(
+            ensure_order_update_events_table(&mock_cfg(port)).await,
+            "200 everywhere reads keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_order_update_events_table_mock_500_degrades_without_panic() {
         let port = spawn_mock_http(MOCK_HTTP_500).await;
-        ensure_order_update_events_table(&mock_cfg(port)).await;
+        assert!(
+            !ensure_order_update_events_table(&mock_cfg(port)).await,
+            "a refused DDL must not read keyed"
+        );
     }
 
     #[tokio::test]
     async fn test_ensure_order_update_events_table_unreachable_degrades_without_panic() {
-        ensure_order_update_events_table(&unreachable_cfg()).await;
+        assert!(
+            !ensure_order_update_events_table(&unreachable_cfg()).await,
+            "unreachable must not read keyed"
+        );
     }
 
     #[tokio::test]

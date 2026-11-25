@@ -1,0 +1,53 @@
+# LF-8 golden day: a TEST schedule, never a strategy. Each line asks for one
+# side and size on one named candle; nothing here reads a price.
+
+# The 09:15 opening minute (released after the opening wait).
+[[intent]]
+security_id = 2885
+segment = "NSE_EQ"
+frame_secs = 60
+bar_open_ist = "09:15:00"
+side = "BUY"
+lots = 2
+kind = "entry"
+
+# Closes the position the 09:15 order opened (an exit, cut to what is held).
+[[intent]]
+security_id = 2885
+segment = "NSE_EQ"
+frame_secs = 60
+bar_open_ist = "09:17:00"
+side = "SELL"
+lots = 5
+kind = "exit"
+
+# A 5 s candle that a late tick reaches after it closed: skipped.
+[[intent]]
+security_id = 1333
+segment = "NSE_EQ"
+frame_secs = 5
+bar_open_ist = "09:16:30"
+side = "BUY"
+lots = 1
+kind = "entry"
+
+# A 5 s candle on the same contract, clean.
+[[intent]]
+security_id = 1333
+segment = "NSE_EQ"
+frame_secs = 5
+bar_open_ist = "09:18:00"
+side = "SELL"
+lots = 3
+kind = "entry"
+
+# A thin contract: more than the window's volume share, so part fills and the
+# rest is cancelled after 60 s. Its candle is closed by the clock.
+[[intent]]
+security_id = 49081
+segment = "NSE_FNO"
+frame_secs = 60
+bar_open_ist = "09:18:00"
+side = "BUY"
+lots = 4
+kind = "entry"

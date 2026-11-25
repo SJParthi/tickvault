@@ -65,7 +65,10 @@ jobs:
   chaos:
     runs-on: ubuntu-latest
     # 60 min ceiling: 30 min typical + 10 min slow + 20 min safety margin.
-    timeout-minutes: 60
+    # 2026-11-07 (TG-4): +20 min for the archiver contention step (build of
+    # the storage lib tests, seeding 5M depth rows, the export pass). Not
+    # measured yet: the first scheduled run is the measurement.
+    timeout-minutes: 80
     env:
       CARGO_TERM_COLOR: always
       # Point the test env vars at the Docker compose stack's published ports.
@@ -97,12 +100,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: '1.95.0'
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -151,12 +154,22 @@ jobs:
         # mutated by a test. Scoped to the chaos_* test binaries only — the
         # full workspace test build is normal CI's job and was the widest
         # pre-test failure surface in this lane.
-        run: |
-          set -euo pipefail
-          cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
+        # `shell: bash` runs with `-eo pipefail`, so the one-line form fails on
+        # a cargo error exactly as the old `set -euo pipefail` block did (the
+        # line reads no variable, so `-u` changed nothing). Folded 2026-11-07
+        # to pay for the TG-4 step's line under the run-line budget.
+        shell: bash
+        run: cargo test --workspace --no-run --test 'chaos_*' 2>&1 | tee /tmp/build.log
 
       - name: Run chaos tests (--include-ignored)
         id: chaos
+        # 2026-11-07: the one ignored chaos test (the QuestDB pause in
+        # chaos_cascade_triple_failure.rs) FAILS instead of skipping when the
+        # stack is not running, and probes this address to prove the pause
+        # really took QuestDB down and that it came back.
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
         run: |
           set -euo pipefail
           # `--include-ignored`, NOT `--ignored` (corrected 2026-08-18).
@@ -164,7 +177,8 @@ jobs:
           # In libtest, `--ignored` runs ONLY the ignored tests; it EXCLUDES
           # every normal one. Across all 11 `chaos_*.rs` files there is exactly
           # ONE `#[ignore]` attribute today (chaos_cascade_triple_failure.rs),
-          # and that test's body self-skips when the stack is unreachable. So
+          # and that test's body self-skipped when the stack was unreachable
+          # (since 2026-11-07 the env above makes that a failure). So
           # this lane was running ONE test that could return immediately while
           # the other 43 chaos test functions never executed here at all — and
           # it reported green while doing so, which is the false-OK class audit
@@ -183,6 +197,27 @@ jobs:
             --no-fail-fast \
             -- --include-ignored --nocapture 2>&1 | tee /tmp/chaos.log
 
+      - name: Archiver export contention vs real QuestDB (TG-4)
+        # Plan item TG-4 (2026-11-06 incident: the archiver's /exp export held
+        # QuestDB's one HTTP thread and ILP writes and /exec probes stalled
+        # behind it). Seeds one market_depth hour, runs the REAL archive pass
+        # against this stack's QuestDB (production image, memory limit, cpuset
+        # and HTTP worker settings from the compose file) with ILP writes,
+        # /exec probes and a second /exp stream running beside it, and fails
+        # when a flush exceeds 5 s, a probe exceeds 2 s, or either fails.
+        # Lives in the storage crate's lib tests (it drives the archiver's
+        # test constructor), so `--test 'chaos_*'` above does not pick it up.
+        # TV_QDB_REAL_REQUIRED=1 turns a missing or unreachable QuestDB into a
+        # failure, never a skip. Runs after the chaos step whether it passed
+        # or failed, as long as the stack came up. Output is appended to
+        # /tmp/chaos.log so the regression issue quotes it.
+        if: ${{ !cancelled() && (steps.chaos.outcome == 'success' || steps.chaos.outcome == 'failure') }}
+        shell: bash
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
+        run: cargo test -p tickvault-storage --lib tg4_archiver_export_contention -- --ignored --nocapture 2>&1 | tee -a /tmp/chaos.log
+
       - name: Tear down Docker compose stack
         if: always()
         run: |
@@ -192,7 +227,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: chaos-logs
           path: |

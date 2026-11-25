@@ -70,13 +70,17 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
 
     // Step 2: Validate expected IP format
     validate_ipv4_format(&expected_ip).map_err(|reason| {
-        error!(reason = %reason, "SSM static IP is not a valid IPv4 address");
+        error!(code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(), source = "ssm_ip_invalid", reason = %reason, "SSM static IP is not a valid IPv4 address");
         ApplicationError::IpVerificationFailed { reason }
     })?;
 
     // Step 3: Detect actual public IP
     let actual_ip = detect_public_ip().await.map_err(|reason| {
-        error!(reason = %reason, "public IP detection failed");
+        error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+            reason = %reason,
+            "public IP detection failed"
+        );
         ApplicationError::IpVerificationFailed { reason }
     })?;
     info!(actual_ip_masked = %mask_ip(&actual_ip), "actual public IP detected");
@@ -84,6 +88,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
     // Step 4: Compare
     if let Err(reason) = compare_ips(&expected_ip, &actual_ip) {
         error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
             expected = %mask_ip(&expected_ip),
             actual = %mask_ip(&actual_ip),
             "public IP does not match SSM static IP — BLOCKING BOOT"
@@ -186,6 +191,7 @@ async fn detect_public_ip() -> Result<String, String> {
 /// Fetches the public IP from a single URL.
 ///
 /// Expects a plain-text response containing only the IP address.
+#[cfg(not(test))]
 async fn fetch_ip_from_url(url: &str, timeout: Duration) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -215,6 +221,14 @@ async fn fetch_ip_from_url(url: &str, timeout: Duration) -> Result<String, Strin
     })?;
 
     Ok(ip)
+}
+
+// Only the transport is replaced in unit tests: the real detection retry and
+// fallback algorithm above still runs. No external HTTP request can be sent.
+#[cfg(test)]
+async fn fetch_ip_from_url(url: &str, _timeout: Duration) -> Result<String, String> {
+    crate::test_support::ssm::record_public_ip_attempt(url);
+    Err("synthetic public-IP refusal; no external request sent".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +465,8 @@ pub async fn get_ip(
         let captured_body = capture_rest_error_body(&body);
         let redacted_url = redact_url_params(&url);
         error!(
+            code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+            source = "get_ip_non_2xx",
             status = %status,
             url = %redacted_url,
             body = %captured_body,
@@ -740,16 +756,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_expected_ip_fails_without_real_ssm() {
-        let result = fetch_expected_ip_from_ssm().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — SSM is reachable.
-            assert!(
-                result.is_ok(),
-                "with real AWS credentials, SSM IP fetch should succeed"
-            );
-        } else {
-            assert!(result.is_err(), "must fail without real SSM connectivity");
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(fetch_expected_ip_from_ssm()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        fixture.assert_requests(1, 1, &["/network/static-ip"]);
+        assert_eq!(
+            fixture.public_ip_attempts(),
+            0,
+            "SSM failure must short-circuit public-IP detection"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -757,20 +775,55 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn test_public_ip_attempts_counts_synthetic_transport_refusal() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture
+            .scope(fetch_ip_from_url(
+                PUBLIC_IP_CHECK_PRIMARY_URL,
+                Duration::from_secs(1),
+            ))
+            .await;
+        assert!(result.unwrap_err().contains("synthetic public-IP refusal"));
+        assert_eq!(fixture.public_ip_attempts(), 1);
+        assert!(fixture.requests().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_public_ip_urls_record_primary_retries_then_fallback() {
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(detect_public_ip()).await;
+        assert!(
+            result
+                .unwrap_err()
+                .contains("all IP detection attempts exhausted")
+        );
+        let expected: Vec<_> = std::iter::repeat_n(
+            PUBLIC_IP_CHECK_PRIMARY_URL.to_string(),
+            PUBLIC_IP_CHECK_MAX_RETRIES as usize,
+        )
+        .chain(std::iter::repeat_n(
+            PUBLIC_IP_CHECK_FALLBACK_URL.to_string(),
+            PUBLIC_IP_CHECK_MAX_RETRIES as usize,
+        ))
+        .collect();
+        assert_eq!(fixture.public_ip_urls(), expected);
+        assert!(fixture.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_verify_public_ip_fails_without_real_ssm() {
-        let result = verify_public_ip().await;
-        if crate::test_support::real_ssm_tests_enabled() {
-            // Dev machine with real AWS credentials — SSM + public IP check both succeed.
-            assert!(
-                result.is_ok(),
-                "with real AWS credentials, IP verification should succeed"
-            );
-        } else {
-            assert!(
-                result.is_err(),
-                "verify_public_ip must fail without real SSM"
-            );
-        }
+        let fixture = crate::test_support::ssm::FailureFixture::new();
+        let result = fixture.scope(verify_public_ip()).await;
+        assert!(matches!(
+            result,
+            Err(ApplicationError::SecretRetrieval { .. })
+        ));
+        fixture.assert_requests(1, 1, &["/network/static-ip"]);
+        assert_eq!(
+            fixture.public_ip_attempts(),
+            0,
+            "SSM failure must short-circuit public-IP detection"
+        );
     }
 
     // -----------------------------------------------------------------------

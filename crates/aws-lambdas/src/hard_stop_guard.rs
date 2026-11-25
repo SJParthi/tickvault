@@ -3,11 +3,14 @@
 //!
 //! Hourly EventBridge cron; the budget/schedule never-cross safety net:
 //!
-//! * Instance already stopped/stopping -> no-op.
-//! * Running OUTSIDE the Mon-Fri 08:30-17:30 IST up-window -> force stop +
+//! * Instance already stopped/stopping -> no-op, except the new-month
+//!   release of an expired budget stop (audit PR30,
+//!   `release_expired_budget_stop`): re-enable the daily-start rule once.
+//! * Running OUTSIDE the Mon-Fri 08:30-16:30 IST up-window -> force stop +
 //!   Telegram (the legacy never-cross guard, unchanged).
 //! * Running INSIDE the up-window:
-//!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, DISABLE the
+//!     - MTD spend >= BUDGET_KILL_USD -> stop the instance, write the
+//!       budget-stop latch (audit PR30, `budget_stop_latch`), DISABLE the
 //!       tv-<env>-daily-start EventBridge rule, page the operator (GAP 1:
 //!       without the disable, the next morning's start cron restarts the
 //!       killed box and runs it daily, unkilled, for the rest of the month).
@@ -20,16 +23,16 @@
 //!
 //! Parity is the contract: same SNS Subject/Message strings (byte-identical),
 //! same result-dict shapes, same IST math (fixed UTC+5:30), same fail-safe
-//! posture (Cost Explorer errors NEVER stop or disable anything; SSM state
+//! posture (spend-lookup errors NEVER stop or disable anything; SSM state
 //! errors fail OPEN to a ping — one ping beats a silent guard).
 //!
 //! The AWS calls are abstracted behind tiny async traits so the unit tests
 //! drive the FULL flow with fakes exactly like the legacy monkeypatched
-//! `boto3.client` fakes did (including the ExplodingSsm "SSM was never
-//! touched" ratchets). The real SDK impls are thin, uncovered-by-design
+//! `boto3.client` fakes did (including the "SSM is never read on the breach
+//! path" ratchet). The real SDK impls are thin, uncovered-by-design
 //! shells (UNPROVEN until deploy — a live Lambda invoke is the only probe).
 
-use chrono::{DateTime, Datelike, FixedOffset, Offset, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, Offset, Timelike, Utc};
 use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
@@ -52,7 +55,125 @@ use tracing::{error, info, warn};
 /// stale fallback was a flagged follow-up while it was harmless; raising the
 /// ceiling made it a defect, so it is fixed here in the same change rather than
 /// left as a note.
-pub const DEFAULT_BUDGET_KILL_USD: f64 = 130.0;
+///
+/// 2026-10-01 (audit PR30b): 225.0 → 150.0, the scheduled revert of the
+/// September-only allowance. Equal to `STANDING_BUDGET_KILL_USD`, so the month
+/// clamp below no longer changes any month.
+///
+/// 2026-10-13 (operator Quote 30, daily-universe §0): 150.0 → 170.0, so AWS
+/// stays at or under ₹15,000 a month (≈$170 at an Assumed ~₹88/USD) and
+/// October is not stopped around 23 Oct by the old line.
+///
+/// 2026-10-21 (operator Quote 33): stays 170.0, the configured line for
+/// October 2026. From November the month clamp brings it down to
+/// `STANDING_BUDGET_KILL_USD` ($75 since operator Quote 37, $62 from December
+/// 2026 since operator Quote 54) in code; the terraform `limit_amount`
+/// (the native 100% stop) can follow on or after 1 November.
+///
+/// 2026-10-28 (operator Quote 45): 170.0 → 185.0 for October 2026 only
+/// (Budgets API: $157.18 spent, $175.88 forecast). November onward is still
+/// clamped to `STANDING_BUDGET_KILL_USD` in code.
+pub const DEFAULT_BUDGET_KILL_USD: f64 = 185.0;
+
+/// The STANDING monthly kill line: from October 2026 the bill must stay within
+/// $150 (operator Quote 23, 2026-09-23 — daily-universe §0 + aws-budget.md),
+/// raised to $170 (≈₹15,000) by operator Quote 30 on 2026-10-13, and lowered
+/// to $100 from November 2026 by operator Quote 33 (2026-10-21), then to **$85 from
+/// November 2026** by operator Quote 36 (the same evening), and to **$75
+/// from November 2026, GST included,** by operator Quote 37. November 2026 alone is $140
+/// (`NOVEMBER_2026_KILL_USD`: $90 by operator Quote 52, 2026-11-11, raised to $140
+/// by Quote 59, 2026-11-14, owner card "$140 (Recommended)" against a $126 forecast). From December
+/// 2026 the standing line is **$62, GST included** (about ₹5,500), operator
+/// Quote 54 (2026-11-11, owner card "Cap ₹5,500"). October
+/// 2026 keeps the configured $170 (`OCTOBER_2026_ALLOWANCE`): its spend was
+/// already $119.20 on 1–20 Oct, so a $100 line would have stopped the box at once.
+///
+/// The configured ceiling (`BUDGET_KILL_USD` / `DEFAULT_BUDGET_KILL_USD`) was
+/// $225 as a September-2026-only allowance, and is $150 again since 2026-10-01. `effective_budget_kill_usd` clamps
+/// every other month back to this value IN CODE, so October is protected even
+/// if the scheduled 1-Oct revert of the terraform value is late or never lands.
+pub const STANDING_BUDGET_KILL_USD: f64 = 62.0;
+
+// A clamp must never RAISE the line: the standing ceiling may not sit above
+// the configured (September-allowance) fallback.
+const _: () = assert!(STANDING_BUDGET_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
+
+/// A billing month (UTC year, month) the operator allowed above
+/// `STANDING_BUDGET_KILL_USD`.
+pub const SEPTEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 9);
+
+/// October 2026 keeps its own line (`OCTOBER_2026_KILL_USD`, $185 since Quote 45); the standing
+/// line (then $75, operator Quotes 33, 36 and 37, 2026-10-21) started after it. One month, like September.
+pub const OCTOBER_2026_ALLOWANCE: (i32, u32) = (2026, 10);
+
+/// The line October 2026 is capped at, whatever is configured (Quote 30, $170;
+/// raised to $185 by operator Quote 45, 2026-10-28, October 2026 only).
+/// A mistaken higher configured value still clamps to it, as it did before.
+pub const OCTOBER_2026_KILL_USD: f64 = 185.0;
+
+/// November 2026 only (operator Quote 52, 2026-11-11, owner card "Raise Nov
+/// to $90 only (Recommended)"): about $21 of the month's bill was two disks
+/// attached to nothing, so the then-standing $75 line would have stopped the box
+/// around 18 to 24 November. Quote 59 (2026-11-14) raised November to $140:
+/// $60.83 spent by 14 Nov and AWS forecast $126, so $90 would have stopped it. December onward is on the standing line, $62
+/// since operator Quote 54 (2026-11-11).
+pub const NOVEMBER_2026_ALLOWANCE: (i32, u32) = (2026, 11);
+
+/// The line November 2026 is capped at, whatever is configured (Quote 52; raised $90 -> $140 by Quote 59, 2026-11-14).
+pub const NOVEMBER_2026_KILL_USD: f64 = 140.0;
+
+// Each one-month line must sit between the standing line and the configured
+// fallback, so the clamp never raises a configured value.
+const _: () = assert!(NOVEMBER_2026_KILL_USD >= STANDING_BUDGET_KILL_USD);
+const _: () = assert!(NOVEMBER_2026_KILL_USD <= DEFAULT_BUDGET_KILL_USD);
+
+/// The kill line that actually applies to one billing month.
+///
+/// **The month is the UTC calendar month, never IST, and that is load-bearing.**
+/// AWS bills and the Budgets API report month-to-date in UTC (the billing
+/// month the guard keys on is `now_utc`'s UTC month). Between 00:00 and 05:30 IST on 1 October the IST
+/// month is already October while month-to-date still holds September's ~$190;
+/// an IST-keyed clamp would compare September's spend against October's $150
+/// line and stop the box for a month that was allowed. Keying both on UTC keeps
+/// the spend and the line describing the same month.
+///
+/// Never RAISES a configured value: a lower configured ceiling stays lower.
+///
+/// **A non-finite or non-positive configured value is REFUSED** and replaced
+/// by `DEFAULT_BUDGET_KILL_USD` before the month clamp. Rust parses `"nan"`,
+/// `"inf"` and `"-5"` as valid `f64`s, so the env parse's fail-soft arm never
+/// sees them. Unguarded, NaN would make every `mtd >= line` compare false and
+/// the September box could never be stopped (fail-OPEN), while `0` or a
+/// negative line would stop the box every hour. The default is the safe
+/// middle: it still stops, and the month clamp still applies to it.
+/// O(1), no allocation.
+pub fn effective_budget_kill_usd(configured: f64, billing_year: i32, billing_month: u32) -> f64 {
+    let configured = if configured.is_finite() && configured > 0.0 {
+        configured
+    } else {
+        DEFAULT_BUDGET_KILL_USD
+    };
+    let month = (billing_year, billing_month);
+    if month == SEPTEMBER_2026_ALLOWANCE {
+        configured
+    } else if month == OCTOBER_2026_ALLOWANCE {
+        configured.min(OCTOBER_2026_KILL_USD)
+    } else if month == NOVEMBER_2026_ALLOWANCE {
+        configured.min(NOVEMBER_2026_KILL_USD)
+    } else {
+        configured.min(STANDING_BUDGET_KILL_USD)
+    }
+}
+/// The line a ping state with no `line` field was saved against, from
+/// November 2026 on. Builds before PR 2221 used the then-standing $75 for
+/// November 2026 and every later month. PR 2221's own build (merged 32
+/// minutes before PR 2222, which started recording the line) used $90 for
+/// November without recording it; such a state reads as saved against $75,
+/// so at most one extra ping fires (loud, never silent). Fixed history,
+/// deliberately NOT `STANDING_BUDGET_KILL_USD`, which moved to $62 under
+/// operator Quote 54 (2026-11-11).
+const UNRECORDED_PING_LINE_USD: f64 = 75.0;
+
 /// Legacy parity default for the change-only ping-state SSM param
 /// (NOT under the banned groww/* namespace).
 pub const DEFAULT_PING_STATE_PARAM: &str = "/tickvault/prod/budget-guard/ping-state";
@@ -78,6 +199,48 @@ pub struct GuardEnv {
     pub start_rule_name: String,
     pub budget_kill_usd: f64,
     pub ping_state_param: String,
+    /// The operator keep-alive marker the start-watchdog's curfew honours —
+    /// honoured here too since 2026-09-08, so the two hourly guards over
+    /// the same box agree on what "deliberately running late" means.
+    pub keep_alive_param: String,
+    /// The budget-stop latch (`budget_stop_latch`), WRITTEN by the breach
+    /// stop so the start watchdog, the autopilot and the terraform apply do
+    /// not restart the box for the rest of the billing month.
+    pub budget_stop_param: String,
+    /// The drain hold (`drain_hold`, operator Quote 31, 2026-10-21), read by
+    /// the OUT-OF-WINDOW stop only. The in-window budget breach stop never
+    /// reads it.
+    pub drain_hold_param: String,
+    /// The rendered Muhurat sessions (`muhurat_window`, plan item J8): a box
+    /// running inside a session window is in-window (budget check, no
+    /// schedule stop).
+    pub muhurat_sessions: String,
+}
+
+/// Grace: never out-of-window-stop a box within this many minutes of its
+/// launch. Pinned equal to the curfew's `CURFEW_START_GRACE_MINUTES` so an
+/// operator's manual start is judged by ONE grace, not two.
+pub const OUT_OF_WINDOW_START_GRACE_MINUTES: i64 =
+    crate::start_watchdog::CURFEW_START_GRACE_MINUTES;
+
+/// Legacy `_read_keep_alive_until`, shared shape with the start-watchdog:
+/// `None` = no (usable) override. Never raises; any failure is "no override",
+/// so the guard stays armed — fail-open here would silently disable budget
+/// protection.
+pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<DateTime<Utc>> {
+    match ssm.get_parameter(param).await {
+        Ok(raw) => {
+            let parsed = crate::start_watchdog::parse_keep_alive_timestamp(&raw);
+            if parsed.is_none() && !raw.trim().is_empty() {
+                info!("keep-alive param unparseable — no override");
+            }
+            parsed
+        }
+        Err(exc) => {
+            info!(error = %exc, "keep-alive param unavailable — no override");
+            None
+        }
+    }
 }
 
 impl GuardEnv {
@@ -99,8 +262,35 @@ impl GuardEnv {
             },
             ping_state_param: std::env::var("PING_STATE_PARAM")
                 .unwrap_or_else(|_| DEFAULT_PING_STATE_PARAM.to_string()),
+            keep_alive_param: std::env::var("KEEP_ALIVE_PARAM").unwrap_or_else(|_| {
+                crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string()
+            }),
+            budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
+            }),
+            drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
+                .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
+            muhurat_sessions: std::env::var(crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+                .unwrap_or_default(),
         }
     }
+}
+
+/// Read the drain hold (operator Quote 31) for the out-of-window stop. A
+/// failed read is no hold, so the guard stays armed (the cost-safe side).
+pub async fn read_drain_hold<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> crate::drain_hold::DrainHold {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "drain hold unavailable — no hold");
+            None
+        }
+    };
+    crate::drain_hold::drain_hold_verdict(raw.as_deref(), now_utc.timestamp())
 }
 
 /// One described instance — the fields this guard reads.
@@ -126,18 +316,34 @@ pub trait SnsApi {
     async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
 }
 
-/// EventBridge surface — `events:DisableRule` only. Errors are CAUGHT by
-/// the breach path (page-don't-crash) and reported honestly in the page.
+/// EventBridge surface — `events:DisableRule` (the breach stop) and
+/// `events:EnableRule` (the new-month release, audit PR30). Errors are
+/// CAUGHT (page-don't-crash) and reported honestly, never fatal.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait EventsApi {
     async fn disable_rule(&self, name: &str) -> Result<(), String>;
+    async fn enable_rule(&self, name: &str) -> Result<(), String>;
 }
 
-/// Cost Explorer surface — the raw `Amount` strings per result period
-/// (the legacy runtime sums `float(d["Total"]["UnblendedCost"]["Amount"])`).
+/// AWS Budgets surface — month-to-date actual spend in USD of the one
+/// tickvault budget (`budgets:DescribeBudget`, free). Replaced the paid Cost
+/// Explorer `GetCostAndUsage` surface on 2026-10-22 (plan item 63, operator
+/// Quote 37). The figure AWS reports is refreshed about every 8 to 12 hours
+/// and carries no month stamp; see `crate::budget_spend` for both limits.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
-pub trait CeApi {
-    async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String>;
+pub trait BudgetsApi {
+    async fn actual_spend_usd(&self) -> Result<f64, String>;
+
+    /// The spend plus the budget's `LastUpdatedTime` (2026-11-16). The
+    /// default carries no stamp (age unknown); the live SDK leg overrides it.
+    async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+        self.actual_spend_usd()
+            .await
+            .map(|actual_usd| crate::budget_spend::SpendReading {
+                actual_usd,
+                last_updated_unix_secs: None,
+            })
+    }
 }
 
 /// SSM surface for the change-only ping state (get + put).
@@ -147,7 +353,7 @@ pub trait SsmApi {
     async fn put_parameter(&self, name: &str, value: &str) -> Result<(), String>;
 }
 
-/// Mon-Fri 08:30-**17:30** IST (inclusive both ends).
+/// Mon-Fri 08:30-**16:30** IST (inclusive both ends).
 ///
 /// 2026-08-08 (operator Quote 14): the close moved 16:30 -> 17:30 with the
 /// 9-hour trading window. This constant is LOAD-BEARING, not cosmetic: this
@@ -155,6 +361,12 @@ pub trait SsmApi {
 /// leaving it at 16:30 while EventBridge stops at 17:30 would have had the
 /// guard kill the box at 17:00 every day and page — silently cancelling the
 /// extra hour the operator paid for.
+///
+/// 2026-10-22 (operator Quote 37, plan item 64): the close moved back 17:30 ->
+/// 16:30 with the daily stop, now derived from the start watchdog's stop
+/// trigger ([`UP_WINDOW_CLOSE_IST_HHMM`]) so the two cannot drift. A box held
+/// past 16:30 by the Quote 31 drain hold is left alone by the out-of-window
+/// arm below while the hold is fresh.
 /// The guard NEVER stops the box during the window on schedule grounds —
 /// only a budget breach may stop it in-window.
 pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
@@ -163,44 +375,140 @@ pub fn in_up_window(now_utc: DateTime<Utc>) -> bool {
         return false;
     }
     let hhmm = ist_now.hour() * 100 + ist_now.minute();
-    (830..=1730).contains(&hhmm)
+    (830..=UP_WINDOW_CLOSE_IST_HHMM).contains(&hhmm)
 }
 
-/// Legacy `mtd_usd` — best-effort Cost Explorer month-to-date total.
+/// The up-window's close as IST `hhmm` (1630), derived from the daily stop
+/// trigger (`start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY`).
+pub const UP_WINDOW_CLOSE_IST_HHMM: u32 =
+    ((crate::start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY / 3600) * 100
+        + (crate::start_watchdog::STOP_TRIGGER_IST_SECS_OF_DAY % 3600) / 60) as u32;
+
+/// Month-to-date spend for a stop decision against `line_usd`, from the free
+/// AWS Budgets API (plan item 63, operator Quote 37, 2026-10-22; was Cost
+/// Explorer `GetCostAndUsage`).
+///
 /// Returns `None` on ANY error — the caller treats None as fail-safe
-/// ("cost_unknown": page, never stop or disable on missing data).
-/// Deliberate deviation: the legacy runtime read `datetime.now(timezone.utc)` inside;
-/// we take the injected clock so the date window is testable/consistent.
-pub async fn mtd_usd<C: CeApi>(ce: &C, now_utc: DateTime<Utc>) -> Option<f64> {
-    let today = now_utc.date_naive();
-    let Some(start) = today.with_day(1) else {
-        // Day 1 always exists in the current month — unreachable, fail-soft.
-        warn!("MTD lookup failed (non-fatal): month start unrepresentable");
-        return None;
-    };
-    match ce
-        .unblended_amounts(&start.to_string(), &today.to_string())
-        .await
-    {
-        Ok(amounts) => {
-            let mut total = 0.0_f64;
-            for a in amounts {
-                match a.parse::<f64>() {
-                    Ok(v) => total += v,
-                    Err(e) => {
-                        // Legacy float() raise -> caught by the blanket arm.
-                        warn!(error = %e, "MTD lookup failed (non-fatal): bad Amount");
-                        return None;
-                    }
-                }
-            }
-            Some(total)
+/// ("cost_unknown": page, never stop or disable on missing data), exactly as
+/// the Cost Explorer path did. Also `None`:
+/// - a NaN or infinite reading (coded `LAMBDA-AWS-01`): NaN makes every
+///   `spend >= line` compare false, so it could never stop the box;
+/// - a negative reading;
+/// - during UTC days 1 and 2 of a month (day 1 only until 2026-10-26, audit
+///   PR L4), a reading at or above `line_usd`, because a Budgets reply has no
+///   month stamp and may still hold last month's total
+///   (`budget_spend::trusted_spend_for_line`). Cost Explorer returned unknown
+///   all of day 1 (empty `[1st, 1st)` interval), so this is no weaker.
+///
+/// Latency: AWS refreshes the figure about every 8 to 12 hours (Assumed, AWS
+/// docs). The budget's native stop action is the second, independent stop.
+pub async fn mtd_usd<B: BudgetsApi>(
+    budgets: &B,
+    line_usd: f64,
+    now_utc: DateTime<Utc>,
+) -> Option<f64> {
+    mtd_reading(budgets, line_usd, now_utc).await.0
+}
+
+/// How old the Budgets figure behind a stop decision is, and a labelled
+/// estimate of spend now (2026-11-16). LOGGING ONLY: no stop decision reads
+/// either field (pinned by
+/// `test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BudgetFreshness {
+    /// Seconds since the budget's `LastUpdatedTime`; `None` when unknown
+    /// (no stamp, a failed read, or a future-dated stamp).
+    pub age_secs: Option<f64>,
+    /// `budget_spend::estimated_spend_now_usd` of the raw reading; an
+    /// ESTIMATE, never a reading.
+    pub estimated_spend_now_usd: Option<f64>,
+}
+
+impl BudgetFreshness {
+    /// Age in hours, for the log line and the result JSON.
+    pub fn age_hours(&self) -> Option<f64> {
+        self.age_secs.map(|s| s / 3600.0)
+    }
+
+    /// Returns `result` with `budget_data_age_hours` and
+    /// `estimated_spend_now_usd` added (JSON `null` when unknown). A
+    /// non-object is returned as is.
+    pub fn annotated(&self, mut result: Value) -> Value {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("budget_data_age_hours".to_string(), json!(self.age_hours()));
+            obj.insert(
+                "estimated_spend_now_usd".to_string(),
+                json!(self.estimated_spend_now_usd),
+            );
         }
-        Err(e) => {
-            warn!(error = %e, "MTD lookup failed (non-fatal)");
+        result
+    }
+}
+
+/// [`mtd_usd`] plus the freshness of the figure (2026-11-16). The spend half
+/// is exactly what `mtd_usd` returns; the freshness half is logged and never
+/// decides a stop. One coded `warn!` (`LAMBDA-AWS-01`) per call when the
+/// figure is over 48 hours old. No alarm, metric filter or page reads that
+/// code from this Lambda's log group (checked in `deploy/aws/terraform`,
+/// 2026-11-16: only the log export to S3 reads it).
+pub async fn mtd_reading<B: BudgetsApi>(
+    budgets: &B,
+    line_usd: f64,
+    now_utc: DateTime<Utc>,
+) -> (Option<f64>, BudgetFreshness) {
+    let raw = budgets.spend_reading().await;
+    let freshness = match &raw {
+        Ok(r) => {
+            let age_secs = crate::budget_spend::data_age_secs(r.last_updated_unix_secs, now_utc);
+            let estimated_spend_now_usd = if r.actual_usd.is_finite() && r.actual_usd >= 0.0 {
+                crate::budget_spend::estimated_spend_now_usd(
+                    r.actual_usd,
+                    r.last_updated_unix_secs,
+                    now_utc,
+                )
+            } else {
+                None
+            };
+            BudgetFreshness {
+                age_secs,
+                estimated_spend_now_usd,
+            }
+        }
+        Err(_) => BudgetFreshness::default(),
+    };
+    if crate::budget_spend::data_is_stale(freshness.age_secs) {
+        warn!(
+            code = "LAMBDA-AWS-01",
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            line_usd,
+            source = crate::budget_spend::SPEND_SOURCE,
+            "AWS Budgets month-to-date spend is over 48 hours old; the stop decision uses it as is (estimate logged, not acted on)"
+        );
+    }
+    let reading = match raw.map(|r| r.actual_usd) {
+        Ok(v) if !v.is_finite() => {
+            error!(
+                code = "LAMBDA-AWS-01",
+                spend = v,
+                "budgets:DescribeBudget gave a non-finite month-to-date spend; treated as unknown"
+            );
             None
         }
-    }
+        Ok(v) if v < 0.0 => {
+            warn!(spend = v, "MTD lookup refused (non-fatal): negative spend");
+            None
+        }
+        Ok(v) => Some(v),
+        Err(e) => {
+            warn!(error = %e, source = crate::budget_spend::SPEND_SOURCE, "MTD lookup failed (non-fatal)");
+            None
+        }
+    };
+    (
+        crate::budget_spend::trusted_spend_for_line(reading, line_usd, now_utc),
+        freshness,
+    )
 }
 
 /// Legacy `classify_in_window_action` — pure decision for the in-window arm
@@ -252,7 +560,8 @@ pub fn classify_ping_decision(
     month: &str,
 ) -> (&'static str, Value) {
     let bucket = spend_bucket(mtd, budget_kill_usd);
-    let mut new_state = json!({"month": month, "bucket": bucket, "outcome": action});
+    let mut new_state =
+        json!({"month": month, "bucket": bucket, "outcome": action, "line": budget_kill_usd});
     // cost_unknown first: it has no trustworthy spend figure, so no other
     // reason may render one; edge-latched so repeats stay silent.
     if action == "cost_unknown" {
@@ -279,6 +588,24 @@ pub fn classify_ping_decision(
     if prev_outcome == "cost_unknown" {
         return ("ping_cost_recovered", new_state);
     }
+    // Quote 52 (2026-11-11): the line can move inside a month ($75 -> $90 for
+    // November 2026). A bucket saved against the old line is not comparable,
+    // so any bucket change after a line change pings once (and saves the new
+    // line). A state saved before the line was recorded (builds before PR
+    // 2222) is read as saved against $75 from November 2026 on, the line
+    // builds before PR 2221 used; PR 2221's build used $90 for November, so
+    // its state can cost at most one extra ping (loud, never silent). That
+    // is a fixed historical value, never the current standing line: since
+    // Quote 54 the standing line is $62, which no such state was saved
+    // against.
+    let prev_line = prev
+        .and_then(|p| p.get("line"))
+        .and_then(Value::as_f64)
+        .or_else(|| (month >= "2026-11").then_some(UNRECORDED_PING_LINE_USD));
+    let line_changed = prev_line.is_some_and(|l| (l - budget_kill_usd).abs() > f64::EPSILON);
+    if line_changed && bucket != prev_bucket {
+        return ("ping_bucket_changed", new_state);
+    }
     if bucket > prev_bucket {
         return ("ping_bucket_changed", new_state);
     }
@@ -288,8 +615,9 @@ pub fn classify_ping_decision(
         return ("ping_bucket_changed", new_state);
     }
     if bucket < prev_bucket {
-        // Hysteresis (hostile-review fix 2026-07-09): Cost Explorer
-        // UnblendedCost estimates are revised BOTH ways, so spend sitting
+        // Hysteresis (hostile-review fix 2026-07-09): month-to-date spend
+        // estimates (Cost Explorer then, the Budgets figure since 2026-10-22)
+        // are revised BOTH ways, so spend sitting
         // on a 10% boundary can flip one bucket down and back up every
         // hour. A 1-bucket dip stays SILENT and RETAINS the stored bucket,
         // so the flip back up is silent too.
@@ -416,20 +744,51 @@ pub async fn save_ping_state<P: SsmApi>(ssm: &P, param: &str, state: &Value) -> 
     }
 }
 
-/// Legacy `_execute_breach_stop` — stop the box + disable the morning start
-/// rule + page (GAP 1). Ordering is deliberate: stop FIRST (caps spend even
-/// if the disable fails), then disable the start rule, then page — the page
-/// honestly reports whether the disable landed so the operator can finish
-/// by hand.
-pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi>(
+/// Legacy `_execute_breach_stop` — stop the box + latch the stop + disable
+/// the morning start rule + page (GAP 1). Ordering is deliberate: stop FIRST
+/// (caps spend even if everything after it fails), then write the
+/// budget-stop latch (audit PR30), then disable the start rule, then page —
+/// the page honestly reports whether the latch and the disable landed so the
+/// operator can finish by hand.
+///
+/// The latch is WRITE-only here: the breach path never reads SSM, so no SSM
+/// outage can gate the stop, and a failed write is reported, never fatal.
+#[allow(clippy::too_many_arguments)] // APPROVED: the four injected AWS surfaces plus the breach facts; a wrapper struct would only rename them.
+pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi, P: SsmApi>(
     env: &GuardEnv,
     ec2: &E,
     sns: &N,
     events: &V,
+    ssm: &P,
     mtd: f64,
     was_state: &str,
+    now_utc: DateTime<Utc>,
 ) -> Result<Value, String> {
     ec2.stop_instances(&env.instance_id).await?;
+
+    let month = crate::budget_stop_latch::billing_month_utc(now_utc);
+    let (latch_ok, latch_line) = match ssm.put_parameter(&env.budget_stop_param, &month).await {
+        Ok(()) => (
+            true,
+            format!(
+                "Budget-stop latch set for {month} (UTC billing month): the 8:45 AM \
+rescue, the autopilot and the terraform apply will not restart the box \
+until the next billing month starts.\n"
+            ),
+        ),
+        Err(e) => {
+            // The full SSM error goes to the log only; the page names the
+            // outcome, never AWS internals.
+            error!(code = "LAMBDA-AWS-02", error = %e, param = %env.budget_stop_param, "ssm:PutParameter for the budget-stop latch failed");
+            (
+                false,
+                "⚠ could NOT write the budget-stop latch (SSM refused the write; see the \
+Lambda log) — the 8:45 AM rescue may restart the box tomorrow; this guard stops it \
+again within the hour.\n"
+                    .to_string(),
+            )
+        }
+    };
 
     let mut disable_ok = false;
     let disable_err;
@@ -443,7 +802,7 @@ pub async fn execute_breach_stop<E: Ec2Api, N: SnsApi, V: EventsApi>(
             }
             Err(e) => {
                 // legacy: page-don't-crash (logger.exception + continue).
-                error!(error = %e, rule = %env.start_rule_name, "events:DisableRule failed");
+                error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:DisableRule failed");
                 disable_err = e;
             }
         }
@@ -478,14 +837,17 @@ _instance_: `{instance_id}`\n\
 _was_state_: {was_state}\n\
 _MTD spend_: ~${mtd:.2} >= ${kill:.0} stop-budget\n\
 {disable_line}\n\
+{latch_line}\
 Why: the native AWS Budget stop-actions fire only ONCE per\n\
 month-crossing. Without disabling the start rule, tomorrow's\n\
 8:30 AM auto-start would restart the box and it would run\n\
 every day for the rest of the month, unkilled.\n\
-After investigating the spend, re-enable with:\n  aws events enable-rule --name {rule}\n",
+After investigating the spend, clear the latch and re-enable with:\n  \
+aws ssm delete-parameter --name {param}\n  aws events enable-rule --name {rule}\n",
         instance_id = env.instance_id,
         kill = env.budget_kill_usd,
         rule = env.start_rule_name,
+        param = env.budget_stop_param,
     );
     sns.publish(&env.alerts_topic_arn, &subject_capped, &message)
         .await?;
@@ -494,26 +856,185 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         "noop": false,
         "breach": true,
         "disable_ok": disable_ok,
+        "latch_ok": latch_ok,
         "was_state": was_state,
     }))
 }
 
+/// The new-month release of a budget stop (audit PR30). Runs only while the
+/// box is stopped. When the latch names an EARLIER billing month, the stop
+/// it recorded has expired, so the `daily-start` rule the breach stop
+/// disabled is turned back on, the latch is overwritten with
+/// `released-<month>` (so this happens once), and the operator gets one
+/// short note. Without it the rule stayed off all of the next month and
+/// the 8:45 AM rescue paged every morning.
+///
+/// Fail-safe in every direction: an unreadable latch, a current-month
+/// latch or any other value does nothing; a failed enable is logged and
+/// leaves the latch in place, so the next hourly run tries again.
+/// Returns `true` only when the rule was re-enabled.
+pub async fn release_expired_budget_stop<N: SnsApi, V: EventsApi, P: SsmApi>(
+    env: &GuardEnv,
+    sns: &N,
+    events: &V,
+    ssm: &P,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    if env.start_rule_name.is_empty() {
+        return false;
+    }
+    let raw = ssm.get_parameter(&env.budget_stop_param).await.ok();
+    if !crate::budget_stop_latch::latch_names_an_earlier_month(raw.as_deref(), now_utc) {
+        return false;
+    }
+    let old_month = raw
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if let Err(e) = events.enable_rule(&env.start_rule_name).await {
+        error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:EnableRule for the new-month budget-stop release failed");
+        return false;
+    }
+    if let Err(e) = ssm
+        .put_parameter(&env.budget_stop_param, &format!("released-{old_month}"))
+        .await
+    {
+        // The rule is back on, which is what matters; a stale latch only
+        // means the next run re-enables an already-enabled rule.
+        warn!(error = %e, param = %env.budget_stop_param, "could not mark the budget-stop latch released");
+    }
+    info!(month = %old_month, rule = %env.start_rule_name, "budget stop released for the new billing month");
+    let message = format!(
+        "🟢 *New billing month: the budget stop from {old_month} is released*\n\
+The morning auto-start is back on, so the box starts at 8:30 AM on the next \
+trading day. Nothing to do.\n"
+    );
+    if let Err(e) = sns
+        .publish(
+            &env.alerts_topic_arn,
+            "[BUDGET] new month — auto-start re-enabled",
+            &message,
+        )
+        .await
+    {
+        warn!(error = %e, "could not send the budget-stop release note");
+    }
+    true
+}
+
+/// Keeps the morning auto-start off while the budget stop for THIS billing
+/// month holds and the box is already stopped (audit B2 finding 10,
+/// 2026-11-13). Runs only from the already-stopped branch, after the
+/// new-month release.
+///
+/// Before this, a budget crossing reported while the box was stopped (an
+/// evening or a weekend) reached only the AWS-Budgets kill-switch: it wrote
+/// the latch, but nothing disabled the `daily-start` rule, because the breach
+/// stop that does so runs only for a running box. The EventBridge rule starts
+/// the box through the SSM start automation, which never reads the latch, so
+/// the box started at 8:30 AM the next trading day and the guard then stopped
+/// it again inside the session.
+///
+/// The latch alone is not trusted (audit B2 review, 2026-11-13): the
+/// kill-switch dates its latch by a fixed notification lag, so a late notice
+/// about the previous month can write a latch for the new one. The rule is
+/// disabled only when this guard's own month-to-date read (the free Budgets
+/// API, `mtd_usd`) is at or above this month's effective line. An unknown or
+/// lower reading leaves the rule alone (fail-open, like every latch reader).
+///
+/// No new permission: the guard role may already disable this one rule (the
+/// breach stop uses it) and read the budget. Disabling an already-disabled
+/// rule is a no-op, so running it every hour is safe. A failed disable is
+/// logged with the existing `LAMBDA-AWS-02` code and retried next hour. No
+/// page. Returns `true` when the rule was (re)disabled this run.
+///
+/// Recovery: once this has disabled the rule, deleting the latch alone does
+/// not bring the morning start back (the new-month release reads the latch).
+/// The kill-switch page, the breach page and the watchdog's morning note all
+/// name both steps: delete the latch, then `aws events enable-rule`.
+///
+/// Ordering with the 8:30 AM start (audit B2 review): the guard runs at
+/// minute 50 of every hour (`budget-guards.tf`), so its 02:50 UTC run holds
+/// the rule before the 03:00 UTC daily start. Residual window, stated
+/// honestly: a latch written between 02:50 and 03:00 UTC on a trading day can
+/// still let that morning's start through; the 03:50 UTC run then reads the
+/// box as running in-window and breach-stops it at 09:20 IST if spend is over
+/// the line.
+pub async fn hold_current_month_budget_stop<V: EventsApi, B: BudgetsApi, P: SsmApi>(
+    env: &GuardEnv,
+    events: &V,
+    budgets: &B,
+    ssm: &P,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    if env.start_rule_name.is_empty() {
+        return false;
+    }
+    let raw = ssm.get_parameter(&env.budget_stop_param).await.ok();
+    if !crate::budget_stop_latch::budget_stop_is_latched(raw.as_deref(), now_utc) {
+        return false;
+    }
+    let line = effective_budget_kill_usd(env.budget_kill_usd, now_utc.year(), now_utc.month());
+    let Some(spend) = mtd_usd(budgets, line, now_utc).await else {
+        info!(
+            "this month's budget-stop latch is set but spend is unknown; morning start left alone"
+        );
+        return false;
+    };
+    if spend < line {
+        info!(
+            spend,
+            line,
+            "this month's budget-stop latch is set but spend is under the line; morning start left alone"
+        );
+        return false;
+    }
+    if let Err(e) = events.disable_rule(&env.start_rule_name).await {
+        error!(code = "LAMBDA-AWS-02", error = %e, rule = %env.start_rule_name, "events:DisableRule to hold this month's budget stop failed; retried next hour");
+        return false;
+    }
+    info!(rule = %env.start_rule_name, "box stopped and this month's budget stop holds; morning auto-start kept disabled");
+    true
+}
+
+/// True when `launch_time` falls on the same IST calendar date as `now_utc`
+/// (audit B2 review round 5, 2026-11-13). The pre-open exemption (step 1c in
+/// [`run_guard`]) is for a box started THIS morning, which booted a fresh
+/// process for today. A box still running from an earlier date (one the
+/// drain hold kept up overnight, whose 07:35 IST curfew stop then failed)
+/// must keep the out-of-window stop: before minute 50 the guard's 07:30 IST
+/// run stopped it, and nothing else would until the 08:30 rule found it
+/// running and left yesterday's process to run the session. An unknown
+/// launch time is not exempt. O(1).
+fn launched_on_this_ist_date(launch_time: Option<DateTime<Utc>>, now_utc: DateTime<Utc>) -> bool {
+    launch_time.is_some_and(|launch| {
+        launch.with_timezone(&ist()).date_naive() == now_utc.with_timezone(&ist()).date_naive()
+    })
+}
+
 /// Legacy `lambda_handler` — hourly EventBridge cron entry (event unused).
-pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
+pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, B: BudgetsApi, P: SsmApi>(
     env: &GuardEnv,
     ec2: &E,
     sns: &N,
     events: &V,
-    ce: &C,
+    budgets: &B,
     ssm: &P,
     now_utc: DateTime<Utc>,
 ) -> Result<Value, String> {
     if env.instance_id.is_empty() {
-        error!("INSTANCE_ID env var is empty — cannot guard instance");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "INSTANCE_ID env var is empty — cannot guard instance"
+        );
         return Ok(json!({"ok": false, "reason": "missing INSTANCE_ID"}));
     }
     if env.alerts_topic_arn.is_empty() {
-        error!("ALERTS_TOPIC_ARN env var is empty — cannot page operator");
+        error!(
+            code = "LAMBDA-CONFIG-01",
+            "ALERTS_TOPIC_ARN env var is empty — cannot page operator"
+        );
         return Ok(json!({"ok": false, "reason": "missing ALERTS_TOPIC_ARN"}));
     }
 
@@ -529,20 +1050,59 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
         state.as_str(),
         "stopped" | "stopping" | "shutting-down" | "terminated"
     ) {
-        info!(instance = %env.instance_id, state = %state, "already stopped, no-op");
-        return Ok(json!({"ok": true, "noop": true, "state": state}));
+        let released = release_expired_budget_stop(env, sns, events, ssm, now_utc).await;
+        // Audit B2 finding 10 (2026-11-13): a budget stop recorded while the
+        // box was already stopped also keeps the morning start off.
+        let held = hold_current_month_budget_stop(env, events, budgets, ssm, now_utc).await;
+        info!(instance = %env.instance_id, state = %state, released, held, "already stopped, no-op");
+        return Ok(
+            json!({"ok": true, "noop": true, "state": state, "released": released, "held": held}),
+        );
     }
 
-    if in_up_window(now_utc) {
+    // Plan item J8: a configured Muhurat session window (a weekend or evening
+    // session) counts as in-window, so the guard runs the same budget check
+    // and never schedule-stops the box during the session.
+    if in_up_window(now_utc)
+        || crate::muhurat_window::in_muhurat_up_window_raw(now_utc, &env.muhurat_sessions)
+    {
         // Running DURING the trading window — expected. GAP 1 check first:
         // even in-window, a breached budget stops the box + kills the
         // morning restart. The breach stop is evaluated BEFORE any ping
         // state read — it can NEVER be gated on ping-state problems.
-        let usd = mtd_usd(ce, now_utc).await;
+        //
+        // 2026-09-23 (operator Quote 23): every kill decision, ping and
+        // breach message below uses the EFFECTIVE line for this UTC billing
+        // month: $150 since the 2026-10-01 revert (it was $225 in September
+        // 2026 only), $170 since operator Quote 30 (2026-10-13). Shadowing
+        // `env` makes it impossible for one branch to read the raw value.
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let env = &effective_env;
+        // 2026-11-16: `freshness` (data age + labelled estimate) is logged
+        // and added to the result only; `action` reads `usd` alone.
+        let (usd, freshness) = mtd_reading(budgets, env.budget_kill_usd, now_utc).await;
         let action = classify_in_window_action(usd, env.budget_kill_usd);
         if action == "breach_stop" {
             // breach_stop implies usd is Some; 0.0 fallback is unreachable.
-            return execute_breach_stop(env, ec2, sns, events, usd.unwrap_or(0.0), &state).await;
+            return execute_breach_stop(
+                env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await
+            .map(|out| freshness.annotated(out));
         }
 
         // 2026-07-09 (operator escalation — Telegram noise N2): the running
@@ -575,8 +1135,15 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
             state_saved = save_ping_state(ssm, &env.ping_state_param, &new_state).await;
         }
         let bucket = new_state.get("bucket").and_then(Value::as_i64).unwrap_or(0);
-        info!(action, reason, bucket, "in-window budget check");
-        return Ok(json!({
+        info!(
+            action,
+            reason,
+            bucket,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            "in-window budget check (estimated_spend_now_usd is an estimate, not acted on)"
+        );
+        let out = json!({
             "ok": true,
             "noop": true,
             "in_window": true,
@@ -584,12 +1151,166 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
             "budget_action": action,
             "ping_reason": reason,
             "state_saved": state_saved,
+        });
+        return Ok(freshness.annotated(out));
+    }
+
+    // Running OUTSIDE the up-window. Before force-stopping, honour the two
+    // exemptions the start-watchdog's curfew already honours — and until
+    // 2026-09-08 this guard did NOT, so an operator who set the keep-alive
+    // marker and started the box for evening work had it stopped by THIS
+    // Lambda within the hour while the curfew correctly left it alone. Two
+    // guards over the same box that disagree on the exemption is one guard
+    // that ignores it.
+    //
+    // 1. The keep-alive marker: an explicit, timed operator override.
+    if let Some(until) = read_keep_alive_until(ssm, &env.keep_alive_param).await
+        && now_utc < until
+    {
+        info!(
+            keep_alive_until = %until,
+            "out-of-window guard — keep-alive override active; leaving the box alone"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "keep_alive"
+        }));
+    }
+    // 1b. The drain hold (operator Quote 31, 2026-10-21): the app keeps the
+    //     box up after the close until the day's data is in the database.
+    //     Read HERE only, after the in-window budget path above has returned.
+    //     Never honoured from 07:30 IST to 16:25 IST (`drain_hold`).
+    //
+    //     The budget stop is NEVER gated on the hold (Quote 31 REJECT row):
+    //     before honouring a hold, run the SAME budget evaluation the
+    //     in-window arm runs, with the same effective ceiling, and on a
+    //     breach take the same breach stop (stop, latch, disable the start
+    //     rule, page). A spend-lookup error keeps the in-window fail-safe
+    //     posture: never stop on it, so the hold is then honoured.
+    let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now_utc).await;
+    if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let (usd, freshness) = mtd_reading(budgets, effective_env.budget_kill_usd, now_utc).await;
+        let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
+        if action == "breach_stop" {
+            // breach_stop implies usd is Some; 0.0 fallback is unreachable.
+            return execute_breach_stop(
+                &effective_env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await
+            .map(|out| freshness.annotated(out));
+        }
+        info!(
+            until_unix,
+            budget_action = action,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            "out-of-window guard — drain hold active, budget not breached; leaving the box alone"
+        );
+        let out = json!({
+            "ok": true, "noop": true, "state": state, "skipped": "drain_hold",
+            "budget_action": action
+        });
+        return Ok(freshness.annotated(out));
+    }
+    // 1c. The pre-open slot, Mon-Fri 08:00-08:30 IST (audit B2 follow-up,
+    //     2026-11-13). The start watchdog's curfew treats it as operating
+    //     hours (`start_watchdog::is_within_operating_hours`, which opens at
+    //     its 08:00 constant), so a box running here is not one this guard
+    //     may schedule-stop either. The guard used to fire at minute 0 and
+    //     had no run in this slot; at minute 50 it runs at 08:20 IST and
+    //     stopped a box started around 07:10 IST, which the 08:30 rule then
+    //     booted again. Same budget check as the drain hold above: a breach
+    //     still stops (the budget stop is never gated on an exemption).
+    //     Only a box launched on THIS IST date is exempt (B2 review round 5,
+    //     `launched_on_this_ist_date`): one left running from an earlier
+    //     date (drain hold overnight, failed 07:35 curfew run) falls through
+    //     to the out-of-window stop below, as the old 07:30 IST run did.
+    if crate::start_watchdog::is_within_operating_hours(now_utc)
+        && launched_on_this_ist_date(inst.launch_time, now_utc)
+    {
+        let effective_env = GuardEnv {
+            budget_kill_usd: effective_budget_kill_usd(
+                env.budget_kill_usd,
+                now_utc.year(),
+                now_utc.month(),
+            ),
+            ..env.clone()
+        };
+        let (usd, freshness) = mtd_reading(budgets, effective_env.budget_kill_usd, now_utc).await;
+        let action = classify_in_window_action(usd, effective_env.budget_kill_usd);
+        if action == "breach_stop" {
+            return execute_breach_stop(
+                &effective_env,
+                ec2,
+                sns,
+                events,
+                ssm,
+                usd.unwrap_or(0.0),
+                &state,
+                now_utc,
+            )
+            .await
+            .map(|out| freshness.annotated(out));
+        }
+        info!(
+            budget_action = action,
+            budget_data_age_hours = freshness.age_hours(),
+            estimated_spend_now_usd = freshness.estimated_spend_now_usd,
+            "out-of-window guard: curfew operating hours (pre-open); leaving the box alone"
+        );
+        let out = json!({
+            "ok": true, "noop": true, "state": state, "skipped": "pre_open",
+            "budget_action": action
+        });
+        return Ok(freshness.annotated(out));
+    }
+    // 2. Launch grace: a box started minutes ago is a deliberate manual
+    //    start still being used, not a 16:30 stop that failed. The same
+    //    grace the curfew uses, so the two guards cannot disagree on it.
+    if let Some(launch_time) = inst.launch_time
+        && now_utc.signed_duration_since(launch_time)
+            < Duration::minutes(OUT_OF_WINDOW_START_GRACE_MINUTES)
+    {
+        info!(
+            launch_time = %launch_time,
+            grace_minutes = OUT_OF_WINDOW_START_GRACE_MINUTES,
+            "out-of-window guard — fresh manual start inside the grace window; not stopping"
+        );
+        return Ok(json!({
+            "ok": true, "noop": true, "state": state, "skipped": "grace"
         }));
     }
 
-    // Running OUTSIDE the up-window — force stop + alert (the legacy
-    // never-cross guard, unchanged by GAP 1).
+    // Force stop + alert (the legacy never-cross guard, unchanged by GAP 1).
+    // A failed stop returns the error here (unchanged), so only a SUCCESSFUL
+    // stop can reach the silent branch below.
     ec2.stop_instances(&env.instance_id).await?;
+    if drain_hold.silences_stop_of(inst.launch_time.map(|t| t.timestamp())) {
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended: the expected end of the evening
+        // drain, so no page.
+        info!(
+            was_state = %state,
+            "out-of-window guard — drain hold ended; stopped without a page"
+        );
+        return Ok(json!({
+            "ok": true, "noop": false, "was_state": state, "drain_hold": "ended"
+        }));
+    }
     sns.publish(
         &env.alerts_topic_arn,
         "[BUDGET] hard auto-stop guard fired",
@@ -598,7 +1319,7 @@ pub async fn run_guard<E: Ec2Api, N: SnsApi, V: EventsApi, C: CeApi, P: SsmApi>(
 _instance_: `{}`\n\
 _was_state_: {state}\n\
 Hourly out-of-window guard found the box running OUTSIDE the\n\
-08:30-17:30 IST Mon-Fri window. EventBridge 17:30 stop (or a\n\
+08:30-16:30 IST Mon-Fri window. EventBridge 16:30 stop (or a\n\
 manual start) left it up. Now stopped to protect the budget.\n",
             env.instance_id
         ),
@@ -684,40 +1405,36 @@ impl EventsApi for SdkEvents {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-}
 
-pub struct SdkCe {
-    client: aws_sdk_costexplorer::Client,
-}
-
-impl CeApi for SdkCe {
-    async fn unblended_amounts(&self, start: &str, end: &str) -> Result<Vec<String>, String> {
-        let interval = aws_sdk_costexplorer::types::DateInterval::builder()
-            .start(start)
-            .end(end)
-            .build()
-            .map_err(|e| e.to_string())?;
-        let r = self
-            .client
-            .get_cost_and_usage()
-            .time_period(interval)
-            .granularity(aws_sdk_costexplorer::types::Granularity::Monthly)
-            .metrics("UnblendedCost")
+    async fn enable_rule(&self, name: &str) -> Result<(), String> {
+        self.client
+            .enable_rule()
+            .name(name)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let mut out = Vec::with_capacity(r.results_by_time().len());
-        for period in r.results_by_time() {
-            // Legacy `d["Total"]["UnblendedCost"]["Amount"]` — a missing key
-            // raises inside mtd_usd's blanket catch -> None; Err mirrors it.
-            let amount = period
-                .total()
-                .and_then(|t| t.get("UnblendedCost"))
-                .and_then(|m| m.amount())
-                .ok_or_else(|| "missing Total.UnblendedCost.Amount".to_string())?;
-            out.push(amount.to_string());
-        }
-        Ok(out)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The live AWS Budgets leg (plan item 63, Quote 37): one free
+/// `budgets:DescribeBudget` per hourly invoke on the budget named by
+/// `BUDGET_NAME` in account `BUDGET_ACCOUNT_ID`. Missing coordinates are an
+/// error (unknown spend: page, never stop).
+pub struct SdkBudgets {
+    client: aws_sdk_budgets::Client,
+    coords: Result<crate::budget_spend::BudgetCoordinates, String>,
+}
+
+impl BudgetsApi for SdkBudgets {
+    async fn actual_spend_usd(&self) -> Result<f64, String> {
+        let coords = self.coords.as_ref().map_err(Clone::clone)?;
+        crate::budget_spend::describe_actual_spend(&self.client, coords).await
+    }
+
+    async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+        let coords = self.coords.as_ref().map_err(Clone::clone)?;
+        crate::budget_spend::describe_spend_reading(&self.client, coords).await
     }
 }
 
@@ -769,13 +1486,14 @@ pub async fn handle(_event: Value) -> Result<Value, Error> {
     let events = SdkEvents {
         client: crate::clients::eventbridge(&config),
     };
-    let ce = SdkCe {
-        client: crate::clients::cost_explorer_us_east_1().await,
+    let budgets = SdkBudgets {
+        client: crate::clients::budgets_us_east_1().await,
+        coords: crate::budget_spend::budget_coordinates_from_env(),
     };
     let ssm = SdkSsm {
         client: crate::clients::ssm(&config),
     };
-    run_guard(&env, &ec2, &sns, &events, &ce, &ssm, Utc::now())
+    run_guard(&env, &ec2, &sns, &events, &budgets, &ssm, Utc::now())
         .await
         .map_err(Error::from)
 }
@@ -797,7 +1515,7 @@ mod tests {
             .expect("valid test timestamp")
     }
 
-    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-17:30).
+    // 2026-07-07 is a Tuesday. 04:30 UTC = 10:00 IST (inside 08:30-16:30).
     fn in_window() -> DateTime<Utc> {
         utc(2026, 7, 7, 4, 30)
     }
@@ -812,15 +1530,32 @@ mod tests {
 
     struct FakeEc2 {
         state: String,
+        /// The LaunchTime the fake reports. The legacy default is
+        /// 2026-07-07 03:00 UTC; grace tests override it so `now` can sit
+        /// inside or outside the start-grace window deliberately.
+        launch_time: DateTime<Utc>,
         stopped: RefCell<Vec<Vec<String>>>,
+        /// When set, `stop_instances` fails (an AccessDenied-style refusal).
+        stop_fails: bool,
     }
 
     impl FakeEc2 {
         fn new(state: &str) -> Self {
+            Self::launched_at(state, utc(2026, 7, 7, 3, 0))
+        }
+
+        fn launched_at(state: &str, launch_time: DateTime<Utc>) -> Self {
             Self {
                 state: state.to_string(),
+                launch_time,
                 stopped: RefCell::new(Vec::new()),
+                stop_fails: false,
             }
+        }
+
+        fn stop_failing(mut self) -> Self {
+            self.stop_fails = true;
+            self
         }
     }
 
@@ -828,12 +1563,14 @@ mod tests {
         async fn describe(&self, _instance_id: &str) -> Result<Option<GuardInstance>, String> {
             Ok(Some(GuardInstance {
                 state: self.state.clone(),
-                // Legacy fake: LaunchTime = 2026-07-07 03:00 UTC.
-                launch_time: Some(utc(2026, 7, 7, 3, 0)),
+                launch_time: Some(self.launch_time),
             }))
         }
 
         async fn stop_instances(&self, instance_id: &str) -> Result<(), String> {
+            if self.stop_fails {
+                return Err("UnauthorizedOperation".to_string());
+            }
             self.stopped
                 .borrow_mut()
                 .push(vec![instance_id.to_string()]);
@@ -869,6 +1606,7 @@ mod tests {
     struct FakeEvents {
         fail: bool,
         disabled: RefCell<Vec<String>>,
+        enabled: RefCell<Vec<String>>,
     }
 
     impl FakeEvents {
@@ -876,12 +1614,13 @@ mod tests {
             Self {
                 fail: false,
                 disabled: RefCell::new(Vec::new()),
+                enabled: RefCell::new(Vec::new()),
             }
         }
         fn failing() -> Self {
             Self {
                 fail: true,
-                disabled: RefCell::new(Vec::new()),
+                ..Self::new()
             }
         }
     }
@@ -894,18 +1633,26 @@ mod tests {
             self.disabled.borrow_mut().push(name.to_string());
             Ok(())
         }
+
+        async fn enable_rule(&self, name: &str) -> Result<(), String> {
+            if self.fail {
+                return Err("AccessDeniedException".to_string());
+            }
+            self.enabled.borrow_mut().push(name.to_string());
+            Ok(())
+        }
     }
 
-    /// Cost Explorer fake — returns a fixed MTD or raises.
-    struct FakeCe {
+    /// AWS Budgets fake — returns a fixed month-to-date spend or fails.
+    struct FakeBudgets {
         amount: Option<f64>,
     }
 
-    impl CeApi for FakeCe {
-        async fn unblended_amounts(&self, _start: &str, _end: &str) -> Result<Vec<String>, String> {
+    impl BudgetsApi for FakeBudgets {
+        async fn actual_spend_usd(&self) -> Result<f64, String> {
             match self.amount {
-                Some(a) => Ok(vec![format!("{a}")]),
-                None => Err("CE throttled".to_string()),
+                Some(a) => Ok(a),
+                None => Err("budgets:DescribeBudget throttled".to_string()),
             }
         }
     }
@@ -913,8 +1660,12 @@ mod tests {
     /// SSM fake for the change-only ping state (2026-07-09). read_fail /
     /// write_fail simulate outages; EVERY call is recorded so the
     /// breach-path test can prove SSM was never touched.
+    ///
+    /// Keyed on the parameter NAME since 2026-10-21, so the ping state, the
+    /// keep-alive, the budget-stop latch and the drain hold are distinct: a
+    /// value set for one is never what another read receives.
     struct FakeSsm {
-        value: RefCell<Option<String>>,
+        values: RefCell<std::collections::HashMap<String, String>>,
         read_fail: bool,
         write_fail: bool,
         reads: RefCell<u32>,
@@ -922,37 +1673,58 @@ mod tests {
     }
 
     impl FakeSsm {
-        fn new(value: Option<&str>) -> Self {
+        /// No parameter exists (every read is ParameterNotFound).
+        fn empty() -> Self {
             Self {
-                value: RefCell::new(value.map(str::to_string)),
+                values: RefCell::new(std::collections::HashMap::new()),
                 read_fail: false,
                 write_fail: false,
                 reads: RefCell::new(0),
                 writes: RefCell::new(Vec::new()),
             }
         }
-        fn read_failing(value: Option<&str>) -> Self {
+        fn set(self, name: &str, value: &str) -> Self {
+            self.put_value(name, value);
+            self
+        }
+        fn put_value(&self, name: &str, value: &str) {
+            self.values
+                .borrow_mut()
+                .insert(name.to_string(), value.to_string());
+        }
+        fn keep_alive(self, value: &str) -> Self {
+            self.set(crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM, value)
+        }
+        fn drain_hold(self, value: &str) -> Self {
+            self.set(crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM, value)
+        }
+        /// Every read fails; `ping_state` is the value a read would have
+        /// returned (proving the failure, not an absence, is what is seen).
+        fn read_failing(ping_state: &str) -> Self {
             Self {
                 read_fail: true,
-                ..Self::new(value)
+                ..Self::empty().set(DEFAULT_PING_STATE_PARAM, ping_state)
             }
         }
         fn write_failing() -> Self {
             Self {
                 write_fail: true,
-                ..Self::new(None)
+                ..Self::empty()
             }
         }
     }
 
     impl SsmApi for FakeSsm {
-        async fn get_parameter(&self, _name: &str) -> Result<String, String> {
+        async fn get_parameter(&self, name: &str) -> Result<String, String> {
             *self.reads.borrow_mut() += 1;
-            let value = self.value.borrow().clone();
-            match value {
-                Some(v) if !self.read_fail => Ok(v),
-                _ => Err("ParameterNotFound".to_string()),
+            if self.read_fail {
+                return Err("AccessDenied".to_string());
             }
+            self.values
+                .borrow()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "ParameterNotFound".to_string())
         }
 
         async fn put_parameter(&self, _name: &str, value: &str) -> Result<(), String> {
@@ -964,18 +1736,6 @@ mod tests {
         }
     }
 
-    /// An SSM client whose ANY use panics — proves a path never touches it.
-    struct ExplodingSsm;
-
-    impl SsmApi for ExplodingSsm {
-        async fn get_parameter(&self, name: &str) -> Result<String, String> {
-            panic!("SSM must never be used on this path: get_parameter {name}");
-        }
-        async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
-            panic!("SSM must never be used on this path: put_parameter {name}");
-        }
-    }
-
     fn test_env() -> GuardEnv {
         GuardEnv {
             instance_id: "i-tvapp".to_string(),
@@ -983,6 +1743,10 @@ mod tests {
             start_rule_name: "tv-prod-daily-start".to_string(),
             budget_kill_usd: 55.0,
             ping_state_param: DEFAULT_PING_STATE_PARAM.to_string(),
+            keep_alive_param: crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM.to_string(),
+            budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
+            drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
+            muhurat_sessions: String::new(),
         }
     }
 
@@ -1042,25 +1806,26 @@ mod tests {
     }
 
     #[test]
-    fn test_1730_ist_is_in_and_1731_is_out() {
-        // 12:00 UTC = 17:30 IST; 12:01 UTC = 17:31 IST (Tuesday).
-        assert!(in_up_window(utc(2026, 7, 7, 12, 0)));
-        assert!(!in_up_window(utc(2026, 7, 7, 12, 1)));
-        // 2026-08-08 (Quote 14) regression pin: the OLD close was 16:30 IST
-        // (11:00 UTC). It must now be INSIDE the window — if this flips back,
-        // the hourly guard force-stops the box an hour before its schedule.
+    fn test_1630_ist_is_in_and_1631_is_out() {
+        // 2026-10-22 (Quote 37, plan item 64): the close moved back to 16:30.
+        // 11:00 UTC = 16:30 IST; 11:01 UTC = 16:31 IST (Tuesday).
+        assert_eq!(UP_WINDOW_CLOSE_IST_HHMM, 1630);
         assert!(in_up_window(utc(2026, 7, 7, 11, 0)));
-        assert!(in_up_window(utc(2026, 7, 7, 11, 1)));
+        assert!(!in_up_window(utc(2026, 7, 7, 11, 1)));
+        // 17:30 IST (the close from 2026-08-08 to 2026-10-22) is now OUT, so
+        // the hourly guard is the backstop for a missed 16:30 stop.
+        assert!(!in_up_window(utc(2026, 7, 7, 12, 0)));
     }
 
-    // --- MtdUsd ------------------------------------------------------------
+    // --- MtdUsd (AWS Budgets since 2026-10-22, plan item 63) ---------------
 
     #[tokio::test]
-    async fn test_returns_sum_from_ce() {
+    async fn test_mtd_usd_returns_the_budgets_spend() {
         let got = mtd_usd(
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
+            170.0,
             in_window(),
         )
         .await;
@@ -1068,12 +1833,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_returns_none_on_ce_error() {
+    async fn test_mtd_usd_returns_none_on_budgets_error() {
         assert!(
-            mtd_usd(&FakeCe { amount: None }, in_window())
+            mtd_usd(&FakeBudgets { amount: None }, 170.0, in_window())
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_mtd_usd_refuses_nan_infinite_and_negative_spend() {
+        // The old Cost Explorer parse accepted "NaN": every `spend >= line`
+        // compare is false with NaN, so it could never stop the box.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+            assert!(
+                mtd_usd(&FakeBudgets { amount: Some(bad) }, 170.0, in_window())
+                    .await
+                    .is_none(),
+                "{bad} must read as unknown spend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mtd_usd_first_utc_day_reading_at_or_above_the_line_is_unknown() {
+        // 1 Nov 04:30 UTC: a Budgets reply has no month stamp, so $160 may be
+        // October's total. Unknown, never a stop.
+        let day1 = utc(2026, 11, 1, 4, 30);
+        assert!(
+            mtd_usd(
+                &FakeBudgets {
+                    amount: Some(160.0)
+                },
+                75.0,
+                day1
+            )
+            .await
+            .is_none()
+        );
+        // Below the line on day 1 is used as is.
+        let low = mtd_usd(&FakeBudgets { amount: Some(2.0) }, 75.0, day1).await;
+        assert_eq!(low, Some(2.0));
+        // 2026-10-26 (audit PR L4): day 2 is distrusted too (Monday 2 Nov
+        // could still show October's total); this asserted day 2 trusted.
+        let day2 = utc(2026, 11, 2, 4, 30);
+        let day2_high = mtd_usd(
+            &FakeBudgets {
+                amount: Some(160.0),
+            },
+            75.0,
+            day2,
+        )
+        .await;
+        assert_eq!(day2_high, None);
+        // From day 3 the same reading is trusted.
+        let day3 = utc(2026, 11, 3, 4, 30);
+        let high = mtd_usd(
+            &FakeBudgets {
+                amount: Some(160.0),
+            },
+            75.0,
+            day3,
+        )
+        .await;
+        assert_eq!(high, Some(160.0));
+    }
+
+    #[tokio::test]
+    async fn test_first_utc_day_breach_reading_pages_cost_unknown_and_never_stops() {
+        // 1 Dec 2026 is a Tuesday; 04:30 UTC = 10:00 IST, inside the window
+        // (1 Nov 2026 is a Sunday, outside it).
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &test_env(),
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(500.0),
+            },
+            &ssm,
+            utc(2026, 12, 1, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_eq!(out["budget_action"], json!("cost_unknown"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
     }
 
     // --- LambdaHandlerEnvGuards --------------------------------------------
@@ -1089,8 +1940,8 @@ mod tests {
             &FakeEc2::new("running"),
             &FakeSns::default(),
             &FakeEvents::new(),
-            &FakeCe { amount: Some(1.0) },
-            &FakeSsm::new(None),
+            &FakeBudgets { amount: Some(1.0) },
+            &FakeSsm::empty(),
             in_window(),
         )
         .await
@@ -1110,8 +1961,8 @@ mod tests {
             &FakeEc2::new("running"),
             &FakeSns::default(),
             &FakeEvents::new(),
-            &FakeCe { amount: Some(1.0) },
-            &FakeSsm::new(None),
+            &FakeBudgets { amount: Some(1.0) },
+            &FakeSsm::empty(),
             in_window(),
         )
         .await
@@ -1131,7 +1982,7 @@ mod tests {
         ec2: &FakeEc2,
         sns: &FakeSns,
         events: &FakeEvents,
-        ce: &FakeCe,
+        ce: &FakeBudgets,
         now: DateTime<Utc>,
         ssm: &FakeSsm,
     ) -> Value {
@@ -1147,12 +1998,12 @@ mod tests {
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             in_window(),
@@ -1161,6 +2012,11 @@ mod tests {
         .await;
         assert_eq!(out["breach"], json!(true));
         assert_eq!(out["disable_ok"], json!(true));
+        assert_eq!(out["latch_ok"], json!(true));
+        // Audit PR30: the breach latches this UTC billing month, and the
+        // breach path only WRITES SSM (no ping-state read).
+        assert_eq!(*ssm.writes.borrow(), vec!["2026-07".to_string()]);
+        assert_eq!(*ssm.reads.borrow(), 0);
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         assert_eq!(
             *events.disabled.borrow(),
@@ -1172,12 +2028,13 @@ mod tests {
         assert!(msg.contains("Budget breached"));
         assert!(msg.contains("auto-start DISABLED"));
         assert!(msg.contains("aws events enable-rule --name tv-prod-daily-start"));
-        // Byte-exact legacy-oracle parity (rendered by RUNNING
+        // Byte-exact message. It began as legacy-oracle parity (rendered by RUNNING
         // `_execute_breach_stop` from handler.py @ 9b1c2e6a1^ with the same
         // inputs: INSTANCE_ID=i-tvapp, START_RULE_NAME=tv-prod-daily-start,
         // BUDGET_KILL_USD=55, mtd=57.31, was_state=running, disable ok).
         // Fix round F1: the 2-space indent before the enable-rule command
         // must survive — a `\n\` source continuation stripped it.
+        // Audit PR30 added the latch line and the delete-parameter step.
         assert_eq!(
             msg.as_str(),
             "🛑 *Budget breached — box stopped + morning auto-start DISABLED \
@@ -1186,11 +2043,16 @@ _instance_: `i-tvapp`\n\
 _was_state_: running\n\
 _MTD spend_: ~$57.31 >= $55 stop-budget\n\
 Morning auto-start rule `tv-prod-daily-start` DISABLED.\n\
+Budget-stop latch set for 2026-07 (UTC billing month): the 8:45 AM rescue, \
+the autopilot and the terraform apply will not restart the box until the \
+next billing month starts.\n\
 Why: the native AWS Budget stop-actions fire only ONCE per\n\
 month-crossing. Without disabling the start rule, tomorrow's\n\
 8:30 AM auto-start would restart the box and it would run\n\
 every day for the rest of the month, unkilled.\n\
-After investigating the spend, re-enable with:\n  aws events enable-rule --name tv-prod-daily-start\n"
+After investigating the spend, clear the latch and re-enable with:\n  \
+aws ssm delete-parameter --name /tickvault-guard/prod/budget-stop-month\n  \
+aws events enable-rule --name tv-prod-daily-start\n"
         );
         assert!(published[0].subject.chars().count() <= 99);
     }
@@ -1204,12 +2066,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(31.20),
             },
             in_window(),
@@ -1230,12 +2092,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         );
         // Hour 2, same bucket -> silent, no extra write.
         let seeded = ssm.writes.borrow().last().expect("seeded").clone();
-        *ssm.value.borrow_mut() = Some(seeded);
+        ssm.put_value(DEFAULT_PING_STATE_PARAM, &seeded);
         let out2 = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(32.50),
             },
             in_window(),
@@ -1258,12 +2120,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: None },
+            &FakeBudgets { amount: None },
             in_window(),
             &ssm,
         )
@@ -1271,7 +2133,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         assert_eq!(out["noop"], json!(true));
         assert_eq!(out["budget_action"], json!("cost_unknown"));
         assert_eq!(out["ping_reason"], json!("ping_cost_unknown_edge"));
-        // FAIL-SAFE: no stop, no disable on a Cost Explorer failure.
+        // FAIL-SAFE: no stop, no disable on a spend-lookup failure.
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
         assert_eq!(sns.published.borrow().len(), 1);
@@ -1282,12 +2144,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     async fn test_disable_failure_still_stops_and_pages_honestly() {
         let (ec2, sns) = (FakeEc2::new("running"), FakeSns::default());
         let events = FakeEvents::failing();
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(60.0) },
+            &FakeBudgets { amount: Some(60.0) },
             in_window(),
             &ssm,
         )
@@ -1307,12 +2169,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             out_of_window(),
@@ -1330,6 +2192,302 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         );
     }
 
+    /// 2026-09-08: an operator keep-alive marker that has not yet expired
+    /// stops the out-of-window force-stop, exactly as it stops the curfew.
+    /// The FakeSsm is keyed on the parameter name, so the marker is set on
+    /// the keep-alive parameter `read_keep_alive_until` reads.
+    #[tokio::test]
+    async fn test_out_of_window_keep_alive_override_leaves_the_box_running() {
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        // out_of_window() is 2026-07-07 14:00 UTC; the marker runs to 18:00.
+        let ssm = FakeSsm::empty().keep_alive("2026-07-07T18:00:00Z");
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            out_of_window(),
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["skipped"], json!("keep_alive"));
+        assert!(
+            ec2.stopped.borrow().is_empty(),
+            "keep-alive must prevent the stop"
+        );
+        assert!(
+            sns.published.borrow().is_empty(),
+            "no page for a deliberate late run"
+        );
+    }
+
+    /// An EXPIRED marker is no marker: the stop still lands.
+    #[tokio::test]
+    async fn test_out_of_window_expired_keep_alive_still_stops() {
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().keep_alive("2026-07-07T13:00:00Z");
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            out_of_window(),
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// A box launched inside the grace window is a manual start still in
+    /// use, not a failed 16:30 stop — left alone, exactly as the curfew does.
+    /// Saturday 2026-07-04 03:20 UTC (08:50 IST) is out of window; the fake
+    /// reports a launch 20 minutes earlier, inside the 45-minute grace.
+    #[tokio::test]
+    async fn test_out_of_window_fresh_launch_inside_grace_is_not_stopped() {
+        let now = utc(2026, 7, 4, 3, 20);
+        let launched = now - Duration::minutes(20);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(
+            out["noop"],
+            json!(true),
+            "a 20-minute-old launch is inside grace"
+        );
+        assert_eq!(out["skipped"], json!("grace"));
+        assert!(
+            ec2.stopped.borrow().is_empty(),
+            "grace must never stop the box"
+        );
+        assert!(
+            sns.published.borrow().is_empty(),
+            "grace is silent — no page"
+        );
+    }
+
+    /// The grace is a WINDOW, not a flag: one minute past it the same box
+    /// on the same Saturday is stopped. Pins the boundary from the other side
+    /// so the constant cannot silently become "never stop a manual start".
+    #[tokio::test]
+    async fn test_out_of_window_launch_past_grace_is_stopped() {
+        let now = utc(2026, 7, 4, 3, 20);
+        let launched = now - Duration::minutes(OUT_OF_WINDOW_START_GRACE_MINUTES + 1);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(
+            out["noop"],
+            json!(false),
+            "one minute past grace has no grace"
+        );
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// Audit B2 follow-up (2026-11-13): the guard's minute-50 run at 08:20
+    /// IST on a weekday is inside the curfew's operating hours. A box started
+    /// at 07:10 IST (past the launch grace by then) must not be stopped or
+    /// paged; the 08:30 window opens ten minutes later.
+    #[tokio::test]
+    async fn test_pre_open_slot_leaves_an_early_started_box_alone() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        let launched = utc(2026, 11, 10, 1, 40); // Tue 07:10 IST
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        assert!(!in_up_window(now));
+        assert!(crate::start_watchdog::is_within_operating_hours(now));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["skipped"], json!("pre_open"));
+        assert!(ec2.stopped.borrow().is_empty(), "not stopped");
+        assert!(sns.published.borrow().is_empty(), "not paged");
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    /// The pre-open exemption never gates the budget stop: over the line, the
+    /// 08:20 IST run still takes the breach stop.
+    #[tokio::test]
+    async fn test_pre_open_slot_still_takes_a_budget_breach_stop() {
+        let now = utc(2026, 11, 10, 2, 50);
+        let launched = utc(2026, 11, 10, 1, 40);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(1_000.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// Outside the pre-open slot nothing changed: 07:50 IST on the same
+    /// weekday still stops a box past its launch grace.
+    #[tokio::test]
+    async fn test_before_the_curfew_open_still_stops() {
+        let now = utc(2026, 11, 10, 2, 20); // Tue 07:50 IST
+        let launched = utc(2026, 11, 10, 1, 0);
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    /// Audit B2 review round 5 (2026-11-13): the pre-open exemption is only
+    /// for a box launched this IST morning. A box launched the previous
+    /// morning and kept up overnight by the drain hold (written until 07:29
+    /// IST), whose 07:35 IST curfew stop failed, must still be stopped by the
+    /// 08:20 IST run, as the old 07:30 IST run did. With 1c exempting any
+    /// running box it took the `pre_open` arm and yesterday's process ran the
+    /// session.
+    #[tokio::test]
+    async fn test_regression_pre_open_slot_stops_a_box_held_up_from_yesterday() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        let launched = utc(2026, 11, 9, 3, 0); // Mon 08:30 IST
+        let hold_until = utc(2026, 11, 10, 1, 59); // Tue 07:29 IST
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", launched),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            hold_until,
+            hold_until - Duration::minutes(5),
+        ));
+        assert!(crate::start_watchdog::is_within_operating_hours(now));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_ne!(out["skipped"], json!("pre_open"));
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    #[test]
+    fn test_launched_on_this_ist_date_uses_the_ist_calendar() {
+        let now = utc(2026, 11, 10, 2, 50); // Tue 08:20 IST
+        // Tue 00:00 IST = Mon 18:30 UTC: same IST date.
+        assert!(launched_on_this_ist_date(
+            Some(utc(2026, 11, 9, 18, 30)),
+            now
+        ));
+        // Mon 23:59 IST = Mon 18:29 UTC: the earlier IST date.
+        assert!(!launched_on_this_ist_date(
+            Some(utc(2026, 11, 9, 18, 29)),
+            now
+        ));
+        assert!(!launched_on_this_ist_date(None, now));
+    }
+
+    /// The two hourly guards over the same box must judge a manual start
+    /// by ONE grace. If the constants ever diverge, an operator's evening
+    /// start is left alone by one Lambda and stopped by the other.
+    #[test]
+    fn out_of_window_start_grace_matches_the_curfew_grace() {
+        assert_eq!(
+            OUT_OF_WINDOW_START_GRACE_MINUTES,
+            crate::start_watchdog::CURFEW_START_GRACE_MINUTES
+        );
+        const { assert!(OUT_OF_WINDOW_START_GRACE_MINUTES > 0) };
+    }
+
+    /// `read_keep_alive_until` is fail-CLOSED for the guard: an unreadable
+    /// or unparseable parameter is "no override", never a skip.
+    #[tokio::test]
+    async fn read_keep_alive_until_treats_missing_and_garbage_as_no_override() {
+        let missing = FakeSsm::empty();
+        assert!(
+            read_keep_alive_until(&missing, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM)
+                .await
+                .is_none()
+        );
+        let garbage = FakeSsm::empty().keep_alive("tomorrow-ish");
+        assert!(
+            read_keep_alive_until(&garbage, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM)
+                .await
+                .is_none()
+        );
+        let good = FakeSsm::empty().keep_alive("2026-07-07T18:00:00Z");
+        assert_eq!(
+            read_keep_alive_until(&good, crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM).await,
+            Some(utc(2026, 7, 7, 18, 0))
+        );
+    }
+
     #[tokio::test]
     async fn test_already_stopped_is_noop() {
         let (ec2, sns, events) = (
@@ -1337,12 +2495,12 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             FakeSns::default(),
             FakeEvents::new(),
         );
-        let ssm = FakeSsm::new(None);
+        let ssm = FakeSsm::empty();
         let out = run_scenario(
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
             in_window(),
@@ -1352,6 +2510,140 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         assert_eq!(out["noop"], json!(true));
         assert!(ec2.stopped.borrow().is_empty());
         assert!(events.disabled.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    fn stopped_with_latch(
+        latch: Option<&str>,
+    ) -> (FakeEc2, FakeSns, FakeEvents, FakeBudgets, FakeSsm) {
+        (
+            FakeEc2::new("stopped"),
+            FakeSns::default(),
+            FakeEvents::new(),
+            FakeBudgets { amount: Some(0.4) },
+            latch.map_or_else(FakeSsm::empty, |l| {
+                FakeSsm::empty().set(crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM, l)
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_re_enables_the_rule_once_in_the_new_month() {
+        // in_window() is in July; the latch names June.
+        let (ec2, sns, events, ce, ssm) = stopped_with_latch(Some("2026-06"));
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["released"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert_eq!(*events.enabled.borrow(), vec!["tv-prod-daily-start"]);
+        assert_eq!(*ssm.writes.borrow(), vec!["released-2026-06"]);
+        assert_eq!(sns.published.borrow().len(), 1);
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("budget stop from 2026-06 is released")
+        );
+
+        // The marker never releases again.
+        ssm.put_value(
+            crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM,
+            "released-2026-06",
+        );
+        let again = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(again["released"], json!(false));
+        assert_eq!(events.enabled.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_leaves_a_current_month_stop_alone() {
+        let (ec2, sns, events, ce, ssm) = stopped_with_latch(Some("2026-07"));
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(false));
+        assert!(events.enabled.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_release_expired_budget_stop_keeps_the_latch_when_the_enable_fails() {
+        let (ec2, sns, _, ce, ssm) = stopped_with_latch(Some("2026-06"));
+        let events = FakeEvents::failing();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(false));
+        // No marker: the next hourly run tries again.
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    /// Audit B2 finding 10: a budget crossing recorded while the box was
+    /// already stopped (the kill-switch wrote the latch, no breach stop ran)
+    /// must keep the morning auto-start off. Before the fix the stopped branch
+    /// returned without touching the rule, so 8:30 AM started the box.
+    #[tokio::test]
+    async fn test_regression_stopped_box_with_this_months_latch_keeps_the_start_rule_disabled() {
+        // in_window() is in July; the latch names July and spend is over.
+        let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-07"));
+        let ce = FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["held"], json!(true));
+        assert_eq!(*events.disabled.borrow(), vec!["tv-prod-daily-start"]);
+        assert!(events.enabled.borrow().is_empty());
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty(), "no page for the hold");
+    }
+
+    #[tokio::test]
+    async fn test_stopped_box_without_a_current_latch_leaves_the_start_rule_alone() {
+        // Audit B2 follow-up (2026-11-13): spend OVER the line, so only the
+        // latch check can keep the rule enabled (with the fixture's $0.40
+        // the spend check alone kept it, whatever the latch check did).
+        let over_the_line = || FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        for latch in [None, Some("released-2026-06"), Some("garbage")] {
+            let (ec2, sns, events, _, ssm) = stopped_with_latch(latch);
+            let ce = over_the_line();
+            let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+            assert_eq!(out["held"], json!(false), "latch {latch:?}");
+            assert!(events.disabled.borrow().is_empty(), "latch {latch:?}");
+        }
+        // An earlier month's latch is released, never held.
+        let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-06"));
+        let ce = over_the_line();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["released"], json!(true));
+        assert_eq!(out["held"], json!(false));
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    /// Audit B2 review (2026-11-13): a latch naming this month with spend
+    /// under the line (a late notice about last month dated into this one)
+    /// or unknown leaves the morning start alone.
+    #[tokio::test]
+    async fn test_regression_hold_needs_this_months_spend_over_the_line() {
+        for amount in [Some(0.4), None] {
+            let (ec2, sns, events, _, ssm) = stopped_with_latch(Some("2026-07"));
+            let ce = FakeBudgets { amount };
+            let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+            assert_eq!(out["held"], json!(false), "spend {amount:?}");
+            assert!(events.disabled.borrow().is_empty(), "spend {amount:?}");
+            assert!(sns.published.borrow().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hold_current_month_budget_stop_with_a_failing_disable_returns_false() {
+        let (ec2, sns, _, _, ssm) = stopped_with_latch(Some("2026-07"));
+        let ce = FakeBudgets {
+            amount: Some(1_000.0),
+        };
+        let events = FakeEvents::failing();
+        let out = run_scenario(&ec2, &sns, &events, &ce, in_window(), &ssm).await;
+        assert_eq!(out["held"], json!(false));
         assert!(sns.published.borrow().is_empty());
     }
 
@@ -1499,7 +2791,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     #[tokio::test]
     async fn test_ssm_read_failure_fails_open_to_ping() {
         // An unreadable state must PING (one ping beats a silent guard).
-        let ssm = FakeSsm::read_failing(Some(&state_json("2026-07", 6)));
+        let ssm = FakeSsm::read_failing(&state_json("2026-07", 6));
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -1509,7 +2801,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(33.4) },
+            &FakeBudgets { amount: Some(33.4) },
             in_window(),
             &ssm,
         )
@@ -1532,7 +2824,7 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(33.4) },
+            &FakeBudgets { amount: Some(33.4) },
             in_window(),
             &ssm,
         )
@@ -1543,9 +2835,22 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
     }
 
     #[tokio::test]
-    async fn test_breach_stop_ignores_ping_state() {
+    async fn test_execute_breach_stop_ignores_ping_state() {
         // RATCHET: the breach stop is evaluated BEFORE any state read — an
-        // SSM outage (or poisoned state) can never gate the stop.
+        // SSM outage (or poisoned state) can never gate the stop. Since
+        // audit PR30 the breach path WRITES the budget-stop latch; a read
+        // still panics here, and a failing write must not stop the stop,
+        // the disable or the page.
+        struct ReadExplodesWriteFails;
+        impl SsmApi for ReadExplodesWriteFails {
+            async fn get_parameter(&self, name: &str) -> Result<String, String> {
+                panic!("SSM must never be READ on the breach path: get_parameter {name}");
+            }
+            async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
+                assert_eq!(name, crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM);
+                Err("simulated SSM outage".to_string())
+            }
+        }
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -1556,15 +2861,23 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &ec2,
             &sns,
             &events,
-            &FakeCe {
+            &FakeBudgets {
                 amount: Some(57.31),
             },
-            &ExplodingSsm,
+            &ReadExplodesWriteFails,
             in_window(),
         )
         .await
         .expect("run_guard ok");
         assert_eq!(out["breach"], json!(true));
+        assert_eq!(out["latch_ok"], json!(false));
+        let published = sns.published.borrow();
+        assert_eq!(published.len(), 1);
+        assert!(
+            published[0]
+                .message
+                .contains("could NOT write the budget-stop latch")
+        );
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
         assert_eq!(
             *events.disabled.borrow(),
@@ -1572,9 +2885,28 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
         );
     }
 
+    /// The out-of-window arm reads the keep-alive marker and (since operator
+    /// Quote 31, 2026-10-21) the drain hold, and never writes. A read-only
+    /// SSM that fails both reads must fall through to the stop (fail-CLOSED:
+    /// an unreadable override is no override), and the write path must stay
+    /// untouched on this arm.
     #[tokio::test]
-    async fn test_out_of_window_force_stop_never_touches_ssm() {
-        // The legacy out-of-window arm is untouched — no state read/write.
+    async fn test_out_of_window_force_stop_reads_keep_alive_only_and_never_writes_ssm() {
+        struct ReadFailsWriteExplodes;
+        impl SsmApi for ReadFailsWriteExplodes {
+            async fn get_parameter(&self, name: &str) -> Result<String, String> {
+                assert!(
+                    name == crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM
+                        || name == crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM,
+                    "the only out-of-window reads are the keep-alive marker and \
+                     the drain hold, not {name}"
+                );
+                Err("simulated SSM outage".to_string())
+            }
+            async fn put_parameter(&self, name: &str, _value: &str) -> Result<(), String> {
+                panic!("SSM must never be WRITTEN on the out-of-window arm: {name}");
+            }
+        }
         let (ec2, sns, events) = (
             FakeEc2::new("running"),
             FakeSns::default(),
@@ -1585,13 +2917,1465 @@ After investigating the spend, re-enable with:\n  aws events enable-rule --name 
             &ec2,
             &sns,
             &events,
-            &FakeCe { amount: Some(10.0) },
-            &ExplodingSsm,
+            &FakeBudgets { amount: Some(10.0) },
+            &ReadFailsWriteExplodes,
             out_of_window(),
         )
         .await
         .expect("run_guard ok");
-        assert_eq!(out["noop"], json!(false));
+        assert_eq!(
+            out["noop"],
+            json!(false),
+            "an unreadable keep-alive is no override"
+        );
         assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+    }
+
+    // --- EffectiveBudgetKill (operator Quote 23, 2026-09-23) ---------------
+
+    #[test]
+    fn effective_ceiling_september_2026_keeps_the_allowance() {
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 9), 225.0);
+    }
+
+    #[test]
+    fn effective_ceiling_october_2026_keeps_the_configured_line() {
+        // Quote 33 (2026-10-21): October had spent $119.20 by the 20th, so the
+        // standing line ($62 since Quote 54) never applies to October.
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 10), 170.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2026, 8), 62.0);
+    }
+
+    #[test]
+    fn test_regression_classify_ping_decision_pings_once_when_the_line_moves_mid_month() {
+        // Regression: 2026-11-11 (PR 2221 review) — spend $46 was bucket 6
+        // against $75; against $90 it is bucket 5. A 1-step dip used to be
+        // silent and keep bucket 6, hiding the 60%-of-$90 message at $54.
+        let old = json!({"month": "2026-11", "bucket": 6, "outcome": "below_budget"});
+        let (reason, state) =
+            classify_ping_decision(Some(&old), "below_budget", Some(46.0), 90.0, "2026-11");
+        assert_eq!(reason, "ping_bucket_changed");
+        assert_eq!(state["bucket"], json!(5));
+        assert_eq!(state["line"], json!(90.0));
+        // Once the new line is saved, the usual hysteresis applies again.
+        let (reason, _) =
+            classify_ping_decision(Some(&state), "below_budget", Some(44.0), 90.0, "2026-11");
+        assert_eq!(reason, "silent");
+        let (reason, _) =
+            classify_ping_decision(Some(&state), "below_budget", Some(54.0), 90.0, "2026-11");
+        assert_eq!(reason, "ping_bucket_changed");
+        // Same line, same bucket: silent, as before.
+        let same =
+            json!({"month": "2026-11", "bucket": 5, "outcome": "below_budget", "line": 90.0});
+        let (reason, _) =
+            classify_ping_decision(Some(&same), "below_budget", Some(46.0), 90.0, "2026-11");
+        assert_eq!(reason, "silent");
+    }
+
+    #[test]
+    fn test_regression_classify_ping_decision_unrecorded_line_is_75_not_the_standing_line() {
+        // Regression: 2026-11-11 (Quote 54) — a state saved with no `line`
+        // field was saved against $75 by every build before PR 2222. The
+        // fallback used to read STANDING_BUDGET_KILL_USD, which became $62:
+        // a November state would then read as "line changed" against $90
+        // (still pings, by luck) and a December state saved against $75
+        // would read as unchanged against $62, so a 1-bucket dip after the
+        // line moved stayed silent and kept the stale bucket.
+        assert!((UNRECORDED_PING_LINE_USD - 75.0).abs() < f64::EPSILON);
+        assert!((UNRECORDED_PING_LINE_USD - STANDING_BUDGET_KILL_USD).abs() > f64::EPSILON);
+        // December 2026, legacy state at bucket 7 against $75 ($55 = 73%);
+        // against $62, $43 is bucket 6 (69%). The line moved, so it pings once.
+        let old = json!({"month": "2026-12", "bucket": 7, "outcome": "below_budget"});
+        let (reason, state) =
+            classify_ping_decision(Some(&old), "below_budget", Some(43.0), 62.0, "2026-12");
+        assert_eq!(reason, "ping_bucket_changed");
+        assert_eq!(state["bucket"], json!(6));
+        assert_eq!(state["line"], json!(62.0));
+        // A legacy state in a month the guard really ran at $75 and still
+        // runs at $75 (an explicit $75 configured value) keeps the hysteresis.
+        let (reason, _) =
+            classify_ping_decision(Some(&old), "below_budget", Some(48.0), 75.0, "2026-12");
+        assert_eq!(reason, "silent");
+        // Before November 2026 a legacy state is read as unchanged.
+        let oct = json!({"month": "2026-10", "bucket": 7, "outcome": "below_budget"});
+        let (reason, _) =
+            classify_ping_decision(Some(&oct), "below_budget", Some(120.0), 185.0, "2026-10");
+        assert_eq!(reason, "silent");
+    }
+
+    #[test]
+    fn test_regression_effective_ceiling_november_2026_is_the_140_dollar_line() {
+        // Regression: 2026-11-11 — November 2026 only is $90 (Quote 52), $140 since
+        // Quote 59 (2026-11-14); the
+        // standing line is $62 from December (Quote 54).
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 11), 140.0);
+        assert_eq!(
+            effective_budget_kill_usd(185.0, 2026, 11),
+            NOVEMBER_2026_KILL_USD
+        );
+        assert_eq!(effective_budget_kill_usd(170.0, 2027, 11), 62.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2026, 12), 62.0);
+        assert_eq!(effective_budget_kill_usd(170.0, 2027, 10), 62.0);
+    }
+
+    #[test]
+    fn test_quote54_standing_line_is_62_from_december_2026() {
+        // Operator Quote 54 (2026-11-11, owner card "Cap ₹5,500"): $62 a
+        // month, GST included, from 1 December 2026. November is $140 (Quote 59).
+        assert!((STANDING_BUDGET_KILL_USD - 62.0).abs() < f64::EPSILON);
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
+            62.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2027, 1),
+            62.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            140.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 10),
+            185.0
+        );
+    }
+
+    #[test]
+    fn effective_ceiling_other_years_september_is_still_clamped() {
+        // The allowance is one billing month, never "every September".
+        assert_eq!(effective_budget_kill_usd(225.0, 2027, 9), 62.0);
+        assert_eq!(effective_budget_kill_usd(225.0, 2025, 9), 62.0);
+    }
+
+    #[test]
+    fn test_effective_budget_kill_usd_refuses_non_finite_and_non_positive() {
+        // NaN in September would make `mtd >= line` always false: the box
+        // could never be stopped. It must fall back to a real line.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, -5.0] {
+            assert_eq!(
+                effective_budget_kill_usd(bad, 2026, 9),
+                DEFAULT_BUDGET_KILL_USD,
+                "September must fall back to the default for {bad}"
+            );
+            assert_eq!(
+                effective_budget_kill_usd(bad, 2026, 12),
+                STANDING_BUDGET_KILL_USD,
+                "December must still clamp to the standing line for {bad}"
+            );
+        }
+        // Every result is a finite, positive line a spend compare can cross.
+        let line = effective_budget_kill_usd(f64::NAN, 2026, 9);
+        assert!(line.is_finite() && line > 0.0);
+        assert!(140.0_f64 < line && 230.0_f64 >= line);
+    }
+
+    #[test]
+    fn effective_ceiling_never_raises_a_lower_configured_value() {
+        assert_eq!(effective_budget_kill_usd(55.0, 2026, 10), 55.0);
+        assert_eq!(effective_budget_kill_usd(55.0, 2026, 9), 55.0);
+        assert_eq!(effective_budget_kill_usd(70.0, 2026, 11), 70.0);
+    }
+
+    #[test]
+    fn test_effective_budget_kill_usd_is_keyed_on_the_utc_month_not_ist() {
+        // 2026-09-30 20:00 UTC = 01:30 IST on 1 October. Cost Explorer
+        // month-to-date is still September's, so the line must still be
+        // September's. An IST-keyed clamp would read October here.
+        let t = utc(2026, 9, 30, 20, 0);
+        assert_eq!(effective_budget_kill_usd(225.0, t.year(), t.month()), 225.0);
+        let ist_month = t.with_timezone(&ist()).month();
+        assert_eq!(ist_month, 10, "fixture must straddle the IST boundary");
+    }
+
+    #[tokio::test]
+    async fn effective_ceiling_october_breach_at_190_stops_even_with_a_225_config() {
+        // 2026-10-05 is a Monday; 04:30 UTC = 10:00 IST, inside the window.
+        // Moved from 1 Oct on 2026-10-22 (plan item 63): on UTC day 1 a
+        // Budgets reading at or above the line is unknown (no month stamp),
+        // so a day-1 breach pages and never stops.
+        // 2026-10-26 (audit PR L4): moved again, to Monday 5 Oct, because UTC
+        // day 2 is now distrusted the same way (first 48 h of the month).
+        let env = GuardEnv {
+            budget_kill_usd: 225.0,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(190.0),
+            },
+            &ssm,
+            utc(2026, 10, 5, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        let published = sns.published.borrow();
+        assert!(
+            published[0].message.contains(">= $185 stop-budget"),
+            "the breach page must name the EFFECTIVE line: {}",
+            published[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_regression_quote59_november_line_is_140_dollars() {
+        // Operator Quote 52 (2026-11-11): November 2026 only, the line was $90;
+        // Quote 59 (2026-11-14) raised it to $140. $139 month-to-date must not stop
+        // the box; $141 must.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        for (spend, should_stop) in [(139.0, false), (141.0, true)] {
+            let (ec2, sns, events) = (
+                FakeEc2::new("running"),
+                FakeSns::default(),
+                FakeEvents::new(),
+            );
+            let ssm = FakeSsm::empty();
+            let out = run_guard(
+                &env,
+                &ec2,
+                &sns,
+                &events,
+                &FakeBudgets {
+                    amount: Some(spend),
+                },
+                &ssm,
+                utc(2026, 11, 20, 4, 30),
+            )
+            .await
+            .expect("run_guard ok");
+            assert_eq!(
+                out["breach"] == json!(true),
+                should_stop,
+                "November spend ${spend}"
+            );
+            assert_eq!(ec2.stopped.borrow().is_empty(), !should_stop);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quote54_december_line_is_62_dollars() {
+        // Operator Quote 54 (2026-11-11): from December 2026 the line is $62,
+        // GST included. $61 month-to-date must not stop the box; $63 must.
+        // January 2027 is on the same line. Thursday 10 Dec 2026 and Thursday
+        // 14 Jan 2027, 04:30 UTC = 10:00 IST, past the distrusted first 48 h.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        for (now, spend, should_stop) in [
+            (utc(2026, 12, 10, 4, 30), 61.0, false),
+            (utc(2026, 12, 10, 4, 30), 63.0, true),
+            (utc(2027, 1, 14, 4, 30), 61.0, false),
+            (utc(2027, 1, 14, 4, 30), 63.0, true),
+        ] {
+            let (ec2, sns, events) = (
+                FakeEc2::new("running"),
+                FakeSns::default(),
+                FakeEvents::new(),
+            );
+            let ssm = FakeSsm::empty();
+            let out = run_guard(
+                &env,
+                &ec2,
+                &sns,
+                &events,
+                &FakeBudgets {
+                    amount: Some(spend),
+                },
+                &ssm,
+                now,
+            )
+            .await
+            .expect("run_guard ok");
+            assert_eq!(
+                out["breach"] == json!(true),
+                should_stop,
+                "{now} spend ${spend}"
+            );
+            assert_eq!(ec2.stopped.borrow().is_empty(), !should_stop);
+            if should_stop {
+                let published = sns.published.borrow();
+                assert!(
+                    published[0].message.contains(">= $62 stop-budget"),
+                    "the breach page must name the $62 line: {}",
+                    published[0].message
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_regression_quote30_october_at_165_does_not_stop() {
+        // Operator Quote 30 (2026-10-13): the line is $170 (≈₹15,000). An
+        // October month-to-date of $165 was a breach at the old $150 line
+        // and must not stop the box now.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(165.0),
+            },
+            &ssm,
+            utc(2026, 10, 27, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_regression_quote45_october_at_178_does_not_stop() {
+        // Operator Quote 45 (2026-10-28): October 2026 only, the line is $185.
+        // The 28 Oct forecast was $175.88; a Thursday month-to-date of $178
+        // was a breach at the old $170 line and must not stop the box now.
+        let env = GuardEnv {
+            budget_kill_usd: DEFAULT_BUDGET_KILL_USD,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(178.0),
+            },
+            &ssm,
+            utc(2026, 10, 29, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        // November 2026: the same configured $185 is clamped to $140 (Quote 59);
+        // December onward to the standing $62 (Quote 54).
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 11),
+            140.0
+        );
+        assert_eq!(
+            effective_budget_kill_usd(DEFAULT_BUDGET_KILL_USD, 2026, 12),
+            62.0
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_ceiling_september_at_160_does_not_stop() {
+        // 2026-09-23 is a Wednesday; 04:30 UTC = 10:00 IST.
+        let env = GuardEnv {
+            budget_kill_usd: 225.0,
+            ..test_env()
+        };
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty();
+        let out = run_guard(
+            &env,
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(160.0),
+            },
+            &ssm,
+            utc(2026, 9, 23, 4, 30),
+        )
+        .await
+        .expect("run_guard ok");
+        assert_ne!(out["breach"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    // --- Drain hold (operator Quote 31, 2026-10-21) --------------------------
+
+    fn hold(state: &str, until: DateTime<Utc>, written: DateTime<Utc>) -> String {
+        format!(
+            r#"{{"v":1,"state":"{state}","until_unix":{},"written_unix":{},"left":"wal"}}"#,
+            until.timestamp(),
+            written.timestamp()
+        )
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_leaves_the_box_running() {
+        let now = out_of_window(); // Tue 19:30 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(2),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(true));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_stops_without_a_page() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(30),
+            now - Duration::minutes(30),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert!(sns.published.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_stale_drain_hold_keeps_the_existing_page() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::days(1),
+            now - Duration::days(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("Hard Auto-Stop Guard Fired")
+        );
+    }
+
+    /// The budget stop is NEVER gated on the hold. 16:28 IST is inside the
+    /// up-window AND inside the hours a hold counts, so a fresh hold exists
+    /// here; the breach still stops, latches, disables and pages, and the
+    /// breach path never even reads SSM.
+    #[tokio::test]
+    async fn test_in_window_breach_ignores_an_active_drain_hold() {
+        let now = utc(2026, 7, 7, 10, 58); // Tue 16:28 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        assert!(matches!(
+            crate::drain_hold::drain_hold_verdict(
+                Some(&hold(
+                    "holding",
+                    now + Duration::minutes(10),
+                    now - Duration::minutes(1)
+                )),
+                now.timestamp()
+            ),
+            crate::drain_hold::DrainHold::Active { .. }
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(500.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert_eq!(*ssm.reads.borrow(), 0);
+        assert_eq!(sns.published.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_drain_hold_fails_toward_no_hold_on_a_read_error() {
+        use crate::drain_hold::{DEFAULT_DRAIN_HOLD_PARAM, DrainHold};
+        let now = out_of_window();
+        let raw = hold("holding", now + Duration::minutes(5), now);
+        assert_eq!(
+            read_drain_hold(
+                &FakeSsm::empty().drain_hold(&raw),
+                DEFAULT_DRAIN_HOLD_PARAM,
+                now
+            )
+            .await,
+            DrainHold::Active {
+                until_unix: (now + Duration::minutes(5)).timestamp()
+            }
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::read_failing(&raw), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::empty(), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+    }
+
+    /// Review fix (2026-10-21): an ACTIVE hold never shields a budget breach.
+    /// Out of window (19:00 IST) with a fresh hold, a breached month still
+    /// takes the full breach stop: stop, latch, disable the start rule, page.
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_with_a_breach_still_breach_stops() {
+        let now = utc(2026, 7, 7, 13, 30); // Tue 19:00 IST
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets {
+                amount: Some(500.0),
+            },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["breach"], json!(true));
+        assert_eq!(*ec2.stopped.borrow(), vec![vec!["i-tvapp".to_string()]]);
+        assert_eq!(*ssm.writes.borrow(), vec!["2026-07".to_string()]);
+        assert_eq!(
+            *events.disabled.borrow(),
+            vec!["tv-prod-daily-start".to_string()]
+        );
+        assert_eq!(sns.published.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_below_budget_is_skipped() {
+        let now = utc(2026, 7, 7, 13, 30);
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert_eq!(out["budget_action"], json!("below_budget"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    /// A spend-lookup error keeps the in-window fail-safe posture: it never
+    /// stops the box, so the fresh hold is honoured.
+    #[tokio::test]
+    async fn test_out_of_window_active_drain_hold_with_a_spend_lookup_error_is_skipped() {
+        let now = utc(2026, 7, 7, 13, 30);
+        let (ec2, sns, events) = (
+            FakeEc2::new("running"),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: None },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert_eq!(out["budget_action"], json!("cost_unknown"));
+        assert!(ec2.stopped.borrow().is_empty());
+        assert!(events.disabled.borrow().is_empty());
+        assert!(ssm.writes.borrow().is_empty());
+    }
+
+    /// A box started AFTER the hold record was written is a different
+    /// session: the ended hold does not silence its stop.
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_does_not_silence_a_later_session() {
+        let now = out_of_window(); // 14:00 UTC
+        let (ec2, sns, events) = (
+            FakeEc2::launched_at("running", utc(2026, 7, 7, 13, 0)),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            utc(2026, 7, 7, 12, 30),
+            utc(2026, 7, 7, 12, 30),
+        ));
+        let out = run_scenario(
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            now,
+            &ssm,
+        )
+        .await;
+        assert_eq!(out["noop"], json!(false));
+        assert!(out.get("drain_hold").is_none());
+        assert!(
+            sns.published.borrow()[0]
+                .message
+                .contains("Hard Auto-Stop Guard Fired")
+        );
+    }
+
+    /// A FAILED stop is never silenced: it takes the existing failure path
+    /// (the invoke errors, which the Lambda's Errors alarm pages).
+    #[tokio::test]
+    async fn test_out_of_window_ended_drain_hold_failed_stop_is_not_silenced() {
+        let now = out_of_window();
+        let (ec2, sns, events) = (
+            FakeEc2::new("running").stop_failing(),
+            FakeSns::default(),
+            FakeEvents::new(),
+        );
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(30),
+            now - Duration::minutes(30),
+        ));
+        let out = run_guard(
+            &test_env(),
+            &ec2,
+            &sns,
+            &events,
+            &FakeBudgets { amount: Some(10.0) },
+            &ssm,
+            now,
+        )
+        .await;
+        assert!(out.is_err(), "a failed stop must surface, not read as done");
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    // ---- plan item J8: a Muhurat session window is in-window -------------
+
+    #[tokio::test]
+    async fn test_muhurat_window_is_in_window_and_never_schedule_stops() {
+        // Sunday 2026-11-08 14:30 IST (09:00 UTC), launched 13:06 IST: past
+        // the grace, outside the weekday window, inside the Muhurat window.
+        let env = GuardEnv {
+            muhurat_sessions: "2026-11-08@14:05-15:30".to_string(),
+            ..test_env()
+        };
+        let ec2 = FakeEc2::launched_at("running", utc(2026, 11, 8, 7, 36));
+        let out = run_guard(
+            &env,
+            &ec2,
+            &FakeSns::default(),
+            &FakeEvents::new(),
+            &FakeBudgets { amount: Some(10.0) },
+            &FakeSsm::empty(),
+            utc(2026, 11, 8, 9, 0),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out["in_window"], json!(true));
+        assert!(ec2.stopped.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_timing_unset_keeps_the_out_of_window_stop() {
+        let env = GuardEnv {
+            muhurat_sessions: "2026-11-08@-".to_string(),
+            ..test_env()
+        };
+        let ec2 = FakeEc2::launched_at("running", utc(2026, 11, 8, 7, 36));
+        let out = run_guard(
+            &env,
+            &ec2,
+            &FakeSns::default(),
+            &FakeEvents::new(),
+            &FakeBudgets { amount: Some(10.0) },
+            &FakeSsm::empty(),
+            utc(2026, 11, 8, 9, 0),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out["noop"], json!(false));
+        assert_eq!(ec2.stopped.borrow().len(), 1);
+    }
+
+    // --- Budget data age (2026-11-16) ------------------------------------
+    //
+    // The Budgets figure lagged the bill by ~2 days on 16 Nov 2026
+    // (LastUpdatedTime 14 Nov 06:29 UTC). The guard now logs its age and an
+    // estimate; neither may change a stop decision.
+    mod budget_freshness {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        /// Budgets fake that also reports a `LastUpdatedTime`.
+        struct FakeStampedBudgets {
+            amount: Option<f64>,
+            last_updated: Option<f64>,
+        }
+
+        impl BudgetsApi for FakeStampedBudgets {
+            async fn actual_spend_usd(&self) -> Result<f64, String> {
+                self.amount
+                    .ok_or_else(|| "budgets:DescribeBudget throttled".to_string())
+            }
+            async fn spend_reading(&self) -> Result<crate::budget_spend::SpendReading, String> {
+                Ok(crate::budget_spend::SpendReading {
+                    actual_usd: self.actual_spend_usd().await?,
+                    last_updated_unix_secs: self.last_updated,
+                })
+            }
+        }
+
+        /// 14 Nov 2026 06:29 UTC (the stamp read live on 16 Nov).
+        fn stamp_14_nov() -> f64 {
+            // APPROVED: exact small i64 → f64.
+            #[allow(clippy::cast_precision_loss)]
+            let s = utc(2026, 11, 14, 6, 29).timestamp() as f64;
+            s
+        }
+
+        /// Tuesday 17 Nov 2026 10:00 IST: in the up-window.
+        fn tue_17_nov() -> DateTime<Utc> {
+            utc(2026, 11, 17, 4, 30)
+        }
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .map_err(|_| std::io::Error::other("poisoned"))?
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Captured {
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+            }
+        }
+
+        async fn run_in_window_capturing(budgets: &FakeStampedBudgets) -> (Value, String) {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (ec2, sns, events, ssm) = (
+                FakeEc2::new("running"),
+                FakeSns::default(),
+                FakeEvents::new(),
+                FakeSsm::empty(),
+            );
+            let out = run_guard(
+                &test_env(),
+                &ec2,
+                &sns,
+                &events,
+                budgets,
+                &ssm,
+                tue_17_nov(),
+            )
+            .await
+            .expect("run_guard ok");
+            (out, captured.text())
+        }
+
+        #[tokio::test]
+        async fn test_in_window_result_carries_budget_data_age_and_estimate() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (out, log) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["budget_action"], json!("below_budget"));
+            let age_h = out["budget_data_age_hours"].as_f64().expect("age known");
+            // 14 Nov 06:29 → 17 Nov 04:30 UTC = 69 h 61 m = 70 h 1 m.
+            assert!((age_h - (70.0 + 1.0 / 60.0)).abs() < 1e-6, "{age_h}");
+            let est = out["estimated_spend_now_usd"].as_f64().expect("estimate");
+            let want = crate::budget_spend::estimated_spend_now_usd(
+                40.0,
+                Some(stamp_14_nov()),
+                tue_17_nov(),
+            )
+            .expect("estimate");
+            assert!((est - want).abs() < 1e-9 && est > 40.0, "{est} vs {want}");
+            // The decision log line carries both fields.
+            assert!(log.contains("in-window budget check"), "{log}");
+            assert!(log.contains("budget_data_age_hours="), "{log}");
+            assert!(log.contains("estimated_spend_now_usd="), "{log}");
+        }
+
+        #[test]
+        fn test_budget_freshness_age_hours_and_annotated() {
+            let f = BudgetFreshness {
+                age_secs: Some(7_200.0),
+                estimated_spend_now_usd: Some(61.5),
+            };
+            assert_eq!(f.age_hours(), Some(2.0));
+            let out = f.annotated(json!({"ok": true}));
+            assert_eq!(out["ok"], json!(true));
+            assert_eq!(out["budget_data_age_hours"], json!(2.0));
+            assert_eq!(out["estimated_spend_now_usd"], json!(61.5));
+            let unknown = BudgetFreshness::default();
+            assert_eq!(unknown.age_hours(), None);
+            let out = unknown.annotated(json!({"ok": true}));
+            assert_eq!(out["budget_data_age_hours"], Value::Null);
+            assert!(
+                out.as_object()
+                    .expect("object")
+                    .contains_key("estimated_spend_now_usd")
+            );
+            // A non-object result is returned untouched.
+            assert_eq!(f.annotated(json!("x")), json!("x"));
+        }
+
+        #[tokio::test]
+        async fn test_unstamped_reading_reports_unknown_age_as_null() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: None,
+            };
+            let (out, log) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["budget_action"], json!("below_budget"));
+            assert_eq!(out["budget_data_age_hours"], Value::Null);
+            assert_eq!(out["estimated_spend_now_usd"], Value::Null);
+            assert!(!log.contains("LAMBDA-AWS-01"), "{log}");
+        }
+
+        #[tokio::test]
+        async fn test_stale_reading_warns_once_per_run_with_the_existing_code() {
+            // 70 h old: one coded warning.
+            let stale = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (_, log) = run_in_window_capturing(&stale).await;
+            assert_eq!(log.matches("LAMBDA-AWS-01").count(), 1, "{log}");
+            assert!(log.contains("over 48 hours old"), "{log}");
+            assert!(log.contains("WARN"), "{log}");
+            // 1 h old: no warning.
+            #[allow(clippy::cast_precision_loss)]
+            let fresh_stamp = (tue_17_nov() - Duration::hours(1)).timestamp() as f64;
+            let fresh = FakeStampedBudgets {
+                amount: Some(40.0),
+                last_updated: Some(fresh_stamp),
+            };
+            let (out, log) = run_in_window_capturing(&fresh).await;
+            assert_eq!(log.matches("LAMBDA-AWS-01").count(), 0, "{log}");
+            let age_h = out["budget_data_age_hours"].as_f64().expect("age");
+            assert!((age_h - 1.0).abs() < 1e-9, "{age_h}");
+        }
+
+        #[tokio::test]
+        async fn test_breach_result_also_carries_the_freshness_fields() {
+            let budgets = FakeStampedBudgets {
+                amount: Some(80.0),
+                last_updated: Some(stamp_14_nov()),
+            };
+            let (out, _) = run_in_window_capturing(&budgets).await;
+            assert_eq!(out["breach"], json!(true));
+            assert!(out["budget_data_age_hours"].as_f64().is_some(), "{out}");
+            assert!(out["estimated_spend_now_usd"].as_f64().is_some(), "{out}");
+        }
+
+        /// The stop decision before 2026-11-16, re-derived from first
+        /// principles: refuse non-finite and negative readings, distrust a
+        /// reading at or above the line on UTC days 1 and 2, then compare.
+        fn decision_before(amount: Option<f64>, line: f64, now: DateTime<Utc>) -> &'static str {
+            let reading = amount.filter(|v| v.is_finite() && *v >= 0.0);
+            let trusted = crate::budget_spend::trusted_spend_for_line(reading, line, now);
+            classify_in_window_action(trusted, line)
+        }
+
+        /// Exhaustive sweep (no proptest dependency in this crate): spend ×
+        /// line × stamp × day. The decision with any stamp equals the
+        /// decision with none, and both equal the pre-2026-11-16 rule.
+        #[tokio::test]
+        async fn test_mtd_reading_stop_decision_is_unchanged_by_the_freshness_fields() {
+            let spends = [
+                None,
+                Some(0.0),
+                Some(1.0),
+                Some(54.99),
+                Some(55.0),
+                Some(55.01),
+                Some(61.99),
+                Some(62.0),
+                Some(62.01),
+                Some(139.99),
+                Some(140.0),
+                Some(500.0),
+                Some(-1.0),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+            ];
+            let lines = [55.0, 62.0, 75.0, 140.0];
+            let days = [
+                utc(2026, 11, 1, 4, 30),
+                utc(2026, 11, 2, 4, 30),
+                utc(2026, 11, 3, 4, 30),
+                tue_17_nov(),
+                utc(2026, 12, 15, 4, 30),
+            ];
+            let mut cases = 0_u32;
+            for now in days {
+                #[allow(clippy::cast_precision_loss)]
+                let now_s = now.timestamp() as f64;
+                let stamps = [
+                    None,
+                    Some(now_s),
+                    Some(now_s - 3600.0),
+                    Some(now_s - 48.0 * 3600.0),
+                    Some(now_s - 72.0 * 3600.0),
+                    Some(now_s + 3600.0),
+                    Some(now_s - 40.0 * 86_400.0),
+                    Some(f64::NAN),
+                ];
+                for &line in &lines {
+                    for &amount in &spends {
+                        let want = decision_before(amount, line, now);
+                        for &stamp in &stamps {
+                            let budgets = FakeStampedBudgets {
+                                amount,
+                                last_updated: stamp,
+                            };
+                            let (usd, _) = mtd_reading(&budgets, line, now).await;
+                            assert_eq!(
+                                classify_in_window_action(usd, line),
+                                want,
+                                "amount={amount:?} line={line} stamp={stamp:?} now={now}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(cases, 5 * 4 * 15 * 8);
+            // End to end through run_guard (in-window, effective line 55): the
+            // breach stop fires on the same spends with and without a stamp.
+            for &amount in &spends {
+                let mut seen = Vec::new();
+                for stamp in [None, Some(stamp_14_nov())] {
+                    let budgets = FakeStampedBudgets {
+                        amount,
+                        last_updated: stamp,
+                    };
+                    let (ec2, sns, events, ssm) = (
+                        FakeEc2::new("running"),
+                        FakeSns::default(),
+                        FakeEvents::new(),
+                        FakeSsm::empty(),
+                    );
+                    let out = run_guard(
+                        &test_env(),
+                        &ec2,
+                        &sns,
+                        &events,
+                        &budgets,
+                        &ssm,
+                        tue_17_nov(),
+                    )
+                    .await
+                    .expect("run_guard ok");
+                    seen.push((
+                        out["breach"].clone(),
+                        out["budget_action"].clone(),
+                        ec2.stopped.borrow().len(),
+                        events.disabled.borrow().len(),
+                        sns.published.borrow().len(),
+                    ));
+                }
+                assert_eq!(seen[0], seen[1], "amount={amount:?}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live SDK adapters, the env wiring and `handle`, driven through the REAL
+// AWS SDK against a loopback account (crate::test_support).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sdk_loopback_tests {
+    use super::*;
+    use crate::budget_spend::{BUDGET_ACCOUNT_ID_ENV, BUDGET_NAME_ENV, BudgetCoordinates};
+    use crate::test_support::{
+        EnvVarGuard, Fleet, aws_env_guards, env_lock, loopback_sdk_config, operations, recorded,
+        start_fleet,
+    };
+
+    async fn config_for(
+        fleet: Fleet,
+    ) -> (
+        aws_config::SdkConfig,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::test_support::LoopbackRequest>>>,
+    ) {
+        let (endpoint, requests) = start_fleet(fleet).await;
+        (loopback_sdk_config(&endpoint).await, requests)
+    }
+
+    fn coords() -> BudgetCoordinates {
+        BudgetCoordinates {
+            account_id: "123456789012".to_string(),
+            budget_name: "tv-prod-monthly".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_and_stop() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        let inst = ec2
+            .describe("i-0loopback")
+            .await
+            .expect("describe succeeds")
+            .expect("one instance");
+        assert_eq!(inst.state, "running");
+        assert!(inst.launch_time.is_some());
+        ec2.stop_instances("i-0loopback")
+            .await
+            .expect("stop succeeds");
+        assert_eq!(
+            operations(&requests),
+            vec!["DescribeInstances", "StopInstances"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_not_found_and_errors() {
+        let (config, _) = config_for(Fleet {
+            instance_state: None,
+            fail: vec!["StopInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        assert!(
+            ec2.describe("i-0gone")
+                .await
+                .expect("describe succeeds")
+                .is_none()
+        );
+        assert!(ec2.stop_instances("i-0gone").await.is_err());
+
+        let (config, _) = config_for(Fleet {
+            fail: vec!["DescribeInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        let ec2 = SdkEc2 {
+            client: aws_sdk_ec2::Client::new(&config),
+        };
+        assert!(ec2.describe("i-0x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_and_failure() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let sns = SdkSns {
+            client: aws_sdk_sns::Client::new(&config),
+        };
+        sns.publish("arn:t", "sub", "msg")
+            .await
+            .expect("publish succeeds");
+        assert_eq!(
+            recorded(&requests)[0].form_value("Subject").as_deref(),
+            Some("sub")
+        );
+
+        let (config, _) = config_for(Fleet {
+            fail: vec!["Publish"],
+            ..Fleet::default()
+        })
+        .await;
+        let sns = SdkSns {
+            client: aws_sdk_sns::Client::new(&config),
+        };
+        assert!(sns.publish("arn:t", "sub", "msg").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_events_disable_and_enable_name_the_rule() {
+        let (config, requests) = config_for(Fleet::default()).await;
+        let events = SdkEvents {
+            client: aws_sdk_eventbridge::Client::new(&config),
+        };
+        events
+            .disable_rule("tv-prod-start")
+            .await
+            .expect("disable succeeds");
+        events
+            .enable_rule("tv-prod-start")
+            .await
+            .expect("enable succeeds");
+        let seen = recorded(&requests);
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[0].target.ends_with("DisableRule"),
+            "{}",
+            seen[0].target
+        );
+        assert!(seen[1].target.ends_with("EnableRule"), "{}", seen[1].target);
+        assert!(seen.iter().all(|r| r.body.contains("tv-prod-start")));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_events_failures_are_errors() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AWSEvents.DisableRule", "AWSEvents.EnableRule"],
+            ..Fleet::default()
+        })
+        .await;
+        let events = SdkEvents {
+            client: aws_sdk_eventbridge::Client::new(&config),
+        };
+        assert!(events.disable_rule("r").await.is_err());
+        assert!(events.enable_rule("r").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_budgets_reads_the_actual_spend_or_refuses_missing_coordinates() {
+        let (config, requests) = config_for(Fleet {
+            spend_usd: "157.18",
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        assert_eq!(budgets.actual_spend_usd().await, Ok(157.18));
+        let seen = recorded(&requests);
+        assert!(seen[0].body.contains("123456789012"));
+        assert!(seen[0].body.contains("tv-prod-monthly"));
+
+        let missing = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Err("BUDGET_NAME env var is missing or empty".to_string()),
+        };
+        assert_eq!(
+            missing.actual_spend_usd().await,
+            Err("BUDGET_NAME env var is missing or empty".to_string())
+        );
+    }
+
+    /// 2026-11-16: the real SDK deserializer reads `Budget.LastUpdatedTime`
+    /// (epoch seconds, a JSON float) into the spend reading; a reply without
+    /// it reads as unknown (`None`), never a guess.
+    #[tokio::test]
+    async fn test_sdk_budgets_describe_spend_reading_reads_last_updated_time() {
+        let (config, _) = config_for(Fleet {
+            spend_usd: "157.18",
+            budget_last_updated: Some("1794637740.25"),
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let reading = budgets.spend_reading().await.expect("reading");
+        assert_eq!(reading.actual_usd, 157.18);
+        let stamp = reading.last_updated_unix_secs.expect("LastUpdatedTime");
+        assert!((stamp - 1_794_637_740.25).abs() < 1e-3, "{stamp}");
+
+        let (config, _) = config_for(Fleet::default()).await;
+        let unstamped = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let reading = unstamped.spend_reading().await.expect("reading");
+        assert_eq!(reading.last_updated_unix_secs, None);
+
+        let missing = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Err("BUDGET_NAME env var is missing or empty".to_string()),
+        };
+        assert!(missing.spend_reading().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_budgets_api_failure_is_unknown_spend() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AWSBudgetServiceGateway.DescribeBudget"],
+            ..Fleet::default()
+        })
+        .await;
+        let budgets = SdkBudgets {
+            client: aws_sdk_budgets::Client::new(&config),
+            coords: Ok(coords()),
+        };
+        let err = budgets
+            .actual_spend_usd()
+            .await
+            .expect_err("a refusal is unknown spend");
+        assert!(err.contains("budgets:DescribeBudget failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_get_and_put_a_plain_string() {
+        let mut ssm_values = std::collections::HashMap::new();
+        ssm_values.insert(DEFAULT_PING_STATE_PARAM.to_string(), "3".to_string());
+        let (config, requests) = config_for(Fleet {
+            ssm: ssm_values,
+            ..Fleet::default()
+        })
+        .await;
+        let ssm = SdkSsm {
+            client: aws_sdk_ssm::Client::new(&config),
+        };
+        assert_eq!(
+            ssm.get_parameter(DEFAULT_PING_STATE_PARAM).await.as_deref(),
+            Ok("3")
+        );
+        assert!(ssm.get_parameter("/absent").await.is_err());
+        ssm.put_parameter(DEFAULT_PING_STATE_PARAM, "4")
+            .await
+            .expect("put succeeds");
+        let put = recorded(&requests)
+            .into_iter()
+            .find(|r| r.target == "AmazonSSM.PutParameter")
+            .expect("one put");
+        assert!(put.body.contains("\"Type\":\"String\""), "{}", put.body);
+        assert!(put.body.contains("\"Overwrite\":true"));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_put_failure_is_an_error() {
+        let (config, _) = config_for(Fleet {
+            fail: vec!["AmazonSSM.PutParameter"],
+            ..Fleet::default()
+        })
+        .await;
+        let ssm = SdkSsm {
+            client: aws_sdk_ssm::Client::new(&config),
+        };
+        assert!(ssm.put_parameter("/p", "v").await.is_err());
+    }
+
+    const GUARD_KEYS: [&str; 9] = [
+        "INSTANCE_ID",
+        "ALERTS_TOPIC_ARN",
+        "START_RULE_NAME",
+        "BUDGET_KILL_USD",
+        "PING_STATE_PARAM",
+        "KEEP_ALIVE_PARAM",
+        "BUDGET_STOP_PARAM",
+        "DRAIN_HOLD_PARAM",
+        crate::muhurat_window::MUHURAT_SESSIONS_ENV,
+    ];
+
+    #[test]
+    fn test_guard_env_from_process_env_defaults_when_unset() {
+        let _lock = env_lock();
+        let _unset: Vec<EnvVarGuard> = GUARD_KEYS
+            .iter()
+            .map(|k| EnvVarGuard::set(k, None))
+            .collect();
+        let env = GuardEnv::from_process_env();
+        assert_eq!(env.instance_id, "");
+        assert_eq!(env.alerts_topic_arn, "");
+        assert_eq!(env.start_rule_name, "");
+        assert_eq!(env.budget_kill_usd, DEFAULT_BUDGET_KILL_USD);
+        assert_eq!(env.ping_state_param, DEFAULT_PING_STATE_PARAM);
+        assert_eq!(
+            env.keep_alive_param,
+            crate::start_watchdog::DEFAULT_KEEP_ALIVE_PARAM
+        );
+        assert_eq!(
+            env.budget_stop_param,
+            crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM
+        );
+        assert_eq!(
+            env.drain_hold_param,
+            crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM
+        );
+        assert_eq!(env.muhurat_sessions, "");
+    }
+
+    #[test]
+    fn test_guard_env_from_process_env_reads_every_override() {
+        let _lock = env_lock();
+        let _set: Vec<EnvVarGuard> = GUARD_KEYS
+            .iter()
+            .map(|k| {
+                let value = if *k == "BUDGET_KILL_USD" {
+                    "75".to_string()
+                } else {
+                    format!("v-{k}")
+                };
+                EnvVarGuard::set(k, Some(&value))
+            })
+            .collect();
+        let env = GuardEnv::from_process_env();
+        assert_eq!(env.instance_id, "v-INSTANCE_ID");
+        assert_eq!(env.alerts_topic_arn, "v-ALERTS_TOPIC_ARN");
+        assert_eq!(env.start_rule_name, "v-START_RULE_NAME");
+        assert_eq!(env.budget_kill_usd, 75.0);
+        assert_eq!(env.ping_state_param, "v-PING_STATE_PARAM");
+        assert_eq!(env.keep_alive_param, "v-KEEP_ALIVE_PARAM");
+        assert_eq!(env.budget_stop_param, "v-BUDGET_STOP_PARAM");
+        assert_eq!(env.drain_hold_param, "v-DRAIN_HOLD_PARAM");
+    }
+
+    #[test]
+    fn test_guard_env_unparsable_budget_falls_back_to_the_compiled_default() {
+        // A fat-fingered value must not kill the guard: it falls back to the
+        // compiled default, which `effective_budget_kill_usd` then clamps.
+        let _lock = env_lock();
+        let _bad = EnvVarGuard::set("BUDGET_KILL_USD", Some("seventy-five"));
+        assert_eq!(
+            GuardEnv::from_process_env().budget_kill_usd,
+            DEFAULT_BUDGET_KILL_USD
+        );
+    }
+
+    #[test]
+    fn test_handle_runs_the_guard_against_a_stopped_box_without_stopping_it() {
+        let _lock = env_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread fixture runtime")
+            .block_on(async {
+                let (endpoint, requests) = start_fleet(Fleet {
+                    instance_state: Some("stopped"),
+                    ..Fleet::default()
+                })
+                .await;
+                let _aws = aws_env_guards(&endpoint);
+                let _id = EnvVarGuard::set("INSTANCE_ID", Some("i-0loopback"));
+                let _topic =
+                    EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+                let _rule = EnvVarGuard::set("START_RULE_NAME", Some("tv-prod-start"));
+                let _acct = EnvVarGuard::set(BUDGET_ACCOUNT_ID_ENV, Some("123456789012"));
+                let _name = EnvVarGuard::set(BUDGET_NAME_ENV, Some("tv-prod-monthly"));
+
+                let out = handle(json!({})).await.expect("the guard runs");
+                assert!(out.is_object(), "{out}");
+                let ops = operations(&requests);
+                assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+                assert!(
+                    !ops.iter().any(|o| o == "StopInstances"),
+                    "a stopped box is never stopped again: {ops:?}"
+                );
+            });
     }
 }

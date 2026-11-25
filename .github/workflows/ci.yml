@@ -93,7 +93,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -144,7 +144,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -171,7 +171,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate SSM commands[] quoting in deploy workflows
         shell: bash
@@ -191,16 +191,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-build-and-verify-fmt-clippy
           cache-on-failure: true
@@ -208,7 +208,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
-      - name: cargo clippy (workspace, libs + bins only)
+      - name: cargo clippy (all workspace targets)
+        # Plan item 12b (2026-10-31): every workspace crate's libs, bins,
+        # tests, benches and examples are linted with warnings fatal. One
+        # command replaces the redundant five-crate checkpoint's two passes,
+        # keeping workflow shell within its existing ceiling. The original
+        # dated measurements below explain why all-targets was deferred.
         # THE GATE IS ARMED (2026-08-11). `-D warnings` is ON: any clippy
         # warning in lib+bin code now FAILS this job, and Build & Verify is
         # a needed job of All Green, so it blocks the merge.
@@ -221,17 +226,36 @@ jobs:
         # stale. Measured before arming: `cargo clippy --workspace --no-deps
         # -- -D warnings` exits 0 on this tree.
         #
-        # `--all-targets` is STILL deliberately omitted, and that is a real
-        # remaining gap, not an oversight: test code legitimately uses
-        # `eprintln!` (calibration output), the workspace does not currently
-        # build clean in that mode, and its true warning count is UNMEASURED.
-        # Arming it is separate work with its own measurement — do not
+        # `--all-targets` is now on this step for every workspace crate
+        # (plan item 12b, expanded 2026-10-31). The history below is kept as written.
+        #
+        # MEASURED 2026-08-26 (this comment said "its true warning count is
+        # UNMEASURED" until now, and an unmeasured gap is indistinguishable
+        # from a hidden defect, which is why it was worth an hour):
+        # `cargo clippy --workspace --all-targets --no-deps` reports
+        # **167 warnings + 19 errors = 186 findings**. Dominated by
+        # cosmetics: 72 inconsistent_digit_grouping (date literals such as
+        # `2026_08_28`), 32 doc_overindented_list_items, 24
+        # assertions_on_constants.
+        #
+        # The verdict that matters: **every one of the 186 is inside
+        # `#[cfg(test)]`. Zero are production-scoped.** Each error location
+        # was classified individually, not sampled. The seven
+        # `await_holding_lock` hits look alarming and are not — they are the
+        # `env_guard()` test-serialization mutex in
+        # `crates/api/src/handlers/debug.rs`, all past that file's line-377
+        # `#[cfg(test)]`.
+        #
+        # So this gap masks NO production defect. Closing it is cosmetic
+        # churn across many files, which is precisely why it stays separate
+        # work — but it is now separate KNOWN work rather than an open
+        # unknown. Arming it still means fixing all 186 first; do not
         # bundle it in by adding the flag here.
         #
         # Ratcheted by `crates/common/tests/rust_only_guard.rs::
         # ci_clippy_gate_stays_armed` so `-D warnings` cannot be silently
         # dropped again.
-        run: cargo clippy --workspace --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
   # -------------------------------------------------------------------------
   # Test — one job per crate, parallel. Matrix + fail-fast: false so a
@@ -270,23 +294,42 @@ jobs:
         # gone and every crate tests with default features.
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: ci-test-${{ matrix.crate }}
+          shared-key: ci-test-${{ matrix.crate }}${{ matrix.crate == 'app' && '-no-debug-info' || '' }}
           cache-on-failure: true
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.148
+
+      - name: Start QuestDB for the real round-trip tests (storage only)
+        # Audit PROOF-1 (2026-10-11): crates/storage/tests/questdb_real_roundtrip.rs
+        # writes through the real writers into a real QuestDB and reads the
+        # rows back. Steps on this matrix lane, not a new job, so the
+        # all-green needs list is untouched. Same image digest as
+        # deploy/docker/docker-compose.yml (a multi-arch manifest list, so it
+        # pulls natively on the amd64 runner).
+        if: matrix.crate == 'storage'
+        run: |
+          set -euo pipefail
+          docker run -d --name tv-qdb-it -p 9000:9000 \
+            questdb/questdb:9.3.5@sha256:22ad030544f45a396c743124c928ce33de11666c104f63f69ce4e66e07e7b968
+          for _ in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          docker logs tv-qdb-it
+          exit 1
 
       - name: cargo nextest run -p tickvault-${{ matrix.crate }} (lib + integration, profile=ci)
         # Full per-crate suite — unit (lib) AND integration (tests/) targets.
@@ -295,61 +338,37 @@ jobs:
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
         # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
         # before being marked FAIL.
+        # On the storage lane the two TV_QDB_REAL_* values point the real
+        # round-trip tests at the container above and make a missing or
+        # unreachable QuestDB a failure, not a skip. Empty elsewhere.
+        env:
+          # App tests exhausted runner disk linking with full symbols (#2289).
+          # Other crates keep Cargo's default level 2. Assertions stay enabled.
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.crate == 'app' && '0' || '2' }}
+          TV_QDB_REAL_HTTP: ${{ matrix.crate == 'storage' && '127.0.0.1:9000' || '' }}
+          TV_QDB_REAL_REQUIRED: ${{ matrix.crate == 'storage' && '1' || '' }}
         run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
 
-  # -------------------------------------------------------------------------
-  # Test (trading, groww_orders) — the NON-DEFAULT feature lane for the Groww
-  # order-side subtree (groww-second-feed-scope §39.2 Gate 2: the
-  # crates/trading/src/oms/groww code, gated by the `groww_orders` cargo
-  # feature, must COMPILE + TEST in CI). The default-features `test` matrix
-  # above builds that subtree OUT entirely (the feature is non-default), so a
-  # regression under `groww_orders` would ship silently until live-fire — this
-  # dedicated lane closes that gap, mirroring the DHAT-Zero-Alloc precedent of
-  # a feature-gated area getting its own lane.
-  #
-  # UNCONDITIONAL by design (merge-gate-lock-2026-07-04.md §5): NO `if:` and
-  # NO path filter. A `skipped` result poisons the All Green fan-in
-  # ('skipped' counts as FAILURE on pull_request events, and the PR-only
-  # skip-allowlist in all-green covers ONLY commit-lint / design-first-wall /
-  # local-runtime-block), so this lane MUST run on every PR + push exactly
-  # like the sibling Test jobs. It is therefore in all-green's `needs:` list.
-  #
-  # Mirrors the sibling `test` job's trading branch verbatim (same runner,
-  # checkout, SHA-pinned toolchain, rust-cache, cargo-nextest, `--no-fail-fast
-  # --profile ci`) — the ONLY delta is `--features groww_orders` and a DISTINCT
-  # cache shared-key so the feature build's target artifacts never thrash the
-  # default-feature `ci-test-trading` cache. Clippy is NOT added here —
-  # workspace clippy lives in Build & Verify.
-  # -------------------------------------------------------------------------
-  test-trading-groww-orders:
-    name: "Test (trading, groww_orders)"
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
-        with:
-          toolchain: '1.95.0'
-
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-test-trading-groww-orders
-          cache-on-failure: true
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      - name: cargo nextest run -p tickvault-trading --features groww_orders (lib + integration, profile=ci)
-        # Same suite semantics as the sibling Test jobs — unit (lib) AND
-        # integration (tests/) targets; `#[ignore]`d tests are skipped by
-        # nextest; profile `ci` caps per-test wall-clock + retries flakes once.
-        run: cargo nextest run -p tickvault-trading --features groww_orders --no-fail-fast --profile ci
+      - name: Restart QuestDB and check the rows survived (storage only)
+        # Second phase of rows_survive_a_questdb_restart: the first phase ran
+        # in the suite above and wrote its rows; after the restart this phase
+        # re-runs the boot DDL on the populated tables and reads them back.
+        if: matrix.crate == 'storage'
+        env:
+          TV_QDB_REAL_HTTP: 127.0.0.1:9000
+          TV_QDB_REAL_REQUIRED: '1'
+          TV_QDB_RESTART_PHASE: after
+        run: |
+          set -euo pipefail
+          docker restart tv-qdb-it
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:9000/exec?query=SELECT%201" >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then docker logs tv-qdb-it; exit 1; fi
+          cargo nextest run -p tickvault-storage --test questdb_real_roundtrip --profile ci \
+            -E 'test(rows_survive_a_questdb_restart)'
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
@@ -362,10 +381,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
@@ -377,7 +396,7 @@ jobs:
       - name: Install cargo-audit + cargo-deny (prebuilt, pinned)
         id: install-audit-tools
         continue-on-error: true
-        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7 SHA-pinned
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.82.7 SHA-pinned
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
@@ -387,14 +406,14 @@ jobs:
       - name: Install cargo-audit + cargo-deny (from-source fallback)
         if: steps.install-audit-tools.outcome == 'failure'
         run: |
-          cargo install --locked cargo-audit
-          cargo install --locked cargo-deny
+          cargo install --locked --version 0.22.2 cargo-audit
+          cargo install --locked --version 0.19.9 cargo-deny
 
       - name: cargo deny check
         run: cargo deny check
 
-      - name: cargo audit
-        run: cargo audit --deny yanked
+      - name: Audit workspace and fuzz lockfiles
+        run: cargo audit --deny yanked --file Cargo.lock && cargo audit --deny yanked --file fuzz/Cargo.lock
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening
@@ -421,6 +440,11 @@ jobs:
     name: "Coverage & Perf"
     needs: build-and-verify
     runs-on: ubuntu-latest
+    # LLVM coverage maps do not require DWARF debug data. Keep instrumentation,
+    # debug assertions and overflow checks; reduce instrumented link/disk load.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     # 45 → 60 min (2026-07-09): headroom for the targeted llvm-cov retry
     # below — a cold-cache run + one retry must not die to the job timeout.
     timeout-minutes: 60
@@ -441,13 +465,14 @@ jobs:
       # Mitigations: the disk pre-clean step below (signature a) and the
       # retry-exactly-once wrapper around the llvm-cov invocation
       # (signature b). A SECOND consecutive llvm-cov failure is a real red —
-      # there is no continue-on-error anywhere in this job, and the
-      # threshold-enforcement step is untouched.
+      # this job has no continue-on-error since B3 (2026-11-13): the
+      # production-coverage step after the gate, report-only from 2026-11-07,
+      # now enforces the [production] floors, and the threshold-enforcement
+      # step is untouched.
       - name: Free runner disk space (flake signature a — see comment above)
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== df -h BEFORE cleanup ==="
           df -h /
           # Well-known GH-hosted-runner cleanup recipe: drop preinstalled
           # toolchains this job never uses (~25-30 GB reclaimed).
@@ -458,29 +483,26 @@ jobs:
                       /opt/ghc \
                       /usr/local/share/boost \
                       /opt/hostedtoolcache/CodeQL || true
-          if command -v docker >/dev/null 2>&1; then
-            sudo docker system prune -af >/dev/null 2>&1 || true
-          fi
-          echo "=== df -h AFTER cleanup ==="
+          sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
 
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain 1.95.0 + llvm-tools
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
           components: llvm-tools-preview
 
       - name: Cache cargo + llvm-cov build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-coverage
           cache-on-failure: true
 
       - name: Install cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov
+        run: cargo install --locked --version 0.9.1 cargo-llvm-cov
 
       - name: Run coverage (workspace, JSON output)
         shell: bash
@@ -511,26 +533,57 @@ jobs:
               --output-path target/llvm-cov/coverage.json \
               -- --skip dhat_
           }
-          # Targeted retry (flake signature b — see the dated comment at the
-          # top of this job): exactly ONE retry, only after wiping profraw
-          # residue from the failed attempt (compiled artifacts are kept, so
-          # the retry is mostly a re-run of the test phase). A genuinely
-          # failing test fails BOTH attempts → the job is red; the coverage
-          # THRESHOLD step below is untouched and never retried.
+          # Exactly ONE retry after removing raw profiles. Pinned llvm-cov
+          # 0.9.1 cleans workspace package artifacts on each normal invocation;
+          # dependency artifacts remain. A second failed attempt stays fatal.
+          # The coverage THRESHOLD step below is untouched and never retried.
           if ! run_cov; then
             echo "::warning::cargo llvm-cov failed (attempt 1/2) — retrying once after profraw clean (exit-101 flake class, see #1454). A second failure is a real red."
-            cargo llvm-cov clean --workspace --profraw-only \
+            cargo llvm-cov clean --profraw-only \
               || cargo llvm-cov clean --workspace
             mkdir -p target/llvm-cov
             run_cov
           fi
 
+      # Keep the final failure state visible before any later job cleanup.
+      # Ordinary and instrumented targets are distinct; no size is inferred
+      # from the compressed cache. Missing paths/du timeout are diagnostic only.
+      - name: Report coverage runner resources
+        if: always()
+        shell: bash
+        run: |
+          df -h .
+          df -i .
+          free -m
+          timeout 15s du -sh target/debug target/llvm-cov-target target/llvm-cov 2>/dev/null || true
+
       - name: Enforce per-crate coverage thresholds
         run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
 
+      # 2026-11-07 audit (tests-coverage): the gate above counts
+      # `#[cfg(test)]` code inside src as covered; this prints per-crate
+      # production-only line coverage beside the floors and in the step
+      # summary. B3 (2026-11-13): it now also ENFORCES the `[production]`
+      # floors in quality/crate-coverage-thresholds.toml and exits 1 below
+      # one (no continue-on-error). std only, so one `rustc` call builds it
+      # and no dependency is compiled a second time in this job.
+      - name: Enforce production-only coverage floors
+        if: always()
+        timeout-minutes: 5
+        run: rustc --edition 2024 -O -o target/llvm-cov/coverage-prod-report crates/common/src/bin/coverage_prod_report.rs && target/llvm-cov/coverage-prod-report target/llvm-cov/coverage.json quality/crate-coverage-thresholds.toml
+
+      # PROOF-12 (2026-10-12): per-FILE floors live in the [files] table and
+      # are checked by the Rust bin `coverage_file_floors`. It is NOT run in
+      # this job: llvm-cov builds into its own target dir, so `cargo run`
+      # here would build common's whole dependency tree a second time,
+      # uninstrumented, in the job that has run out of runner disk before
+      # (#1442, #1455). The table is empty, so nothing is gated yet. Run it
+      # by hand on the uploaded report:
+      #   cargo run -p tickvault-common --bin coverage_file_floors -- coverage.json quality/crate-coverage-thresholds.toml
+
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: coverage-report
           path: target/llvm-cov/coverage.json
@@ -559,7 +612,7 @@ jobs:
     timeout-minutes: 15 # 2026-07-16: real full-tree scans measured ~3.5 min; headroom for the lambda/console suites
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # 2026-07-05: guards that the hot-path filter paths inside the two
       # scanners below always match REAL files — a rename can never blind
@@ -568,6 +621,14 @@ jobs:
       - name: Hot-path scanner self-test (zero-match guard)
         shell: bash
         run: bash .claude/hooks/hot-path-scanner-selftest.sh "$GITHUB_WORKSPACE"
+
+      # 2026-10-01: plan-verify.sh read only `active-plan.md`, a name no plan
+      # uses, so it passed every real plan without reading it (commit
+      # e1a1584). The self-test proves it now reads every active-plan*.md.
+      # A step inside this needed job, per merge-gate-lock §5.
+      - name: Plan-verify self-test
+        shell: bash
+        run: bash .claude/hooks/plan-verify.selftest.sh
 
       # Added 2026-08-18 on the operator's "no human monitoring" directive.
       # Deliberately a STEP in an existing needed job rather than a new job:
@@ -583,7 +644,7 @@ jobs:
       # ignored gate.
       - name: Guarantee report (Rust-only + O(1) + automation, measured)
         shell: bash
-        run: cargo run -q -p tickvault-app --bin tv_guarantees
+        run: cargo run -q -p tickvault-app --bin tv-guarantees
 
       - name: Banned pattern scan (full workspace)
         shell: bash
@@ -772,29 +833,50 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: DHAT target drift check (no silent drops)
         shell: bash
         run: |
           set -euo pipefail
           actual=$(ls crates/*/tests/dhat_*.rs | LC_ALL=C sort)
-          expected=$(LC_ALL=C sort <<'EOF'
-          crates/app/tests/dhat_live_ingest_seam.rs
-          crates/app/tests/dhat_mark_forward.rs
-          crates/app/tests/dhat_ws_lag.rs
+          app_expected=$(cat .github/dhat-app-targets.txt)
+          if [ "$(printf '%s\n' "$app_expected" | wc -l)" -ne 14 ] || \
+            printf '%s\n' "$app_expected" | grep -qvE '^crates/app/tests/dhat_[a-z0-9_]+\.rs$'; then
+            echo "::error::app DHAT inventory must contain exactly 14 explicit app test paths."
+            exit 1
+          fi
+          expected=$(LC_ALL=C sort <<EOF
+          $app_expected
           crates/core/tests/dhat_allocation.rs
-          crates/core/tests/dhat_cadence_decide.rs
           crates/core/tests/dhat_depth_packet_zero_alloc.rs
+          crates/core/tests/dhat_frame_silence_activity.rs
           crates/core/tests/dhat_instrument_registry.rs
+          crates/core/tests/dhat_ltt_correction.rs
           crates/core/tests/dhat_moneyness.rs
           crates/core/tests/dhat_telegram_dispatcher.rs
           crates/core/tests/dhat_token_handle.rs
           crates/core/tests/dhat_truedata_decode_zero_alloc.rs
+          crates/core/tests/dhat_ws_reader_memory.rs
           crates/core/tests/dhat_ws_reader_zero_alloc.rs
+          crates/storage/tests/dhat_deferred_depth_note_shed.rs
           crates/storage/tests/dhat_depth_append_zero_alloc.rs
+          crates/storage/tests/dhat_depth_book_hand_off.rs
+          crates/storage/tests/dhat_flush_buffer_recycle.rs
+          crates/storage/tests/dhat_hot_path_latency_minute.rs
+          crates/storage/tests/dhat_hot_path_telemetry.rs
+          crates/storage/tests/dhat_receipt_to_fold_stage.rs
+          crates/storage/tests/dhat_rescue_floor_zero_alloc.rs
+          crates/storage/tests/dhat_seal_per_seal_path.rs
+          crates/storage/tests/dhat_seal_queue_backlog.rs
+          crates/storage/tests/dhat_task_watch.rs
+          crates/storage/tests/dhat_tick_rescue_spare.rs
+          crates/storage/tests/dhat_tick_row_append.rs
+          crates/trading/tests/dhat_live_candles.rs
           crates/trading/tests/dhat_multi_tf_fold.rs
           crates/trading/tests/dhat_risk_engine.rs
+          crates/trading/tests/dhat_tick_ram_arena.rs
+          crates/trading/tests/dhat_worst_fill.rs
           EOF
           )
           # Defensive de-indent: YAML block scalars normally de-dent the
@@ -802,25 +884,24 @@ jobs:
           # not silently break the comparison.
           expected=$(echo "$expected" | sed 's/^[[:space:]]*//' | grep -v '^$')
           if ! diff <(echo "$expected") <(echo "$actual"); then
-            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane target list in ci.yml (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."
-            exit 1
+            echo "::error::crates/*/tests/dhat_*.rs on disk disagrees with the explicit DHAT lane targets in ci.yml and .github/dhat-app-targets.txt (dhat-zero-alloc job). A new/renamed dhat test MUST be added to BOTH the drift list and the matching cargo test step below, or it would silently run in no CI lane."; exit 1
           fi
           echo "DHAT target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-dhat-zero-alloc
           cache-on-failure: true
 
-      # NOTE: plain `cargo test` (not nextest) is deliberate — every dhat
-      # target holds exactly ONE #[test] (dhat allows one Profiler per
-      # process), so there is no intra-binary parallelism to manage, and the
+      # NOTE: plain `cargo test` (not nextest) is deliberate. DHAT has one
+      # process-global profiler. The seed/level/book cases have separate
+      # single-test binaries; other targets retain their existing layout, and the
       # guards below need the classic harness output. Two false-OK guards
       # per step (audit Rule 11): (1) the tee'd "running 0 tests" scan — if
       # the `--features dhat` flag is ever dropped, the three cfg-gated core
@@ -842,14 +923,14 @@ jobs:
           # (core)` also runs them; this lane remains the ratchet authority.
           cargo test -p tickvault-core --features dhat \
             --test dhat_allocation \
-            --test dhat_cadence_decide \
             --test dhat_depth_packet_zero_alloc \
-            --test dhat_instrument_registry \
+            --test dhat_frame_silence_activity \
+            --test dhat_instrument_registry --test dhat_ltt_correction \
             --test dhat_moneyness \
             --test dhat_telegram_dispatcher \
             --test dhat_token_handle \
             --test dhat_truedata_decode_zero_alloc \
-            --test dhat_ws_reader_zero_alloc \
+            --test dhat_ws_reader_memory --test dhat_ws_reader_zero_alloc \
             2>&1 | tee /tmp/dhat-core.log
           if grep -q 'running 0 tests' /tmp/dhat-core.log; then
             echo "::error::a core dhat target ran ZERO tests — vacuous green (--features dhat missing, or the cfg gate excluded the test). Rule 11: no false-OK."
@@ -877,9 +958,21 @@ jobs:
           # deleted with the producer-less presence registry: 8 -> 7.
           # 2026-08-11 (live-lane wiring): dhat_depth_packet_zero_alloc +
           # dhat_truedata_decode_zero_alloc added: 7 -> 9.
-          if [ "$ran" -ne 9 ]; then
-            echo "::error::core DHAT step executed $ran targets, expected 9 — a --test flag was dropped from this step (drift list vs run step mismatch)."
-            exit 1
+          # 2026-09-16 (per-minute price pulls + 15:41 accuracy check removed,
+          # `no-rest-except-live-feed-2026-06-27.md` §12.10): dhat_cadence_decide
+          # deleted with the cadence scheduler — its CadenceExecutor declared
+          # exactly the three removed fetch methods, so the whole tree became
+          # unreachable: 9 -> 8. Found by this lane FAILING on the push, which is
+          # the drift check doing its job: the deletion had moved the test file
+          # and left both the drift list and the --test flag behind.
+          # 2026-10-10 (plan 52g/52h): dhat_frame_silence_activity added for
+          # the per-kind frame-silence register: 8 -> 9.
+          # 2026-11-02 (recovered plan52c): production reader memory
+          # allocation ratchet added with its explicit target: 9 -> 10.
+          # 2026-11-21 (scope lock 2026-11-20, Dhan UTC trade times):
+          # dhat_ltt_correction: the permanent post-cutover UTC dispatch: 10 -> 11.
+          if [ "$ran" -ne 11 ]; then
+            echo "::error::core DHAT step executed $ran targets, expected 11 — a --test flag was dropped from this step (drift list vs run step mismatch)."; exit 1
           fi
 
       # DHAT (storage) — RETIRED 2026-07-17, RE-ADDED 2026-08-15.
@@ -904,22 +997,56 @@ jobs:
       # pools, against the tick path's one row per packet. Feature-UNGATED
       # (house pattern), so Test (storage) also runs it; this lane is the
       # allocation-ratchet authority.
+      #
+      # 2026-09-22: dhat_flush_buffer_recycle added — 1 -> 2. It pins that the
+      # tick and depth writers recycle their ILP buffer across flushes instead
+      # of allocating a fresh one per flush. The drift check caught it on the
+      # first push, exactly as it caught the three targets before it.
+      #
+      # 2026-09-29: dhat_deferred_depth_note_shed added — 2 -> 3. It pins that
+      # the per-packet shed mark (plan item 45a) stays atomics only.
+      #
+      # 2026-10-05: dhat_seal_queue_backlog added (audit N2), 4 -> 5. It pins
+      # that the pre-sized candle hand-off queue allocates nothing with a
+      # real backlog.
+      # 2026-10-02: dhat_rescue_floor_zero_alloc added — 3 -> 4. It pins that
+      # the queued-rescue floors (held on the drain's rescue arm) and the
+      # watermark durability-lag ring stay allocation-free.
+      # 2026-10-26: dhat_hot_path_telemetry added (audit K5), 5 -> 6. It pins
+      # that record_stage_nanos, beat_at and stage_quantiles allocate nothing.
+      # 2026-10-30: dhat_hot_path_latency_minute (the per-minute proof and
+      # capacity window on the telemetry thread) and dhat_receipt_to_fold_stage
+      # (DT0) added, 6 -> 8, each sharing an existing --test line.
+      # Two --test flags share a line so the run: line count does not grow.
+      # 2026-10-30: dhat_tick_row_append added (plan ITEM DT row stage), 6 -> 7.
+      # It pins the per-tick ILP row build at zero allocations. Its flag shares
+      # a line with two others, so the run: line count does not grow.
+      # 2026-10-30: with PR #2146's two (hot_path_latency_minute, receipt_to_fold) -> 9;
+      # the flags are packed three per line so the run: line count stays at its ceiling.
+      # Merged with PR #2143: dhat_seal_per_seal_path (the whole per-seal path after
+      # the fold allocates nothing) shares the second flag line, 9 -> 10; its drift-list
+      # line is paid for by joining the zero-tests echo and exit 1 below.
+      # 2026-10-30: dhat_task_watch added (plan item 4: heartbeat beat/publish and one
+      # memory-ladder poll allocate nothing), packed onto the third flag line, 10 -> 11.
+      # 2026-11-06 (PF-4): dhat_tick_rescue_spare (a rescue hand-off reuses a recycled
+      # batch, 0 blocks), third flag line, 11 -> 12; its drift-list line is paid for by
+      # folding the count check below onto one line.
+      # 2026-11-06 (PF-4b review round 1): dhat_depth_book_hand_off (the drain's book
+      # append and flush or rescue hand-off allocate nothing with recycled batches),
+      # first flag line, 12 -> 13; its drift-list line is paid for by folding the
+      # zero-tests check below onto one line.
       - name: DHAT (storage)
         shell: bash
         run: |
           set -euo pipefail
           cargo test -p tickvault-storage \
-            --test dhat_depth_append_zero_alloc \
+            --test dhat_deferred_depth_note_shed --test dhat_hot_path_latency_minute --test dhat_depth_append_zero_alloc --test dhat_depth_book_hand_off \
+            --test dhat_receipt_to_fold_stage --test dhat_tick_row_append --test dhat_flush_buffer_recycle --test dhat_seal_per_seal_path \
+            --test dhat_hot_path_telemetry --test dhat_rescue_floor_zero_alloc --test dhat_seal_queue_backlog --test dhat_task_watch --test dhat_tick_rescue_spare \
             2>&1 | tee /tmp/dhat-storage.log
-          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then
-            echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
-            exit 1
-          fi
+          if grep -q 'running 0 tests' /tmp/dhat-storage.log; then echo "::error::a storage dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."; exit 1; fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-storage.log || true)
-          if [ "$ran" -ne 1 ]; then
-            echo "::error::storage DHAT step executed $ran targets, expected 1 — a --test flag was dropped from this step."
-            exit 1
-          fi
+          if [ "$ran" -ne 13 ]; then echo "::error::storage DHAT step executed $ran targets, expected 13 — a --test flag was dropped from this step."; exit 1; fi
 
       - name: DHAT (trading)
         shell: bash
@@ -932,17 +1059,22 @@ jobs:
           # 2026-08-11: dhat_multi_tf_fold added with the rebuilt aggregator
           # fold path — 1 → 2. It had been landing on disk with no CI lane
           # running it; the drift check above is what surfaced that.
+          # 2026-09-01: dhat_tick_ram_arena added — 2 → 3. The raw-tick RAM
+          # arena's header claims "zero heap allocation after construction",
+          # and the only thing checking that read ONE of its four
+          # collections. The drift check above caught this target too, on the
+          # first push, exactly as it caught dhat_multi_tf_fold.
           cargo test -p tickvault-trading \
-            --test dhat_multi_tf_fold \
-            --test dhat_risk_engine \
+            --test dhat_live_candles --test dhat_multi_tf_fold \
+            --test dhat_risk_engine --test dhat_tick_ram_arena --test dhat_worst_fill \
             2>&1 | tee /tmp/dhat-trading.log
           if grep -q 'running 0 tests' /tmp/dhat-trading.log; then
             echo "::error::a trading dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
             exit 1
           fi
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-trading.log || true)
-          if [ "$ran" -ne 2 ]; then
-            echo "::error::trading DHAT step executed $ran targets, expected 2 — a --test flag was dropped from this step."
+          if [ "$ran" -ne 5 ]; then
+            echo "::error::trading DHAT step executed $ran targets, expected 5 — a --test flag was dropped from this step."
             exit 1
           fi
 
@@ -957,9 +1089,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p tickvault-app \
-            --test dhat_live_ingest_seam \
-            --test dhat_mark_forward \
-            --test dhat_ws_lag \
+            --test dhat_depth_drain --test dhat_idle_seed_step \
+            --test dhat_depth_book_row_presize --test dhat_depth_level_row_presize \
+            --test dhat_live_ingest_seam --test dhat_live_fill \
+            --test dhat_main_feed_backup_dedup --test dhat_mark_forward \
+            --test dhat_order_path_recorder --test dhat_wal_ring_sink_accept \
+            --test dhat_ws_lag --test dhat_ws_lag_recorder --test dhat_silence_scan --test dhat_trade_safety \
             2>&1 | tee /tmp/dhat-app.log
           if grep -q 'running 0 tests' /tmp/dhat-app.log; then
             echo "::error::an app dhat target ran ZERO tests — vacuous green. Rule 11: no false-OK."
@@ -974,10 +1109,28 @@ jobs:
           # a silently-dropped flag and a silently-added one look identical to
           # the run step, so the count is the only thing that notices. Bumping
           # it is the fix; loosening it to >= would delete the guard.
+          #
+          # 8 since the 2026-10-20 audit (M2): dhat_main_feed_backup_dedup gates
+          # the backup-copy dedup with a published set.
+          # 7 since the PROOF-10 / HOT-1 merge (2026-10-12): both sides added a
+          # target, the same both-sides case the 2026-08-15 note above records.
+          # 6 since audit PROOF-10 (2026-10-11): dhat_depth_drain gates the
+          # app-side depth frame drain (drain_depth_frame).
+          # 6 since audit HOT-1 (2026-10-11): dhat_wal_ring_sink_accept runs the
+          # real WAL ring sink on the socket read path.
+          # 5 since audit M6 (2026-10-05): dhat_ws_lag_recorder runs the lag tap
+          # with the production recorder installed.
+          # 7 since 2026-10-22 (plan item 62): dhat_top_volume_sweep deleted
+          # with the top-volume sweep it gated (operator Quote 34).
+          # 8 since 2026-10-28 (follow-up bundle): dhat_idle_seed_step gates the
+          # idle seed step and the depth row pre-size.
+          # 9 since 2026-10-30 (order path under 1 us): dhat_order_path_recorder
+          # gates the order path with the production recorder installed.
+          # 11 since 2026-10-31: isolate level/book heap cases in their own
+          # binaries, retaining all three cases and their exact 0/0 budgets. 12 since 2026-11-12: dhat_live_fill (LF-6b). 13 since 2026-11-17: dhat_silence_scan gates the silence arm with the reconcile slot cells. 14 since 2026-11-22: dhat_trade_safety gates the trade-safety switch (UTC-SAFETY).
           ran=$(grep -c 'Running.*tests/dhat_' /tmp/dhat-app.log || true)
-          if [ "$ran" -ne 3 ]; then
-            echo "::error::app DHAT step executed $ran targets, expected 3 — a --test flag was dropped from this step."
-            exit 1
+          if [ "$ran" -ne 14 ]; then
+            echo "::error::app DHAT step executed $ran targets, expected 14 — a --test flag was dropped from this step."; exit 1
           fi
 
   # -------------------------------------------------------------------------
@@ -1014,7 +1167,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Loom target drift check (no silent drops)
         shell: bash
@@ -1023,7 +1176,7 @@ jobs:
           actual=$(ls crates/*/tests/loom_*.rs | LC_ALL=C sort)
           expected=$(LC_ALL=C sort <<'EOF'
           crates/core/tests/loom_activity_watchdog.rs
-          crates/core/tests/loom_tick_dedup.rs
+          crates/core/tests/loom_ghost_register.rs
           crates/core/tests/loom_ws_decoupling.rs
           crates/trading/tests/loom_circuit_breaker.rs
           EOF
@@ -1039,12 +1192,12 @@ jobs:
           echo "Loom target list matches the filesystem ($(echo "$actual" | wc -l) targets)."
 
       - name: Install Rust toolchain 1.95.0
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # SHA-pinned (supply-chain hardening 2026-04-25)
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # SHA-pinned (supply-chain hardening 2026-04-25)
         with:
           toolchain: '1.95.0'
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: ci-loom-concurrency
           cache-on-failure: true
@@ -1059,7 +1212,7 @@ jobs:
           set -euo pipefail
           cargo test -p tickvault-core --features loom \
             --test loom_activity_watchdog \
-            --test loom_tick_dedup \
+            --test loom_ghost_register \
             --test loom_ws_decoupling 2>&1 | tee /tmp/loom-core.log
           if grep -q "running 0 tests" /tmp/loom-core.log; then
             echo "::error::A loom target in tickvault-core ran 0 tests — the crate's 'loom' feature is not reaching the cfg gate, so these binaries are EMPTY and this lane would pass vacuously."
@@ -1134,7 +1287,6 @@ jobs:
       - deploy-lint
       - build-and-verify
       - test
-      - test-trading-groww-orders
       - security-and-audit
       - coverage-and-perf
       - repo-guards

@@ -44,6 +44,25 @@ fn repo_root() -> PathBuf {
         .expect("browser_surface_guard: cannot canonicalize repo root")
 }
 
+/// Read a scan target as text, LOSSILY, and PANIC on an I/O failure.
+///
+/// SCOPE FIX #17 (2026-09-02). Five scans in this file read with
+/// `let Ok(body) = read_to_string(..) else { continue }`, and `read_to_string`
+/// rejects the whole file on ONE non-UTF-8 byte — so a Latin-1 `é` in a
+/// comment silently exempted a source file from the browser-surface, spawn,
+/// JS-volume, inline-handler and content-type scans all at once. Lossy
+/// decoding keeps every valid byte scannable; an unreadable file is a guard
+/// FAILURE, never a file to skip, because a skipped file reads as clean.
+fn read_scan_text(root: &Path, path: &str) -> String {
+    let bytes = std::fs::read(root.join(path)).unwrap_or_else(|e| {
+        panic!(
+            "browser_surface_guard: cannot read `{path}`: {e}. A file the enumeration \
+             listed but the guard cannot open must fail the build, not pass it."
+        )
+    });
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// Files matching `pathspec` that are tracked **or newly added and not
 /// ignored**.
 ///
@@ -109,11 +128,23 @@ const SCRIPT_BUDGET: &[(&str, usize)] = &[
     ("crates/api/src/handlers/feeds_page.rs", 1),
     ("crates/api/src/handlers/board_page.rs", 1),
     // --- NOT frontend: XSS fixtures + vendor-body parsing ---
-    ("crates/api/src/handlers/brutex_crossverify.rs", 6),
     ("crates/api/src/middleware.rs", 1),
-    ("crates/app/src/brutex_crossverify_compare.rs", 1),
-    ("crates/aws-lambdas/src/operator_control.rs", 3),
-    ("crates/core/src/notification/events.rs", 12),
+    // 3 -> 2 (2026-09-17): the retired REST-audit test block carried one
+    // `<script` XSS fixture. Shrink-only, so the budget follows it down.
+    ("crates/aws-lambdas/src/operator_control.rs", 2),
+    // 6 -> 4 (2026-09-17): the seven retired REST-leg pull-digest tests
+    // carried two `<script` XSS fixtures between them.
+    //
+    // ⚠ This one shrank in commit 8fc50d4e0 and was re-stamped a commit
+    // LATE, leaving this guard red in between. The reason is worth recording
+    // because it is structural, not carelessness: `events.rs` lives in
+    // `core`, this guard lives in `common`, and `testing-scope.md`'s default
+    // ("edit in crates/<X> -> cargo test -p tickvault-<X>") would never run
+    // it for a core-only change. A cross-crate source-scan guard is outside
+    // the scope rule that is supposed to find it — so a change that shrinks
+    // ANY budgeted surface must run `tickvault-common` regardless of which
+    // crate it edited.
+    ("crates/core/src/notification/events.rs", 4),
     ("crates/trading/src/oms/api_client.rs", 1),
 ];
 
@@ -142,10 +173,10 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
         if path.ends_with("browser_surface_and_toolchain_guard.rs") {
             continue;
         }
-        let full = root.join(&path);
-        let Ok(body) = std::fs::read_to_string(&full) else {
-            continue;
-        };
+        // SCOPE FIX #23 (2026-10-26, audit plan item J5): counted on the
+        // LOWERCASED text. HTML tag names are case-insensitive, so
+        // `<SCRIPT>` runs exactly like `<script>` and was invisible here.
+        let body = read_scan_text(&root, &path).to_ascii_lowercase();
         let count = body.matches("<script").count();
         if count > 0 {
             actual.insert(path, count);
@@ -170,7 +201,33 @@ fn browser_code_in_rust_is_pinned_to_the_enumerated_surfaces() {
             Some(&allowed) if *count > allowed => problems.push(format!(
                 "  GREW: {path} has {count} `<script`, budget allows {allowed}"
             )),
+            // SCOPE FIX #18 (2026-09-05): the SHRINK half. This arm used to be
+            // an empty `Some(_) => {}`, so a budget could sit permanently above
+            // the file it bounds — `notification/events.rs` carried 12 against
+            // an actual 6, six units of headroom nobody granted and no reviewer
+            // would see. Its two siblings in this file (JS_VOLUME_BUDGET,
+            // INLINE_HANDLER_BUDGET) are exact and stale-checked; this one was
+            // neither, which made it the loosest bound on the one carve-out
+            // CLAUDE.md calls deliberately shrink-only. An unbounded carve-out
+            // is not a carve-out, and a carve-out that only ratchets one way is
+            // only half a ratchet.
+            Some(&allowed) if *count < allowed => problems.push(format!(
+                "  SHRANK: {path} has {count} `<script` against a budget of {allowed} — \
+                 lower the budget to {count}. The carve-out is shrink-only: headroom that \
+                 is not in use is headroom the next change spends without review."
+            )),
             Some(_) => {}
+        }
+    }
+
+    // A budget entry whose file is gone bounds nothing and hides the fact that
+    // a surface was removed — the same stale-subject class the dedup guard's
+    // exemption list carried until 2026-09-05.
+    for (path, _) in SCRIPT_BUDGET {
+        if !actual.contains_key(*path) && !repo_root().join(path).exists() {
+            problems.push(format!(
+                "  STALE: {path} is in SCRIPT_BUDGET and no longer exists — remove the entry"
+            ));
         }
     }
 
@@ -244,22 +301,51 @@ fn strip_toml_comments(body: &str) -> String {
 #[test]
 fn cargo_config_declares_no_external_runner_or_linker() {
     let root = repo_root();
-    let path = root.join(".cargo/config.toml");
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        // No cargo config at all is trivially safe.
-        return;
-    };
 
-    let code = strip_toml_comments(&body);
+    // EVERY cargo config, not just the root one — SCOPE FIX #16 (2026-09-01,
+    // hole SIXTEEN). Cargo reads `.cargo/config.toml` from the package
+    // directory and every ancestor, so `crates/app/.cargo/config.toml` sets
+    // the runner/linker for that package's builds and this test never opened
+    // it. Root-only is the enumerate-one-location failure this repo's
+    // rust-only lock has now recorded several times in a row.
+    //
+    // `scan_paths` covers tracked AND untracked files, so a config added but
+    // not yet committed is caught too — the SCOPE FIX C1 lesson.
+    let mut configs = scan_paths(".cargo/config.toml");
+    configs.extend(scan_paths("**/.cargo/config.toml"));
+    configs.extend(scan_paths(".cargo/config"));
+    configs.extend(scan_paths("**/.cargo/config"));
+    configs.sort();
+    configs.dedup();
 
     let mut found = Vec::new();
-    for (lineno, line) in code.lines().enumerate() {
-        let t = line.trim_start();
-        // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
-        // including the dotted and quoted forms cargo accepts.
-        let is_key = |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
-        if is_key("runner") || is_key("linker") {
-            found.push(format!("  .cargo/config.toml:{}: {}", lineno + 1, t.trim()));
+    for rel in &configs {
+        let path = root.join(rel);
+        // FAIL CLOSED — SCOPE FIX #16. The previous version returned early on
+        // any read error, so an unreadable config passed as "trivially safe".
+        // A file cargo WILL read but this guard CANNOT is the one case that
+        // most needs to fail, not the one case that is waved through.
+        let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "CARGO CONFIG UNREADABLE: {rel} exists in the tree but could not be \
+                 read ({e}).\n\n\
+                 This guard now fails CLOSED here. Cargo reads this file on every \
+                 build; a config the toolchain honours and the guard cannot inspect \
+                 is exactly the blind spot `runner`/`linker` enforcement exists to \
+                 prevent."
+            )
+        });
+
+        let code = strip_toml_comments(&body);
+        for (lineno, line) in code.lines().enumerate() {
+            let t = line.trim_start();
+            // Match the KEY, not a substring: `runner = ...` / `linker = ...`,
+            // including the dotted and quoted forms cargo accepts.
+            let is_key =
+                |key: &str| t.starts_with(key) && t[key.len()..].trim_start().starts_with('=');
+            if is_key("runner") || is_key("linker") {
+                found.push(format!("  {rel}:{}: {}", lineno + 1, t.trim()));
+            }
         }
     }
 
@@ -350,14 +436,55 @@ const SPAWN_ALLOWLIST: &[(&str, &str)] = &[
     ("bash", "test harnesses invoking the repo's own .sh hooks"),
     ("sh", "same, POSIX form"),
     (
+        "timeout",
+        "GNU coreutils deadline supervisor, restricted below to the deployment \
+         backup module. Preserves the reviewed 20s Git/sudo and 30s sha256sum \
+         deadlines with kill-after=5, plus five owned test children. It is \
+         neither a language runtime nor a shell; no general spawn allowance.",
+    ),
+    (
         "docker",
         "compose health checks (infra.rs) + container tests",
     ),
-    ("df", "disk-health watcher"),
+    // `df` LEFT 2026-10-12 (deep audit DA-12): the disk-health probe reads
+    // free space with one `statvfs` call now, so no literal `df` spawn
+    // remains. (`tv_doctor` still runs `df -h` through a non-literal helper,
+    // which this literal scan does not see; that is an operator report.)
+    (
+        "kill",
+        "test only (audit G3, 2026-10-11): main.rs sends SIGTERM to the test's \
+         own process to prove a signal landing between two shutdown waits is \
+         returned by the next wait. A POSIX process utility, not a language \
+         runtime; nothing in production spawns it.",
+    ),
     ("open", "operator convenience — opens a URL on the dev box"),
     (
         "chronyc",
         "clock-discipline verification for the latency claim",
+    ),
+    (
+        "systemctl",
+        "host tuning (`tickvault host-tuning`, audit D6b 2026-10-01): enable \
+         chronyd, stop irqbalance, daemon-reload after a drop-in change. A \
+         system service manager, not a language runtime; the shell script it \
+         replaced ran the same calls.",
+    ),
+    (
+        "modprobe",
+        "host tuning (`tickvault host-tuning bbr`, audit D6b 2026-10-01): load \
+         tcp_bbr before writing the sysctl that needs it. A kernel module \
+         loader, not a language runtime; the unit's former `/bin/sh -c` ran it.",
+    ),
+    (
+        "/usr/bin/true",
+        "coreutils no-op, NOT a language runtime. It is what \
+         `infra.rs::spawn_program` substitutes in cfg(test) builds so that \
+         `cargo test` cannot run `docker compose up --force-recreate` (which \
+         tears down every container on the machine) or `xdg-open`. Spawned \
+         once, by the test that proves the substitute exists and ignores the \
+         argv it is handed. Named as a LITERAL on purpose: hiding it behind a \
+         const would keep it off this allowlist and out of a reader's view, \
+         which is the opposite of what this list is for.",
     ),
 ];
 
@@ -389,6 +516,108 @@ fn spawned_literals(body: &str) -> Vec<String> {
     out
 }
 
+const DEPLOY_BACKUP_TIMEOUT_SOURCE: &str = "crates/app/src/bin/smoke_test/deploy_backup.rs";
+// Two production supervisors and five owned fixture supervisors. Shrink-only.
+const DEPLOY_BACKUP_TIMEOUT_SITE_CEILING: usize = 7;
+
+fn timeout_spawn_scope_problem(path: &str, binaries: &[String]) -> Option<String> {
+    let sites = binaries
+        .iter()
+        .filter(|bin| bin.as_str() == "timeout")
+        .count();
+    if sites == 0 {
+        None
+    } else if path != DEPLOY_BACKUP_TIMEOUT_SOURCE || sites > DEPLOY_BACKUP_TIMEOUT_SITE_CEILING {
+        Some(format!(
+            "  {path}: {sites} timeout spawn(s) outside the reviewed backup scope/ceiling"
+        ))
+    } else {
+        None
+    }
+}
+
+#[test]
+fn timeout_scope_rejects_other_paths_lookalikes_and_extra_sites() {
+    let one = spawned_literals(r#"Command::new("timeout")"#);
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &one).is_none());
+    for path in [
+        "crates/app/src/main.rs",
+        "crates/app/tests/deploy_backup.rs",
+        "crates/app/src/bin/other/deploy_backup.rs",
+        "./crates/app/src/bin/smoke_test/deploy_backup.rs",
+        "crates/app/src/bin/smoke_test/deploy_backup.rs.bak",
+    ] {
+        assert!(
+            timeout_spawn_scope_problem(path, &one).is_some(),
+            "path={path}"
+        );
+    }
+    let ceiling = vec!["timeout".to_string(); DEPLOY_BACKUP_TIMEOUT_SITE_CEILING];
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &ceiling).is_none());
+    let over = vec!["timeout".to_string(); DEPLOY_BACKUP_TIMEOUT_SITE_CEILING + 1];
+    assert!(timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &over).is_some());
+    assert!(timeout_spawn_scope_problem("crates/app/src/main.rs", &["git".to_string()]).is_none());
+}
+
+fn deploy_backup_deadline_roles_match(body: &str) -> bool {
+    let Some(production) = tickvault_common::source_scan::production_region(body) else {
+        return false;
+    };
+    let production = tickvault_common::source_scan::strip_rust_comments(&production);
+    spawned_literals(&production)
+        .iter()
+        .filter(|name| name.as_str() == "timeout")
+        .count()
+        == 2
+        && production.contains(r#"command.args(["--kill-after=5", "20"])"#)
+        && production.contains(r#".args(["--kill-after=5", "30", "sha256sum", "--"])"#)
+}
+
+#[test]
+fn deploy_backup_keeps_its_reviewed_production_deadline_roles() {
+    let body = read_scan_text(&repo_root(), DEPLOY_BACKUP_TIMEOUT_SOURCE);
+    assert!(
+        deploy_backup_deadline_roles_match(&body),
+        "the complete production region must retain both reviewed deadlines"
+    );
+}
+
+#[test]
+fn deploy_backup_deadline_guard_keeps_trailing_production_and_refuses_missing_test_module() {
+    let body = read_scan_text(&repo_root(), DEPLOY_BACKUP_TIMEOUT_SOURCE);
+    assert!(deploy_backup_deadline_roles_match(&body));
+    let test_gate = "#[cfg(test)]\nmod tests {";
+    assert_eq!(body.matches(test_gate).count(), 1);
+    assert!(!deploy_backup_deadline_roles_match(&body.replacen(
+        test_gate,
+        "mod tests {",
+        1
+    )));
+    let fixture_site = r#"let mut verify = Command::new("timeout");"#;
+    assert_eq!(body.matches(fixture_site).count(), 1);
+    let moved = body.replacen(fixture_site, r#"let mut verify = Command::new("git");"#, 1)
+        + r#"
+fn trailing_production_probe() { let _child = Command::new("timeout"); }
+"#;
+    assert!(
+        timeout_spawn_scope_problem(DEPLOY_BACKUP_TIMEOUT_SOURCE, &spawned_literals(&moved))
+            .is_none(),
+        "fixture stays within the total seven-site ceiling"
+    );
+    assert!(
+        !deploy_backup_deadline_roles_match(&moved),
+        "a third production supervisor after mod tests must still be seen"
+    );
+    let commented = body.replace(
+        r#"command.args(["--kill-after=5", "20"]);"#,
+        r#"// command.args(["--kill-after=5", "20"]);"#,
+    );
+    assert!(
+        !deploy_backup_deadline_roles_match(&commented),
+        "a comment must not stand in for the deadline"
+    );
+}
+
 #[test]
 fn every_spawned_binary_is_on_the_allowlist() {
     let root = repo_root();
@@ -401,10 +630,12 @@ fn every_spawned_binary_is_on_the_allowlist() {
         if SPAWN_SCAN_EXEMPT.contains(&path.as_str()) {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(root.join(&path)) else {
-            continue;
-        };
-        for bin in spawned_literals(&body) {
+        let body = read_scan_text(&root, &path);
+        let binaries = spawned_literals(&body);
+        if let Some(problem) = timeout_spawn_scope_problem(&path, &binaries) {
+            violations.push(problem);
+        }
+        for bin in binaries {
             seen_any = true;
             if !allowed.contains(&bin.as_str()) {
                 violations.push(format!("  {path}: Command::new(\"{bin}\")"));
@@ -460,7 +691,32 @@ fn spawn_allowlist_is_documented_and_has_no_language_runtime() {
     // set gives strictly stronger protection anyway (it rejects `zig` and
     // `cmake` too, which no runtime denylist would have listed) while naming
     // nothing banned.
-    const FROZEN: &[&str] = &["git", "bash", "sh", "docker", "df", "open", "chronyc"];
+    // `/usr/bin/true` joined 2026-09-05, turned by hand as this comment
+    // requires. It is coreutils' no-op -- not a language runtime, not a package
+    // manager -- and it is here because `infra.rs::spawn_program` substitutes it
+    // in cfg(test) builds so `cargo test` can no longer run `docker compose up
+    // --force-recreate` or `xdg-open` against the machine running the tests.
+    //
+    // `systemctl` and `modprobe` joined 2026-10-01 (audit D6b), turned by hand:
+    // the per-boot host tuning moved from shell into `tickvault host-tuning`,
+    // and those are the system tools the scripts already called. Moving the
+    // calls into Rust put them in front of this scan for the first time.
+    const FROZEN: &[&str] = &[
+        "git",
+        "bash",
+        "sh",
+        "docker",
+        // "df" left 2026-10-12 (deep audit DA-12): statvfs replaced the fork.
+        // 2026-10-11 (audit G3): test-only SIGTERM to the test's own process.
+        "kill",
+        "open",
+        "chronyc",
+        "systemctl",
+        "modprobe",
+        "/usr/bin/true",
+        // 2026-11-02: only the reviewed backup supervisor sites, not a runtime.
+        "timeout",
+    ];
 
     let mut actual: Vec<&str> = SPAWN_ALLOWLIST.iter().map(|(b, _)| *b).collect();
     actual.sort_unstable();
@@ -503,4 +759,678 @@ fn spawn_scanner_extracts_literals_and_ignores_non_literals() {
         spawned_literals("Command::new(program)").is_empty(),
         "a non-literal spawn yields no literal — this is the documented limit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// JS VOLUME + HANDLER-ATTRIBUTE SCOPE (2026-08-29)
+//
+// `rust-only-forever-lock-2026-07-19.md` §0.3 recorded two holes in the guard
+// above and closed neither, noting only that the tree was clean at the time:
+//
+//   1. It counts `<script` TAGS, not JavaScript. A budget-1 surface can grow
+//      from 20 lines of JS to 20,000 inside one tag with the count unchanged.
+//      "Rust only, except frontend" then has an unbounded exception, and an
+//      unbounded carve-out is not a carve-out.
+//   2. JavaScript carrying no `<script` at all is uncounted ENTIRELY — an
+//      inline `onclick=` attribute, or a route serving
+//      `Content-Type: application/javascript`.
+//
+// Both are the same shape as every prior fix in this family: the hole was in
+// what the guard LOOKED AT, never in its list. "Verified clean today" is a
+// measurement with a date on it, not an enforcement — this repository has
+// been bitten repeatedly by exactly that substitution.
+// ---------------------------------------------------------------------------
+
+/// Lines of JavaScript inside `<script>…</script>` blocks, per surface.
+///
+/// Counted inclusively from the line opening the block to the line closing
+/// it — the same span a reader would call "the script". EXACT values, so any
+/// growth is visible; the table may SHRINK freely.
+///
+/// **Growing a number here means the frontend carve-out got bigger**, and
+/// needs a dated operator note in `rust-only-forever-lock-2026-07-19.md`
+/// first, exactly like adding a path to `SCRIPT_BUDGET`.
+const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
+    ("crates/api/src/handlers/board_page.rs", 263),
+    // 235 → 301 on 2026-10-30: the F&O stocks movers section (PR #2141),
+    // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
+    // 301 → 275 the same day: the speed-and-health panel compacted the script.
+    ("crates/api/src/handlers/dashboard_page.rs", 275),
+    ("crates/api/src/handlers/feeds_page.rs", 226),
+    // Public portal Top Movers, user-requested 2026-10-31; scope/measurement in §0.16.
+    ("crates/aws-lambdas/src/operator_control_console.html", 581),
+];
+
+/// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
+///
+/// This is JavaScript that carries no `<script` tag, so the tag budget above
+/// is structurally blind to it. EXACT values, shrink-only.
+///
+/// The single occurrence outside the frontend surface is an XSS test fixture
+/// (`"><img src=x onerror=alert(1)>`) fed to a sanitiser — enumerated rather
+/// than pattern-excluded, so a REAL handler added to that file later still
+/// shows up as a count change.
+const INLINE_HANDLER_BUDGET: &[(&str, usize)] = &[
+    ("crates/aws-lambdas/src/operator_control.rs", 1),
+    ("crates/aws-lambdas/src/operator_control_console.html", 21),
+];
+
+/// The handler attributes scanned for. Not exhaustive by construction — no
+/// list of DOM events can be — but it covers every handler that has ever
+/// appeared in this tree plus the ones a new page would reach for first.
+const HANDLER_ATTRS: &[&str] = &[
+    "onblur",
+    "onchange",
+    "onclick",
+    "onerror",
+    "onfocus",
+    "oninput",
+    "onkeydown",
+    "onkeyup",
+    "onload",
+    "onmouseover",
+    "onsubmit",
+];
+
+/// Count lines inside `<script>…</script>` blocks, inclusive of the opening
+/// and closing lines.
+///
+/// An opening tag with NO closer anywhere after it is a fixture string or
+/// malformed markup, never a real block running to end of file — so it
+/// contributes its own line and nothing more. Getting this wrong is not
+/// cosmetic: the first version counted to EOF and reported 2,320 lines of
+/// "JavaScript" in a Rust notification module whose `<script` occurrences are
+/// all XSS test fixtures. A guard that inflates is abandoned as fast as one
+/// that under-reports.
+///
+/// Deliberately line-based rather than byte-based: bytes swing with
+/// formatting and would make the budget noisy enough that the next reader
+/// raises it out of irritation rather than intent. A guard people re-baseline
+/// to silence it is not a guard.
+fn js_line_count(body: &str) -> usize {
+    js_block_span(body).lines
+}
+
+/// Bytes inside `<script>…</script>` blocks, over the same span
+/// [`js_line_count`] counts (each counted line's bytes plus its newline).
+///
+/// SCOPE FIX #23 (2026-10-26, audit plan item J5). The line budget alone let
+/// one line hold any amount of script: a minified bundle pasted on a single
+/// line counts as one line. The line budget stays the review signal; this is
+/// a CEILING beside it, set to the bytes measured on the fix date, so growth
+/// fails and a formatting-only shrink passes (lower the ceiling to keep the
+/// gain).
+fn js_byte_count(body: &str) -> usize {
+    js_block_span(body).bytes
+}
+
+/// Lines and bytes of the script blocks in `body`.
+struct JsSpan {
+    lines: usize,
+    bytes: usize,
+}
+
+/// One pass shared by [`js_line_count`] and [`js_byte_count`], so the two
+/// budgets measure the same span. Tags are matched CASE-INSENSITIVELY
+/// (SCOPE FIX #23, 2026-10-26): `<SCRIPT>` opens a block in every browser,
+/// and the case-sensitive version counted none of it.
+fn js_block_span(body: &str) -> JsSpan {
+    let mut total = JsSpan { lines: 0, bytes: 0 };
+    let mut in_block = false;
+    let mut current = JsSpan { lines: 0, bytes: 0 };
+    let mut opener_bytes = 0_usize;
+    for line in body.lines() {
+        let lower = line.to_ascii_lowercase();
+        let line_span = line.len() + 1;
+        if in_block {
+            current.lines += 1;
+            current.bytes += line_span;
+        }
+        // Walk this line's tags IN ORDER (review round 1, 2026-10-26). The
+        // first version asked only "does the line contain an opener / a
+        // closer?", so `<script src=a></script><script>` opened and closed on
+        // that line and the block it left open was counted as nothing until
+        // the next closer: any amount of script could follow uncounted. A
+        // line shared by two blocks is counted in both (errs toward more).
+        let mut pos = 0_usize;
+        loop {
+            if in_block {
+                let Some(at) = lower[pos..].find("</script>") else {
+                    break;
+                };
+                pos += at + "</script>".len();
+                in_block = false;
+                total.lines += current.lines;
+                total.bytes += current.bytes;
+                current = JsSpan { lines: 0, bytes: 0 };
+            } else {
+                let Some(at) = lower[pos..].find("<script") else {
+                    break;
+                };
+                pos += at + "<script".len();
+                in_block = true;
+                current = JsSpan {
+                    lines: 1,
+                    bytes: line_span,
+                };
+                opener_bytes = line_span;
+            }
+        }
+    }
+    if in_block {
+        // An unterminated opener contributes its own line and nothing more.
+        total.lines += 1;
+        total.bytes += opener_bytes;
+    }
+    total
+}
+
+/// Count inline handler attributes: an `on*` name followed by `=`, allowing
+/// whitespace between. Case-insensitive, because HTML attributes are.
+fn inline_handler_count(body: &str) -> usize {
+    let lower = body.to_ascii_lowercase();
+    let mut total = 0_usize;
+    for attr in HANDLER_ATTRS {
+        let mut from = 0_usize;
+        while let Some(hit) = lower[from..].find(attr) {
+            let at = from + hit;
+            let after = at + attr.len();
+            // The next non-space character must be `=`, or this is a
+            // substring of some longer identifier (`onloaded`, `on_click`)
+            // rather than an attribute.
+            let is_attr = lower[after..]
+                .chars()
+                .find(|c| !c.is_whitespace())
+                .is_some_and(|c| c == '=');
+            if is_attr {
+                total += 1;
+            }
+            from = after;
+        }
+    }
+    total
+}
+
+/// Files this scanner must skip: it has to SPELL the patterns it looks for,
+/// so scanning itself would make it permanently self-tripping. Same carve-out
+/// the tag scanner above takes, for the same reason.
+fn is_the_scanner_itself(path: &str) -> bool {
+    path.ends_with("browser_surface_and_toolchain_guard.rs")
+}
+
+#[test]
+fn javascript_volume_inside_script_tags_only_shrinks() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JS_VOLUME_BUDGET.iter().copied().collect();
+
+    // SCOPE, and why it is narrow on purpose.
+    //
+    // This budget measures the SIZE of the frontend carve-out, so it scans the
+    // carve-out: the enumerated frontend surfaces, plus every tracked `.html`
+    // (so a NEW html surface is caught here as well as by the html test).
+    //
+    // It deliberately does NOT try to measure "lines of JavaScript" in
+    // arbitrary Rust files. Their `<script` occurrences are XSS fixtures and
+    // sanitiser inputs — string literals, often an opener with no closer on
+    // the same line — and any line-pairing over them produces nonsense: an
+    // early doc-comment mention pairs with an unrelated fixture 1,100 lines
+    // later. Those files are already guarded EXACTLY, by tag count, in
+    // `SCRIPT_BUDGET`; a new `<script` in any of them fails that test.
+    let mut scan: Vec<String> = JS_VOLUME_BUDGET
+        .iter()
+        .map(|(p, _)| (*p).to_string())
+        .collect();
+    for path in scan_paths("*.html") {
+        if !scan.contains(&path) {
+            scan.push(path);
+        }
+    }
+
+    let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+    for path in scan {
+        if is_the_scanner_itself(&path) {
+            continue;
+        }
+        let body = read_scan_text(&root, &path);
+        actual.insert(path, js_line_count(&body));
+    }
+
+    // Non-vacuity: a scanner that silently matches nothing would pass forever.
+    assert!(
+        actual
+            .get("crates/api/src/handlers/dashboard_page.rs")
+            .is_some_and(|n| *n > 100),
+        "JS-volume scan found no substantial script block in a known frontend \
+         surface — the scanner is broken and would pass vacuously"
+    );
+
+    let mut problems = Vec::new();
+    for (path, count) in &actual {
+        match budget.get(path.as_str()) {
+            None if *count > 0 => problems.push(format!(
+                "  UNBUDGETED: {path} contains {count} line(s) of JavaScript and is \
+                 not in JS_VOLUME_BUDGET"
+            )),
+            Some(&allowed) if *count > allowed => problems.push(format!(
+                "  GREW: {path} has {count} line(s) of JavaScript, budget allows {allowed}"
+            )),
+            _ => {}
+        }
+    }
+
+    // A budget entry whose file lost its script is stale and must go, or the
+    // ratchet outlives what it bounds.
+    for (path, _) in JS_VOLUME_BUDGET {
+        assert!(
+            actual.get(*path).is_some_and(|n| *n > 0),
+            "SHRINK THE RATCHET: {path} no longer contains JavaScript. Remove it \
+             from JS_VOLUME_BUDGET in the same PR — a budget entry for a file \
+             with no script silently permits one to reappear."
+        );
+    }
+
+    assert!(
+        problems.is_empty(),
+        "FRONTEND CARVE-OUT GREW:\n{}\n\n\
+         `CLAUDE.md` exempts the FRONTEND from the Rust-only rule. That \
+         exemption is shrink-only by design: counting `<script` TAGS alone \
+         would let one tag hold twenty thousand lines and still read as \
+         budget 1.\n\n\
+         If the growth is genuinely wanted, add a dated note to \
+         `.claude/rules/project/rust-only-forever-lock-2026-07-19.md` FIRST, \
+         then raise the number here.",
+        problems.join("\n")
+    );
+}
+
+/// The two frontend tables must name the same surfaces. A `.rs` page that
+/// gained a script tag but no volume entry would be size-unbounded; a volume
+/// entry with no tag entry would be measuring a file nothing else guards.
+#[test]
+fn the_volume_budget_and_the_tag_budget_name_the_same_surfaces() {
+    let tag_paths: Vec<&str> = SCRIPT_BUDGET.iter().map(|(p, _)| *p).collect();
+    for (path, _) in JS_VOLUME_BUDGET {
+        let known = tag_paths.contains(path) || HTML_ALLOWED_FRONTEND.contains(path);
+        assert!(
+            known,
+            "{path} is in JS_VOLUME_BUDGET but in neither SCRIPT_BUDGET nor \
+             HTML_ALLOWED_FRONTEND — the tables have drifted"
+        );
+    }
+}
+
+#[test]
+fn inline_event_handlers_only_shrink() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = INLINE_HANDLER_BUDGET.iter().copied().collect();
+
+    let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+    for pathspec in ["*.rs", "*.html"] {
+        for path in scan_paths(pathspec) {
+            if is_the_scanner_itself(&path) {
+                continue;
+            }
+            let body = read_scan_text(&root, &path);
+            let n = inline_handler_count(&body);
+            if n > 0 {
+                actual.insert(path, n);
+            }
+        }
+    }
+
+    assert!(
+        !actual.is_empty(),
+        "inline-handler scan found nothing anywhere — the scanner is broken and \
+         would pass vacuously (the frontend console has had handlers throughout)"
+    );
+
+    let mut problems = Vec::new();
+    for (path, count) in &actual {
+        match budget.get(path.as_str()) {
+            None => problems.push(format!(
+                "  UNBUDGETED: {path} has {count} inline event-handler attribute(s) \
+                 and is not in INLINE_HANDLER_BUDGET"
+            )),
+            Some(&allowed) if *count > allowed => problems.push(format!(
+                "  GREW: {path} has {count} inline handler(s), budget allows {allowed}"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    for (path, _) in INLINE_HANDLER_BUDGET {
+        assert!(
+            actual.contains_key(*path),
+            "SHRINK THE RATCHET: {path} no longer has an inline event handler. \
+             Remove it from INLINE_HANDLER_BUDGET in the same PR."
+        );
+    }
+
+    assert!(
+        problems.is_empty(),
+        "INLINE JAVASCRIPT OUTSIDE THE BUDGET:\n{}\n\n\
+         An `onclick=` attribute is JavaScript that carries no `<script` tag, \
+         so the tag budget cannot see it at all. Same rule: the frontend \
+         carve-out is shrink-only, and growing it needs a dated operator note \
+         in `rust-only-forever-lock-2026-07-19.md` first.",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn nothing_serves_a_javascript_content_type() {
+    // The third way JavaScript reaches a browser without a `<script` tag in
+    // our source: a route that answers with a JS media type and a body built
+    // elsewhere. VERIFIED ABSENT 2026-08-29 -- this is enforcement, not a
+    // measurement, so it stays absent.
+    let root = repo_root();
+    let needles = [
+        "application/javascript",
+        "text/javascript",
+        "application/ecmascript",
+    ];
+    let mut hits = Vec::new();
+    for path in scan_paths("*.rs") {
+        if is_the_scanner_itself(&path) {
+            continue;
+        }
+        let body = read_scan_text(&root, &path);
+        let lower = body.to_ascii_lowercase();
+        for n in needles {
+            if lower.contains(n) {
+                hits.push(format!("  {path} mentions `{n}`"));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "A JAVASCRIPT MEDIA TYPE APPEARS IN RUST SOURCE:\n{}\n\n\
+         A route serving `application/javascript` delivers script to a browser \
+         with no `<script` tag anywhere in our source, so both budgets above \
+         are blind to it. If this is a genuine new frontend surface, record it \
+         in `rust-only-forever-lock-2026-07-19.md` first and give it its own \
+         enumerated allowance here.",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn js_scanners_self_test() {
+    // The counters are the whole enforcement. If they mis-count, both budgets
+    // above pass while the carve-out grows, which is worse than no guard --
+    // it reports safety that is not there.
+
+    // Inclusive span, opening line through closing line.
+    assert_eq!(js_line_count("<script>\nlet a=1;\n</script>"), 3);
+    // Content outside the block is not JavaScript.
+    assert_eq!(
+        js_line_count("<p>x</p>\n<script>\nlet a=1;\n</script>\n<p>y</p>"),
+        3
+    );
+    // Two blocks both count.
+    assert_eq!(
+        js_line_count("<script>\na\n</script>\n<script>\nb\n</script>"),
+        6
+    );
+    // No script, no count.
+    assert_eq!(js_line_count("<p>nothing here</p>"), 0);
+    // THE HOLE THIS CLOSES: one tag, many lines. Tag count stays 1; this does not.
+    let fat = format!("<script>\n{}</script>", "x();\n".repeat(500));
+    assert_eq!(
+        fat.matches("<script").count(),
+        1,
+        "tag count is blind to volume"
+    );
+    assert_eq!(js_line_count(&fat), 502);
+
+    // An opener with no closer is a fixture string, not a block running to
+    // EOF. The first version of this counter got that wrong and reported
+    // 2,320 lines of "JavaScript" in a Rust notification module.
+    assert_eq!(
+        js_line_count("<script>alert(1)</script>"),
+        1,
+        "opener and closer on one line"
+    );
+    assert_eq!(
+        js_line_count("let s = \"<script>\";\nlet a = 1;\nlet b = 2;\n"),
+        1,
+        "an unterminated opener contributes its own line and nothing more"
+    );
+    assert_eq!(
+        js_line_count("</script>\nlet a = 1;\n"),
+        0,
+        "a stray closer with no opener opens nothing"
+    );
+
+    // Handler attributes, with and without space before `=`.
+    assert_eq!(inline_handler_count(r#"<b onclick="f()">"#), 1);
+    assert_eq!(inline_handler_count(r#"<b onclick = "f()">"#), 1);
+    assert_eq!(inline_handler_count("<img src=x onerror=alert(1)>"), 1);
+    assert_eq!(
+        inline_handler_count(r#"<b ONCLICK="f()">"#),
+        1,
+        "attributes are case-insensitive"
+    );
+    assert_eq!(
+        inline_handler_count(r#"<b onclick="f()" onchange="g()">"#),
+        2
+    );
+    // NOT handlers: a longer identifier that merely starts the same way.
+    assert_eq!(inline_handler_count("let onloaded = 1;"), 0);
+    assert_eq!(inline_handler_count("fn on_click_handler() {}"), 0);
+    assert_eq!(inline_handler_count("// discusses onclick in prose"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// SCOPE FIX #23 (2026-10-26, audit plan item J5) — three more ways the
+// frontend carve-out could grow unseen: script bytes on few lines, a
+// `javascript:` URL (script with no tag and no handler attribute), and an SVG
+// (markup that runs scripts, never opened by any scan before).
+// ---------------------------------------------------------------------------
+
+/// Bytes of JavaScript inside script blocks, per surface: the same surfaces
+/// and span as [`JS_VOLUME_BUDGET`]. A CEILING, measured on 2026-10-26: a
+/// value above it fails; a value below it passes and the ceiling should be
+/// lowered in the same PR. Growing a number needs the same dated operator note
+/// as `JS_VOLUME_BUDGET`.
+const JS_BYTE_BUDGET: &[(&str, usize)] = &[
+    ("crates/api/src/handlers/board_page.rs", 10_838),
+    // 8,781 → 12,194 on 2026-10-30: the F&O stocks movers section (PR #2141),
+    // owner-approved in rust-only-forever-lock-2026-07-19.md §0.15.
+    // 12,194 → 11,014 the same day: the speed-and-health panel compacted the script.
+    // 11,014 → 10,953 on review: both token-gated reads share one guard.
+    ("crates/api/src/handlers/dashboard_page.rs", 10_953),
+    ("crates/api/src/handlers/feeds_page.rs", 9_720),
+    // Requested Stocks reference view, 2026-11-02; measured scope in §0.17.
+    // 34,530 → 34,714 on 2026-11-03: the movers date and time selection,
+    // owner-requested in rust-only-forever-lock-2026-07-19.md §0.18.
+    // 34,714 → 34,627 on 2026-11-06 (plan PR MV review): the in-flight lock on
+    // the movers table cost bytes, a shared `$$` helper saved more.
+    // 34,627 → 34,696 the same day (PR MV combined review): a generation stamp
+    // on each reply so an older filter's rows never render under a newer one;
+    // still under the 34,714 §0.18 approved.
+    // 34,696 → 35,000 on 2026-11-17: the key is remembered in this browser for
+    // 30 days (owner card "Remember 30 days"), rust-only-forever-lock §0.20.
+    // Stocks watchlists, verified opening prices and socket readouts (§0.23, 2026-11-25).
+    (
+        "crates/aws-lambdas/src/operator_control_console.html",
+        49_746,
+    ),
+];
+
+#[test]
+fn javascript_bytes_inside_script_tags_stay_under_the_ceiling() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JS_BYTE_BUDGET.iter().copied().collect();
+    let mut scan: Vec<String> = JS_BYTE_BUDGET
+        .iter()
+        .map(|(p, _)| (*p).to_string())
+        .collect();
+    for path in scan_paths("*.html") {
+        if !scan.contains(&path) {
+            scan.push(path);
+        }
+    }
+    let mut problems = Vec::new();
+    for path in &scan {
+        let bytes = js_byte_count(&read_scan_text(&root, path));
+        match budget.get(path.as_str()) {
+            None if bytes > 0 => problems.push(format!(
+                "  UNBUDGETED: {path} holds {bytes} byte(s) of JavaScript and is not in \
+                 JS_BYTE_BUDGET"
+            )),
+            Some(&allowed) if bytes > allowed => problems.push(format!(
+                "  GREW: {path} holds {bytes} byte(s) of JavaScript, ceiling {allowed}"
+            )),
+            Some(_) if bytes == 0 => problems.push(format!(
+                "  STALE: {path} holds no JavaScript; remove it from JS_BYTE_BUDGET"
+            )),
+            _ => {}
+        }
+    }
+    let volume: Vec<&str> = JS_VOLUME_BUDGET.iter().map(|(p, _)| *p).collect();
+    let bytes_paths: Vec<&str> = JS_BYTE_BUDGET.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        volume, bytes_paths,
+        "JS_BYTE_BUDGET and JS_VOLUME_BUDGET must name the same surfaces in the same order"
+    );
+    assert!(
+        problems.is_empty(),
+        "FRONTEND CARVE-OUT GREW (bytes):\n{}\n\n\
+         The line budget cannot see a long line. Growth needs a dated note in \
+         `.claude/rules/project/rust-only-forever-lock-2026-07-19.md` FIRST.",
+        problems.join("\n")
+    );
+}
+
+/// `javascript:` URLs per file, across `*.rs`, `*.html` and `*.svg`. Zero
+/// anywhere on 2026-10-26, so the budget is EMPTY: any occurrence fails.
+/// Shrink-only, like every table in this file.
+const JAVASCRIPT_URL_BUDGET: &[(&str, usize)] = &[];
+
+/// Case-insensitive count of `javascript:` (URL schemes are case-insensitive,
+/// and browsers also ignore whitespace inside the scheme, which this does not
+/// model: a stated limit, not a covered case).
+fn javascript_url_count(body: &str) -> usize {
+    body.to_ascii_lowercase().matches("javascript:").count()
+}
+
+#[test]
+fn javascript_urls_only_shrink() {
+    let root = repo_root();
+    let budget: BTreeMap<&str, usize> = JAVASCRIPT_URL_BUDGET.iter().copied().collect();
+    let mut problems = Vec::new();
+    let mut scanned = 0_usize;
+    for pathspec in ["*.rs", "*.html", "*.svg", "*.SVG"] {
+        for path in scan_paths(pathspec) {
+            if is_the_scanner_itself(&path) {
+                continue;
+            }
+            scanned += 1;
+            let n = javascript_url_count(&read_scan_text(&root, &path));
+            let allowed = budget.get(path.as_str()).copied().unwrap_or(0);
+            if n > allowed {
+                problems.push(format!(
+                    "  {path}: {n} `javascript:` URL(s), budget {allowed}"
+                ));
+            } else if n < allowed {
+                problems.push(format!(
+                    "  SHRANK: {path}: {n} against a budget of {allowed}; lower the budget"
+                ));
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "javascript-URL scan read almost nothing — it would pass vacuously"
+    );
+    assert!(
+        problems.is_empty(),
+        "`javascript:` URL OUTSIDE THE BUDGET:\n{}\n\n\
+         A `javascript:` URL runs script with no `<script` tag and no handler \
+         attribute, so neither budget above sees it. Growing this needs a dated \
+         note in `rust-only-forever-lock-2026-07-19.md` first.",
+        problems.join("\n")
+    );
+}
+
+/// Does an SVG carry a script element or a `javascript:` URL?
+fn svg_carries_script(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<script") || lower.contains("javascript:")
+}
+
+/// An SVG is markup a browser runs scripts from. None is tracked today; any
+/// tracked or untracked one must carry no script element, no `javascript:`
+/// URL and no inline handler attribute.
+#[test]
+fn svg_files_carry_no_script() {
+    let root = repo_root();
+    let mut svgs = scan_paths("*.svg");
+    svgs.extend(scan_paths("*.SVG"));
+    let offenders: Vec<String> = svgs
+        .iter()
+        .filter(|p| {
+            let body = read_scan_text(&root, p);
+            svg_carries_script(&body) || inline_handler_count(&body) > 0
+        })
+        .cloned()
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "SVG FILE(S) CARRYING SCRIPT: {offenders:?}. A script inside an image is \
+         JavaScript outside the budgeted frontend set; remove it."
+    );
+}
+
+#[test]
+fn scope_fix_2026_10_26_scanners_self_test() {
+    // Case: `<SCRIPT>` opens a block like `<script>`.
+    assert_eq!(js_line_count("<SCRIPT>\nlet a=1;\n</SCRIPT>"), 3);
+    assert_eq!(js_line_count("<Script>\nx\n</script>"), 3);
+    // Bytes: the span's lines plus their newlines.
+    assert_eq!(js_byte_count("<script>\nab\n</script>"), 9 + 3 + 10);
+    assert_eq!(js_byte_count("<p>no script</p>"), 0);
+    // One line, many bytes: the line count stays 1, the bytes do not.
+    let minified = format!("<script>{}</script>", "x();".repeat(1000));
+    assert_eq!(js_line_count(&minified), 1);
+    assert_eq!(js_byte_count(&minified), minified.len() + 1);
+    // An unterminated opener contributes its own line's bytes and no more.
+    assert_eq!(
+        js_byte_count("let a = 1;\nlet s = \"<script>\";\nlet b = 2;\n"),
+        "let s = \"<script>\";".len() + 1
+    );
+    // Review round 1: a block opened after a closer on the same line is
+    // counted. Before, the 500 lines below read as 1 line.
+    let reopened = format!(
+        "<script src=a></script><script>\n{}</script>",
+        "x();\n".repeat(500)
+    );
+    assert_eq!(js_line_count(&reopened), 1 + 502);
+    assert_eq!(
+        js_byte_count(&reopened),
+        2 * "<script src=a></script><script>".len() + 2 + 500 * 5 + "</script>".len() + 1
+    );
+    // Three blocks on one line: the line is counted once per block.
+    assert_eq!(
+        js_line_count("<script>a</script><SCRIPT>b</script><script>c</script>"),
+        3
+    );
+    // A closer before an opener on a line, outside a block, opens nothing
+    // until the opener; the opener then runs to the next closer.
+    assert_eq!(js_line_count("x</script> <script>\ny\n</script>"), 3);
+    // `javascript:` URLs, case-insensitively.
+    assert_eq!(javascript_url_count("<a href=\"javascript:go()\">"), 1);
+    assert_eq!(javascript_url_count("<a href=\"JavaScript:go()\">"), 1);
+    assert_eq!(javascript_url_count("the javascript language"), 0);
+    // SVG scan.
+    assert!(svg_carries_script("<svg><script>alert(1)</script></svg>"));
+    assert!(svg_carries_script("<svg><SCRIPT href='x.js'/></svg>"));
+    assert!(svg_carries_script(
+        "<svg><a href=\"JavaScript:alert(1)\">x</a></svg>"
+    ));
+    assert!(!svg_carries_script(
+        "<svg><rect width='1' height='1'/></svg>"
+    ));
+    assert!(inline_handler_count("<svg onload=\"alert(1)\"></svg>") > 0);
 }

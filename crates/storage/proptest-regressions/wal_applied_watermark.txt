@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0913cd1310092940e59e411694e57635f7a8c6198578e9e967ae991fd2f29213 # shrinks to ops = [Probe(LagOnly), Ack { ticks: true, depth: false }]

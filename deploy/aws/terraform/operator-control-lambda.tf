@@ -14,6 +14,12 @@
 #   * Function URL auth = NONE at AWS, but the handler requires
 #     `Authorization: Bearer <secret>` (constant-time compare) where the secret
 #     is read at runtime from the SSM SecureString below — NEVER in env/state.
+#   * Audit M4 (2026-10-04): no CORS (same-origin only), reserved concurrency
+#     3, an API Gateway stage throttle, and a per-container failed-key guard
+#     in the handler (10 wrong keys / 5 min per source → 429). None of these
+#     makes a leaked or short secret safe: the secret is the control. Rotate
+#     it (operator action: put a new long random value in the SSM parameter;
+#     the handler re-reads it within 60 s) whenever it may have been seen.
 #   * Destructive actions are market-hours-guarded in the handler (force to override).
 #   * `deploy` is intentionally NOT here (needs a GitHub PAT we don't store) —
 #     deploy stays auto-on-merge; the console links to Actions for it.
@@ -108,13 +114,41 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"]
   }
 
-  # AWS tab: read-only CloudWatch alarm states + month-to-date cost. No
-  # resource-level scoping is available for these read APIs (AWS requires "*").
+  # AWS tab: read-only CloudWatch alarm states. No resource-level scoping is
+  # available for DescribeAlarms (AWS requires "*").
   statement {
     sid       = "ReadOnlyObservability"
     effect    = "Allow"
-    actions   = ["cloudwatch:DescribeAlarms", "ce:GetCostAndUsage"]
+    actions   = ["cloudwatch:DescribeAlarms"]
     resources = ["*"]
+  }
+
+  # AWS tab month-to-date cost: the free AWS Budgets DescribeBudget on the ONE
+  # tickvault budget (2026-10-22, plan item 63, operator Quote 37; was paid
+  # ce:GetCostAndUsage on "*").
+  statement {
+    sid       = "ViewTheOneBudget"
+    effect    = "Allow"
+    actions   = ["budgets:ViewBudget"]
+    resources = [aws_budgets_budget.tv_monthly.arn]
+  }
+
+  # Plan PR MV (2026-11-06): read the published movers universe (one key
+  # only) so a Stocks movers click is answered without an SSM round trip.
+  statement {
+    sid       = "ReadMoversUniverse"
+    effect    = "Allow"
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/universe.json"]
+  }
+
+  # Plan PR MV review: the viewer heartbeat that makes the box publish (one
+  # key only; the box publishes nothing and queries nothing without it).
+  statement {
+    sid       = "WriteMoversViewer"
+    effect    = "Allow"
+    actions   = ["s3:PutObject"]
+    resources = ["${aws_s3_bucket.tv_live_view.arn}/movers/viewer.json"]
   }
 
   # Review finding 7: pin logs to THIS account + this Lambda's log group only.
@@ -163,6 +197,16 @@ resource "aws_lambda_function" "operator_control" {
   timeout          = 30
   memory_size      = 128
 
+  # Audit M4 (2026-10-04): cap concurrent containers. The portal makes one
+  # call at a time per open tab (an Overview refresh can hold a container up
+  # to ~25 s on a synchronous SSM read), so 3 covers a refresh, a tab load
+  # and a click; a flood beyond that is throttled by Lambda instead of
+  # scaling out. It also bounds the in-handler failed-key counter: at most 3
+  # containers, so at most 3 × AUTH_FAILURE_LIMIT wrong keys per source per
+  # window. RISK: Lambda requires 10 UNRESERVED executions left in the
+  # account; on an account whose concurrency quota is 10 this apply fails.
+  reserved_concurrent_executions = 3
+
   environment {
     variables = {
       # NOTE: this is the PARAMETER NAME, not the secret. The handler reads the
@@ -185,6 +229,12 @@ resource "aws_lambda_function" "operator_control" {
       # stay in lockstep; a staging env would need the workflow parameterized.
       PORTAL_GIT_SHA   = var.portal_git_sha
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
+      # 2026-10-22 (plan item 63): the budget the AWS tab reads its
+      # month-to-date cost from (free DescribeBudget).
+      BUDGET_NAME       = aws_budgets_budget.tv_monthly.name
+      BUDGET_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+      # Plan PR MV: where the movers universe is published (live-view-bucket.tf).
+      LIVE_VIEW_BUCKET = aws_s3_bucket.tv_live_view.bucket
     }
   }
 }
@@ -194,12 +244,13 @@ resource "aws_lambda_function_url" "operator_control" {
   function_name      = aws_lambda_function.operator_control[0].function_name
   authorization_type = "NONE" # bearer-secret enforced inside the handler
 
-  cors {
-    allow_origins = ["*"]
-    allow_methods = ["GET", "POST"] # GET serves the console page; POST runs actions
-    allow_headers = ["authorization", "content-type"]
-    max_age       = 300
-  }
+  # Audit M4 (2026-10-04): NO cors block, on purpose. It used to allow
+  # origin "*". The console page is served by a GET to this same URL and
+  # its script POSTs to `location.href`, so every legitimate request is
+  # same-origin and needs no CORS. With no CORS configuration a page on any
+  # OTHER origin cannot send the Authorization header here or read a reply.
+  # CORS is a browser rule only: it does not stop curl, which the bearer
+  # check, the failed-key guard and the concurrency cap handle.
 }
 
 # REQUIRED for authorization_type = "NONE": a Function URL with NONE auth still
@@ -251,6 +302,15 @@ resource "aws_apigatewayv2_stage" "operator_control" {
   api_id      = aws_apigatewayv2_api.operator_control[0].id
   name        = "$default"
   auto_deploy = true
+
+  # Audit M4 (2026-10-04): the one GLOBAL rate bound on the portal. The
+  # in-handler failed-key guard counts per container; this caps every
+  # caller together. The page polls once per 8 s plus clicks, far below it.
+  # The API has no cors_configuration either, so it stays same-origin only.
+  default_route_settings {
+    throttling_burst_limit = 10
+    throttling_rate_limit  = 2
+  }
 }
 
 resource "aws_lambda_permission" "operator_control_apigw" {
@@ -263,20 +323,8 @@ resource "aws_lambda_permission" "operator_control_apigw" {
 }
 
 # Per-Lambda error alarm → existing tv_alerts SNS (matches the killswitch pattern).
-resource "aws_cloudwatch_metric_alarm" "operator_control_errors" {
-  count               = var.enable_operator_control_lambda ? 1 : 0
-  alarm_name          = "tv-${var.environment}-operator-control-errors"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period              = 300
-  statistic           = "Sum"
-  threshold           = 0
-  alarm_description   = "operator-control Lambda erroring — control buttons may be failing"
-  dimensions          = { FunctionName = aws_lambda_function.operator_control[0].function_name }
-  treat_missing_data  = "notBreaching"
-}
+# alarm "operator_control_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
 
 output "operator_control_function_url" {
   value       = var.enable_operator_control_lambda ? aws_lambda_function_url.operator_control[0].function_url : null

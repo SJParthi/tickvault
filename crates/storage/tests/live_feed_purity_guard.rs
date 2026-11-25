@@ -165,12 +165,45 @@ fn live_feed_purity_no_tick_writer_in_historical_flow() {
 
     // Anti-vacuity: a guard that scanned nothing must FAIL, not pass. This is the
     // assertion whose absence let the guard sleep.
+    //
+    // 2026-08-21: the floor moved 10 -> 7 when the four Groww REST modules
+    // (groww_spot_1m_boot, groww_option_chain_1m_boot, groww_contract_1m_boot,
+    // option_contract_1m_rest_persistence) were deleted with the Groww feed,
+    // taking the discovered set from 12 to 8. The floor is deliberately still
+    // BELOW the real count, because its job is to catch discovery breaking,
+    // not to pin an exact inventory -- but it is close enough that losing a
+    // second module fails loudly instead of quietly shrinking the scan.
+    //
+    // 2026-09-17: the floor moves 7 -> 3, and it also stops sitting below the
+    // truth. The operator's SOCKETS-ONLY narrowing
+    // (`no-rest-except-live-feed-2026-06-27.md` §12.10) deleted FIVE discovered
+    // modules — `spot_1m_rest_boot.rs` and `option_chain_1m_boot.rs` from
+    // crates/app/src, and `spot_1m_rest_persistence.rs`,
+    // `option_chain_1m_persistence.rs` and `rest_fetch_audit_persistence.rs`
+    // from crates/storage/src — taking the discovered set from 8 to 3. The
+    // drop is exactly 5 and matches exactly those five names; a floor lowered
+    // by a number that did not match its named cause would be padding.
+    //
+    // The three that remain are `dhan_rest_stack.rs`, `rest_candle_fold.rs`
+    // and `option_contract_1m_rest_persistence.rs`.
+    //
+    // ⚠ THE FLOOR NOW SITS AT THE REAL COUNT, reversing the 2026-08-21
+    // reasoning above, and the reason is the size of the set rather than a
+    // change of principle. "Deliberately BELOW the real count" was right at 12
+    // discovered modules, where one legitimately arriving or leaving is noise.
+    // At 3 it is not: a floor of 2 would let a THIRD of the scanned flow
+    // vanish while this assertion still reported health — which is the
+    // false-OK the whole guard exists to prevent, reintroduced by its own
+    // anti-vacuity check. At 3, deleting a module forces a deliberate edit
+    // here, and both times that has happened the edit was the forcing
+    // function that made someone check the delta.
     assert!(
-        scanned_files >= 10,
+        scanned_files >= 3,
         "LIVE-FEED-PURITY guard scanned only {scanned_files} REST/historical \
-         module(s). 12 exist today, so anything below 10 means discovery broke \
-         or the naming convention changed — either way the guard is no longer \
-         covering the flow it claims to. Fix historical_flow_paths()."
+         module(s). 3 exist today, so anything below that means discovery \
+         broke, the naming convention changed, or a module was deleted \
+         without this floor being re-derived — either way the guard is no \
+         longer covering the flow it claims to. Fix historical_flow_paths()."
     );
 
     assert!(

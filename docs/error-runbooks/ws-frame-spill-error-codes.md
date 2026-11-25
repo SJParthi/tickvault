@@ -65,6 +65,66 @@ flapping writer means the underlying disk is failing — page the operator.
 **Source:** `crates/storage/src/ws_frame_spill.rs` (the `catch_unwind` respawn wrapper + the
 resilient `writer_loop`), `crates/common/src/error_code.rs::WsSpill01WriterRespawn`.
 
+
+### §1.1 — SHUTDOWN ABANDONMENT (added 2026-08-28): same code, different condition, and it does NOT page
+
+`WS-SPILL-01` now has a **second** emit site with a different meaning, and the
+difference matters for triage: the drain that runs at process shutdown
+(`WsFrameSpill::shutdown`, called from `main` step 5b-3) reports at this code
+when it gives up with records still in the writer's queue.
+
+| | the §1 condition | this one |
+|---|---|---|
+| What happened | the writer hit a disk error / panicked and was respawned | the writer did not finish its queue inside `WAL_SPILL_SHUTDOWN_BUDGET_SECS` |
+| When | any time, repeatedly | exactly once, at shutdown |
+| Recoverable | the writer keeps draining | **no — those frames are gone** |
+| Log field to look for | `stage` | `queued` and `budget_secs` |
+| Counter | `tv_ws_frame_spill_writer_respawn_total` | `tv_wal_spill_shutdown_incomplete_total` |
+
+**The hole this closed.** The writer thread used to be spawned and DETACHED —
+its `JoinHandle` was discarded, nothing signalled it, and nothing could: the
+only `Sender` lives inside `WsFrameSpill`, which the drain paths hold through
+an `Arc`, so the channel could never close and the thread never had a reason to
+exit. The process ended while up to `SPILL_CHANNEL_CAPACITY` records — 524,288,
+~100 s of frames at the 5,000 fps envelope — sat unwritten. Every one had
+already been reported to its caller as `Spilled`, and none was counted on the
+way out: `persisted_total` counts `write_all`, `drop_critical` counts only what
+`try_send` refused outright. The tick and depth ILP writers had this fixed on
+2026-08-28 (`tv_offload_writer_shutdown_incomplete_total`); the WAL — the one
+tier whose whole job is to be the thing that does not lose frames — did not.
+
+**⚠ This condition is LOGGED but NOT PAGED, deliberately, and that is a gap.**
+The `ws-spill-01` CloudWatch alarm is `eval = 3 × 300s` — it requires the
+condition to sustain across three consecutive five-minute windows, which is
+correct for a flapping writer and structurally impossible for a once-per-process
+shutdown event. So an abandoned drain reaches `errors.jsonl` and the counter,
+and reaches nobody's phone.
+
+Closing it needs a dedicated single-shot filter — one log-filter alarm, ~$0.10/mo
+— and that is an operator decision, not an executor's: the maximal-month
+arithmetic already sits above the budget's automatic `STOP_EC2_INSTANCES` line
+(see `.claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md` §2.3n),
+and the rule-file-first law requires a dated quote before any new page.
+`tv_wal_spill_shutdown_incomplete_total` is likewise NOT EMF-selected for the
+same reason. Until then, the check is manual and cheap:
+
+```
+aws logs filter-log-events --log-group-name /tickvault/prod/app \
+  --filter-pattern '{ $.code = "WS-SPILL-01" && $.queued = * }'
+```
+
+A clean shutdown logs `info!("WAL spill: final drain complete on shutdown; queue
+empty")` instead, so the absence of that line is itself a signal.
+
+**Triage when it fires:**
+1. Read `queued` — that is the exact number of captured frames lost. It is not
+   an estimate; the channel was asked its length.
+2. Read `budget_secs`. If the budget was spent, the writer was stalled — check
+   `tv_ws_frame_spill_write_errors_total` and the disk for the same session.
+3. Nothing recovers those frames. The 15:41 cross-verification will show the
+   session's tail short by roughly that many.
+4. If this repeats, the fix is not a bigger budget: it is finding why the writer
+   could not clear a queue it normally clears in under a second of disk time.
 ---
 
 ## §2. WS-SPILL-02 — durable frame dropped (writer dead at append instant)
@@ -95,6 +155,108 @@ arm), `crates/common/src/error_code.rs::WsSpill02FrameDropped`.
 
 ---
 
+## §2a. WS-SPILL-03 and WS-SPILL-04 (added 2026-10-06, audit M3)
+
+Two more codes in this family, both Medium and neither alarmed. Their runbook is
+`docs/error-runbooks/audit-m3-error-codes.md`:
+
+- **WS-SPILL-03** — the WAL could not be opened at boot, so boot halts. The halt is
+  paged by the existing boot-heartbeat and liveness alarms.
+- **WS-SPILL-04** — a WAL segment could not be read at boot replay and was skipped.
+  The event already pages through `durable-floor-breach` on
+  `tv_wal_replay_corrupted_segments_total`; WS-SPILL-02 was not reused because it
+  would page the same event a second time.
+
+### 2026-11-07 — a failed boot replay no longer archives `replaying/`
+
+Until this date, a STAGE-C boot replay that returned an error (a segment
+folder could not be listed, K2 fail-closed) fell through in `main.rs` to
+`confirm_replayed`, which archived the segments an earlier boot had staged in
+`replaying/` without reading them. Archived segments are never replayed, so
+their rows were lost from the database.
+
+The decision now lives in `crates/app/src/boot_wal_confirm.rs`: only a pass
+that read its segments, with no lane refold pending, archives. A failed pass
+logs `WS-SPILL-04` with `source = "boot_replay_error_staging_kept"` (a refused
+pass logs `WS-SPILL-01` with `source = "boot_replay_refused_staging_kept"`),
+both `warn!`, no page; `replaying/` stays for the WAL catch-up drain or the
+next boot. Every outcome is counted on `tv_wal_boot_replay_confirm_total{outcome}`
+(`held_for_lane_refold`, `held_refused`, `held_failed`, `archived`; local
+`/metrics` only, all four registered at 0 each boot).
+
+Triage for `boot_replay_error_staging_kept`: the preceding `WS-SPILL-04` line
+from the storage layer names the folder that could not be listed. Fix its
+permissions or the volume (`ls -la data/ws_wal data/ws_wal/replaying`), then restart
+or let the catch-up drain retry; nothing is lost while the segments stay put.
+The boot-time `WS-SPILL-02 source="boot_replay_failed"` line still pages as
+before; its text now says nothing staged was archived.
+
+### 2026-11-08 — the replay frame cap and the replay ack (PR RD, noise lock §2.17)
+
+These `WS-SPILL-01` lines are not a writer or disk fault; the alarm text's
+"disk I/O error" does not apply to them.
+
+| `source` | Level | Pages | Meaning, and what to do |
+|---|---|---|---|
+| `replay_frame_cap` | ERROR | yes | A boot replayed its 3,000,000-frame allowance and stopped; the rest stays as `*.wal` files for the next boot. Read `tv_wal_unapplied_pinned_bytes` over several boots: if it does not fall, the backlog is not draining. |
+| `replay_frame_cap_planned` | WARN | no | The same stop on the evening drain's own planned restart (cap 15,000,000, Quote 41). Expected; counted on `tv_wal_replay_frame_cap_stops_total`. |
+| `replay_rows_lost` | ERROR | yes | A replayed row landed in neither QuestDB nor a spill. With `confirmed = false` (a tick row, or depth the table could not mark) the batch is held for the next boot. With `confirmed = true` (PR RD review, 2026-11-08) only order-book rows were lost: their range is marked for the after-close pass, the segments are archived, and the marks keep them on disk until that pass writes the rows back (below the 5% disk floor a marked segment with a verified S3 copy can still be deleted, `deferred_depth_deleted_under_disk_floor_copy_in_s3`). Check the depth and tick spill folders' size and the QuestDB logs. |
+| `replay_ack_wait_timeout` | ERROR | yes | The replay ack really waited its full time; the batch is held for the next boot. Check QuestDB health. |
+
+### 2026-11-11 — the replay DEFERRAL lines on the planned evening restart (noise lock §2.17 note)
+
+On the evening drain's own planned restart (the boot's frame cap is the
+evening allowance, or the boot's claim recorded it, since the STAGE-C replay
+runs before the cap is raised) the replay's two DEFERRAL lines are quiet.
+Nothing is lost on either: a deferred segment stays a `*.wal` file for a
+later boot. Owner confirmed 2026-11-11 ("Yes, quiet them too (Recommended)"; see the §2.17 note).
+
+| Code | `source` | Level | Pages | Meaning, and what to do |
+|---|---|---|---|---|
+| `WS-SPILL-01` | `replay_deferred` | ERROR | yes | The catch-up replay left segments past its RAM budget on a boot that is NOT the planned evening restart. A deferral on every boot means the WAL grows faster than replay drains it; read `tv_wal_unapplied_pinned_bytes` over several boots. |
+| `WS-SPILL-01` | `replay_deferred_planned` | WARN | no | The same line on the planned evening restart: the boot's slice ended with segments left, which is expected. The evening drain's progress check stops the restarts if the backlog does not shrink. |
+| `WS-SPILL-02` | *(no `source`)* | ERROR | yes | A replay pass deferred the remaining segments. `stopped_for_memory = true`: the host cannot hold the frames (raising the byte budget makes it worse); this one pages on EVERY boot, the planned one included. `false`: the byte budget; raise it or drain more often. |
+| `WS-SPILL-02` | `replay_budget_deferred_planned` | WARN | no | A BYTE-budget deferral (`stopped_for_memory = false`) on the planned evening restart. Expected; counted as before. |
+
+The ERROR lines keep their fields and text; only their log `target` moved to
+`tickvault_storage::wal_replay_frame_cap` (no alarm filter keys on it).
+
+### 2026-11-11 — the replay limit lines page only when the backlog is stuck (noise lock §2.20)
+
+Owner card "Page only if stuck (Recommended)", answered after the 8:33 AM IST
+SOS "safety capture hit a limit". Once per start, after the WAL folder is
+claimed and before the boot replay, the app counts the waiting segments the
+replay would still read and compares the count with the one saved by the
+previous start that was NOT a planned evening restart (the planned evening
+restart saves no count) in `data/state/wal-backlog-trend.state`. The record
+is one line, `v2 <IST date> <count|unknown> <crc32 hex>`, the CRC-32 (IEEE,
+eight lower-case hex digits) of the text before the space that precedes it,
+then a newline. A
+`v1` line, or one whose checksum does not match, reads as unreadable and
+pages; do not write the file by hand (delete it instead: the next start then
+reads `first_start` and pages once). A count taken while segments wait but
+the applied watermark (`applied.tvaw`) is absent, rejected or overflowed
+with no known height is saved as `unknown`, so the start after it pages too.
+The boot log carries one `info!` line with `verdict`,
+`previous_backlog_segments` and `backlog_segments`.
+
+| Code | `source` | Level | Pages? | Meaning / action |
+|---|---|---|---|---|
+| `WS-SPILL-01` | `replay_frame_cap_shrinking` | WARN | no | The frame cap stopped this start's replay, and the waiting backlog is strictly lower than at the previous start: it is draining. Counted on `tv_wal_replay_frame_cap_stops_total` as before. |
+| `WS-SPILL-01` | `replay_deferred_shrinking` | WARN | no | The catch-up replay left segments for the next start on a shrinking backlog. |
+| `WS-SPILL-02` | `replay_budget_deferred_shrinking` | WARN | no | A BYTE-budget deferral on a shrinking backlog. A MEMORY-guard stop (`stopped_for_memory = true`) still pages on every start. |
+| `WS-SPILL-01` | `wal_backlog_trend_state` | WARN | no | The record could not be saved. This start's replay-limit lines page (verdict `state_not_saved`) whatever it compared, and so does every later start that cannot save it, so a folder that stays unwritable pages on every start. Whatever record is at the path is removed when it can be (`record_removed = true`; `removed_record` says whether it was the previous start's or this start's, the latter when only the folder sync after the rename failed; `removal_synced = false` means a power cut can bring a record back); when it cannot (the folder itself is not writable, so unlink fails too), it stays until a save succeeds, and the first start after the folder recovers can compare against it once. Check the `data/state` folder is writable. The planned evening restart never saves a count (by design, not a failure). |
+
+The plain `replay_frame_cap`, `replay_deferred` and byte-budget ERROR lines
+still page on a first start, an unreadable or future-dated record, an
+unknown count now or before, or an equal or higher count: that is a stuck
+backlog. Read `tv_wal_unapplied_pinned_bytes` over several starts.
+`replay_rows_lost` and `replay_ack_wait_timeout` are unchanged and always
+page. Honest limit: a backlog that falls by one segment per start stays
+quiet on the phone; it is on the counters and the boot `info!` line.
+
+---
+
 ## §3. Trigger / auto-load
 
 This rule activates when editing:
@@ -102,3 +264,13 @@ This rule activates when editing:
 - `crates/storage/src/ws_frame_spill.rs`
 - Any file containing `WS-SPILL-`, `WsSpill0`, `tv_ws_frame_spill_writer_respawn_total`, or
   `tv_ws_frame_spill_write_errors_total`
+
+## Checking how a WAL segment was archived
+
+On Linux, inspect the archived file with `getfattr -n user.tickvault.replay_archive.v1 /path/to/wal/archive/<segment>.wal`. The attribute identifies the last recorded archive decision for that local inode. `applied_watermark` records a range skipped under the persisted watermark. `settled_after_ack` records promotion after the write acknowledgements, durability lag and clean database probes. `direct_confirm` records the path taken when the replay caller had no further sink writes pending. Each value describes an archive decision. Independent database readback is needed to count stored ticks.
+
+Older archives, copies made without extended attributes, and files affected by an interruption between the move and metadata write can lack the attribute. The writer synchronizes the attribute on the archived inode. A power failure can still affect the directory rename under the filesystem’s existing durability rules. Treat a missing decision as unknown. Metadata-write failures increment `tv_wal_replay_archive_provenance_failed_total`. A conflicting segment filename leaves the original captures in place. Compare their contents and backup records before resolving the collision.
+
+When the verified-upload gate is enabled, age, size and disk-floor pruning hash a segment only when selecting it for deletion. A different file with the same name and length stays on disk if its SHA-256 differs from the verified cold object. The writer clears the stale local marker so the ordinary uploader can verify the replacement. Both distinct cold copies can coexist under the canonical and content-derived sidecar keys. If the filesystem refuses to remove the marker, the check will retry at the next eligible prune.
+
+For a verified prune, search the application JSON logs for `wal_verified_prune` and the segment name or raw SHA-256. The event carries the exact bucket, object key, byte length and last archive decision (`unknown` if unavailable). The checked-in CloudWatch agent forwards the machine app log to `/tickvault/prod/app`. Tracing is asynchronous, and logging configuration, delivery and retention govern whether that event can be retrieved. If the segment was uploaded while active, S3 retains its verified bytes and raw SHA-256, and its original object metadata has no subsequent archive decision. Local pruning also removes the inode and upload marker. The prune event does not insert a QuestDB row or create a permanent remote audit receipt.

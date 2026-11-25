@@ -1,0 +1,953 @@
+//! Source-scan ratchet — every counter an ALARM reads must be REGISTERED at
+//! boot, not born at the incident.
+//!
+//! # The defect this pins closed (found 2026-08-28)
+//!
+//! The CloudWatch agent computes a counter's value as the DELTA between
+//! consecutive scrapes, and it DROPS the first sample of a series it has never
+//! seen — there is nothing to subtract from. A counter that is only ever
+//! touched at its failure site is therefore born AT the incident, and the
+//! dropped baseline sample IS the incident.
+//!
+//! For an alarm shaped `threshold >= 1, evaluation_periods = 1` on a counter
+//! that reads zero on a healthy day — which is every loss alarm in this repo —
+//! that means the alarm publishes NO DATAPOINT for a single-episode failure.
+//! And a single episode is the dominant shape for all of them: a rolled-back
+//! binary meeting a newer WAL format happens once; a disk refusing the durable
+//! floor's own write happens once and is the most severe event in the process.
+//!
+//! Four such counters were found in one sweep, each alarmed, each EMF-selected,
+//! each dead on arrival. That is not a coincidence, it is the shape: an author
+//! adding an alarm looks at the emit site and the terraform, and the seeding
+//! block lives in neither.
+//!
+//! # What this pins
+//!
+//! Every `tv_*` metric name that appears in an `aws_cloudwatch_metric_alarm`
+//! block in `deploy/aws/terraform/` must also appear in the post-recorder
+//! registration block in `crates/app/src/main.rs`.
+//!
+//! # Honest limits
+//!
+//! - It reads `metric_name = "..."` assignments, so an alarm built from a
+//!   variable or a `for_each` map is invisible to it. Those are listed in
+//!   `KNOWN_INDIRECT` with the reason, so the exemption is a decision on the
+//!   record rather than a silent miss.
+//! - It proves the name is REGISTERED, not that the registration runs before
+//!   the first scrape. `counter_preregistration_after_recorder_guard.rs` pins
+//!   the ordering half.
+//! - Gauges are excluded: a gauge is published verbatim, with no delta and no
+//!   dropped first sample, so it has no equivalent hazard.
+
+mod log_drop_support;
+
+use std::path::{Path, PathBuf};
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/app -> repo root")
+        .to_path_buf()
+}
+
+/// Alarms whose metric name this scanner cannot resolve statically, each with
+/// the reason. Listing them here is deliberate: an exemption that is written
+/// down can be argued with, one that is invisible cannot.
+const KNOWN_INDIRECT: &[&str] = &[
+    // Built from a `for_each` map of error codes; the metric is a log METRIC
+    // FILTER, not a counter this process emits, so there is nothing to seed.
+    "error-code-alarms.tf",
+    // ⚠ REMOVED 2026-09-01 (adversarial review). This file was exempted with
+    // the reason "Same: log metric filters over coded ERROR lines." That is
+    // FALSE and measurably so: `live-lane-alarms.tf` contains TWENTY-THREE
+    // alarms on `namespace = local.app_namespace` and ZERO
+    // `aws_cloudwatch_log_metric_filter` resources. Among them are
+    // `tv_ticks_lost_total`, `tv_dhan_ws_wal_dropped_total`,
+    // `tv_ws_frame_wal_reinjected_dropped_total` and
+    // `tv_aggregator_slot_exhausted_total` — the loss counters this guard
+    // exists for.
+    //
+    // Every one happens to be seeded today, so nothing was broken. What was
+    // broken is the GUARD: a new loss alarm added to that file was unchecked
+    // BY CONSTRUCTION, and the exemption's own wording made it look
+    // deliberate. An exemption that is written down can be argued with — but
+    // only if what it says is true.
+];
+
+/// Metric names that are GAUGES, which have no dropped-first-sample hazard.
+///
+/// Verified by grep against `metrics::gauge!` at the time of writing; a name
+/// that later becomes a counter fails this guard, which is the correct
+/// direction to fail.
+/// Alarms on metrics this PROCESS does not emit at all.
+///
+/// Recorded rather than silently skipped, because each one is a real finding:
+/// an alarm reading a metric with no producer can never fire, and reads as
+/// permanently healthy. Fixing them means either adding the producer or
+/// deleting the alarm — a decision, not a seeding.
+const KNOWN_NO_PRODUCER: &[&str] = &[
+    // ⚠ CORRECTED 2026-09-01 (adversarial review). This list previously
+    // carried THREE names under the heading "DEAD MONITORS", with the claim:
+    // "Verified 2026-08-28: no `counter!`, `gauge!` or `histogram!` anywhere
+    // in `crates/*/src` emits these names, so their alarms are permanently
+    // green and always will be."
+    //
+    // That was FALSE for two of the three, and it was written as a dated,
+    // VERIFIED claim — the most trusted shape a comment can take:
+    //
+    //   tv_telegram_dropped_total          seeded on all three `reason`
+    //                                      labels at `main.rs` and
+    //                                      incremented at
+    //                                      `notification/coalescer.rs`. It is
+    //                                      ALSO produced by a log metric
+    //                                      filter in telegram-drop-alarm.tf,
+    //                                      so it is alive in both lanes.
+    //   tv_wal_suspension_probe_failed_total
+    //                                      emitted twice in
+    //                                      `storage/src/wal_suspension_watcher.rs`.
+    //
+    // Both are removed, so the guard now REQUIRES them to stay seeded. The
+    // cost of the stale entry was not a broken alarm — both were fine — but a
+    // comment that told the next reader two live counters were dead. That is
+    // the manufactures-a-false-finding class this repository keeps paying
+    // for, and it cost a session: an audit run today reported one of them as
+    // a CRITICAL blind spot on the strength of exactly this reasoning.
+    //
+    // Emitted by a Lambda (`crates/aws-lambdas/src/deploy_watchdog.rs`), not
+    // by this process. Correctly unseeded here.
+    "tv_binary_main_sha_mismatch",
+    // A DERIVED metric: the alarm reads a log metric filter, not a counter we
+    // emit. Nothing to register.
+    "tv_orders_placed_delta_total",
+    // (2026-10-22: `tv_order_fill_lag_seconds` LEFT this list. It was the one
+    // producerless name of the original three, and the finding recorded here,
+    // "add the producer or retire the alarm", was closed by retiring the
+    // alarm: plan item 65, Quote 37 alarm review, noise-lock §2.14.)
+    //
+    // A DERIVED metric, added 2026-09-02: the alarm
+    // `tv-<env>-deploy-provenance-blind` reads a log metric filter over the
+    // deploy-watchdog Lambda's OWN log group, so no counter in this process
+    // emits it and there is nothing here to register. It exists precisely
+    // BECAUSE that Lambda publishes nothing when it goes blind — see
+    // `dhan-rest-only-noise-lock-2026-07-14.md` §2.3q, where a producer that
+    // silently declined to produce composed with a notBreaching alarm into a
+    // monitor that had never been able to fire.
+    "tv_deploy_provenance_blind_total",
+];
+
+/// Counters seeded through a PRE-RESOLVED HANDLE rather than a named literal,
+/// with the verified seeding site for each.
+///
+/// # Why this list has to exist (2026-09-01)
+///
+/// The extractor reads `increment(0)` calls and resolves the metric NAME from
+/// the adjacent literal or constant. That works for
+/// `counter!("tv_x").increment(0)` and cannot work for
+/// `self.wal_dropped.increment(0)`, where the name was bound to a struct field
+/// somewhere else entirely. Following a field back to its metric name needs
+/// dataflow analysis, which a source scan does not have.
+///
+/// These four surfaced the moment `live-lane-alarms.tf` lost its blanket
+/// exemption. Every one was checked by hand and every one is CORRECTLY seeded
+/// — with the per-label fan-out `main.rs` could not produce, because only the
+/// construction site knows its own `endpoint` / `ws_type` / `source` values.
+/// Adding a duplicate literal seed in `main.rs` to satisfy the scanner would
+/// have made the code worse and the guard no truer.
+///
+/// A per-metric exemption with evidence is strictly better than the file-wide
+/// one it replaces: the other nineteen alarms in that file are now genuinely
+/// checked, and a NEW loss alarm added there is caught.
+const SEEDED_VIA_HANDLE: &[(&str, &str)] = &[
+    (
+        "tv_ticks_lost_total",
+        "SpillDropCounters::new (storage/src/ws_frame_spill.rs) builds a \
+         handle per (source x ws_type) and loops `increment(0)` over all of \
+         them at construction.",
+    ),
+    (
+        "tv_dhan_ws_wal_dropped_total",
+        "WalRingSink::pre_register (core/src/websocket/pool_supervisor.rs) \
+         seeds it per endpoint label at sink construction.",
+    ),
+    (
+        "tv_dhan_ws_ring_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
+    (
+        "tv_dhan_ws_ring_bytes_full_total",
+        "WalRingSink::pre_register — same site, same call.",
+    ),
+];
+
+const KNOWN_GAUGES: &[&str] = &[
+    // ADDED 2026-09-01. Surfaced when `live-lane-alarms.tf` lost its blanket
+    // exemption. Emitted as `metrics::gauge!(REBALANCE_AGE_SECS).set(..)` in
+    // `depth_rebalance.rs` — a gauge is published verbatim, with no delta and
+    // no dropped first sample, so it has no seeding hazard at all.
+    // (2026-10-22: its alarm, depth-steering-stalled, was deleted by the Quote
+    // 37 alarm review while depth is switched off; the entry stays so the
+    // gauge is classed correctly if the alarm returns with depth.)
+    "tv_depth_rebalance_age_secs",
+    "tv_dhan_feed_stack_up",
+    "tv_dhan_ws_alive_connections",
+    "tv_questdb_wal_suspended_tables",
+    "tv_spill_dir_free_bytes",
+    "tv_dhan_feed_last_tick_age_secs",
+    "tv_dhan_ws_worst_conn_tick_age_secs",
+    "tv_disk_runway_sessions",
+    "tv_disk_seconds_to_full",
+    "tv_daily_pnl",
+    "tv_token_remaining_seconds",
+    "tv_token_valid",
+    "tv_boot_completed",
+    "tv_ws_frame_spill_queue_depth",
+    "tv_ws_frame_spill_queue_high_water",
+    "tv_dhan_preopen_ready_secs",
+    "tv_clock_skew_seconds",
+    "tv_questdb_disconnected_seconds",
+    "tv_questdb_wal_apply_lag_max",
+    "tv_rest_1m_fire_heartbeat",
+    // ADDED 2026-09-05 with the ring-dwell alarm (noise-lock §2.3u). Emitted as
+    // `metrics::gauge!(RING_DWELL_MAX_MS_GAUGE)` in `dhan_feed_stack.rs`,
+    // through the one-minute peak hold (2026-09-24, §2.3u addendum) — a
+    // per-window MAXIMUM that is published verbatim, so there is no delta and
+    // no dropped first sample. Same class as `tv_depth_rebalance_age_secs`.
+    "tv_dhan_feed_ring_dwell_max_ms",
+    // ADDED 2026-09-25 with the feed-delay and slow-reconnect alarms
+    // (noise-lock §2.6). Both are published through the same one-minute
+    // peak hold as the ring-dwell gauge: a per-window MAXIMUM set with
+    // `metrics::gauge!(..).set(..)`, published verbatim, so there is no delta
+    // and no dropped first sample.
+    "tv_dhan_ws_lag_max_ms",
+    // ADDED 2026-11-06 (plan PR AL-4, noise-lock §2.6 dated row):
+    // `dhan-feed-delay-high` now reads the index/spot class maximum. It is set
+    // with `metrics::gauge!(..).set(..)` through the same 60 s peak hold as
+    // `tv_dhan_ws_lag_max_ms` above, so there is no delta and no dropped
+    // first sample to seed.
+    "tv_dhan_ws_lag_max_ms_by_class",
+    "tv_dhan_ws_main_reconnect_recovery_max_ms",
+];
+
+/// The six derived metrics behind the loss-group pages (2026-10-05,
+/// `loss-group-alarms.tf`, noise lock §2.10). No app code emits these: each is
+/// the OUTPUT of log metric filters over the metrics log, one filter per source
+/// counter. What must be seeded is every SOURCE counter, which
+/// `every_loss_group_filter_counter_is_registered_at_boot` checks instead.
+const DERIVED_LOSS_GROUP_METRICS: &[&str] = &[
+    "tv_loss_market_data_refused_total",
+    "tv_loss_subscription_gap_total",
+    "tv_loss_audit_rows_total",
+    "tv_loss_durability_sync_total",
+    "tv_loss_order_path_total",
+    "tv_loss_bound_or_blind_total",
+];
+
+/// The number of source counters the loss groups read. Moves only with a dated
+/// row in noise lock §2.10 (§2.10-a, 2026-10-11: 55 to 69; 2026-10-22, plan item 62:
+/// 69 to 65, the four top_volume counters left with their writer).
+const LOSS_GROUP_FILTER_COUNT: usize = 65;
+
+/// Derived metrics that are a LABEL SLICE of one source counter, written by a
+/// log metric filter over the metrics log (noise lock §2.9-i, 2026-10-10):
+/// `(derived, source, label, sliced values)`.
+///
+/// Not `KNOWN_NO_PRODUCER`: there IS a producer, the source counter. Not
+/// `DERIVED_LOSS_GROUP_METRICS`: that list sums WHOLE counters, so seeding the
+/// counter name is enough there. A slice reads only some label values, and the
+/// agent drops the first sample of each labelled series, so every sliced value
+/// must itself be seeded at 0, which a name-only check cannot see.
+/// `every_derived_slice_filter_source_is_registered_for_each_sliced_label`
+/// checks exactly that.
+const DERIVED_SLICE_FILTER_METRICS: &[(&str, &str, &str, &[&str])] = &[(
+    "tv_log_lines_dropped_shipped_total",
+    "tv_log_lines_dropped_total",
+    "sink",
+    &["app_log", "errors_jsonl"],
+)];
+
+/// Maps `const NAME: &str = "tv_...";` to its literal, workspace-wide, so a
+/// registration written through a named constant (the house style for a metric
+/// with a documented meaning) is not read as a miss.
+fn const_metric_literals() -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for crate_dir in ["app", "storage", "core", "trading", "api", "common"] {
+        let root = repo_root().join("crates").join(crate_dir).join("src");
+        collect_const_literals(&root, &mut out);
+    }
+    out
+}
+
+fn collect_const_literals(dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_const_literals(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in src.lines() {
+            let t = line.trim().trim_start_matches("pub ");
+            let Some(rest) = t.strip_prefix("const ") else {
+                continue;
+            };
+            let Some((name, tail)) = rest.split_once(':') else {
+                continue;
+            };
+            let Some((_, after)) = tail.split_once('"') else {
+                continue;
+            };
+            let Some(value) = after.split('"').next() else {
+                continue;
+            };
+            if value.starts_with("tv_") {
+                out.insert(name.trim().to_owned(), value.to_owned());
+            }
+        }
+    }
+}
+
+/// Every metric name registered at zero ANYWHERE in the workspace.
+///
+/// Workspace-wide, not `main.rs` only: several baselines legitimately live
+/// beside their emit site (`register_drop_baseline` in the storage crate), and
+/// a guard that only read `main.rs` would have demanded a second, duplicate
+/// registration for each of them.
+fn zero_registered_names() -> std::collections::BTreeSet<String> {
+    let consts = const_metric_literals();
+    let mut out = std::collections::BTreeSet::new();
+    for crate_dir in ["app", "storage", "core", "trading", "api", "common"] {
+        let root = repo_root().join("crates").join(crate_dir).join("src");
+        collect_zero_registrations(&root, &consts, &mut out);
+    }
+    out
+}
+
+/// Remove Rust comments before scanning for registrations.
+///
+/// # Why this exists (2026-09-01, found by adversarial review)
+///
+/// Without it this guard had a CRITICAL false-OK: the terraform side already
+/// stripped `#` comments, but the Rust side split raw source on
+/// `metrics::counter!(`, so a registration that had been COMMENTED OUT still
+/// counted as present. Bite-proven — prefixing a real seeding line with `//`
+/// left the guard fully green while the counter lost its baseline and its
+/// alarm went dead on the first episode. That is precisely the failure this
+/// guard exists to prevent, hiding inside the guard itself.
+///
+/// String-literal aware: a `//` inside a metric name or message must not be
+/// treated as the start of a comment, or stripping would corrupt the very
+/// literals the scan is looking for.
+fn strip_rust_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                // Escaped char: copy it verbatim so `\"` never ends the string.
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            // Line comment: drop through end of line, keep the newline so
+            // line-oriented context in panic messages stays meaningful.
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            // Block comment. Rust nests these; track depth so an inner `*/`
+            // cannot terminate an outer comment early.
+            let mut depth = 1usize;
+            i += 2;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+fn collect_zero_registrations(
+    dir: &Path,
+    consts: &std::collections::BTreeMap<String, String>,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_zero_registrations(&path, consts, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Comments FIRST: a commented-out registration must not count.
+        let src = strip_rust_comments(&raw);
+        // A registration may wrap across lines, so join the file and scan for
+        // each `counter!(..)` span that ends in `.increment(0)`.
+        for span in src.split("metrics::counter!(").skip(1) {
+            let Some(head) = span.split(";").next() else {
+                continue;
+            };
+            if !head.contains(".increment(0)") {
+                continue;
+            }
+            // A string literal names the metric directly; a bare identifier is
+            // a named constant and is resolved through `consts`, which is how
+            // this repo writes any metric with a documented meaning.
+            if let Some(rest) = head.split_once('"')
+                && let Some(name) = rest.1.split('"').next()
+                && name.starts_with("tv_")
+            {
+                out.insert(name.to_owned());
+                continue;
+            }
+            let ident: String = head
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            // A fully-qualified path (`tickvault_storage::ilp_overflow::NAME`)
+            // is the same constant seen from another crate; the last segment
+            // is the one `const_metric_literals` keyed on.
+            let ident = ident.rsplit("::").next().unwrap_or_default();
+            if let Some(resolved) = consts.get(ident.trim()) {
+                out.insert(resolved.clone());
+            }
+        }
+    }
+}
+
+fn read(rel: &str) -> String {
+    let p = repo_root().join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+}
+
+/// Every `metric_name = "tv_..."` in a terraform file, with its file name.
+fn alarmed_metric_names() -> Vec<(String, String)> {
+    let tf_dir = repo_root().join("deploy/aws/terraform");
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&tf_dir) else {
+        panic!("cannot read {}", tf_dir.display());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tf") {
+            continue;
+        }
+        let file = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if KNOWN_INDIRECT.contains(&file.as_str()) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in src.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let Some(rest) = trimmed.strip_prefix("metric_name") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim();
+            let Some(inner) = rest.strip_prefix('"') else {
+                continue;
+            };
+            let Some(name) = inner.split('"').next() else {
+                continue;
+            };
+            if name.starts_with("tv_") {
+                out.push((name.to_owned(), file.clone()));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[test]
+fn every_alarmed_counter_is_registered_at_boot() {
+    let registered = zero_registered_names();
+    let alarmed = alarmed_metric_names();
+
+    assert!(
+        alarmed.len() >= 5,
+        "the terraform scan found only {} alarmed metric names — the scanner has \
+         probably stopped matching, which would make this guard vacuous",
+        alarmed.len()
+    );
+
+    let mut missing: Vec<String> = Vec::new();
+    for (name, file) in &alarmed {
+        if KNOWN_GAUGES.contains(&name.as_str())
+            || KNOWN_NO_PRODUCER.contains(&name.as_str())
+            || SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+            || DERIVED_LOSS_GROUP_METRICS.contains(&name.as_str())
+            || DERIVED_SLICE_FILTER_METRICS.iter().any(|(d, ..)| d == name)
+        {
+            continue;
+        }
+        if !registered.contains(name.as_str()) {
+            missing.push(format!("  {name}  (alarmed in {file})"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "ALARMED COUNTER NEVER REGISTERED — these alarms are dead on arrival \
+         for a single-episode failure.\n\
+         \n{}\n\
+         \n\
+         The CloudWatch agent computes counter deltas and DROPS the first sample \
+         of a series it has never seen. A counter touched only at its failure \
+         site is born AT the incident, so the dropped baseline sample IS the \
+         incident and the alarm publishes nothing.\n\
+         \n\
+         Fix by adding `metrics::counter!(\"<name>\").increment(0);` to the \
+         post-recorder registration block in crates/app/src/main.rs (or beside \
+         its emit site) — NOT by adding the name to KNOWN_GAUGES unless it is \
+         genuinely a gauge, nor to KNOWN_NO_PRODUCER unless it genuinely has none.",
+        missing.join("\n")
+    );
+}
+
+/// The scanner must actually find things, in more than one file.
+#[test]
+fn the_terraform_scanner_is_not_vacuous() {
+    let alarmed = alarmed_metric_names();
+    let files: std::collections::BTreeSet<&str> = alarmed.iter().map(|(_, f)| f.as_str()).collect();
+    assert!(
+        files.len() >= 2,
+        "expected alarmed metrics across several terraform files, found {files:?}"
+    );
+    assert!(
+        alarmed.iter().any(|(n, _)| n.starts_with("tv_")),
+        "every matched name must be one of ours"
+    );
+}
+
+/// Attributes an empty Rust scan correctly — 2026-09-01.
+///
+/// An adversarial audit reported the two Rust scanners as a false-OK:
+/// `collect_const_literals` and `collect_zero_registrations` both open with
+/// `let Ok(entries) = read_dir(dir) else { return; }`, so a moved source root
+/// yields an empty scan, which the audit read as "the guard then passes having
+/// compared nothing."
+///
+/// CHECKED, and it is the OPPOSITE. `every_alarmed_counter_is_registered_at_boot`
+/// treats every alarmed name absent from `registered` as MISSING — so an empty
+/// scan makes *all* of them missing and the assertion fires. The guard already
+/// fails CLOSED on this axis; there was no vacuity to close. Recorded here
+/// because the direction is the whole point: a finding that is wrong in the
+/// reassuring direction hides a bug, and one wrong in the alarming direction —
+/// this one — sends the next reader to fix something that is not broken.
+///
+/// What IS worth fixing is the DIAGNOSIS. With the root moved, the failure
+/// arrives as a wall of ~49 "ALARMED COUNTER NEVER REGISTERED" lines, which
+/// reads exactly like a real regression in boot-time seeding. This test fires
+/// first with the actual cause named, turning a misleading failure into a
+/// one-line one. That is the same false-RED class as the seal suite's disk
+/// coupling: not a missing assertion, a misattributed one.
+#[test]
+fn an_empty_rust_scan_is_reported_as_a_moved_root_not_a_seeding_regression() {
+    let consts = const_metric_literals();
+    assert!(
+        !consts.is_empty(),
+        "const_metric_literals() found ZERO `const NAME: &str = \"tv_...\"` \
+         declarations. The source root has moved or the scanner is broken — \
+         this is NOT a boot-time seeding regression, which is what the other \
+         assertions in this file are about to look like."
+    );
+
+    let zeroed = zero_registered_names();
+    assert!(
+        !zeroed.is_empty(),
+        "zero_registered_names() found ZERO boot-time counter registrations. \
+         Same cause, same warning: the failures below are a broken scan, not \
+         missing seeding sites."
+    );
+}
+
+/// Bite-proof: the four names this guard was written for must be present.
+///
+/// Without this the guard could pass by never having matched them at all.
+#[test]
+fn the_four_counters_that_motivated_this_guard_are_registered() {
+    let registered = zero_registered_names();
+    for name in [
+        "tv_wal_replay_unknown_magic_total",
+        "tv_seal_writer_drain_dropped_total",
+        "tv_ws_frame_spill_write_errors_total",
+        "tv_tick_rows_refused_total",
+    ] {
+        assert!(
+            registered.contains(name),
+            "{name} was found alarmed-but-unregistered on 2026-08-28; it must stay registered"
+        );
+    }
+}
+
+/// Every [`SEEDED_VIA_HANDLE`] exemption must still have its seeding site.
+///
+/// An exemption that outlives the code it points at is not an exemption, it is
+/// a blind spot with a paper trail. This file has already carried one: three
+/// names sat under "DEAD MONITORS ... Verified 2026-08-28" while two of them
+/// were being emitted and seeded the whole time, and an audit run on
+/// 2026-09-01 reported one of them to the operator as a CRITICAL blind spot on
+/// the strength of that comment. Prose does not stay true; a test does.
+#[test]
+fn the_handle_seeded_exemptions_still_have_their_seeding_sites() {
+    assert!(
+        !SEEDED_VIA_HANDLE.is_empty(),
+        "the exemption list is empty — either delete this test or restore it"
+    );
+
+    // WalRingSink::pre_register — three counters, seeded per endpoint label.
+    let pool = read("crates/core/src/websocket/pool_supervisor.rs");
+    let pre_register = pool
+        .split_once("fn pre_register(&self)")
+        .and_then(|(_, rest)| rest.split_once("\n    }"))
+        .map(|(body, _)| body)
+        .unwrap_or_default();
+    assert!(
+        !pre_register.is_empty(),
+        "WalRingSink::pre_register has moved or been renamed. Three alarmed \
+         loss counters are exempted from the seeding guard because it seeds \
+         them; if it is gone, those alarms are dead on their first episode."
+    );
+    // 2026-10-26 (audit L1): a fourth seed, `ring_closed`
+    // (tv_dhan_ws_ring_closed_total, local /metrics only, not alarmed), joined
+    // the three alarmed ones; the three exemptions still need all three.
+    for seeded in [
+        "wal_dropped.increment(0)",
+        "ring_full.increment(0)",
+        "ring_bytes_full.increment(0)",
+    ] {
+        assert!(
+            pre_register.contains(seeded),
+            "pre_register no longer seeds `{seeded}` — the exemptions for \
+             tv_dhan_ws_wal_dropped_total / _ring_full_total / \
+             _ring_bytes_full_total assume it seeds all three:\n{pre_register}"
+        );
+    }
+    assert_eq!(
+        pre_register.matches("increment(0)").count(),
+        4,
+        "pre_register no longer seeds exactly four counters (three alarmed plus \
+         the local ring_closed):\n{pre_register}"
+    );
+
+    // A function that seeds is worth nothing if nobody calls it. Adversarial
+    // review (2026-09-01) bite-proved that replacing the `sink.pre_register()`
+    // call with a comment left this guard fully green while all three counters
+    // silently lost their baseline. The seeding SITE and the seeding CALL are
+    // two different claims, and only one of them was being checked.
+    let pool_no_comments = strip_rust_comments(&pool);
+    assert!(
+        pool_no_comments.contains("pre_register()"),
+        "WalRingSink::pre_register exists but is never CALLED (comments \
+         stripped, so a commented-out call does not count). The three \
+         exempted counters are unseeded and their alarms are dead on the \
+         first episode."
+    );
+
+    // SpillDropCounters::new — a loop over every (source x ws_type) handle.
+    let spill = read("crates/storage/src/ws_frame_spill.rs");
+    assert!(
+        spill.contains("ticks_lost_channel_full[idx].increment(0)")
+            && spill.contains("ticks_lost_writer_dead[idx].increment(0)"),
+        "SpillDropCounters::new no longer seeds both tv_ticks_lost_total \
+         sources over every ws_type. That counter's alarm is the tick-loss \
+         pager, and an unseeded series means its FIRST episode — the one that \
+         matters — publishes nothing."
+    );
+}
+
+/// Self-test for the comment stripper.
+///
+/// A scanner is only as trustworthy as its own parsing. This pins the three
+/// cases that matter: a commented-out registration must disappear, a real one
+/// must survive, and a `//` inside a string literal must NOT be mistaken for
+/// the start of a comment (which would corrupt the metric names the scan is
+/// looking for and produce false FAILURES instead of false passes).
+#[test]
+fn the_comment_stripper_hides_commented_out_code_and_keeps_real_code() {
+    // 1. Line comment: the registration must be gone.
+    let commented = r#"// metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        !strip_rust_comments(commented).contains("metrics::counter!"),
+        "a commented-out registration survived stripping — the guard would \
+         count it as present"
+    );
+
+    // 2. Block comment, including a nested one.
+    let blocked = r#"/* outer /* inner */ metrics::counter!("tv_probe_total"); */ let x = 1;"#;
+    let stripped = strip_rust_comments(blocked);
+    assert!(
+        !stripped.contains("metrics::counter!"),
+        "a block-commented registration survived stripping: {stripped}"
+    );
+    assert!(
+        stripped.contains("let x = 1;"),
+        "the stripper ate code after a nested block comment: {stripped}"
+    );
+
+    // 3. Real code survives untouched.
+    let real = r#"metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(real).contains(r#"metrics::counter!("tv_probe_total")"#),
+        "the stripper removed a REAL registration"
+    );
+
+    // 4. `//` inside a string literal is not a comment. Getting this wrong
+    //    would truncate URLs and messages and could hide a following
+    //    registration on the same line.
+    let in_string = r#"let u = "https://x/y"; metrics::counter!("tv_probe_total").increment(0);"#;
+    let out = strip_rust_comments(in_string);
+    assert!(
+        out.contains("tv_probe_total"),
+        "a `//` inside a string literal was treated as a comment, hiding the \
+         registration that followed it: {out}"
+    );
+
+    // 5. An escaped quote must not end the string early.
+    let escaped = r#"let s = "a\"// b"; metrics::counter!("tv_probe_total").increment(0);"#;
+    assert!(
+        strip_rust_comments(escaped).contains("tv_probe_total"),
+        "an escaped quote ended the string early and swallowed real code"
+    );
+}
+
+/// Every `counter = "tv_..."` source named in `loss-group-alarms.tf`.
+fn loss_group_filter_counters() -> Vec<String> {
+    let src = read("deploy/aws/terraform/loss-group-alarms.tf");
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(at) = trimmed.find("counter") else {
+            continue;
+        };
+        let rest = trimmed[at + "counter".len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let Some(inner) = rest.trim().strip_prefix('"') else {
+            continue;
+        };
+        if let Some(name) = inner.split('"').next()
+            && name.starts_with("tv_")
+        {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// The loss-group pages (2026-10-05, noise lock §2.10) read 65 source counters
+/// (55 until the 2026-10-11 §2.10-a row, 69 until plan item 62 on 2026-10-22) through log metric filters. Each source is exposed to the same dropped
+/// first sample as any alarmed counter, so each must be registered at 0 at
+/// boot, either in `main.rs` or beside its owner, or named in
+/// `SEEDED_VIA_HANDLE` with its seeding site.
+#[test]
+fn every_loss_group_filter_counter_is_registered_at_boot() {
+    let counters = loss_group_filter_counters();
+    assert_eq!(
+        counters.len(),
+        LOSS_GROUP_FILTER_COUNT,
+        "loss-group-alarms.tf names {} source counters, expected {}. A change \
+         to the set needs a dated row in noise lock §2.10 and this constant \
+         moved with it.",
+        counters.len(),
+        LOSS_GROUP_FILTER_COUNT
+    );
+    let unique: std::collections::BTreeSet<&str> = counters.iter().map(String::as_str).collect();
+    assert_eq!(
+        unique.len(),
+        counters.len(),
+        "a source counter is listed twice"
+    );
+
+    let registered = zero_registered_names();
+    let missing: Vec<&str> = counters
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !registered.contains(*name) && !SEEDED_VIA_HANDLE.iter().any(|(n, _)| n == name)
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "LOSS-GROUP SOURCE COUNTER NEVER REGISTERED: {missing:?}. Its first \
+         failure would be the dropped baseline sample and the page would not \
+         fire. Seed it with `increment(0)` for every label value the filter \
+         slices on, in the post-recorder block of crates/app/src/main.rs."
+    );
+}
+
+/// The six alarms must name exactly the six derived metrics the filters
+/// publish into, so no page reads a metric nothing writes.
+#[test]
+fn the_loss_group_alarms_read_the_metrics_the_filters_write() {
+    let alarmed: std::collections::BTreeSet<String> = alarmed_metric_names()
+        .into_iter()
+        .filter(|(_, file)| file == "loss-group-alarms.tf")
+        .map(|(name, _)| name)
+        .collect();
+    let derived: std::collections::BTreeSet<String> = DERIVED_LOSS_GROUP_METRICS
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    assert_eq!(
+        alarmed, derived,
+        "the alarms in loss-group-alarms.tf and DERIVED_LOSS_GROUP_METRICS disagree"
+    );
+    let src = read("deploy/aws/terraform/loss-group-alarms.tf");
+    assert!(
+        src.contains("name      = \"tv_loss_${each.value.group}_total\""),
+        "the filters no longer publish into tv_loss_<group>_total, so this check \
+         reads the wrong shape"
+    );
+    // The filters write `tv_loss_<group>_total` for every group a filter names.
+    let written: std::collections::BTreeSet<String> = src
+        .match_indices("group = \"")
+        .filter_map(|(at, m)| src[at + m.len()..].split('"').next())
+        .map(|group| format!("tv_loss_{group}_total"))
+        .collect();
+    assert_eq!(
+        written, derived,
+        "the groups the filters write and the metrics the alarms read disagree"
+    );
+}
+
+/// The sliced values of `source` that `main_src` does NOT seed at 0.
+fn unseeded_slice_values(
+    main_src: &str,
+    source: &str,
+    label: &str,
+    values: &[&str],
+) -> Vec<String> {
+    let stripped = strip_rust_comments(main_src);
+    let seeded = log_drop_support::seeded_label_values(&stripped, source, label);
+    values
+        .iter()
+        .filter(|v| !seeded.contains(**v))
+        .map(|v| (*v).to_owned())
+        .collect()
+}
+
+/// A label-slice filter is only as good as the seeding of each value it
+/// slices: an unseeded value's first real increment is the sample the agent
+/// drops, so a single-episode failure on that sink would never page.
+#[test]
+fn every_derived_slice_filter_source_is_registered_for_each_sliced_label() {
+    let registered = zero_registered_names();
+    let main_src = read("crates/app/src/main.rs");
+    let tf_dir = repo_root().join("deploy/aws/terraform");
+    let tf_all: String = std::fs::read_dir(&tf_dir)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", tf_dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("tf"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    for (derived, source, label, values) in DERIVED_SLICE_FILTER_METRICS {
+        assert!(
+            registered.contains(*source),
+            "{derived} slices {source}, but {source} is never registered at 0 at boot"
+        );
+        let missing = unseeded_slice_values(&main_src, source, label, values);
+        assert!(
+            missing.is_empty(),
+            "{derived} slices {source} on {label} = {values:?}, but main.rs does not seed \
+             {missing:?} at 0; the first drop on that sink would be the agent's dropped sample"
+        );
+        // Some filter writes the derived name, so the exemption above can never
+        // hide an alarm that reads a metric nothing produces.
+        let written = tf_all
+            .split("metric_transformation {")
+            .skip(1)
+            .any(|block| {
+                let body = block.split('}').next().unwrap_or_default();
+                body.lines().any(|l| {
+                    let compact: String = l.chars().filter(|c| !c.is_whitespace()).collect();
+                    compact.starts_with(&format!("name=\"{derived}\""))
+                })
+            });
+        assert!(
+            written,
+            "no metric_transformation in terraform writes {derived}"
+        );
+    }
+}
+
+#[test]
+fn bite_an_unseeded_slice_value_is_caught() {
+    let main_src = read("crates/app/src/main.rs");
+    let (_, source, label, values) = DERIVED_SLICE_FILTER_METRICS[0];
+    assert!(unseeded_slice_values(&main_src, source, label, values).is_empty());
+    let narrowed = main_src.replacen(
+        r#"for sink in ["app_log", "errors_jsonl"] {"#,
+        r#"for sink in ["app_log"] {"#,
+        1,
+    );
+    assert_ne!(narrowed, main_src, "bite setup: the seed loop moved");
+    assert_eq!(
+        unseeded_slice_values(&narrowed, source, label, values),
+        vec!["errors_jsonl".to_owned()],
+        "dropping a sliced value from the boot seed must be caught"
+    );
+}

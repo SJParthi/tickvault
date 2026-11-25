@@ -1,0 +1,1345 @@
+//! Audit PR41a, reworked for Z6 — a replayed candle never replaces a fuller
+//! copy of the same bar, whatever order the copies are written in.
+//!
+//! ## The gap
+//!
+//! A candle can be written more than once. A tick that arrives one bucket
+//! late re-folds the bar that just sealed and the aggregator sends the
+//! amended bar down the same seal path (`ConsumeOutcome::AmendedLate`), and
+//! the day-close seal can amend an intraday-sealed bar with carried volume.
+//! Each later copy has at least as many ticks and at least as much volume as
+//! the one before it, so `(tick_count, volume)`, compared in that order, is a
+//! version number for the copies of one bar within one fold lineage.
+//!
+//! The candle tables' DEDUP key `(ts, security_id, segment, feed)` means the
+//! last write wins. A copy that reaches the spill, the dead-letter file or
+//! the escalation queue and is replayed AFTER a fuller copy was committed
+//! puts the older bar back over the newer one, with nothing counting it.
+//!
+//! The first version (PR41a) kept one entry per `(security_id, segment, feed,
+//! timeframe)` and relied on the order in which copies reached the disk. Four
+//! paths broke that order (Z6): a later bucket spilled before the amend
+//! committed and replaced the entry; the original was still in the
+//! escalation queue when the amend committed; the original went to the
+//! dead-letter file, which the ledger never saw; and a parked spill file
+//! resumed after a later file had replayed the amend.
+//!
+//! ## How
+//!
+//! The ledger now keeps one entry per bar, `(slot, bucket)`, holding the
+//! fullest copy on disk this process wrote (spill or dead-letter) and the
+//! fullest copy committed to the database (live or by the mid-session
+//! replay). Every rule is a max, so the result does not depend on order:
+//!
+//! * A spill append of a copy less full than the fullest one on disk or
+//!   committed is not written ([`SpillLedger::verdict`]). This closes the
+//!   escalation-queue path: the queued original is refused when it finally
+//!   reaches the spill, because the amend was recorded as committed.
+//! * A live commit fuller than the copy on disk is appended to the spill
+//!   ([`SpillLedger::on_live_commit`] returns `Mirror`), so the boot drain,
+//!   which keeps the fullest copy per bar across every file, ends on it.
+//! * The mid-session replay skips a copy less full than the committed one,
+//!   or equal to it while that commit is trusted (audit PR L, L2)
+//!   ([`SpillLedger::replay_is_older`]) and records what it commits
+//!   ([`SpillLedger::on_replay_commit`]), so a parked file resumed late
+//!   cannot write an older copy over one a later file already replayed.
+//! * A live commit with no entry while the escalation queue holds anything
+//!   records a committed-only entry, so a queued original arriving later is
+//!   refused.
+//!
+//! ## Bounds
+//!
+//! At most `capacity` entries, allocated once when the ledger is built and
+//! never grown. Every per-seal operation is one hash probe: O(1), no
+//! allocation. Entries are forgotten by [`SpillLedger::forget_replayed`],
+//! which the mid-session replay calls when it has consumed every spill file
+//! staged up to an epoch: an entry whose disk copies are all in those files,
+//! that has no dead-letter copy, and whose escalation-queue horizon has
+//! passed is dropped. That pass is O(capacity), on the seal writer task, at
+//! most once per replay scan (30 s).
+//!
+//! **At capacity the ledger fails toward writing data.** A copy it cannot
+//! track is still written (counted as `untracked`), and while any untracked
+//! copy may be on disk, every live commit with no entry is mirrored to the
+//! spill (counted as `mirrored_overflow`), so the fullest copy is always on
+//! disk for the boot drain's max rule. Nothing is dropped.
+
+use std::collections::HashMap;
+
+use crate::seal_spill::SerializedSeal;
+
+/// Identity of one bar: one aggregator slot's timeframe and one bucket.
+/// Segment and feed are part of it (I-P1-11: a security id alone is not
+/// unique, and two feeds' copies of the same bar are distinct rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BarKey {
+    security_id: u64,
+    bucket_start_ist_secs: u32,
+    segment: u8,
+    feed: u8,
+    tf_ordinal: u8,
+}
+
+impl BarKey {
+    fn of(seal: &SerializedSeal) -> Self {
+        Self {
+            security_id: seal.security_id,
+            bucket_start_ist_secs: seal.bucket_start_ist_secs,
+            segment: seal.exchange_segment_code,
+            // `Feed::index()` is a small enum index; the cast cannot truncate.
+            feed: u8::try_from(seal.feed.index()).unwrap_or(u8::MAX),
+            tf_ordinal: seal.tf_ordinal,
+        }
+    }
+}
+
+/// `(tick_count, volume)`: how full a copy of a bar is. Both only grow
+/// across the copies of one bar, so the tuple order is the copy order.
+type Fullness = (u32, u64);
+
+fn fullness_of(seal: &SerializedSeal) -> Fullness {
+    (seal.tick_count, seal.volume)
+}
+
+const HAS_DISK: u8 = 1;
+const HAS_COMMITTED: u8 = 1 << 1;
+const DEAD_LETTERED: u8 = 1 << 2;
+
+/// What the ledger knows about one bar. 40 bytes.
+#[derive(Clone, Copy, Debug)]
+struct BarEntry {
+    disk_ticks: u32,
+    committed_ticks: u32,
+    /// Spill epoch of the newest disk copy (see the module docs).
+    disk_epoch: u32,
+    flags: u8,
+    disk_volume: u64,
+    committed_volume: u64,
+    /// Escalation progress that must be reached before the entry may be
+    /// forgotten: everything queued before its last update has been written.
+    queue_mark: u64,
+    /// The ledger's trust generation when the committed copy was last
+    /// recorded (audit PR L, L2). A replayed copy EQUAL to the committed one
+    /// is skipped only while this matches the current generation; a QuestDB
+    /// suspicion bumps it, so an ack that may have been false never hides
+    /// the copy that would repair it.
+    committed_trust: u32,
+}
+
+impl BarEntry {
+    const EMPTY: Self = Self {
+        disk_ticks: 0,
+        committed_ticks: 0,
+        disk_epoch: 0,
+        flags: 0,
+        disk_volume: 0,
+        committed_volume: 0,
+        queue_mark: 0,
+        committed_trust: 0,
+    };
+
+    fn disk(&self) -> Option<Fullness> {
+        (self.flags & HAS_DISK != 0).then_some((self.disk_ticks, self.disk_volume))
+    }
+
+    fn committed(&self) -> Option<Fullness> {
+        (self.flags & HAS_COMMITTED != 0).then_some((self.committed_ticks, self.committed_volume))
+    }
+
+    fn note_disk(&mut self, copy: Fullness, epoch: u32, dead_lettered: bool) {
+        if self.disk().is_none_or(|held| copy > held) {
+            self.disk_ticks = copy.0;
+            self.disk_volume = copy.1;
+        }
+        self.disk_epoch = self.disk_epoch.max(epoch);
+        self.flags |= HAS_DISK;
+        if dead_lettered {
+            self.flags |= DEAD_LETTERED;
+        }
+    }
+
+    fn note_committed(&mut self, copy: Fullness, trust: u32) {
+        match self.committed() {
+            Some(held) if copy < held => {}
+            Some(held) if copy == held => self.committed_trust = trust,
+            _ => {
+                self.committed_ticks = copy.0;
+                self.committed_volume = copy.1;
+                self.committed_trust = trust;
+            }
+        }
+        self.flags |= HAS_COMMITTED;
+    }
+
+    /// The fullest copy known on disk or in the database.
+    fn fullest(&self) -> Option<Fullness> {
+        match (self.disk(), self.committed()) {
+            (Some(d), Some(c)) => Some(d.max(c)),
+            (d, c) => d.or(c),
+        }
+    }
+}
+
+/// Copies the ledger could not track (it was full). Same forgetting rule as
+/// an entry, so the ledger leaves overflow once those copies are consumed.
+#[derive(Clone, Copy, Debug, Default)]
+struct Overflow {
+    active: bool,
+    disk_epoch: u32,
+    queue_mark: u64,
+    /// Latest bucket of any untracked copy written to the dead-letter file
+    /// (audit PR L, L2). Only the boot drain reads that file, so such a copy
+    /// stays on disk for the whole process; a live commit of a bar whose
+    /// bucket is at or before this is mirrored even after the rest of the
+    /// overflow has cleared. A bar with a later bucket cannot have a
+    /// dead-letter copy among them.
+    dead_letter_max_bucket: Option<u32>,
+}
+
+/// What the spill should do with a copy it is about to append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpillVerdict {
+    /// Write it, and record it once the write succeeds.
+    Write,
+    /// The spill or the database already holds a fuller copy of this bar.
+    /// Do not write.
+    OlderNotWritten,
+    /// Write it, but the ledger is full and cannot track this bar.
+    Untracked,
+}
+
+/// What a live commit asks of the spill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LiveCommit {
+    /// Nothing: no older copy of this bar can be on disk.
+    Nothing,
+    /// Append the committed copy to the spill: an older copy is on disk.
+    Mirror,
+    /// Append the committed copy to the spill: the ledger overflowed and
+    /// cannot tell whether an older copy is on disk.
+    MirrorOverflow,
+}
+
+/// Escalation-queue progress at one moment (see
+/// `SealSpillWriter::queue_progress`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueProgress {
+    /// Seals the escalation thread has finished with (written, sent to the
+    /// DLQ, or reported lost) so far.
+    pub(crate) written: u64,
+    /// `true` when nothing was queued.
+    pub(crate) idle: bool,
+}
+
+impl QueueProgress {
+    /// `true` when everything queued before `mark` was taken is finished.
+    const fn has_passed(self, mark: u64) -> bool {
+        self.idle || self.written >= mark
+    }
+}
+
+/// See the module docs.
+#[derive(Debug)]
+pub(crate) struct SpillLedger {
+    bars: HashMap<BarKey, BarEntry>,
+    capacity: usize,
+    overflow: Overflow,
+    /// Bumped on every QuestDB suspicion transition ([`Self::distrust_commits`]).
+    trust_generation: u32,
+}
+
+impl SpillLedger {
+    /// A ledger for at most `capacity` bars, allocated now.
+    ///
+    /// # Complexity
+    /// O(capacity) once, at construction.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bars: HashMap::with_capacity(capacity),
+            capacity,
+            overflow: Overflow::default(),
+            trust_generation: 0,
+        }
+    }
+
+    /// Touches every slot of the table once and leaves it empty (plan item
+    /// US1-C, 2026-11-24). The table is allocated at construction but the
+    /// kernel maps each page only when it is first written, so the first
+    /// rescue of a new bar paid a page fault about every insert: measured
+    /// 1.6 µs per seal on a fresh ledger against about 0.5 µs on a warm one
+    /// (`us1c_rescue_cost_split`, x86 dev container). Fills the table to its
+    /// capacity with placeholder keys, then clears it: nothing is left behind,
+    /// and no real bar is ever compared with a placeholder.
+    ///
+    /// # Cost
+    /// O(capacity) once (about 200,000 inserts, a few milliseconds), only in
+    /// the production writer. SPACE: the table becomes resident from boot,
+    /// which it becomes anyway once an outage has spilled that many bars.
+    pub(crate) fn prefault(&mut self) -> usize {
+        let slots = self.bars.capacity();
+        for index in 0..slots {
+            let key = BarKey {
+                security_id: u64::try_from(index).unwrap_or(u64::MAX),
+                bucket_start_ist_secs: 0,
+                segment: 0,
+                feed: 0,
+                tf_ordinal: 0,
+            };
+            self.bars.insert(key, BarEntry::EMPTY);
+        }
+        // `clear` keeps the allocation; the capacity must not have grown.
+        self.bars.clear();
+        slots
+    }
+
+    /// `true` while the ledger holds anything or has overflowed.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.bars.is_empty()
+            || self.overflow.active
+            || self.overflow.dead_letter_max_bucket.is_some()
+    }
+
+    /// `true` while an untracked copy may be on disk.
+    #[cfg(test)]
+    pub(crate) const fn overflowed(&self) -> bool {
+        self.overflow.active
+    }
+
+    /// The entry for `key`, inserted empty if there is room. `None` at
+    /// capacity. One hash probe.
+    fn entry(&mut self, key: BarKey) -> Option<&mut BarEntry> {
+        if self.bars.len() < self.capacity {
+            return Some(self.bars.entry(key).or_insert(BarEntry::EMPTY));
+        }
+        self.bars.get_mut(&key)
+    }
+
+    fn note_untracked(&mut self, bucket: u32, epoch: u32, dead_lettered: bool, queue_mark: u64) {
+        let o = &mut self.overflow;
+        o.active = true;
+        if dead_lettered {
+            o.dead_letter_max_bucket =
+                Some(o.dead_letter_max_bucket.map_or(bucket, |b| b.max(bucket)));
+        }
+        o.disk_epoch = o.disk_epoch.max(epoch);
+        o.queue_mark = o.queue_mark.max(queue_mark);
+    }
+
+    /// Decide what to do with a copy about to be appended to the spill.
+    ///
+    /// Refused only when a FULLER copy of the same bar is on disk or
+    /// committed: the fuller one is what every replay must end on. An equal
+    /// copy is written (it is the same bar).
+    ///
+    /// # Complexity
+    /// O(1), one hash probe.
+    pub(crate) fn verdict(&self, seal: &SerializedSeal) -> SpillVerdict {
+        match self.bars.get(&BarKey::of(seal)) {
+            Some(entry) if entry.fullest().is_some_and(|f| fullness_of(seal) < f) => {
+                SpillVerdict::OlderNotWritten
+            }
+            Some(_) => SpillVerdict::Write,
+            None if self.bars.len() >= self.capacity => SpillVerdict::Untracked,
+            None => SpillVerdict::Write,
+        }
+    }
+
+    /// Record a copy now on disk: in the spill at `epoch`, or in the
+    /// dead-letter file (`dead_lettered`, which pins the entry until the next
+    /// boot, since only the boot drain reads that file). `also_committed`
+    /// for a mirrored live commit. Call only after the write succeeded.
+    /// Returns `false` when the ledger was full and the copy is untracked.
+    ///
+    /// # Complexity
+    /// O(1), one hash probe; never grows the map past its capacity.
+    pub(crate) fn record_on_disk(
+        &mut self,
+        seal: &SerializedSeal,
+        epoch: u32,
+        dead_lettered: bool,
+        also_committed: bool,
+        queue_mark: u64,
+    ) -> bool {
+        let copy = fullness_of(seal);
+        let trust = self.trust_generation;
+        match self.entry(BarKey::of(seal)) {
+            Some(entry) => {
+                entry.note_disk(copy, epoch, dead_lettered);
+                if also_committed {
+                    entry.note_committed(copy, trust);
+                }
+                entry.queue_mark = entry.queue_mark.max(queue_mark);
+                true
+            }
+            None => {
+                self.note_untracked(seal.bucket_start_ist_secs, epoch, dead_lettered, queue_mark);
+                false
+            }
+        }
+    }
+
+    /// A copy was committed by the live writer. Records it and says whether
+    /// it must also be appended to the spill.
+    ///
+    /// `queue_busy`: the escalation queue holds something, which may be an
+    /// older copy of this bar on its way to the spill. A committed-only entry
+    /// is then recorded so that copy is refused when it arrives.
+    ///
+    /// # Complexity
+    /// O(1), at most two hash probes.
+    pub(crate) fn on_live_commit(
+        &mut self,
+        seal: &SerializedSeal,
+        queue_busy: bool,
+        epoch: u32,
+        queue_mark: u64,
+    ) -> LiveCommit {
+        let key = BarKey::of(seal);
+        let copy = fullness_of(seal);
+        let trust = self.trust_generation;
+        if let Some(entry) = self.bars.get_mut(&key) {
+            let mirror = entry.disk().is_some_and(|held| copy > held);
+            entry.note_committed(copy, trust);
+            entry.queue_mark = entry.queue_mark.max(queue_mark);
+            return if mirror {
+                LiveCommit::Mirror
+            } else {
+                LiveCommit::Nothing
+            };
+        }
+        // Audit PR L, L2: a bar an untracked dead-letter copy may hold is
+        // still mirrored after the rest of the overflow cleared.
+        let dead_letter_covers = self
+            .overflow
+            .dead_letter_max_bucket
+            .is_some_and(|max| key.bucket_start_ist_secs <= max);
+        if !self.overflow.active && !queue_busy && !dead_letter_covers {
+            // No copy of this bar is on disk this process (or every one has
+            // been replayed and forgotten), and none can be in the queue.
+            return LiveCommit::Nothing;
+        }
+        match self.entry(key) {
+            Some(entry) => {
+                entry.note_committed(copy, trust);
+                entry.queue_mark = entry.queue_mark.max(queue_mark);
+            }
+            // Full: the queued original, if any, may be written untracked.
+            None => self.note_untracked(key.bucket_start_ist_secs, epoch, false, queue_mark),
+        }
+        if self.overflow.active || dead_letter_covers {
+            LiveCommit::MirrorOverflow
+        } else {
+            LiveCommit::Nothing
+        }
+    }
+
+    /// A copy was committed by the mid-session replay. Updates an existing
+    /// entry only: a bar with no entry has no other tracked copy.
+    ///
+    /// # Complexity
+    /// O(1), one hash probe.
+    pub(crate) fn on_replay_commit(&mut self, seal: &SerializedSeal) {
+        let trust = self.trust_generation;
+        if let Some(entry) = self.bars.get_mut(&BarKey::of(seal)) {
+            entry.note_committed(fullness_of(seal), trust);
+        }
+    }
+
+    /// `true` when `replayed` is no fuller than a copy already committed.
+    /// The replay drops it.
+    ///
+    /// Audit PR L, L2 (2026-10-26): an EQUAL copy is dropped too, was
+    /// written. It is the same bar, and re-writing it replaced the committed
+    /// live row with one whose three receipt delays read unknown (a replayed
+    /// seal carries no receipt times), for nothing. Only while the committed
+    /// copy is trusted: after a QuestDB suspicion ([`Self::distrust_commits`])
+    /// the equal copy is written again, since its ack may have been false.
+    ///
+    /// # Complexity
+    /// O(1), one hash probe.
+    pub(crate) fn replay_is_older(&self, replayed: &SerializedSeal) -> bool {
+        let copy = fullness_of(replayed);
+        self.bars.get(&BarKey::of(replayed)).is_some_and(|entry| {
+            entry.committed().is_some_and(|held| {
+                copy < held || (copy == held && entry.committed_trust == self.trust_generation)
+            })
+        })
+    }
+
+    /// Stop trusting every committed copy recorded so far (audit PR L, L2):
+    /// a replayed copy equal to one of them is written again, as before
+    /// 2026-10-26. Called on every QuestDB suspicion transition, when an ack
+    /// may have been false and the replay re-reads its files to repair it.
+    /// A strictly older copy is still skipped.
+    ///
+    /// # Complexity
+    /// O(1): one add.
+    pub(crate) fn distrust_commits(&mut self) {
+        self.trust_generation = self.trust_generation.wrapping_add(1);
+    }
+
+    /// Forget every bar whose copies can no longer be written: every disk
+    /// copy is in a spill file staged at or before `consumed_through` (and
+    /// the replay has consumed all of those), it has no dead-letter copy, and
+    /// everything queued before its last update is finished. Returns how
+    /// many entries were dropped.
+    ///
+    /// # Complexity
+    /// O(capacity): one pass over the map, no allocation. Called by the
+    /// mid-session replay at most once per scan, on the seal writer task.
+    pub(crate) fn forget_replayed(&mut self, consumed_through: u32, queue: QueueProgress) -> usize {
+        let before = self.bars.len();
+        // O(1) EXEMPT: begin — the forgetting pass, at most once per replay scan
+        self.bars.retain(|_, entry| {
+            let disk_consumed = entry.disk().is_none() || entry.disk_epoch <= consumed_through;
+            let forgettable = entry.flags & DEAD_LETTERED == 0
+                && disk_consumed
+                && queue.has_passed(entry.queue_mark);
+            !forgettable
+        });
+        // O(1) EXEMPT: end
+        let o = self.overflow;
+        // Audit PR L, L2 (2026-10-26): a dead-lettered untracked copy used to
+        // pin the whole overflow for the process, so every later live commit
+        // was mirrored to the spill for the rest of the session. It now
+        // clears like any other, keeping only the dead-letter bucket bound,
+        // which mirrors just the bars such a copy could be.
+        if o.active && o.disk_epoch <= consumed_through && queue.has_passed(o.queue_mark) {
+            self.overflow = Overflow {
+                dead_letter_max_bucket: o.dead_letter_max_bucket,
+                ..Overflow::default()
+            };
+        }
+        before - self.bars.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.bars.len()
+    }
+}
+
+/// The boot drain's record of the fullest copy of each bar it has written
+/// (Z6). Built per boot, only when files are staged, and dropped with it.
+///
+/// Unlike the live ledger it grows on demand (cold, once per boot) up to
+/// `cap` bars. Past the cap a copy is written untracked and counted, so the
+/// failure direction is "write the data".
+///
+/// **S1 (2026-10-02): the record outlives a drain that stops early.** Each
+/// bar carries the fullest copy APPENDED (what the drain compares against)
+/// and the fullest copy a successful flush COMMITTED. When a drain stops with
+/// files still staged, the committed half is written to a summary file
+/// ([`BootWritten::encode_committed`]) and the next boot seeds its record
+/// from it ([`BootWritten::seed_from_bytes`]), so a file left staged cannot
+/// put an older copy over a fuller one an earlier boot committed and
+/// archived. Only committed copies are persisted: a copy whose flush failed
+/// is not in the database and must never refuse a copy that is.
+#[derive(Debug)]
+pub(crate) struct BootWritten {
+    bars: HashMap<BarKey, WrittenBar>,
+    /// Bars appended since the last flush, promoted to committed by
+    /// [`Self::commit_pending`]. At most one flush batch long.
+    pending: Vec<BarKey>,
+    cap: usize,
+}
+
+/// One bar in [`BootWritten`].
+#[derive(Clone, Copy, Debug)]
+struct WrittenBar {
+    /// Fullest copy appended to the database writer (committed or not).
+    written: Fullness,
+    /// Fullest copy a successful flush committed, if any.
+    committed: Option<Fullness>,
+}
+
+/// Magic + layout version of the boot summary file (S1).
+/// `TVBWSUM2` since 2026-10-22 (plan item 62): the timeframe byte is a `TfIndex`
+/// ordinal and `S3`/`S5` were removed, so a `TVBWSUM1` file names frames by
+/// the old ordinals and is refused whole rather than read into the wrong frame.
+const BOOT_SUMMARY_MAGIC: [u8; 8] = *b"TVBWSUM2";
+/// Bytes of one bar in the summary file: security id 8, bucket 4, segment 1,
+/// feed 1, timeframe 1, ticks 4, volume 8.
+const BOOT_SUMMARY_RECORD_SIZE: usize = 27;
+/// Header: magic 8, record count 8.
+const BOOT_SUMMARY_HEADER_SIZE: usize = 16;
+/// Trailer: CRC-32 (IEEE) of every byte before it.
+const BOOT_SUMMARY_TRAILER_SIZE: usize = 4;
+
+/// Why a boot summary file was refused. The whole file is refused: a partly
+/// trusted summary could refuse a copy the database does not hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BootSummaryRefused {
+    /// Wrong magic or layout version.
+    Magic,
+    /// The length does not match the record count.
+    Length,
+    /// The checksum does not match.
+    Checksum,
+}
+
+/// What [`BootWritten::seed_from_bytes`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BootSummarySeeded {
+    /// Bars seeded as committed.
+    pub(crate) seeded: usize,
+    /// Bars in the file the record had no room for (counted, never blocks).
+    pub(crate) untracked: usize,
+}
+
+impl BootWritten {
+    /// An empty record for at most `cap` bars. Allocates nothing yet.
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            bars: HashMap::new(),
+            pending: Vec::new(),
+            cap,
+        }
+    }
+
+    /// `true` when a fuller copy of this bar was already written (this
+    /// drain) or committed (an earlier, stopped drain, via the summary).
+    ///
+    /// # Complexity
+    /// O(1), one hash probe.
+    pub(crate) fn is_older(&self, seal: &SerializedSeal) -> bool {
+        self.bars
+            .get(&BarKey::of(seal))
+            .is_some_and(|held| fullness_of(seal) < held.written)
+    }
+
+    /// Record a copy appended to the database writer. Returns `false` when
+    /// the record is full and this bar is untracked.
+    ///
+    /// # Complexity
+    /// O(1) amortised, one hash probe (the map may grow: boot only).
+    pub(crate) fn record(&mut self, seal: &SerializedSeal) -> bool {
+        let key = BarKey::of(seal);
+        let copy = fullness_of(seal);
+        if let Some(held) = self.bars.get_mut(&key) {
+            held.written = held.written.max(copy);
+            self.pending.push(key);
+            return true;
+        }
+        if self.bars.len() >= self.cap {
+            return false;
+        }
+        self.bars.insert(
+            key,
+            WrittenBar {
+                written: copy,
+                committed: None,
+            },
+        );
+        self.pending.push(key);
+        true
+    }
+
+    /// A flush succeeded: every copy appended since the last flush is now
+    /// committed.
+    ///
+    /// # Complexity
+    /// O(appended since the last flush), at most one flush batch.
+    pub(crate) fn commit_pending(&mut self) {
+        // O(1) EXEMPT: begin — one flush batch, boot drain, cold
+        for key in self.pending.drain(..) {
+            if let Some(held) = self.bars.get_mut(&key) {
+                held.committed = Some(held.written);
+            }
+        }
+        // O(1) EXEMPT: end
+    }
+
+    /// A flush failed: the copies appended since the last flush are NOT
+    /// committed. Their bars keep any earlier committed copy.
+    pub(crate) fn discard_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Bars with a committed copy.
+    ///
+    /// # Complexity
+    /// O(bars). Boot drain, once.
+    pub(crate) fn committed_len(&self) -> usize {
+        // O(1) EXEMPT: one pass, boot drain, once
+        self.bars.values().filter(|b| b.committed.is_some()).count()
+    }
+
+    /// Serialise at most `max_bars` committed bars for the summary file.
+    /// Returns the bytes and how many committed bars did not fit.
+    ///
+    /// # Complexity
+    /// O(bars), one allocation of the output. Boot drain, once, only when it
+    /// stops with files still staged.
+    pub(crate) fn encode_committed(&self, max_bars: usize) -> (Vec<u8>, usize) {
+        let committed = self.committed_len();
+        let kept = committed.min(max_bars);
+        let dropped = committed - kept;
+        let mut out = Vec::with_capacity(
+            BOOT_SUMMARY_HEADER_SIZE
+                + kept.saturating_mul(BOOT_SUMMARY_RECORD_SIZE)
+                + BOOT_SUMMARY_TRAILER_SIZE,
+        );
+        out.extend_from_slice(&BOOT_SUMMARY_MAGIC);
+        out.extend_from_slice(&(kept as u64).to_le_bytes());
+        // O(1) EXEMPT: begin — one pass, boot drain, once
+        for (key, bar) in self
+            .bars
+            .iter()
+            .filter_map(|(k, b)| b.committed.map(|c| (k, c)))
+            .take(kept)
+        {
+            out.extend_from_slice(&key.security_id.to_le_bytes());
+            out.extend_from_slice(&key.bucket_start_ist_secs.to_le_bytes());
+            out.push(key.segment);
+            out.push(key.feed);
+            out.push(key.tf_ordinal);
+            out.extend_from_slice(&bar.0.to_le_bytes());
+            out.extend_from_slice(&bar.1.to_le_bytes());
+        }
+        // O(1) EXEMPT: end
+        let crc = crate::wal_applied_watermark::crc32_ieee(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        (out, dropped)
+    }
+
+    /// Seed this record from a summary file written by an earlier, stopped
+    /// drain. Every seeded bar is committed (and so also written). The file
+    /// is checked whole before anything is seeded.
+    ///
+    /// # Complexity
+    /// O(records in the file). Boot drain, once.
+    pub(crate) fn seed_from_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<BootSummarySeeded, BootSummaryRefused> {
+        if bytes.len() < BOOT_SUMMARY_HEADER_SIZE + BOOT_SUMMARY_TRAILER_SIZE
+            || bytes[..8] != BOOT_SUMMARY_MAGIC
+        {
+            return Err(BootSummaryRefused::Magic);
+        }
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&bytes[8..16]);
+        let count = u64::from_le_bytes(count_bytes);
+        let expected = usize::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(BOOT_SUMMARY_RECORD_SIZE))
+            .and_then(|n| n.checked_add(BOOT_SUMMARY_HEADER_SIZE + BOOT_SUMMARY_TRAILER_SIZE));
+        if expected != Some(bytes.len()) {
+            return Err(BootSummaryRefused::Length);
+        }
+        let (body, trailer) = bytes.split_at(bytes.len() - BOOT_SUMMARY_TRAILER_SIZE);
+        let mut crc_bytes = [0u8; 4];
+        crc_bytes.copy_from_slice(trailer);
+        if crate::wal_applied_watermark::crc32_ieee(body) != u32::from_le_bytes(crc_bytes) {
+            return Err(BootSummaryRefused::Checksum);
+        }
+        let mut outcome = BootSummarySeeded::default();
+        // O(1) EXEMPT: begin — one pass over the summary, boot drain, once
+        for rec in body[BOOT_SUMMARY_HEADER_SIZE..].chunks_exact(BOOT_SUMMARY_RECORD_SIZE) {
+            let mut sid = [0u8; 8];
+            sid.copy_from_slice(&rec[0..8]);
+            let mut bucket = [0u8; 4];
+            bucket.copy_from_slice(&rec[8..12]);
+            let mut ticks = [0u8; 4];
+            ticks.copy_from_slice(&rec[15..19]);
+            let mut volume = [0u8; 8];
+            volume.copy_from_slice(&rec[19..27]);
+            let key = BarKey {
+                security_id: u64::from_le_bytes(sid),
+                bucket_start_ist_secs: u32::from_le_bytes(bucket),
+                segment: rec[12],
+                feed: rec[13],
+                tf_ordinal: rec[14],
+            };
+            let copy = (u32::from_le_bytes(ticks), u64::from_le_bytes(volume));
+            if let Some(held) = self.bars.get_mut(&key) {
+                held.written = held.written.max(copy);
+                held.committed = Some(held.committed.map_or(copy, |c| c.max(copy)));
+                outcome.seeded += 1;
+            } else if self.bars.len() >= self.cap {
+                outcome.untracked += 1;
+            } else {
+                self.bars.insert(
+                    key,
+                    WrittenBar {
+                        written: copy,
+                        committed: Some(copy),
+                    },
+                );
+                outcome.seeded += 1;
+            }
+        }
+        // O(1) EXEMPT: end
+        Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickvault_common::feed::Feed;
+    use tickvault_trading::candles::{BufferedSeal, LiveCandleState, TfIndex};
+
+    fn copy_of(
+        sid: u64,
+        seg: u8,
+        tf: TfIndex,
+        bucket: u32,
+        ticks: u32,
+        volume: u64,
+    ) -> SerializedSeal {
+        let mut state = LiveCandleState::empty();
+        state.bucket_start_ist_secs = bucket;
+        state.tick_count = ticks;
+        state.volume = volume;
+        state.open = 100.0;
+        state.high = 100.0;
+        state.low = 100.0;
+        state.close = 100.0;
+        SerializedSeal::from(&BufferedSeal::new(sid, seg, tf, state, Feed::Dhan))
+    }
+
+    const IDLE: QueueProgress = QueueProgress {
+        written: 0,
+        idle: true,
+    };
+
+    #[test]
+    fn test_on_live_commit_fuller_than_record_on_disk_copy_is_mirrored() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let original = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
+        assert_eq!(ledger.verdict(&original), SpillVerdict::Write);
+        assert!(ledger.record_on_disk(&original, 1, false, false, 0));
+
+        let amended = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        assert_eq!(
+            ledger.on_live_commit(&amended, false, 1, 0),
+            LiveCommit::Mirror
+        );
+        // Once the mirror is on disk, committing it again asks for nothing.
+        assert!(ledger.record_on_disk(&amended, 1, false, true, 0));
+        assert_eq!(
+            ledger.on_live_commit(&amended, false, 1, 0),
+            LiveCommit::Nothing
+        );
+        // A bar never on disk asks for nothing and gets no entry.
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(13, 2, TfIndex::M1, 660, 9, 90), false, 1, 0),
+            LiveCommit::Nothing
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn test_regression_z6_a_later_bucket_does_not_hide_the_earlier_bars_amend() {
+        // Path A: the old ledger kept one entry per slot, so spilling B2
+        // replaced B1 and the amend of B1 was never mirrored.
+        let mut ledger = SpillLedger::with_capacity(8);
+        ledger.record_on_disk(&copy_of(13, 2, TfIndex::M1, 600, 4, 40), 1, false, false, 0);
+        ledger.record_on_disk(&copy_of(13, 2, TfIndex::M1, 660, 1, 10), 1, false, false, 0);
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(13, 2, TfIndex::M1, 600, 5, 40), false, 1, 0),
+            LiveCommit::Mirror
+        );
+    }
+
+    #[test]
+    fn a_carry_settlement_with_equal_ticks_and_more_volume_is_fuller() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        ledger.record_on_disk(
+            &copy_of(13, 2, TfIndex::M60, 3_600, 4, 40),
+            1,
+            false,
+            false,
+            0,
+        );
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(13, 2, TfIndex::M60, 3_600, 4, 45), false, 1, 0),
+            LiveCommit::Mirror
+        );
+    }
+
+    #[test]
+    fn an_older_copy_is_refused_against_disk_or_committed() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        ledger.record_on_disk(&copy_of(13, 2, TfIndex::M1, 600, 5, 40), 1, false, false, 0);
+        let older = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
+        assert_eq!(ledger.verdict(&older), SpillVerdict::OlderNotWritten);
+        // An equal copy is written.
+        assert_eq!(
+            ledger.verdict(&copy_of(13, 2, TfIndex::M1, 600, 5, 40)),
+            SpillVerdict::Write
+        );
+        // An older bucket is a different bar.
+        assert_eq!(
+            ledger.verdict(&copy_of(13, 2, TfIndex::M1, 540, 1, 1)),
+            SpillVerdict::Write
+        );
+    }
+
+    #[test]
+    fn test_regression_z6_a_queued_original_is_refused_after_its_amend_committed() {
+        // Path B: nothing is on disk yet, the original waits in the
+        // escalation queue, and the amend commits live.
+        let mut ledger = SpillLedger::with_capacity(8);
+        let original = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
+        let amended = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        assert_eq!(
+            ledger.on_live_commit(&amended, true, 1, 7),
+            LiveCommit::Nothing
+        );
+        assert_eq!(ledger.verdict(&original), SpillVerdict::OlderNotWritten);
+        // With the queue empty, a commit records nothing.
+        let mut idle = SpillLedger::with_capacity(8);
+        assert_eq!(
+            idle.on_live_commit(&amended, false, 1, 0),
+            LiveCommit::Nothing
+        );
+        assert!(!idle.is_active());
+    }
+
+    #[test]
+    fn test_is_older_after_on_replay_commit_only_against_a_committed_copy() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let c1 = copy_of(13, 2, TfIndex::M1, 600, 4, 40);
+        let c2 = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        ledger.record_on_disk(&c1, 1, false, false, 0);
+        ledger.record_on_disk(&c2, 1, false, false, 0);
+        // Both on disk, neither committed: the replay writes both in order.
+        assert!(!ledger.replay_is_older(&c1));
+        // Once the replay commits c2 (a later file first), c1 is dropped.
+        ledger.on_replay_commit(&c2);
+        assert!(ledger.replay_is_older(&c1));
+        // Audit PR L, L2: c2 itself, equal to the committed copy, is skipped too.
+        assert!(ledger.replay_is_older(&c2));
+    }
+
+    #[test]
+    fn segment_feed_timeframe_and_bucket_are_separate_bars() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let base = copy_of(27, 0, TfIndex::M1, 600, 5, 0);
+        ledger.record_on_disk(&base, 1, false, true, 0);
+        // Same id, another segment (I-P1-11): not the same bar.
+        assert!(!ledger.replay_is_older(&copy_of(27, 1, TfIndex::M1, 600, 4, 0)));
+        assert!(!ledger.replay_is_older(&copy_of(27, 0, TfIndex::M5, 600, 4, 0)));
+        assert!(!ledger.replay_is_older(&copy_of(27, 0, TfIndex::M1, 660, 4, 0)));
+        let mut other_feed = copy_of(27, 0, TfIndex::M1, 600, 4, 0);
+        other_feed.feed = Feed::Truedata;
+        assert!(!ledger.replay_is_older(&other_feed));
+        assert!(ledger.replay_is_older(&copy_of(27, 0, TfIndex::M1, 600, 4, 0)));
+    }
+
+    #[test]
+    fn test_regression_z6_ledger_at_capacity_fails_toward_writing() {
+        let mut ledger = SpillLedger::with_capacity(2);
+        ledger.record_on_disk(&copy_of(1, 2, TfIndex::M1, 600, 1, 1), 1, false, false, 0);
+        ledger.record_on_disk(&copy_of(2, 2, TfIndex::M1, 600, 1, 1), 1, false, false, 0);
+        let third = copy_of(3, 2, TfIndex::M1, 600, 1, 1);
+        assert_eq!(ledger.verdict(&third), SpillVerdict::Untracked);
+        assert!(!ledger.record_on_disk(&third, 1, false, false, 0));
+        assert_eq!(ledger.len(), 2, "never grows past its capacity");
+        assert!(ledger.overflowed());
+        // Every commit of an untracked bar is mirrored while overflowed.
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(3, 2, TfIndex::M1, 600, 2, 1), false, 1, 0),
+            LiveCommit::MirrorOverflow
+        );
+        // A tracked bar still updates at the cap.
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(1, 2, TfIndex::M1, 600, 2, 1), false, 1, 0),
+            LiveCommit::Mirror
+        );
+        // Once the untracked copy's epoch is consumed, overflow ends.
+        ledger.forget_replayed(1, IDLE);
+        assert!(!ledger.overflowed());
+        assert_eq!(ledger.len(), 0);
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — the replay re-wrote a copy
+    /// equal to the committed one, replacing the live row with one whose
+    /// receipt delays read unknown. Bites with `<`.
+    #[test]
+    fn test_regression_replay_is_older_skips_a_copy_equal_to_the_committed_one() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let copy = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        ledger.record_on_disk(&copy, 1, false, true, 0);
+        assert!(
+            ledger.replay_is_older(&copy),
+            "the committed bar itself is not replayed"
+        );
+        assert!(
+            !ledger.replay_is_older(&copy_of(13, 2, TfIndex::M1, 600, 6, 40)),
+            "a fuller copy still is"
+        );
+    }
+
+    /// Audit PR L, L2: after a QuestDB suspicion the committed copies are not
+    /// trusted, so an equal copy the replay re-reads is written again; a
+    /// commit recorded after that is trusted again. Bites: without the trust
+    /// check the equal copy stays skipped after the suspicion.
+    #[test]
+    fn test_regression_distrust_commits_lets_an_equal_copy_replay_after_a_suspicion() {
+        let mut ledger = SpillLedger::with_capacity(8);
+        let copy = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        ledger.record_on_disk(&copy, 1, false, true, 0);
+        assert!(ledger.replay_is_older(&copy));
+        ledger.distrust_commits();
+        assert!(
+            !ledger.replay_is_older(&copy),
+            "its ack may have been false"
+        );
+        assert!(
+            ledger.replay_is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)),
+            "a strictly older copy is still skipped"
+        );
+        ledger.on_replay_commit(&copy);
+        assert!(
+            ledger.replay_is_older(&copy),
+            "trusted again once re-committed"
+        );
+    }
+
+    /// Regression: 2026-10-26 (audit PR L, L2) — one untracked dead-letter
+    /// copy pinned the overflow for the process, so every later live commit
+    /// was mirrored to the spill. Now the overflow clears and only bars at or
+    /// before the dead-letter bucket are still mirrored. Bites: the old code
+    /// stays overflowed and mirrors the later bar.
+    #[test]
+    fn test_regression_forget_replayed_clears_an_overflow_a_dead_letter_copy_pinned() {
+        let mut ledger = SpillLedger::with_capacity(1);
+        ledger.record_on_disk(&copy_of(1, 2, TfIndex::M1, 600, 1, 1), 1, false, false, 0);
+        let dead_lettered = copy_of(2, 2, TfIndex::M1, 600, 1, 1);
+        assert!(!ledger.record_on_disk(&dead_lettered, 1, true, false, 0));
+        assert!(ledger.overflowed());
+        ledger.forget_replayed(1, IDLE);
+        assert!(
+            !ledger.overflowed(),
+            "the overflow clears once its spill copies are consumed"
+        );
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(3, 2, TfIndex::M1, 660, 2, 1), false, 2, 0),
+            LiveCommit::Nothing,
+            "a bar after the dead-letter bucket cannot be in that file"
+        );
+        assert_eq!(
+            ledger.on_live_commit(&copy_of(2, 2, TfIndex::M1, 600, 2, 1), false, 2, 0),
+            LiveCommit::MirrorOverflow,
+            "the dead-lettered bar is still mirrored, so the boot drain ends on the fuller copy"
+        );
+        assert!(ledger.is_active());
+    }
+
+    #[test]
+    fn test_regression_z6_forget_replayed_keeps_what_can_still_be_written() {
+        let mut ledger = SpillLedger::with_capacity(16);
+        // Consumed spill copy: forgotten.
+        ledger.record_on_disk(&copy_of(1, 2, TfIndex::M1, 600, 1, 1), 3, false, false, 0);
+        // A spill copy appended after the consumed epoch: kept.
+        ledger.record_on_disk(&copy_of(2, 2, TfIndex::M1, 600, 1, 1), 4, false, false, 0);
+        // A dead-letter copy: kept until the next boot.
+        ledger.record_on_disk(&copy_of(3, 2, TfIndex::M1, 600, 1, 1), 1, true, false, 0);
+        // Committed while the queue held something not yet written: kept.
+        ledger.on_live_commit(&copy_of(4, 2, TfIndex::M1, 600, 2, 1), true, 1, 10);
+        let busy = QueueProgress {
+            written: 9,
+            idle: false,
+        };
+        assert_eq!(ledger.forget_replayed(3, busy), 1);
+        assert_eq!(ledger.len(), 3);
+        // The queue passes the mark: the committed-only entry goes.
+        let passed = QueueProgress {
+            written: 10,
+            idle: false,
+        };
+        assert_eq!(ledger.forget_replayed(3, passed), 1);
+        assert_eq!(ledger.len(), 2);
+    }
+
+    #[test]
+    fn boot_written_keeps_the_fullest_and_is_bounded() {
+        let mut written = BootWritten::new(1);
+        let c2 = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        assert!(written.record(&c2));
+        assert!(written.is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)));
+        assert!(!written.is_older(&c2));
+        // Past the cap a new bar is untracked, and the tracked one stays.
+        assert!(!written.record(&copy_of(13, 2, TfIndex::M1, 660, 1, 1)));
+        assert!(written.is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)));
+    }
+
+    #[test]
+    fn test_regression_s1_summary_persists_only_committed_copies() {
+        let mut written = BootWritten::new(16);
+        let committed = copy_of(13, 2, TfIndex::M1, 600, 5, 40);
+        assert!(written.record(&committed));
+        written.commit_pending();
+        // Appended but its flush failed: not in the database.
+        assert!(written.record(&copy_of(13, 2, TfIndex::M1, 660, 3, 9)));
+        written.discard_pending();
+        assert_eq!(written.committed_len(), 1);
+
+        let (bytes, dropped) = written.encode_committed(16);
+        assert_eq!(dropped, 0);
+        let mut next = BootWritten::new(16);
+        let seeded = next.seed_from_bytes(&bytes).expect("valid summary");
+        assert_eq!(
+            seeded,
+            BootSummarySeeded {
+                seeded: 1,
+                untracked: 0
+            }
+        );
+        assert!(next.is_older(&copy_of(13, 2, TfIndex::M1, 600, 4, 40)));
+        assert!(!next.is_older(&committed));
+        // The uncommitted bar never refuses anything.
+        assert!(!next.is_older(&copy_of(13, 2, TfIndex::M1, 660, 1, 1)));
+        // Seeded bars are re-persisted by a second stopped drain.
+        assert_eq!(next.committed_len(), 1);
+    }
+
+    #[test]
+    fn test_regression_s1_summary_refuses_a_damaged_file_whole() {
+        let mut written = BootWritten::new(16);
+        written.record(&copy_of(13, 2, TfIndex::M1, 600, 5, 40));
+        written.commit_pending();
+        let (bytes, _) = written.encode_committed(16);
+        let mut flipped = bytes.clone();
+        flipped[20] ^= 1;
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&flipped),
+            Err(BootSummaryRefused::Checksum)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&bytes[..bytes.len() - 1]),
+            Err(BootSummaryRefused::Length)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(b"not a summary at all"),
+            Err(BootSummaryRefused::Magic)
+        );
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&[]),
+            Err(BootSummaryRefused::Magic)
+        );
+    }
+
+    #[test]
+    fn test_commit_pending_moves_pending_into_committed() {
+        let mut written = BootWritten::new(16);
+        let first = copy_of(21, 2, TfIndex::M1, 600, 3, 30);
+        assert!(written.record(&first));
+        // Appended, not yet flushed: nothing committed, nothing persisted.
+        assert_eq!(written.committed_len(), 0);
+        assert_eq!(written.encode_committed(16).0.len(), 16 + 4);
+
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 1);
+        assert!(written.pending.is_empty(), "the batch is consumed");
+        // A second commit with nothing pending changes nothing.
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 1);
+
+        // A fuller copy appended and committed raises the committed copy.
+        let fuller = copy_of(21, 2, TfIndex::M1, 600, 5, 50);
+        assert!(written.record(&fuller));
+        written.commit_pending();
+        let (bytes, _) = written.encode_committed(16);
+        let mut next = BootWritten::new(16);
+        next.seed_from_bytes(&bytes).expect("valid");
+        assert!(next.is_older(&first), "the fuller copy was committed");
+        assert!(!next.is_older(&fuller));
+
+        // A fuller copy whose flush FAILED leaves the committed copy where it
+        // was, although the drain still compares against the fuller one.
+        let failed = copy_of(21, 2, TfIndex::M1, 600, 9, 90);
+        assert!(written.record(&failed));
+        written.discard_pending();
+        written.commit_pending();
+        assert!(written.is_older(&fuller), "appended copy still compared");
+        let (bytes, _) = written.encode_committed(16);
+        let mut next = BootWritten::new(16);
+        next.seed_from_bytes(&bytes).expect("valid");
+        assert!(
+            !next.is_older(&fuller),
+            "the uncommitted fuller copy is never persisted"
+        );
+    }
+
+    #[test]
+    fn test_committed_len_counts_only_committed() {
+        let mut written = BootWritten::new(16);
+        assert_eq!(written.committed_len(), 0, "empty record");
+        for bucket in [600, 660, 720] {
+            assert!(written.record(&copy_of(22, 2, TfIndex::M1, bucket, 1, 1)));
+        }
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 3);
+        // Two more bars appended, then their flush fails: still three.
+        assert!(written.record(&copy_of(22, 2, TfIndex::M1, 780, 1, 1)));
+        assert!(written.record(&copy_of(22, 2, TfIndex::M5, 600, 1, 1)));
+        written.discard_pending();
+        assert_eq!(written.committed_len(), 3);
+        // A bar committed twice is counted once.
+        assert!(written.record(&copy_of(22, 2, TfIndex::M1, 600, 2, 2)));
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 3);
+        // The same key in another segment is another bar (I-P1-11).
+        assert!(written.record(&copy_of(22, 1, TfIndex::M1, 600, 1, 1)));
+        written.commit_pending();
+        assert_eq!(written.committed_len(), 4);
+        // Seeded bars count as committed.
+        let mut seeded = BootWritten::new(16);
+        seeded
+            .seed_from_bytes(&written.encode_committed(16).0)
+            .expect("valid");
+        assert_eq!(seeded.committed_len(), 4);
+    }
+
+    #[test]
+    fn test_encode_committed_then_seed_from_bytes_round_trips() {
+        let mut written = BootWritten::new(16);
+        let bars = [
+            copy_of(u64::MAX, 2, TfIndex::M1, 600, u32::MAX, u64::MAX),
+            copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 7, 70),
+            copy_of(23, 2, TfIndex::M5, 900, 4, 0),
+        ];
+        for bar in &bars {
+            assert!(written.record(bar));
+        }
+        written.commit_pending();
+
+        let (bytes, dropped) = written.encode_committed(16);
+        assert_eq!(dropped, 0);
+        assert_eq!(&bytes[..8], b"TVBWSUM2");
+        assert_eq!(
+            bytes.len(),
+            16 + bars.len() * 27 + 4,
+            "header, one fixed record per bar, CRC trailer"
+        );
+        let mut next = BootWritten::new(16);
+        assert_eq!(
+            next.seed_from_bytes(&bytes),
+            Ok(BootSummarySeeded {
+                seeded: 3,
+                untracked: 0
+            })
+        );
+        // Every bar, at its boundary values, comes back exactly: the same
+        // copy is not older, one tick fewer is.
+        for bar in &bars {
+            assert!(!next.is_older(bar));
+        }
+        assert!(next.is_older(&copy_of(
+            u64::MAX,
+            2,
+            TfIndex::M1,
+            600,
+            u32::MAX - 1,
+            u64::MAX
+        )));
+        assert!(next.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 6, 70)));
+        assert!(next.is_older(&copy_of(23, 2, TfIndex::M5, 900, 3, 0)));
+        // A copy under a key the file never held is not refused.
+        assert!(!next.is_older(&copy_of(23, 3, TfIndex::M5, 900, 1, 0)));
+        // Re-encoding the seeded record yields as many bars.
+        assert_eq!(next.encode_committed(16).0.len(), bytes.len());
+
+        // max_bars truncates and counts; zero keeps none and is still valid.
+        let (two, dropped) = written.encode_committed(2);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&two).map(|s| s.seeded),
+            Ok(2)
+        );
+        let (none, dropped) = written.encode_committed(0);
+        assert_eq!(dropped, 3);
+        assert_eq!(none.len(), 16 + 4);
+        assert_eq!(
+            BootWritten::new(16).seed_from_bytes(&none),
+            Ok(BootSummarySeeded::default())
+        );
+        // An empty record encodes as the same empty, valid summary.
+        let (empty, dropped) = BootWritten::new(16).encode_committed(16);
+        assert_eq!(dropped, 0);
+        assert_eq!(empty, none);
+
+        // Seeding into a record that already holds a fuller copy keeps the
+        // fuller one; a fuller seeded copy raises a smaller one.
+        let mut holder = BootWritten::new(16);
+        assert!(holder.record(&copy_of(23, 2, TfIndex::M5, 900, 9, 0)));
+        assert!(holder.record(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 1, 1)));
+        holder.seed_from_bytes(&bytes).expect("valid");
+        assert!(holder.is_older(&copy_of(23, 2, TfIndex::M5, 900, 4, 0)));
+        assert!(!holder.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 7, 70)));
+        assert!(holder.is_older(&copy_of(23, 1, TfIndex::M5, u32::MAX - 59, 1, 1)));
+
+        // A record count that claims more records than the bytes hold (here
+        // one that would overflow) is refused on length, and nothing seeds.
+        let mut lying = bytes.clone();
+        lying[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut probe = BootWritten::new(16);
+        assert_eq!(
+            probe.seed_from_bytes(&lying),
+            Err(BootSummaryRefused::Length)
+        );
+        assert_eq!(probe.committed_len(), 0, "nothing seeded from a refusal");
+        // A damaged record body is refused whole.
+        let mut flipped = bytes.clone();
+        let last_record_byte = bytes.len() - 5;
+        flipped[last_record_byte] ^= 0x80;
+        assert_eq!(
+            probe.seed_from_bytes(&flipped),
+            Err(BootSummaryRefused::Checksum)
+        );
+        assert_eq!(probe.committed_len(), 0);
+        // A wrong layout version is refused on magic, even with a valid CRC
+        // over an otherwise empty summary. Since 2026-10-22 (plan item 62) the
+        // live magic is `TVBWSUM2`, so the previous build's `TVBWSUM1` is
+        // the wrong version: its timeframe bytes are the old ordinals.
+        let (mut v1, _) = BootWritten::new(16).encode_committed(16);
+        v1[7] = b'1';
+        assert_eq!(probe.seed_from_bytes(&v1), Err(BootSummaryRefused::Magic));
+    }
+
+    #[test]
+    fn test_regression_s1_summary_is_bounded_and_counts_what_it_drops() {
+        let mut written = BootWritten::new(16);
+        for bucket in [600, 660, 720] {
+            written.record(&copy_of(13, 2, TfIndex::M1, bucket, 1, 1));
+        }
+        written.commit_pending();
+        let (bytes, dropped) = written.encode_committed(2);
+        assert_eq!(dropped, 1);
+        // Seeding past the cap counts, never blocks.
+        let seeded = BootWritten::new(1).seed_from_bytes(&bytes).expect("valid");
+        assert_eq!(
+            seeded,
+            BootSummarySeeded {
+                seeded: 1,
+                untracked: 1
+            }
+        );
+    }
+
+    /// Plan item US1-C: the prefault touches the whole table and leaves the
+    /// ledger exactly as a fresh one: empty, inactive, same capacity, and a
+    /// real bar is judged as on a fresh ledger.
+    #[test]
+    fn test_us1c_prefault_leaves_the_ledger_empty_with_its_capacity() {
+        let mut fresh = SpillLedger::with_capacity(4_096);
+        let mut warmed = SpillLedger::with_capacity(4_096);
+        let capacity = warmed.bars.capacity();
+        let touched = warmed.prefault();
+        assert_eq!(touched, capacity);
+        assert_eq!(warmed.bars.capacity(), capacity, "no growth");
+        assert!(warmed.bars.is_empty());
+        assert!(!warmed.is_active());
+        let s = copy_of(7, 1, TfIndex::M1, 1_716_023_700, 5, 50);
+        assert_eq!(warmed.verdict(&s), fresh.verdict(&s));
+        // A placeholder-shaped key (bucket 0) is not remembered either.
+        let placeholder = copy_of(3, 0, TfIndex::M1, 0, 5, 50);
+        assert_eq!(warmed.verdict(&placeholder), fresh.verdict(&placeholder));
+        let _ = (&mut fresh, &mut warmed);
+    }
+}

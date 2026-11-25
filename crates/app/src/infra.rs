@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use secrecy::ExposeSecret;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_core::auth::secret_manager;
@@ -70,7 +70,7 @@ const DEPLOYED_COMPOSE_PATH: &str = "repo/deploy/docker/docker-compose.yml";
 ///
 /// It went unnoticed because something else was quietly covering for it: the
 /// deploy workflow runs its own `docker compose up` (with the correct path),
-/// and the systemd unit's `ExecStartPre` runs `ensure-questdb.sh` (also with
+/// and the systemd unit's `ExecStartPre` ran `ensure-questdb.sh` (also with
 /// the correct path). QuestDB was therefore always already up by the time the
 /// app looked, so `classify_compose_outcome` returned `DegradedServiceUp` and
 /// the boot continued. A permanently-broken function reported a degraded-but-
@@ -103,7 +103,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 
 /// System-wide docker CLI plugin locations probed for the Compose v2 plugin
 /// binary when neither `docker compose` nor `docker-compose` resolves
-/// (issue #1505 — mirrors the `scripts/ensure-questdb.sh` rung-3c ladder).
+/// (issue #1505 — mirrors the `ensure_questdb` self-heal ladder).
 ///
 /// Deliberately EXCLUDES the per-user `~/.docker/cli-plugins/` directory:
 /// the systemd unit runs with `ProtectHome=true`, so a per-user plugin is
@@ -111,7 +111,7 @@ fn resolve_compose_path() -> Option<&'static str> {
 /// fallback — that invisibility is the #1505 root cause, and probing it
 /// here would make dev-shell behaviour diverge from the service context.
 /// Ratcheted by `test_compose_plugin_system_paths_are_system_wide`.
-const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
+pub(crate) const COMPOSE_PLUGIN_SYSTEM_PATHS: [&str; 3] = [
     "/usr/local/lib/docker/cli-plugins/docker-compose",
     "/usr/libexec/docker/cli-plugins/docker-compose",
     "/usr/lib/docker/cli-plugins/docker-compose",
@@ -146,11 +146,13 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
 /// Outcome of the boot-time `docker compose up -d` retry loop, once the
 /// required service (QuestDB) has been probed.
 ///
-/// Root cause this guards against: `run_docker_compose_up` runs
-/// `--force-recreate`, which is NOT idempotent — it tears down + recreates
+/// Root cause this guarded against: `run_docker_compose_up` ran
+/// `--force-recreate`, which is NOT idempotent — it tore down + recreated
 /// every container on every boot. On a same-day crash-recovery boot (QuestDB
-/// already up + busy) the recreate can fail all `COMPOSE_UP_MAX_RETRIES`
-/// attempts even though the service the app actually needs is healthy. The
+/// already up + busy) the recreate could fail all `COMPOSE_UP_MAX_RETRIES`
+/// attempts even though the service the app actually needs is healthy.
+/// (2026-10-11, audit QDB-1: the boot now runs plain `up -d`; the
+/// classification stays, since compose can still fail while QuestDB is up.) The
 /// old code fired a Telegram CRITICAL unconditionally on that path — a
 /// false-CRITICAL that erodes operator trust in the pager. This enum routes
 /// the failure by whether the required service is ACTUALLY reachable.
@@ -160,7 +162,7 @@ pub enum ComposeOutcome {
     Succeeded,
     /// compose-up exhausted its retries, but the required service (QuestDB)
     /// is reachable — the app can run. Log Low (`warn!`), no CRITICAL page.
-    /// This is the `--force-recreate`-churn-while-service-up false-CRITICAL.
+    /// This was the recreate-churn-while-service-up false-CRITICAL.
     DegradedServiceUp,
     /// compose-up exhausted its retries AND the required service is NOT
     /// reachable — a real outage. Keep the CRITICAL page.
@@ -210,14 +212,14 @@ pub fn classify_compose_outcome(
 // in the invoking context (e.g. the plugin lives under
 // `~/.docker/cli-plugins/`, hidden from the systemd service by
 // `ProtectHome=true`). That failure is DETERMINISTIC — retrying the same
-// invocation is noise, not recovery. Mirror the `scripts/ensure-questdb.sh`
+// invocation is noise, not recovery. Mirror the `ensure_questdb` self-heal
 // ladder (v2 → v1 → plugin-by-absolute-path) so a cold boot can bring
 // QuestDB up even when the `docker compose` front-end is broken, and fail
 // LOUDLY (once, with the actionable cause) when no compose front-end exists.
 
 /// A resolved, working Docker Compose front-end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComposeCli {
+pub(crate) enum ComposeCli {
     /// `docker compose …` — the modern v2 plugin resolved by the docker CLI.
     DockerComposeV2,
     /// `docker-compose …` — the standalone v1 binary on `PATH`.
@@ -229,7 +231,7 @@ enum ComposeCli {
 
 impl ComposeCli {
     /// The program to exec for this front-end.
-    fn program(self) -> &'static str {
+    pub(crate) fn program(self) -> &'static str {
         match self {
             ComposeCli::DockerComposeV2 => "docker",
             ComposeCli::StandaloneV1 => "docker-compose",
@@ -238,7 +240,7 @@ impl ComposeCli {
     }
 
     /// Human-readable label for logs.
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             ComposeCli::DockerComposeV2 => "docker compose (v2 plugin)",
             ComposeCli::StandaloneV1 => "docker-compose (v1 standalone)",
@@ -301,48 +303,12 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         return;
     }
 
-    // Fetch infra credentials from SSM concurrently.
-    let (questdb_creds, telegram_creds) = match tokio::join!(
-        secret_manager::fetch_questdb_credentials(),
-        secret_manager::fetch_telegram_credentials(),
-    ) {
-        (Ok(q), Ok(t)) => (q, t),
-        (q_result, t_result) => {
-            if let Err(ref err) = q_result {
-                warn!(
-                    ?err,
-                    "failed to fetch QuestDB credentials from SSM — cannot auto-start Docker"
-                );
-            }
-            if let Err(ref err) = t_result {
-                warn!(
-                    ?err,
-                    "failed to fetch Telegram credentials from SSM — cannot auto-start Docker"
-                );
-            }
-            return;
-        }
+    // Fetch infra credentials from SSM and build the compose environment —
+    // the SAME builder `container_health_snapshot` uses, so `up` and `ps`
+    // can never disagree about what the compose file needs to parse.
+    let Some(env_vars) = fetch_compose_env("cannot auto-start Docker").await else {
+        return;
     };
-
-    // Build env vars for docker-compose.
-    let env_vars = [
-        (
-            "TV_QUESTDB_PG_USER",
-            questdb_creds.pg_user.expose_secret().to_string(),
-        ),
-        (
-            "TV_QUESTDB_PG_PASSWORD",
-            questdb_creds.pg_password.expose_secret().to_string(),
-        ),
-        (
-            "TV_TELEGRAM_BOT_TOKEN",
-            telegram_creds.bot_token.expose_secret().to_string(),
-        ),
-        (
-            "TV_TELEGRAM_CHAT_ID",
-            telegram_creds.chat_id.expose_secret().to_string(),
-        ),
-    ];
 
     // Ensure the machine app.log placeholder exists before Docker mounts it.
     // Alloy container mounts ../../data/logs → /var/log/tv-app to watch the
@@ -381,6 +347,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         None => {
             metrics::counter!("tv_boot_compose_cli_unavailable_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_cli_missing",
                 probed_system_paths = ?COMPOSE_PLUGIN_SYSTEM_PATHS,
                 "no usable Docker Compose CLI in this context — `docker compose`, \
                  `docker-compose`, and the system plugin paths all failed to \
@@ -401,6 +369,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             // time, and a "recreate churn" counter blaming the wrong cause.
             metrics::counter!("tv_boot_compose_file_missing_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_file_missing",
                 compose_cli = cli.label(),
                 candidates = ?[DOCKER_COMPOSE_PATH, DEPLOYED_COMPOSE_PATH],
                 working_dir = ?std::env::current_dir().ok(),
@@ -445,9 +415,9 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
             }
         }
     }
-    // false-CRITICAL fix (2026-07-01): compose-up may fail all retries purely
-    // because `--force-recreate` churns containers that are ALREADY up (e.g. a
-    // same-day crash-recovery boot with QuestDB already serving). Only page
+    // false-CRITICAL fix (2026-07-01): compose-up may fail all retries while
+    // the containers are ALREADY up (e.g. a same-day crash-recovery boot with
+    // QuestDB already serving). Only page
     // CRITICAL when the required service (QuestDB) is ACTUALLY unreachable —
     // otherwise the app can run and the CRITICAL was a false alarm.
     let questdb_reachable =
@@ -464,6 +434,8 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         }
         ComposeOutcome::Critical => {
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Boot01QuestDbSlow.code_str(),
+                source = "compose_up_failed",
                 "docker compose up failed after {COMPOSE_UP_MAX_RETRIES} attempts and \
                  QuestDB is unreachable — services may not be available. \
                  Telegram CRITICAL alert should fire."
@@ -506,7 +478,9 @@ async fn open_all_dashboards() {
 pub struct ClockSkewSample {
     /// Signed seconds; positive = local clock is AHEAD of trusted source.
     pub skew_secs: f64,
-    /// Source label, one of `"chronyc"` or `"questdb_now"`.
+    /// Source label. Always `"chronyc"` since 2026-10-11 (audit CLOCK-3):
+    /// the `"questdb_now"` fallback was removed because QuestDB runs on this
+    /// host and shares its clock, so it could only ever read about 0.
     pub source: &'static str,
 }
 
@@ -526,14 +500,20 @@ impl ClockSkewSample {
 /// pull in a new `thiserror` dependency for one enum.
 #[derive(Debug, Clone)]
 pub enum ClockSkewError {
-    /// Both probe paths (`chronyc` PRIMARY, QuestDB `SELECT now()`
-    /// FALLBACK) failed before producing a sample. The boot orchestrator
-    /// should log a WARN and proceed (not HALT) — refusing to boot when
-    /// we cannot even read the clock is brittle on dev hardware.
+    /// The `chronyc` probe failed before producing a sample. The boot
+    /// orchestrator should log a WARN and proceed (not HALT) — refusing to
+    /// boot when we cannot even read the clock is brittle on dev hardware.
+    ///
+    /// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3).** This variant used to mean
+    /// "both probes failed": a QuestDB `SELECT now()` fallback ran first.
+    /// QuestDB is a container on this same host and shares its kernel clock,
+    /// so that "skew" was about 0 by construction, and it reported a healthy
+    /// number exactly when chronyd had stopped. The fallback is gone; when
+    /// chronyc fails the skew is reported as unknown, not as a number.
     Unavailable {
-        /// Primary probe failure description.
+        /// Primary (`chronyc`) probe failure description.
         primary: String,
-        /// Fallback probe failure description.
+        /// Why no fallback produced a number (fixed text since 2026-10-11).
         fallback: String,
     },
     /// Sample acquired and skew exceeded `CLOCK_SKEW_HALT_THRESHOLD_SECS`.
@@ -568,18 +548,13 @@ impl std::fmt::Display for ClockSkewError {
 
 impl std::error::Error for ClockSkewError {}
 
-/// Reads `chronyc tracking` and parses the `Last offset` line.
+/// Reads `chronyc tracking` and parses it with [`parse_chronyc_tracking`].
 ///
 /// Security review: `Command::new` + `args(&[...])` with a STATIC slice.
 /// No string interpolation, no shell, no env passthrough — argv cannot
 /// be influenced by external input. The `chronyc` binary itself comes
 /// from the host (Docker bind-mount) and is trusted. On hosts without
 /// chrony installed, this returns `Err` and the caller falls through.
-///
-/// `Last offset` line format:
-/// ```text
-/// Last offset     : -0.000007441 seconds
-/// ```
 fn probe_via_chronyc() -> Result<ClockSkewSample, String> {
     // STATIC argv — argv is a `&[&str; 1]` literal. Security-reviewed:
     // never mix in user input, never `format!`, never `env` passthrough.
@@ -595,116 +570,155 @@ fn probe_via_chronyc() -> Result<ClockSkewSample, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_chronyc_tracking(&stdout)
+}
+
+/// Parses `chronyc tracking` output into a skew sample.
+///
+/// `Last offset` line format:
+/// ```text
+/// Last offset     : -0.000007441 seconds
+/// ```
+///
+/// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3, follow-up).** This used to read
+/// `Last offset` alone. A chronyd that is running but has never synchronised
+/// (no reachable NTP source) still prints `Last offset : +0.000000000
+/// seconds`, so a free-running clock read as exactly 0 skew and passed the
+/// boot gate and the alarm. The sample is now refused when the output shows
+/// the daemon is not synchronised: `Leap status : Not synchronised`, or a
+/// `Reference ID` of `00000000` / `0.0.0.0` (no source selected). A refused
+/// sample is `Err`, so the caller reports skew as unknown rather than 0.
+fn parse_chronyc_tracking(stdout: &str) -> Result<ClockSkewSample, String> {
+    let mut offset: Option<f64> = None;
     for line in stdout.lines() {
         // Tolerate locale variants — match prefix only.
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Last offset") {
-            // After the colon, the value is `<sign?>0.NNNNN seconds`.
-            let after_colon = rest.split(':').nth(1).ok_or_else(|| {
-                format!("chronyc tracking 'Last offset' line malformed: {trimmed}")
-            })?;
-            let value = after_colon
+        let Some((key, after_colon)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value_text = after_colon.trim();
+        if key.eq_ignore_ascii_case("Leap status")
+            && value_text.to_ascii_lowercase().contains("not synchronised")
+        {
+            return Err(format!(
+                "chronyc tracking reports the clock is not synchronised: {trimmed}"
+            ));
+        }
+        if key.eq_ignore_ascii_case("Reference ID") {
+            let reference = value_text.split_whitespace().next().unwrap_or("");
+            if reference.is_empty() || reference == "00000000" || reference == "0.0.0.0" {
+                return Err(format!(
+                    "chronyc tracking has no selected time source: {trimmed}"
+                ));
+            }
+        }
+        if key == "Last offset" {
+            let value = value_text
                 .split_whitespace()
                 .next()
                 .ok_or_else(|| format!("chronyc tracking value missing: {trimmed}"))?;
             let skew_secs: f64 = value
                 .parse()
                 .map_err(|e| format!("chronyc tracking value not f64 ('{value}'): {e}"))?;
-            return Ok(ClockSkewSample {
-                skew_secs,
-                source: "chronyc",
-            });
+            offset = Some(skew_secs);
         }
     }
-    Err("chronyc tracking did not contain a 'Last offset' line".to_string())
-}
-
-/// Falls back to QuestDB `SELECT now()` over its HTTP `/exec` endpoint.
-///
-/// Returns the signed difference between `Utc::now()` and QuestDB's
-/// `now()`. QuestDB stores all timestamps in UTC, so the comparison is
-/// timezone-safe.
-async fn probe_via_questdb_now(questdb_config: &QuestDbConfig) -> Result<ClockSkewSample, String> {
-    let url = format!(
-        "http://{}:{}/exec?query=SELECT%20now()",
-        questdb_config.host, questdb_config.http_port
-    );
-    let client = reqwest::Client::builder()
-        .timeout(INFRA_PROBE_TIMEOUT)
-        .build()
-        .map_err(|e| format!("reqwest builder: {e}"))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("questdb GET failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("questdb /exec status {}", resp.status()));
+    match offset {
+        Some(skew_secs) => Ok(ClockSkewSample {
+            skew_secs,
+            source: "chronyc",
+        }),
+        None => Err("chronyc tracking did not contain a 'Last offset' line".to_string()),
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("questdb body read: {e}"))?;
-    // Body shape: `{"query":"SELECT now()","columns":[...],"dataset":[["2026-04-27T12:34:56.123456Z"]],...}`
-    // Lift the timestamp string out of the dataset without pulling in serde_json.
-    let dataset_marker = "\"dataset\":[[\"";
-    let from = body
-        .find(dataset_marker)
-        .ok_or_else(|| format!("questdb response missing dataset: {body}"))?
-        + dataset_marker.len();
-    let end = body[from..]
-        .find('"')
-        .ok_or_else(|| format!("questdb response malformed: {body}"))?;
-    let ts_str = &body[from..from + end];
-    let questdb_ts = chrono::DateTime::parse_from_rfc3339(ts_str)
-        .map_err(|e| format!("questdb timestamp '{ts_str}' parse: {e}"))?;
-    let local_ts = chrono::Utc::now();
-    let skew_secs = (local_ts.timestamp_micros() - questdb_ts.timestamp_micros()) as f64 / 1.0e6;
-    Ok(ClockSkewSample {
-        skew_secs,
-        source: "questdb_now",
-    })
 }
 
-/// Wave 2 Item 7.3 (G8) — sample wall-clock skew at boot.
+/// Text placed in `ClockSkewError::Unavailable { fallback }` when `chronyc`
+/// fails. There is no fallback source on purpose (audit CLOCK-3, 2026-10-11):
+/// the QuestDB `SELECT now()` fallback compared this host's clock with a
+/// container on this host, which shares the same kernel clock, so it read
+/// about 0 whatever the real drift was.
+const CLOCK_SKEW_NO_FALLBACK: &str =
+    "none: QuestDB runs on this host and shares its clock, so it cannot measure skew";
+
+/// Wave 2 Item 7.3 (G8) — sample wall-clock skew.
 ///
-/// PRIMARY: `chronyc tracking` shell-out (host has chrony installed in
-/// every prod + dev container per `deploy/`). FALLBACK: QuestDB
-/// `SELECT now()` over PG-wire — usable post-`wait_for_questdb_ready`.
-/// One probe, no try/catch chain — PRIMARY is attempted first, then
-/// FALLBACK if PRIMARY errored.
+/// The only source is `chronyc tracking` (chrony is installed on the prod
+/// host and in the dev containers per `deploy/`). Called once at boot by
+/// [`enforce_clock_skew_at_boot`] and every 30 s by the poller.
+///
+/// **⚠ CORRECTED 2026-10-11 (audit CLOCK-3).** This used to fall back to
+/// QuestDB `SELECT now()` when `chronyc` failed. QuestDB is a container on
+/// this same host, so that comparison read about 0 by construction. It set
+/// `tv_clock_skew_seconds{source="questdb_now"}`, which the CloudWatch
+/// `clock-skew-high` alarm and the BOOT-03 gate both read, so a stopped
+/// chronyd with a drifting clock looked healthy. The fallback is removed:
+/// when `chronyc` fails this returns `Unavailable` and writes NO skew number.
+///
+/// **Honest limit.** While `chronyc` is unavailable, `tv_clock_skew_seconds`
+/// keeps its last real `chronyc` value (or never exists on a box without
+/// chrony), and the CloudWatch alarm treats missing data as not breaching.
+/// The local gauge `tv_clock_skew_probe_available` (1 = a chronyc sample,
+/// 0 = unavailable) says which case holds; it is deliberately NOT shipped to
+/// CloudWatch (noise lock). Paging on it is an alarm change for the owner.
 ///
 /// Returns `Ok(sample)` regardless of magnitude — the caller is
 /// responsible for comparing `sample.skew_secs.abs()` against
 /// `CLOCK_SKEW_HALT_THRESHOLD_SECS`. This split lets unit tests
 /// deterministically drive the threshold logic without a live clock.
-pub async fn probe_clock_skew(
-    questdb_config: &QuestDbConfig,
-) -> Result<ClockSkewSample, ClockSkewError> {
-    match probe_via_chronyc() {
+pub async fn probe_clock_skew() -> Result<ClockSkewSample, ClockSkewError> {
+    probe_clock_skew_using(probe_via_chronyc).await
+}
+
+/// [`probe_clock_skew`] with the `chronyc` reader injected, so tests can
+/// drive both outcomes without a real chrony.
+///
+/// The reader shells out with the BLOCKING `Command::output()`, which has no
+/// timeout. Called once at boot that is harmless; called on a 30s loop for
+/// the life of the session it would park a tokio worker on every tick and,
+/// if chronyc ever hung, park it permanently. So it runs on the blocking
+/// pool: a stuck probe costs a blocking thread rather than a runtime worker.
+/// `join_error` can only be a panic here (nothing cancels this handle), and
+/// a panicking probe is reported as a probe failure rather than propagated —
+/// the caller's contract is "degrade and proceed", not "take the process
+/// down".
+async fn probe_clock_skew_using<F>(chronyc_reader: F) -> Result<ClockSkewSample, ClockSkewError>
+where
+    F: FnOnce() -> Result<ClockSkewSample, String> + Send + 'static,
+{
+    let chronyc = match tokio::task::spawn_blocking(chronyc_reader).await {
+        Ok(result) => result,
+        Err(join_error) => Err(format!("chronyc probe task failed: {join_error}")),
+    };
+    // Plan item LF-6a: the reading (or its absence) also feeds the per-minute
+    // `host_capacity_minute.clock_offset_ns` column. Two atomic stores.
+    let now_unix_secs = chrono::Utc::now().timestamp();
+    match chronyc {
         Ok(sample) => {
             // Emit a Prometheus gauge so dashboards can plot drift over
             // time. `tv_clock_skew_seconds` is the canonical metric name.
             metrics::gauge!("tv_clock_skew_seconds", "source" => sample.source)
                 .set(sample.skew_secs);
+            metrics::gauge!("tv_clock_skew_probe_available").set(1.0);
+            tickvault_storage::host_capacity_minute::publish_clock_offset(
+                Some(sample.skew_secs),
+                now_unix_secs,
+            );
             Ok(sample)
         }
         Err(primary_err) => {
+            tickvault_storage::host_capacity_minute::publish_clock_offset(None, now_unix_secs);
             debug!(
                 error = %primary_err,
-                "chronyc clock-skew probe failed, trying QuestDB fallback"
+                "chronyc clock-skew probe failed; skew is unknown (no fallback source)"
             );
-            match probe_via_questdb_now(questdb_config).await {
-                Ok(sample) => {
-                    metrics::gauge!("tv_clock_skew_seconds", "source" => sample.source)
-                        .set(sample.skew_secs);
-                    Ok(sample)
-                }
-                Err(fallback_err) => Err(ClockSkewError::Unavailable {
-                    primary: primary_err,
-                    fallback: fallback_err,
-                }),
-            }
+            // No number is written to `tv_clock_skew_seconds`: an invented
+            // value is worse than a missing one.
+            metrics::gauge!("tv_clock_skew_probe_available").set(0.0);
+            Err(ClockSkewError::Unavailable {
+                primary: primary_err,
+                fallback: CLOCK_SKEW_NO_FALLBACK.to_string(),
+            })
         }
     }
 }
@@ -713,10 +727,9 @@ pub async fn probe_clock_skew(
 /// `Err(ThresholdExceeded)` if the magnitude exceeds the configured
 /// halt threshold. Boot orchestrator calls this; on Err it must HALT.
 pub async fn enforce_clock_skew_at_boot(
-    questdb_config: &QuestDbConfig,
     threshold_secs: f64,
 ) -> Result<ClockSkewSample, ClockSkewError> {
-    let sample = probe_clock_skew(questdb_config).await?;
+    let sample = probe_clock_skew().await?;
     if sample.exceeds(threshold_secs) {
         return Err(ClockSkewError::ThresholdExceeded {
             skew_secs: sample.skew_secs,
@@ -725,6 +738,175 @@ pub async fn enforce_clock_skew_at_boot(
         });
     }
     Ok(sample)
+}
+
+/// Backoff before respawning the poll loop after an unexpected exit.
+///
+/// Matches `DISK_PRESSURE_RESPAWN_BACKOFF_SECS`. Short, because the whole
+/// point is that the gauge is frozen while the loop is down: every second
+/// of backoff is a second the alarm reads a value nobody is refreshing.
+pub const CLOCK_SKEW_RESPAWN_BACKOFF_SECS: u64 = 5;
+
+/// The poll loop itself. Never returns on its own — the supervisor treats a
+/// return as a failure precisely because of that.
+async fn run_clock_skew_loop(interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    // The first tick of a tokio interval fires immediately; the boot gate
+    // has just sampled, so skip it rather than probe twice in a second.
+    ticker.tick().await;
+    let mut failures: u64 = 0;
+    // Plan item LF-6a (noise lock §2.22): the first probe of each minute is
+    // that minute's sample for the 1 ms / 5-minute page. The latch is saved
+    // under data/state so a restart inside one unbroken episode does not page
+    // it again (once per episode).
+    let latch_dir = std::path::Path::new(crate::clock_offset_page::CLOCK_OFFSET_LATCH_DIR);
+    let restored = tickvault_storage::off_worker::off_worker(|| {
+        crate::clock_offset_page::restore_clock_offset_latch_in(
+            latch_dir,
+            crate::clock_offset_page::ist_date_of_unix_secs(chrono::Utc::now().timestamp()),
+        )
+    });
+    let mut episode = crate::clock_offset_page::ClockOffsetEpisode::with_latch(restored);
+    loop {
+        ticker.tick().await;
+        let probed = probe_clock_skew().await;
+        // The RAW reading: the stored column's one-hour bound is not applied
+        // to the page, so the largest skews page too.
+        let minute_sample = match &probed {
+            Ok(s) => crate::clock_offset_page::clock_offset_sample_from_secs(s.skew_secs),
+            Err(_) => crate::clock_offset_page::ClockOffsetSample::Failed,
+        };
+        let now_unix_secs = chrono::Utc::now().timestamp();
+        let was_latched = episode.is_latched();
+        crate::clock_offset_page::report_clock_offset_verdict(
+            crate::clock_offset_page::feed_clock_offset_episode(
+                &mut episode,
+                now_unix_secs,
+                minute_sample,
+            ),
+        );
+        let is_latched = episode.is_latched();
+        if was_latched != is_latched {
+            tickvault_storage::off_worker::off_worker(|| {
+                crate::clock_offset_page::persist_clock_offset_latch_change_in(
+                    latch_dir,
+                    crate::clock_offset_page::ist_date_of_unix_secs(now_unix_secs),
+                    was_latched,
+                    is_latched,
+                )
+            });
+        }
+        match probed {
+            Ok(sample) => {
+                failures = 0;
+                debug!(
+                    skew_secs = sample.skew_secs,
+                    source = sample.source,
+                    "clock-skew re-sampled"
+                );
+            }
+            Err(err) => {
+                failures = failures.saturating_add(1);
+                // Power-of-two throttle: a probe that fails every 30s for
+                // a whole session would otherwise write ~1,000 identical
+                // lines into a sink whose whole purpose is signal.
+                if failures.is_power_of_two() {
+                    warn!(
+                        code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
+                            .code_str(),
+                        reason = "probe_unavailable",
+                        consecutive_failures = failures,
+                        error = %err,
+                        "clock-skew re-sample FAILED — tv_clock_skew_seconds is now \
+                         stale and the alarm on it is reading an old value"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Re-samples wall-clock skew every
+/// [`CLOCK_SKEW_POLL_INTERVAL_SECS`] for the life of the process, so
+/// `tv_clock_skew_seconds` tracks LIVE drift instead of freezing at its boot
+/// value.
+///
+/// # Why this is not optional
+///
+/// [`probe_clock_skew`] sets a `metrics` gauge. The Prometheus exporter is
+/// built with no idle timeout, so a gauge renders its last value on every
+/// scrape forever. With the boot gate as the only caller, CloudWatch received
+/// the 08:30 reading on every scrape until the box stopped — a dense, healthy
+/// series that could not move. `tv-<env>-clock-skew-high` and the dashboard
+/// panel both read it, and both were therefore reporting a number taken
+/// before the market opened. Drift that developed at 11:00 was invisible to
+/// every surface that exists to catch it.
+///
+/// This does NOT change the boot gate: BOOT-03 still halts a boot that starts
+/// out of tolerance. It changes what happens for the nine hours afterwards.
+///
+/// # Why it is SUPERVISED (added 2026-08-26, hours after the poller itself)
+///
+/// The first version of this was a bare `tokio::spawn` of the loop below.
+/// That is the same defect it was written to fix, one level up: if the task
+/// dies, the gauge stops being written and the exporter goes on rendering
+/// its last value — a dense, healthy, frozen series, which is exactly the
+/// false-green the poller exists to end. A fix that can silently revert to
+/// the bug is not a fix.
+///
+/// So it now follows the house supervisor shape
+/// (`disk_pressure_boot::spawn_disk_pressure_loop`): an outer loop spawns the
+/// inner one, awaits its handle, counts `tv_clock_skew_poller_respawn_total`
+/// and restarts it. A CLEAN return is treated as a failure too — the inner
+/// loop cannot return on its own, so reaching that arm means something ended
+/// it.
+///
+/// # Honest envelope
+///
+/// This makes the EXISTING alarm able to see drift; it adds no alarm and no
+/// page. A probe that starts FAILING mid-session (chrony stopped; since
+/// 2026-10-11 there is no QuestDB fallback) leaves the last good value
+/// rendering — the same staleness in miniature — so the failure is logged with the BOOT-03 code at a
+/// power-of-two throttle rather than passing silently. Supervision covers the
+/// task DYING; it does not cover the probe failing while the task lives, and
+/// neither case pages anyone. Stated here rather than discovered later.
+pub fn spawn_clock_skew_poller(interval: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let handle = tokio::spawn(async move { run_clock_skew_loop(interval).await });
+            match handle.await {
+                Ok(()) => {
+                    warn!("clock-skew poll loop exited cleanly — respawning");
+                }
+                Err(err) => {
+                    // CODED, and the guard is why. The first version of this
+                    // arm carried no `code =` field, and
+                    // `uncoded_error_sites_may_only_shrink` failed CI by
+                    // name: an uncoded `error!` reaches the log sink and
+                    // nothing else, because every CloudWatch metric filter
+                    // that pages an operator matches on `$.code`.
+                    //
+                    // BOOT-03 is the right code rather than a convenient
+                    // one: it is what the sibling probe-failure `warn!` in
+                    // `run_clock_skew_loop` uses, it owns the clock-skew
+                    // runbook, and both failures put the operator in the
+                    // same position — `tv_clock_skew_seconds` is no longer
+                    // being refreshed and the alarm on it cannot tell that
+                    // from a steady clock.
+                    error!(
+                        code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded
+                            .code_str(),
+                        ?err,
+                        "clock-skew poll loop died — respawning (tv_clock_skew_seconds is \
+                         frozen at its last value until it returns, and the alarm on it \
+                         cannot tell that apart from a steady clock)"
+                    );
+                }
+            }
+            metrics::counter!("tv_clock_skew_poller_respawn_total").increment(1);
+            tokio::time::sleep(Duration::from_secs(CLOCK_SKEW_RESPAWN_BACKOFF_SECS)).await;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -836,45 +1018,126 @@ pub fn parse_container_health(ps_stdout: &str) -> (usize, usize, Vec<String>) {
     (total, unhealthy, unhealthy_names)
 }
 
+/// The environment variables `docker compose` needs merely to PARSE the
+/// compose file, in the order [`compose_env`] emits them.
+///
+/// Two of them are `${VAR:?…}` REQUIRED interpolations in
+/// `deploy/docker/docker-compose.yml` (the QuestDB PG credentials), so ANY
+/// compose subcommand run without them — `ps` included, not just `up` —
+/// exits non-zero before it looks at a single container. That is the
+/// mechanism behind the boot ping that read `Healthy: 0/0` on a box whose
+/// containers were all up (`dhan-rest-only-noise-lock-2026-07-14.md` §2.3x).
+/// Both call sites build their environment through this one list, and
+/// `infra::tests` pins every required interpolation in the compose file to it.
+pub(crate) const COMPOSE_ENV_KEYS: [&str; 4] = [
+    "TV_QUESTDB_PG_USER",
+    "TV_QUESTDB_PG_PASSWORD",
+    "TV_TELEGRAM_BOT_TOKEN",
+    "TV_TELEGRAM_CHAT_ID",
+];
+
+/// A fully-built compose environment: one `(key, value)` pair per
+/// [`COMPOSE_ENV_KEYS`] entry, in that order.
+type ComposeEnv = [(&'static str, String); COMPOSE_ENV_KEYS.len()];
+
+/// Pure: pairs [`COMPOSE_ENV_KEYS`] with values supplied in the same order.
+///
+/// Takes plain values rather than the SSM credential types so the key set is
+/// testable without AWS. Cold path (boot + one boot-time health check).
+fn compose_env(values: [String; COMPOSE_ENV_KEYS.len()]) -> ComposeEnv {
+    let [pg_user, pg_password, bot_token, chat_id] = values;
+    [
+        (COMPOSE_ENV_KEYS[0], pg_user),
+        (COMPOSE_ENV_KEYS[1], pg_password),
+        (COMPOSE_ENV_KEYS[2], bot_token),
+        (COMPOSE_ENV_KEYS[3], chat_id),
+    ]
+}
+
+/// Fetches the compose credentials from SSM (concurrently) and builds the
+/// shared compose environment. `None` when either fetch fails — each failure
+/// is logged with `consequence` naming what the caller cannot do without it.
+async fn fetch_compose_env(consequence: &'static str) -> Option<ComposeEnv> {
+    match tokio::join!(
+        secret_manager::fetch_questdb_credentials(),
+        secret_manager::fetch_telegram_credentials(),
+    ) {
+        (Ok(questdb_creds), Ok(telegram_creds)) => Some(compose_env([
+            questdb_creds.pg_user.expose_secret().to_string(),
+            questdb_creds.pg_password.expose_secret().to_string(),
+            telegram_creds.bot_token.expose_secret().to_string(),
+            telegram_creds.chat_id.expose_secret().to_string(),
+        ])),
+        (q_result, t_result) => {
+            if let Err(ref err) = q_result {
+                warn!(
+                    ?err,
+                    consequence, "failed to fetch QuestDB credentials from SSM"
+                );
+            }
+            if let Err(ref err) = t_result {
+                warn!(
+                    ?err,
+                    consequence, "failed to fetch Telegram credentials from SSM"
+                );
+            }
+            None
+        }
+    }
+}
+
 /// One-shot `(services_healthy, services_total)` snapshot for the boot-time
-/// `BootHealthCheck` ping. Runs `docker compose ps` once via the same format as
-/// the watchdog and reuses [`parse_container_health`]. Returns `(0, 0)` when the
-/// Docker daemon is down or the command fails — an honest "nothing healthy"
-/// (the operator wants the ping to fire with the real counts either way).
+/// `BootHealthCheck` ping, or `None` when the check could not run at all.
+///
+/// Runs `docker compose ps` once via the same format as the watchdog and
+/// reuses [`parse_container_health`]. It passes the SAME environment `up`
+/// gets ([`fetch_compose_env`]) — without it the compose file's required
+/// interpolations make `ps` exit non-zero, which until 2026-09-23 was
+/// reported as `(0, 0)` and paged the operator "Healthy: 0/0" on a box whose
+/// containers were all up.
+///
+/// `None` means UNKNOWN (daemon down, no compose CLI, no credentials, the
+/// command failed) — never "nothing is healthy". `Some((0, 0))` is reserved
+/// for a check that ran and genuinely found no containers.
 // TEST-EXEMPT: thin docker-compose-ps shell-out; the (healthy, total) math is
-// fully covered by parse_container_health unit tests.
-pub async fn container_health_counts() -> (usize, usize) {
+// covered by parse_container_health unit tests, the env key set by
+// compose_env tests.
+pub async fn container_health_snapshot() -> Option<(usize, usize)> {
     use tokio::process::Command;
 
     if !is_docker_daemon_running().await {
-        return (0, 0);
+        warn!("container_health_snapshot: Docker daemon not running — health UNKNOWN");
+        return None;
     }
     // Issue #1505: resolve a working compose front-end first — a broken
-    // `docker compose` CLI made this `ps` exit 125 with empty stdout, which
-    // parsed as an unlabelled (0, 0) instead of an honest failure.
+    // `docker compose` CLI made this `ps` exit 125 with empty stdout.
     let Some(cli) = resolve_compose_cli().await else {
-        warn!(
-            "container_health_counts: no usable Docker Compose CLI — \
-             reporting (0, 0)"
-        );
-        return (0, 0);
+        warn!("container_health_snapshot: no usable Docker Compose CLI — health UNKNOWN");
+        return None;
     };
+    let env_vars = fetch_compose_env("container health UNKNOWN").await?;
+    // Chained, and the program on its own line: `infra_spawn_seam_guard`
+    // exempts exactly this READ-ONLY `ps` site by the text
+    // `cli.program())`. It is deliberately NOT seam-routed — `ps` changes
+    // nothing on the machine.
     let output = match Command::new(cli.program())
         .args(compose_cli_args(
             cli,
-            // Same resolution as the up path — a health count taken against a
-            // missing file reports (0, 0), which reads as "no containers" and
-            // is indistinguishable from "everything is down".
+            // Same resolution as the up path.
             resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
             &["ps", "--format", "{{.Name}} {{.State}}"],
         ))
+        .envs(env_vars.iter().map(|(key, value)| (*key, value.as_str())))
         .output()
         .await
     {
         Ok(o) => o,
         Err(err) => {
-            warn!(?err, "container_health_counts: docker compose ps failed");
-            return (0, 0);
+            warn!(
+                ?err,
+                "container_health_snapshot: docker compose ps failed — health UNKNOWN"
+            );
+            return None;
         }
     };
     if !output.status.success() {
@@ -882,13 +1145,21 @@ pub async fn container_health_counts() -> (usize, usize) {
         warn!(
             exit = ?output.status.code(),
             stderr = %stderr.trim(),
-            "container_health_counts: docker compose ps failed — reporting (0, 0)"
+            "container_health_snapshot: docker compose ps failed — health UNKNOWN"
         );
-        return (0, 0);
+        return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let (total, unhealthy, _names) = parse_container_health(&stdout);
-    (total.saturating_sub(unhealthy), total)
+    Some((total.saturating_sub(unhealthy), total))
+}
+
+/// Compatibility wrapper over [`container_health_snapshot`]: an UNKNOWN
+/// result becomes `(0, 0)`. Kept so existing callers compile; the boot ping
+/// should move to the snapshot so it can say "unknown" instead of "0/0".
+// TEST-EXEMPT: one-line map over container_health_snapshot.
+pub async fn container_health_counts() -> (usize, usize) {
+    container_health_snapshot().await.unwrap_or((0, 0))
 }
 
 // ---------------------------------------------------------------------------
@@ -933,7 +1204,12 @@ async fn ensure_docker_daemon_running() -> bool {
     {
         use tokio::process::Command;
 
-        let launch_result = Command::new("open")
+        // Seam, not a bare spawn: this arm LAUNCHES Docker Desktop, and
+        // `test_ensure_docker_daemon_running_does_not_panic` reaches it. The
+        // `!cfg!(target_os = "macos")` guard above means CI never gets here,
+        // so the hazard is invisible on Linux and real on the Mac this repo
+        // is developed on. See `spawn_program`.
+        let launch_result = Command::new(spawn_program("open"))
             .args(["-a", DOCKER_DESKTOP_APP_NAME])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -982,6 +1258,63 @@ async fn ensure_docker_daemon_running() -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Test-mode spawn seam (side-effect containment, 2026-09-05)
+// ---------------------------------------------------------------------------
+
+/// The binary `spawn_program` substitutes in `cfg(test)` builds.
+///
+/// `true(1)` ignores every argument and exits 0, so the argv this module
+/// builds is passed and discarded rather than acted on. It is POSIX and ships
+/// at this path on both platforms this repo targets (Linux runners, macOS
+/// dev). If it is somehow absent the spawn returns `Err`, which is exactly
+/// what a machine without Docker or a browser already does — so the fallback
+/// is the behaviour these tests had before this seam existed, never a panic
+/// and never the real program.
+#[cfg(test)]
+const TEST_SPAWN_NOOP_PROGRAM: &str = "/usr/bin/true";
+
+/// The binary to actually hand to `Command::new`.
+///
+/// Production: the caller's program, unchanged and untouched.
+///
+/// **`cfg(test)`: a no-op.** Two functions in this module spawn a process with
+/// real, destructive side effects, and this module's unit tests call both:
+///
+/// * [`run_docker_compose_up`] runs `docker compose up -d`, which starts or
+///   recreates containers. Until 2026-10-11 it also passed `--force-recreate`,
+///   which tore down every container. Six tests reach it. On a developer
+///   machine with the stack up, `cargo test -p tickvault-app` would change
+///   their running containers.
+/// * [`open_in_browser`] runs `open`/`xdg-open`. Five tests reach it through
+///   `open_all_dashboards`, and `DASHBOARD_SERVICES` includes QuestDB on 9000
+///   — so with a local stack up, `cargo test` opens browser windows.
+///
+/// Redirecting the PROGRAM is deliberate, and is what distinguishes this from
+/// the two obvious alternatives:
+///
+/// * `#[ignore]` would delete the coverage of eleven tests against a crate
+///   with a ratcheted coverage floor, and the tests would then run nowhere.
+/// * An early `return` inside each function would skip the spawn, so every
+///   line after it would go uncovered.
+///
+/// Substituting the program keeps **every line executed**: the argv is still
+/// built, a process is still spawned, its exit status is still read, and the
+/// success branch is still taken — which no test could reach before, because
+/// `docker` is absent from CI runners and the real call always errored.
+/// Coverage is therefore non-decreasing by construction.
+#[cfg(test)]
+fn spawn_program(_real: &str) -> &'static str {
+    TEST_SPAWN_NOOP_PROGRAM
+}
+
+/// Production build: hand back exactly what the caller asked for. This arm
+/// compiles to nothing at all in release — the seam has zero runtime cost.
+#[cfg(not(test))]
+fn spawn_program(real: &str) -> &str {
+    real
+}
+
 /// Opens a URL in the default browser.
 ///
 /// Uses `open` on macOS, `xdg-open` on Linux. Best-effort — logs a warning
@@ -995,7 +1328,7 @@ pub async fn open_in_browser(url: &str) {
         "xdg-open"
     };
 
-    match Command::new(program)
+    match Command::new(spawn_program(program))
         .arg(url)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1042,7 +1375,7 @@ async fn probe_command_succeeds(program: &str, args: &[&str]) -> bool {
 }
 
 /// True when `path` is an existing regular file with an execute bit set.
-fn is_executable_file(path: &str) -> bool {
+pub(crate) fn is_executable_file(path: &str) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1060,7 +1393,7 @@ fn is_executable_file(path: &str) -> bool {
 
 /// Resolves a working Compose front-end: `docker compose` (v2) →
 /// `docker-compose` (v1) → the plugin binary at a system path
-/// (issue #1505 — the same ladder as `scripts/ensure-questdb.sh`).
+/// (issue #1505 — the same ladder as the `ensure_questdb` self-heal).
 ///
 /// `None` means NO compose CLI exists in this context — a DETERMINISTIC
 /// failure (the `unknown shorthand flag: 'f'` class); callers log it loudly
@@ -1080,34 +1413,30 @@ async fn resolve_compose_cli() -> Option<ComposeCli> {
         .map(ComposeCli::PluginPath)
 }
 
-/// Runs `<compose front-end> -f <file> up -d --force-recreate` with the given
-/// environment variables, via the resolved [`ComposeCli`].
+/// Runs `<compose front-end> -f <file> up -d` with the given environment
+/// variables, via the resolved [`ComposeCli`].
 ///
-/// `--force-recreate` ensures containers with updated configs (healthchecks,
-/// dashboard JSON, Alloy config) are recreated automatically. Docker only
-/// recreates containers whose config hash actually changed — no-op for unchanged.
+/// Plain `up -d` starts anything missing or stopped and recreates only a
+/// container whose config hash changed; a running, unchanged QuestDB is left
+/// alone. Until 2026-10-11 (audit QDB-1) this passed `--force-recreate`, and
+/// the comment here claimed Docker only recreated changed containers. That
+/// flag does the opposite: it recreates EVERY container, so each app restart
+/// (a crash-recovery boot mid-session included) stopped QuestDB under any
+/// open ILP connection and lost the in-flight rows. The deploy workflow keeps
+/// its own `--force-recreate tv-questdb`, scoped to a changed memory cap.
 /// The argument vector comes from the pure [`compose_cli_args`] builder so the
 /// R1 (2026-06-30) subcommand-before-`-f` ordering stays unit-ratcheted.
 async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> Result<()> {
-    use tokio::process::Command;
-
-    let mut cmd = Command::new(cli.program());
-    cmd.args(compose_cli_args(
+    let output = compose_output(
         cli,
         // Resolved, not the bare constant: on the deployed box the constant
         // points at a file that does not exist. See `resolve_compose_path`.
         resolve_compose_path().unwrap_or(DOCKER_COMPOSE_PATH),
-        &["up", "-d", "--force-recreate"],
-    ));
-
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
-
-    let output = cmd
-        .output()
-        .await
-        .context("failed to execute docker compose — is Docker installed?")?;
+        &["up", "-d"],
+        env_vars,
+    )
+    .await
+    .context("failed to execute docker compose — is Docker installed?")?;
 
     if output.status.success() {
         info!("docker compose up -d completed successfully");
@@ -1120,6 +1449,31 @@ async fn run_docker_compose_up(cli: ComposeCli, env_vars: &[(&str, String)]) -> 
             stderr.trim()
         ))
     }
+}
+
+/// Runs one compose command through the resolved front-end and returns its
+/// output: `<front-end> [compose] -f <file> <tail…>` with `env_vars` added to
+/// the child's environment.
+///
+/// The ONE place compose is spawned, shared by the boot compose-up and by
+/// `tickvault ensure-questdb` (audit D6d), so the non-literal spawn count does
+/// not grow. The child is killed if the caller drops the future (a timeout).
+// TEST-EXEMPT: spawns docker compose, so no unit test can run it here; callers are ensure_questdb and infra
+pub(crate) async fn compose_output<V: AsRef<std::ffi::OsStr>>(
+    cli: ComposeCli,
+    compose_path: &str,
+    tail: &[&str],
+    env_vars: &[(&str, V)],
+) -> std::io::Result<std::process::Output> {
+    use tokio::process::Command;
+
+    let mut cmd = Command::new(spawn_program(cli.program()));
+    cmd.args(compose_cli_args(cli, compose_path, tail));
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    cmd.kill_on_drop(true);
+    cmd.output().await
 }
 
 /// Polls a service until it becomes reachable or timeout expires.
@@ -1178,6 +1532,119 @@ mod tests {
         // Blank lines are skipped, not counted.
         let (total, unhealthy, _) = parse_container_health("\n   \n\n");
         assert_eq!((total, unhealthy), (0, 0));
+    }
+
+    // --- §2.3x (2026-09-23): `ps` must get the same env `up` gets -----------
+
+    /// Production source only — cut at the test module so the literals in
+    /// these tests can never satisfy their own scans.
+    fn production_src() -> &'static str {
+        let full = include_str!("infra.rs");
+        let cut = full
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("infra.rs has a test module"); // APPROVED: test
+        &full[..cut]
+    }
+
+    /// Body of the top-level fn whose signature starts with `sig`.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("`{sig}` not found in infra.rs"));
+        let rest = &src[start..];
+        // `\x7D` / `\x7B` spell the braces so the banned-pattern scanner's
+        // brace-depth count cannot mistake a string literal for a block end.
+        let end = rest.find("\n\x7D\n").expect("fn has a closing brace"); // APPROVED: test
+        &rest[..end]
+    }
+
+    #[test]
+    fn test_compose_env_emits_exactly_the_shared_keys_in_order() {
+        let env = compose_env([
+            "u".to_string(),
+            "p".to_string(),
+            "t".to_string(),
+            "c".to_string(),
+        ]);
+        let keys: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, COMPOSE_ENV_KEYS.to_vec());
+        let values: Vec<&str> = env.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(values, vec!["u", "p", "t", "c"]);
+    }
+
+    #[test]
+    fn test_container_health_snapshot_ps_and_up_build_their_env_from_the_same_builder() {
+        let src = production_src();
+        let up = fn_body(src, "pub async fn ensure_infra_running(");
+        let ps = fn_body(src, "pub async fn container_health_snapshot(");
+        assert!(
+            up.contains("fetch_compose_env("),
+            "ensure_infra_running must build the compose env via fetch_compose_env"
+        );
+        assert!(
+            ps.contains("fetch_compose_env("),
+            "container_health_snapshot must build the compose env via fetch_compose_env — \
+             `ps` without it exits non-zero on the compose file's required \
+             interpolations and the boot ping reads 0/0"
+        );
+        assert!(
+            ps.contains(".envs(env_vars."),
+            "container_health_snapshot must apply the env to the ps command"
+        );
+        // Neither site may keep a private inline key list that could drift.
+        for key in COMPOSE_ENV_KEYS {
+            let quoted = format!("\"{key}\"");
+            assert!(
+                !up.contains(&quoted) && !ps.contains(&quoted),
+                "{key} is spelled inline at a call site — build it from COMPOSE_ENV_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_required_compose_interpolation_is_a_shared_key() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let compose = std::fs::read_to_string(root.join("deploy/docker/docker-compose.yml"))
+            .expect("read docker-compose.yml"); // APPROVED: test
+        let required = required_interpolations(&compose);
+        assert!(
+            !required.is_empty(),
+            "no `${{VAR:?…}}` found — the scan is vacuous or the compose file moved"
+        );
+        for var in &required {
+            assert!(
+                COMPOSE_ENV_KEYS.contains(&var.as_str()),
+                "docker-compose.yml requires `{var}` but COMPOSE_ENV_KEYS does not \
+                 supply it — every compose subcommand (ps included) would fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_required_interpolation_scan_bites() {
+        assert_eq!(
+            required_interpolations("a: ${TV_X:?need it}\nb: ${TV_Y:-default}\nc: ${TV_Z}\n"),
+            vec!["TV_X".to_string()]
+        );
+        assert!(required_interpolations("no vars here").is_empty());
+    }
+
+    /// Names of every `${VAR:?…}` (required) interpolation in `text`.
+    fn required_interpolations(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(i) = rest.find("$\x7B") {
+            rest = &rest[i + 2..];
+            let name_len = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if rest[name_len..].starts_with(":?") {
+                out.push(rest[..name_len].to_string());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     #[test]
@@ -1490,19 +1957,78 @@ mod tests {
     // Async function smoke tests — exercise without crashing
     // -----------------------------------------------------------------------
 
+    // wait_for_service_healthy should return (not hang) when service
+    // is unreachable. We use a very short timeout constant implicitly
+    // but the function will just timeout and return.
+    // NOTE: This would wait 60s with the real constant, so we just
+    // verify the function signature is correct and it doesn't panic
+    // when called with unreachable targets. We skip actual wait.
+    // The function is tested indirectly through ensure_infra_running.
+
+    /// The seam's BEHAVIOUR, not its text.
+    ///
+    /// `infra_spawn_seam_guard` proves every destructive site *calls*
+    /// `spawn_program`. That is worth nothing if the function hands back what
+    /// it was given -- the call sites would look guarded and spawn the real
+    /// binary anyway. This asserts the substitution itself, for each of the
+    /// three programs a test can actually reach.
+    #[test]
+    fn spawn_program_substitutes_every_destructive_binary_under_test() {
+        for real in ["docker", "docker-compose", "xdg-open", "open"] {
+            let resolved = spawn_program(real);
+            assert_ne!(
+                resolved, real,
+                "spawn_program returned the REAL binary {real:?} in a cfg(test) \
+                 build -- `cargo test` would spawn it for real, which for \
+                 `docker` means `up --force-recreate` tearing down every \
+                 container on the machine running the tests"
+            );
+            assert_eq!(
+                resolved, TEST_SPAWN_NOOP_PROGRAM,
+                "spawn_program substituted something other than the no-op for \
+                 {real:?}; the substitute must be inert and must ignore the \
+                 argv it is handed"
+            );
+        }
+    }
+
+    /// The no-op must actually exist and actually be inert, or the seam
+    /// silently degrades to the pre-seam error path on this platform.
     #[tokio::test]
-    async fn test_wait_for_service_healthy_unreachable_returns() {
-        // wait_for_service_healthy should return (not hang) when service
-        // is unreachable. We use a very short timeout constant implicitly
-        // but the function will just timeout and return.
-        // NOTE: This would wait 60s with the real constant, so we just
-        // verify the function signature is correct and it doesn't panic
-        // when called with unreachable targets. We skip actual wait.
-        // The function is tested indirectly through ensure_infra_running.
+    async fn the_test_noop_program_exists_and_ignores_the_compose_argv() {
+        // Spawned as a LITERAL, then tied to the const by the assertion below.
+        // `rust_only_guard::non_literal_spawn_sites_only_shrink` budgets
+        // variable-program spawns because a string scan cannot see through
+        // them; there is no reason for this test to spend one of those slots
+        // when an equality assertion pins the same thing more directly.
+        assert_eq!(
+            TEST_SPAWN_NOOP_PROGRAM, "/usr/bin/true",
+            "the no-op path moved; the literal spawned just below no longer \
+             tests the program the seam actually substitutes"
+        );
+        let status = tokio::process::Command::new("/usr/bin/true")
+            .args(["-f", "/nonexistent", "up", "-d", "--force-recreate"])
+            .status()
+            .await;
+        match status {
+            Ok(st) => assert!(
+                st.success(),
+                "{TEST_SPAWN_NOOP_PROGRAM} exited non-zero when handed the \
+                 compose argv; it must ignore every argument and succeed, or \
+                 the tests exercise the failure branch instead of the success \
+                 branch"
+            ),
+            Err(e) => panic!(
+                "{TEST_SPAWN_NOOP_PROGRAM} could not be spawned ({e}). The \
+                 seam then falls back to the pre-seam behaviour -- still safe \
+                 (nothing destructive runs) but the success branch of the \
+                 spawn path goes uncovered on this platform."
+            ),
+        }
     }
 
     #[tokio::test]
-    async fn test_run_docker_compose_up_returns_error_without_docker() {
+    async fn test_run_docker_compose_up_without_docker_does_not_panic() {
         // If Docker is not installed/running, docker compose should fail
         // gracefully with an error result (not panic).
         let env_vars: Vec<(&str, String)> = vec![];
@@ -1574,7 +2100,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_is_docker_daemon_running_returns_bool() {
+    async fn test_is_docker_daemon_running_does_not_panic() {
         // Exercise the full function body: calls `docker info` via Command.
         // In CI without Docker, returns false. With Docker, returns true.
         // Either way, must not panic.
@@ -1584,7 +2110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_docker_daemon_running_returns_bool() {
+    async fn test_ensure_docker_daemon_running_does_not_panic() {
         // Exercises the ensure_docker_daemon_running path.
         // On Linux (CI), if Docker daemon is not running, it will log a
         // warning and return false (auto-launch only supported on macOS).
@@ -1594,7 +2120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_docker_compose_up_with_env_vars() {
+    async fn test_run_docker_compose_up_with_env_vars_does_not_panic() {
         // Exercise run_docker_compose_up with actual env vars.
         // The compose file may not exist in test context, but we exercise
         // the command construction, env var injection, and error handling.
@@ -1637,7 +2163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_all_dashboards_exercises_unreachable_branch() {
+    async fn test_open_all_dashboards_unreachable_branch_does_not_panic() {
         // Services are likely not running in test env, so exercises the skip branch.
         // The function should complete without panic in either case.
         open_all_dashboards().await;
@@ -1648,7 +2174,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_service_reachable_localhost_various_ports() {
+    fn test_is_service_reachable_various_ports_does_not_panic() {
         // Exercise is_service_reachable with various port numbers.
         // Most ports should be unreachable in test env.
         let ports = [9000_u16, 9009, 8812, 3000, 16686, 3100, 9090, 8080];
@@ -1695,7 +2221,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_ensure_infra_running_with_reachable_mock() {
+    async fn test_ensure_infra_running_with_unreachable_port_does_not_panic() {
         // When the service is already reachable, ensure_infra_running returns
         // immediately after opening Grafana. We test this by using a port
         // that is definitely not reachable — the function will attempt Docker.
@@ -1710,7 +2236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ensure_infra_running_with_unreachable_host() {
+    async fn test_ensure_infra_running_with_unreachable_host_does_not_panic() {
         // Exercise the path where QuestDB is not reachable and Docker
         // daemon check runs.
         let config = QuestDbConfig {
@@ -1745,14 +2271,9 @@ mod tests {
     // ensure_docker_daemon_running — platform gate
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_ensure_docker_daemon_platform_check() {
-        // On Linux, auto-launch is not supported.
-        // On macOS, it attempts `open -a Docker`.
-        let is_macos = cfg!(target_os = "macos");
-        // Just verify the cfg! macro works correctly in test context.
-        let _: bool = is_macos;
-    }
+    // On Linux, auto-launch is not supported.
+    // On macOS, it attempts `open -a Docker`.
+    // Just verify the cfg! macro works correctly in test context.
 
     // -----------------------------------------------------------------------
     // Docker compose path — file existence (when run from repo root)
@@ -1947,21 +2468,16 @@ mod tests {
     // ensure_docker_daemon_running — Linux path
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_ensure_docker_daemon_running_exercises_platform_check() {
-        // On Linux, if Docker is not running, it should return false
-        // (auto-launch only on macOS). If Docker IS running, returns true.
-        // Either way, must not panic.
-        let result = ensure_docker_daemon_running().await;
-        let _: bool = result;
-    }
+    // On Linux, if Docker is not running, it should return false
+    // (auto-launch only on macOS). If Docker IS running, returns true.
+    // Either way, must not panic.
 
     // -----------------------------------------------------------------------
     // open_all_dashboards — exercises all services (none reachable in test)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_open_all_dashboards_iterates_all_services() {
+    async fn test_open_all_dashboards_all_services_does_not_panic() {
         // Services are not running in test env, so each service hits the
         // "not reachable" branch. Verifies the loop doesn't panic.
         open_all_dashboards().await;
@@ -1973,17 +2489,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_service_healthy_unreachable_completes() {
-        // Use a very high port that's definitely not open.
-        // The function will poll until timeout (60s), which is too long for tests.
-        // But since the constant is 60s, this test verifies the function
-        // doesn't panic. We use tokio::time::timeout to limit wait.
+        // Port 1 on loopback: nothing listens, and a connect there is refused
+        // immediately rather than hanging. The 5 s outer bound keeps the test
+        // fast; the function itself would poll for INFRA_HEALTH_TIMEOUT (60 s).
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             wait_for_service_healthy("unreachable", "127.0.0.1", 1),
         )
         .await;
-        // Either timeout or the function completes — both are fine.
-        let _ = result;
+        // The ASSERTION, added 2026-09-05: the outer timeout MUST elapse.
+        //
+        // wait_for_service_healthy polls every INFRA_HEALTH_POLL_INTERVAL (2 s)
+        // until INFRA_HEALTH_TIMEOUT (60 s) and returns EARLY only when the
+        // service becomes reachable. Port 1 on loopback refuses instantly, so a
+        // correct implementation keeps polling and the 5 s bound above wins.
+        //
+        // That is the real contract and it is worth pinning: a boot helper that
+        // gave up on the first connection-refused would defeat its own purpose --
+        // it exists precisely to wait for a service that is not up YET. Before
+        // this the test discarded the result, so that regression passed silently.
+        assert!(
+            result.is_err(),
+            "wait_for_service_healthy returned within 5s against an unreachable \
+             port -- it must keep polling until INFRA_HEALTH_TIMEOUT (60s), not \
+             give up on connection-refused"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2112,7 +2642,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_system_metrics_exported() {
+    fn test_system_metrics_gauges_do_not_panic_without_recorder() {
         // Verify metric calls compile without a recorder installed.
         metrics::gauge!("tv_process_threads").set(1.0_f64);
         metrics::gauge!("tv_process_open_fds").set(10.0_f64);
@@ -2161,7 +2691,7 @@ mod tests {
         let args = compose_cli_args(
             ComposeCli::DockerComposeV2,
             "deploy/docker/docker-compose.yml",
-            &["up", "-d", "--force-recreate"],
+            &["up", "-d"],
         );
         assert_eq!(
             args[0], "compose",
@@ -2176,7 +2706,7 @@ mod tests {
         assert_eq!(args[2], "deploy/docker/docker-compose.yml");
         assert_eq!(args[3], "up");
         assert_eq!(args[4], "-d");
-        assert_eq!(args[5], "--force-recreate");
+        assert_eq!(args.len(), 5, "boot compose-up is plain `up -d` (QDB-1)");
         // `compose` must appear BEFORE `-f` in the full vector.
         let compose_pos = args.iter().position(|a| *a == "compose").unwrap();
         let f_pos = args.iter().position(|a| *a == "-f").unwrap();
@@ -2406,6 +2936,12 @@ mod tests {
 
     /// Binds a `UnixDatagram` listener at `path`, reads exactly ONE
     /// datagram with a short timeout, and returns the payload.
+    // APPROVED: deliberately kept for the future sd_notify integration tests the
+    // module comment describes. Until 2026-09-05 this was held alive by a "test"
+    // whose entire body was a fn-pointer coercion -- a compile-time check wearing
+    // a #[test] attribute, which proved nothing at runtime and counted against the
+    // assertion-free ratchet. An attribute is the honest way to say this.
+    #[allow(dead_code)]
     fn receive_one_datagram(path: &std::path::Path) -> Vec<u8> {
         use std::os::unix::net::UnixDatagram;
         let listener = UnixDatagram::bind(path).unwrap_or_else(|e| {
@@ -2518,11 +3054,206 @@ mod tests {
         assert_eq!(b"WATCHDOG=1".len(), 10);
     }
 
-    // Silence "unused function" from receive_one_datagram — kept as a
-    // helper for future sd_notify integration tests but not required
-    // by the current four.
+    // --- Audit CLOCK-3 (2026-10-11): no QuestDB fallback for clock skew -----
+
+    /// Runs `probe_clock_skew_using(reader)` under a local Prometheus
+    /// recorder and returns the result plus the rendered metrics text.
+    fn probe_with_local_recorder<F>(reader: F) -> (Result<ClockSkewSample, ClockSkewError>, String)
+    where
+        F: FnOnce() -> Result<ClockSkewSample, String> + Send + 'static,
+    {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let result = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime"); // APPROVED: test
+            rt.block_on(probe_clock_skew_using(reader))
+        });
+        (result, handle.render())
+    }
+
+    /// Regression: 2026-10-11 — a failed chronyc probe used to fall back to
+    /// QuestDB `SELECT now()`, a container sharing this host's clock, and
+    /// write `tv_clock_skew_seconds{source="questdb_now"}` at about 0 —
+    /// a stopped chronyd read as healthy at the boot gate and the alarm.
+    /// Now the probe reports Unavailable and writes NO skew number.
     #[test]
-    fn test_receive_one_datagram_helper_is_linked() {
-        let _ = receive_one_datagram as fn(&std::path::Path) -> Vec<u8>;
+    fn test_regression_clock3_probe_clock_skew_using_reports_unavailable_not_a_questdb_number_when_chronyc_fails()
+     {
+        let (result, rendered) =
+            probe_with_local_recorder(|| Err("chronyc: command not found".to_string()));
+        match result {
+            Err(ClockSkewError::Unavailable { primary, fallback }) => {
+                assert!(primary.contains("chronyc"), "primary error kept: {primary}");
+                assert!(
+                    fallback.contains("QuestDB") && fallback.starts_with("none"),
+                    "fallback must say there is no fallback source and why: {fallback}"
+                );
+            }
+            other => panic!("a failed chronyc probe must be Unavailable, got {other:?}"),
+        }
+        assert!(
+            rendered.contains("tv_clock_skew_probe_available 0"),
+            "availability gauge must read 0 when chronyc fails:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("tv_clock_skew_seconds"),
+            "no skew number may be written when chronyc fails (an invented value \
+             is worse than a missing one):\n{rendered}"
+        );
+        assert!(!rendered.contains("questdb_now"), "{rendered}");
+    }
+
+    #[test]
+    fn test_probe_clock_skew_using_sets_gauge_on_chronyc_sample() {
+        let (result, rendered) = probe_with_local_recorder(|| {
+            Ok(ClockSkewSample {
+                skew_secs: 0.25,
+                source: "chronyc",
+            })
+        });
+        let sample = result.expect("chronyc sample is returned"); // APPROVED: test
+        assert_eq!(sample.source, "chronyc");
+        assert!((sample.skew_secs - 0.25).abs() < f64::EPSILON);
+        assert!(
+            rendered.contains("tv_clock_skew_seconds{source=\"chronyc\"} 0.25"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("tv_clock_skew_probe_available 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_probe_clock_skew_using_reports_a_panicking_reader_as_unavailable() {
+        let (result, rendered) =
+            probe_with_local_recorder(|| -> Result<ClockSkewSample, String> {
+                panic!("simulated chronyc reader panic")
+            });
+        assert!(
+            matches!(result, Err(ClockSkewError::Unavailable { .. })),
+            "a panicking reader degrades to Unavailable, got {result:?}"
+        );
+        assert!(
+            rendered.contains("tv_clock_skew_probe_available 0"),
+            "{rendered}"
+        );
+    }
+
+    /// Source scan: the production clock-skew code has no QuestDB source.
+    /// Comment lines are skipped — the dated correction names the removed
+    /// source on purpose.
+    #[test]
+    fn test_clock_skew_probe_has_no_questdb_source() {
+        for (n, line) in production_src().lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for needle in [
+                "questdb_now",
+                "SELECT%20now()",
+                "select%20now()",
+                "fn probe_via_questdb",
+            ] {
+                assert!(
+                    !code.contains(needle),
+                    "infra.rs line {} reintroduces the QuestDB clock-skew fallback (`{needle}`): \
+                     QuestDB shares this host's clock and cannot measure skew",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    /// A synchronised `chronyc tracking` output (Amazon Time Sync shape).
+    const CHRONYC_SYNCED: &str = "Reference ID    : A9FEA97B (169.254.169.123)\n\
+Stratum         : 4\n\
+Ref time (UTC)  : Sun Oct 11 03:00:00 2026\n\
+System time     : 0.000001234 seconds fast of NTP time\n\
+Last offset     : -0.000007441 seconds\n\
+RMS offset      : 0.000012000 seconds\n\
+Frequency       : 12.345 ppm slow\n\
+Leap status     : Normal\n";
+
+    /// A running chronyd that has never synchronised: `Last offset` reads 0.
+    const CHRONYC_UNSYNCED: &str = "Reference ID    : 00000000 ()\n\
+Stratum         : 0\n\
+Ref time (UTC)  : Thu Jan 01 00:00:00 1970\n\
+System time     : 0.000000000 seconds slow of NTP time\n\
+Last offset     : +0.000000000 seconds\n\
+RMS offset      : 0.000000000 seconds\n\
+Frequency       : 0.000 ppm slow\n\
+Leap status     : Not synchronised\n";
+
+    #[test]
+    fn test_parse_chronyc_tracking_reads_last_offset_when_synchronised() {
+        let sample = parse_chronyc_tracking(CHRONYC_SYNCED).expect("synced sample"); // APPROVED: test
+        assert_eq!(sample.source, "chronyc");
+        assert!((sample.skew_secs - (-0.000_007_441)).abs() < 1e-12);
+    }
+
+    // Regression: 2026-10-11 — an unsynchronised chronyd printed
+    // `Last offset : +0.000000000` and read as exactly 0 skew (audit CLOCK-3).
+    #[test]
+    fn test_regression_clock3_parse_chronyc_tracking_refuses_an_unsynchronised_daemon() {
+        let err = parse_chronyc_tracking(CHRONYC_UNSYNCED)
+            .expect_err("unsynchronised chronyd must not yield a 0 skew"); // APPROVED: test
+        assert!(
+            err.contains("no selected time source") || err.contains("not synchronised"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_refuses_leap_status_not_synchronised_alone() {
+        // A non-zero reference id, but the leap status says unsynchronised.
+        let text = CHRONYC_SYNCED.replace(
+            "Leap status     : Normal",
+            "Leap status     : Not synchronised",
+        );
+        let err = parse_chronyc_tracking(&text).expect_err("must refuse"); // APPROVED: test
+        assert!(err.contains("not synchronised"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_refuses_a_zero_dotted_reference_id() {
+        let text = CHRONYC_SYNCED.replace("A9FEA97B (169.254.169.123)", "0.0.0.0 ()");
+        let err = parse_chronyc_tracking(&text).expect_err("must refuse"); // APPROVED: test
+        assert!(err.contains("no selected time source"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_chronyc_tracking_errors_without_last_offset_or_on_garbage() {
+        let missing = CHRONYC_SYNCED.replace("Last offset     : -0.000007441 seconds\n", "");
+        assert!(parse_chronyc_tracking(&missing).is_err());
+        let garbage = CHRONYC_SYNCED.replace("-0.000007441", "abc");
+        assert!(parse_chronyc_tracking(&garbage).is_err());
+        assert!(parse_chronyc_tracking("").is_err());
+    }
+
+    /// Source scan on `main.rs`: the BOOT-03 `Err(unavailable)` arm must still
+    /// start the poller, so a chronyd that comes back later is measured
+    /// (audit CLOCK-3 follow-up, 2026-10-11).
+    #[test]
+    fn test_boot03_unavailable_arm_starts_the_clock_skew_poller() {
+        let main = include_str!("main.rs");
+        let start = main
+            .find("Err(unavailable) => {")
+            .expect("main.rs BOOT-03 unavailable arm"); // APPROVED: test
+        let arm = &main[start..];
+        let end = arm.find("\n        }\n    }\n").expect("arm end"); // APPROVED: test
+        let arm = &arm[..end];
+        assert!(
+            arm.contains("infra::spawn_clock_skew_poller("),
+            "the BOOT-03 unavailable arm no longer starts the clock-skew poller"
+        );
+        assert!(
+            arm.contains("reason = \"probe_unavailable\""),
+            "the BOOT-03 unavailable warn lost its reason field"
+        );
     }
 }

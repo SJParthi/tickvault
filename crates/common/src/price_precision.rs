@@ -39,19 +39,168 @@ use std::io::Write;
 /// (ryu's f32 buffer is 16; +8 of slack for safety).
 const F32_DECIMAL_BUF_SIZE: usize = 24;
 
+/// Powers of ten tried by [`f32_to_f64_clean`]'s arithmetic path, in
+/// order: decimal places 0 through 9. Every entry is exact in `f64`.
+const DECIMAL_SCALES: [f64; 10] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9];
+
+/// Magnitude bound of the arithmetic path: 2^24. Below it every integer
+/// is an `f32`, so the shortest decimal of a value never ends in an
+/// integer-part zero the arithmetic could miss; at or above it the
+/// shortest form can round the integer part (`123456792_f32` displays
+/// as `123456790`), and the text path handles it.
+const ARITHMETIC_PATH_MAX_MAGNITUDE: f32 = 16_777_216.0;
+
+/// Magnitude bound of the two-decimal fast path in [`f32_to_f64_clean`]:
+/// 2^17. Below it the spacing of `f32` values is at most 2^-7
+/// (0.0078125), less than 0.01, so at most one multiple of 0.01 rounds
+/// to any given `f32` (the proof is in [`f32_to_f64_clean`]'s docs).
+/// At 2^17 and above the spacing is 2^-6 (0.015625) or more, two
+/// multiples of 0.01 can round to the same `f32`, and the fast path
+/// could return a different one than the search, so it is not tried.
+const TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE: f32 = 131_072.0;
+
+// The fast path sits inside the arithmetic path's range.
+const _: () = assert!(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE < ARITHMETIC_PATH_MAX_MAGNITUDE);
+
+/// Index of `10^2` in [`DECIMAL_SCALES`]: the step the fast path has
+/// already tried, which the search skips after a fast-path miss.
+const TWO_DECIMAL_SCALE_INDEX: usize = 2;
+
+/// The scale the fast path tries first: `10^2`, two decimal places, the
+/// precision of exchange prices. Exact in `f64`, and the entry of
+/// [`DECIMAL_SCALES`] at [`TWO_DECIMAL_SCALE_INDEX`].
+const TWO_DECIMAL_SCALE: f64 = DECIMAL_SCALES[TWO_DECIMAL_SCALE_INDEX];
+
+/// One step of [`f32_to_f64_clean`]'s search at `scale`: take the
+/// nearest integer `m` to `widened · scale`, then its other neighbour,
+/// and return the first `m / scale` that narrows back to `v`. The fast
+/// path and the loop both call this, so they test the same candidates
+/// in the same order.
+#[inline(always)]
+fn hit_at_scale(v: f32, widened: f64, scale: f64) -> Option<f64> {
+    let scaled = widened * scale;
+    let nearest = scaled.round();
+    let candidate = nearest / scale;
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: narrowing is the round-trip test itself
+    if candidate as f32 == v {
+        return Some(candidate);
+    }
+    let other = if scaled > nearest {
+        nearest + 1.0
+    } else {
+        nearest - 1.0
+    };
+    let candidate = other / scale;
+    #[allow(clippy::cast_possible_truncation)]
+    // APPROVED: narrowing is the round-trip test itself
+    if candidate as f32 == v {
+        return Some(candidate);
+    }
+    None
+}
+
 /// Converts `f32` → `f64` without IEEE-754 widening artifacts.
 ///
-/// Zero allocation. O(1) — one ryu format + one parse.
+/// The result is the `f64` nearest to the shortest decimal that
+/// round-trips through `f32` (what `{v}` prints). Zero allocation.
+///
+/// # How
+///
+/// For `0 < |v| < 2^24` it searches decimal places 0..=9: at each scale
+/// `s` it takes the nearest integer `m` to `v·s` (then its other
+/// neighbour) and accepts the first `m / s` that rounds back to `v` as
+/// an `f32`. `m` and `s` are exact in `f64`, so the IEEE division gives
+/// the nearest `f64` to the decimal `m / s`, which is what parsing the
+/// printed text gives. Anything else (zero, non-finite, larger values,
+/// or no hit within nine places) takes the format-and-parse path.
+///
+/// Bit-identical to the format-and-parse path for all 2^32 inputs,
+/// checked by `test_f32_to_f64_clean_matches_text_path_for_every_f32`
+/// (`#[ignore]`d: about 8 minutes on 4 cores, release).
 ///
 /// # Performance
 ///
-/// Hot path safe — no heap allocation; ~50ns per call on the bench
-/// machine. Used in `tick_persistence::append_tick` (per-tick) and
-/// `aggregator_cell::fold_in_bucket` (per-tick) — both budgeted at
-/// <100ns end-to-end.
+/// O(1): at most 1 + 10 scales × 2 candidates, then the text path.
+/// Measured 2026-10-09 (release, x86 dev container, 1,000 price-like
+/// inputs): about 17 ns per call against 129 ns for format-and-parse.
+/// Used per tick in `tick_persistence::append_tick`, the depth rows and
+/// the candle fold. For the two-decimal fast path's figures see below.
+///
+/// # Two-decimal fast path (2026-11-17, plan ITEM DT)
+///
+/// For `0 < |v| < 2^17` the scale `10^2` is tried first, before the
+/// search. A hit returns at once; a miss runs the search from scale 1,
+/// skipping the scale-100 step it has just made (the same call, so it
+/// would miss again). Most prices have two decimals or fewer, so they now cost one
+/// scale step instead of up to three. Measured 2026-11-17 (release,
+/// x86 dev container, `test_f32_to_f64_clean_fast_path_timing`: 4,096
+/// inputs, 70% two-decimal prices 0.05 to 1,00,000, 15% one-decimal, 10%
+/// integers, 5% four-decimal; best of 5 per sample, 8 samples each):
+/// fast path 6.0 to 6.5 ns per call in 6 samples (the other two 10.3
+/// and 11.3 ns), frozen search 13.6 to 14.1 ns in 5 (the others 17.3,
+/// 17.4 and 19.4 ns). Re-run after the miss path stopped repeating the
+/// scale-100 step (same harness, 3 runs): price mix 5.7 to 5.9 ns
+/// against 12.6 to 17.0 ns; a miss-heavy mix (4,096 three- and
+/// four-decimal values below 2^17, 3,867 of them fast-path misses)
+/// 21.0 to 21.6 ns against 22.0 to 23.3 ns, so a miss costs no more
+/// than before. Not measured on the production host.
+///
+/// Why a hit is exactly what the search returns:
+///
+/// 1. Let `S` be the set of `f64` values `fl(M / 100)`, for integers
+///    `M`, that narrow to `v`. `fl` (IEEE division) and the narrowing
+///    are both monotone, so the reals `r` with `(fl(r) as f32) == v`
+///    form one interval, at most one `f32` spacing plus one `f64`
+///    spacing wide: below 2^17 that is under 2^-7 + 2^-36 < 0.01. So at
+///    most one `M / 100` lies in it, and `S` has at most one element.
+/// 2. A search hit at scale 1 or 10 is `fl(m / s)` with `s` dividing
+///    100, the correctly rounded value of the rational `m / s` =
+///    `(m · 100 / s) / 100`. So it equals `fl(M / 100)` with
+///    `M = m · 100 / s`, it narrows to `v`, and it is in `S`. The fast
+///    path's hit is in `S` too, so the two are the same `f64`.
+/// 3. If the search would reach scale 100 instead, its step there is the
+///    same `hit_at_scale` call with the same arguments as the fast
+///    path's: same candidates, nearest first, then the other neighbour,
+///    same result. After a fast-path miss that result is `None`, so
+///    skipping the step leaves the output unchanged; a fast-path hit
+///    returns that same value.
+///
+/// Negative values are the mirror image (`round` is symmetric, the
+/// interval argument does not use the sign). Zero, non-finite values and
+/// `|v| >= 2^17` never take the fast path. Checked for all 2^32 inputs
+/// against the search as it was before (frozen in the tests) by
+/// `test_f32_to_f64_clean_matches_frozen_search_for_every_f32`.
 #[inline]
 #[must_use]
 pub fn f32_to_f64_clean(v: f32) -> f64 {
+    let magnitude = v.abs();
+    if magnitude > 0.0 && magnitude < ARITHMETIC_PATH_MAX_MAGNITUDE {
+        // APPROVED: f64::from(f32) is exact; only the scaled candidates
+        // below are returned, never this widened value.
+        let widened = f64::from(v);
+        let fast_path_tried = magnitude < TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE;
+        if fast_path_tried && let Some(candidate) = hit_at_scale(v, widened, TWO_DECIMAL_SCALE) {
+            return candidate;
+        }
+        for (index, scale) in DECIMAL_SCALES.into_iter().enumerate() {
+            // The fast path made this exact call and it missed; the call
+            // is deterministic, so running it again cannot hit.
+            if fast_path_tried && index == TWO_DECIMAL_SCALE_INDEX {
+                continue;
+            }
+            if let Some(candidate) = hit_at_scale(v, widened, scale) {
+                return candidate;
+            }
+        }
+    }
+    f32_to_f64_clean_via_text(v)
+}
+
+/// The format-and-parse conversion: print the shortest round-trip
+/// decimal (`{v}`, ryu) and parse it as `f64`. The reference the
+/// arithmetic path in [`f32_to_f64_clean`] must match, and its fallback.
+fn f32_to_f64_clean_via_text(v: f32) -> f64 {
     if v == 0.0 || !v.is_finite() {
         // APPROVED: f64::from(f32) is correct for zero/inf/NaN — no
         // precision loss for these values, only for ordinary decimals.
@@ -98,6 +247,77 @@ pub fn round_to_2dp(value: f64) -> f64 {
     if rounded == 0.0 { 0.0 } else { rounded }
 }
 
+// ============================================================================
+// Display-layer 2-decimal formatters (Sub-PR #4.5)
+// ============================================================================
+
+/// Sentinel for non-finite display values. NaN / +inf / -inf render as
+/// an em-dash (operator-locked 2026-05-27) rather than "NaN" / "inf"
+/// which are confusing in a trading context. Callers MUST use these
+/// helpers — direct `format!("{:.2}", value)` is banned in
+/// operator-facing string paths per Sub-PR #4.6 (future hook addition).
+const NON_FINITE_SENTINEL: &str = "—";
+
+/// Format a price value for operator display — exactly 2 decimal places,
+/// non-finite values rendered as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every price emitted via Telegram, UI, or
+/// REST response MUST go through this helper. Storage + RAM keep full
+/// f64 precision; only the operator-facing boundary rounds to 2 decimals.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_price_2_decimals;
+/// assert_eq!(format_price_2_decimals(2500.55), "2500.55");
+/// assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
+/// assert_eq!(format_price_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_price_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    format!("{value:.2}")
+}
+
+/// Format a percentage value for operator display — exactly 2 decimal
+/// places, leading sign ('+' or '-'), trailing '%'. Zero renders without
+/// a sign. Non-finite values render as em-dash sentinel.
+///
+/// Operator-locked 2026-05-27: every percentage emitted via Telegram,
+/// UI, or REST response MUST go through this helper. Standard NSE
+/// display convention.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::price_precision::format_pct_2_decimals;
+/// assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
+/// assert_eq!(format_pct_2_decimals(-0.81), "-0.81%");
+/// assert_eq!(format_pct_2_decimals(0.0), "0.00%");
+/// assert_eq!(format_pct_2_decimals(f64::NAN), "—");
+/// ```
+#[must_use]
+pub fn format_pct_2_decimals(value: f64) -> String {
+    if !value.is_finite() {
+        return NON_FINITE_SENTINEL.to_string();
+    }
+    // Zero (including -0.0) renders without a sign per operator
+    // convention. Use `format!("{:.2}", value)` to apply rounding first,
+    // then check the rounded value — avoids "+0.00%" when the raw value
+    // is a tiny negative that rounds to zero.
+    let rounded = format!("{value:.2}");
+    if rounded == "0.00" || rounded == "-0.00" {
+        return "0.00%".to_string();
+    }
+    if value > 0.0 {
+        format!("+{rounded}%")
+    } else {
+        format!("{rounded}%")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,11 +353,185 @@ mod tests {
         // Operator-observed corruption: 23925.65_f32 was landing as
         // 23925.650390625_f64 in candles_1m via f64::from().
         assert_eq!(f32_to_f64_clean(23925.65_f32), 23925.65_f64);
-        assert_eq!(f32_to_f64_clean(23937.30_f32), 23937.30_f64);
-        assert_eq!(f32_to_f64_clean(23924.40_f32), 23924.40_f64);
+        assert_eq!(f32_to_f64_clean(23_937.3_f32), 23937.30_f64);
+        assert_eq!(f32_to_f64_clean(23_924.4_f32), 23924.40_f64);
         assert_eq!(f32_to_f64_clean(10.20_f32), 10.20_f64);
         assert_eq!(f32_to_f64_clean(21004.95_f32), 21004.95_f64);
     }
+
+    /// Bit comparison that treats every NaN as equal to every NaN.
+    fn same_bits(left: f64, right: f64) -> bool {
+        left.to_bits() == right.to_bits() || (left.is_nan() && right.is_nan())
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_text_path_for_every_paise_price() {
+        // Every price in paise from 0 to 2,00,000.00 rupees, both signs:
+        // the values the feed actually carries.
+        for paise in 0_u32..=20_000_000 {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation, paise < 2^25
+            let price = paise as f32 / 100.0;
+            for v in [price, -price] {
+                let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+                assert!(same_bits(fast, text), "{v}: {fast} != {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_text_path_on_a_stride_of_all_f32() {
+        // Every 4,099th bit pattern (about one million inputs) across
+        // the whole f32 range: subnormals, tiny and huge values, the
+        // 2^24 boundary, both signs, infinities and NaNs.
+        let mut bits: u64 = 0;
+        while bits <= u64::from(u32::MAX) {
+            #[allow(clippy::cast_possible_truncation)]
+            // APPROVED: loop bound keeps bits within u32
+            let v = f32::from_bits(bits as u32);
+            let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+            assert!(same_bits(fast, text), "{v:e}: {fast} != {text}");
+            bits += 4_099;
+        }
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_boundary_values_match_text_path() {
+        let boundaries = [
+            ARITHMETIC_PATH_MAX_MAGNITUDE,
+            f32::from_bits(ARITHMETIC_PATH_MAX_MAGNITUDE.to_bits() - 1),
+            f32::from_bits(ARITHMETIC_PATH_MAX_MAGNITUDE.to_bits() + 1),
+            123_456_792.0,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::MAX,
+            0.1,
+            0.3,
+            1e-9,
+            -0.0,
+        ];
+        for v in boundaries {
+            for v in [v, -v] {
+                let (fast, text) = (f32_to_f64_clean(v), f32_to_f64_clean_via_text(v));
+                assert!(same_bits(fast, text), "{v:e}: {fast} != {text}");
+            }
+        }
+    }
+
+    // The all-2^32 proof against the text path lives in
+    // `crates/common/tests/price_fast_path_harness.rs` (`#[ignore]`d).
+
+    /// `f32_to_f64_clean` exactly as it was before the two-decimal fast
+    /// path (2026-11-17): the oracle the fast path must match bit for
+    /// bit. Frozen; never edit it to make a test pass.
+    fn f32_to_f64_clean_frozen_before_fast_path(v: f32) -> f64 {
+        let magnitude = v.abs();
+        if magnitude > 0.0 && magnitude < ARITHMETIC_PATH_MAX_MAGNITUDE {
+            let widened = f64::from(v);
+            for scale in DECIMAL_SCALES {
+                let scaled = widened * scale;
+                let nearest = scaled.round();
+                let candidate = nearest / scale;
+                #[allow(clippy::cast_possible_truncation)]
+                // APPROVED: narrowing is the round-trip test itself
+                if candidate as f32 == v {
+                    return candidate;
+                }
+                let other = if scaled > nearest {
+                    nearest + 1.0
+                } else {
+                    nearest - 1.0
+                };
+                let candidate = other / scale;
+                #[allow(clippy::cast_possible_truncation)]
+                // APPROVED: narrowing is the round-trip test itself
+                if candidate as f32 == v {
+                    return candidate;
+                }
+            }
+        }
+        f32_to_f64_clean_via_text(v)
+    }
+
+    #[test]
+    fn test_two_decimal_fast_path_constants_are_the_proven_values() {
+        // The proof needs the bound at 2^17 (f32 spacing below it is
+        // 2^-7 < 0.01) and the scale at the third DECIMAL_SCALES entry.
+        assert_eq!(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE, 2_f32.powi(17));
+        let below = f32::from_bits(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE.to_bits() - 1);
+        assert!(f64::from(TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE - below) < 0.01);
+        assert_eq!(TWO_DECIMAL_SCALE.to_bits(), DECIMAL_SCALES[2].to_bits());
+    }
+
+    #[test]
+    fn test_f32_to_f64_clean_matches_frozen_search_near_the_fast_path_bound() {
+        // Every f32 within 100,000 steps either side of 2^17 (where the
+        // spacing doubles and the fast path stops), both signs, plus a
+        // run of tiny values and every paise price up to 1,40,000.
+        let bound = TWO_DECIMAL_FAST_PATH_MAX_MAGNITUDE.to_bits();
+        for bits in (bound - 100_000)..=(bound + 100_000) {
+            let v = f32::from_bits(bits);
+            for v in [v, -v] {
+                let (new, old) = (
+                    f32_to_f64_clean(v),
+                    f32_to_f64_clean_frozen_before_fast_path(v),
+                );
+                assert!(same_bits(new, old), "{v:e}: {new} != {old}");
+            }
+        }
+        for bits in 1_u32..200_000 {
+            let v = f32::from_bits(bits);
+            let (new, old) = (
+                f32_to_f64_clean(v),
+                f32_to_f64_clean_frozen_before_fast_path(v),
+            );
+            assert!(same_bits(new, old), "{v:e}: {new} != {old}");
+        }
+        for paise in 0_u32..=14_000_000 {
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation, paise < 2^24
+            let price = paise as f32 / 100.0;
+            for v in [price, -price] {
+                let (new, old) = (
+                    f32_to_f64_clean(v),
+                    f32_to_f64_clean_frozen_before_fast_path(v),
+                );
+                assert!(same_bits(new, old), "{v}: {new} != {old}");
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(4_096))]
+
+        #[test]
+        fn proptest_f32_to_f64_clean_equals_frozen_search_any_bits(bits in proptest::prelude::any::<u32>()) {
+            let v = f32::from_bits(bits);
+            let (new, old) = (f32_to_f64_clean(v), f32_to_f64_clean_frozen_before_fast_path(v));
+            proptest::prop_assert!(same_bits(new, old), "{:e}: {} != {}", v, new, old);
+        }
+
+        #[test]
+        fn proptest_f32_to_f64_clean_equals_frozen_search_on_prices(
+            units in 0_u32..30_000_000,
+            places in 0_u32..5,
+            negative in proptest::prelude::any::<bool>(),
+        ) {
+            // Decimal prices with 0..=4 places, up to 3,00,000 rupees:
+            // crosses the 2^17 fast-path bound.
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: test input generation
+            let v = (units as f32) / 10_f32.powi(places as i32);
+            let v = if negative { -v } else { v };
+            let (new, old) = (f32_to_f64_clean(v), f32_to_f64_clean_frozen_before_fast_path(v));
+            proptest::prop_assert!(same_bits(new, old), "{}: {} != {}", v, new, old);
+        }
+    }
+
+    // The all-2^32 proof against the frozen search and the release timing
+    // harness live in `crates/common/tests/price_fast_path_harness.rs`
+    // (`#[ignore]`d, run on demand), so code CI never runs is not counted
+    // inside this source file.
 
     #[test]
     fn test_f32_to_f64_clean_naive_conversion_differs() {
@@ -289,76 +683,5 @@ mod tests {
         // the output is a valid % string with 2 decimals.
         let s = format_pct_2_decimals(0.005);
         assert!(s == "+0.01%" || s == "0.00%", "got {s}");
-    }
-}
-
-// ============================================================================
-// Display-layer 2-decimal formatters (Sub-PR #4.5)
-// ============================================================================
-
-/// Sentinel for non-finite display values. NaN / +inf / -inf render as
-/// an em-dash (operator-locked 2026-05-27) rather than "NaN" / "inf"
-/// which are confusing in a trading context. Callers MUST use these
-/// helpers — direct `format!("{:.2}", value)` is banned in
-/// operator-facing string paths per Sub-PR #4.6 (future hook addition).
-const NON_FINITE_SENTINEL: &str = "—";
-
-/// Format a price value for operator display — exactly 2 decimal places,
-/// non-finite values rendered as em-dash sentinel.
-///
-/// Operator-locked 2026-05-27: every price emitted via Telegram, UI, or
-/// REST response MUST go through this helper. Storage + RAM keep full
-/// f64 precision; only the operator-facing boundary rounds to 2 decimals.
-///
-/// # Examples
-///
-/// ```
-/// use tickvault_common::price_precision::format_price_2_decimals;
-/// assert_eq!(format_price_2_decimals(2500.55), "2500.55");
-/// assert_eq!(format_price_2_decimals(2520.5500488), "2520.55");
-/// assert_eq!(format_price_2_decimals(f64::NAN), "—");
-/// ```
-#[must_use]
-pub fn format_price_2_decimals(value: f64) -> String {
-    if !value.is_finite() {
-        return NON_FINITE_SENTINEL.to_string();
-    }
-    format!("{value:.2}")
-}
-
-/// Format a percentage value for operator display — exactly 2 decimal
-/// places, leading sign ('+' or '-'), trailing '%'. Zero renders without
-/// a sign. Non-finite values render as em-dash sentinel.
-///
-/// Operator-locked 2026-05-27: every percentage emitted via Telegram,
-/// UI, or REST response MUST go through this helper. Standard NSE
-/// display convention.
-///
-/// # Examples
-///
-/// ```
-/// use tickvault_common::price_precision::format_pct_2_decimals;
-/// assert_eq!(format_pct_2_decimals(5.0), "+5.00%");
-/// assert_eq!(format_pct_2_decimals(-0.81), "-0.81%");
-/// assert_eq!(format_pct_2_decimals(0.0), "0.00%");
-/// assert_eq!(format_pct_2_decimals(f64::NAN), "—");
-/// ```
-#[must_use]
-pub fn format_pct_2_decimals(value: f64) -> String {
-    if !value.is_finite() {
-        return NON_FINITE_SENTINEL.to_string();
-    }
-    // Zero (including -0.0) renders without a sign per operator
-    // convention. Use `format!("{:.2}", value)` to apply rounding first,
-    // then check the rounded value — avoids "+0.00%" when the raw value
-    // is a tiny negative that rounds to zero.
-    let rounded = format!("{value:.2}");
-    if rounded == "0.00" || rounded == "-0.00" {
-        return "0.00%".to_string();
-    }
-    if value > 0.0 {
-        format!("+{rounded}%")
-    } else {
-        format!("{rounded}%")
     }
 }

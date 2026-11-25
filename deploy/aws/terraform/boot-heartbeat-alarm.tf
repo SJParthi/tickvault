@@ -205,6 +205,10 @@ resource "aws_cloudwatch_log_group" "tv_boot_heartbeat_gate" {
 # Open the boot-heartbeat window at 08:50 IST (03:20 UTC) Mon-Fri — 10 min after
 # the 08:40 IST soft boot deadline (§10), giving the app time to publish its
 # first health signal on a healthy boot.
+# 2026-11-07: the cron is weekday-only and not holiday-aware; on a weekday NSE
+# holiday the handler (alarm_gate::effective_mode, nse_calendar pinned to
+# config/base.toml) runs the open as a close, so the alarm stays disarmed and
+# no "boot heartbeat ABSENT" page fires for a box the holiday gate stopped.
 resource "aws_cloudwatch_event_rule" "tv_boot_heartbeat_open" {
   name                = "tv-${var.environment}-boot-heartbeat-open"
   description         = "Enable boot-heartbeat alarm actions at 08:50 IST (Mon-Fri)"
@@ -269,4 +273,93 @@ resource "aws_lambda_permission" "tv_boot_heartbeat_close" {
 output "boot_heartbeat_alarm_name" {
   description = "Boot-heartbeat alarm (pages on a hung/never-booted/DIED-BEFORE-09:20 app in the 08:50-09:20 IST window — widened from 09:10 on 2026-07-09 to close the market-open seam). Signal: the dedicated tv_boot_completed gauge MISSING (treat_missing_data=breaching) — emitted by crates/app/src/main.rs on a completed boot, in the CW-agent filter (daily-universe-scope-expansion-2026-05-27.md §19). Repointed off the tv_realtime_guarantee_score proxy (PR #1278 follow-up)."
   value       = aws_cloudwatch_metric_alarm.boot_heartbeat_missing.alarm_name
+}
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# None of the six was ever decided about: the seven that ARE alarmed were each
+# added by the PR that created them, and these six by PRs that did not think
+# to. The ratchet added alongside makes that omission fail the build.
+# ---------------------------------------------------------------------------
+
+# KEPT by the operator Quote 53 alarm review (2026-11-11, docs/audits/2026-11-alarm-review.md):
+# this gate arms the KEPT boot-heartbeat-missing page, which ships disarmed;
+# without this alarm and its did-it-run sibling below, a failing or dropped
+# gate leaves that page off with nothing to say so (the deploy-provenance-blind
+# reasoning, applied to a live-lane page).
+resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_errors" {
+  alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-errors"
+  alarm_description   = "The BOOT-HEARTBEAT GATE itself FAILED. It arms the boot alarm in the morning and disarms it at 09:20 IST when the market-hours window takes over. A failure leaves the gate STUCK in whichever state it was in: armed all night (false pages) or disarmed all morning (the boot alarm silently covers nothing). Triage: read the Lambda log group, then check the boot alarm's actions_enabled state directly."
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
+  }
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  # NO ok_actions (the round-14 precedent): these run on a schedule, so the
+  # post-ALARM auto-OK only means the single Errors datapoint AGED OUT of the
+  # lookback — never that anything was fixed. The telegram-webhook Lambda
+  # forwards every OK as a green "recovered" page, so a symmetric ok_actions
+  # here would produce a Rule-11 false recovery per failure episode. The real
+  # recovery signal is the NEXT scheduled run succeeding.
+  ok_actions = []
+}
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the gate RUN?" (found by the new scheduled-Lambda guard)
+#
+# This Lambda does not DO anything an operator would miss directly - it flips
+# another alarm's actions on and off around the boot window. That is exactly
+# what makes its silence dangerous: a stuck gate leaves the boot alarm armed
+# through the night (a page every morning at the stop, training the operator to
+# ignore it) or disarmed through the morning (blind at the one moment boot
+# failure matters). Neither state looks like a broken Lambda from outside.
+#
+# 24h window rather than the 6h used for the hourly guards: this one fires on
+# MON-FRI open/close crons, so a 6h window would breach every weekend on a
+# perfectly healthy schedule. A dropped schedule here costs one trading
+# morning's alarm fidelity, not the trading day itself, so a day of detection
+# latency is the right trade against a weekend of false pages.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+# KEPT by the operator Quote 53 alarm review (2026-11-11): see the Errors alarm above.
+resource "aws_cloudwatch_metric_alarm" "boot_heartbeat_gate_not_invoked" {
+  alarm_name          = "tv-${var.environment}-boot-heartbeat-gate-not-invoked"
+  alarm_description   = "The boot-window gate did NOT RUN in the last 24h - its EventBridge schedule was dropped or disabled (the 2026-07-02 scheduler-drop class). This gate ARMS and DISARMS the boot alarm around the morning window; while it is not running the boot alarm is stuck in whichever state it was last left, so a dead app either pages nobody all morning or pages every night, and its Errors alarm cannot see this (no invocation = no error)."
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Invocations"
+  namespace           = "AWS/Lambda"
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 1
+  # breaching: a missing Invocations datapoint IS the condition being detected.
+  treat_missing_data = "breaching"
+  dimensions = {
+    FunctionName = aws_lambda_function.tv_boot_heartbeat_gate.function_name
+  }
+  # GATED (2026-09-01): ships DISARMED. The market-hours gate Lambda
+  # (market-hours-liveness-alarm.tf ALARM_NAMES) enables actions at 09:20 IST
+  # Mon-Fri and disables them at 15:35 IST. Without this the alarm pages every
+  # Saturday and Sunday: the watched Lambda is on a MON-FRI cron, so its
+  # Invocations datapoint is legitimately ABSENT at the weekend and
+  # treat_missing_data = breaching turns that absence into an ALARM. The gate
+  # cannot disarm an alarm that ships armed, so this line is half of the fix.
+  actions_enabled = false
+  alarm_actions   = [aws_sns_topic.tv_alerts.arn]
+  ok_actions      = []
 }

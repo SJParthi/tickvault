@@ -331,7 +331,7 @@ SCOREBOARD-01 / FEED-REJECT-01 precedent).
 **Honest envelope:** no live Groww order can leave the box today — four
 independent gates (config default-OFF + absent cargo feature + hardcoded paper
 mode + rule-file lock), each pinned by a build-failing ratchet
-(`groww_order_lattice_guard.rs`). Paper mode exercises the ledger / FSM / audit
+(`groww_order_lattice_guard.rs` (⚠ CORRECTED 2026-11-15: that guard was deleted 2026-08-21 with the Groww order side; NOT ENFORCED)). Paper mode exercises the ledger / FSM / audit
 / Telegram arms but NOT the HTTP classification / ladder / 429 / auth arms
 (mock-integration mileage only until the future live flip).
 

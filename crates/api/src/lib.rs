@@ -23,6 +23,7 @@
 //! # Boot Sequence Position
 //! Pipeline → **API Server**
 
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
@@ -166,22 +167,21 @@ pub fn build_router_with_auth(
             require_bearer_auth,
         ));
 
-    // Security trim 2026-07-04 (operator directive, Session A): the 4 read-only
-    // `/api/debug/*` routes move OFF the public router and behind the SAME
+    // Security trim 2026-07-04 (operator directive, Session A): the read-only (4 then,
+    // 5 with speed-health) `/api/debug/*` routes move OFF the public router and behind the SAME
     // bearer-auth middleware — applied UNCONDITIONALLY (deliberately NOT gated
     // on `feed_toggle_public`).
     //
-    // HONEST CONTRACT (adversarial-review fix 2026-07-04): on EVERY real boot
-    // (prod AND local Mac) main.rs constructs `ApiAuthConfig::from_token` with
-    // the SSM-fetched token and HARD-FAILS if the fetch fails — so auth is
-    // ALWAYS enabled at runtime and these routes ALWAYS demand
-    // `Authorization: Bearer <token>` (401 otherwise, fail-closed). The
-    // `require_bearer_auth` disabled-passthrough is reachable ONLY for
-    // empty-token constructions (unit/router tests, `ApiAuthConfig::disabled`)
-    // — it is NOT a "local dev is tokenless" carve-out. Tokenless callers
-    // (curl, MCP `tool_tickvault_api` without TICKVAULT_API_BEARER_TOKEN) get
-    // 401 here even on localhost; the tickvault-logs MCP LOG tools are
-    // unaffected because they read the local filesystem, never these routes.
+    // 2026-11-02: corrected the former always-enabled runtime claim.
+    // Normal nonempty SSM credentials enable these legacy gates. Paper boot
+    // can intentionally choose PaperEmptyAuthDisabled, so disabled passthrough
+    // is reachable in production and these legacy debug routes then permit
+    // tokenless requests. That boot policy is unchanged here. The movers
+    // routes below use require_configured_bearer_auth and instead return 503
+    // when authentication is disabled or its configured token is empty.
+    // Kept for the F&O stocks route below; `auth_config` itself moves into
+    // `debug_routes`.
+    let fno_auth_config = auth_config.clone();
     let debug_routes: Router<SharedAppState> = Router::new()
         // Autonomous-ops Layer 1 (observability): read-only log access
         // for Claude MCP / remote sessions.
@@ -203,6 +203,14 @@ pub fn build_router_with_auth(
         .route(
             "/api/debug/cross-verify/latest",
             axum::routing::get(handlers::debug::cross_verify_latest),
+        )
+        // Owner 2026-10-30: speed and health numbers for the /dashboard page
+        // (step latencies, ticks per minute, the daily tick check, backlog,
+        // reconnects, candle overflow). Read-only, 5 s cached, bearer-gated
+        // like the other debug reads.
+        .route(
+            "/api/debug/speed-health",
+            axum::routing::get(handlers::speed_health::speed_health),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config,
@@ -293,17 +301,32 @@ pub fn build_router_with_auth(
             "/api/board/data",
             axum::routing::get(handlers::board::board_data),
         )
-        // BruteX cross-verify report page (public read-only, same tier as
-        // the /feeds page + GET /api/feeds read precedent). QuestDB-backed
-        // (up to 2 /exec queries per hit), so it joins the rate-limited
-        // public sub-router per the 2026-07-09 hardening above.
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&public_limiter),
+            public_rate_limit,
+        ));
+    // Owner 2026-10-30 ("yes add the fno stocks page to dashboard dude"): the
+    // F&O stocks movers JSON the /dashboard page polls. One bounded QuestDB
+    // query per miss (2 s cache), so it is bearer-gated AND on the SAME
+    // shared limiter as the three routes above (one budget, not a second).
+    // `route_layer` order: the last one added runs first, so a request
+    // without a valid token is refused before it spends rate budget.
+    let fno_stocks_routes: Router<SharedAppState> = Router::new()
         .route(
-            "/crossverify",
-            axum::routing::get(handlers::brutex_crossverify::crossverify_page),
+            "/api/stock-movers",
+            axum::routing::get(handlers::stock_movers::get_stock_movers),
+        )
+        .route(
+            "/api/fno-stocks",
+            axum::routing::get(handlers::fno_stocks::get_fno_stocks),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             public_limiter,
             public_rate_limit,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            fno_auth_config,
+            middleware::require_configured_bearer_auth,
         ));
     // The 4 `/api/debug/*` routes live on `debug_routes` above (bearer-auth
     // gated, security trim 2026-07-04) — no longer on the public router.
@@ -317,6 +340,7 @@ pub fn build_router_with_auth(
     // on the merged routes block.
     public_routes
         .merge(limited_public_routes)
+        .merge(fno_stocks_routes)
         .merge(debug_routes)
         .merge(protected_routes)
         .layer(axum::middleware::from_fn(request_tracing))
@@ -325,45 +349,70 @@ pub fn build_router_with_auth(
 }
 // O(1) EXEMPT: end
 
+/// Resolves the configured allowed origins into parsed CORS header values.
+///
+/// Split out of [`build_cors_layer`] so the resolution is TESTABLE: `CorsLayer`
+/// exposes no getter for the origins it was built with, so a test that only
+/// calls `build_cors_layer` can assert nothing beyond "it did not panic" — which
+/// is what the five tests below did before 2026-09-05. On a port that is
+/// publicly funnelled, an origin list that silently resolved to something wider
+/// than intended would have been invisible to the suite.
+///
+/// Contract:
+/// * empty input        -> the localhost dev defaults
+/// * all inputs invalid -> the localhost dev defaults (never an empty list,
+///                         because `CorsLayer::allow_origin([])` allows nothing
+///                         and would take the API dark rather than fail loudly)
+/// * mixed valid/invalid -> only the valid ones, invalid dropped individually
+///
+/// A wildcard is NEVER synthesised here; if the operator configures one it is
+/// their explicit choice, and `cors_origins_are_never_empty_and_never_a_wildcard`
+/// pins that this function does not invent one on any fallback path.
+// O(1) EXEMPT: begin — cold path, called once at boot
+fn resolve_cors_origins(allowed_origins: &[String]) -> Vec<axum::http::HeaderValue> {
+    use axum::http::HeaderValue;
+
+    // `from_static` is infallible for these string literals.
+    let defaults = || {
+        vec![
+            HeaderValue::from_static("http://localhost:3000"),
+            HeaderValue::from_static("http://localhost:3001"),
+        ]
+    };
+
+    if allowed_origins.is_empty() {
+        return defaults();
+    }
+
+    let parsed: Vec<HeaderValue> = allowed_origins
+        .iter()
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
+        .collect();
+
+    if parsed.is_empty() {
+        defaults()
+    } else {
+        parsed
+    }
+}
+// O(1) EXEMPT: end
+
 /// Builds a CORS layer from configured allowed origins.
 ///
 /// If the list is empty, falls back to permissive localhost defaults for dev safety.
 // O(1) EXEMPT: begin — cold path, called once at boot
 fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
-    use axum::http::{HeaderValue, Method, header};
-
-    let origins: Vec<&str> = if allowed_origins.is_empty() {
-        vec!["http://localhost:3000", "http://localhost:3001"]
-    } else {
-        allowed_origins.iter().map(String::as_str).collect()
-    };
-
-    let parsed: Vec<HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse::<HeaderValue>().ok())
-        .collect();
+    use axum::http::{Method, header};
 
     // B3: Restrict methods to GET/POST/DELETE and headers to Authorization/Content-Type.
     // Prevents CSRF-style attacks from permitted origins using arbitrary methods/headers.
     let methods = [Method::GET, Method::POST, Method::DELETE];
     let headers = [header::AUTHORIZATION, header::CONTENT_TYPE];
 
-    if parsed.is_empty() {
-        // Fallback: if all origins failed to parse, allow localhost defaults.
-        // HeaderValue::from_static is infallible for string literals.
-        CorsLayer::new()
-            .allow_origin([
-                HeaderValue::from_static("http://localhost:3000"),
-                HeaderValue::from_static("http://localhost:3001"),
-            ])
-            .allow_methods(methods)
-            .allow_headers(headers)
-    } else {
-        CorsLayer::new()
-            .allow_origin(parsed)
-            .allow_methods(methods)
-            .allow_headers(headers)
-    }
+    CorsLayer::new()
+        .allow_origin(resolve_cors_origins(allowed_origins))
+        .allow_methods(methods)
+        .allow_headers(headers)
 }
 // O(1) EXEMPT: end
 
@@ -371,9 +420,87 @@ fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
 mod tests {
     use super::*;
 
+    /// Assert that a built router actually SERVES the configured origin, and
+    /// that an origin which was NOT configured is not echoed back.
+    ///
+    /// ADDED 2026-09-05. The three `build_router*` tests below previously ended
+    /// in `let _router = build_router(state, &origins, ..);` and asserted
+    /// nothing — so "build a router with custom origins" was proven only to
+    /// the extent that it did not panic. Nothing connected the origin list a
+    /// caller passes to what a browser is actually told, which is the only
+    /// property that matters on port 3001 (publicly funnelled).
+    ///
+    /// The negative half is the security half: a layer that reflected every
+    /// Origin back, or answered `*`, would satisfy the positive assertion
+    /// alone while allowing every site on the internet.
+    async fn assert_origin_is_allowed_on_the_wire(router: Router, configured_origin: &str) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        // An origin no test configures anywhere, so a pass here cannot be luck.
+        const UNCONFIGURED: &str = "https://attacker.example.net";
+
+        let allow_header = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let configured = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, configured_origin)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert_eq!(
+            allow_header(&configured).as_deref(),
+            Some(configured_origin),
+            "a configured origin must be echoed in access-control-allow-origin; \
+             without this the origin list a caller passes is never proven to \
+             reach the wire"
+        );
+
+        let stranger = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(axum::http::header::ORIGIN, UNCONFIGURED)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let got = allow_header(&stranger);
+        assert!(
+            got.as_deref() != Some(UNCONFIGURED) && got.as_deref() != Some("*"),
+            "an UNCONFIGURED origin was allowed (header: {got:?}). A layer that \
+             reflects any Origin, or answers `*`, opens the API to every site \
+             on the internet — and would pass the positive assertion above."
+        );
+    }
+
+    /// Helper: render the resolved origins as strings so assertions read as
+    /// the operator would state them.
+    fn resolved(origins: &[String]) -> Vec<String> {
+        resolve_cors_origins(origins)
+            .iter()
+            .map(|h| h.to_str().unwrap_or("<non-utf8>").to_string())
+            .collect()
+    }
+
+    const LOCALHOST_DEFAULTS: [&str; 2] = ["http://localhost:3000", "http://localhost:3001"];
+
     #[test]
     fn test_build_cors_layer_empty_origins_uses_defaults() {
-        // Should not panic — falls back to localhost defaults
+        assert_eq!(resolved(&[]), LOCALHOST_DEFAULTS.to_vec());
+        // The layer itself must still build on the same input.
         let _cors = build_cors_layer(&[]);
     }
 
@@ -383,13 +510,21 @@ mod tests {
             "http://localhost:3000".to_string(),
             "http://example.com".to_string(),
         ];
+        assert_eq!(
+            resolved(&origins),
+            vec!["http://localhost:3000", "http://example.com"],
+            "both configured origins must survive resolution, in order"
+        );
         let _cors = build_cors_layer(&origins);
     }
 
     #[test]
     fn test_build_cors_layer_all_invalid_origins_falls_back() {
-        // Invalid origins that can't parse to HeaderValue — should fall back to defaults
+        // Invalid origins that can't parse to HeaderValue — should fall back to
+        // defaults, NEVER to an empty list (an empty allow_origin allows nothing
+        // and would take the API dark instead of failing loudly).
         let origins = vec!["\x00invalid".to_string(), "\x01bad".to_string()];
+        assert_eq!(resolved(&origins), LOCALHOST_DEFAULTS.to_vec());
         let _cors = build_cors_layer(&origins);
     }
 
@@ -399,13 +534,57 @@ mod tests {
             "http://localhost:3000".to_string(),
             "\x00invalid".to_string(),
         ];
+        assert_eq!(
+            resolved(&origins),
+            vec!["http://localhost:3000"],
+            "an unparseable origin is dropped individually — it must not \
+             discard the valid sibling, and must not trigger the defaults"
+        );
         let _cors = build_cors_layer(&origins);
     }
 
     #[test]
     fn test_build_cors_layer_single_valid_origin() {
         let origins = vec!["https://my-dashboard.example.com".to_string()];
+        assert_eq!(
+            resolved(&origins),
+            vec!["https://my-dashboard.example.com"],
+            "a single configured origin must be the ONLY one allowed — the \
+             localhost defaults must not be appended to it"
+        );
         let _cors = build_cors_layer(&origins);
+    }
+
+    /// The two properties that matter on a publicly funnelled port, asserted
+    /// over every shape the resolver can be handed.
+    #[test]
+    fn cors_origins_are_never_empty_and_never_a_wildcard() {
+        let cases: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["\x00invalid".to_string()],
+            vec!["\x00a".to_string(), "\x01b".to_string()],
+            vec!["http://localhost:3000".to_string()],
+            vec![
+                "https://ops.example.com".to_string(),
+                "\x00invalid".to_string(),
+            ],
+            vec![String::new()],
+        ];
+        for case in cases {
+            let out = resolved(&case);
+            assert!(
+                !out.is_empty(),
+                "resolve_cors_origins returned an EMPTY list for {case:?} — \
+                 CorsLayer::allow_origin([]) allows nothing, so the API would \
+                 go dark silently instead of failing loudly"
+            );
+            assert!(
+                !out.iter().any(|o| o == "*"),
+                "resolve_cors_origins SYNTHESISED a wildcard for {case:?} — a \
+                 wildcard may only ever come from explicit operator config, \
+                 never from a fallback path (port 3001 is publicly funnelled)"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -492,8 +671,8 @@ mod tests {
         let _router = build_router(state, &[], true);
     }
 
-    #[test]
-    fn test_build_router_with_custom_origins() {
+    #[tokio::test]
+    async fn test_build_router_with_custom_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -526,7 +705,8 @@ mod tests {
             "http://localhost:3000".to_string(),
             "https://dashboard.example.com".to_string(),
         ];
-        let _router = build_router(state, &origins, true);
+        let router = build_router(state, &origins, true);
+        assert_origin_is_allowed_on_the_wire(router, "https://dashboard.example.com").await;
     }
 
     // -------------------------------------------------------------------
@@ -689,7 +869,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(axum::http::Method::POST)
-                        .uri("/api/feeds/groww")
+                        .uri("/api/feeds/truedata")
                         .header("content-type", "application/json")
                         .body(Body::from(r#"{"enabled":true}"#))
                         .unwrap(),
@@ -713,10 +893,12 @@ mod tests {
         use tower::ServiceExt;
 
         // Companion ratchet to the 401 test above: the gate OPENS for the real
-        // token in BOTH modes — the 2026-07-04 gating must never lock the
-        // operator out. S2b (2026-07-15): a groww ENABLE now hits the
-        // retired-feed 409 INSIDE the handler — the assertion is "past the
-        // auth gate" (never 401), so use a groww DISABLE which flows through.
+        // token in BOTH modes, so the 2026-07-04 gating can never lock the
+        // operator out. The probe is a TrueData DISABLE: it is runtime-toggleable
+        // and narrowing is always permitted, so a 200 here means "past the auth
+        // gate" and nothing else. (It probed "groww" until 2026-08-21; that name
+        // now answers 400 "unknown feed", which would have passed the auth gate
+        // too but for the wrong reason.)
         for feed_toggle_public in [true, false] {
             let auth = ApiAuthConfig::from_token(SecretString::from("secret-tok".to_string()));
             let router = build_router_with_auth(auth_test_state(), &[], auth, feed_toggle_public);
@@ -725,7 +907,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method(axum::http::Method::POST)
-                        .uri("/api/feeds/groww")
+                        .uri("/api/feeds/truedata")
                         .header("content-type", "application/json")
                         .header("authorization", "Bearer secret-tok")
                         .body(Body::from(r#"{"enabled":false}"#))
@@ -1038,8 +1220,8 @@ mod tests {
     // build_router: unknown route returns 404
     // -------------------------------------------------------------------
 
-    #[test]
-    fn test_build_router_live_mode_with_origins() {
+    #[tokio::test]
+    async fn test_build_router_live_mode_with_origins() {
         let state = state::SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
@@ -1070,7 +1252,8 @@ mod tests {
         );
         let origins = vec!["http://localhost:3000".to_string()];
         // dry_run=false exercises the live-mode auth path (auto-generates token)
-        let _router = build_router(state, &origins, false);
+        let router = build_router(state, &origins, false);
+        assert_origin_is_allowed_on_the_wire(router, "http://localhost:3000").await;
     }
 
     #[tokio::test]

@@ -41,8 +41,39 @@ Wants=network-online.target docker.service
 # repeated restarts, so this never trips a legitimate boot. These directives are
 # placed in [Unit] (NOT [Service]) per modern systemd — they govern the unit's
 # start-rate, unlike Restart=/RestartSec= which live in [Service].
-StartLimitIntervalSec=600
-StartLimitBurst=8
+#
+# ⚠ WIDENED 2026-09-03 — the 10-minute window could not see a SLOW loop, and a
+# slow loop is the one that actually happened.
+#
+# The arithmetic the old pair encoded: `failed` needs > 8 restarts inside
+# StartLimitIntervalSec, so ANY cycle at or above 600/8 = 75 seconds never
+# trips it, no matter how many times it repeats. That is not a corner case —
+# it is the normal shape of a memory-driven loop, where the process spends
+# minutes climbing before it is killed.
+#
+# MEASURED 2026-09-03: the app crash-looped from 08:31 to 09:02 IST on ~9-minute
+# cycles (RSS climbing to 20.96 GB, watchdog kill, restart, repeat). Four full
+# cycles. `StartLimitBurst` NEVER FIRED, because 540s > 75s. The unit reported
+# `active (running)` throughout, and the loop was found by reading an RSS chart,
+# not by anything systemd said.
+#
+# New pair: > 5 restarts in 60 min → `failed`, which catches any cycle under
+# 3600/5 = 720 seconds. Today's ~540s loop trips on the sixth restart, roughly
+# 45 minutes in.
+#
+# The burst comes DOWN 8 → 5, deliberately. Raising the window alone would have
+# left the trip point at 3600/8 = 450s — still under today's 540s cycle, i.e. a
+# change that reads like a fix and would not have caught the incident that
+# motivated it.
+#
+# What this COSTS, stated rather than absorbed: `failed` means the app is DOWN
+# and stays down until someone starts it. That is the intended trade and it is
+# not a comfortable one. A looping app captures no ticks anyway AND churns the
+# disk that caused the loop, so the choice is between "down and paging" and
+# "down and silent". The existing market-hours liveness alarm pages on the
+# missing metrics either way; `failed` additionally stops the churn.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -60,19 +91,27 @@ WorkingDirectory=/opt/tickvault
 # container that was removed (down/wipe/reset). Without this, a missing QuestDB
 # makes the app crash-loop forever on BOOT-02.
 #
-# This calls scripts/ensure-questdb.sh (idempotent) instead of a bare
-# `docker compose ... up -d questdb`, which had THREE bugs (incident 2026-06-08):
+# The bare `docker compose ... up -d questdb` this replaced had THREE bugs
+# (incident 2026-06-08):
 #   (a) hosts without the `docker compose` v2 plugin → no-op (docker prints help);
 #   (b) the compose SERVICE name is `tv-questdb`, not `questdb`;
 #   (c) a recreate needs QDB_PG_* creds from SSM, absent from this unit's env.
-# The helper handles running/stopped/removed, tries compose v2→v1→plugin-path,
-# and falls back to `docker run` so the box recovers even with no compose.
-# Leading `-` = a transient hiccup does NOT hard-fail the unit; the app's own
-# 60s `wait_for_questdb_ready` is the real gate.
+# The self-heal was scripts/ensure-questdb.sh until 2026-10-01 (audit D6d); it
+# is now `tickvault ensure-questdb`, run from the root-owned copy
+# `bin/tickvault-host` (see tickvault-host-tuning.service: the deploy rollback
+# restores `bin/tickvault`, and a binary from before the port would ignore the
+# subcommand and boot the whole app here). It handles running/stopped/removed,
+# reads the PG creds from SSM itself, tries compose v2→v1→plugin-path, and
+# falls back to `docker run` so the box recovers even with no compose. Every
+# docker call inside is time-bounded, because TimeoutStartSec=infinity below
+# means systemd never kills a hung ExecStartPre.
+# Leading `-` = a transient hiccup (or a missing copy on a new instance before
+# its first deploy) does NOT hard-fail the unit; the app's own 60s
+# `wait_for_questdb_ready` is the real gate.
 # NOTE: still does NOT fix QuestDB CRASHING on start (disk-full / volume
 # corruption) — see docs/runbooks/aws-docker-daemon-dead.md (`docker logs
 # tv-questdb` + `df -h`).
-ExecStartPre=-/bin/bash /opt/tickvault/repo/scripts/ensure-questdb.sh
+ExecStartPre=-/opt/tickvault/bin/tickvault-host ensure-questdb
 
 # Boot can legitimately exceed systemd's default 90s TimeoutStartSec: the app
 # is Type=notify and only sends READY=1 AFTER its own boot gates complete —
@@ -86,17 +125,52 @@ ExecStartPre=-/bin/bash /opt/tickvault/repo/scripts/ensure-questdb.sh
 TimeoutStartSec=infinity
 
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
-# Bounded by StartLimitIntervalSec/StartLimitBurst in [Unit]: after > 8
-# restarts in 10 min the unit goes to `failed` and stops restarting (so a true
-# crash-loop becomes an observable hard failure instead of an infinite silent
-# churn under a re-emitted stale gauge). Recover a `failed` unit manually with
-# `systemctl reset-failed tickvault && systemctl start tickvault`.
+# Bounded by StartLimitIntervalSec/StartLimitBurst in [Unit]: after more than
+# StartLimitBurst restarts inside StartLimitIntervalSec (5 in 3600 s since
+# 2026-09-03; it read "> 8 in 10 min" until then) the unit goes to `failed`
+# and stops restarting, so a true crash-loop becomes an observable hard failure
+# instead of an infinite silent churn under a re-emitted stale gauge.
+# CORRECTED 2026-10-26 (audit PR L4): this said to recover a `failed` unit
+# manually. No human step is needed while the unit is enabled:
+# scripts/aws-autopilot.sh runs `systemctl reset-failed tickvault` then
+# `systemctl start tickvault` on any pass that finds the enabled unit not
+# active (passes run every 15 minutes, 08:30-16:30 IST
+# Mon-Fri, .github/workflows/aws-autopilot.yml). A DISABLED unit is read as an
+# intentional kill switch and is left alone.
 Restart=always
 RestartSec=3
 
-# Watchdog: app must call sd_notify(WATCHDOG=1) every 30s.
-# If no watchdog ping for 60s (2x interval), systemd kills and restarts.
-WatchdogSec=60
+# Watchdog: app must call sd_notify(WATCHDOG=1) every 30s
+# (boot_helpers::WATCHDOG_INTERVAL_SECS, pinned by a build-time assertion).
+#
+# ⚠ RAISED 2026-09-03, 60 → 150 seconds. This directive KILLED THE APP on a
+# process that was alive, working, and losing nothing.
+#
+# At 60s the margin was exactly ONE missed ping. A 30-second interval inside a
+# 60-second deadline tolerates no slow cycle at all: the beacon has to be
+# scheduled, and win, twice in a row, forever. Under `MemoryHigh` throttling —
+# 371,828 throttle events measured on 2026-09-03 — the kernel is deliberately
+# slowing allocation, the beacon task loses its slot, the second ping is late,
+# and systemd SIGABRTs a process whose only fault was being throttled.
+#
+# That is the wrong instrument for the job. The watchdog exists to catch a HUNG
+# process, not a SLOW one, and a throttled process is slow by design — the
+# throttle is the system working. Killing it converts a recoverable pressure
+# event into a restart loop, and the restart re-reads the same backlog that
+# caused the pressure.
+#
+# 150s = five ping intervals, so four consecutive pings must be missed before a
+# kill. A genuinely hung process still dies, 90 seconds later than before; a
+# throttled one now survives its bad minute. Detection latency traded for not
+# killing healthy work, which is the right direction on a feed whose mandate is
+# to lose nothing.
+#
+# It stays well under TimeoutStopSec=145 + the deploy watchdog's own window, so
+# nothing downstream re-times against it.
+# (⚠ CORRECTED 2026-10-11, audit CONC-1: TimeoutStopSec is 165 now, see the
+# shutdown rationale below. systemd stops the watchdog once the unit is
+# stopping, so the two do not interact.)
+WatchdogSec=150
 
 # Environment
 Environment=RUST_LOG=info
@@ -166,7 +240,7 @@ Environment=TICKVAULT_DHAN_LIVE_FEED=1
 # (nr_throttled 18,594 / nr_periods 85,149).
 #
 # The partition, whose other halves live in deploy/docker/docker-compose.yml
-# (QuestDB + sidecars) and deploy/aws/host-tuning/apply-host-tuning.sh (IRQs):
+# (QuestDB + sidecars) and `tickvault host-tuning apply` (IRQs):
 #
 #   core 0  OS + NIC IRQ/softirq + the log sidecars
 #   core 1  THIS PROCESS — exclusive
@@ -188,7 +262,7 @@ Environment=TICKVAULT_DHAN_LIVE_FEED=1
 #
 # HOST-SIZE SAFETY. This names CPUs 1-2, which requires at least 3 cores. On a
 # smaller host the tuning unit REMOVES this setting via a drop-in before the
-# app starts (see apply-host-tuning.sh) rather than letting it pin the app
+# app starts (see `tickvault host-tuning apply`) rather than letting it pin the app
 # into a set the kernel cannot honour.
 #
 # ROLLBACK — no code change, no rebuild, no redeploy:
@@ -206,9 +280,175 @@ AllowedCPUs=1-2
 # ROLLBACK to the pre-2026-08-19 `num_cpus` behaviour on this box: set 4.
 Environment=TICKVAULT_TOKIO_WORKER_THREADS=2
 
+# ---------------------------------------------------------------------------
+# MONDAY 2 NOV 2026 MEASURED DAY — own-core placement ON (plan ITEM DT-S1)
+# ---------------------------------------------------------------------------
+# Owner decision, Fri 30 Oct 2026 ~17:45 IST (card in the coordinator
+# session): "Yes, Monday live test (Recommended)" — "Own-core ON for Monday
+# 2 Nov only, never-sleeping sorter OFF, measured minute by minute."
+#
+# What is ON: the frame drain on its own thread pinned to the readers' core
+# (core 1), and every other app thread on core 0. QuestDB moves to core 0 by
+# TV_QDB_CORE_ISOLATION=1 in tickvault-host-tuning.service. What stays OFF:
+# real-time priority (TICKVAULT_HOT_RT_PRIORITY) and the busy-poll drain.
+#
+# When it takes effect: both variables are read ONCE, in `main`, before any
+# runtime exists. A deploy never runs inside 09:00–15:45 IST (the deploy
+# guard), so the first process to read them is the after-close restart, and
+# Monday's 08:30 boot runs the measured session with them.
+#
+# REVIEW with the 16:15 IST verdict on Mon 2 Nov. To switch off: delete these
+# two lines (and the host-tuning one) in an after-close update; the defaults
+# are off, so nothing else changes.
+Environment=TICKVAULT_DRAIN_THREAD=on
+Environment=TICKVAULT_BACKGROUND_CORE=0
+#
+# Owner decision, Thu 12 Nov 2026 ~16:15 IST (card in the session): "Yes,
+# both, measure 1 day (Recommended)" — "Turn on top priority for the 2 feed
+# threads and keep the monitoring agent on core 0. Measure the next full
+# trading day against today; undo if ticks lost, the database falling
+# behind, or worse numbers."
+#
+# Measured 12 Nov (live, host_capacity_minute + /proc/<tid>/schedstat): the
+# host is 15-20% busy, yet the frame drain waited 133 s for core 1 against
+# 268 s of run time, worst seconds 36 ms (drain) and 41 ms (reader), because
+# both are SCHED_OTHER threads waking each other ~38M times a day. Real-time
+# priority (readers SCHED_FIFO 2, drain SCHED_FIFO 1) lets a woken hot
+# thread run at once instead of waiting a 1.4 ms EEVDF slice. Guarded by the
+# kernel RT throttle (sched_rt_runtime_us 950000 of 1000000 on the box,
+# verified 12 Nov): a stuck hot thread still leaves core 1 5%, and the app
+# refuses RT outright if the throttle is off (HOT-PATH-03 hot_rt_refused).
+# QuestDB is unaffected: it is pinned to core 0.
+#
+# REVIEW with the 16:15 IST capacity verdict of the first session that runs
+# it, against 12 Nov: reader/drain CPU wait, worst second, receipt_to_fold
+# and ring_dwell p99, ticks lost 0, ring refusals 0, QuestDB backlog. To
+# switch off: delete the two lines below in an after-close update.
+Environment=TICKVAULT_HOT_RT_PRIORITY=1
+LimitRTPRIO=2
+
+# ---------------------------------------------------------------------------
+# Hot-thread placement (plan ITEM DT, 2026-10-30) — ALL OFF by default
+# ---------------------------------------------------------------------------
+#
+# On the 2-core r8g.large the socket readers and the frame drain sometimes
+# wait 2-16 ms for a CPU that QuestDB or a background thread holds (measured
+# 29 Oct). Four independent switches move them apart; each is off until the
+# operator turns it on for one measured live day:
+#
+#   TICKVAULT_DRAIN_THREAD=on        the frame drain on its own OS thread,
+#                                     pinned to the readers' core (core 1)
+#   TICKVAULT_BACKGROUND_CORE=0      every other app thread on core 0
+#   TICKVAULT_HOT_RT_PRIORITY=1      readers SCHED_FIFO 2, drain SCHED_FIFO 1;
+#                                     refused unless kernel.sched_rt_runtime_us
+#                                     is below its period and at least half of
+#                                     it (default 950000 of
+#                                     1000000), so a stuck thread can never
+#                                     freeze the box. Needs LimitRTPRIO below.
+#   TV_QDB_CORE_ISOLATION=1          (in deploy/docker/.env, not here)
+#                                     QuestDB alone on core 0, applied by
+#                                     `tickvault host-tuning apply`
+#
+# To turn on (all four, or any subset), in a drop-in, outside market hours:
+#   printf '[Service]\nEnvironment=TICKVAULT_DRAIN_THREAD=on\nEnvironment=TICKVAULT_BACKGROUND_CORE=0\nEnvironment=TICKVAULT_HOT_RT_PRIORITY=1\nLimitRTPRIO=2\n' \
+#     > /etc/systemd/system/tickvault.service.d/95-hot-threads.conf
+#   echo 'TV_QDB_CORE_ISOLATION=1' >> /opt/tickvault/repo/deploy/docker/.env
+#   systemctl daemon-reload && systemctl restart tickvault
+# Rollback: delete the drop-in and the .env line, daemon-reload, restart.
+# Read back: the boot log lines "frame drain placement" / "the frame drain
+# runs on its own thread", any HOT-PATH-03 line, and the live stage
+# tv_hot_path_stage_max_ns{stage="drain_main_frame"} / ring_dwell.
+
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
+
+# ---------------------------------------------------------------------------
+# Memory ceiling + OOM ranking (2026-09-02 — second-sweep finding 5)
+# ---------------------------------------------------------------------------
+#
+# Until this block the unit set NO memory directive of any kind. Two things
+# followed from that, and both were measured in source rather than assumed:
+#
+#   1. The kernel OOM killer ranks by RSS, and this process is the largest
+#      RSS on the box after QuestDB. QuestDB's container already carries
+#      `oom_score_adj: -500` (deploy/docker/docker-compose.yml), so under
+#      host memory exhaustion the kernel would kill THIS process FIRST.
+#      That is the wrong order: QuestDB is recoverable — a stalled or
+#      restarted database is absorbed by the tick/depth spill tier and
+#      re-ingested — while this process is the ONLY tick capture path, and
+#      an upstream tick that arrives while it is dead is never resent.
+#   2. RESOURCE-02 (the process's own memory early warning,
+#      crates/storage/src/resource_monitor.rs) resolves its ceiling from the
+#      cgroup, and with no directive here the cgroup reports `max`, so the
+#      80% line it watched was 80% of the whole machine — unreachable
+#      before the kernel acts.
+#
+# OOMScoreAdjust=-900 puts this process BELOW QuestDB (-500) in the kill
+# order, so exhaustion takes the recoverable tenant first. It does not make
+# the process unkillable (-1000 would); the kernel still reclaims it last.
+#
+# MemoryHigh=20G is a THROTTLE, not a kill: past it the kernel reclaims this
+# cgroup aggressively and slows allocation, and RESOURCE-02 has a reachable
+# ceiling to page against. There is deliberately NO `MemoryMax=` — a hard
+# cap turns a memory spike into an OOM kill of the one process whose death
+# loses ticks, which is exactly the outcome the ranking above exists to
+# avoid. Throttle and page, never kill.
+#
+# WHY 15G. Host usable RAM (MemTotal on the r8g.xlarge, 32 GiB nominal) is
+# ~31.3 GiB. Committed to other tenants: QuestDB hard cap 12.5 GiB
+# (`mem_limit: ${QDB_MEM_LIMIT:-12g}` + `shm_size: 512m`, docker-compose.yml)
+# + sidecars ~0.64 GiB (tv-alloy 384m + tv-loki 256m) + an OS/page-cache
+# floor of 2–4 GiB. That leaves ~14.2–16.2 GiB for this process. Its
+# measured working-set envelope is 4.3–11.2 GB (the subsystem-memory gauges),
+# so 15 GiB sits ABOVE the envelope — a healthy session never touches it —
+# and BELOW host exhaustion, so the throttle engages before the kernel does.
+# AL2023 runs with no swap, so "before swap" and "before OOM" are the same
+# line here; the throttle is the only soft stop that exists.
+#
+# ONE COPY. deploy/aws/terraform/user-data.sh.tftpl installs this file with
+# a plain `cp` from the repo checkout (verified: it is not templated), so
+# there is no second copy of the unit to drift from this one.
+#
+# ROLLBACK — no code change, no rebuild, no redeploy:
+#   printf '[Service]\nMemoryHigh=infinity\nOOMScoreAdjust=0\n' \
+#     > /etc/systemd/system/tickvault.service.d/99-memory-rollback.conf
+#   systemctl daemon-reload && systemctl restart tickvault
+# `MemoryHigh=infinity` removes the throttle; `OOMScoreAdjust=0` restores the
+# kernel's default ranking. Reverting this file in git and redeploying
+# achieves the same thing.
+OOMScoreAdjust=-900
+# RAISED 15G -> 20G on 2026-09-03, operator-approved, after a live incident.
+#
+# WHAT HAPPENED: a 21 GB depth spill file was read WHOLE into memory by the
+# recovery drain (`tick_spill_replay`, since fixed to stream). Process RSS hit
+# 20.96 GiB. The kernel then reclaimed so aggressively that the watchdog
+# beacon could not deliver its 30-second ping inside `WatchdogSec=60`, and
+# systemd SIGABRTed a process that was alive and working -- once every ~9
+# minutes, all session. `oom_kill` stayed 0 throughout: this was never an OOM.
+#
+# The ~9-minute cycle also slips the [Unit] start limit: 8 starts per 600 s
+# means any cycle >= 75 s never trips it, so the unit loops forever instead of
+# transitioning to `failed` where an alarm could see it.
+#
+# WHY 20G AND NOT MORE: the measured steady working set is 0.29-1.54 GiB in
+# session and ~15.6 GiB during a large replay. The host has ~30 GiB with
+# QuestDB capped at 12 GiB, so 20G leaves the host a real margin. Raising
+# further would trade a cgroup throttle for a HOST OOM, where the kernel
+# picks the victim -- and QuestDB's oom_score_adj of -500 makes this process
+# a worse target than it looks despite OOMScoreAdjust=-900 below.
+#
+# THIS VALUE IS LOAD-BEARING AND MUST STAY IN THE REPOSITORY. It was applied
+# live as a systemd drop-in first; a drop-in is an EXTENSION, not an override,
+# so `systemd-delta` reports nothing and the drift is invisible. A fresh
+# instance provisioned from this file at 15G re-enters the SIGABRT loop.
+#
+# NOTE, because it is not obvious: this ceiling is not only a throttle. With
+# no `MemoryMax=`, `resolve_memory_ceiling` resolves the unit's ceiling FROM
+# `memory.high`, so raising it also raised the WAL catch-up stand-down (60%
+# => 12.88 GB) and the RESOURCE-02 page line (80% => 17.18 GB). Changing this
+# number moves those with it.
+MemoryHigh=20G
 
 # Security hardening
 NoNewPrivileges=true
@@ -217,9 +457,10 @@ ProtectHome=true
 # Docker socket exemption (2026-07-13, deploy-hang fix companion):
 # ProtectSystem=strict mounts the whole hierarchy read-only (except
 # /dev /proc /sys), and connect(2) on a unix socket needs WRITE access to the
-# socket inode — so every `docker …` call made by ExecStartPre
-# (ensure-questdb.sh) fails with EACCES in the SERVICE-USER context while the
-# SAME script works from an SSM/root shell (no sandbox). On a post-nuke boot
+# socket inode — so every `docker …` call made by ExecStartPre (then
+# ensure-questdb.sh, now `tickvault-host ensure-questdb`) fails with EACCES in
+# the SERVICE-USER context while the SAME call works from an SSM/root shell (no
+# sandbox). On a post-nuke boot
 # with no QuestDB container/image that meant the self-heal could never bring
 # QuestDB up → BOOT-02 halt at 08:30. The `-` prefix ignores a missing socket
 # (docker.service not yet up), so this can never fail the unit start; it only
@@ -229,8 +470,100 @@ ProtectHome=true
 ReadWritePaths=/opt/tickvault/data /opt/tickvault/config -/var/run/docker.sock -/run/docker.sock
 PrivateTmp=true
 
-# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL.
-TimeoutStopSec=30
+# Graceful shutdown: send SIGTERM, wait, then SIGKILL.
+#
+# MEASURED AND RAISED 2026-08-21 (was 30s, which SIGKILLed the day's tail).
+# The app's shutdown path runs FOUR bounded waits SEQUENTIALLY:
+#
+#   DHAN_SOCKET_STOP_BUDGET_SECS           = 5    (socket close, runs first)
+#   DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS   = 30   (lane flush, second)
+#   SEAL_WRITER_SHUTDOWN_BUDGET_SECS       = 75   (final seal drain, third)
+#   SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS   = 5    (escalation queue, fourth)
+#   WAL_SPILL_SHUTDOWN_BUDGET_SECS         = 10   (WAL queue drain, fifth)
+#   worst case                             = 125s
+#
+# Three live in crates/app/src/main.rs; WAL_SPILL_SHUTDOWN_BUDGET_SECS lives
+# in crates/storage/src/ws_frame_spill.rs and is reached through
+# WsFrameSpill::shutdown.
+#
+# At 30s the seal writer could receive at most 10s of its 75s budget, and at
+# the measured ~10,200 seals/sec that drains ~102,000 of a possible 600,000
+# seals at the 25,000-instrument ceiling — the rest, INCLUDING every
+# instrument's final daily bar, died on SIGKILL. The 75s constant was sized
+# from a live drain-rate measurement on 2026-08-20 and its own comment warns
+# that "overrunning systemd's stop timeout earns a SIGKILL, which loses the
+# very tail this exists to save" — the two files had simply drifted, with
+# nothing pinning them together.
+#
+# 145 = the 120s worst case + 25s margin. Raising it is fail-SAFE: it only
+# ever grants more time, never less. The daily 17:30 IST auto-stop is
+# unaffected — a 115s shutdown completes by ~17:31:55, and the stop-verify
+# lambda does not fire until 17:45 IST.
+#
+# 2026-08-28: 120 -> 130, because the lane budget went 20s -> 30s to cover
+# the spawn-failure fallback, where the tail flushes depth AND ticks
+# synchronously (5s + 5s of ILP timeout) BEFORE the 12s join deadline even
+# starts. The guard below caught the overrun; the note that raised the lane
+# budget claimed 30s was "still far inside TimeoutStopSec=120" and was WRONG
+# — a .service file is invisible to the compile-time assert in main.rs, and
+# that is exactly the blind spot this test exists to cover. Fix applied in
+# the direction the guard prescribes: raise the timeout, never shrink a drain
+# budget that was sized from a real failure mode.
+#
+# 2026-08-28 (same day, second raise): 130 -> 140, because a THIRD bounded
+# wait joined the path — WAL_SPILL_SHUTDOWN_BUDGET_SECS. Until then the WAL
+# spill writer thread was DETACHED: nothing joined it, nothing could signal
+# it, and the process exited while up to 524,288 captured frames sat unwritten
+# in its queue, counted by nothing. The drain that closes that hole is a
+# fourth thing competing for this timeout, so the timeout moved with it.
+#
+# 2026-08-28 (same day, third raise): 140 -> 145, because a FOURTH bounded
+# wait joined the path — SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS. Refused seals
+# used to write to disk INLINE on the frame-drain task (a spill mutex plus a
+# write(2), and on spill failure a create_dir_all, an open, a JSON heap
+# allocation and four more syscalls) — on the one thread that empties the
+# socket, which is how ticks are lost UPSTREAM at a vendor that skips slow
+# consumers forward with no sequence number. Moving that to a dedicated
+# thread creates a bounded queue, and a bounded queue that is not drained at
+# exit is the same silent loss the WAL raise above closed. The margin stays
+# 25s rather than narrowing to 20s: the guard permits 20 but calls it the
+# floor, and the teardown after the drain (API + otel shutdown, partition
+# detach) is what spends it.
+#
+# 2026-10-02 (Z11d): a FIFTH bounded wait, DHAN_SOCKET_STOP_BUDGET_SECS, now
+# runs first: shutdown closes the Dhan feed sockets before it stops the lane
+# drain, because they used to keep appending to the WAL while its writer was
+# shut down beneath them. The timeout is NOT raised: 145 - 125 leaves exactly
+# the 20s floor the guard requires (the 25s margin noted above narrows to it).
+# Any further budget growth must raise this timeout.
+#
+# **⚠ CORRECTED 2026-10-11 (audit CONC-1) — the worst case was 137s, not
+# 125s.** The table above left out two bounded waits that were already on the
+# same sequential path, and the guard summed only the five it listed:
+#
+#   SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS = 2    (crash marker, after the
+#                                                  escalation queue; main.rs)
+#   SHUTDOWN_FLUSH_TIMEOUT_SECS            = 10   (Telegram flush, after the
+#                                                  WAL drain; in
+#                                                  crates/core/src/notification/service.rs)
+#
+# So 145 left 8s, not the 20s floor. The same change adds an eighth wait,
+# INSTANCE_LOCK_RELEASE_BUDGET_SECS = 3 (main.rs, after the WAL drain and
+# before the Telegram flush): a clean stop now releases the dual-instance lock
+# instead of leaving it for its 90s TTL, so a restart in market hours opens
+# its sockets at once (audit CONC-4). The worst case is therefore
+#
+#   5 + 30 + 75 + 5 + 2 + 10 + 3 + 10       = 140s
+#
+# and the timeout moves to 165 = 140 + the 25s margin this file prefers. No
+# drain budget is shrunk. OpenTelemetry adds nothing while tracing is off in
+# config/base.toml. The longest `systemctl stop` or `restart` can now take up
+# to 165s; the 17:30 stop still ends long before the 17:45 stop-verify.
+#
+# Pinned by crates/app/tests/shutdown_budget_fits_systemd_guard.rs — the
+# relationship, not the number: raising any app budget past this timeout
+# now fails the build.
+TimeoutStopSec=165
 KillMode=mixed
 KillSignal=SIGTERM
 

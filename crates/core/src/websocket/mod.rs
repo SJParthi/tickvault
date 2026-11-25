@@ -37,12 +37,18 @@
 // PR #4 (2026-05-19): `depth_connection` module DELETED.
 
 pub mod activity_watchdog;
+// 2026-09-02 (audit finding 9): edge latch so a dropped socket-lifecycle audit
+// row is LOUD once per episode instead of a bare counter nothing reads.
+pub mod audit_drop_latch;
 // 2026-08-09 revival, transport round: the ONE `DhanFeedSocket` implementation
 // — tokio-tungstenite over TLS with an EXPLICIT frame cap (the library default
 // is a 64 MiB message, which sixteen sockets could turn into a gigabyte of
 // attacker-controlled allocation). Contains no policy: every reconnect, park
 // and resubscribe decision stays in `pool_supervisor`.
 pub mod connection;
+// 2026-10-20 (audit M1): the live frame ring, pre-allocated so a backlog never
+// allocates on the socket read task (tokio's mpsc grows in 32-slot blocks).
+pub mod frame_ring;
 pub mod idle_watchdog;
 pub mod market_hours_gate;
 pub mod order_update_connection;
@@ -53,14 +59,26 @@ pub mod pool_budget;
 // executes it. Opens no socket itself: the transport is a trait
 // (`DhanFeedSocket`) so every decision branch is unit-testable without a
 // network. Spawned by `tickvault_app::dhan_feed_stack`, DEFAULT-OFF.
+pub mod hot_thread_placement;
 pub mod pool_supervisor;
+pub mod reader_runtime;
+pub mod receive_buffer;
 pub mod reconnect_ladder;
+// 2026-10-20: the frame-silence gate stays shut all day on an NSE holiday or
+// weekend (569 holiday redials on 2026-10-20 measured the gap).
+pub mod silence_calendar;
+// 2026-10-13: a depth-200 swap whose new contract never streams is
+// resubscribed in place once at 90 s (scope lock, same date).
+pub mod silent_swap;
 // Rebuilt 2026-08-11 with the operator-approved 16-connection revival
 // (websocket-connection-scope-lock.md, the two 2026-08-09 sections). Deleted
 // in the 2026-07-17 stage-3 sweep alongside the lane it served.
 pub mod subscription_builder;
 pub mod tls;
 pub mod types;
+// 2026-11-13 (audit B2 finding 7): the TCP dial with SO_KEEPALIVE on, so the
+// kernel keepalive ladder in the sysctl file applies to every Dhan socket.
+pub mod ws_dial;
 
 // PR #4 (2026-05-19): depth_connection re-exports retired.
 pub use order_update_connection::run_order_update_connection;

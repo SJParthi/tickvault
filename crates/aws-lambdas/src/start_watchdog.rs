@@ -8,12 +8,19 @@
 //! * mode="check"        @ 08:45 IST — verify the box started; self-heal
 //!   (ec2:StartInstances) + page if not; flag late starts; respect the
 //!   NSE-holiday intentional-stop marker (fail-open).
-//! * mode="stop_check"   @ 17:45 IST — verify the 17:30 stop worked;
-//!   self-stop a box left running since before 17:30; never touch a manual
+//! * mode="daily_stop"   @ 16:30 IST — the scheduled stop (operator Quote 31,
+//!   2026-10-21; was an SSM stop automation): stop the box unless a fresh
+//!   drain hold says the day's data is still going into the database.
+//! * mode="stop_check"   @ 16:45 IST — verify the 16:30 stop worked;
+//!   self-stop a box left running since before 16:30; never touch a manual
 //!   evening session.
 //! * mode="curfew_check" hourly — stop a forgotten out-of-hours box unless
 //!   a keep-alive override / launch grace applies (operator directive
 //!   2026-07-03: "manual human error is not acceptable").
+//!
+//! The three stop modes read the drain hold (`drain_hold`): a fresh hold
+//! skips the stop silently, and a hold that ended tonight turns the stop
+//! into a silent one. The hold is never honoured from 07:30 IST to 16:25 IST.
 //!
 //! Parity is the contract: same mode dispatch, same SNS Subject/Message
 //! strings (byte-identical), same result-dict shapes, same IST math
@@ -35,24 +42,41 @@ use tracing::{error, info, warn};
 /// The daily_start EventBridge rule fires at 03:00 UTC (= 08:30 IST, Mon-Fri).
 pub const START_TRIGGER_UTC_HOUR: u32 = 3;
 pub const START_TRIGGER_UTC_MINUTE: u32 = 0;
-/// The daily_stop EventBridge rule fires at 12:00 UTC (= 17:30 IST, Mon-Fri).
+/// The daily_stop EventBridge rule fires at 11:00 UTC (= 16:30 IST, Mon-Fri).
 /// 2026-08-08 (operator Quote 14): moved from 11:00 UTC / 16:30 IST with the
-/// 9-hour window. KEEP IN LOCKSTEP with main.tf `daily_stop` schedule_expression.
-pub const STOP_TRIGGER_UTC_HOUR: u32 = 12;
+/// 9-hour window. 2026-10-22 (operator Quote 37, plan item 64): moved back to
+/// 11:00 UTC / 16:30 IST. KEEP IN LOCKSTEP with main.tf `daily_stop`
+/// schedule_expression and the app's
+/// `shutdown_class::SCHEDULED_DAILY_STOP_SECS_OF_DAY_IST`.
+pub const STOP_TRIGGER_UTC_HOUR: u32 = 11;
 pub const STOP_TRIGGER_UTC_MINUTE: u32 = 0;
 /// EC2 start -> running takes <1 min; anything launched more than this many
 /// minutes after the trigger means the scheduled start did NOT do it.
 pub const LATE_START_GRACE_MINUTES: i64 = 5;
 
-/// Operating hours: 08:00-**17:30** IST, Mon-Fri (curfew guard inactive inside).
+/// Operating hours: 08:00-**16:30** IST, Mon-Fri (curfew guard inactive inside).
 ///
 /// 2026-08-08 (operator Quote 14): close moved 17:00 -> 17:30. LOAD-BEARING:
 /// the curfew guard STOPS a box running outside these hours, so a 17:00 close
 /// against a 17:30 EventBridge stop would have curfew-killed the box 30 min
 /// early every day. The 08:00 open is deliberately UNCHANGED — the start stays
 /// 08:30, so the open already has 30 min of slack and no morning schedule moves.
+///
+/// 2026-10-22 (operator Quote 37, plan item 64): close moved back 17:30 ->
+/// 16:30 with the daily stop. The drain hold still keeps a held box up past it.
 pub const OPERATING_OPEN_IST_MINUTES: u32 = 8 * 60;
-pub const OPERATING_CLOSE_IST_MINUTES: u32 = 17 * 60 + 30;
+pub const OPERATING_CLOSE_IST_MINUTES: u32 = 16 * 60 + 30;
+
+/// The daily stop as IST seconds of day (16:30 IST = 59,400), derived from
+/// [`STOP_TRIGGER_UTC_HOUR`] / [`STOP_TRIGGER_UTC_MINUTE`] plus +05:30. The
+/// drain hold's ignored window ends [`DAILY_STOP_JITTER_LEAD_SECS`] before it.
+pub const STOP_TRIGGER_IST_SECS_OF_DAY: i64 = (STOP_TRIGGER_UTC_HOUR as i64) * 3600
+    + (STOP_TRIGGER_UTC_MINUTE as i64) * 60
+    + crate::time::IST_OFFSET_SECS as i64;
+
+/// How long before the daily stop its EventBridge jitter window opens (the
+/// app's `shutdown_class::SCHEDULED_STOP_WINDOW_LEAD_SECS`, 300 s).
+pub const DAILY_STOP_JITTER_LEAD_SECS: i64 = 300;
 /// Grace: never curfew-stop a box within this many minutes of its launch.
 pub const CURFEW_START_GRACE_MINUTES: i64 = 45;
 
@@ -75,6 +99,19 @@ pub struct WatchdogEnv {
     pub dashboard_port: String,
     pub keep_alive_param: String,
     pub holiday_stop_param: String,
+    /// The budget-stop latch (`budget_stop_latch`): the month a budget stop
+    /// happened in. While it names this UTC month the 08:45 self-start is
+    /// skipped, so the watchdog never undoes a budget stop.
+    pub budget_stop_param: String,
+    /// The drain hold (`drain_hold`, operator Quote 31, 2026-10-21): while
+    /// the app reports the day's data is not yet in the database, the 16:30
+    /// daily stop, the 16:45 stop check and the hourly curfew leave the box
+    /// running.
+    pub drain_hold_param: String,
+    /// The rendered Muhurat sessions (`muhurat_window`, plan item J8): the
+    /// `muhurat_check` mode starts and stops the box around each session,
+    /// and the curfew leaves the box alone inside a session window.
+    pub muhurat_sessions: String,
 }
 
 impl WatchdogEnv {
@@ -87,6 +124,13 @@ impl WatchdogEnv {
                 .unwrap_or_else(|_| DEFAULT_KEEP_ALIVE_PARAM.to_string()),
             holiday_stop_param: std::env::var("HOLIDAY_STOP_PARAM")
                 .unwrap_or_else(|_| DEFAULT_HOLIDAY_STOP_PARAM.to_string()),
+            budget_stop_param: std::env::var("BUDGET_STOP_PARAM").unwrap_or_else(|_| {
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string()
+            }),
+            drain_hold_param: std::env::var("DRAIN_HOLD_PARAM")
+                .unwrap_or_else(|_| crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string()),
+            muhurat_sessions: std::env::var(crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+                .unwrap_or_default(),
         }
     }
 }
@@ -385,7 +429,7 @@ pub async fn instance_info<E: Ec2Api>(
 ) -> (String, Option<DateTime<Utc>>) {
     match ec2.describe(instance_id).await {
         Err(exc) => {
-            error!(error = %exc, "describe_instances failed");
+            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances failed");
             ("unknown".to_string(), None)
         }
         Ok(None) => ("not-found".to_string(), None),
@@ -397,7 +441,7 @@ pub async fn instance_info<E: Ec2Api>(
 pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option<String> {
     match ec2.describe(instance_id).await {
         Err(exc) => {
-            error!(error = %exc, "describe_instances for public IP failed");
+            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances for public IP failed");
             None
         }
         Ok(desc) => desc.and_then(|d| d.public_ip).filter(|ip| !ip.is_empty()),
@@ -471,6 +515,7 @@ pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> StartAttem
             let kind = classify_start_failure(&exc);
             match kind {
                 StartFailureKind::CapacityRefusal => error!(
+                    code = "LAMBDA-START-02",
                     error = %exc,
                     "self-heal start_instances REFUSED — AWS has no capacity for this \
                      instance type in the instance's availability zone. Retrying cannot \
@@ -480,7 +525,7 @@ pub async fn try_self_start<E: Ec2Api>(ec2: &E, instance_id: &str) -> StartAttem
                      volume is zone-locked and does not follow, so snapshot first."
                 ),
                 StartFailureKind::Other => {
-                    error!(error = %exc, "self-heal start_instances FAILED");
+                    error!(code = "LAMBDA-START-02", error = %exc, "self-heal start_instances FAILED");
                 }
             }
             StartAttempt::Failed(kind)
@@ -496,7 +541,7 @@ pub async fn try_self_stop<E: Ec2Api>(ec2: &E, instance_id: &str) -> bool {
             true
         }
         Err(exc) => {
-            error!(error = %exc, "self-heal stop_instances FAILED");
+            error!(code = "LAMBDA-START-02", error = %exc, "self-heal stop_instances FAILED");
             false
         }
     }
@@ -521,7 +566,7 @@ pub async fn read_keep_alive_until<S: SsmApi>(ssm: &S, param: &str) -> Option<Da
     }
 }
 
-/// Legacy `_holiday_stop_is_today` — true iff holiday-gate.sh stamped
+/// Legacy `_holiday_stop_is_today` — true iff the holiday gate stamped
 /// TODAY's IST date into the marker. FAIL-OPEN False on any error so a real
 /// trading day can never lose the 08:45 rescue.
 pub async fn holiday_stop_is_today<S: SsmApi>(
@@ -538,6 +583,42 @@ pub async fn holiday_stop_is_today<S: SsmApi>(
     }
 }
 
+/// `true` when the budget-stop latch names the current UTC billing month.
+/// FAIL-OPEN: an unreadable or missing latch keeps the self-start; the
+/// hourly hard-stop guard still stops a breached box from the month-to-date
+/// spend (AWS Budgets since 2026-10-22, plan item 63).
+pub async fn budget_stop_is_this_month<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "budget-stop latch unavailable — treating as not latched");
+            None
+        }
+    };
+    crate::budget_stop_latch::budget_stop_is_latched(raw.as_deref(), now_utc)
+}
+
+/// Read the drain hold (operator Quote 31). A failed read is no hold: the
+/// stop paths then behave exactly as before (the cost-safe direction).
+pub async fn read_drain_hold<S: SsmApi>(
+    ssm: &S,
+    param: &str,
+    now_utc: DateTime<Utc>,
+) -> crate::drain_hold::DrainHold {
+    let raw = match ssm.get_parameter(param).await {
+        Ok(raw) => Some(raw),
+        Err(exc) => {
+            info!(error = %exc, "drain hold unavailable — treating as no hold");
+            None
+        }
+    };
+    crate::drain_hold::drain_hold_verdict(raw.as_deref(), now_utc.timestamp())
+}
+
 /// Legacy `_publish` — skips (with a warning) when the topic ARN is unset.
 async fn publish<N: SnsApi>(
     sns: &N,
@@ -550,6 +631,174 @@ async fn publish<N: SnsApi>(
         return Ok(());
     }
     sns.publish(&env.alerts_topic_arn, subject, message).await
+}
+
+/// A box launched this long before the Muhurat box window opened is not one
+/// `muhurat_check` started, so `muhurat_check` never stops it (the curfew's
+/// own rules then apply).
+pub const MUHURAT_OWN_START_SLACK_MINUTES: i64 = 15;
+
+/// What `muhurat_check` does with a box after the Muhurat window, given what
+/// it read. Pure, so every branch is tested without fakes.
+#[must_use]
+pub fn muhurat_after_window_should_stop(
+    state: &str,
+    launch_time: Option<DateTime<Utc>>,
+    box_start: DateTime<Utc>,
+    keep_alive_active: bool,
+    drain_hold_active: bool,
+) -> bool {
+    if state != "running" || keep_alive_active || drain_hold_active {
+        return false;
+    }
+    // Only a box launched inside (or just before) this window, i.e. the one
+    // this mode started. Unknown launch time: leave it to the curfew.
+    launch_time
+        .is_some_and(|lt| lt >= box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES))
+}
+
+/// `mode = "muhurat_check"` (plan item J8): fired every 15 minutes on each
+/// configured Muhurat date by a dated EventBridge rule. Starts the box inside
+/// the session window, stops the box it started once the window has passed,
+/// and fails closed (coded error, no start) when the session times are not
+/// set. Honours the budget-stop latch, the holiday-stop marker, the
+/// keep-alive override and the drain hold.
+///
+/// **⚠ CHANGED 2026-10-26 (audit PR L4):** a Muhurat date whose times are unset
+/// or malformed now returns `Err` after its coded `LAMBDA-CONFIG-01` line, so
+/// the invocation fails and the Lambda's existing Errors alarm fires. Before,
+/// it returned `Ok`, the box was not started, and nothing paged: a missed
+/// Muhurat session was silent. The box is still never started on that path.
+async fn run_muhurat_check<E: Ec2Api, S: SsmApi, N: SnsApi>(
+    env: &WatchdogEnv,
+    ec2: &E,
+    ssm: &S,
+    sns: &N,
+    now: DateTime<Utc>,
+) -> Result<Value, String> {
+    use crate::muhurat_window::{MuhuratPhase, muhurat_phase, parse_muhurat_sessions};
+    let schedule = parse_muhurat_sessions(&env.muhurat_sessions);
+    match muhurat_phase(now, &schedule) {
+        MuhuratPhase::NotToday => {
+            info!("muhurat_check — no Muhurat session today; nothing to do");
+            Ok(json!({"mode": "muhurat_check", "phase": "not_today", "started": false}))
+        }
+        MuhuratPhase::TimingUnset { date } => {
+            error!(
+                code = "LAMBDA-CONFIG-01",
+                %date,
+                "muhurat_check — today is a Muhurat date but its NSE session times are \
+                 not set (terraform var muhurat_sessions); the box is NOT started. Fill \
+                 the times from NSE's Muhurat circular and apply terraform."
+            );
+            Err(format!(
+                "muhurat_check phase=timing_unset date={date}: Muhurat session times not set; box NOT started"
+            ))
+        }
+        MuhuratPhase::Malformed { entries } => {
+            error!(
+                code = "LAMBDA-CONFIG-01",
+                ?entries,
+                "muhurat_check — MUHURAT_SESSIONS has unreadable entries and none names \
+                 today with valid times; the box is NOT started."
+            );
+            Err(format!(
+                "muhurat_check phase=malformed entries={entries:?}: no valid Muhurat session for today; box NOT started"
+            ))
+        }
+        MuhuratPhase::BeforeWindow { box_start } => {
+            info!(%box_start, "muhurat_check — before today's Muhurat box window");
+            Ok(json!({"mode": "muhurat_check", "phase": "before", "started": false}))
+        }
+        MuhuratPhase::InWindow { box_start, .. } => {
+            let (state, _) = instance_info(ec2, &env.instance_id).await;
+            if matches!(state.as_str(), "running" | "pending" | "stopping") {
+                info!(state = %state, "muhurat_check — box already up (or stopping); nothing to do");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false
+                }));
+            }
+            if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+                info!("muhurat_check — budget-stop latch names this month; not starting");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false, "skipped": "budget_stop"
+                }));
+            }
+            if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await {
+                info!("muhurat_check — holiday-stop marker is today; not starting");
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "in_window", "state": state,
+                    "started": false, "skipped": "holiday_stop"
+                }));
+            }
+            let attempt = try_self_start(ec2, &env.instance_id).await;
+            let started = attempt.started();
+            if started {
+                info!(%box_start, "muhurat_check — box start issued for today's Muhurat session");
+            } else if now - box_start < Duration::minutes(15) {
+                // One page, at the first attempt only: later 15-minute
+                // retries log (LAMBDA-START-02) without paging again.
+                publish(
+                    sns,
+                    env,
+                    "Muhurat auto-start FAILED — box did not start",
+                    "🆘 Today is an NSE Muhurat trading day and the box did NOT start \
+for the special session. I will retry every 15 minutes until the session \
+ends. If it keeps failing, press 'Start instance' on the portal.",
+                )
+                .await?;
+            }
+            Ok(json!({
+                "mode": "muhurat_check", "phase": "in_window", "state": state,
+                "started": started
+            }))
+        }
+        MuhuratPhase::AfterWindow { box_start, .. } => {
+            let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
+            if state != "running" {
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "after", "state": state,
+                    "stopped": false
+                }));
+            }
+            let keep_alive_active = read_keep_alive_until(ssm, &env.keep_alive_param)
+                .await
+                .is_some_and(|until| now < until);
+            let drain_hold_active = matches!(
+                read_drain_hold(ssm, &env.drain_hold_param, now).await,
+                crate::drain_hold::DrainHold::Active { .. }
+            );
+            if !muhurat_after_window_should_stop(
+                &state,
+                launch_time,
+                box_start,
+                keep_alive_active,
+                drain_hold_active,
+            ) {
+                info!(
+                    keep_alive_active,
+                    drain_hold_active,
+                    "muhurat_check — after the window; box left running (held, kept alive, \
+                     or not started by this mode)"
+                );
+                return Ok(json!({
+                    "mode": "muhurat_check", "phase": "after", "state": state,
+                    "stopped": false
+                }));
+            }
+            let stopped = try_self_stop(ec2, &env.instance_id).await;
+            info!(
+                stopped,
+                "muhurat_check — Muhurat window over; box stop issued"
+            );
+            Ok(json!({
+                "mode": "muhurat_check", "phase": "after", "state": state,
+                "stopped": stopped
+            }))
+        }
+    }
 }
 
 /// Legacy `lambda_handler` — the full mode dispatch, driven through the
@@ -567,7 +816,23 @@ pub async fn run_watchdog<E: Ec2Api, S: SsmApi, N: SnsApi>(
     let mode = event.get("mode").and_then(Value::as_str).unwrap_or("check");
     info!(mode, instance = %env.instance_id, "start-watchdog invoked");
 
+    if mode == "muhurat_check" {
+        return run_muhurat_check(env, ec2, ssm, sns, now).await;
+    }
+
     if mode == "ping" {
+        // 2026-11-07: the 08:30 ping said "the app should report live" on a
+        // weekday NSE holiday (the holiday gate stops the box minutes later)
+        // and while a budget stop holds the box down this month. Neither day
+        // starts the app, so the ping stays silent.
+        if !crate::nse_calendar::is_nse_trading_day_at(now) {
+            info!("ping — not an NSE trading day; start message not sent");
+            return Ok(json!({"mode": "ping", "published": false, "skipped": "non_trading_day"}));
+        }
+        if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+            info!("ping — budget stop holds this month; start message not sent");
+            return Ok(json!({"mode": "ping", "published": false, "skipped": "budget_stop"}));
+        }
         let mut message = "🟢 8:30 AM IST instance start triggered (Mon-Fri). \
 The app should report live in ~3 minutes. \
 If you do NOT get a 'tickvault started' message by 8:40 AM, the \
@@ -593,11 +858,60 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         return Ok(json!({"mode": "ping", "published": true}));
     }
 
+    if mode == "daily_stop" {
+        // @ 16:30 IST (operator Quote 31, 2026-10-21): the scheduled stop.
+        // Until then EventBridge fired the SSM stop automation directly,
+        // which could not see the drain hold. Now: a fresh hold keeps the box
+        // running until the app reports the day's data is in the database;
+        // otherwise stop it, with no page (the old automation sent none). A
+        // failed stop is left to the 16:45 stop_check, which pages. An
+        // unknown state (describe failed) still attempts the stop: a stop is
+        // idempotent, and the old SSM automation retried the same way.
+        // 2026-10-26 (audit PR L4): a configured Muhurat window that covers
+        // 16:30 IST keeps the box up, as the curfew and the hard-stop guard
+        // already do; before, the scheduled stop ended a weekday session.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("daily_stop — inside a Muhurat session window; box kept running");
+            return Ok(json!({"mode": "daily_stop", "stopped": false, "skipped": "muhurat"}));
+        }
+        let (state, _) = instance_info(ec2, &env.instance_id).await;
+        if state != "running" && state != "unknown" {
+            info!(state = %state, "daily_stop — instance not running; nothing to do");
+            return Ok(json!({"mode": "daily_stop", "state": state, "stopped": false}));
+        }
+        if let crate::drain_hold::DrainHold::Active { until_unix } =
+            read_drain_hold(ssm, &env.drain_hold_param, now).await
+        {
+            info!(
+                until_unix,
+                "daily_stop — drain hold active, box kept running"
+            );
+            return Ok(json!({
+                "mode": "daily_stop", "state": state, "stopped": false,
+                "skipped": "drain_hold"
+            }));
+        }
+        let stopped = try_self_stop(ec2, &env.instance_id).await;
+        if !stopped {
+            error!(
+                code = "LAMBDA-START-02",
+                "daily_stop — stop attempt FAILED; the 16:45 stop_check will retry and page"
+            );
+        }
+        return Ok(json!({"mode": "daily_stop", "state": state, "stopped": stopped}));
+    }
+
     if mode == "stop_check" {
-        // @ 17:45 IST: verify the 17:30 daily_stop actually stopped the box.
-        // Self-heal rule: stop ONLY a box launched BEFORE today's 17:30
+        // @ 16:45 IST: verify the 16:30 daily_stop actually stopped the box.
+        // Self-heal rule: stop ONLY a box launched BEFORE today's 16:30
         // trigger; a box launched AFTER it is a deliberate manual evening
         // session and is NEVER touched.
+        // 2026-10-26 (audit PR L4): inside a Muhurat window the box is up on
+        // purpose (daily_stop skipped it); never stop or page.
+        if crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions) {
+            info!("stop_check — inside a Muhurat session window; box deliberately running");
+            return Ok(json!({"mode": "stop_check", "alerted": false, "skipped": "muhurat"}));
+        }
         let (state, launch_time) = instance_info(ec2, &env.instance_id).await;
         if state != "running" {
             info!(state = %state, "stop_check OK — instance not running; staying silent");
@@ -609,49 +923,76 @@ If you do NOT get a 'tickvault started' message by 8:40 AM, the \
         {
             info!(
                 launch_time = %lt,
-                "stop_check — running but launched after 17:30 IST: manual evening session, leaving it alone"
+                "stop_check — running but launched after 16:30 IST: manual evening session, leaving it alone"
             );
             return Ok(json!({"mode": "stop_check", "state": state, "alerted": false}));
+        }
+        // Operator Quote 31 (2026-10-21): read the drain hold before any
+        // stop or page. A fresh hold means the 16:30 stop was deliberately
+        // skipped while the day's data drains — silent.
+        let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now).await;
+        if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+            info!(
+                until_unix,
+                "stop_check — drain hold active; box deliberately still running"
+            );
+            return Ok(json!({
+                "mode": "stop_check", "state": state, "alerted": false,
+                "skipped": "drain_hold"
+            }));
         }
         let Some(_) = launch_time else {
             // Can't prove it isn't a manual session — page, don't stop.
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — box still running",
-                "🆘 The 5:30 PM IST auto-stop did NOT stop the box and I could \
+                "16:30 auto-stop FAILED — box still running",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box and I could \
 not read its launch time, so I won't risk killing a manual \
 session. If you are NOT using it right now, press \
 'Stop instance' on the portal — it bills every hour it runs.",
             )
             .await?;
-            error!("stop_check FAILED — running, launch_time unknown — paged");
+            error!(
+                code = "LAMBDA-START-01",
+                "stop_check FAILED — running, launch_time unknown — paged"
+            );
             return Ok(json!({
                 "mode": "stop_check", "state": state, "alerted": true, "self_stopped": false
             }));
         };
         let self_stopped = try_self_stop(ec2, &env.instance_id).await;
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended: a SUCCESSFUL stop here is the
+        // expected end of the drain, so no page. A failed stop still pages.
+        if self_stopped && drain_hold.silences_stop_of(launch_time.map(|t| t.timestamp())) {
+            info!("stop_check — drain hold ended; stopped without a page");
+            return Ok(json!({
+                "mode": "stop_check", "state": state, "alerted": false,
+                "self_stopped": true, "drain_hold": "ended"
+            }));
+        }
         if self_stopped {
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — watchdog stopped the box itself",
-                "🆘 The 5:30 PM IST auto-stop did NOT stop the box (it had been \
-running since before 5:30 PM). I have sent the stop command \
+                "16:30 auto-stop FAILED — watchdog stopped the box itself",
+                "🆘 The 4:30 PM IST auto-stop did NOT stop the box (it had been \
+running since before 4:30 PM). I have sent the stop command \
 myself. If you WANTED it running this evening, just press \
 'Start instance' on the portal — a box you start manually \
-after 5:30 PM is never auto-stopped. Also investigate why the \
-5:30 PM stop failed: AWS console → Systems Manager → \
-Automation executions for AWS-StopEC2Instance.",
+after 4:30 PM is never auto-stopped. Also investigate why the \
+4:30 PM stop failed: AWS console → CloudWatch → Log groups → \
+/aws/lambda/tv-prod-start-watchdog (the daily_stop run at 4:30 PM).",
             )
             .await?;
         } else {
             publish(
                 sns,
                 env,
-                "17:30 auto-stop FAILED — manual stop NEEDED",
+                "16:30 auto-stop FAILED — manual stop NEEDED",
                 &format!(
-                    "🆘 The 5:30 PM IST auto-stop did NOT stop the box — and the \
+                    "🆘 The 4:30 PM IST auto-stop did NOT stop the box — and the \
 watchdog's own stop attempt ALSO failed. Press 'Stop instance' \
 on the portal, or run \
 `aws ec2 stop-instances --instance-ids {} \
@@ -662,8 +1003,8 @@ on the portal, or run \
             .await?;
         }
         error!(
-            self_stopped,
-            "stop_check FAILED — instance running past stop — paged"
+            code = "LAMBDA-START-01",
+            self_stopped, "stop_check FAILED — instance running past stop — paged"
         );
         return Ok(json!({
             "mode": "stop_check", "state": state, "alerted": true, "self_stopped": self_stopped
@@ -672,7 +1013,11 @@ on the portal, or run \
 
     if mode == "curfew_check" {
         // Hourly, active OUTSIDE 08:00-17:00 IST Mon-Fri (and all weekend).
-        if is_within_operating_hours(now) {
+        // Plan item J8: a configured Muhurat session window counts as
+        // operating hours, so the curfew never stops the box mid-session.
+        if is_within_operating_hours(now)
+            || crate::muhurat_window::in_muhurat_up_window_raw(now, &env.muhurat_sessions)
+        {
             info!("curfew_check — inside operating hours; guard inactive");
             return Ok(json!({
                 "mode": "curfew_check", "skipped": "operating_hours", "stopped": false
@@ -694,6 +1039,20 @@ on the portal, or run \
             return Ok(json!({
                 "mode": "curfew_check", "state": state, "stopped": false,
                 "skipped": "keep_alive"
+            }));
+        }
+        // Operator Quote 31 (2026-10-21): a fresh drain hold keeps the box
+        // running while the day's data drains (never from 07:30 IST, see
+        // `drain_hold`), exactly like the keep-alive above.
+        let drain_hold = read_drain_hold(ssm, &env.drain_hold_param, now).await;
+        if let crate::drain_hold::DrainHold::Active { until_unix } = drain_hold {
+            info!(
+                until_unix,
+                "curfew_check — drain hold active; leaving the box alone"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": false,
+                "skipped": "drain_hold"
             }));
         }
         if let Some(lt) = launch_time
@@ -725,12 +1084,29 @@ it bills every hour it runs."
                 ),
             )
             .await?;
-            error!("curfew_check — running, launch_time unknown — paged, not stopped");
+            error!(
+                code = "LAMBDA-START-01",
+                "curfew_check — running, launch_time unknown — paged, not stopped"
+            );
             return Ok(json!({
                 "mode": "curfew_check", "state": state, "stopped": false, "alerted": true
             }));
         };
         let self_stopped = try_self_stop(ec2, &env.instance_id).await;
+        // The box was held tonight, was already running when the hold was
+        // written, and the hold has ended (or 07:30 IST passed): a SUCCESSFUL
+        // stop here is the expected end of the drain, so no page. A failed
+        // stop still takes the manual-stop page below.
+        if self_stopped && drain_hold.silences_stop_of(launch_time.map(|t| t.timestamp())) {
+            info!(
+                now_ist = %now_ist,
+                "curfew_check — drain hold ended; stopped without a page"
+            );
+            return Ok(json!({
+                "mode": "curfew_check", "state": state, "stopped": true,
+                "alerted": false, "drain_hold": "ended"
+            }));
+        }
         if self_stopped {
             publish(
                 sns,
@@ -761,7 +1137,10 @@ with no keep-alive, and my stop attempt FAILED. Press \
                 ),
             )
             .await?;
-            error!("curfew_check — stop attempt FAILED — manual stop paged");
+            error!(
+                code = "LAMBDA-START-02",
+                "curfew_check — stop attempt FAILED — manual stop paged"
+            );
         }
         return Ok(json!({
             "mode": "curfew_check", "state": state, "stopped": self_stopped, "alerted": true
@@ -796,7 +1175,7 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
                 ),
             )
             .await?;
-            error!(launch_time = %lt, "check — running but launched LATE — paged");
+            error!(code = "LAMBDA-START-01", launch_time = %lt, "check — running but launched LATE — paged");
             return Ok(json!({
                 "mode": "check", "state": state, "alerted": true, "self_started": false
             }));
@@ -807,17 +1186,67 @@ for AWS-StartEC2Instance, and the EventBridge rule's FailedInvocations."
         }));
     }
 
+    // 2026-11-07 (review of the holiday fixes): on a weekday NSE holiday the
+    // box is meant to be stopped, so a missing holiday marker (the gate's
+    // marker write failed, or the 08:30 start never ran) must not start it
+    // here and page. The compiled calendar decides first, as the ping does.
+    if !crate::nse_calendar::is_nse_trading_day_at(now) {
+        info!(state = %state, "check — not an NSE trading day; no self-start, no page");
+        return Ok(json!({
+            "mode": "check", "state": state, "alerted": false, "self_started": false,
+            "skipped": "non_trading_day"
+        }));
+    }
+
     // Box is NOT running at 08:45 IST. NSE-holiday intentional stop: marker
     // == today -> the stop is intentional: stay silent, do NOT self-start.
     // FAIL-OPEN: a missing/stale/unreadable marker keeps the self-heal.
     if holiday_stop_is_today(ssm, &env.holiday_stop_param, now).await {
         info!(
             state = %state,
-            "check — box is stopped but the holiday-stop marker is TODAY (NSE-holiday self-stop by holiday-gate.sh); staying silent"
+            "check — box is stopped but the holiday-stop marker is TODAY (NSE-holiday self-stop by the holiday gate); staying silent"
         );
         return Ok(json!({
             "mode": "check", "state": state, "alerted": false, "self_started": false,
             "skipped": "holiday_stop"
+        }));
+    }
+
+    // Budget stop (audit PR30): the hourly guard or the AWS-Budgets
+    // kill-switch stopped the box this billing month and latched it.
+    // Starting it would only run until the guard stops it again, paging
+    // both ways every morning. So no self-start, and one short note each
+    // trading morning instead of the Critical "box down" page, so a stopped
+    // box on a trading day is never silent.
+    if budget_stop_is_this_month(ssm, &env.budget_stop_param, now).await {
+        info!(
+            state = %state,
+            "check — box is stopped and the budget-stop latch names this month; not self-starting"
+        );
+        let month = crate::budget_stop_latch::billing_month_utc(now);
+        let message = format!(
+            "⏸ *Box is off today: the monthly budget stop for {month} holds*\n\
+The box stays off until the next billing month. Nothing to do unless you want it \
+back sooner: delete the parameter {param} and enable the daily-start rule.\n",
+            param = env.budget_stop_param,
+        );
+        let noted = match publish(
+            sns,
+            env,
+            "[BUDGET] box off today — budget stop holds",
+            &message,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "could not send the budget-stop morning note");
+                false
+            }
+        };
+        return Ok(json!({
+            "mode": "check", "state": state, "alerted": noted, "self_started": false,
+            "skipped": "budget_stop"
         }));
     }
 
@@ -888,7 +1317,7 @@ failed. Market opens 9:15 AM. Start it NOW: portal 'Start instance' or \
         .await?;
     }
     let self_started = attempt.started();
-    error!(state = %state, self_started, "check FAILED — operator paged");
+    error!(code = "LAMBDA-START-01", state = %state, self_started, "check FAILED — operator paged");
     Ok(json!({
         "mode": "check", "state": state, "alerted": true, "self_started": self_started
     }))
@@ -955,7 +1384,9 @@ impl Ec2Api for SdkEc2 {
 }
 
 pub struct SdkSsm {
-    client: aws_sdk_ssm::Client,
+    /// `pub(crate)` since 2026-10-20 so the deploy-watchdog reads the same
+    /// holiday-stop marker through [`holiday_stop_is_today`] instead of a copy.
+    pub(crate) client: aws_sdk_ssm::Client,
 }
 
 impl SsmApi for SdkSsm {
@@ -1146,32 +1577,55 @@ mod tests {
         }
     }
 
+    /// SSM fake keyed on the parameter NAME (2026-10-21), so the keep-alive,
+    /// holiday, budget-stop and drain-hold parameters are distinct: a value
+    /// set for one is never what another read receives.
     struct FakeSsm {
-        value: Option<String>,
+        values: std::collections::HashMap<String, String>,
         raises: bool,
     }
 
     impl FakeSsm {
-        fn with(value: Option<&str>) -> Self {
+        /// No parameter exists (every read is ParameterNotFound).
+        fn empty() -> Self {
             Self {
-                value: value.map(str::to_string),
+                values: std::collections::HashMap::new(),
                 raises: false,
             }
         }
         fn raising() -> Self {
             Self {
-                value: None,
                 raises: true,
+                ..Self::empty()
             }
+        }
+        fn set(mut self, name: &str, value: &str) -> Self {
+            self.values.insert(name.to_string(), value.to_string());
+            self
+        }
+        fn keep_alive(self, value: &str) -> Self {
+            self.set(DEFAULT_KEEP_ALIVE_PARAM, value)
+        }
+        fn holiday(self, value: &str) -> Self {
+            self.set(DEFAULT_HOLIDAY_STOP_PARAM, value)
+        }
+        fn budget(self, value: &str) -> Self {
+            self.set(crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM, value)
+        }
+        fn drain_hold(self, value: &str) -> Self {
+            self.set(crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM, value)
         }
     }
 
     impl SsmApi for FakeSsm {
-        async fn get_parameter(&self, _name: &str) -> Result<String, String> {
-            if self.raises || self.value.is_none() {
-                return Err("ParameterNotFound".to_string());
+        async fn get_parameter(&self, name: &str) -> Result<String, String> {
+            if self.raises {
+                return Err("AccessDenied".to_string());
             }
-            Ok(self.value.clone().unwrap_or_default())
+            self.values
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "ParameterNotFound".to_string())
         }
     }
 
@@ -1182,6 +1636,9 @@ mod tests {
             dashboard_port: "3001".to_string(),
             keep_alive_param: DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             holiday_stop_param: DEFAULT_HOLIDAY_STOP_PARAM.to_string(),
+            budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
+            drain_hold_param: crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM.to_string(),
+            muhurat_sessions: String::new(),
         }
     }
 
@@ -1228,6 +1685,51 @@ mod tests {
         // Stale-wording regression lock: the schedule is 08:30 IST, not 08:00.
         assert!(published[0].message.contains("8:30"));
         assert!(!published[0].message.contains("08:00"));
+    }
+
+    /// Regression (2026-11-07): no "start triggered, app should report live"
+    /// on a weekday NSE holiday (Tue 2026-11-10 08:30 IST) or while a budget
+    /// stop holds this month; a normal weekday still sends it.
+    #[tokio::test]
+    async fn test_regression_ping_silent_on_holiday_and_budget_stop() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).ip("13.200.1.2");
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::raising(),
+            &sns,
+            utc(2026, 11, 10, 3, 0),
+        )
+        .await;
+        assert_eq!(out["published"], json!(false));
+        assert_eq!(out["skipped"], json!("non_trading_day"));
+
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::empty().budget("2026-06"),
+            &sns,
+            in_window_now(),
+        )
+        .await;
+        assert_eq!(out["published"], json!(false));
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(sns.published.borrow().is_empty());
+
+        let out = run(
+            json!({"mode": "ping"}),
+            &ec2,
+            &FakeSsm::empty().budget("2026-05"),
+            &sns,
+            in_window_now(),
+        )
+        .await;
+        assert_eq!(
+            out["published"],
+            json!(true),
+            "a stale latch never silences it"
+        );
     }
 
     #[tokio::test]
@@ -1520,7 +2022,7 @@ mod tests {
         // self-start, no Critical page. in_window_now is 08:45 IST 2026-06-10.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-06-10"));
+        let ssm = FakeSsm::empty().holiday("2026-06-10");
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["alerted"], json!(false));
         assert_eq!(out["self_started"], json!(false));
@@ -1530,15 +2032,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_stopped_on_nse_holiday_without_marker_stays_silent_no_start() {
+        // Tue 2026-11-10 is an NSE holiday; 03:15 UTC = 08:45 IST. The holiday
+        // marker is missing (its write failed, or the 08:30 start never ran):
+        // the calendar alone must keep the box stopped and the pager quiet.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::empty();
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 10, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(false));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["skipped"], json!("non_trading_day"));
+        assert!(ec2.start_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+        // The trading day after it still self-heals with no marker.
+        let out = run(
+            json!({"mode": "check"}),
+            &ec2,
+            &ssm,
+            &sns,
+            utc(2026, 11, 11, 3, 15),
+        )
+        .await;
+        assert_eq!(out["self_started"], json!(true));
+    }
+
+    #[tokio::test]
     async fn test_check_stopped_stale_holiday_marker_still_self_starts() {
         // A previous holiday's marker never matches today -> normal self-heal.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("stopped"));
-        let ssm = FakeSsm::with(Some("2026-06-09")); // yesterday's holiday
+        let ssm = FakeSsm::empty().holiday("2026-06-09"); // yesterday's holiday
         let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
         assert_eq!(out["alerted"], json!(true));
         assert_eq!(out["self_started"], json!(true));
         assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+    }
+
+    /// 2026-10-20: `holiday_stop_is_today` directly, the read the
+    /// deploy-watchdog now shares (moved here from `deploy_watchdog.rs`, next
+    /// to the checks above that drive it through `run`). The marker blocks
+    /// only on today's IST date; an older, empty, missing or unreadable
+    /// marker fails open.
+    #[tokio::test]
+    async fn holiday_marker_blocks_only_on_todays_ist_date() {
+        // 2026-10-20 03:10 UTC = 08:40 IST on the NSE holiday.
+        let now = utc(2026, 10, 20, 3, 10);
+        for (ssm, blocks) in [
+            (FakeSsm::empty().holiday("2026-10-20"), true),
+            (FakeSsm::empty().holiday(" 2026-10-20\n"), true),
+            (FakeSsm::empty().holiday("2026-10-19"), false),
+            (FakeSsm::empty().holiday("2026-10-02"), false),
+            (FakeSsm::empty().holiday(""), false),
+            (FakeSsm::empty(), false),
+            (FakeSsm::raising(), false),
+        ] {
+            assert_eq!(
+                holiday_stop_is_today(&ssm, DEFAULT_HOLIDAY_STOP_PARAM, now).await,
+                blocks,
+                "marker {:?} (raises: {})",
+                ssm.values,
+                ssm.raises
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Budget-stop latch (audit PR30). FakeSsm is keyed on the parameter
+    // name (2026-10-21), so "2026-06" is the latch for June and only the
+    // latch read receives it.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_latch_skips_the_self_start() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::empty().budget("2026-06");
+        let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_started"], json!(false));
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(ec2.start_calls.borrow().is_empty()); // the budget stop holds
+        // One short note, never the Critical "box down" page.
+        let published = sns.published.borrow();
+        assert_eq!(published.len(), 1);
+        assert!(published[0].subject.contains("budget stop holds"));
+        assert!(
+            published[0]
+                .message
+                .contains("budget stop for 2026-06 holds")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_last_months_latch_still_self_starts() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let ssm = FakeSsm::empty().budget("2026-05");
+        let out = run(json!({"mode": "check"}), &ec2, &ssm, &sns, in_window_now()).await;
+        assert_eq!(out["self_started"], json!(true));
+        assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_budget_stop_is_this_month_fails_open_on_a_read_error() {
+        assert!(
+            !budget_stop_is_this_month(
+                &FakeSsm::raising(),
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM,
+                in_window_now()
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1565,14 +2177,16 @@ mod tests {
     // the old values, 11:46 UTC (17:16 IST) is now BEFORE the stop trigger, so
     // a deliberate manual evening session would have been misread as a box
     // left running since morning and stopped.
+    // 2026-10-22 (Quote 37, plan item 64): back to 11:00 UTC (16:30 IST) and
+    // 11:15 UTC (16:45 IST); the fixtures move with them again.
     fn stop_check_now() -> DateTime<Utc> {
-        utc(2026, 6, 10, 12, 15) // 17:45 IST — the stop_check slot
+        utc(2026, 6, 10, 11, 15) // 16:45 IST — the stop_check slot
     }
     fn morning_launch() -> DateTime<Utc> {
         utc(2026, 6, 10, 3, 13) // 08:43 IST — since morning
     }
     fn evening_launch() -> DateTime<Utc> {
-        utc(2026, 6, 10, 12, 16) // manual 17:46 IST — AFTER the 17:30 stop
+        utc(2026, 6, 10, 11, 16) // manual 16:46 IST — AFTER the 16:30 stop
     }
 
     #[tokio::test]
@@ -1717,7 +2331,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -1735,7 +2349,7 @@ mod tests {
         // Explicit keep-alive in the future -> the operator WANTS it running.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-03T06:00:00+05:30")); // tomorrow 6 AM IST
+        let ssm = FakeSsm::empty().keep_alive("2026-07-03T06:00:00+05:30"); // tomorrow 6 AM IST
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -1755,7 +2369,7 @@ mod tests {
         // A keep-alive that already lapsed no longer protects the box.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-02T20:00:00+05:30")); // 8 PM IST — past
+        let ssm = FakeSsm::empty().keep_alive("2026-07-02T20:00:00+05:30"); // 8 PM IST — past
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -1773,7 +2387,7 @@ mod tests {
         // Operator pastes a plain IST timestamp with no offset — honored.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("2026-07-03T06:00:00")); // naive -> IST -> future
+        let ssm = FakeSsm::empty().keep_alive("2026-07-03T06:00:00"); // naive -> IST -> future
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -2013,7 +2627,7 @@ mod tests {
         // Garbage in the param must not silently disable budget protection.
         let sns = FakeSns::default();
         let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
-        let ssm = FakeSsm::with(Some("not-a-timestamp"));
+        let ssm = FakeSsm::empty().keep_alive("not-a-timestamp");
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
@@ -2033,7 +2647,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2053,7 +2667,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             market_hours_now(),
         )
@@ -2073,7 +2687,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             weekend_now(),
         )
@@ -2089,7 +2703,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2107,7 +2721,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2131,7 +2745,7 @@ mod tests {
         let out = run(
             json!({"mode": "curfew_check"}),
             &ec2,
-            &FakeSsm::with(None),
+            &FakeSsm::empty(),
             &sns,
             curfew_night_now(),
         )
@@ -2145,7 +2759,7 @@ mod tests {
 
     #[test]
     fn test_operating_hours_boundaries() {
-        // Pin the exact window: [08:00, 17:00) IST, Mon-Fri only.
+        // Pin the exact window: [08:00, 16:30) IST, Mon-Fri only.
         let ist_tz = FixedOffset::east_opt(crate::time::IST_OFFSET_SECS).expect("ist offset");
         let at = |y: i32, mo: u32, d: u32, h: u32, mi: u32| {
             ist_tz
@@ -2161,10 +2775,970 @@ mod tests {
         // 17:29 are now INSIDE and only 17:30 is out. The 17:00 assert is kept
         // (inverted) as the regression pin: if the close slips back, the curfew
         // guard stops the box 30 min before its scheduled 17:30 stop.
-        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 0)));
-        assert!(is_within_operating_hours(at(2026, 7, 1, 17, 29)));
-        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 30)));
+        // 2026-10-22 (Quote 37, plan item 64): close moved back to 16:30, so
+        // 16:29 is the last inside minute and 16:30 and 17:00 are out.
+        assert!(is_within_operating_hours(at(2026, 7, 1, 16, 29)));
+        assert!(!is_within_operating_hours(at(2026, 7, 1, 16, 30)));
+        assert!(!is_within_operating_hours(at(2026, 7, 1, 17, 0)));
         // Sunday midday is never operating hours.
         assert!(!is_within_operating_hours(at(2026, 7, 5, 12, 0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Drain hold (operator Quote 31, 2026-10-21): the 16:30 daily_stop, the
+    // 16:45 stop_check and the hourly curfew leave the box running while the
+    // app holds it, and stop it WITHOUT a page once a hold has ended.
+    // -----------------------------------------------------------------------
+
+    fn hold(state: &str, until: DateTime<Utc>, written: DateTime<Utc>) -> String {
+        format!(
+            r#"{{"v":1,"state":"{state}","until_unix":{},"written_unix":{},"left":"12 buckets"}}"#,
+            until.timestamp(),
+            written.timestamp()
+        )
+    }
+
+    // Wed 2026-06-10 16:30 IST — the daily_stop slot (17:30 until 2026-10-22).
+    fn daily_stop_now() -> DateTime<Utc> {
+        utc(2026, 6, 10, 11, 0)
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_stopped_box_is_a_silent_noop() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["mode"], json!("daily_stop"));
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    // Regression: 2026-10-26 (audit PR L4) — the 16:30 daily_stop and the
+    // 16:45 stop_check did not skip a Muhurat window (only the curfew and the
+    // hard-stop guard did), so a weekday Muhurat session was stopped mid-run.
+    #[tokio::test]
+    async fn test_regression_daily_stop_and_stop_check_skip_a_muhurat_window() {
+        // Monday 9 Nov 2026, session 15:00-16:30 IST: box window 14:00-17:30.
+        let raw = "2026-11-09@15:00-16:30";
+        for (mode, now) in [
+            ("daily_stop", utc(2026, 11, 9, 11, 0)),  // 16:30 IST
+            ("stop_check", utc(2026, 11, 9, 11, 15)), // 16:45 IST
+        ] {
+            let sns = FakeSns::default();
+            let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 9, 8, 30));
+            let out = run_watchdog(
+                &json!({ "mode": mode }),
+                &muhurat_env(raw),
+                &ec2,
+                &FakeSsm::empty(),
+                &sns,
+                now,
+            )
+            .await
+            .expect("run_watchdog");
+            assert_eq!(out["skipped"], json!("muhurat"), "{mode}");
+            assert!(ec2.stop_calls.borrow().is_empty(), "{mode} must not stop");
+            assert!(sns.published.borrow().is_empty(), "{mode} must not page");
+        }
+        // Outside the window (a later date) the same daily_stop stops.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 10, 3, 0));
+        let out = run_watchdog(
+            &json!({"mode": "daily_stop"}),
+            &muhurat_env(raw),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 10, 11, 0),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["stopped"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_no_hold_stops_silently() {
+        // The old SSM stop automation sent no page; neither does this.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_an_unreadable_hold_still_stops() {
+        // Fail toward stopping: an SSM error is no hold.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::raising(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(true));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_an_active_hold_keeps_the_box_running() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(10),
+            now - Duration::minutes(1),
+        ));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_with_a_released_hold_stops_silently() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(1),
+            now - Duration::minutes(1),
+        ));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_failure_is_left_to_the_stop_check_without_a_page() {
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(morning_launch())
+            .stop_raises();
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_active_hold_is_silent_and_never_stops() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(20),
+            now - Duration::minutes(2),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_active_hold_also_covers_an_unknown_launch_time() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"));
+        let ssm = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(20), now));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_stops_without_a_page() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        // An expired "holding" record written minutes ago: the hold lapsed.
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now - Duration::minutes(1),
+            now - Duration::minutes(4),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_with_unknown_launch_still_pages_without_stopping() {
+        // The existing never-kill-a-possible-manual-session rule still wins.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"));
+        let ssm = FakeSsm::empty().drain_hold(&hold("released", now, now));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_stale_hold_keeps_the_existing_page() {
+        // A record from yesterday is no hold: unchanged stop + page.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(morning_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::hours(20),
+            now - Duration::hours(20),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("stopped the box itself")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_active_hold_leaves_the_box_alone() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(15),
+            now - Duration::minutes(3),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_stops_without_a_page() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(40),
+            now - Duration::minutes(40),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(out["drain_hold"], json!("ended"));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_at_0735_ist_stops_a_box_still_held_overnight() {
+        // The hard bound: from 07:30 IST a hold is ignored, so the 07:35
+        // curfew stops the box (silently, it was held tonight) and the 08:30
+        // start boots it fresh.
+        let now = utc(2026, 7, 3, 2, 5); // Fri 07:35 IST
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "holding",
+            now + Duration::minutes(30),
+            now - Duration::minutes(5),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(false));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_curfew_keep_alive_and_drain_hold_are_distinct_parameters() {
+        // A drain-hold value is never read as the keep-alive, and a stale
+        // drain hold leaves the existing curfew page in place.
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(curfew_old_launch());
+        let ssm = FakeSsm::empty()
+            .keep_alive("2026-07-02T20:00:00+05:30") // expired
+            .drain_hold(&hold(
+                "released",
+                now - Duration::days(2),
+                now - Duration::days(2),
+            ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("Curfew auto-stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_drain_hold_reads_its_own_parameter_and_fails_toward_no_hold() {
+        use crate::drain_hold::{DEFAULT_DRAIN_HOLD_PARAM, DrainHold};
+        let now = curfew_night_now();
+        let raw = hold("holding", now + Duration::minutes(5), now);
+        let active = FakeSsm::empty().drain_hold(&raw);
+        assert_eq!(
+            read_drain_hold(&active, DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::Active {
+                until_unix: (now + Duration::minutes(5)).timestamp()
+            }
+        );
+        // The same record under ANOTHER name is not the drain hold.
+        let elsewhere = FakeSsm::empty().keep_alive(&raw);
+        assert_eq!(
+            read_drain_hold(&elsewhere, DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+        assert_eq!(
+            read_drain_hold(&FakeSsm::raising(), DEFAULT_DRAIN_HOLD_PARAM, now).await,
+            DrainHold::None
+        );
+    }
+
+    // --- Review fixes (2026-10-21): silence only a SUCCESSFUL stop of the box
+    // that was running when the hold was written; daily_stop on an unknown
+    // state still attempts the stop.
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_failed_stop_still_pages_manual() {
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(morning_launch())
+            .stop_raises();
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(2),
+            now - Duration::minutes(2),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(false));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("manual stop NEEDED")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_check_ended_hold_does_not_silence_a_later_session() {
+        // Launched 16:20 IST, after the 16:10 IST hold write: another session.
+        let now = stop_check_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 6, 10, 10, 50));
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            utc(2026, 6, 10, 10, 40),
+            utc(2026, 6, 10, 10, 40),
+        ));
+        let out = run(json!({"mode": "stop_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["alerted"], json!(true));
+        assert_eq!(out["self_stopped"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("stopped the box itself")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_failed_stop_still_pages_manual() {
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("running"))
+            .launch(curfew_old_launch())
+            .stop_raises();
+        let ssm = FakeSsm::empty().drain_hold(&hold(
+            "released",
+            now - Duration::minutes(40),
+            now - Duration::minutes(40),
+        ));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("manual stop NEEDED")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_curfew_ended_hold_does_not_silence_a_later_session() {
+        // Box launched 50 min ago (past the 45-min grace), 5 min AFTER the
+        // hold record was written: a different session, so it pages.
+        let now = curfew_night_now();
+        let sns = FakeSns::default();
+        let launch = now - Duration::minutes(50);
+        let ec2 = FakeEc2::new(Some("running")).launch(launch);
+        let written = launch - Duration::minutes(5);
+        let ssm = FakeSsm::empty().drain_hold(&hold("released", written, written));
+        let out = run(json!({"mode": "curfew_check"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(out["alerted"], json!(true));
+        assert!(
+            sns.published.borrow()[0]
+                .subject
+                .contains("Curfew auto-stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_unknown_state_still_attempts_the_stop() {
+        // describe failed: the stop is idempotent, so attempt it.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(None);
+        let out = run(
+            json!({"mode": "daily_stop"}),
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            daily_stop_now(),
+        )
+        .await;
+        assert_eq!(out["state"], json!("unknown"));
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daily_stop_unknown_state_with_an_active_hold_is_skipped() {
+        let now = daily_stop_now();
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(None);
+        let ssm = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(10), now));
+        let out = run(json!({"mode": "daily_stop"}), &ec2, &ssm, &sns, now).await;
+        assert_eq!(out["skipped"], json!("drain_hold"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    // ---- plan item J8: Muhurat session start/stop (muhurat_check) --------
+
+    /// 2026-11-08 (Sunday) 14:05-15:30 IST: box window 13:05-16:30 IST =
+    /// 07:35-11:00 UTC.
+    const MUHURAT: &str = "2026-11-08@14:05-15:30";
+
+    fn muhurat_env(raw: &str) -> WatchdogEnv {
+        WatchdogEnv {
+            muhurat_sessions: raw.to_string(),
+            ..test_env()
+        }
+    }
+
+    async fn run_muhurat(
+        raw: &str,
+        ec2: &FakeEc2,
+        ssm: &FakeSsm,
+        sns: &FakeSns,
+        now: DateTime<Utc>,
+    ) -> Value {
+        run_watchdog(
+            &json!({"mode": "muhurat_check"}),
+            &muhurat_env(raw),
+            ec2,
+            ssm,
+            sns,
+            now,
+        )
+        .await
+        .expect("run_watchdog")
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_starts_a_stopped_box_inside_the_window() {
+        let (ec2, sns) = (FakeEc2::new(Some("stopped")), FakeSns::default());
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 7, 45),
+        )
+        .await;
+        assert_eq!(out["phase"], json!("in_window"));
+        assert_eq!(out["started"], json!(true));
+        assert_eq!(*ec2.start_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_leaves_a_running_box_alone() {
+        let ec2 = FakeEc2::new(Some("running"));
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 8, 0),
+        )
+        .await;
+        assert_eq!(out["started"], json!(false));
+        assert!(ec2.start_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_before_window_and_other_day_never_start() {
+        for (raw, now, phase) in [
+            (MUHURAT, utc(2026, 11, 8, 7, 30), "before"), // 13:00 IST
+            (MUHURAT, utc(2026, 11, 9, 8, 0), "not_today"),
+            ("", utc(2026, 11, 8, 8, 0), "not_today"),
+        ] {
+            let ec2 = FakeEc2::new(Some("stopped"));
+            let out = run_muhurat(raw, &ec2, &FakeSsm::empty(), &FakeSns::default(), now).await;
+            assert_eq!(out["phase"], json!(phase), "{raw} {now}");
+            assert!(ec2.start_calls.borrow().is_empty(), "{raw} {now}");
+        }
+    }
+
+    // Regression: 2026-10-26 (audit PR L4) — an unset or malformed Muhurat
+    // session returned Ok, so the box stayed off and no alarm fired. It now
+    // returns Err (the Lambda Errors alarm pages) and still never starts.
+    #[tokio::test]
+    async fn test_regression_muhurat_config_error_returns_err_and_never_starts() {
+        for (raw, phase) in [
+            ("2026-11-08@-", "timing_unset"),
+            ("2026-11-08@15:30-14:05", "malformed"),
+        ] {
+            let ec2 = FakeEc2::new(Some("stopped"));
+            let out = run_watchdog(
+                &json!({"mode": "muhurat_check"}),
+                &muhurat_env(raw),
+                &ec2,
+                &FakeSsm::empty(),
+                &FakeSns::default(),
+                utc(2026, 11, 8, 8, 0),
+            )
+            .await;
+            let err = out.expect_err("a Muhurat config error must fail the invocation");
+            assert!(err.contains(phase), "{raw}: {err}");
+            assert!(ec2.start_calls.borrow().is_empty(), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_respects_the_budget_stop_and_holiday_marker() {
+        let now = utc(2026, 11, 8, 8, 0);
+        let budget = FakeSsm::empty().budget("2026-11");
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run_muhurat(MUHURAT, &ec2, &budget, &FakeSns::default(), now).await;
+        assert_eq!(out["skipped"], json!("budget_stop"));
+        assert!(ec2.start_calls.borrow().is_empty());
+
+        let holiday = FakeSsm::empty().holiday("2026-11-08");
+        let ec2 = FakeEc2::new(Some("stopped"));
+        let out = run_muhurat(MUHURAT, &ec2, &holiday, &FakeSns::default(), now).await;
+        assert_eq!(out["skipped"], json!("holiday_stop"));
+        assert!(ec2.start_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_failed_start_pages_once_at_the_first_attempt() {
+        let ec2 = FakeEc2::new(Some("stopped")).start_raises();
+        let sns = FakeSns::default();
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 7, 35),
+        )
+        .await;
+        assert_eq!(out["started"], json!(false));
+        assert_eq!(sns.published.borrow().len(), 1);
+        assert!(sns.published.borrow()[0].subject.contains("Muhurat"));
+        // A later retry logs, no second page.
+        let sns = FakeSns::default();
+        let ec2 = FakeEc2::new(Some("stopped")).start_raises();
+        run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 8, 5),
+        )
+        .await;
+        assert!(sns.published.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_stops_its_own_box_after_the_window() {
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let sns = FakeSns::default();
+        let out = run_muhurat(
+            MUHURAT,
+            &ec2,
+            &FakeSsm::empty(),
+            &sns,
+            utc(2026, 11, 8, 11, 15),
+        )
+        .await;
+        assert_eq!(out["phase"], json!("after"));
+        assert_eq!(out["stopped"], json!(true));
+        assert_eq!(*ec2.stop_calls.borrow(), vec!["i-0test".to_string()]);
+        assert!(
+            sns.published.borrow().is_empty(),
+            "the planned stop pages nobody"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_muhurat_check_after_window_honours_hold_and_keep_alive() {
+        let now = utc(2026, 11, 8, 11, 15); // 16:45 IST, the hold counts again
+        let launched = utc(2026, 11, 8, 7, 36);
+        let held = FakeSsm::empty().drain_hold(&hold("holding", now + Duration::minutes(10), now));
+        let ec2 = FakeEc2::new(Some("running")).launch(launched);
+        let out = run_muhurat(MUHURAT, &ec2, &held, &FakeSns::default(), now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+
+        let kept = FakeSsm::empty().keep_alive("2026-11-08T23:00:00+05:30");
+        let ec2 = FakeEc2::new(Some("running")).launch(launched);
+        let out = run_muhurat(MUHURAT, &ec2, &kept, &FakeSns::default(), now).await;
+        assert_eq!(out["stopped"], json!(false));
+        assert!(ec2.stop_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_muhurat_after_window_should_stop_table() {
+        let box_start = utc(2026, 11, 8, 7, 35);
+        let ours = Some(box_start + Duration::minutes(1));
+        let slack_edge = Some(box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES));
+        let earlier = Some(box_start - Duration::minutes(MUHURAT_OWN_START_SLACK_MINUTES + 1));
+        assert!(muhurat_after_window_should_stop(
+            "running", ours, box_start, false, false
+        ));
+        assert!(muhurat_after_window_should_stop(
+            "running", slack_edge, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", earlier, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", None, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "stopped", ours, box_start, false, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", ours, box_start, true, false
+        ));
+        assert!(!muhurat_after_window_should_stop(
+            "running", ours, box_start, false, true
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_curfew_never_stops_the_box_inside_a_muhurat_window() {
+        // Sunday 2026-11-08 14:35 IST, launched 13:06 IST: outside the weekday
+        // operating hours and past the 45-minute grace, but inside the window.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let out = run_watchdog(
+            &json!({"mode": "curfew_check"}),
+            &muhurat_env(MUHURAT),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 9, 5),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["skipped"], json!("operating_hours"));
+        assert!(ec2.stop_calls.borrow().is_empty());
+        // Without the session configured the same box is curfew-stopped.
+        let ec2 = FakeEc2::new(Some("running")).launch(utc(2026, 11, 8, 7, 36));
+        let out = run_watchdog(
+            &json!({"mode": "curfew_check"}),
+            &muhurat_env("2026-11-08@-"),
+            &ec2,
+            &FakeSsm::empty(),
+            &FakeSns::default(),
+            utc(2026, 11, 8, 9, 5),
+        )
+        .await
+        .expect("run_watchdog");
+        assert_eq!(out["stopped"], json!(true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The live SDK adapters and `handle`, driven through the REAL AWS SDK against
+// a loopback account (crate::test_support). The decision logic above is
+// covered with fakes; these prove the adapters turn real EC2 / SSM / SNS
+// replies into the values that logic reads.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sdk_loopback_tests {
+    use super::*;
+    use crate::test_support::{
+        EnvVarGuard, Fleet, aws_env_guards, env_lock, loopback_sdk_config, operations, recorded,
+        start_fleet,
+    };
+
+    async fn adapters(
+        fleet: Fleet,
+    ) -> (
+        SdkEc2,
+        SdkSsm,
+        SdkSns,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::test_support::LoopbackRequest>>>,
+    ) {
+        let (endpoint, requests) = start_fleet(fleet).await;
+        let config = loopback_sdk_config(&endpoint).await;
+        (
+            SdkEc2 {
+                client: aws_sdk_ec2::Client::new(&config),
+            },
+            SdkSsm {
+                client: aws_sdk_ssm::Client::new(&config),
+            },
+            SdkSns {
+                client: aws_sdk_sns::Client::new(&config),
+            },
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_reads_state_launch_time_and_public_ip() {
+        let (ec2, _, _, requests) = adapters(Fleet::default()).await;
+        let desc = ec2
+            .describe("i-0loopback")
+            .await
+            .expect("describe succeeds")
+            .expect("one instance");
+        assert_eq!(desc.state, "running");
+        assert_eq!(desc.public_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            desc.launch_time.map(|t| t.to_rfc3339()),
+            Some("2026-10-30T03:00:00+00:00".to_string())
+        );
+        let seen = recorded(&requests);
+        assert_eq!(
+            seen[0].form_value("InstanceId.1").as_deref(),
+            Some("i-0loopback")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_describe_with_no_reservation_is_not_found() {
+        let (ec2, _, _, _) = adapters(Fleet {
+            instance_state: None,
+            ..Fleet::default()
+        })
+        .await;
+        assert!(
+            ec2.describe("i-0gone")
+                .await
+                .expect("describe succeeds")
+                .is_none()
+        );
+        assert_eq!(instance_info(&ec2, "i-0gone").await.0, "not-found");
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_errors_surface_as_text() {
+        let (ec2, _, _, _) = adapters(Fleet {
+            fail: vec!["DescribeInstances", "StartInstances", "StopInstances"],
+            ..Fleet::default()
+        })
+        .await;
+        assert!(ec2.describe("i-0x").await.is_err());
+        assert!(ec2.start_instances("i-0x").await.is_err());
+        assert!(ec2.stop_instances("i-0x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ec2_start_and_stop_send_the_instance_id() {
+        let (ec2, _, _, requests) = adapters(Fleet::default()).await;
+        ec2.start_instances("i-0loopback")
+            .await
+            .expect("start succeeds");
+        ec2.stop_instances("i-0loopback")
+            .await
+            .expect("stop succeeds");
+        assert_eq!(
+            operations(&requests),
+            vec!["StartInstances", "StopInstances"]
+        );
+        assert!(
+            recorded(&requests)
+                .iter()
+                .all(|r| r.form_value("InstanceId.1").as_deref() == Some("i-0loopback"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_ssm_get_parameter_reads_the_value_and_surfaces_a_miss() {
+        let mut ssm_values = std::collections::HashMap::new();
+        ssm_values.insert(
+            DEFAULT_KEEP_ALIVE_PARAM.to_string(),
+            "2026-10-30T18:00:00+05:30".to_string(),
+        );
+        let (_, ssm, _, _) = adapters(Fleet {
+            ssm: ssm_values,
+            ..Fleet::default()
+        })
+        .await;
+        assert_eq!(
+            ssm.get_parameter(DEFAULT_KEEP_ALIVE_PARAM).await.as_deref(),
+            Ok("2026-10-30T18:00:00+05:30")
+        );
+        assert!(ssm.get_parameter("/tickvault/prod/absent").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_sends_topic_subject_and_message() {
+        let (_, _, sns, requests) = adapters(Fleet::default()).await;
+        sns.publish("arn:aws:sns:ap-south-1:1:tv", "subject line", "body text")
+            .await
+            .expect("publish succeeds");
+        let seen = recorded(&requests);
+        assert_eq!(
+            seen[0].form_value("TopicArn").as_deref(),
+            Some("arn:aws:sns:ap-south-1:1:tv")
+        );
+        assert_eq!(
+            seen[0].form_value("Subject").as_deref(),
+            Some("subject line")
+        );
+        assert_eq!(seen[0].form_value("Message").as_deref(), Some("body text"));
+    }
+
+    #[tokio::test]
+    async fn test_sdk_sns_publish_failure_is_an_error() {
+        let (_, _, sns, _) = adapters(Fleet {
+            fail: vec!["Publish"],
+            ..Fleet::default()
+        })
+        .await;
+        assert!(sns.publish("arn:x", "s", "m").await.is_err());
+    }
+
+    #[test]
+    fn test_watchdog_env_from_process_env_reads_overrides_and_defaults() {
+        let _lock = env_lock();
+        let keys = [
+            "EC2_INSTANCE_ID",
+            "ALERTS_TOPIC_ARN",
+            "DASHBOARD_PORT",
+            "KEEP_ALIVE_PARAM",
+            "HOLIDAY_STOP_PARAM",
+            "BUDGET_STOP_PARAM",
+            "DRAIN_HOLD_PARAM",
+            crate::muhurat_window::MUHURAT_SESSIONS_ENV,
+        ];
+        {
+            let _unset: Vec<EnvVarGuard> = keys.iter().map(|k| EnvVarGuard::set(k, None)).collect();
+            let env = WatchdogEnv::from_process_env();
+            assert_eq!(env.instance_id, "");
+            assert_eq!(env.alerts_topic_arn, "");
+            assert_eq!(env.dashboard_port, "3001");
+            assert_eq!(env.keep_alive_param, DEFAULT_KEEP_ALIVE_PARAM);
+            assert_eq!(env.holiday_stop_param, DEFAULT_HOLIDAY_STOP_PARAM);
+            assert_eq!(
+                env.budget_stop_param,
+                crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM
+            );
+            assert_eq!(
+                env.drain_hold_param,
+                crate::drain_hold::DEFAULT_DRAIN_HOLD_PARAM
+            );
+            assert_eq!(env.muhurat_sessions, "");
+        }
+        let _set: Vec<EnvVarGuard> = keys
+            .iter()
+            .map(|k| EnvVarGuard::set(k, Some(&format!("v-{k}"))))
+            .collect();
+        let env = WatchdogEnv::from_process_env();
+        assert_eq!(env.instance_id, "v-EC2_INSTANCE_ID");
+        assert_eq!(env.alerts_topic_arn, "v-ALERTS_TOPIC_ARN");
+        assert_eq!(env.dashboard_port, "v-DASHBOARD_PORT");
+        assert_eq!(env.keep_alive_param, "v-KEEP_ALIVE_PARAM");
+        assert_eq!(env.holiday_stop_param, "v-HOLIDAY_STOP_PARAM");
+        assert_eq!(env.budget_stop_param, "v-BUDGET_STOP_PARAM");
+        assert_eq!(env.drain_hold_param, "v-DRAIN_HOLD_PARAM");
+        assert_eq!(
+            env.muhurat_sessions,
+            format!("v-{}", crate::muhurat_window::MUHURAT_SESSIONS_ENV)
+        );
+    }
+
+    #[test]
+    fn test_handle_ping_describes_the_instance_and_publishes_the_dashboard_link() {
+        let _lock = env_lock();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread fixture runtime")
+            .block_on(async {
+                let (endpoint, requests) = start_fleet(Fleet::default()).await;
+                let _aws = aws_env_guards(&endpoint);
+                let _id = EnvVarGuard::set("EC2_INSTANCE_ID", Some("i-0loopback"));
+                let _topic =
+                    EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
+                let _port = EnvVarGuard::set("DASHBOARD_PORT", Some("3001"));
+
+                let out = handle(json!({"mode": "ping"}))
+                    .await
+                    .expect("ping succeeds");
+                assert!(out.is_object(), "{out}");
+                // `handle` reads the real clock. Since 2026-11-07 the ping is
+                // silent on a weekend or NSE holiday, so on such a day the
+                // SDK path ends at the calendar check (the publish path is
+                // covered by the fake-clock ping tests above).
+                if !crate::nse_calendar::is_nse_trading_day_at(Utc::now()) {
+                    assert_eq!(out["skipped"], json!("non_trading_day"), "{out}");
+                    return;
+                }
+                let ops = operations(&requests);
+                assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+                let publish = recorded(&requests)
+                    .into_iter()
+                    .find(|r| r.query_action().as_deref() == Some("Publish"))
+                    .expect("the ping publishes");
+                let message = publish.form_value("Message").unwrap_or_default();
+                assert!(
+                    message.contains("http://203.0.113.7:3001/feeds"),
+                    "the start message carries the dashboard link: {message}"
+                );
+            });
     }
 }

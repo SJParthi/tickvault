@@ -238,7 +238,7 @@ Same as 20-level — no exchange timestamp. We use `received_at_nanos`.
 
 Checks every 60s if spot price has drifted ≥3 strikes from current ATM.
 If so, sends `DepthCommand::Swap200` through the command channel:
-1. Unsubscribe old instrument (RequestCode 25)
+1. Unsubscribe old instrument (RequestCode 24 — was 25 until the 2026-09-10 live verdict)
 2. Subscribe new ATM instrument (RequestCode 23)
 3. **ZERO disconnect. ZERO reconnect.** Same WebSocket stays alive.
 
@@ -355,7 +355,7 @@ PascalCase top-level keys.
 | 21 | Subscribe Full | Main feed |
 | 22 | Unsubscribe Full | Main feed |
 | 23 | Subscribe Depth | 20-level + 200-level |
-| 25 | Unsubscribe Depth | 20-level + 200-level (**NOT 24!**) |
+| 24 | Unsubscribe Depth | 20-level + 200-level (**25 was proven IGNORED live on 2026-09-10** — `08-annexure-enums.md` end note) |
 
 ---
 
@@ -485,9 +485,9 @@ PascalCase top-level keys.
 | A2 | 200-level uses 1 connection per instrument | Dhan API limitation, not our choice |
 | A3 | Depth data only flows during 09:15-15:30 IST | Dhan sends nothing outside market hours |
 | A4 | PrevClose packets arrive on any subscription mode | Expected — used for day change % calculations |
-| A5 | Unsubscribe depth = 25 (not SDK's 24) | SDK bug; we follow Dhan docs |
+| A5 | Unsubscribe depth = 24 (the SDK's `subscribe_code + 1`) | LIVE-VERIFIED 2026-09-10: Dhan ignored every code-25 unsubscribe; the SDK was right, the portal doc was wrong |
 | A6 | Main feed does NOT rebalance dynamically | 25,000 capacity covers all index derivatives + ATM±10 stocks; no gap from ATM drift |
-| A7 | Depth rebalance uses command channel (no disconnect) | RequestCode 25 (unsub) + 23 (sub) on same WS; zero tick loss during ATM swap |
+| A7 | Depth rebalance uses command channel (no disconnect) | RequestCode 24 (unsub; was 25 until 2026-09-10) + 23 (sub) on same WS; zero tick loss during ATM swap |
 
 ### 10.3 Missing Metrics
 

@@ -394,12 +394,10 @@ fn banned_hit(literal: &str) -> Option<&'static str> {
         }
     }
     let squished = squish(literal);
-    for phrase in COMPOUND_BANNED {
-        if squished.contains(squish(phrase).as_str()) {
-            return Some(phrase);
-        }
-    }
-    None
+    COMPOUND_BANNED
+        .iter()
+        .find(|&phrase| squished.contains(squish(phrase).as_str()))
+        .map(|v| v as _)
 }
 
 #[test]

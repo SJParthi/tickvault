@@ -1,4 +1,5 @@
 // Compile-time lint enforcement — defense-in-depth with CLI clippy flags
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout)]
@@ -22,7 +23,6 @@
 //!
 //! # Modules
 //! - `auth` — Authentication, TOTP generation, JWT token lifecycle
-//! - `cadence` — Judge-locked per-minute REST fire scheduler (chains + spots)
 //! - `historical` — Historical OHLCV candle fetching and chunked retrieval
 //! - `index_constituency` — Index constituent mapping and validation
 //! - `instrument` — Master instrument download, CSV parsing, F&O universe building
@@ -36,10 +36,6 @@
 //! Config -> Instrument Download -> **Auth** -> WebSocket -> Parse -> Route
 
 pub mod auth;
-/// Judge-locked cadence scheduler: per-minute chain + spot fire timing with
-/// structural zero-429 gates, failure ladder, and event-driven decisions.
-/// See `.claude/rules/project/cadence-error-codes.md`.
-pub mod cadence;
 /// Pluggable market-data feeds (Groww second feed, operator lock 2026-06-19).
 /// Native tickvault Rust — brutex is reference only. See
 /// `.claude/rules/project/groww-second-feed-scope-2026-06-19.md`.
@@ -54,6 +50,8 @@ pub mod network;
 pub mod notification;
 pub mod parser;
 pub mod pipeline;
+/// Atomic types the loom lane can see (audit H3); std atomics otherwise.
+pub(crate) mod sync;
 // Dead-code batch 2 (2026-07-18): `scheduler` DELETED — zero refs; its module
 // doc still described the DELETED WS timeline (08:30 WS up … 15:30 disconnect).
 pub mod websocket;

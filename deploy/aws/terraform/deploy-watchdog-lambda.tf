@@ -61,6 +61,27 @@ resource "aws_iam_role_policy" "deploy_watchdog" {
         Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/binary-git-sha"
       },
       {
+        # 2026-09-02: read the SSM MIRROR of main HEAD, so the provenance
+        # comparison survives the absence of the operator GitHub token.
+        # WRITER IS postmerge-catchup.yml (every 30 min), NOT deploy-aws.yml:
+        # deploy-aws writes GITHUB_SHA, which IS main HEAD at deploy time, so a
+        # mirror written there would always equal binary-git-sha and the
+        # staleness signal could never go red.
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/deploy/desired-git-sha"
+      },
+      {
+        # 2026-10-20: read the holiday-stop marker the app's holiday gate
+        # writes before it stops the box on a weekday NSE holiday, so a stale
+        # verdict does not dispatch a redeploy that would self-start the box
+        # the gate just stopped. Read-only, exactly that one parameter (the
+        # same one the start-watchdog reads).
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/holiday-stop-date"
+      },
+      {
         # B9 deploy provenance: publish the mismatch metric. PutMetricData
         # supports no resource-level scoping — constrain by namespace so
         # this Lambda can only ever write Tickvault/Prod metrics.
@@ -125,6 +146,15 @@ resource "aws_lambda_function" "deploy_watchdog" {
       # /tickvault/prod/... path (prod is the only real env) — the two must
       # stay in lockstep; a staging env would need the workflow parameterized.
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
+      # 2026-09-02: the main-HEAD mirror the watchdog falls back to when
+      # /tickvault/<env>/operator/github-token is absent. Same lockstep note as
+      # above -- postmerge-catchup.yml writes the hardcoded /tickvault/prod/
+      # path. GitHub stays the PREFERRED source, so adding a token later
+      # upgrades the check with no further change.
+      DESIRED_SHA_PARAM = "/tickvault/${var.environment}/deploy/desired-git-sha"
+      # 2026-10-20: no redeploy dispatch while this marker is today's IST date
+      # (the holiday gate stopped the box on purpose).
+      HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }
   }
 
@@ -216,6 +246,14 @@ resource "aws_lambda_permission" "deploy_watchdog_postmarket" {
 # THIS instance only. SSM agent is up within ~30-60s of `running`; the
 # dispatched GitHub deploy takes ~1-2 min to reach its SSM step, by which the
 # box is ready.
+#
+# 2026-11-07 (owner: "see today is saturday why the fuck server started dude
+# why?"): an event pattern cannot filter by day, so this rule still fires on
+# every start, weekends and holidays included. The day gate lives in the
+# handler: crates/aws-lambdas/src/deploy_watchdog.rs `non_trading_day_skip`
+# returns before any read, page or dispatch unless the IST date is a regular
+# NSE trading day (nse_calendar, pinned to config/base.toml). A Muhurat date
+# is skipped too (every deploy workflow refuses it, Quote 49).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_event_rule" "deploy_watchdog_instance_start" {
   name        = "tv-${var.environment}-deploy-watchdog-instance-start"
@@ -271,9 +309,14 @@ resource "aws_cloudwatch_metric_alarm" "binary_sha_stale" {
   statistic           = "Minimum"
   threshold           = 1
   dimensions          = { host = "tickvault-prod" }
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.tv_alerts.arn]
-  ok_actions          = [aws_sns_topic.tv_alerts.arn]
+  # 2026-11-07: "ignore", was "notBreaching". The watchdog publishes nothing on
+  # a weekend or NSE holiday (non_trading_day_skip), so a Friday ALARM read the
+  # empty Saturday window as OK and sent a false "recovered". With "ignore" a
+  # missing day keeps the current state: it still never pages, and the OK
+  # (with its recovery message) comes only from a real 0 sample.
+  treat_missing_data = "ignore"
+  alarm_actions      = [aws_sns_topic.tv_alerts.arn]
+  ok_actions         = [aws_sns_topic.tv_alerts.arn]
 
   tags = {
     Project = "tickvault"
@@ -289,4 +332,115 @@ output "deploy_watchdog_function_name" {
 output "binary_sha_stale_alarm_name" {
   description = "B9 deploy provenance: CloudWatch alarm firing when the deployed binary's git SHA lags main HEAD across a full 24h of watchdog samples"
   value       = aws_cloudwatch_metric_alarm.binary_sha_stale.alarm_name
+}
+
+# ---------------------------------------------------------------------------
+# Watch the watchman (2026-08-25, operator "Fix wbrytjonf dude oaku" — the
+# §2.3f dated authorization in dhan-rest-only-noise-lock-2026-07-14.md).
+#
+# This Lambda had NO Errors alarm. It was one of SIX in that state out of 13 —
+# not the one the authorizing message claimed, which is corrected in §2.3f.
+# None of the six was ever decided about: the seven that ARE alarmed were each
+# added by the PR that created them, and these six by PRs that did not think
+# to. The ratchet added alongside makes that omission fail the build.
+# ---------------------------------------------------------------------------
+
+# alarm "deploy_watchdog_errors" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-25 - "did the deploy watchdog RUN?" (found by the new guard)
+#
+# Worth stating plainly because the history is specific: on 2026-07-09 both
+# morning deploy crons were scheduler-dropped and the box booted on a stale
+# binary. THIS Lambda is the detector for that class - and it is itself
+# scheduler-drop-fragile, with nothing watching. A detector that can go missing
+# by the same mechanism as the fault it detects needs its own liveness check,
+# or the first time both drop together nobody learns anything.
+#
+# 24h window: MON-FRI post-boot cron.
+#
+# ok_actions = [] - recovery here means "a datapoint appeared again", which is
+# worth seeing in the console and is not worth a second page.
+# ---------------------------------------------------------------------------
+
+# alarm "deploy_watchdog_not_invoked" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
+
+# ---------------------------------------------------------------------------
+# DEPLOY-PROVENANCE BLIND — the watchdog is running but publishing nothing
+#
+# Authorized by the operator's 2026-09-02 reaffirmation; the dated quote and
+# the reasoning live in .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md
+# section 2.3q, recorded BEFORE this resource per the rule-file-first law.
+#
+# WHY THIS EXISTS. binary_sha_stale above reads a metric the watchdog only
+# publishes when BOTH shas are known, and it treats missing data as healthy.
+# So a watchdog that skips every fire reads exactly like a watchdog reporting
+# "in sync". Measured live on 2026-09-02: four consecutive fires skipped,
+# tv_binary_main_sha_mismatch had ZERO datapoints in three days, and
+# binary_sha_stale sat OK throughout. The check that detects a box running
+# stale code had never been able to fire.
+#
+# Root cause that day: /tickvault/<env>/operator/github-token does not exist,
+# so the Lambda cannot ask GitHub for main HEAD. Not a code defect — a missing
+# parameter — which is exactly why a code-only guard could never have caught
+# it and an OBSERVED-BEHAVIOUR alarm can.
+#
+# THRESHOLD 3, not 1, deliberately. The watchdog fires ~2-3 times a weekday
+# (instance-start + two crons), so 3 skips in a 24h window means EVERY fire
+# that day was blind — the same "every sample in the day" semantics
+# binary_sha_stale itself uses. A single transient skip (a GitHub blip, a
+# cold-start timeout) does not page.
+#
+# treat_missing_data = notBreaching is CORRECT here and is not the trap it is
+# in binary_sha_stale: this metric is emitted only on FAILURE, so no data
+# genuinely means no skips. ok_actions ARE set because the recovery is real —
+# skips stopping means the comparison started working again, not a datapoint
+# ageing out. A watchdog that stops running entirely is covered separately by
+# deploy_watchdog_not_invoked above.
+#
+# TERM filter, not a coded JSON filter: this Lambda's log group is its own
+# (/aws/lambda/tv-<env>-deploy-watchdog), NOT the app group that the
+# local.error_code_alerts family filters, so it needs its own standalone pair.
+# The matched substring is pinned by the comment at the emit site in
+# crates/aws-lambdas/src/deploy_watchdog.rs — rewording that message silences
+# this alarm.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_log_metric_filter" "deploy_provenance_blind" {
+  name           = "tv-${var.environment}-deploy-provenance-blind"
+  log_group_name = aws_cloudwatch_log_group.deploy_watchdog.name
+  pattern        = "\"mismatch metric skipped\""
+
+  metric_transformation {
+    name      = "tv_deploy_provenance_blind_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # NO dimensions: Lambda log events carry no host field and metric filters
+    # cannot emit constant dimensions. NO default_value: sparse metric, billed
+    # only in hours with datapoints, which notBreaching makes correct.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "deploy_provenance_blind" {
+  alarm_name          = "tv-${var.environment}-deploy-provenance-blind"
+  alarm_description   = "The deploy watchdog RAN but could not compare the running binary against main — every fire in the last 24h skipped, so tv-${var.environment}-binary-sha-stale is reading OK on no data and CANNOT tell you the box is on old code. Usual cause: /tickvault/${var.environment}/operator/github-token is missing or unreadable, so main HEAD cannot be fetched. Check the Lambda log for which sha was unknown (binary_sha_known / desired_sha_known). Runbook: .claude/rules/project/deploy-provenance.md"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  metric_name         = "tv_deploy_provenance_blind_total"
+  namespace           = local.app_namespace
+  period              = 86400
+  statistic           = "Sum"
+  threshold           = 3
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.tv_alerts.arn]
+  ok_actions          = [aws_sns_topic.tv_alerts.arn]
+
+  tags = {
+    Project = "tickvault"
+    Layer   = "L2-VERIFY"
+  }
 }

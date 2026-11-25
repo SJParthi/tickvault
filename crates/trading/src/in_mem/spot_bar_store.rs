@@ -87,12 +87,25 @@ use crate::candles::{TF_COUNT, TfIndex};
 /// could not land half-applied: the ring capacity math derives from the same
 /// two constants, so a session move that missed this file would fail the
 /// BUILD rather than silently under-size every per-timeframe ring.
-pub const SESSION_SECS: u32 =
-    ((MARKET_CLOSE_IST_NANOS - MARKET_OPEN_IST_NANOS) / 1_000_000_000) as u32;
+/// 2026-08-28: the RAM ring must span the CANDLE session, which now opens at
+/// 09:00 with the pre-open call auction - not the market open at 09:15. Sized
+/// off `MARKET_OPEN_IST_NANOS` this ring was fifteen minutes short of the
+/// grid feeding it, so the first fifteen pre-open 1m bars of every day would
+/// have been evicted by the day's own later bars: a silent, capacity-shaped
+/// data loss that no counter would have reported.
+pub const CANDLE_SESSION_OPEN_IST_NANOS: i64 = 32_400 * 1_000_000_000;
 
 const _: () = assert!(
-    SESSION_SECS == 23_100,
-    "session length must be 385 minutes (09:15-15:40 IST)"
+    CANDLE_SESSION_OPEN_IST_NANOS < MARKET_OPEN_IST_NANOS,
+    "the candle session must open BEFORE the market, never at or after it"
+);
+
+pub const SESSION_SECS: u32 =
+    ((MARKET_CLOSE_IST_NANOS - CANDLE_SESSION_OPEN_IST_NANOS) / 1_000_000_000) as u32;
+
+const _: () = assert!(
+    SESSION_SECS == 24_000,
+    "session length must be 400 minutes (09:00-15:40 IST): 15 pre-open + 385 regular"
 );
 
 /// One sealed bar resident in RAM — 48 bytes, `Copy`, no heap.
@@ -414,6 +427,8 @@ impl SpotBarStore {
         if slots.len() >= MAX_SPOT_BAR_SLOTS {
             metrics::counter!("tv_spot_bar_slots_exhausted_total").increment(1);
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::RamStore01Degraded.code_str(),
+                source = "spot_bar_slots_full",
                 feed = key.feed.as_str(),
                 security_id = key.security_id,
                 cap = MAX_SPOT_BAR_SLOTS,
@@ -655,21 +670,27 @@ mod tests {
 
     #[test]
     fn test_bars_per_day_session_math() {
-        // ceil(23_100 / tf_secs), floored at 1 — spot-checked + summed.
+        // ceil(24_000 / tf_secs), floored at 1 — spot-checked + summed.
         // 2026-08-07: session 375 -> 385 min (NSE CAS change 2026-08-03).
-        assert_eq!(bars_per_day(TfIndex::M1), 385);
-        assert_eq!(bars_per_day(TfIndex::M3), 129);
-        assert_eq!(bars_per_day(TfIndex::M5), 77);
-        assert_eq!(bars_per_day(TfIndex::M15), 26);
-        assert_eq!(bars_per_day(TfIndex::D1), 1);
-        // 2026-08-10: M2/M30/M60 appended (operator Quote 13's thirteen
-        // frames). ceil(23_100/120)=193, ceil(23_100/1800)=13,
-        // ceil(23_100/3600)=7 → 618 + 213 = 831.
-        assert_eq!(bars_per_day(TfIndex::M2), 193);
-        assert_eq!(bars_per_day(TfIndex::M30), 13);
+        // 2026-08-28: 385 -> 400 min — the candle session now opens at 09:00
+        // with the NSE pre-open call auction, so every ring gained the 15
+        // pre-open minutes it must hold. M1 385 -> 400, M3 129 -> 134,
+        // M5 77 -> 80.
+        // 2026-09-19: the nine-frame collapse retired D1 and M2 (and every
+        // second-scale frame but 1s/3s/5s), so the RESIDENT sum drops
+        // 863 -> 662: 400 + 134 + 80 + 27 + 14 + 7. The second-scale frames
+        // are excluded from this sum as they always were.
+        assert_eq!(bars_per_day(TfIndex::M1), 400);
+        assert_eq!(bars_per_day(TfIndex::M3), 134);
+        assert_eq!(bars_per_day(TfIndex::M5), 80);
+        assert_eq!(bars_per_day(TfIndex::M15), 27);
+        assert_eq!(bars_per_day(TfIndex::M30), 14);
         assert_eq!(bars_per_day(TfIndex::M60), 7);
-        assert_eq!(total_bars_per_day_all_tfs(), 831);
-        assert_eq!(SESSION_SECS, 23_100);
+        // 2026-09-22: M10 became a native frame (NO VIEWS ANYWHERE), so the
+        // resident sum moves 662 -> 702 (+40 = 24_000 / 600).
+        assert_eq!(bars_per_day(TfIndex::M10), 40);
+        assert_eq!(total_bars_per_day_all_tfs(), 702);
+        assert_eq!(SESSION_SECS, 24_000);
     }
 
     #[test]
@@ -677,10 +698,14 @@ mod tests {
         // The design envelope: 8 slots (2 feeds × 4 spot SIDs) × 35 days.
         assert_eq!(core::mem::size_of::<RamBar>(), 48, "RamBar must stay 48 B");
         let bytes = estimated_capacity_bytes(35, 8);
-        // 831 × 35 × 8 × 48 = 11_168_640 B ≈ 10.6 MiB
+        // 702 × 35 × 8 × 48 = 9_434_880 B ≈ 9.0 MiB
         // (2026-08-07: 601 -> 618 bars/day with the 385-minute session;
-        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13.)
-        assert_eq!(bytes, 11_168_640);
+        //  2026-08-10: 618 -> 831 with M2/M30/M60, operator Quote 13;
+        //  2026-08-28: 831 -> 863 with the 09:00 pre-open open;
+        //  2026-09-19: 863 -> 662 with the nine-frame collapse — D1 and M2
+        //  lost their writers, so their rings are no longer allocated;
+        //  2026-09-22: 662 -> 702 as M10 became a native frame.)
+        assert_eq!(bytes, 9_434_880);
         assert!(
             bytes < 40 * 1024 * 1024,
             "spot ring envelope must stay under 40 MB (got {bytes})"
@@ -726,12 +751,12 @@ mod tests {
 
     #[test]
     fn test_spot_bar_store_wraparound_evicts_oldest() {
-        // spot_days=1 → M15 capacity = 26 bars (385-min session, 2026-08-07);
-        // the 27th append evicts the oldest, and an over-window old bar is
-        // dropped (never displaces).
+        // spot_days=1 → M15 capacity = 27 bars (400-min session, 2026-08-28
+        // — was 26 on the 385-min one); the 28th append evicts the oldest,
+        // and an over-window old bar is dropped (never displaces).
         let store = SpotBarStore::new(1);
         let cap = bars_per_day(TfIndex::M15) as usize;
-        assert_eq!(cap, 26);
+        assert_eq!(cap, 27);
         for i in 0..(cap as u32 + 1) {
             store.append_sealed(key(), TfIndex::M15, bar(OPEN0 + i * 900, f64::from(i)));
         }
@@ -830,7 +855,7 @@ mod tests {
         assert_eq!(bars[2].close, 2.0);
         // Unknown slot → empty, never a panic.
         let other = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 99,
             exchange_segment_code: 0,
         };
@@ -852,7 +877,7 @@ mod tests {
         let store = SpotBarStore::new(1);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let groww_key = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 4_611_686_018_427_387_913,
             exchange_segment_code: 0,
         };
@@ -861,44 +886,57 @@ mod tests {
         let stats = store.stats();
         assert_eq!(stats.slots, 2);
         assert_eq!(stats.bars_resident_per_feed[Feed::Dhan.index()], 1);
-        assert_eq!(stats.bars_resident_per_feed[Feed::Groww.index()], 2);
+        assert_eq!(stats.bars_resident_per_feed[Feed::Truedata.index()], 2);
         assert_eq!(stats.min_depth_days_per_feed[Feed::Dhan.index()], 1);
-        assert_eq!(stats.min_depth_days_per_feed[Feed::Groww.index()], 1);
-        // Two slots × 1 day × 831 bars × 48 B of pre-allocated capacity
-        // (385-min session; 618 -> 831 on 2026-08-10 with M2/M30/M60).
-        assert_eq!(stats.estimated_bytes, 2 * 831 * 48);
+        assert_eq!(stats.min_depth_days_per_feed[Feed::Truedata.index()], 1);
+        // Two slots × 1 day × 662 bars × 48 B of pre-allocated capacity
+        // (400-min session since 2026-08-28; 618 -> 831 on 2026-08-10 with
+        // M2/M30/M60, then 831 -> 863 with the 09:00 pre-open open, then
+        // 863 -> 662 with the 2026-09-19 nine-frame collapse, then 662 -> 702
+        // when M10 became a native frame on 2026-09-22).
+        assert_eq!(stats.estimated_bytes, 2 * 702 * 48);
     }
 
     #[test]
     fn test_second_scale_rings_are_capacity_one_placeholders() {
-        // C3: the 16 GDF-gated second-scale frames allocate capacity-1
-        // placeholder rings (ZERO rows until the GDF 1s feed lands — a
-        // pinned 16 × 48 B = 768 B/slot of actual heap) and are excluded
-        // from the RAM-resident bar total + byte estimate; the session
-        // formula stays honest for the future GDF capacity flip.
-        assert_eq!(bars_per_day(TfIndex::S1), 23_100);
-        assert_eq!(bars_per_day(TfIndex::S2), 11_550);
-        assert_eq!(bars_per_day(TfIndex::S15), 1_540);
-        assert_eq!(bars_per_day(TfIndex::S30), 770);
+        // C3: the GDF-gated second-scale frames allocate capacity-1
+        // placeholder rings (ZERO rows until the GDF 1s feed lands) and are
+        // excluded from the RAM-resident bar total + byte estimate; the
+        // session formula stays honest for the future GDF capacity flip.
+        //
+        // 2026-09-19 nine-frame collapse: sixteen second-scale frames became
+        // THREE (1s/3s/5s), so the placeholder heap is 3 × 48 B = 144 B/slot
+        // (was 768) and the would-be formula cost falls 80_440 -> 36_800.
+        assert_eq!(bars_per_day(TfIndex::S1), 24_000);
+        // 2026-10-22 (plan item 62): 3s and 5s removed, ONE second-scale frame.
         let mut gated_formula_total = 0u32;
+        let mut gated_frames = 0usize;
         for tf in TfIndex::ALL {
             if tf.is_second_scale() {
                 gated_formula_total += bars_per_day(tf);
+                gated_frames += 1;
             }
         }
-        // 2026-08-07: 75_413 -> 77_422 with the 385-minute session. These are
-        // the GDF-gated second-scale frames — capacity-1 placeholders today,
-        // so the number is the would-be formula cost, not allocated memory.
-        assert_eq!(gated_formula_total, 77_422, "gated formula sum drifted");
+        assert_eq!(gated_frames, 1, "second-scale frame count drifted");
+        // 2026-08-07: 75_413 -> 77_422 with the 385-minute session;
+        // 2026-08-28: 77_422 -> 80_440 with the 400-minute one;
+        // 2026-09-19: 80_440 -> 36_800 with the nine-frame collapse. These
+        // are the GDF-gated second-scale frames — capacity-1 placeholders
+        // today, so the number is the would-be formula cost, not allocated
+        // memory.
+        // 2026-10-22: 36_800 -> 24_000 with 3s and 5s removed (plan item 62).
+        assert_eq!(gated_formula_total, 24_000, "gated formula sum drifted");
         // The resident total + byte estimate exclude the gated frames.
-        // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13). These
-        // three are minute-scale, so unlike the GDF-gated second frames they
-        // ARE resident and DO count toward the byte estimate.
-        assert_eq!(total_bars_per_day_all_tfs(), 831);
+        // 2026-08-10: 618 -> 831 with M2/M30/M60 (operator Quote 13);
+        // 2026-09-19: 863 -> 662 as D1 and M2 lost their writers. M30/M60
+        // are minute-scale, so unlike the GDF-gated second frames they ARE
+        // resident and DO count toward the byte estimate. 2026-09-22: 662 -> 702
+        // with M10 (minute-scale, so resident).
+        assert_eq!(total_bars_per_day_all_tfs(), 702);
         let store = SpotBarStore::new(35);
         store.append_sealed(key(), TfIndex::M1, bar(OPEN0, 1.0));
         let stats = store.stats();
-        assert_eq!(stats.estimated_bytes, 831 * 35 * 48);
+        assert_eq!(stats.estimated_bytes, 702 * 35 * 48);
         let slot = store.find_slot(key()).expect("slot exists");
         let rings = slot.rings.read();
         assert_eq!(rings.len(), TF_COUNT, "one ring per TfIndex ordinal");
@@ -941,7 +979,7 @@ mod tests {
         };
         // Same id, same segment, DIFFERENT feed — the third key axis.
         let groww_idx = SlotKey {
-            feed: Feed::Groww,
+            feed: Feed::Truedata,
             security_id: 27,
             exchange_segment_code: 0,
         };
@@ -1078,7 +1116,7 @@ mod tests {
                             "a resident slot must stay readable across concurrent inserts"
                         );
                         let churn = SlotKey {
-                            feed: Feed::Groww,
+                            feed: Feed::Truedata,
                             security_id: 42,
                             exchange_segment_code: 0,
                         };
@@ -1100,7 +1138,7 @@ mod tests {
                 }
                 store.append_sealed(
                     SlotKey {
-                        feed: Feed::Groww,
+                        feed: Feed::Truedata,
                         security_id: 42,
                         exchange_segment_code: 0,
                     },
@@ -1202,5 +1240,165 @@ mod tests {
         assert!(!second, "second install must be refused (first-wins)");
         let store = spot_bar_store().expect("global store must be readable");
         assert_eq!(store.spot_days(), 35, "the FIRST install's depth wins");
+    }
+
+    /// A bar OLDER than everything retained, while the ring still has room,
+    /// must be kept at the front — not dropped.
+    ///
+    /// This is the boot catch-up shape reaching the per-bar `upsert` path
+    /// rather than the block-prepend fast path (a single-bar day, or a repair
+    /// refold of one older bucket). Before this test the `Err(0)` +
+    /// below-capacity arm had no coverage at all, so an edit that collapsed it
+    /// into the `DroppedOverWindow` arm above it would have silently discarded
+    /// every such bar while the ring sat half empty.
+    #[test]
+    fn an_older_bar_below_capacity_is_inserted_at_the_front_not_dropped() {
+        // M60 is the COARSEST surviving frame since the 2026-09-19 nine-frame
+        // collapse (D1 was the anchor here until then, at one bar per session
+        // day). Its ring is `bars_per_day(M60) × spot_days`, so one day gives
+        // a seven-bar ring — comfortably non-full at two bars, which is the
+        // only property this test needs.
+        let store = SpotBarStore::new(1);
+        let cap = bars_per_day(TfIndex::M60);
+        assert!(cap > 2, "the ring must be able to sit below capacity");
+
+        let newer = DAY0 + 3_600;
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::M60, bar(newer, 101.0)),
+            UpsertOutcome::Appended
+        );
+        // Ring holds ONE bar of a seven-bar ring: below capacity, and the
+        // incoming bucket is older than the front.
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::M60, bar(DAY0, 100.0)),
+            UpsertOutcome::InsertedMiddle,
+            "an older bucket with room left must be retained, never dropped"
+        );
+
+        let held = store.latest_n(key(), TfIndex::M60, 8);
+        assert_eq!(
+            held.iter()
+                .map(|b| b.bucket_start_ist_secs)
+                .collect::<Vec<_>>(),
+            vec![newer, DAY0],
+            "`latest_n` reads NEWEST-first, so an ascending ring renders \
+             [newer, older]. A front insert that landed at the back would \
+             render [DAY0, newer] here and silently mis-order every read."
+        );
+        assert_eq!(
+            store.stats().middle_inserts,
+            1,
+            "a front insert is a counted middle insert, not a silent append"
+        );
+    }
+
+    /// A GAP-FILLING bar that arrives when the ring is already full must evict
+    /// the oldest and land in the right place — never corrupt the ordering.
+    ///
+    /// The index arithmetic here is the trap: `binary_search` returns the
+    /// insertion index computed against the PRE-eviction ring, so after
+    /// `pop_front` every position has shifted by one and the insert must use
+    /// `idx - 1`. Using `idx` unshifted puts the bar one slot too far right,
+    /// which breaks the ascending invariant that every read path
+    /// (`bar_at`'s binary search included) depends on. Nothing covered this
+    /// arm, and the corruption is silent — the ring simply starts answering
+    /// lookups with the wrong bucket.
+    #[test]
+    fn a_gap_filling_bar_at_capacity_evicts_the_oldest_and_keeps_the_ring_sorted() {
+        let store = SpotBarStore::new(1);
+        // Derived, never a literal: the ring capacity follows
+        // `bars_per_day(M60)` and moved once already (the 2026-08-28 pre-open
+        // session widened every frame). A hardcoded size would pass today and
+        // stop testing "at capacity" the next time the session changes.
+        let cap = bars_per_day(TfIndex::M60);
+        let hole = cap - 2; // the bucket deliberately left unfilled
+
+        // Fill the ring to EXACTLY capacity, skipping one middle bucket and
+        // appending one beyond it so the hole is genuinely interior.
+        for i in 0..=cap {
+            if i == hole {
+                continue;
+            }
+            assert_eq!(
+                store.append_sealed(
+                    key(),
+                    TfIndex::M60,
+                    bar(DAY0 + i * 3_600, 100.0 + f64::from(i))
+                ),
+                UpsertOutcome::Appended
+            );
+        }
+
+        let oldest = DAY0;
+        let filler = DAY0 + hole * 3_600;
+
+        // Ring is now FULL and has a hole in the middle.
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::M60, bar(filler, 999.0)),
+            UpsertOutcome::InsertedMiddle
+        );
+
+        let held = store.latest_n(key(), TfIndex::M60, cap as usize + 8);
+        let stamps: Vec<u32> = held.iter().map(|b| b.bucket_start_ist_secs).collect();
+        assert_eq!(
+            stamps.len(),
+            cap as usize,
+            "the ring holds exactly its capacity after an at-capacity insert"
+        );
+        let mut descending = stamps.clone();
+        descending.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(
+            stamps, descending,
+            "`latest_n` is NEWEST-first, so the ascending ring must render \
+             strictly descending. An unshifted insert index would order the \
+             ring wrongly and break every binary-search read"
+        );
+        assert!(
+            stamps.contains(&filler),
+            "the gap-filler must still be in the retained window"
+        );
+        assert_eq!(
+            store.bar_at(key(), TfIndex::M60, filler).map(|b| b.close),
+            Some(999.0),
+            "the gap-filler must be findable by its own bucket ts"
+        );
+        assert!(
+            store.bar_at(key(), TfIndex::M60, oldest).is_none(),
+            "the evicted bucket must be gone, not shadowing a later lookup"
+        );
+    }
+
+    /// An older-than-window bar AT capacity is dropped, and the drop is
+    /// COUNTED — the honest half of eviction.
+    #[test]
+    fn an_older_bar_at_capacity_is_dropped_and_counted() {
+        let store = SpotBarStore::new(1);
+        let cap = bars_per_day(TfIndex::M60);
+
+        // Fill to capacity starting ONE bucket above the floor, so a bar at
+        // the floor is older than the whole retained window.
+        for i in 1..=cap {
+            store.append_sealed(
+                key(),
+                TfIndex::M60,
+                bar(DAY0 + i * 3_600, 100.0 + f64::from(i)),
+            );
+        }
+        assert_eq!(
+            store.append_sealed(key(), TfIndex::M60, bar(DAY0, 100.0)),
+            UpsertOutcome::DroppedOverWindow,
+            "a bar older than the whole retained window at capacity is dropped"
+        );
+        assert_eq!(
+            store.stats().dropped_over_window,
+            1,
+            "the drop must be counted -- a silent drop is indistinguishable \
+             from an instrument that never emitted"
+        );
+        assert_eq!(
+            store.latest_n(key(), TfIndex::M60, cap as usize + 8).len(),
+            cap as usize,
+            "the retained window itself must be untouched by the refusal"
+        );
     }
 }

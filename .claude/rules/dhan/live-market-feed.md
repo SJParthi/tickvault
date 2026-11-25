@@ -56,6 +56,8 @@ paths:
    | `8-11` | f32 LE | LTP |
    | `12-15` | u32 LE | LTT (IST epoch seconds — NOT UTC; subtract 19800 for UTC) |
 
+   > ⚠ 2026-11-20: Dhan changed LTT to UTC epoch, permanently, effective 20 Nov 2026 (ticket #6684672). For frames received from 2026-11-20 00:00 IST, IST = raw + 19,800 s (applied once, in the core dispatcher, by WAL receipt; scope lock §"2026-11-21"). Every "IST epoch seconds" LTT label in this file applies to earlier receipts only.
+
 7. **PrevClose packet (code 6) — 16 bytes.** **IDX_I (indices) ONLY.**
    **CONFIRMED by Dhan support (2026-04-10, Ticket #5525125):** PrevClose as a
    standalone packet is emitted only for IDX_I instruments. For NSE_EQ and

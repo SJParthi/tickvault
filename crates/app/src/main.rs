@@ -1,32 +1,62 @@
 //! Binary entry point for the tickvault application.
 //!
 //! Orchestrates the complete boot sequence:
-//! Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
+//! ~~Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown~~
 //!
 //! # Boot Sequence (optimized for fast restart)
 //!
-//! Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips
-//! the Dhan HTTP auth call on crash recovery (~500ms-2s saved).
+//! ~~Steps 4+5 and QuestDB DDL queries run in parallel. Token cache skips~~
+//! ~~the Dhan HTTP auth call on crash recovery (~500ms-2s saved).~~
 //!
-//! 1. Load and validate configuration
-//! 2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)
-//! 3. Initialize structured logging with OpenTelemetry layer
-//! 4. (parallel) Notification service + Docker infra check
-//! 5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)
-//! 6. Authenticate (token cache → SSM → TOTP → JWT)
-//! 7. (parallel) QuestDB table setup (5 DDL queries concurrent)
-//! 8. Build F&O universe + subscription plan
-//! 9. Build WebSocket connection pool
-//! 10. Spawn tick processing pipeline
-//! 11. Spawn background historical candle fetch (cold path)
-//! 12. Spawn order update WebSocket
-//! 13. Start API server
-//! 14. Spawn token renewal task
-//! 15. Await shutdown signal
+//! ~~1. Load and validate configuration~~
+//! ~~2. Initialize observability (Prometheus metrics + OpenTelemetry tracing)~~
+//! ~~3. Initialize structured logging with OpenTelemetry layer~~
+//! ~~4. (parallel) Notification service + Docker infra check~~
+//! ~~5. Verify public IP against SSM static IP (BLOCKS BOOT on mismatch)~~
+//! ~~6. Authenticate (token cache → SSM → TOTP → JWT)~~
+//! ~~7. (parallel) QuestDB table setup (5 DDL queries concurrent)~~
+//! ~~8. Build F&O universe + subscription plan~~
+//! ~~9. Build WebSocket connection pool~~
+//! ~~10. Spawn tick processing pipeline~~
+//! ~~11. Spawn background historical candle fetch (cold path)~~
+//! ~~12. Spawn order update WebSocket~~
+//! ~~13. Start API server~~
+//! ~~14. Spawn token renewal task~~
+//! ~~15. Await shutdown signal~~
+//!
+//! **⚠ CORRECTED 2026-10-11** — the list above is the 2026-05 boot and is
+//! stale: there is no IP check, no F&O universe or subscription plan, no
+//! tick pipeline task, no historical candle fetch and no separate
+//! token-renewal step here. The boot today, in source order:
+//!
+//! ~~1. holiday-gate short-circuit (Step -1, Step 0.5)~~
+//! ~~2. CryptoProvider (Step 0) and the panic hook (Step 0.9)~~
+//! ~~3. configuration (Step 1)~~
+//!
+//! **⚠ CORRECTED 2026-10-11 (later the same day):** items 1 and 2 above
+//! were not in source order. The source runs: holiday-gate CLI
+//! short-circuit (Step -1), CryptoProvider (Step 0), the holiday-gate and
+//! ensure-questdb one-shots (Step 0.5), the panic hook (Step 0.9), then
+//! configuration (Step 1). Items 4 onward are unchanged.
+//! 4. observability, including the WAL replay read (Step 2)
+//! 5. logging (Step 3)
+//! 6. per-feed dispatcher (Step C)
+//! 7. systemd watchdog pinger
+//! 8. shared infrastructure (QuestDB, notifier)
+//! 9. process and disk monitors
+//! 10. WAL replay settlement
+//! 11. Dhan REST stack (auth, and the order-update socket when enabled)
+//! 12. Dhan live-feed stack
+//! 13. systemd ready
+//! 14. run loop (API server), then shutdown
+//!
+//! Read the `Step` banners in this file, not this list: this list is prose
+//! and goes stale the same way the one above did.
 
 // APPROVED: clippy 1.95 tightened these doc-formatting lints; this binary
 // crate root predates them. Allow rather than churn doc comments for a
 // cosmetic markdown-rendering nicety with zero runtime/behavior impact.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![allow(clippy::doc_lazy_continuation)]
 #![allow(clippy::doc_overindented_list_items)]
 // Match the lib.rs restriction-lint blanket for the binary crate root:
@@ -37,16 +67,16 @@
 
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
-    CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
+    CONFIG_BASE_PATH, IstTimer, check_clock_drift, compute_market_close_sleep,
     create_error_log_writer, format_bind_addr, should_emit_post_market_alert,
 };
+use tickvault_app::holiday_gate::trading_day_gate_exit_code;
+use tickvault_app::movers_universe_publisher;
 use tickvault_app::{host_limits, infra, observability, subsystem_memory};
 
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use figment::Figment;
-use figment::providers::{Format, Toml};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -92,45 +122,69 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // Main
 // ---------------------------------------------------------------------------
 
-/// Exit code returned by the `--check-trading-day` gate.
-///
-/// The holiday-gate shell script (`deploy/aws/holiday-gate.sh`) reads `$?` —
-/// NOT stdout (the app denies `print_stdout`/`print_stderr`). Contract:
-/// - `0`  = today (IST) is a trading day → let the app start.
-/// - `75` = today is a weekend / NSE holiday → gate self-stops the instance.
-///
-/// Pure so the contract is unit-testable without touching the clock/config.
-fn trading_day_gate_exit_code(is_trading_day: bool) -> i32 {
-    if is_trading_day { 0 } else { 75 }
-}
-
 /// `--check-trading-day` short-circuit: load config → build the calendar →
 /// evaluate IST today → exit with [`trading_day_gate_exit_code`].
 ///
-/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate script
+/// FAIL-OPEN: any config/calendar load error exits `70`, which the gate
 /// treats as "let the app start" — so the gate can NEVER stop the box on a real
 /// trading day because of a transient load failure. Single source of truth: the
 /// SAME `config/base.toml` NSE holiday list the app itself uses (no duplication).
+/// **⚠ CORRECTED 2026-10-11 (audit INP-14):** "the same list" was true only
+/// while no `config/<env>.toml` set one: the gate merged base and local, the
+/// boot merged base, `config/<env>.toml` and local. Both now read
+/// `boot_helpers::layered_config_figment`, the same layered config.
 fn run_trading_day_gate() -> ! {
-    let config: ApplicationConfig = match Figment::new()
-        .merge(Toml::file(CONFIG_BASE_PATH))
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
-    {
-        Ok(c) => c,
+    std::process::exit(trading_day_gate_code());
+}
+
+/// Exit code for the load error that the gate treats as "let the app start".
+const TRADING_DAY_GATE_LOAD_ERROR_EXIT: i32 = 70;
+
+/// The `--check-trading-day` verdict as an exit code, without exiting, so the
+/// in-process holiday gate asks the very same question.
+fn trading_day_gate_code() -> i32 {
+    let Some(calendar) = load_gate_trading_calendar() else {
         // FAIL-OPEN on load error (exit 70 → gate lets the app start).
-        Err(_) => std::process::exit(70),
-    };
-    let calendar = match TradingCalendar::from_config(&config.trading) {
-        Ok(c) => c,
-        Err(_) => std::process::exit(70),
+        return TRADING_DAY_GATE_LOAD_ERROR_EXIT;
     };
     let today_ist = (chrono::Utc::now()
         + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
-    std::process::exit(trading_day_gate_exit_code(
-        calendar.is_trading_day(today_ist),
-    ));
+    trading_day_gate_exit_code(calendar.is_trading_day(today_ist))
+}
+
+/// The trading calendar from the same layered config the boot uses, or
+/// `None` when the config or the calendar cannot be loaded (both gates then
+/// fail open).
+fn load_gate_trading_calendar() -> Option<TradingCalendar> {
+    // AUDIT INP-14 (2026-10-11): the same layered merge as the boot (base,
+    // then config/<env>.toml, then local). Until this date the gate skipped
+    // the env file.
+    let config: ApplicationConfig = tickvault_app::boot_helpers::layered_config_figment(
+        &tickvault_app::boot_helpers::resolve_config_env(),
+    )
+    .extract()
+    .ok()?;
+    TradingCalendar::from_config(&config.trading).ok()
+}
+
+/// What the holiday gate (`tickvault holiday-gate`) needs to know about one
+/// IST date (2026-10-20): a weekday NSE holiday is the only verdict it stops
+/// on, and a Muhurat or mock session never counts as one. A load error is
+/// `Unreadable`, which the gate treats as "let the app start". Asked
+/// in-process by `holiday_gate::run`; the `--check-trading-day` contract
+/// above is unchanged.
+fn holiday_gate_calendar_day(
+    today_ist: chrono::NaiveDate,
+) -> tickvault_app::holiday_gate::CalendarDay {
+    let Some(calendar) = load_gate_trading_calendar() else {
+        return tickvault_app::holiday_gate::CalendarDay::Unreadable;
+    };
+    tickvault_app::holiday_gate::classify_calendar_day(
+        today_ist,
+        calendar.is_holiday(today_ist),
+        calendar.is_muhurat_trading_day(today_ist) || calendar.is_mock_trading_day(today_ist),
+    )
 }
 
 /// Metric name for the dedicated boot-completed CloudWatch signal.
@@ -191,6 +245,17 @@ const BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS: u64 = 300;
 /// Poll cadence for the boot-completed feed-liveness wait.
 const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 
+/// Attempts at the boot-time SSM read of the API bearer token before the boot
+/// fails loudly (infra sweep row 12, 2026-09-08). Three is the REST stack's
+/// own shape: enough to ride out a throttle or a cold-start DNS blip, few
+/// enough that a genuinely dead SSM still fails the boot inside the
+/// start-watchdog's window.
+const API_BEARER_FETCH_MAX_ATTEMPTS: u32 = 3;
+/// Seconds before the second bearer-token fetch; doubles per attempt.
+/// Local to the shared-infra path on purpose: `build_shared_infra` may
+/// not name the Dhan REST stack (`per_feed_boot_isolation_guard`).
+const API_BEARER_FETCH_BACKOFF_SECS: u64 = 2;
+
 /// How many consecutive 30s stall scans must run with ZERO ticks observed
 /// before the starved-detector line fires.
 ///
@@ -201,6 +266,43 @@ const BOOT_COMPLETED_FEED_LIVENESS_POLL_MS: u64 = 1000;
 /// past any normal dial-to-first-frame, and the condition it detects is
 /// structural rather than transient — once true it stays true, so waiting
 /// costs nothing and guessing early costs credibility.
+/// Whether a Dhan per-minute REST leg exists to be armed. It does NOT.
+///
+/// The boot Telegram's capture line reports whether today's per-minute Dhan
+/// spot-1m and option-chain pulls will fire. Until 2026-09-16 it computed that
+/// from config — `spot_1m_rest.enabled || (cadence.enabled && cadence.dhan_lane)`
+/// — which was correct while those legs existed.
+///
+/// They were REMOVED on 2026-09-16 under the operator's sockets-only directive
+/// ("Bro just remove per minute price falls and 3.41 pm accuracy check alone"),
+/// and the config was not: `[cadence] enabled` and `dhan_lane` both still read
+/// `true` in `config/base.toml`. So both operands evaluated TRUE and the boot
+/// Telegram sent, every trading morning:
+///
+///   "✅ Dhan per-minute price capture — armed (fires 9:16 AM to 3:30 PM IST
+///    on trading days): Dhan spot candles for N indices + Dhan option chain
+///    for M indices"
+///
+/// for legs with no module, no executor and no scheduler. Every one of
+/// `cadence_boot.rs`, `dhan_cadence_executor.rs`, `spot_1m_rest_boot.rs` and
+/// `option_chain_1m_boot.rs` is deleted; `crates/core/src/cadence/` is gone.
+/// A green checkmark on the operator's phone asserting a capability that does
+/// not exist is the false-OK class this repository keeps retiring — and it is
+/// the worst-placed instance of it, because it is delivered rather than
+/// waited for.
+///
+/// Constant-folded rather than left to config on purpose. Config is a
+/// PREFERENCE and these legs are ABSENT: no flag can arm a module that is not
+/// compiled, so reading a flag here can only ever produce a wrong answer, and
+/// flipping `[cadence] enabled` back would silently restore the false page.
+/// The same shape as `rest_candle_fold::LIVE_INLET_HAS_PRODUCER`, for the same
+/// reason.
+///
+/// Pinned by `boot_report_capture_claim_guard.rs`, which DERIVES the expected
+/// value from whether a producing module actually exists — so restoring a leg
+/// without flipping this fails, and flipping this without a leg fails too.
+const DHAN_PER_MINUTE_LEGS_EXIST: bool = false;
+
 const STALL_SCAN_STARVED_AFTER_SCANS: u32 = 4;
 
 /// Should the stall scan report that it is STARVED rather than healthy?
@@ -228,41 +330,17 @@ const fn stall_scan_is_starved(
         && stale_scans >= STALL_SCAN_STARVED_AFTER_SCANS
 }
 
-/// Decide whether the boot-completed "the app is alive" signal
-/// (`tv_boot_completed`) may be emitted, given each feed's enabled flag and its
-/// observed lane-running state.
+/// Pure decision behind [`emit_boot_completed_when_feed_live`]: should the
+/// alive signal (`tv_boot_completed`) be published?
 ///
-/// FEED-AGNOSTIC by construction: the signal is warranted iff AT LEAST ONE
-/// ENABLED feed is running — a live Groww satisfies it when only Groww is
-/// enabled, a live Dhan when only Dhan is enabled, and either when both are
-/// enabled. A running-but-DISABLED feed never counts (an operator-off feed is
-/// not a reason to claim "alive").
-///
-/// The one exception: when NO feed is enabled (a deliberately feed-less run —
-/// shared-infra-only), the signal IS emitted so the boot-heartbeat alarm does
-/// not false-page a legitimately headless boot. The caller logs that case
-/// explicitly.
-///
-/// This closes the alerting hole where a boot that reached the emit line with
-/// EVERY enabled feed dead still published `tv_boot_completed=1` — so the
-/// boot-heartbeat alarm (`treat_missing_data="breaching"`) never paged. With
-/// this gate, "every enabled feed failed to come up" withholds the metric →
-/// MISSING → the alarm pages, exactly the intended signal.
-///
-/// Pure + O(1) — unit-tested truth table.
-fn boot_completed_should_emit(
-    dhan_enabled: bool,
-    groww_enabled: bool,
-    dhan_running: bool,
-    groww_running: bool,
-) -> bool {
-    // Deliberately feed-less run: nothing to be "live", so emit to avoid a
-    // false page on a headless shared-infra-only boot.
-    if !dhan_enabled && !groww_enabled {
-        return true;
-    }
-    // At least one feed enabled: emit iff at least one ENABLED feed is running.
-    (dhan_enabled && dhan_running) || (groww_enabled && groww_running)
+/// A deliberately feed-less run (`!dhan_enabled`) emits — a headless
+/// shared-infra-only boot must not false-page the boot-heartbeat alarm.
+/// Otherwise the signal is published only when the enabled feed is genuinely
+/// running, so a boot whose feed died WITHHOLDS it and the alarm pages on the
+/// missing metric. A running flag on a DISABLED feed never counts.
+#[must_use]
+pub fn boot_completed_should_emit(dhan_enabled: bool, dhan_running: bool) -> bool {
+    !dhan_enabled || dhan_running
 }
 
 /// Emit `tv_boot_completed` ONLY once at least one enabled feed's lane is
@@ -276,7 +354,6 @@ fn boot_completed_should_emit(
 async fn emit_boot_completed_when_feed_live(
     feed_runtime: &std::sync::Arc<tickvault_api::feed_state::FeedRuntimeState>,
     dhan_enabled: bool,
-    groww_enabled: bool,
     // BUG-2 fix (2026-07-05): `true` when the Dhan lane COMPLETED its boot
     // but deliberately built no pool (non-trading day / offline slow boot).
     // The lane is honestly NOT running (`dhan_running=false` on the feeds
@@ -286,14 +363,14 @@ async fn emit_boot_completed_when_feed_live(
     // waits for the lane-running flag).
     dhan_poolless_idle: bool,
 ) {
-    if !dhan_enabled && !groww_enabled {
+    if !dhan_enabled {
         // Deliberately feed-less run — emit immediately (no feed to wait for),
         // logged explicitly so the operator sees WHY the "alive" signal fired
         // with no live feed.
         info!(
-            "boot-completed: no feed enabled (dhan_enabled=false, groww_enabled=false) — \
-             emitting the alive signal immediately for the REST-only boot (the per-minute \
-             Dhan/Groww REST legs are config-gated by their own sections, not these flags)"
+            "boot-completed: no feed enabled (dhan_enabled=false) — emitting the alive \
+             signal immediately for the REST-only boot (the per-minute Dhan REST \
+             legs are config-gated by their own sections, not this flag)"
         );
         emit_boot_completed();
         return;
@@ -305,13 +382,10 @@ async fn emit_boot_completed_when_feed_live(
         // BUG-2 fix: a poolless-idle Dhan lane counts as "alive" for the
         // boot signal — the boot completed; there is simply no market today.
         let dhan_running = feed_runtime.is_dhan_lane_running() || dhan_poolless_idle;
-        let groww_running = feed_runtime.is_groww_lane_running();
-        if boot_completed_should_emit(dhan_enabled, groww_enabled, dhan_running, groww_running) {
+        if boot_completed_should_emit(dhan_enabled, dhan_running) {
             info!(
                 dhan_enabled,
-                groww_enabled,
                 dhan_running,
-                groww_running,
                 dhan_poolless_idle,
                 "boot-completed: a live feed is up (or the Dhan lane completed a \
                  pool-less non-trading-day boot) — emitting the alive signal"
@@ -324,10 +398,10 @@ async fn emit_boot_completed_when_feed_live(
             // WITHHOLD the alive signal so the boot-heartbeat alarm pages on the
             // MISSING metric, and name the dead feed(s) for the operator.
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "boot_no_feed_live",
                 dhan_enabled,
-                groww_enabled,
                 dhan_running,
-                groww_running,
                 wait_secs = BOOT_COMPLETED_FEED_LIVENESS_WAIT_SECS,
                 "boot-completed: NO enabled feed reached a live state within the wait window — \
                  WITHHOLDING the alive signal (tv_boot_completed) so the boot-heartbeat alarm \
@@ -391,6 +465,69 @@ const TOKIO_WORKER_THREADS_ENV: &str = "TICKVAULT_TOKIO_WORKER_THREADS";
 /// outage, so the parse clamps rather than trusts.
 const MAX_TOKIO_WORKER_THREADS: usize = 64;
 
+/// Runtime-sizing facts resolved in `main`, where no subscriber exists yet.
+///
+/// `main` runs before the tracing subscriber is installed and the direct-print
+/// macros are banned house-wide, so the derivation is stashed here and emitted by
+/// `async_main` as a real `info!` once logging is up.
+static TOKIO_RUNTIME_SIZING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// What `install_reader_runtime` did in `main`, for the boot log.
+static READER_RUNTIME_OUTCOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// The reader threads' core-pin plan, resolved in `main`, for the boot log.
+static READER_CORE_PLAN: std::sync::OnceLock<
+    tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+> = std::sync::OnceLock::new();
+
+/// Host-derived floor and ceiling for the resolved worker count.
+///
+/// The clamp is the point: a 1-core dev container must not get 2 (that
+/// oversubscribes), and a larger host must not silently widen the runtime past
+/// what the CPU isolation intends. `worker_threads(0)` panics the tokio
+/// builder, so the floor of 1 is a boot-safety bound, not a preference.
+const MIN_TOKIO_WORKER_THREADS: usize = 1;
+const HOST_DERIVED_WORKER_CEILING: usize = 4;
+
+/// How many CPUs this PROCESS may actually use, and where that answer came
+/// from.
+///
+/// Memory is already derived this way in two places — `market_ram_store_boot`
+/// reads `/proc/meminfo` AND the cgroup limit and takes the smaller, and the
+/// frame ring reads `/proc/meminfo` for its 2%. CPU was the one resource still
+/// answered by a constant chosen for one machine, which is the gap this closes.
+///
+/// Order matters. The cgroup quota is asked FIRST because it is what the
+/// systemd unit's `AllowedCPUs` actually confines this process to;
+/// `available_parallelism` reports the MACHINE, which on a confined process is
+/// the wrong, larger number.
+fn host_cpu_allowance() -> (usize, &'static str) {
+    // cgroup v2: "$MAX $PERIOD", where $MAX is "max" for unlimited.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = s.split_whitespace();
+        if let (Some(max), Some(period)) = (it.next(), it.next())
+            && let (Ok(m), Ok(p)) = (max.parse::<u64>(), period.parse::<u64>())
+            && p > 0
+        {
+            // Round UP: a 1.5-core quota should get 2 workers, not 1.
+            let cores = m.div_ceil(p);
+            if cores >= 1 {
+                return (cores as usize, "cgroup");
+            }
+        }
+    }
+    match std::thread::available_parallelism() {
+        Ok(n) => (n.get(), "parallelism"),
+        Err(_) => (DEFAULT_TOKIO_WORKER_THREADS, "fallback"),
+    }
+}
+
+/// Clamp a host allowance into the runtime width actually used.
+///
+/// Pure so the boundaries are testable without a machine: 0 and absurd values
+/// both land inside `[MIN, CEILING]`, and there is no input that returns
+/// something `worker_threads()` would reject.
+fn clamp_worker_threads(host: usize) -> usize {
+    host.clamp(MIN_TOKIO_WORKER_THREADS, HOST_DERIVED_WORKER_CEILING)
+}
 /// Resolve the runtime width from the raw environment value.
 ///
 /// Fail-SAFE by construction: absent, empty, non-numeric, zero, or absurd all
@@ -398,31 +535,202 @@ const MAX_TOKIO_WORKER_THREADS: usize = 64;
 /// this return something the runtime builder would reject, because a process
 /// that refuses to boot over a malformed tuning hint is strictly worse than
 /// one that boots on the default.
-fn resolve_tokio_worker_threads(raw: Option<&str>) -> usize {
+fn resolve_tokio_worker_threads(raw: Option<&str>, host_derived: usize) -> usize {
     match raw.map(str::trim) {
         Some(v) if !v.is_empty() => match v.parse::<usize>() {
             Ok(n) if (1..=MAX_TOKIO_WORKER_THREADS).contains(&n) => n,
-            _ => DEFAULT_TOKIO_WORKER_THREADS,
+            _ => host_derived,
         },
-        _ => DEFAULT_TOKIO_WORKER_THREADS,
+        _ => host_derived,
+    }
+}
+
+/// What the boot log says about the reader threads' core pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderPinReport {
+    /// Every reader thread is on this core.
+    Pinned(i64),
+    /// Unpinned by design or by the host shape; an `info!` line.
+    Unpinned(&'static str),
+    /// The operator asked for a pin the process could not apply; a coded
+    /// `warn!` line, once.
+    Refused(&'static str),
+}
+
+/// Pure verdict from the plan, whether the reader runtime exists, and what
+/// its threads recorded.
+fn reader_pin_report(
+    plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan,
+    runtime_installed: bool,
+    pinned_core: i64,
+    pin_failures: u64,
+) -> ReaderPinReport {
+    use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+    match plan {
+        Plan::Off => ReaderPinReport::Unpinned("TICKVAULT_WS_READER_CORE=off"),
+        Plan::Unsupported => ReaderPinReport::Unpinned("not Linux"),
+        Plan::DefaultNotAllowed => {
+            ReaderPinReport::Unpinned("core 1 is not in this process's allowed core set")
+        }
+        Plan::RefusedCoreZero => {
+            ReaderPinReport::Refused("core 0 is never used: it services network interrupts")
+        }
+        Plan::NotAllowed(_) => {
+            ReaderPinReport::Refused("the named core is not in this process's allowed core set")
+        }
+        Plan::Invalid => {
+            ReaderPinReport::Refused("TICKVAULT_WS_READER_CORE is not `off` or a core id")
+        }
+        Plan::Pin(_) if !runtime_installed => {
+            ReaderPinReport::Unpinned("no dedicated reader runtime (TICKVAULT_WS_READER_THREADS=0)")
+        }
+        Plan::Pin(_) if pin_failures > 0 || pinned_core < 0 => {
+            ReaderPinReport::Refused("the kernel refused the pin")
+        }
+        Plan::Pin(_) => ReaderPinReport::Pinned(pinned_core),
+    }
+}
+
+/// Logs the reader pin outcome once and sets `tv_ws_reader_pinned_core`
+/// (the core, or -1). Never fails boot.
+fn report_reader_core_pin(plan: tickvault_core::websocket::reader_runtime::ReaderCorePlan) {
+    use tickvault_core::websocket::reader_runtime as rr;
+    let pinned = rr::reader_pinned_core();
+    let (failures, errno) = rr::reader_pin_failures();
+    let report = reader_pin_report(
+        plan,
+        rr::reader_runtime_handle().is_some(),
+        pinned,
+        failures,
+    );
+    let gauge_value = match report {
+        ReaderPinReport::Pinned(core) => core,
+        _ => -1,
+    };
+    metrics::gauge!("tv_ws_reader_pinned_core")
+        .set(f64::from(i32::try_from(gauge_value).unwrap_or(-1)));
+    match report {
+        ReaderPinReport::Pinned(core) => {
+            info!(core, "socket reader threads pinned to their own core");
+        }
+        ReaderPinReport::Unpinned(reason) => {
+            info!(plan = ?plan, reason, "socket reader threads run unpinned");
+        }
+        ReaderPinReport::Refused(reason) => {
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::HotPath03ReaderPinNotApplied
+                    .code_str(),
+                plan = ?plan,
+                reason,
+                failed_threads = failures,
+                os_errno = errno,
+                "socket reader threads run UNPINNED — the requested core pin was not applied"
+            );
+        }
     }
 }
 
 fn main() -> Result<()> {
-    let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
-    let worker_threads = resolve_tokio_worker_threads(raw.as_deref());
+    // `tickvault host-tuning <action>` (audit D6b): the per-boot host tuning the
+    // host-tuning unit runs as root. Dispatched before the runtime is built: it
+    // is synchronous, needs no TLS, and exits immediately.
+    let cli_args: Vec<String> = std::env::args().collect();
+    if let Some(code) = tickvault_app::host_tuning::run_cli(&cli_args) {
+        std::process::exit(code);
+    }
+    // `tickvault strategy-dry-run ...` (rule brutex-strategy-host-2026-10-29.md):
+    // loads and checks published brutex strategy folders; no order, no live change.
+    if let Some(code) = tickvault_app::strategy_dry_run::run_cli(&cli_args) {
+        std::process::exit(code);
+    }
 
-    // `enable_all` matches what `#[tokio::main]` installed (IO + time drivers).
-    // Named threads so `top -H` / `perf` on the box can tell a runtime worker
-    // apart from a blocking-pool thread while attributing a stall.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_name("tv-worker")
-        .enable_all()
-        .build()
+    let raw = std::env::var(TOKIO_WORKER_THREADS_ENV).ok();
+    let (host_cpus, cpu_source) = host_cpu_allowance();
+    let host_derived = clamp_worker_threads(host_cpus);
+    let worker_threads = resolve_tokio_worker_threads(raw.as_deref(), host_derived);
+    // Stashed, not written to stdout: the direct-print macros are banned
+    // house-wide and the tracing subscriber does not exist yet at this point
+    // in `main`. `async_main` emits this as a real `info!` once logging is up.
+    // The SOURCE travels with the value — a derived number nobody can trace
+    // back to its input is the thing this change set out to remove.
+    let _ = TOKIO_RUNTIME_SIZING.set(format!(
+        "workers={worker_threads} host_cpus={host_cpus} source={cpu_source} \
+         clamped={host_derived} override={}",
+        raw.as_deref().unwrap_or("unset")
+    ));
+
+    // The socket readers' own runtime (2026-10-02), built BEFORE the main
+    // runtime's `block_on` so dropping a losing racer can never happen inside
+    // async code. `0` in the env keeps the readers on the main runtime. The
+    // outcome travels to the boot log with the sizing line below.
+    let reader_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_THREADS_ENV).ok();
+    let reader_threads =
+        tickvault_core::websocket::reader_runtime::resolve_ws_reader_threads(reader_raw.as_deref());
+    // Core pinning for those threads (2026-10-02): resolved here, against the
+    // process's allowed core set, and reported by `async_main` once logging
+    // and the metrics recorder exist.
+    let core_raw =
+        std::env::var(tickvault_core::websocket::reader_runtime::WS_READER_CORE_ENV).ok();
+    let core_plan = tickvault_core::websocket::reader_runtime::resolve_ws_reader_core_for_process(
+        core_raw.as_deref(),
+    );
+    let _ = READER_CORE_PLAN.set(core_plan);
+    // Plan ITEM DT (2026-10-30): real-time priority for the readers and the
+    // drain, off unless asked AND the kernel's real-time throttle is active.
+    let rt_decision = tickvault_app::hot_thread_boot::decide_rt_from_env();
+    let _ = READER_RUNTIME_OUTCOME.set(
+        match tickvault_core::websocket::reader_runtime::install_reader_runtime(
+            reader_threads,
+            core_plan.core(),
+            rt_decision.reader(),
+        ) {
+            Ok(outcome) => format!("{outcome:?}"),
+            Err(err) => format!("FAILED({err}) — readers share the main runtime"),
+        },
+    );
+    // Plan ITEM DT: the drain's placement, and (when asked) this thread
+    // pinned to the background core so the main runtime built below, and
+    // every thread it spawns, inherits it (off by default). DP-6: cores read before the pin.
+    let _process_cores = tickvault_storage::host_capacity_minute::record_process_core_count();
+    tickvault_app::hot_thread_boot::place_drain_and_background(rt_decision);
+
+    let runtime = tickvault_app::hot_path_proof_boot::build_main_runtime(worker_threads)
         .context("failed to build the tokio runtime")?;
 
-    runtime.block_on(async_main())
+    let outcome = runtime.block_on(async_main());
+    // RUNTIME-NOT-DROPPED-AT-EXIT (2026-10-10). The runtime is leaked, not
+    // dropped, and the process exits as soon as `main` returns.
+    //
+    // By the time `async_main` returns, the shutdown sequence has already
+    // drained every durable tier itself (lane seal and flush, seal writer,
+    // escalation thread, crash marker, WAL spill), except when the lane
+    // overran its shutdown budget mid-way through a WAL refold batch; that
+    // is logged as a shutdown timeout and its unconfirmed segments are
+    // re-read on the next boot. Dropping the runtime adds nothing to that
+    // and caused two measured failures:
+    //
+    // * 6 Oct 2026, 15:46:51 IST: the drop shut the time driver down while a
+    //   blocking-pool thread was still waiting on a timer through
+    //   `Handle::block_on` (the tick spill replay round runs that way). Tokio
+    //   panicked with "A Tokio 1.x context was found, but it is being
+    //   shutdown" 20 ms after "tickvault stopped", and `panic = "abort"`
+    //   turned it into a core dump.
+    // * 9 Oct 22:41 and 10 Oct 02:17 IST: the drop waited without bound for a
+    //   worker stuck in the lane's synchronous WAL refold, about 85 s after
+    //   "tickvault stopped", against systemd's 145 s stop timeout. When the
+    //   lane resumed it spawned the frame drain into the dying runtime, which
+    //   cancelled it at once ("frame drain DIED").
+    //
+    // Leaking keeps the drivers alive until the process ends, so no thread
+    // can see a runtime that is shutting down, and the exit no longer waits
+    // on work nobody needs. Anything still running at that point is
+    // crash-safe by design (the same work a SIGKILL would cut short): WAL
+    // segments are confirmed only after their rows landed, spill files are
+    // deleted only after their replay landed. Pinned by
+    // `crates/app/tests/shutdown_runtime_not_dropped_guard.rs`.
+    std::mem::forget(runtime);
+    outcome
 }
 
 async fn async_main() -> Result<()> {
@@ -442,9 +750,9 @@ async fn async_main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step -1: Holiday-gate CLI short-circuit (cold path, no TLS / no runtime).
     // -----------------------------------------------------------------------
-    // `tickvault --check-trading-day` is invoked by the boot-time holiday gate
-    // (deploy/aws/holiday-gate.sh via the tickvault-holiday-gate.service oneshot)
-    // BEFORE the app proper starts. It exits 0 (trading day) / 75 (holiday) /
+    // `tickvault --check-trading-day` answers the holiday gate's question for an
+    // operator at a shell (the gate itself, `tickvault holiday-gate`, asks it
+    // in-process at Step 0.5 below). It exits 0 (trading day) / 75 (holiday) /
     // 70 (load error → fail-open). Must run before CryptoProvider install — the
     // gate needs no TLS and exits immediately.
     if std::env::args().any(|a| a == "--check-trading-day") {
@@ -464,6 +772,117 @@ async fn async_main() -> Result<()> {
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
 
     // -----------------------------------------------------------------------
+    // Step 0.5: `tickvault holiday-gate` (audit D6c; was deploy/aws/holiday-gate.sh)
+    // -----------------------------------------------------------------------
+    // Run by tickvault-holiday-gate.service before the app: same calendar as `--check-trading-day`;
+    // on a definitive holiday it stamps the stop marker, pages, stops the instance (TLS: IMDS/AWS).
+    let cli_args: Vec<String> = std::env::args().collect();
+    if tickvault_app::holiday_gate::is_invocation(&cli_args) {
+        let code = tickvault_app::holiday_gate::run(holiday_gate_calendar_day).await;
+        std::process::exit(code);
+    }
+    // `tickvault ensure-questdb` (D6d): ExecStartPre / console restarts bring QuestDB up (SSM, TLS).
+    // `tickvault day-repair`: the one-off repair of 2026-11-20 (Quote 63, rust-only §0.21).
+    if tickvault_app::ensure_questdb::is_invocation(&cli_args) {
+        let code = tickvault_app::ensure_questdb::run().await;
+        std::process::exit(code);
+    }
+    if tickvault_app::day_repair::is_invocation(&cli_args) {
+        std::process::exit(tickvault_app::day_repair::run_cli(&cli_args).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 0.9: Panic hook (audit CR-3, 2026-10-11)
+    // -----------------------------------------------------------------------
+    // Installed HERE, before the config load (which can panic) and before the
+    // first spawned task, the WAL writer thread and every other boot step, so
+    // a panic in boot from here on leaves the synchronous PROC-03 lines and
+    // gets the bounded WAL drain. Until this date it sat after ~40 spawns and
+    // the WAL thread, so an early panic left only the default stderr message.
+    // After the one-shot CLI short-circuits above, which never run the app.
+    // NOT covered (default stderr message only): the TLS provider install at
+    // Step 0, the holiday-gate and ensure-questdb one-shots, and main()'s
+    // reader-runtime setup before async_main starts.
+    // It needs nothing initialized: with no subscriber yet the tracing line
+    // is a no-op, the drain reports no spill registered, and the file writers
+    // create `data/logs/machine` themselves. No alarm pages on these lines. A
+    // single panic that systemd restarts within about five minutes is not
+    // paged at all; only a restart loop (past StartLimitBurst the unit stays
+    // failed) or an outage of five minutes or more between 09:20 and 15:35
+    // IST trips market-hours-liveness-missing. A PROC-03 page is an open
+    // owner decision under the noise lock.
+    // Release builds use panic = "abort" (deep audit SUP-10): this hook is the
+    // LAST code a panicking process runs. No task survives a panic in
+    // production, so a catch_unwind or JoinError respawn arm elsewhere runs only
+    // in test and dev builds; recovery is the systemd restart (RestartSec=3)
+    // plus WAL replay, and the clippy unwrap/expect denies are the defence.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let location = panic_info.location().map_or_else(
+            || "unknown".to_string(),
+            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
+        );
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        // Synchronous FIRST: every tracing sink is non-blocking, and under
+        // `panic = "abort"` the process dies before their worker threads
+        // flush. This line is the one record that must not ride a queue.
+        tickvault_app::observability::append_panic_line_sync(
+            std::path::Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+            &location,
+            &payload,
+        );
+        // Audit OBS-1 (2026-10-11): errors.log is not shipped to CloudWatch;
+        // the hourly errors.jsonl file is. Write the same crash there too,
+        // synchronously, before the WAL drain can make it wait.
+        tickvault_app::observability::append_panic_jsonl_line_sync(
+            std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+            &location,
+            &payload,
+        );
+        // Z11b (2026-10-02): under `panic = "abort"` (the release profile) the
+        // process dies the moment this hook returns, and every record still
+        // in the WAL spill channel dies with it — each one already reported to
+        // its socket as `Spilled`, and never resent by Dhan. Give the writer a
+        // bounded moment to empty the channel into the page cache, which
+        // survives the abort. Skipped (inside the call) when the writer itself
+        // panicked, and not run at all under unwinding, where the panic may be
+        // caught and the process lives on.
+        let wal_drain = if cfg!(panic = "abort") {
+            Some(
+                tickvault_storage::ws_frame_spill::drain_registered_for_abort(
+                    tickvault_storage::ws_frame_spill::WAL_ABORT_DRAIN_BUDGET,
+                ),
+            )
+        } else {
+            None
+        };
+        // Review of OBS-1 (2026-10-11): the two synchronous lines above run
+        // before the drain and the tracing line below dies with the abort, so
+        // without this no surviving record says how the drain ended. One more
+        // synchronous line, after the drain and before the default hook.
+        if let Some(outcome) = &wal_drain {
+            tickvault_app::observability::append_panic_wal_drain_jsonl_line_sync(
+                std::path::Path::new(tickvault_app::observability::ERRORS_JSONL_DIR),
+                &format!("{outcome:?}"),
+            );
+        }
+        tracing::error!(
+            code = tickvault_common::error_code::ErrorCode::Proc03Panicked.code_str(),
+            panic_location = %location,
+            panic_payload = %payload,
+            wal_drain = ?wal_drain,
+            "PANIC: tickvault crashed"
+        );
+        default_panic_hook(panic_info);
+    }));
+
+    // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
     // -----------------------------------------------------------------------
     // Merge order (last-write-wins): base.toml → config/<env>.toml → local.toml.
@@ -471,15 +890,14 @@ async fn async_main() -> Result<()> {
     // ENVIRONMENT, the SAME variable secret_manager uses for the SSM prefix, so
     // config + secrets always agree. For dev/local there is no override file,
     // so this is byte-identical to the previous base + local behaviour.
+    // Since 2026-10-11 (audit INP-14) the merge lives in
+    // `boot_helpers::layered_config_figment`, shared with the
+    // `--check-trading-day` gate so the two can never read different files.
     let config_env = tickvault_app::boot_helpers::resolve_config_env();
-    let mut config_figment = Figment::new().merge(Toml::file(CONFIG_BASE_PATH));
-    if let Some(env_path) = tickvault_app::boot_helpers::config_env_path(&config_env) {
-        config_figment = config_figment.merge(Toml::file(env_path));
-    }
-    let mut config: ApplicationConfig = config_figment
-        .merge(Toml::file(CONFIG_LOCAL_PATH))
-        .extract()
-        .context("failed to load configuration from config/base.toml")?;
+    let mut config: ApplicationConfig =
+        tickvault_app::boot_helpers::layered_config_figment(&config_env)
+            .extract()
+            .context("failed to load configuration from config/base.toml")?;
 
     config
         .validate()
@@ -496,6 +914,8 @@ async fn async_main() -> Result<()> {
     .date_naive();
     if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
         error!(
+            code = tickvault_common::error_code::ErrorCode::OmsGapDryRunSafety.code_str(),
+            source = "sandbox_window_boot",
             error = %e,
             "S6-Step4 BOOT BLOCKED: sandbox-only window violation"
         );
@@ -579,17 +999,6 @@ async fn async_main() -> Result<()> {
         // resurrect the retired feed over the production.toml flip (the
         // boot-heartbeat false-page class). One boot-time warn makes the
         // suppression visible (never silent).
-        if tickvault_api::feed_state_persist::groww_overlay_suppressed(
-            &config.feeds,
-            persisted.as_ref(),
-        ) {
-            warn!(
-                "feed-state overlay requested groww_enabled=true but the config says false — \
-                 overlay SUPPRESSED: the Groww live feed is retired by operator directive \
-                 2026-07-15 (both brokers are REST-only for market data). Re-enabling requires \
-                 a config change + restart."
-            );
-        }
         config.feeds = tickvault_api::feed_state_persist::overlay_feeds(config.feeds, persisted);
     }
     let feeds = &config.feeds;
@@ -623,13 +1032,11 @@ async fn async_main() -> Result<()> {
     // exists anymore).
     info!(
         dhan_enabled = feeds.dhan_enabled,
-        groww_enabled = feeds.groww_enabled,
-        both_enabled = feeds.both_enabled(),
         "feed selection: which market-data feeds are configured"
     );
     if !feeds.any_enabled() {
         warn!(
-            "[feeds] both dhan_enabled and groww_enabled are false — no market-data \
+            "[feeds] dhan_enabled is false — no market-data \
              feed is configured; the Dhan boot path still runs as today until the \
              feed-gating PR lands"
         );
@@ -700,6 +1107,15 @@ async fn async_main() -> Result<()> {
     // `index_constituency_boot::tests::ratchet_ts_pin_migration_spawns_before_groww_universe_rider`.
     tokio::spawn(
         tickvault_app::index_constituency_boot::run_index_constituency_ts_pin_migration_at_boot(
+            config.questdb.clone(),
+        ),
+    );
+    // Contract name repair (2026-10-10, item 56): once a day after the close,
+    // put the `contract` name back on rows a boot rewrote without one (the
+    // 2026-10-09 evening redeploys). Process-global, every boot mode; it only
+    // touches days whose contract files are still on disk.
+    tokio::spawn(
+        tickvault_app::contract_name_repair_boot::run_contract_name_repair_loop(
             config.questdb.clone(),
         ),
     );
@@ -794,6 +1210,40 @@ async fn async_main() -> Result<()> {
     // is KEPT.
 
     // -----------------------------------------------------------------------
+    // Step 2: Initialize observability (Prometheus metrics exporter)
+    //
+    // MOVED HERE 2026-08-26, ahead of STAGE-C, and the move is the fix — not
+    // a tidy-up. A `metrics::counter!` resolved before the recorder is
+    // installed returns `Counter { inner: None }`, whose `increment` is a
+    // no-op FOREVER; if the caller caches that handle (as `SpillDropCounters`
+    // does, deliberately, to keep its drop path allocation-free) the counter
+    // is dead for the process lifetime. `SpillDropCounters::new` ran inside
+    // `WsFrameSpill::new` in STAGE-C below — 35 lines BEFORE this call — so
+    // `tv_ws_frame_spill_drop_critical` and `tv_ticks_lost_total` never
+    // appeared in `/metrics` at all. Live-verified absent on prod
+    // 2026-08-26 while their neighbours rendered at 0. That silently
+    // disarmed the `tv-<env>-ticks-lost-at-spill-writer` alarm and one leg
+    // of the `durable-floor-breach` composite.
+    //
+    // This is the SECOND occurrence of the identical bug in this file: the
+    // 2026-07-14 PR-C3 note ~120 lines above records the same no-op-recorder
+    // loss for `tv_ws_frame_wal_replay_total`, fixed by moving the INCREMENT.
+    // Moving one increment fixes one instance and leaves the ordering hazard
+    // in place, which is why it recurred. Installing the recorder before the
+    // first boot-flow registration retires the whole class instead.
+    //
+    // Ratchet: crates/app/tests/metrics_recorder_install_order_guard.rs.
+    // -----------------------------------------------------------------------
+    observability::init_metrics(&config.observability)
+        .context("failed to initialize Prometheus metrics")?;
+
+    // Cache parser dispatcher Counter handles AFTER the recorder is
+    // installed. Without this, the first hot-path packet of each kind
+    // would allocate (Principle #1 violation). Must run post-install
+    // because handles created pre-install resolve to a no-op counter.
+    tickvault_core::parser::prewarm_dispatcher_counters();
+
+    // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
     // Every raw WS frame (2 types: LiveFeed, OrderUpdate)
@@ -810,31 +1260,152 @@ async fn async_main() -> Result<()> {
     // remain in `ws_frame_spill::WsType` as orphan; any replayed records
     // of those types are silently dropped here.
     // -----------------------------------------------------------------------
-    // Single source of truth for the WAL dir (hostile-review H1: shared
-    // with the 15:40 conservation audit so the two sites can never drift).
-    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
+    // PR RD finding 3: take the evening drain's restart mark before replaying.
+    let _planned_evening_boot = tickvault_app::evening_drain::claim_planned_boot();
+    let ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir(); // shared with the 15:40 audit (H1)
     let ws_wal_dir = ws_wal_path.display().to_string(); // O(1) EXEMPT: boot-time
+    // CLAIM THE WAL DIRECTORY BEFORE ANYTHING TOUCHES IT (2026-08-28).
+    //
+    // `replay_all` below is not a read — it RENAMES live `*.wal` files into
+    // `replaying/`. Until this claim moved up here, a second process started
+    // against a live one would stage the INCUMBENT's currently-open segment out
+    // from under it (the incumbent keeps writing to the moved inode, its fd is
+    // still valid), and only THEN reach the claim inside `WsFrameSpill::new`
+    // ~115 lines later, be refused, and exit. The refusal worked; it arrived
+    // after the damage, and the incumbent's remaining session frames were left
+    // in a file its own `confirm_replayed` would never cover.
+    //
+    // The guard is MOVED into `WsFrameSpill::new_with_guard` below rather than
+    // re-taken there: a second `lock_wal_dir` from this same process is a
+    // different open file description and the kernel refuses it exactly as it
+    // refuses a foreign one.
+    let ws_wal_guard = match tickvault_storage::ws_frame_spill::lock_wal_dir(&ws_wal_path) {
+        Ok(guard) => guard,
+        Err(err) => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Resilience01DualInstanceDetected.code_str(),
+                dir = %ws_wal_dir,
+                error = %err,
+                "STAGE-C: another live process already owns this WAL directory — refusing \
+                 to start. Two writers mint capture_seq from independent counters, collide \
+                 inside the ticks DEDUP key, and destroy ticks with no counter to show it."
+            );
+            std::process::exit(1);
+        }
+    };
+    // §2.20 + K4: backlog vs the last start, then the last receipt, before any append.
+    tickvault_storage::ltt_correction::install_at_boot_from(&config); // scope lock 2026-11-20
+    let _backlog_trend = tickvault_storage::wal_backlog_trend::judge_at_boot(&ws_wal_path);
+    let previous_process_last_receipt =
+        tickvault_storage::wal_last_receipt::newest_receipt_nanos_on_disk(&ws_wal_path);
+
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     // TICK-SEQ-01: carry each replayed frame's `frame_seq` so re-injected
     // frames reuse the SAME capture sequence as their original live write
     // (replay-stable). v1 records replay with frame_seq=0.
-    let mut ws_wal_replay_live_feed: Vec<(u64, bytes::Bytes)> = Vec::new();
+    // TVW3: the third element is the frame's ORIGINAL arrival instant, read
+    // back from the WAL record. It was persisted on 2026-08-28 precisely so
+    // replay would stop re-deriving it, and until this change NOTHING read it
+    // back -- `ReplayedFrame::received_at_nanos` had zero consumers in the
+    // workspace while its own doc said "a replay consumer MUST prefer this
+    // over a fresh clock read". `WAL_RECEIPT_UNKNOWN_NANOS` for v1/v2 records,
+    // which genuinely predate the field.
+    // Put both unrecovered-frame series on the wire at zero BEFORE the replay
+    // decides anything.
+    //
+    // This one is not housekeeping: `tv-<env>-wal-frames-not-recovered` alarms
+    // on this metric at threshold 1, and a live sweep on 2026-08-29 found the
+    // metric had NEVER published a datapoint — so that alarm has been sitting
+    // at OK since it shipped and could not have fired. A counter only touched
+    // when frames are LOST is born at the loss, and the CloudWatch agent drops
+    // the first sample of a series it has never seen, so the first episode is
+    // exactly the one that goes missing.
+    //
+    // Seeded here, in STAGE-C, because STAGE-C is the WAL replay: the series
+    // appears when the thing it measures actually runs, never from a boot-wide
+    // seeder that would claim health for a subsystem that never started.
+    for ws_type in ["live_feed", "order_update"] {
+        metrics::counter!("tv_ws_frame_wal_reinjected_dropped_total", "ws_type" => ws_type)
+            .increment(0);
+    }
+    // (frame_seq, received_at_nanos, TVW4 endpoint, frame) — the endpoint is
+    // what lets the lane's refold route a depth frame to the depth drain.
+    let mut ws_wal_replay_live_feed: Vec<(
+        u64,
+        i64,
+        tickvault_storage::ws_frame_spill::WalEndpoint,
+        bytes::Bytes,
+    )> = Vec::new();
+    // Indexes into `ws_wal_replay_live_feed` of frames that follow a gap in
+    // the replay (plan ITEM 47).
+    let mut ws_wal_replay_gaps: Vec<usize> = Vec::new();
+    // Whether the boot pass ENDED on a gap: frames after its last live-feed
+    // frame were skipped. `None` when it returned nothing (plan ITEM 47).
+    let mut ws_wal_replay_trailing_gap: Option<bool> = None;
+    // Receipt time of the boot pass's last candle-bearing frame, so the
+    // catch-up drain can see a process boundary across the pass boundary.
+    let mut ws_wal_replay_last_fold_receipt: Option<i64> = None;
     let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
-    match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
-        Ok(recovered) => {
+    // A REFUSED or FAILED pass touches nothing, including `replaying/`; only a
+    // pass that READ may archive it (`boot_wal_confirm`, 2026-11-07).
+    let ws_wal_replay_result = tickvault_storage::ws_frame_spill::replay_all_fenced(&ws_wal_path);
+    let ws_wal_replay_pass =
+        tickvault_app::boot_wal_confirm::BootReplayPass::of(&ws_wal_replay_result);
+    match ws_wal_replay_result {
+        Ok(batch) => {
+            let boot_pass_trailing_gap = batch.trailing_gap;
+            let recovered = batch.frames;
             if recovered.is_empty() {
                 info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
             } else {
                 let mut live = 0u64;
                 let mut ord = 0u64;
                 let mut truedata = 0u64;
+                // A gap in front of a frame this lane does not fold still
+                // applies to the next live-feed frame (plan ITEM 47).
+                let mut gap_carry = false;
+                let mut segment_boundary = false;
                 for rec in recovered {
+                    gap_carry |= rec.after_gap;
+                    // A process boundary is a gap too: nothing is dropped where
+                    // one run's frames meet the next one's, so receipt times
+                    // are compared across each segment boundary.
+                    segment_boundary |= rec.first_in_segment;
+                    if tickvault_storage::ws_frame_spill::frame_feeds_the_candle_fold(
+                        rec.ws_type,
+                        rec.endpoint,
+                    ) {
+                        if std::mem::replace(&mut segment_boundary, false)
+                            && let Some(prev) = ws_wal_replay_last_fold_receipt
+                            && tickvault_storage::ws_frame_spill::process_boundary_is_gap(
+                                prev,
+                                rec.received_at_nanos,
+                            )
+                        {
+                            gap_carry = true;
+                        }
+                        // A record with no known receipt (legacy) does not reset
+                        // the comparison point.
+                        if tickvault_storage::ws_frame_spill::plausible_receipt_nanos(
+                            rec.received_at_nanos,
+                        ) != tickvault_storage::ws_frame_spill::WAL_RECEIPT_UNKNOWN_NANOS
+                        {
+                            ws_wal_replay_last_fold_receipt = Some(rec.received_at_nanos);
+                        }
+                    }
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            ws_wal_replay_live_feed
-                                .push((rec.frame_seq, bytes::Bytes::from(rec.frame)));
+                            if std::mem::replace(&mut gap_carry, false) {
+                                ws_wal_replay_gaps.push(ws_wal_replay_live_feed.len());
+                            }
+                            ws_wal_replay_live_feed.push((
+                                rec.frame_seq,
+                                rec.received_at_nanos,
+                                rec.endpoint,
+                                bytes::Bytes::from(rec.frame),
+                            ));
                         }
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
                             ord += 1;
@@ -853,6 +1424,9 @@ async fn async_main() -> Result<()> {
                         }
                     }
                 }
+                // A gap flagged on a frame after the last live-feed one, or
+                // after the pass's last frame, is a gap at the pass's end.
+                ws_wal_replay_trailing_gap = Some(boot_pass_trailing_gap || gap_carry);
                 info!(
                     dir = %ws_wal_dir,
                     total = live + ord + truedata,
@@ -873,18 +1447,73 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill02FrameDropped.code_str(),
+                source = "boot_replay_failed",
                 ?err,
                 dir = %ws_wal_dir,
-                "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
+                "STAGE-C: WAL replay failed — continuing boot; nothing staged is archived, \
+                 every segment stays for the catch-up drain or the next boot"
             );
         }
     }
+
+    // The SECOND `observability::init_metrics` call that stood here is
+    // DELETED (2026-08-28). The 2026-08-26 change that moved the install
+    // ahead of STAGE-C -- for the recorder-ordering reason written at that
+    // call site ~100 lines above -- COPIED it instead of MOVING it, and left
+    // this one behind. `PrometheusBuilder::install()` binds the exporter's
+    // HTTP listener, so the second call bound 9091 a second time in the same
+    // process and returned EADDRINUSE, which `?` turned into a boot failure:
+    //
+    //     Error: failed to initialize Prometheus metrics
+    //       0: failed to install Prometheus metrics exporter
+    //       1: failed to create HTTP listener: Address in use (os error 98)
+    //
+    // The binary could therefore NEVER start. Live on prod 2026-08-28: the
+    // deploy swapped the binary at 08:55 IST, systemd retried 8 times in 18
+    // seconds, hit "Start request repeated too quickly" and stopped trying;
+    // the box sat with no app through the 09:15 open until the previous
+    // binary was restored. Nothing in the port was ever wrong -- `ss`, `lsof`
+    // and `fuser` all showed 9091 free while a fresh start still failed,
+    // which is what identifies the collision as self-inflicted rather than an
+    // orphaned process.
+    //
+    // Pinned by metrics_recorder_install_order_guard::
+    // init_metrics_is_called_exactly_once, so a future move that copies
+    // instead of moving fails the build rather than the boot.
+
+    // MOVED HERE 2026-08-26, and the move is the whole fix.
+    //
+    // This block used to sit ~35 lines ABOVE `init_metrics`, which meant
+    // `SpillDropCounters::new()` resolved its handles against the NO-OP
+    // recorder. `metrics::counter!` with no recorder installed returns a
+    // no-op handle, and this one is CACHED in the struct for the process
+    // lifetime — so the pre-registration was lost AND every later
+    // `increment(1)` on a real frame drop went nowhere. `tv_ticks_lost_total`
+    // and `tv_ws_frame_spill_drop_critical` were therefore absent from
+    // /metrics on the live box (verified 2026-08-26: zero matching lines out
+    // of 756), which makes `tv-<env>-ticks-lost-spill` — the alarm on
+    // UNRECOVERABLE tick loss — incapable of ever firing.
+    //
+    // This exact hazard is documented twice within 40 lines of here: the
+    // STAGE-C.2b comment above ("they hit the no-op recorder and were
+    // silently lost") and `prewarm_dispatcher_counters` below ("Must run
+    // post-install because handles created pre-install resolve to a no-op
+    // counter"). It was fixed for those two and missed here.
+    //
+    // Nothing between the old and new position touched `ws_frame_spill` —
+    // its only consumer is the stack wiring far below — and the fail-closed
+    // halt is strictly better here: it now happens with the exporter UP, so
+    // the boot-halt is observable rather than silent.
     // PR-C2 (2026-07-13): with the Dhan live WS retired there is no frame
     // APPEND site left in this process (the dhan_rest_stack order-update WS
     // deliberately runs wal_spill=None while dormant — C1 dormancy honesty),
     // but the WAL WRITER + fail-closed init are KEPT: the WAL dir remains the
     // replay/archive floor consumed above and by the 15:40 conservation audit.
-    let _ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
+    let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new_with_guard(
+        &ws_wal_path,
+        ws_wal_guard,
+    ) {
         Ok(spill) => {
             info!(
                 dir = %ws_wal_dir,
@@ -899,6 +1528,7 @@ async fn async_main() -> Result<()> {
         }
         Err(err) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill03WalInitFailed.code_str(),
                 ?err,
                 dir = %ws_wal_dir,
                 "STAGE-C: failed to initialize WsFrameSpill — HALTING boot (fail-closed). \
@@ -910,24 +1540,26 @@ async fn async_main() -> Result<()> {
             // should never ever be lost … irrespective of any situation").
             // The WAL is the durable floor of the ring → spill → WAL chain; if it
             // can't init, the guarantee is void, so we REFUSE to run. systemd
-            // Restart=always re-launches and the operator is paged by the ERROR
-            // above — a loud restart loop beats a silent lossy session.
+            // Restart=always re-launches; a loud restart loop beats a silent
+            // lossy session. (Corrected 2026-10-06, audit M3: this said "the
+            // operator is paged by the ERROR above", but that line carried no
+            // code and no filter matched it. It now carries WS-SPILL-03, which
+            // is deliberately NOT alarmed; the page comes from the existing
+            // boot-heartbeat and market-hours liveness alarms, because a
+            // halted boot never publishes `tv_boot_completed`. This line names
+            // the cause in triage.)
             std::process::exit(1);
         }
     };
 
     // -----------------------------------------------------------------------
-    // Step 2: Initialize observability (Prometheus metrics exporter)
+    // Step 2 (continued): post-install metric registrations
+    //
+    // `init_metrics` + `prewarm_dispatcher_counters` moved ABOVE STAGE-C on
+    // 2026-08-26 — see the block there for why. Everything below is
+    // post-install either way; the move only widened that guarantee to cover
+    // STAGE-C, which previously sat on the wrong side of it.
     // -----------------------------------------------------------------------
-    observability::init_metrics(&config.observability)
-        .context("failed to initialize Prometheus metrics")?;
-
-    // Cache parser dispatcher Counter handles AFTER the recorder is
-    // installed. Without this, the first hot-path packet of each kind
-    // would allocate (Principle #1 violation). Must run post-install
-    // because handles created pre-install resolve to a no-op counter.
-    tickvault_core::parser::prewarm_dispatcher_counters();
-
     // Seal-writer TRUE-DROP counter (2026-07-09 candle-drop paging PR):
     // same delta-baseline rationale as the two registrations above — the CW
     // agent's prometheus pipeline drops each counter series' FIRST sample
@@ -947,6 +1579,20 @@ async fn async_main() -> Result<()> {
     // (source-order scan of this file):
     // crates/app/tests/seal_drop_paging_wiring_guard.rs.
     metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped").increment(0);
+    // Deep audit DA-14: why a sealed candle was dropped or a disk file was
+    // repaired. Local `/metrics` only (no EMF name, no alarm); registered
+    // at 0 so the first increment is a delta, not the baseline. The drops
+    // themselves still page through `kind="dropped"` above.
+    metrics::counter!("tv_seal_writer_drain_total", "kind" => "dropped_below_floor").increment(0);
+    metrics::counter!("tv_seal_floor_refused_total").increment(0);
+    metrics::counter!("tv_seal_spill_torn_tail_cut_total").increment(0);
+    metrics::counter!(tickvault_storage::seal_dlq::SEAL_DLQ_TORN_LINE_CLOSED_COUNTER).increment(0);
+    // Seal-spill retention (DA-13a, 2026-10-13): records of never-replayed
+    // spill files the sweep deleted because a verified cold copy exists. A
+    // sibling of the seal-writer counter above, NOT one of the paged
+    // data-at-risk counters below: no alarm reads it (local `/metrics` only).
+    // Registered at 0 so its first increment is a delta, not the baseline.
+    metrics::counter!("tv_seal_spill_unreplayed_deleted_with_copy_records_total").increment(0);
     // Order-side counters (cluster-C, 2026-07-14): dense-from-boot so the CW
     // agent's dropped-first-sample delta baseline is the harmless 0 — without
     // this, alarm #10 (orders-rejected) is dead for a single-rejection session
@@ -958,6 +1604,411 @@ async fn async_main() -> Result<()> {
     metrics::counter!("tv_orders_placed_total", "mode" => "paper").increment(0);
     metrics::counter!("tv_orders_placed_total", "mode" => "live").increment(0);
 
+    // The four live-lane failure counters alarmed on 2026-08-28
+    // (deploy/aws/terraform/live-lane-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md 2.3l). Same first-sample
+    // rationale as every registration above, and these needed it MOST: two of
+    // the four are `metrics::counter!(...).increment(1)` written INLINE at the
+    // failure site, so without this the series is born AT the incident and the
+    // dropped baseline sample IS the incident. All four alarms are
+    // `threshold >= 1, evaluation_periods = 1` on a counter that reads zero on
+    // a healthy lane -- precisely the shape that produces zero datapoints and a
+    // pager that is dead on arrival for the single-episode case, which is the
+    // dominant shape for all four.
+    //
+    // Registered HERE rather than at each emit site because those sites sit
+    // behind runtime gates (the lane, the aggregator, the replay pass); a
+    // counter registered only when its subsystem starts is not dense from boot
+    // on a lane that is off, and this block is the one place provably after the
+    // recorder install and before any scrape.
+    metrics::counter!("tv_dhan_feed_seals_rescued_total").increment(0);
+    metrics::counter!("tv_aggregator_slot_exhausted_total").increment(0);
+    metrics::counter!("tv_tick_spill_replay_quarantined_total").increment(0);
+    // Audit DA-13b: the spill replay's empty-out gate counters (held while
+    // QuestDB is suspect, empty-out deferred, rewound, non-last file kept
+    // live), every label pair, dense from boot like their siblings above.
+    tickvault_storage::tick_spill_replay::register_replay_baseline();
+    metrics::counter!("tv_wal_catchup_budget_exhausted_total").increment(0);
+
+    // The two inputs to `aggregator-refusal-rate-high` (2026-09-03).
+    //
+    // This alarm is metric MATH -- `100 * refused / ingested` -- so BOTH sides
+    // must be dense from boot or the ratio has no datapoint to compute. Worse
+    // than a plain unseeded counter: an unseeded DENOMINATOR makes the alarm
+    // silent even while the numerator is publishing perfectly, so the failure
+    // is invisible from the numerator's own chart.
+    //
+    // `ingest_ticks_total` is built lazily inside the frame arm, so a lane that
+    // received nothing never registers it at all -- which is exactly the
+    // session where the ratio would matter most. Caught by
+    // `alarmed_counters_are_seeded_guard`, not by the eye: the alarm looked
+    // correct, and the counters it reads are ones this process emits every
+    // second of a healthy session, which is precisely why the gap is easy to
+    // miss.
+    metrics::counter!("tv_aggregator_tick_refused_total").increment(0);
+    metrics::counter!("tv_dhan_feed_ingest_ticks_total").increment(0);
+
+    // Four MORE alarmed counters that were never registered (2026-08-28,
+    // found by an adversarial sweep of the loss paths).
+    //
+    // Each of these is EMF-selected AND carries an alarm, and each is emitted
+    // ONLY at its failure site — so the series was born AT the incident and the
+    // CloudWatch agent's dropped-first-sample delta baseline WAS the incident.
+    // Every one of the four alarms was therefore dead on arrival for the
+    // single-episode case, which for all four is the dominant shape:
+    //
+    //   tv_wal_replay_unknown_magic_total   a rolled-back binary meeting a
+    //                                       newer WAL record format. Once-ever
+    //                                       by nature, so the first occurrence
+    //                                       is the ONLY occurrence.
+    //   tv_seal_writer_drain_dropped_total  candle loss with all three
+    //                                       absorption tiers failed. Note the
+    //                                       name: it is NOT the labelled
+    //                                       `tv_seal_writer_drain_total{kind=
+    //                                       "dropped"}` seeded above — that is
+    //                                       a different series, and seeding one
+    //                                       never registered the other.
+    //   tv_ws_frame_spill_write_errors_total  the durable floor's OWN write
+    //                                       failing. The rarest and most severe
+    //                                       event in the process.
+    //   tv_tick_rows_refused_total          a row refused before it is written,
+    //                                       so nothing downstream counts it.
+    //
+    // One label value per name is enough: the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what the alarm
+    // reads and registering any member registers it. Both `reason` values are
+    // seeded for the refusal counter anyway — there are only two, and a reader
+    // comparing this block against the emit sites should find them all.
+    metrics::counter!("tv_wal_replay_unknown_magic_total").increment(0);
+    // DA-13c: local `/metrics` only (no EMF name, no alarm).
+    metrics::counter!(tickvault_app::dhan_feed_stack::WAL_REFOLD_ABANDONED_BYTES_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_HELD_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_RECOVERED_COUNTER)
+        .increment(0);
+    // A gauge the boot replay may already have set: `increment(0.0)` registers
+    // it without overwriting that value.
+    metrics::gauge!(tickvault_storage::wal_replay_settle::WAL_REPLAY_SETTLE_UNREADABLE_BYTES_GAUGE)
+        .increment(0.0);
+    metrics::counter!("tv_seal_writer_drain_dropped_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_write_errors_total", "stage" => "write_record")
+        .increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "security_id_width").increment(0);
+    metrics::counter!("tv_tick_rows_refused_total", "reason" => "price_not_finite").increment(0);
+
+    // Seven MORE alarmed counters found unregistered by the guard that was
+    // written for the four above (2026-08-28, same sweep).
+    //
+    // Writing the guard turned a four-item finding into a twenty-item one, and
+    // that is the point of writing it: the four were what one agent happened to
+    // look at, and the class was never four. Each of these is read by an alarm
+    // in `deploy/aws/terraform/` and emitted only at a failure site, so each was
+    // dead on arrival for the single-episode case exactly as the four were.
+    //
+    // One label value per name is enough — the EMF processor folds label values
+    // into one summed series per host, so the folded NAME is what an alarm
+    // reads and registering any member registers it. The value chosen is the
+    // one an operator is most likely to see first.
+    metrics::counter!("tv_order_audit_persist_errors_total", "stage" => "append").increment(0);
+    metrics::counter!("tv_order_update_events_persist_errors_total", "stage" => "append")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_dropped_total", "reason" => "channel_full")
+        .increment(0);
+    metrics::counter!("tv_order_update_events_rows_discarded_total", "kind" => "order")
+        .increment(0);
+    metrics::counter!("tv_partition_archive_failed_total", "stage" => "drop").increment(0);
+    metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(0);
+    metrics::counter!("tv_disk_watcher_respawn_total").increment(0);
+    metrics::counter!("tv_ws_frame_spill_drop_critical", "ws_type" => "live_feed").increment(0);
+    // The ten data-at-risk counters paged on 2026-10-04
+    // (deploy/aws/terraform/data-at-risk-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.9). Several are emitted only at
+    // the failure site or only from a task that starts minutes after boot, so
+    // without these the first failure is the dropped baseline sample. Every
+    // label value the emit sites use is seeded, because the agent drops the
+    // first sample of each label set, not of each name.
+    metrics::counter!("tv_raw_frame_upload_failed_total").increment(0);
+    for set in ["seal_spill", "tick_quarantine", "depth_quarantine"] {
+        metrics::counter!("tv_cold_file_upload_failed_total", "set" => set).increment(0);
+    }
+    metrics::counter!("tv_raw_upload_marker_write_failed_total").increment(0);
+    for dir in ["archive", "active"] {
+        metrics::counter!("tv_wal_prune_refused_not_uploaded_total", "dir" => dir).increment(0);
+    }
+    metrics::counter!("tv_seal_spill_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_quarantine_prune_refused_not_uploaded_total").increment(0);
+    metrics::counter!("tv_order_update_broadcast_drops_total").increment(0);
+    for sink in ["app_log", "errors_jsonl"] {
+        metrics::counter!("tv_log_lines_dropped_total", "sink" => sink).increment(0);
+    }
+    for reason in ["queue_full", "thread_gone"] {
+        metrics::counter!(
+            "tv_tick_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+        metrics::counter!(
+            "tv_depth_rescue_inline_fallback_total",
+            "feed" => "dhan",
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    // The counters behind the six loss-group pages of 2026-10-05
+    // (deploy/aws/terraform/loss-group-alarms.tf, authority
+    // dhan-rest-only-noise-lock-2026-07-14.md §2.10). Same reason as the block
+    // above: most are emitted only at the failure site, so the first failure
+    // would be the dropped baseline sample. Counters already seeded at zero
+    // where their owner is built (the spill probe, the replay rejects, the
+    // ranking discards, the audit-spill tables, the rebalance and depth-universe
+    // reasons, the depth view) are not repeated here. Every label value the
+    // filters slice on is seeded.
+    for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
+        let endpoint = endpoint.as_str();
+        metrics::counter!("tv_dhan_ws_close_drain_discarded_total", "endpoint" => endpoint)
+            .increment(0);
+        metrics::counter!("tv_dhan_ws_subscribe_dispatch_failed_total", "endpoint" => endpoint)
+            .increment(0);
+    }
+    metrics::counter!("tv_feed_aux_rows_refused_total", "reason" => "security_id_width")
+        .increment(0);
+    metrics::counter!("tv_candle_int_self_heal_refused_total").increment(0);
+    for (half, stage) in [
+        ("main_feed", "spawn_skipped"),
+        ("depth", "spawn_skipped"),
+        ("depth", "gave_up_outstanding_sockets"),
+    ] {
+        metrics::counter!("tv_dhan_dial_incomplete_total", "half" => half, "stage" => stage)
+            .increment(0);
+    }
+    metrics::counter!("tv_dhan_ws_topup_failed_total").increment(0);
+    metrics::counter!("tv_dhan_ws_swap_failed_total").increment(0);
+    metrics::counter!("tv_dhan_ws_swap_timeout_total").increment(0);
+    for stage in ["append", "flush"] {
+        metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => stage).increment(0);
+        metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => stage).increment(0);
+    }
+    for reason in tickvault_app::feed_scoreboard_boot::WS_AUDIT_DROP_REASONS {
+        metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(0);
+    metrics::counter!("tv_dhan_feed_xverify_persist_errors_total").increment(0);
+    for stage in ["append", "flush", "ensure_client_build", "ensure_ddl"] {
+        metrics::counter!("tv_pnl_audit_persist_errors_total", "stage" => stage).increment(0);
+        metrics::counter!("tv_order_leg_pnl_persist_errors_total", "stage" => stage).increment(0);
+    }
+    for reason in ["full", "closed"] {
+        metrics::counter!("tv_order_leg_pnl_dropped_total", "reason" => reason).increment(0);
+        metrics::counter!("tv_order_alert_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_wal_fsync_errors_total").increment(0);
+    metrics::counter!("tv_seal_spill_sync_failed_total").increment(0);
+    metrics::counter!("tv_seal_unwritten_mark_errors_total").increment(0);
+    metrics::counter!("tv_wal_deferred_depth_persist_failed_total").increment(0);
+    // DA-13d: pinned WAL segments deleted below the disk floor. Local /metrics only.
+    for copy_in_s3 in ["true", "false"] {
+        metrics::counter!(
+            tickvault_storage::ws_frame_spill::WAL_DEFERRED_DEPTH_LOST_COUNTER,
+            "copy_in_s3" => copy_in_s3
+        )
+        .increment(0);
+    }
+    // DA-13d: depth partitions the archiver held for the after-close pass.
+    tickvault_storage::partition_archive::count_depth_partitions_held(0);
+    // The after-close depth pass stopping at its disk floor (2026-10-13).
+    // Local /metrics only: no alarm or filter reads it.
+    metrics::counter!("tv_wal_deferred_depth_pass_total", "outcome" => "disk_floor").increment(0);
+    metrics::counter!("tv_wal_applied_watermark_persist_failed_total").increment(0);
+    // SEBI constituency write failures (audit OBS-2, 2026-10-11).
+    // Seeded here, after the recorder install, so a scrape records 0 before
+    // the once-a-day write that may fail. Local /metrics only: no alarm reads
+    // it yet (that needs a dated loss-group row). The two lifecycle write
+    // counters left with the writer (owner Quote 44, 2026-10-28).
+    metrics::counter!("tv_index_constituency_persist_failed_total").increment(0);
+    for reason in ["too_large", "unparseable_order"] {
+        metrics::counter!("tv_order_update_frames_dropped_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_order_update_hollow_decode_total").increment(0);
+    metrics::counter!("tv_order_update_receiver_lagged_total").increment(0);
+    metrics::counter!("tv_mark_forward_dropped_total").increment(0);
+    metrics::counter!("tv_order_runtime_mark_producer_lost_total").increment(0);
+    metrics::counter!("tv_oms_unknown_segment_fills_refused_total").increment(0);
+    for reason in ["invalid_price", "pnl_overflow"] {
+        metrics::counter!("tv_risk_fill_rejected_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_oms_fill_price_rejected_total").increment(0);
+    metrics::counter!("tv_oms_order_book_full_total").increment(0);
+    metrics::counter!("tv_order_runtime_sid_refused_total").increment(0);
+    metrics::counter!("tv_oms_order_aliases_refused_total").increment(0);
+    for reason in ["id_too_long", "capacity"] {
+        metrics::counter!("tv_oms_correlations_refused_total", "reason" => reason).increment(0);
+    }
+    metrics::counter!("tv_spot_price_store_refused_total").increment(0);
+    metrics::counter!("tv_prev_close_store_refused_total").increment(0);
+    // `tv_volume_leaderboard_refused_total`, `tv_top_volume_rank_append_failed_total`
+    // and `tv_top_volume_snapshot_refused_total` are no longer seeded: their
+    // emitters went with `top_volume` on 2026-10-22 (plan item 62, Quote 34).
+    metrics::counter!("tv_wal_lag_tracker_refused_total").increment(0);
+    // PR W review round 4 (C): local `/metrics` only, no filter, no alarm.
+    metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_EPISODES_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::wal_applied_watermark::WAL_SUSPECT_SECONDS_COUNTER)
+        .increment(0);
+    // Bucket-table overflow episodes: local metrics only, once per false-to-true transition.
+    metrics::counter!(
+        tickvault_storage::wal_applied_watermark::UNAPPLIED_OVERFLOW_EPISODES_COUNTER
+    )
+    .increment(0);
+    // PR W review round 5: every trim refusal reason exists from boot, so a
+    // trim refused all session is visible. The pinned gauges are NOT set to 0
+    // here on purpose: 0 would read "nothing pinned" while the trim never ran.
+    for reason in [
+        "listing_failed",
+        "unreadable_first_record",
+        "nothing_waiting",
+        "unreadable_set_apart",
+    ] {
+        metrics::counter!(
+            tickvault_storage::wal_unapplied_ranges::WAL_UNAPPLIED_TRIM_REFUSED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    metrics::counter!("tv_spill_dir_health_check_failed_total").increment(0);
+    metrics::counter!("tv_resource_monitor_probe_failed_total").increment(0);
+    metrics::counter!("tv_oom_monitor_probe_failed_total").increment(0);
+    metrics::counter!("tv_ws_activity_watchdog_panicked_total", "label" => "order-update")
+        .increment(0);
+    // The fourteen counters that joined the same six pages on 2026-10-11
+    // (noise lock §2.10-a). Same reason, every label value each emit site uses.
+    for endpoint in tickvault_core::websocket::pool_budget::DhanEndpointType::ALL {
+        let endpoint = endpoint.as_str();
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                tickvault_core::websocket::connection::FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+        // Only the primary account opens through the budget in production.
+        for reason in ["endpoint_at_capacity", "total_at_capacity"] {
+            metrics::counter!(
+                tickvault_core::websocket::pool_budget::POOL_BUDGET_REFUSED_METRIC,
+                "account" => "primary",
+                "endpoint" => endpoint,
+                "reason" => reason
+            )
+            .increment(0);
+        }
+    }
+    metrics::counter!(
+        tickvault_core::websocket::pool_supervisor::INSTANCE_LOCK_DIAL_REFUSED_METRIC
+    )
+    .increment(0);
+    for reason in ["sync", "slot_overflow"] {
+        metrics::counter!(
+            tickvault_storage::seal_dlq::SEAL_DLQ_SYNC_FAILED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    for tier in ["minute", "hour", "day"] {
+        metrics::counter!("tv_oms_order_budget_refused_total", "tier" => tier).increment(0);
+    }
+    metrics::counter!("tv_oms_dh904_exhausted_total").increment(0);
+    for source in ["code", "wire_string"] {
+        metrics::counter!("tv_oms_unknown_order_segment_refused_total", "source" => source)
+            .increment(0);
+    }
+    metrics::counter!("tv_oms_stop_all_refusals_total").increment(0);
+    for reason in ["nan", "infinite", "non_positive"] {
+        metrics::counter!(
+            tickvault_trading::risk::engine::MARK_REJECTED_COUNTER,
+            "reason" => reason
+        )
+        .increment(0);
+    }
+    metrics::counter!("tv_day_ohlc_tracker_refused_total").increment(0);
+    metrics::counter!("tv_tick_gap_tracker_refused_total").increment(0);
+    for reason in ["clean_exit", "panic", "cancelled", "unknown"] {
+        metrics::counter!("tv_day_ohlc_reset_failures_total", "reason" => reason).increment(0);
+    }
+    for site in [
+        "boot_probe",
+        "oms_wiring",
+        "retired_views_drop",
+        "shadow_drop_legacy",
+        "shadow_drop_retired_candles",
+        "shadow_ensure_tables",
+        "wal_suspension_probe",
+    ] {
+        metrics::counter!("tv_http_client_build_failed_total", "site" => site).increment(0);
+    }
+    // The seal-spill write-error counter (2026-08-28). Emitted only when the
+    // producer-side durable tier's own append fails, which is the moment the
+    // no-drop policy is leaning hardest on it — and, like the twenty above, it
+    // was dead on arrival for that first episode. Not EMF-selected, for the
+    // same cost reason as the escalation counters below.
+    metrics::counter!("tv_seal_spill_write_errors_total", "stage" => "write").increment(0);
+    metrics::counter!(
+        tickvault_storage::ilp_overflow::PENDING_DISCARDED_COUNTER,
+        "table" => "ticks"
+    )
+    .increment(0);
+
+    // The four seal-escalation counters (2026-08-28), registered for the same
+    // delta-baseline reason and NOT EMF-selected.
+    //
+    // Not selected deliberately: each EMF name costs ~$0.30/mo, and the
+    // maximal-month projection already sits above the budget's automatic
+    // `STOP_EC2_INSTANCES` line (see the COST NOTEs in
+    // dhan-rest-only-noise-lock-2026-07-14.md). Selecting four more is an
+    // operator decision with a price, not an executor's. Registering them
+    // costs nothing, keeps them honest on the local `/metrics` exporter, and
+    // means the delta baseline already exists if any of them is ever selected
+    // — the CloudWatch agent DROPS the first sample of a series it has never
+    // seen, so an unseeded counter publishes nothing on the day it first
+    // fires, which is precisely the day it matters.
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUED_COUNTER)
+        .increment(0);
+    metrics::counter!(
+        tickvault_storage::seal_writer_runner::SEAL_ESCALATION_INLINE_FALLBACK_COUNTER
+    )
+    .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_LOST_COUNTER)
+        .increment(0);
+    metrics::counter!(tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER)
+        .increment(0);
+    // Telegram drop counters, seeded 2026-09-01.
+    //
+    // These three were created LAZILY, inside their own error arms, so a
+    // process that had never failed to send published no series at all — and
+    // an absent CloudWatch series is indistinguishable from a healthy zero.
+    // `telegram-drop-alarm.tf` pages at 3 drops; without a seeded baseline the
+    // agent's delta pipeline discards the first sample of a series it has
+    // never seen, so the alarm behaved as though its threshold were 4 and the
+    // FIRST episode of a broken bot was invisible.
+    //
+    // This is a log-metric-filter metric, not an EMF one, so seeding it costs
+    // NOTHING against the metric budget — which matters, because the maximal
+    // month sits ~$1 under the operator's cap with room for roughly three more
+    // EMF names.
+    //
+    // Labels are the exact three the producers emit: `service.rs` (send_failed,
+    // noop_mode) and `coalescer.rs:423` (coalesced_sample_capped).
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "send_failed").increment(0);
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "noop_mode").increment(0);
+    metrics::counter!("tv_telegram_dropped_total", "reason" => "coalesced_sample_capped")
+        .increment(0);
+    // PR47 (2026-10-11): a lost SMS copy of a High/Critical page is counted
+    // (both `service.rs::send_sns_sms` failure arms). Prometheus only;
+    // seeded so the series reads 0 rather than absent before the first
+    // failure.
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "attribute_build").increment(0);
+    metrics::counter!("tv_sns_sms_failed_total", "reason" => "publish_failed").increment(0);
     // Host kernel-limit verification (2026-08-10). Must run AFTER the recorder
     // is installed — gauges written before install resolve to a no-op recorder
     // and would be silently discarded, same rationale as the registrations
@@ -1020,12 +2071,19 @@ async fn async_main() -> Result<()> {
     // File logging (data/logs/) is always active regardless of this flag.
     let fmt_boxed: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         if config.logging.log_to_stdout {
+            // Non-blocking since 2026-09-26 (audit fix PR1): the default
+            // `io::stdout` writer wrote synchronously on the calling thread,
+            // including the frame-drain task.
+            let (stdout_writer, stdout_guard) =
+                tickvault_app::observability::init_lossy_non_blocking(std::io::stdout(), "stdout");
+            Box::leak(Box::new(stdout_guard));
             let fmt_layer = tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_file(false)
                 .with_line_number(false)
-                .with_timer(ist_timer.clone());
+                .with_timer(ist_timer.clone())
+                .with_writer(stdout_writer);
             if config.logging.format == "json" {
                 Some(Box::new(fmt_layer.json()))
             } else {
@@ -1052,6 +2110,7 @@ async fn async_main() -> Result<()> {
             Ok((writer, guard)) => {
                 use tracing_subscriber::Layer as _;
                 Box::leak(Box::new(guard));
+                tickvault_app::observability::register_log_drop_counter("app_log", &writer);
                 // Per-target DEBUG suppression for the FILE appender only.
                 // Stdout + errors.log + errors.jsonl keep the configured
                 // global level. See `build_app_log_filter_directive` for
@@ -1059,6 +2118,16 @@ async fn async_main() -> Result<()> {
                 let file_filter_directive =
                     tickvault_app::boot_helpers::build_app_log_filter_directive(log_filter);
                 let file_filter = tracing_subscriber::EnvFilter::new(file_filter_directive);
+                // TWO SHIPPED SCHEMAS ON PURPOSE (2026-10-12, deep audit
+                // OBS-15). This app log is NESTED (`fields.code`,
+                // `fields.*`) with IST timestamps; errors.jsonl below is FLAT
+                // (`code` at the top level) with UTC timestamps. Both reach
+                // the same CloudWatch log group, so a query must name the
+                // shape it reads. Do NOT flatten this layer: the terraform
+                // divergence control `log_schema_nested_errors` and the
+                // `preopen-ready-secs` filter read the nested shape
+                // (`$.fields.code`, `$.fields.ready_at_ist_secs`). Pinned by
+                // `observability_chain_e2e::app_log_layer_stays_nested_for_the_schema_divergence_control`.
                 let file_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -1086,6 +2155,14 @@ async fn async_main() -> Result<()> {
         match create_error_log_writer() {
             Some(file) => {
                 use tracing_subscriber::Layer as _;
+                // Non-blocking since 2026-09-26 (audit fix PR1). Until then
+                // this was `std::sync::Mutex::new(file)`: a blocking write
+                // under a lock on whichever thread logged a WARN — the frame
+                // drain included. The panic hook writes its line to this
+                // file synchronously, so a crash is never lost in the queue.
+                let (error_writer, error_guard) =
+                    tickvault_app::observability::init_lossy_non_blocking(file, "errors_log");
+                Box::leak(Box::new(error_guard));
                 let error_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -1093,7 +2170,7 @@ async fn async_main() -> Result<()> {
                     .with_line_number(true)
                     .with_timer(ist_timer.clone())
                     .json()
-                    .with_writer(std::sync::Mutex::new(file))
+                    .with_writer(error_writer)
                     .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
                 Some(Box::new(error_fmt))
             }
@@ -1112,9 +2189,11 @@ async fn async_main() -> Result<()> {
         match observability::init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR) {
             Ok((writer, guard)) => {
                 use tracing_subscriber::Layer as _;
+                use tracing_subscriber::filter::FilterExt as _;
                 // Keep the worker guard alive for the process lifetime —
                 // dropping it stops the background flush thread.
                 Box::leak(Box::new(guard));
+                tickvault_app::observability::register_log_drop_counter("errors_jsonl", &writer);
                 let layer = tracing_subscriber::fmt::layer()
                     .json()
                     // CRITICAL: flatten_event(true) hoists `code`, `severity`,
@@ -1122,6 +2201,8 @@ async fn async_main() -> Result<()> {
                     // summary_writer + Claude can pattern-match them without
                     // walking a nested object. The e2e test
                     // `observability_chain_e2e` regresses on this flag.
+                    // No `with_timer`: these timestamps are UTC, where the
+                    // nested app log above uses IST (deep audit OBS-15).
                     .flatten_event(true)
                     .with_current_span(true)
                     .with_span_list(false)
@@ -1130,7 +2211,12 @@ async fn async_main() -> Result<()> {
                     .with_line_number(true)
                     .with_thread_ids(true)
                     .with_writer(writer)
-                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+                    // 45d (2026-10-01): at most one line a second per
+                    // (call site, code, source) on this stream; app.log and
+                    // errors.log keep every line. See `log_coalescer`.
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR.and(
+                        tickvault_app::log_coalescer::ErrorCoalescer::new("errors_jsonl"),
+                    ));
                 Some(Box::new(layer))
             }
             Err(err) => {
@@ -1167,6 +2253,7 @@ async fn async_main() -> Result<()> {
             {
                 Ok((writer, guard)) => {
                     Box::leak(Box::new(guard));
+                    tickvault_app::observability::register_log_drop_counter(cat.prefix(), &writer);
                     let mut targets = tracing_subscriber::filter::Targets::new();
                     for prefix in tickvault_app::observability::build_category_targets(cat) {
                         targets = targets
@@ -1202,6 +2289,40 @@ async fn async_main() -> Result<()> {
         .with(category_layers)
         .with(otel_layer)
         .init();
+    // PR W review round 6: the WAL boot fold ran before this subscriber
+    // existed; write what it recorded (and any failed fold persist) now.
+    let _boot_fold_logged = tickvault_storage::wal_unapplied_ranges::log_boot_fold_summary();
+    tickvault_storage::ltt_correction::log_boot_summary(); // scope lock 2026-11-20
+
+    // Start telemetry after metrics and tracing, before the watched live tasks.
+    // 2026-10-30: the per-minute latency proof tables, writer before publisher.
+    let _proof_writer = tickvault_app::hot_path_proof_boot::start_hot_path_proof(&config.questdb);
+    if let Err(err) = tickvault_storage::hot_path_telemetry::spawn_publisher(std::sync::Arc::clone(
+        &trading_calendar,
+    )) {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::HotPath04TelemetryNotStarted.code_str(),
+            error = %err,
+            "the hot-path telemetry thread did not start; stage and heartbeat publication \
+             and its stall detection are unavailable (host thread or memory limit)"
+        );
+    }
+    // Plan item 4: task heartbeats + memory ladder, before the watched supervisors.
+    tickvault_app::task_watch_boot::start_task_watch(&config);
+    tokio::spawn(tickvault_storage::hot_path_telemetry::run_runtime_probe(
+        tickvault_storage::hot_path_telemetry::HotTask::MainRuntime,
+        tickvault_storage::hot_path_telemetry::Stage::MainRuntimeLag,
+        u64::MAX,
+    ));
+    if tickvault_core::websocket::reader_runtime::reader_runtime_handle().is_some() {
+        tickvault_core::websocket::reader_runtime::spawn_on_reader_runtime(
+            tickvault_storage::hot_path_telemetry::run_runtime_probe(
+                tickvault_storage::hot_path_telemetry::HotTask::ReaderRuntime,
+                tickvault_storage::hot_path_telemetry::Stage::ReaderRuntimeLag,
+                u64::MAX,
+            ),
+        );
+    }
 
     // Phase 5: background summary_writer task. Emits a human + Claude
     // readable `data/logs/machine/errors.summary.md` every 60s so `/loop` polling
@@ -1232,7 +2353,10 @@ async fn async_main() -> Result<()> {
                 Path::new(observability::ERRORS_JSONL_DIR),
                 Path::new(observability::LEGACY_LOGS_DIR),
             ] {
-                match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
+                // Sweep S5: the directory walk runs off the shared worker.
+                match tickvault_storage::off_worker::off_worker(|| {
+                    observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS)
+                }) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         deleted = n,
@@ -1254,10 +2378,12 @@ async fn async_main() -> Result<()> {
             // also live in the hourly machine app logs + errors.jsonl, so a
             // truncation loses nothing uniquely. Hosted here (the existing
             // hourly sweep task) rather than a new task.
-            match observability::cap_errors_log_size(
-                Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
-                observability::ERRORS_LOG_MAX_BYTES,
-            ) {
+            match tickvault_storage::off_worker::off_worker(|| {
+                observability::cap_errors_log_size(
+                    Path::new(tickvault_app::boot_helpers::ERROR_LOG_FILE_PATH),
+                    observability::ERRORS_LOG_MAX_BYTES,
+                )
+            }) {
                 Ok(None) => {}
                 Ok(Some(prev_bytes)) => tracing::info!(
                     prev_bytes,
@@ -1292,7 +2418,10 @@ async fn async_main() -> Result<()> {
                 Path::new(observability::ERRORS_JSONL_DIR),
                 Path::new(observability::LEGACY_LOGS_DIR),
             ] {
-                match observability::sweep_app_log_retention(dir, RETENTION_HOURS) {
+                // Sweep S5: the directory walk runs off the shared worker.
+                match tickvault_storage::off_worker::off_worker(|| {
+                    observability::sweep_app_log_retention(dir, RETENTION_HOURS)
+                }) {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         deleted = n,
@@ -1331,11 +2460,14 @@ async fn async_main() -> Result<()> {
                     cat.prefix()
                 );
                 for dir in [Path::new(cat.dir()), Path::new(legacy_dir.as_str())] {
-                    match tickvault_app::observability::sweep_category_log_retention(
-                        dir,
-                        cat.prefix(),
-                        RETENTION_HOURS,
-                    ) {
+                    // Sweep S5: the directory walk runs off the shared worker.
+                    match tickvault_storage::off_worker::off_worker(|| {
+                        tickvault_app::observability::sweep_category_log_retention(
+                            dir,
+                            cat.prefix(),
+                            RETENTION_HOURS,
+                        )
+                    }) {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(
                             deleted = n,
@@ -1369,65 +2501,226 @@ async fn async_main() -> Result<()> {
     // boot arms) — deliberately NOT the Dhan-lane periodic health loop,
     // which never runs on a Groww-only boot. Prunes once at task start
     // (each daily prod boot reclaims immediately), then every 6 h.
-    tokio::spawn(async {
+    //
+    // 2026-10-02 (plan item 45e-1, operator Quotes 27 + 28): every pass below
+    // deletes a WAL segment only when a verified S3 copy of it is recorded
+    // (`<wal_dir>/uploaded/<segment>`), unless the operator turned
+    // `[raw_frame_archive] require_upload_before_prune` off. The copies are
+    // made by the raw-frame uploader spawned right after this loop.
+    let require_raw_upload = config.raw_frame_archive.require_upload_before_prune;
+    tokio::spawn(async move {
         use std::time::Duration;
+        // Monotonic, so the pressure floor cannot be defeated by a wall-clock
+        // jump (NTP step, DST, a container clock correction).
+        let reclaim_clock = tokio::time::Instant::now();
+        let mut last_pressure_reclaim_secs: Option<u64> = None;
         loop {
-            let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
-            let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
-                &wal_dir,
-                tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
-                tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
-            );
-            // 2026-08-19: the SPILL retention sweep, wired for the first
-            // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
-            // unit-tested since 2026-07-13 with ZERO production consumers,
-            // and `clear_spill_for_date` — documented as "called by the
-            // writer task after read_all is fully replayed" — likewise had
-            // none. The writer chain only appends, so `data/spill/` grew for
-            // the life of the deployment with no age bound and no size bound.
-            // Rides this existing loop rather than spawning another task:
-            // same cadence, same cold path, one fewer thing to supervise.
-            let _spill = tickvault_storage::seal_spill::prune_spill_files(
-                std::path::Path::new("data/spill"),
-                tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
-            );
-            // The DLQ is MEASURED, never pruned — deliberately asymmetric
-            // with the spill sweep above. It holds the operator-readable
-            // record of seals that were LOST; deleting it to reclaim disk
-            // would destroy the evidence it exists to preserve. Nothing is
-            // written there in normal operation, so a growing DLQ IS the
-            // incident signal — publishing it makes that observable instead
-            // of something discovered when the volume fills.
-            let _dlq =
-                tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
-            tokio::time::sleep(Duration::from_secs(
-                tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
-            ))
+            // ⚠ CHANGED 2026-10-03 (O(1) sweep S3): the four sweeps below list,
+            // stat and delete files, so they run on the blocking pool. On a
+            // tokio worker a slow or full disk held a thread the frame drain
+            // and the socket readers also run on, for the whole sweep.
+            let sweep = tokio::task::spawn_blocking(move || {
+                let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
+                let _outcome = tickvault_storage::ws_frame_spill::prune_archived_segments(
+                    &wal_dir,
+                    tickvault_common::constants::WS_WAL_ARCHIVE_RETENTION_SECS,
+                    tickvault_common::constants::WS_WAL_ARCHIVE_MAX_BYTES,
+                    require_raw_upload,
+                );
+                // 2026-08-25: the ACTIVE WAL set, bounded for the first time.
+                // Only `archive/` was ever pruned, on the assumption that active
+                // segments drain themselves via boot replay. They do not — the
+                // replay budget is 512 MiB per boot against continuous writing,
+                // so everything past the newest five segments was never replayed,
+                // never confirmed, never archived, and eligible for no bound.
+                // Measured on the prod box the day this landed: 244 active
+                // segments, 31 GB, oldest from the previous day, on a volume that
+                // was 94% full with free space cycling down to 1.94 GB — which is
+                // the condition that makes an ILP flush fail in the first place.
+                //
+                // Rides this same loop for the same reason the spill sweep does:
+                // same cadence, same cold path, one fewer task to supervise.
+                let _active = tickvault_storage::ws_frame_spill::prune_active_segments(
+                    &wal_dir,
+                    tickvault_common::constants::WS_WAL_ACTIVE_RETENTION_SECS,
+                    tickvault_storage::ws_frame_spill::ws_wal_active_max_bytes(&wal_dir),
+                    require_raw_upload,
+                );
+                // 2026-08-19: the SPILL retention sweep, wired for the first
+                // time. `SPILL_FILE_MAX_AGE_SECS` was defined, documented and
+                // unit-tested since 2026-07-13 with ZERO production consumers,
+                // and `clear_spill_for_date` — documented as "called by the
+                // writer task after read_all is fully replayed" — likewise had
+                // none. The writer chain only appends, so `data/spill/` grew for
+                // the life of the deployment with no age bound and no size bound.
+                // Rides this existing loop rather than spawning another task:
+                // same cadence, same cold path, one fewer thing to supervise.
+                let _spill = tickvault_storage::seal_spill::prune_spill_files(
+                    std::path::Path::new("data/spill"),
+                    tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS,
+                    require_raw_upload,
+                );
+                // The DLQ is MEASURED, never pruned — deliberately asymmetric
+                // with the spill sweep above. It holds the operator-readable
+                // record of seals that were LOST; deleting it to reclaim disk
+                // would destroy the evidence it exists to preserve. Nothing is
+                // written there in normal operation, so a growing DLQ IS the
+                // incident signal — publishing it makes that observable instead
+                // of something discovered when the volume fills.
+                let _dlq =
+                    tickvault_storage::seal_dlq::record_dlq_bytes(std::path::Path::new("data/dlq"));
+            });
+            // The release build aborts on panic, so the only `Err` here is a
+            // runtime shutting down, when nothing is left to sweep for.
+            let _swept = sweep.await;
+
+            // Wait for the scheduled interval OR a disk-pressure request,
+            // whichever comes first (2026-09-01).
+            //
+            // Before this, the sweep above ran on a fixed 6-hourly timer and
+            // nothing could hurry it. That timer is the deadlock: when the
+            // volume fills, QuestDB suspends its tables and `partition_archive`
+            // correctly refuses to archive a suspended table — so the pressure
+            // loop's own archival pass reclaims NOTHING, and these capture
+            // segments become the only thing on the volume that can still be
+            // freed. On 2026-08-25 the disk hit 100% at ~11:11 IST; a timer
+            // last fired at 09:00 would not have acted until 15:00.
+            //
+            // The floor keeps a long episode from turning this cold path into
+            // a hot loop: the pressure loop polls often and stays in an
+            // episode for many polls, so requests are honoured at most once a
+            // minute. The SCHEDULED pass is never floored — it is the
+            // guarantee; pressure only ever makes it earlier.
+            let by_pressure =
+                tickvault_app::reclaim_signal::wait_for_reclaim_or(Duration::from_secs(
+                    tickvault_common::constants::WS_WAL_ARCHIVE_PRUNE_INTERVAL_SECS,
+                ))
+                .await;
+            if by_pressure {
+                let now_secs = reclaim_clock.elapsed().as_secs();
+                if tickvault_app::reclaim_signal::should_honor_reclaim(
+                    last_pressure_reclaim_secs,
+                    now_secs,
+                    tickvault_app::reclaim_signal::RECLAIM_MIN_INTERVAL_SECS,
+                ) {
+                    last_pressure_reclaim_secs = Some(now_secs);
+                    metrics::counter!("tv_reclaim_pressure_sweeps_total").increment(1);
+                } else {
+                    // Inside the floor: skip straight back to waiting rather
+                    // than sweeping again. Counted so a storm of refused
+                    // requests is visible instead of looking like inactivity.
+                    metrics::counter!("tv_reclaim_floored_total").increment(1);
+                    continue;
+                }
+            }
+        }
+    });
+
+    // The raw-frame uploader (plan item 45e-1, operator Quotes 27 + 28,
+    // 2026-09-29): every sealed WAL segment is gzipped, put to the cold
+    // bucket under `raw-frames/<IST date>/` with a conditional create and a
+    // SHA-256 checksum, verified with HeadObject, and only then marked — and
+    // the prune above deletes nothing unmarked. Its own task and its own
+    // wake: every 2 minutes outside 09:00–15:40 IST (the session's disk and
+    // network belong to capture), and at once on disk pressure, when it runs
+    // a small batch even inside the session. After a batch that marked a
+    // segment it asks the prune to run, so the space actually comes back.
+    // Cold path: one directory walk per pass, and each segment's read, hash
+    // and gzip on a blocking thread — O(segment bytes), never on the drain.
+    let raw_upload_bucket = config.partition_retention.archive_bucket.clone();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use tickvault_storage::raw_frame_upload as raw_upload;
+        let Some(store) = tickvault_storage::s3_cold::S3Cold::load(&raw_upload_bucket).await else {
+            if require_raw_upload {
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
+                        .code_str(),
+                    source = "raw_frame_upload",
+                    "raw-frame uploader not started: no cold bucket resolves for this \
+                     environment — the WAL prune will keep every segment, so the disk \
+                     only grows until a bucket is configured"
+                );
+            } else {
+                info!(
+                    "raw-frame uploader not started: no cold bucket, and the upload gate \
+                     is off in config"
+                );
+            }
+            return;
+        };
+        let now_utc_secs = || chrono::Utc::now().timestamp();
+        // First pass at start when the window is open, so a morning boot
+        // catches up on last night's segments before 09:00.
+        let mut by_pressure = false;
+        loop {
+            if by_pressure || raw_upload::upload_window_open(now_utc_secs()) {
+                let wal_dir = tickvault_app::boot_helpers::ws_wal_dir();
+                let max_segments = if raw_upload::upload_window_open(now_utc_secs()) {
+                    usize::MAX
+                } else {
+                    raw_upload::RAW_UPLOAD_PRESSURE_BATCH
+                };
+                let pressure = by_pressure;
+                let should_continue =
+                    move || pressure || raw_upload::upload_window_open(now_utc_secs());
+                let summary =
+                    raw_upload::run_pass(&store, &wal_dir, max_segments, &should_continue).await;
+                // Then the two prunes that delete other market data: the
+                // sealed-candle spill sweep and the tick / depth quarantine
+                // trims (plan item 45e-1, operator Quotes 27 + 28). Same
+                // schedule and batch as the WAL pass; today's spill day file
+                // is the one the live writer may hold open, so it is skipped.
+                // Review of audit SUP-5 (2026-10-11): when the WAL pass ended on
+                // three S3 time-outs in a row the store is hung, so this loop
+                // skips the three file passes rather than spend their time-outs
+                // too; the WAL pass's failures already count and page, and the
+                // file sets are tried again on the next loop.
+                let others = if summary.store_unreachable {
+                    tracing::debug!(
+                        "cold bucket timed out on the WAL pass; spill and quarantine \
+                         passes skipped this loop"
+                    );
+                    raw_upload::UploadPassSummary::default()
+                } else {
+                    let today_spill_file =
+                        tickvault_storage::seal_spill::live_spill_file_name(now_utc_secs());
+                    raw_upload::run_spill_and_quarantine_passes(
+                        &store,
+                        std::path::Path::new("data/spill"),
+                        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+                        std::path::Path::new(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+                        std::path::Path::new(
+                            tickvault_storage::raw_frame_upload::LEGACY_TOP_VOLUME_SPILL_DIR,
+                        ),
+                        &today_spill_file,
+                        max_segments,
+                        &should_continue,
+                    )
+                    .await
+                };
+                if summary.marked() > 0 || others.marked() > 0 {
+                    tickvault_app::reclaim_signal::request_reclaim();
+                }
+            }
+            by_pressure = tickvault_app::reclaim_signal::wait_for_raw_upload_or(
+                Duration::from_secs(raw_upload::RAW_UPLOAD_INTERVAL_SECS),
+            )
             .await;
         }
     });
 
-    // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let location = panic_info.location().map_or_else(
-            || "unknown".to_string(),
-            |loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()),
-        );
-        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic payload".to_string()
-        };
-        tracing::error!(
-            panic_location = %location,
-            panic_payload = %payload,
-            "PANIC: tickvault crashed"
-        );
-        default_panic_hook(panic_info);
-    }));
+    // Dropped-line publisher for every lossy log sink (2026-09-26 audit fix
+    // PR1). A slow timer on its own task — never the tick path.
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            tickvault_app::observability::LOG_DROP_PUBLISH_INTERVAL_SECS,
+        ));
+        loop {
+            ticker.tick().await;
+            tickvault_app::observability::publish_log_drop_counters();
+        }
+    });
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -1436,6 +2729,21 @@ async fn async_main() -> Result<()> {
         tracing_enabled = config.observability.tracing_enabled,
         "tickvault starting"
     );
+
+    // ITEM 11a: the runtime width was resolved in `main`, before any
+    // subscriber existed. Emit it now — a derived number nobody can trace back
+    // to its input is exactly the thing this change set out to remove, so the
+    // line carries the host allowance and its SOURCE, not just the answer.
+    if let Some(sizing) = TOKIO_RUNTIME_SIZING.get() {
+        info!(sizing = %sizing, "tokio runtime sizing");
+    }
+    if let Some(outcome) = READER_RUNTIME_OUTCOME.get() {
+        info!(outcome = %outcome, "socket reader runtime");
+    }
+    if let Some(plan) = READER_CORE_PLAN.get() {
+        report_reader_core_pin(*plan);
+    }
+    tickvault_app::hot_thread_boot::report_hot_thread_placement();
 
     // Log trading day status — critical for operational awareness.
     let is_trading = trading_calendar.is_trading_day_today();
@@ -1483,76 +2791,144 @@ async fn async_main() -> Result<()> {
     // retirement directive 2026-07-13; websocket-connection-scope-lock.md
     // "2026-07-13 Amendment" §B). Every boot flows through ONE path:
     // shared prefix → build_shared_infra → WAL settlement → REST stack
-    // (unconditional) → READY → run_process_runloop. `dhan_enabled=true` is
-    // an ILLEGAL post-retirement config (logged loudly + ignored at the
-    // REST-stack spawn below — dhan_enabled=false is the prod reality).
-    // The OFF-feed-isolation guarantee is now BY CONSTRUCTION: no Dhan auth
-    // beyond the REST stack's own, no instrument fetch, no Dhan WebSocket
-    // (except the stack's functional-dormant order-update WS) exists on any
-    // path.
+    // (unconditional) → READY → run_process_runloop.
+    //
+    // CORRECTED 2026-08-26. This block used to end:
+    //
+    //   "`dhan_enabled=true` is an ILLEGAL post-retirement config (logged
+    //    loudly + ignored at the REST-stack spawn below — dhan_enabled=false
+    //    is the prod reality). The OFF-feed-isolation guarantee is now BY
+    //    CONSTRUCTION: no Dhan auth beyond the REST stack's own, no
+    //    instrument fetch, no Dhan WebSocket ... exists on any path."
+    //
+    // Every clause was false. `config/base.toml` carries `dhan_enabled = true`
+    // (the 2026-08-11 operator flip), `feed_stack_gate` READS that flag rather
+    // than ignoring it, and the lane it gates dials up to 16 Dhan WebSockets.
+    // So this said the shipped production config is illegal, and that no Dhan
+    // WebSocket can exist, in a boot path whose whole job is to bring them up.
+    //
+    // The same correction was already made 640 lines below, at the
+    // `feed_stack_gate` call site, and its note diagnoses this precisely:
+    // "the message survived the revival because nothing tied it to the flag
+    // it described." That is true of this block too — it was updated there
+    // and missed here, which is the partial re-bless that makes a file look
+    // reviewed. `crates/common/tests/dhan_enabled_premise_guard.rs` now ties
+    // both to the real value in base.toml.
+    //
+    // What IS still true and is the point of this block: there is no Dhan
+    // fast/slow boot to choose between, so this is a LOGGING dispatcher only.
     // =======================================================================
     if !config.feeds.dhan_enabled {
-        if config.feeds.groww_enabled {
-            info!(
-                "GROWW-ONLY MODE — Dhan boot skipped; Groww lane running, shared infra (API + \
-                 seal-writer + aggregator) coming up via the unified hoisted prefix"
-            );
-        } else {
-            warn!(
-                "NO FEED ENABLED — both dhan_enabled and groww_enabled are false; \
-                 shared-infra-only runtime (API + seal-writer + aggregator) coming up via the \
-                 unified hoisted prefix"
-            );
-        }
+        warn!(
+            "NO FEED ENABLED — dhan_enabled is false; shared-infra-only runtime \
+             (API + seal-writer + aggregator) coming up via the unified hoisted prefix"
+        );
     }
 
     // =====================================================================
     // PROCESS-GLOBAL systemd WATCHDOG=1 pinger (2026-07-13, deploy-hang fix
-    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=60. This
+    // hostile-review round 1 CRITICAL). The unit sets WatchdogSec=150 (was
+    // 60 until 2026-09-03, when its one-missed-ping margin killed a merely
+    // THROTTLED process; the unit records the incident). This
     // thin, FEED-AGNOSTIC, process-lifetime task pings every
     // WATCHDOG_INTERVAL_SECS (30s) from the shared boot prefix, BEFORE the
     // boot path sends READY=1 (the READY site sits below this line in
     // source order; a source-scan ratchet pins that ordering + the absence
     // of any feed gate on this spawn). Sending READY=1 with NOBODY pinging
-    // would ARM the watchdog -> systemd SIGABRTs the process at t+60s ->
+    // would ARM the watchdog -> systemd SIGABRTs the process at t+WatchdogSec ->
     // Restart=always loop -> StartLimitBurst hard-fail minutes after a
     // deploy that reported success (Rule-11 false-OK). PR-C2 (2026-07-13,
     // Dhan live-WS retirement): the Dhan-gated lane/fast-arm
     // `spawn_heartbeat_watchdog` twins are DELETED with the lane — this
     // process-global pinger is now the SOLE WATCHDOG=1 source. No-op
     // outside systemd (`notify_systemd_watchdog` requires NOTIFY_SOCKET).
-    let _process_global_watchdog_pinger = tokio::spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS,
-        ));
-        // DELAY, not the default BURST — 2026-08-20.
-        //
-        // Under Burst a stalled runtime pays back every missed tick the
-        // instant it recovers: the pinger fires N times back to back and the
-        // watchdog is satisfied as though nothing happened. That makes a
-        // runtime stall shorter than `WatchdogSec` invisible to the ONE
-        // mechanism whose entire job is to notice it — the beacon reports
-        // health it did not have, which is the false-OK class this repo's own
-        // rules forbid.
-        //
-        // Delay re-bases the schedule from the late tick, so a stall shows up
-        // as a genuine gap between pings. 24 of the other 28 intervals in this
-        // binary already set this explicitly; the liveness beacon was the one
-        // that most needed it and did not.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await; // skip the immediate first tick
-        loop {
-            interval.tick().await;
-            infra::notify_systemd_watchdog();
-        }
-    });
+    // A DEDICATED OS THREAD, not a tokio task — 2026-09-01.
+    //
+    // MEASURED IN PRODUCTION that morning: TWELVE watchdog timeouts and TEN
+    // restarts in 24h, each one a simultaneous 14-socket disconnect plus a
+    // cold resubscribe of ~21,730 instruments. The journal said "Failed to
+    // START" — READY=1 never arrived — and the process consumed 13.175s of
+    // CPU across a 101-second boot. It was BLOCKED, not busy.
+    //
+    // Mechanism: this runtime has TWO workers (`TICKVAULT_TOKIO_WORKER_THREADS=2`)
+    // on two pinned cores (`AllowedCPUs=1-2`). During boot the lane waits on
+    // the daily mapping artifact while the universe rider builds it — and that
+    // rider makes synchronous `std::fs` calls with no `spawn_blocking`, writing
+    // a 111,362-contract artifact and a 134,227-row lifecycle pass. Two
+    // concurrent blocking tasks occupy BOTH workers, which stalls the timer
+    // wheel driving `tokio::time::interval`. This pinger then never runs,
+    // systemd sees no WATCHDOG=1 for 60s, and SIGABRTs the process. The rider
+    // dies mid-build, so the next boot waits for the same missing artifact: a
+    // self-sustaining kill loop.
+    //
+    // `block_in_place` was RULED OUT as the cause — it migrates pending tasks
+    // to a replacement worker. Plain synchronous `std::fs` on a worker does not.
+    //
+    // A liveness beacon must not depend on the health of the thing it reports
+    // on. On its own OS thread with `std::thread::sleep`, this pinger is immune
+    // to runtime starvation: it keeps its schedule whether the runtime is idle,
+    // saturated, or wedged.
+    //
+    // The 2026-08-20 `MissedTickBehavior::Delay` reasoning is PRESERVED and is
+    // now structural rather than configured. That comment recorded why Burst is
+    // wrong: a stalled runtime pays back every missed tick at once, so a stall
+    // shorter than `WatchdogSec` becomes invisible to the one mechanism whose
+    // job is to notice it. `sleep` re-bases from the actual wake, so a late
+    // wake is a real gap and can never be repaid in a burst. The property is
+    // now a consequence of the primitive instead of a setting that can be
+    // dropped in a refactor.
+    //
+    // Widening the runtime to 3 workers was REJECTED as the fix: it contends
+    // with QuestDB's pinned core and treats the symptom. The rider's blocking
+    // I/O is the true cause and is a separate change; this one makes the beacon
+    // truthful whether or not that lands.
+    let _process_global_watchdog_pinger = std::thread::Builder::new()
+        .name("tv-watchdog-ping".to_string())
+        .spawn(|| {
+            let period =
+                std::time::Duration::from_secs(tickvault_app::boot_helpers::WATCHDOG_INTERVAL_SECS);
+            // Skip the immediate first tick, matching the previous behaviour.
+            std::thread::sleep(period);
+            loop {
+                infra::notify_systemd_watchdog();
+                std::thread::sleep(period);
+            }
+        })
+        .inspect_err(|err| {
+            // Not a panic and not silent. If this thread cannot start there is
+            // no WATCHDOG=1 heartbeat, so systemd SIGKILLs the process inside
+            // `WatchdogSec` whatever we do here — the only useful act is to
+            // make the reason legible in the log the operator will read after
+            // the restart, instead of leaving an unexplained kill.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+                error = ?err,
+                "the systemd watchdog beacon thread FAILED TO SPAWN. No \
+                 WATCHDOG=1 will be sent, so systemd will kill this process \
+                 within WatchdogSec and restart it. This is a host resource \
+                 failure (thread limit or memory), not a feed fault."
+            );
+        })
+        .ok();
 
     // =====================================================================
-    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan live-WS lane and
-    // its FAST crash-recovery arm are DELETED per the operator's retirement
-    // directive; Groww is the sole live feed, Dhan is REST-only).
+    // BOOT (single path since PR-C2, 2026-07-13 — the Dhan FAST
+    // crash-recovery arm is DELETED per the operator's retirement directive).
+    //
+    // CORRECTED 2026-08-26. The comment and the boot log below both said
+    // "Groww is the sole live feed, Dhan is REST-only". Both halves are dead:
+    // the operator REVIVED the Dhan live WS on 2026-08-09 (`dhan_enabled =
+    // true` since 2026-08-11) and ordered the ENTIRE Groww feed removed on
+    // 2026-08-21 — `groww_enabled` is not even a config field any more.
+    //
+    // The log line is the part that mattered: it is not a comment, it printed
+    // on EVERY boot into CloudWatch, and it told the operator the opposite of
+    // what the process was doing. That is the class this file already records
+    // 560 lines below, on the ERROR message that advised turning off the live
+    // feed: "actively harmful ... an operator who followed the advice would
+    // have turned off the live feed they had just deliberately enabled".
     // =====================================================================
-    info!("standard boot — shared infra, then per-feed lanes (Groww live; Dhan REST-only)");
+    info!("standard boot — shared infra, then per-feed lanes");
 
     // =======================================================================
     // D2 Stage 2 — HOISTED PROCESS-SHARED INFRA (the single boot path)
@@ -1569,7 +2945,6 @@ async fn async_main() -> Result<()> {
     let SharedInfraHandles {
         notifier,
         health_status,
-        tick_broadcast_sender,
         api_handle,
     } = build_shared_infra(
         &config,
@@ -1623,6 +2998,88 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from("data/spill"),
         );
 
+    // 2026-08-21 — the spill tier's RECOVERY arm.
+    //
+    // The watcher above measures the spill volume; the loop below empties it.
+    // `tick_persistence` rescues a failed ILP flush by writing the buffer to
+    // `data/spill/ticks/` instead of discarding it, which converted a
+    // permanent in-memory loss into a replayable file — and then stopped,
+    // because the documented recovery was a `curl` a human had to run. That
+    // fails the no-manual-intervention rule silently: the file sits on disk
+    // looking exactly like success.
+    //
+    // The drain posts each spill body back to QuestDB's own /write endpoint
+    // (the file IS line protocol, so there is no format to keep in sync) and
+    // truncates on success. Replay is idempotent because the `ticks` DEDUP key
+    // carries `capture_seq`, so a row written twice UPSERTs onto itself — which
+    // is what makes a crash between POST and truncate cost nothing.
+    // Trim the quarantine directory BEFORE the drain starts (2026-08-28).
+    //
+    // `quarantine_spill_file` promises quarantine-never-delete, and that
+    // promise is right: a torn line usually leaves the rest of the file
+    // recoverable by hand. But nothing ever removed from `quarantine/`, and its
+    // bytes count toward the spill ceiling — so accumulated quarantine is a
+    // RATCHET that eventually returns StorageFull for every future rescue, on
+    // this boot and every one after it, killing the tier that keeps live ticks.
+    // The promise is therefore kept for a bounded share rather than forever.
+    // Loud: each deletion names the file. See `prune_quarantine`.
+    let quarantine_pruned = tickvault_storage::tick_persistence::prune_quarantine(
+        std::path::Path::new(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+        tickvault_storage::tick_persistence::tick_spill_max_bytes(),
+        require_raw_upload,
+    );
+    if quarantine_pruned > 0 {
+        warn!(
+            files = quarantine_pruned,
+            "trimmed the tick quarantine directory to its share of the spill ceiling — \
+             see the preceding coded lines for each file"
+        );
+    }
+
+    let _tick_spill_drain_supervisor =
+        tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
+            std::path::PathBuf::from(tickvault_storage::tick_persistence::TICK_SPILL_DIR),
+            &config.questdb.host,
+            config.questdb.http_port,
+            require_raw_upload,
+        );
+
+    // The SAME drain, pointed at the depth rescue tier (2026-08-25).
+    //
+    // `depth_persistence::discard_pending` used to throw its whole buffer
+    // away — its own comment said "These levels are gone from the table" —
+    // while ticks had ring, spill and dead-letter behind them. Depth is the
+    // larger surface by far: 1,530,651,649 rows in the 2026-08-24 session
+    // against 64,349,753 ticks, 24x. It now spills instead of discarding.
+    //
+    // But a spill nobody drains is the exact failure the comment above this
+    // block describes: a file on disk that looks like success. The rescue
+    // shipped with recovery documented as a `curl` a human runs, which is the
+    // no-manual-intervention rule broken in the same change that fixed the
+    // loss. So the drain is spawned here, against the depth directory.
+    //
+    // One supervisor per directory rather than one that walks both: the two
+    // tiers fail independently (depth fills ~24x faster and has its own
+    // 512 MiB cap), and a shared loop would let a wedged depth file starve
+    // tick recovery. The replay body is directory-scoped and format-agnostic
+    // — the spill file IS line protocol — so nothing needed to change in it.
+    //
+    // Idempotent for the same reason ticks are: the `market_depth` DEDUP key
+    // carries `depth_kind` alongside the composite instrument key, so a
+    // replayed row UPSERTs onto itself and a crash between POST and truncate
+    // costs nothing.
+    let _depth_spill_drain_supervisor =
+        tickvault_storage::tick_spill_replay::spawn_supervised_tick_spill_replay(
+            std::path::PathBuf::from(tickvault_storage::depth_persistence::DEPTH_SPILL_DIR),
+            &config.questdb.host,
+            config.questdb.http_port,
+            require_raw_upload,
+        );
+
+    // PR AA finding 6: the old-hour replay is registered BEFORE either archive loop.
+    let boot_replay_intent =
+        tickvault_app::dhan_feed_stack::boot_replay_intent(&ws_wal_replay_live_feed);
+
     // Feed-hardening Item 5 (2026-08-19): the watcher above MEASURES a filling
     // volume and does nothing about it. This loop is the remediation arm.
     //
@@ -1646,6 +3103,47 @@ async fn async_main() -> Result<()> {
             std::path::PathBuf::from("data"),
             config.questdb.clone(),
             config.partition_retention.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+        );
+
+    // The DAILY archive sweep, on its own polling scheduler (2026-09-01).
+    //
+    // This replaces an inline block that used to sit in the `market_close`
+    // arm of the shutdown `tokio::select!` below. That block could not run at
+    // all if the process started after 15:30 IST — `compute_market_close_sleep`
+    // returns ZERO past the close and the arm is guarded on it being non-zero
+    // — and it was also skipped whenever shutdown arrived by SIGTERM, which is
+    // how the 17:30 box stop always arrives. Neither case reported anything,
+    // because a sweep that never runs leaves every failure counter flat.
+    //
+    // Spawned HERE, beside the disk-pressure loop: the same class of job, now
+    // mutually excluded inside `partition_archive` rather than by timing luck.
+    let _daily_archive_supervisor =
+        tickvault_app::daily_archive_boot::spawn_supervised_daily_archive_loop(
+            std::path::PathBuf::from("data"),
+            config.questdb.clone(),
+            config.partition_retention.clone(),
+            config.trading.market_close_time.clone(),
+            // The S3 hold gate (`no-rest-except-live-feed-2026-06-27.md`
+            // §12.15.2): a trading day's partitions archive only once the
+            // 15:41 cross-verification wrote its measured-verdict marker. A
+            // non-trading day is treated as verified — there is nothing to
+            // compare. Past `MAX_CROSSVERIFY_HOLD_DAYS` the archiver proceeds
+            // anyway and says so loudly, so the disk can never fill waiting.
+            // With the Dhan lane OFF no cross-verification runs, so there is
+            // nothing to wait for and the archive is not gated at all.
+            config.feeds.dhan_enabled.then(|| {
+                let calendar = std::sync::Arc::clone(&trading_calendar);
+                let gate: tickvault_storage::partition_archive::VerifiedDayGate =
+                    std::sync::Arc::new(move |day: chrono::NaiveDate| {
+                        !calendar.is_trading_day(day)
+                            || tickvault_app::daily_task_marker::daily_marker_exists(
+                                tickvault_app::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_TASK,
+                                day,
+                            )
+                    });
+                gate
+            }),
         );
 
     // W2 PR#6 (WAL-SUSPEND-01, 2026-07-10, audit follow-up row 10):
@@ -1663,6 +3161,12 @@ async fn async_main() -> Result<()> {
         tickvault_storage::wal_suspension_watcher::spawn_supervised_wal_suspension_watcher(
             config.questdb.clone(),
         );
+    // Operator Quote 31 (2026-10-21): after the close, hold the scheduled
+    // stops off until the day's data is in the database. No environment
+    // (a dev run without TV_ENVIRONMENT) means no hold to write.
+    let _drain_hold = tickvault_core::auth::secret_manager::resolve_environment()
+        .ok()
+        .map(tickvault_app::drain_hold::spawn_drain_hold_supervisor);
 
     // BP-07 (PROC-01, 2026-07-01): supervised OOM-kill monitor. Reads the
     // cgroup-v2 `memory.events` `oom_kill` counter vs a boot baseline every
@@ -1673,10 +3177,17 @@ async fn async_main() -> Result<()> {
     // any hour is critical); on a non-cgroup-v2 dev box the probe fails softly
     // (`tv_oom_monitor_probe_failed_total`, no page, no panic). Supervised so a
     // monitor panic respawns instead of vanishing (mirrors DISK-WATCHER-01).
-    let _oom_monitor_supervisor =
-        tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(std::path::PathBuf::from(
-            tickvault_storage::oom_monitor::DEFAULT_CGROUP_V2_MEMORY_EVENTS_PATH,
-        ));
+    //
+    // 2026-09-01: the path is RESOLVED from `/proc/self/cgroup`, not the
+    // hardcoded root. As a bare systemd unit this process lives in
+    // `system.slice/tickvault.service`, and the cgroup ROOT has no
+    // `memory.events` at all — so the monitor had been failing its probe
+    // softly every 60 s since it shipped, and PROC-01 could never fire on the
+    // one host it exists for. The root constant remains the fallback for the
+    // in-container case, where the root really is our cgroup.
+    let _oom_monitor_supervisor = tickvault_storage::oom_monitor::spawn_supervised_oom_monitor(
+        tickvault_storage::oom_monitor::resolve_memory_events_path(),
+    );
 
     // BP-08 (RESOURCE-01/02/03, 2026-07-01): supervised process-level resource
     // early-warning monitor. Samples open fd count vs LimitNOFILE (RESOURCE-01),
@@ -1713,22 +3224,15 @@ async fn async_main() -> Result<()> {
     let _dhan_universe_rider = tickvault_app::dhan_universe::spawn_dhan_universe_rider(
         config.dhan_universe.clone(),
         config.questdb.clone(),
+        // Quote 44: the daily instrument snapshots go to the same cold bucket
+        // as the raw frames (`[partition_retention] archive_bucket`).
+        config.partition_retention.archive_bucket.clone(),
     );
-
-    if config.groww_universe.enabled {
-        let _groww_universe_rider =
-            tickvault_app::groww_universe::spawn_groww_universe_rider(config.questdb.clone());
-    } else {
-        info!(
-            "[groww_universe] disabled — daily Groww watch-set rider not spawned \
-             (spot-leg VIX resolution + feed='groww' master continuity degrade)"
-        );
-    }
 
     // Tick-conservation retirement (2026-07-18): the daily 15:40 IST
     // conservation audit spawn was DELETED — its inputs (live WAL frames,
     // processor counters, `ticks` writes) all died with the live-WS
-    // retirements; the `tick_conservation_audit` table stays (SEBI).
+    // retirements. RESTORED in a new shape by K4 (2026-10-26), next to the cross-check.
 
     // Daily 15:25 IST orphan-position watchdog — PROCESS-GLOBAL
     // (2026-07-14 re-home; the tick-conservation hoist precedent directly
@@ -1771,16 +3275,6 @@ async fn async_main() -> Result<()> {
         &feed_runtime,
     );
 
-    // BruteX↔TickVault daily cross-verify (BRUTEX-XVERIFY, 2026-07-12) —
-    // PROCESS-GLOBAL spawn like the scoreboard above: the 15:50 IST runner
-    // + supervisor. Config-gated ([brutex_crossverify] enabled, default OFF);
-    // disabled = one info! + return, nothing spawned.
-    tickvault_app::brutex_crossverify_boot::spawn_brutex_crossverify_task(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
     // Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
     // the Groww per-minute REST plan) — the slow-path call site; the FAST
     // crash-recovery arm carries its own (hostile round 1 item 1 — the
@@ -1792,15 +3286,6 @@ async fn async_main() -> Result<()> {
     // Order-runtime mark tap (re-homed 2026-07-16): the forwarder rides
     // into the Groww REST legs (spot + contract) — the only mark sources
     // since the live bridge retired. `None` when `[order_runtime]` is off.
-    spawn_groww_spot_1m_leg(
-        &config,
-        &notifier,
-        &trading_calendar,
-        // Clone: the ORIGINAL rides into the cadence scheduler below —
-        // since PR #1624 the cadence Groww executor is the LIVE mark
-        // producer (these legacy legs are config-OFF at HEAD).
-        order_runtime_mark_forwarder.clone(),
-    );
 
     // Full-fidelity order/position PUSH-event capture (ORDER-EVT-01,
     // 2026-07-18 — `.claude/rules/project/order-update-events-error-codes.md`):
@@ -1815,46 +3300,10 @@ async fn async_main() -> Result<()> {
             &config.order_update_events,
             &config.questdb,
         );
-    #[cfg(not(feature = "groww_orders"))]
-    // The position producer is groww_orders-only — without the feature the
-    // sender drops here (the consumer handles the closed side gracefully).
+    // The position-update producer was the Groww push channel, removed
+    // 2026-08-21 with the feed. The sender drops here; the consumer handles
+    // a closed side gracefully.
     let _ = position_update_events_tx;
-
-    // Groww order/position PUSH channel — Stage D (operator-authorized
-    // paper-mode receive-only build, 2026-07-17): the supervised
-    // NATS-over-WS push runner fanning full-fidelity order events into the
-    // bounded order_audit sink. Gated BOTH on the non-default
-    // `groww_orders` cargo feature (§39.2 Gate 2 — a default build carries
-    // no Groww order code) AND the runtime `[groww_orders]
-    // order_push_enabled` flag (Gate 1, default OFF).
-    #[cfg(feature = "groww_orders")]
-    {
-        if config.groww_orders.order_push_enabled {
-            // The ADDITIVE capture lane rides only when [order_update_events]
-            // is enabled; disabled ⇒ the push runner runs capture-free.
-            let capture = match (
-                order_update_events_tx.clone(),
-                position_update_events_tx.clone(),
-            ) {
-                (Some(orders), Some(positions)) => {
-                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::new(
-                        orders, positions,
-                    )
-                }
-                _ => {
-                    tickvault_trading::oms::groww::push::order_events::GrowwPushCapture::disabled()
-                }
-            };
-            tickvault_app::groww_order_observability::spawn_groww_order_push(
-                &config.questdb,
-                capture,
-            );
-        } else {
-            info!(
-                "groww order push disabled (config) — receive-only order/position channel not spawned"
-            );
-        }
-    }
 
     // Daily 15:40 IST timeframe-consistency verifier — PROCESS-GLOBAL like
     // the conservation audit + scoreboard above (operator 2026-07-13):
@@ -1870,46 +3319,42 @@ async fn async_main() -> Result<()> {
         &notifier,
     );
 
-    // Post-close Dhan↔Groww spot_1m_rest cross-broker OHLC comparator
-    // (SPOT-XVERIFY-01/02) — PROCESS-GLOBAL, config-gated (`[spot_crossverify]
-    // enabled`), 15:47 IST, DEDUP-idempotent. See
-    // `spot_crossverify_boot::spawn_spot_crossverify_tasks`.
-    tickvault_app::spot_crossverify_boot::spawn_spot_crossverify_tasks(
-        &config,
-        &trading_calendar,
-        &notifier,
-    );
-
-    // Judge-locked cadence scheduler — PROCESS-GLOBAL like the verifier
-    // above (2026-07-14): per-minute chain + spot fire timing with
-    // structural zero-429 gates, failure ladder, and event-driven dry-run
-    // decisions (CADENCE-01/02/03). Config-gated (`[cadence] enabled`,
-    // ships false); dry-run executors both lanes — NO REST caller in this
-    // PR; the once-per-process AtomicBool inside makes the fast-arm +
-    // prefix dual-spawn safe. See `cadence_boot::spawn_cadence_scheduler`.
-    // Order-leg P&L (2026-07-19): shared leg-identity handle + boot consumer.
-    let leg_identity_index = tickvault_app::groww_cadence_executor::new_shared_leg_identity_index();
+    let leg_identity_index = tickvault_app::leg_identity::new_shared_leg_identity_index();
     let order_leg_pnl_tx = tickvault_app::order_leg_pnl_boot::spawn_order_leg_pnl_capture(
         config.order_runtime.enabled,
         &config.order_leg_pnl,
         &config.questdb,
         std::sync::Arc::clone(&leg_identity_index),
     );
-    let _cadence_shutdown = tickvault_app::cadence_boot::spawn_cadence_scheduler(
-        &config,
-        &trading_calendar,
-        &feed_runtime,
-        &notifier,
-        // Order-runtime mark tap (2026-07-18): the GROWW cadence
-        // executor's spot persist-confirm seam is the live mark source
-        // (re-homed from the stood-down legacy legs). Threaded to the
-        // GROWW lane ONLY — NEVER the Dhan executor: Dhan sids
-        // (13/25/51) are a different id space than the Groww-native
-        // u64s the paper book keys on; cross-feeding would double-key
-        // instruments invisibly to the first-seen-segment tripwire.
-        order_runtime_mark_forwarder,
-        leg_identity_index,
-    );
+    // ---- the cadence scheduler: REMOVED 2026-09-16 ----
+    //
+    // `cadence_boot::spawn_cadence_scheduler` drove the per-minute chain +
+    // spot fire timing with the zero-429 gates, the failure ladder and the
+    // event-driven decisions. Its `CadenceExecutor` trait declared exactly
+    // three methods — `fetch_chain`, `fetch_spot`, `fetch_expiry_list` —
+    // and all three ARE the market-data REST legs removed under the
+    // operator's 2026-09-16 directive (`no-rest-except-live-feed-2026-06-27.md`
+    // §12.10). With nothing left to execute, the scheduler had no work to
+    // schedule, so the whole `crates/core/src/cadence/` tree goes with it.
+    //
+    // ⚠ THE EXPLICIT DROP BELOW IS LOAD-BEARING — do not "tidy" it away.
+    //
+    // `order_runtime_mark_forwarder` is an mpsc `Sender` that was MOVED into
+    // this call. Deleting the call alone would leave the binding alive in
+    // `async_main`'s frame for the whole process lifetime, so the channel
+    // would NEVER close, `mark_rx.recv()` would pend forever, and the paper
+    // order book's three already-written no-producer arms — including the
+    // `warn!` that exists precisely to say "no mark source" — would none of
+    // them ever run. No error, no warn, no counter: the daily-loss halt and
+    // the paper book would run on permanently stale marks while reporting
+    // healthy. That is the false-OK class this repository forbids.
+    //
+    // Dropping it closes the channel, which is the honest state: the Groww
+    // cadence executor WAS the live mark source, and it is gone. Wiring a
+    // new mark producer from the tick drain is real work on the order path
+    // and is deliberately OUT of this removal's scope.
+    drop(order_runtime_mark_forwarder);
+    let _ = leg_identity_index;
 
     // -----------------------------------------------------------------------
     // DayOhlcTracker boot wiring (post 2026-05-26 simplification; MOVED to
@@ -1943,15 +3388,14 @@ async fn async_main() -> Result<()> {
     // tick-broadcast consumers (see the plan's Observability note).
     // -----------------------------------------------------------------------
     let day_ohlc_tracker = std::sync::Arc::new(tickvault_trading::in_mem::DayOhlcTracker::new());
-    {
-        let consumer_tracker = std::sync::Arc::clone(&day_ohlc_tracker);
-        let consumer_rx = tick_broadcast_sender.subscribe();
-        let _consumer_handle = tickvault_app::day_ohlc_orchestrator::spawn_day_ohlc_tick_consumer(
-            consumer_tracker,
-            consumer_rx,
-            tickvault_common::always_on::current(), // §30 GIFT exemption — same source as the aggregator/tick processor
-        );
-    }
+    // 2026-09-02 (audit finding 13): the tick-consumer spawn that sat here
+    // (`spawn_day_ohlc_tick_consumer` on a subscriber of the process broadcast)
+    // is DELETED with the publisher-less process tick broadcast — the
+    // "DORMANT SINCE PR-C2" note above was the honest description of a
+    // subscriber that could never wake, and the channel it waited on cost a
+    // ~40 MB `ParsedTick` ring for nothing. The function is retained,
+    // publisher-ready, in `day_ohlc_orchestrator.rs`; the midnight reset
+    // below stays because it is self-contained and clock-driven.
     {
         // CCL-02: supervised respawn wrapper (INDEX-OHLC-02) so a panic in the
         // IST-midnight reset task can never silently take the daily reset offline
@@ -2082,20 +3526,20 @@ async fn async_main() -> Result<()> {
         )
         .increment(dropped);
         ws_wal_replay_live_feed.clear();
+        ws_wal_replay_gaps.clear();
+        ws_wal_replay_trailing_gap = None;
+        ws_wal_replay_last_fold_receipt = None;
     }
-    {
-        // Both legs settled (loudly archived) — archive the staged segments
-        // so they never re-stage. `confirm_replayed` MOVES segments into the
-        // WAL archive dir (never deletes). Honest envelope (round-2 note,
-        // 2026-07-14): this confirm also runs when `replay_all` itself
-        // ERRORED above — segments staged but never read are archived with
-        // a zero count (raw frames preserved on disk, count lost).
-        // Acceptable post-retirement: no consumer exists to re-replay into,
-        // and NOT confirming would re-stage the unreadable segments forever
-        // (the WS-REINJECT-01 growth-storm class).
-        let confirm_ws_wal_path = tickvault_app::boot_helpers::ws_wal_dir();
-        tickvault_storage::ws_frame_spill::confirm_replayed(&confirm_ws_wal_path);
-    }
+    // STAGE-C confirm (2026-11-07). A lane refold confirms itself after its
+    // flush (2026-08-21); a refused or FAILED pass read nothing, so archiving
+    // would bury unread `replaying/` leftovers; only a pass that read its
+    // segments with no refold coming archives (`boot_wal_confirm`).
+    tickvault_app::boot_wal_confirm::settle_boot_replay_staging(
+        &tickvault_app::boot_helpers::ws_wal_dir(),
+        ws_wal_replay_pass,
+        dhan_lane_will_refold && !ws_wal_replay_live_feed.is_empty(),
+        ws_wal_replay_live_feed.len(),
+    );
 
     // =======================================================================
     // DHAN REST-ONLY STACK (PR-C2, 2026-07-13 — the only Dhan surface).
@@ -2148,6 +3592,8 @@ async fn async_main() -> Result<()> {
     ) {
         tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByEnv => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "live_feed_env_missing",
                 env_var = tickvault_app::dhan_feed_stack::DHAN_LIVE_FEED_ENV,
                 "config enables the Dhan live feed but the environment opt-in is missing, so NO \
                  live market data will flow this session — no ticks, no live candles, and the \
@@ -2160,6 +3606,12 @@ async fn async_main() -> Result<()> {
         tickvault_app::dhan_feed_stack::FeedStackGate::DisabledByConfig
         | tickvault_app::dhan_feed_stack::FeedStackGate::Enabled => {}
     }
+    // The dual-instance lock verdict, created HERE so both Dhan stacks read
+    // one flag: the REST stack acquires the SSM lock and stores true; the
+    // live tick lane refuses to open a socket while it reads false. Before
+    // 2026-09-08 the flag lived inside the REST stack's task and the lane's
+    // only protection was the ORDER in which the two happened to run.
+    let dhan_instance_lock_held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _dhan_rest_stack_monitor = tickvault_app::dhan_rest_stack::spawn_dhan_rest_stack(
         tickvault_app::dhan_rest_stack::DhanRestStackParams {
             config: std::sync::Arc::new(config.clone()),
@@ -2186,6 +3638,9 @@ async fn async_main() -> Result<()> {
             // Order-leg P&L (2026-07-19): sink for the runtime's paper-leg
             // realized/unrealized events. None = feature OFF.
             leg_pnl_tx: order_leg_pnl_tx,
+            // Shared with the live tick lane below: the stack sets it on
+            // acquire, the lane refuses to dial while it reads false.
+            instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
         },
     );
 
@@ -2209,56 +3664,36 @@ async fn async_main() -> Result<()> {
     // amendment stands — no CSV download, no parser). Depth sets are empty
     // until an operator names instruments for them.
     // =======================================================================
-    // -----------------------------------------------------------------------
-    // Register the 15:31 cross-verification dependencies BEFORE the lane
-    // spawns (2026-08-11).
+    // ---- the 15:41 cross-verification registration: REMOVED 2026-09-16 ----
     //
-    // Without this call `spawn_daily_crossverify` takes its refusal branch and
-    // the lane runs with NO loss detector at all. That is not a degraded mode
-    // — it is the absence of the only detector that can exist here: the Dhan
-    // main feed carries no sequence number and no snapshot-on-subscribe, so a
-    // dropped packet is invisible at the protocol level. The 15:31 comparison
-    // against Dhan's own REST record is the entire safety net.
+    // This installed the comparator's dependencies (QuestDB `/exec` for the
+    // live candles, Dhan's `/v2/charts/intraday` for the official tape, a
+    // fresh-JWT closure, and the ILP handle that wrote the findings) BEFORE
+    // the lane spawned, because `run_dhan_feed_stack` REFUSED to open any
+    // socket without them.
     //
-    // This was missed once already. The comparator's stub was replaced with a
-    // real implementation on 2026-08-10, and the registration it depends on
-    // was never written — so the "fix" changed a log line and nothing else.
-    // The lane now REFUSES to start without it (see `run_dhan_feed_stack`),
-    // which is what stops that from being possible a third time.
-    let crossverify_installed = tickvault_app::dhan_feed_stack::install_crossverify_deps(
-        tickvault_app::dhan_feed_stack::CrossverifyDeps {
-            questdb_exec_url: format!(
-                "http://{}:{}/exec",
-                config.questdb.host, config.questdb.http_port
-            ),
-            intraday_url: format!(
-                "{}{}",
-                config.dhan.rest_api_base_url,
-                tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
-            ),
-            // A closure, not a value: the JWT rotates roughly every 23h and
-            // this scheduler outlives any single token. Reading it fresh at
-            // each run is the only correct shape.
-            jwt_provider: Box::new(|| {
-                let manager = tickvault_core::auth::token_manager::global_token_manager()?;
-                let guard = manager.token_handle().load();
-                guard.as_ref().as_ref().map(|state| {
-                    use secrecy::ExposeSecret as _;
-                    state.access_token().expose_secret().to_string()
-                })
-            }),
-            config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
-        },
-    );
-    if !crossverify_installed {
-        // Idempotent by design — first call wins. A second call means someone
-        // added a rival registration, which would silently decide which
-        // endpoints the only ground-truth check uses.
-        tracing::warn!(
-            "cross-verification dependencies were already registered — the first \
-             registration stands; check for a duplicate install site"
-        );
-    }
+    // Both halves are gone under the operator's 2026-09-16 directive,
+    // recorded BEFORE the code in `no-rest-except-live-feed-2026-06-27.md`
+    // §12.10: "Bro just remove per minute price falls and 3.41 pm accuracy
+    // check alone dude okay". The refusal floor in `run_dhan_feed_stack`
+    // went with it, and §12.10.3 of that file records that NOTHING replaces
+    // it — a floor gating on a removed component cannot stand, and inventing
+    // a different precondition on the live trading lane inside a removal PR
+    // would be worse than having none.
+    //
+    // ⚠ THE HONEST CONSEQUENCE, which the deleted comment above stated
+    // better than any replacement could: the Dhan main feed carries no
+    // sequence number and no snapshot-on-subscribe, so a dropped packet is
+    // invisible at the protocol level. This comparison against Dhan's own
+    // REST record was the entire safety net. From today there is ZERO
+    // mechanism anywhere in this workspace that compares captured market
+    // data against any external record — every remaining signal reports
+    // whether the machinery RAN, never whether the numbers are RIGHT.
+    // §12.10.4 records that as a LOSS, not as a cost that was mitigated.
+    //
+    // The three audit tables it wrote (`dhan_rest_1m_tape` and its two
+    // siblings) are RETAINED with every row, and are in the operator
+    // console's SEBI keep-list. Only the writer is gone.
 
     // Depth instrument sets, sourced from the per-minute option chain (operator
     // 2026-08-11, second quote — "enable connect estbalish al lteh 16
@@ -2292,13 +3727,114 @@ async fn async_main() -> Result<()> {
     // lost that race and the whole session ran on 4 instruments instead of
     // 4,565, silently. This wait is bounded and fail-soft: on timeout the
     // resolve below takes its existing, loudly-logged fallback.
-    let universe_date_ist = tickvault_app::dhan_universe::today_ist_date();
+    // One IST date for the artifact and calendar verdict: a weekend Muhurat
+    // session needs the same list/widening path as a regular session day.
+    let universe_day_ist = chrono::Utc::now()
+        .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+        .date_naive();
+    let universe_date_ist = universe_day_ist.to_string();
+    let universe_session_day = trading_calendar.is_session_day(universe_day_ist);
+    // Off-session boots (non-trading day, or before the rider's build hour)
+    // fall back to the index universe BY DESIGN — the artifact cannot exist
+    // yet. Judged ONCE here so the wait and the resolve agree, and so the
+    // collapse page fires only for a boot that should have widened.
+    let universe_collapse_expected =
+        tickvault_app::dhan_live_universe::collapse_is_expected_for_this_boot(
+            trading_calendar.is_trading_day_today(),
+            tickvault_common::market_hours::now_ist_secs_of_day(),
+            config.dhan_universe.target_secs_of_day_ist,
+        );
     tickvault_app::dhan_live_universe::await_mapping_artifact(
         &config.dhan_universe,
         &universe_date_ist,
+        universe_collapse_expected,
+        universe_session_day,
     )
     .await;
+    // Judged AGAIN after the wait (audit re-check 7). A boot between 07:10
+    // and the rider hour waits until ten minutes past it, so by the time the
+    // resolve runs the rider hour has passed and today's list SHOULD exist.
+    // Keeping the verdict frozen from before the wait would log that miss as
+    // the expected pre-rider warning and page nobody. It can only flip from
+    // expected to not expected here, never the other way.
+    let universe_collapse_expected_after_wait = universe_collapse_expected
+        && tickvault_app::dhan_live_universe::collapse_is_expected_for_this_boot(
+            trading_calendar.is_trading_day_today(),
+            tickvault_common::market_hours::now_ist_secs_of_day(),
+            config.dhan_universe.target_secs_of_day_ist,
+        );
 
+    // Contract names for `ticks.contract` / `candles_<tf>.contract` BEFORE the
+    // lane dials and before its frame-log replay, so the 09:00 pre-open ticks
+    // and every row the replay rewrites carry one. Second boot call: the first
+    // ran before the seal writer started; this one runs after the wait above,
+    // so a contract file built in the meantime replaces a smaller table. The
+    // attach later replaces the table and, from then on, the boot publish
+    // never does (2026-10-09 regression, see the function).
+    let contract_names =
+        tickvault_app::dhan_contract_universe::publish_contract_labels_at_boot(&universe_date_ist);
+    info!(
+        contract_names,
+        "contract names checked before the lane starts (0 = held table kept)"
+    );
+
+    // Give the lane the `/health` websocket reporter BEFORE it dials, so the
+    // first socket that comes up is the one that arms the row.
+    //
+    // Without this the endpoint answered "retired — live feeds retired
+    // 2026-07-13/15" on a box running the REVIVED lane: `SystemHealthStatus`
+    // gates that row on whether any producer has ever pushed a count, the
+    // producer died with the old lane, and the revival never replaced it. A
+    // dead lane and a healthy one rendered identically on the endpoint whose
+    // whole job is telling them apart. The API side needed no change — its
+    // own doc calls the flag "arm-on-arrival"; this is the arrival.
+    if !tickvault_app::dhan_feed_stack::install_health_reporter(std::sync::Arc::clone(
+        &health_status,
+    )) {
+        // First writer wins. Unreachable in production -- one boot, one call --
+        // so a hit here means a second boot path appeared and the row is
+        // reporting through a handle this boot does not own. Silent would make
+        // that indistinguishable from working.
+        warn!(
+            "the /health websocket reporter was already installed — this boot is NOT the \
+             one arming that row"
+        );
+    }
+
+    // Resolved ONCE and shared, so the daily cross-verification below checks
+    // exactly the universe the lane subscribed — never a second resolution
+    // that could land on a different artifact.
+    let main_feed_instruments = tickvault_app::dhan_live_universe::resolve_live_universe(
+        &config.dhan_universe,
+        tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+        &universe_date_ist,
+        tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed.subscription_capacity(),
+        universe_collapse_expected_after_wait,
+    );
+    // A session that did not get today's list keeps its alarm fed for as long
+    // as it stays that way (the counter's single increment above can land in
+    // the same scrape as its zero seed, which CloudWatch drops).
+    if let Some(reason) = tickvault_app::dhan_live_universe::live_universe_degraded_reason() {
+        tokio::spawn(tickvault_app::dhan_live_universe::run_degraded_universe_heartbeat(reason));
+    }
+
+    // Scope lock 2026-10-13: the silent depth-200 swap wait, validated at boot
+    // (10..=600 s); installed before any depth socket can swap.
+    let silent_swap_secs = tickvault_core::websocket::silent_swap::set_resubscribe_after_secs(
+        config.dhan_universe.depth200_silent_swap_resubscribe_secs,
+    );
+    info!(
+        silent_swap_secs,
+        "depth-200 silent swap resubscribe wait installed"
+    );
+    // Depth on/off (owner, 2026-10-21): stored before the stack spawns, so its
+    // depth attach reads it; while off, the steering heartbeat reads 0.
+    tickvault_app::depth_switch::set_depth_sockets_enabled(
+        config.dhan_universe.depth_sockets_enabled,
+    );
+    if !config.dhan_universe.depth_sockets_enabled {
+        let _depth_off = tickvault_app::depth_switch::spawn_switched_off_heartbeat();
+    }
     let dhan_feed_stack_monitor = tickvault_app::dhan_feed_stack::spawn_dhan_feed_stack(
         tickvault_app::dhan_feed_stack::DhanFeedStackParams {
             shutdown: std::sync::Arc::clone(&dhan_feed_shutdown),
@@ -2306,31 +3842,46 @@ async fn async_main() -> Result<()> {
             // quiet on NSE holidays. EventBridge starts this box MON-FRI, which
             // includes them (2026-08-14).
             calendar: std::sync::Arc::clone(&trading_calendar),
+            // The operator-armed unsubscribe probe, DEFAULT OFF (scope lock,
+            // 2026-09-12). An absent `[depth_unsubscribe_probe]` section reads
+            // as every flag false, so a default build never empties a
+            // depth-200 socket to measure anything.
+            depth_unsubscribe_probe: config.depth_unsubscribe_probe,
+            // Plan item 49e step 3: absent section = off (market_depth rows).
+            depth_storage: config.depth_storage,
+            tick_storage: config.tick_storage, // ITEM DT: absent section = library encoder
+            // Backup copy on another main-feed socket (scope lock 2026-10-02); 0 = off.
+            main_feed_backup_top_n: config.dhan_universe.backup_top_n,
+            subscribe_reconcile_auto_resubscribe: config
+                .dhan_universe
+                .subscribe_reconcile_auto_resubscribe,
+            // Frame-silence fast paths (scope lock 2026-10-10): shadow by default.
+            frame_silence_fast_path: config.dhan_universe.frame_silence_fast_path,
+            ltt_utc_autocorrect: config.dhan_feed.ltt_utc_autocorrect, // scope lock 2026-11-20
+            frame_drain_spin_us: config.dhan_feed.frame_drain_spin_us, // US1-B
             dhan_enabled: config.feeds.dhan_enabled,
+            instance_lock_held: std::sync::Arc::clone(&dhan_instance_lock_held),
             // Frames a previous session captured but died before folding. The
             // lane re-folds them after its ingest exists and before any socket
             // opens; DEDUP-idempotent via the replay-stable `capture_seq`.
             // Empty on a clean boot.
             wal_replay_live_feed: std::mem::take(&mut ws_wal_replay_live_feed),
-            // DEFAULT-OFF: with `live_subscription_from_master = false` (the
-            // shipped value) this returns the same 4 hardcoded index SIDs the
-            // lane has always used, so the operator's 2026-08-11 third-quote
-            // carve-out — "re-pointing the lane… must not be smuggled in" — is
-            // honoured in substance: the live set does not move until a human
-            // flips the flag and restarts.
-            main_feed_instruments: tickvault_app::dhan_live_universe::resolve_live_universe(
-                &config.dhan_universe,
-                tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
-                &universe_date_ist,
-                tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
-                    .subscription_capacity(),
-            ),
+            wal_replay_gaps: std::mem::take(&mut ws_wal_replay_gaps),
+            wal_replay_trailing_gap: ws_wal_replay_trailing_gap,
+            wal_replay_last_fold_receipt: ws_wal_replay_last_fold_receipt,
+            boot_replay_intent, // PR AA finding 6: taken before the archive loops
+            // The master-sourced set: `live_subscription_from_master` was built
+            // default-off and the operator turned it on on 2026-08-12
+            // (`config/base.toml` ships `true`). A missing list for today takes
+            // the newest earlier day's list, and an oversized one fills the
+            // envelope by priority; only with no list on disk is this the 4
+            // index SIDs (audit D3).
+            main_feed_instruments: main_feed_instruments.clone(),
             // Empty by design — the stack late-attaches depth after 09:16 IST.
             depth_20_instruments: Vec::new(),
             depth_200_instruments: Vec::new(),
             questdb: config.questdb.clone(),
-            // So the lane can report whether it is ACTUALLY running, instead of
-            // the console reading a flag nothing ever set (2026-08-14).
+            // So the lane reports whether it is ACTUALLY running (2026-08-14).
             feed_runtime: std::sync::Arc::clone(&feed_runtime),
             // And so a DEAD lane can report dead (2026-08-18). The drain
             // records rows flushed to QuestDB, which is what lets the Dhan
@@ -2342,15 +3893,100 @@ async fn async_main() -> Result<()> {
             // 2026-07-13 (the note there — "there is no frame APPEND site left
             // in this process" — is what this line changes). `None` refuses
             // the lane outright rather than capturing without a durable floor.
-            spill: _ws_frame_spill.clone(),
+            spill: ws_frame_spill.clone(),
             // Both paths seal into the same `candles_<tf>` tables under
             // `feed='dhan'`, and the dedup key has no column that separates
             // them. Passing the fold's real state lets the lane refuse rather
             // than let one writer silently overwrite the other.
             rest_fold_writes_dhan_candles: config.rest_candle_fold.enabled,
+            // Audit D3b: a boot that did not get today's spot list adds it
+            // once the rider writes it, without a restart. Include calendar-listed
+            // Muhurat sessions; ordinary weekends/holidays still have no session
+            // to widen. The existing bounded polling window is unchanged.
+            widen_universe: (tickvault_app::dhan_live_universe::live_universe_widen_pending()
+                && universe_session_day)
+                .then(|| tickvault_app::dhan_live_universe::TodaysUniverseSource {
+                    cfg: config.dhan_universe.clone(),
+                    index_universe: tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                    capacity: tickvault_core::websocket::pool_budget::DhanEndpointType::MainFeed
+                        .subscription_capacity(),
+                }),
         },
     );
 
+    // Daily 1-minute cross-verification (`no-rest-except-live-feed` §12.15,
+    // 2026-09-24): our `candles_1m` against Dhan's own tape after the close.
+    // Its own task — the lane above never waits for it. Only with the Dhan
+    // lane ON: with it off there are no `feed='dhan'` candles to compare, and
+    // the S3 gate above is not armed either.
+    let _dhan_crossverify = config.feeds.dhan_enabled.then(|| {
+        // §12.15.7 (2026-10-06): the archive gate reads a day's marker when
+        // that day's partitions leave their hot window. The gated windows are
+        // checked against the marker keep; `pressure_hot_days` is left out
+        // because the disk-pressure leg is not gated.
+        let retention = &config.partition_retention;
+        let gated_hot_days_max = retention
+            .retention_days
+            .max(retention.market_data_hot_days)
+            .max(retention.depth_hot_days)
+            .max(retention.intraday_hot_days);
+        if tickvault_app::dhan_live_crossverify_boot::crossverify_marker_keep_is_short(
+            gated_hot_days_max,
+        ) {
+            warn!(
+                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                source = "xverify_marker_keep_short",
+                gated_hot_days_max,
+                keep_days = tickvault_app::dhan_live_crossverify_boot::CROSSVERIFY_MARKER_KEEP_DAYS,
+                "a configured archive hot window plus the cross-verification hold comes \
+                 within 3 days of the marker keep — a verified day's marker could be swept \
+                 before the S3 archive gate reads it, and the day would archive as unverified"
+            );
+        }
+        tickvault_app::dhan_live_crossverify_boot::spawn_dhan_live_crossverify(
+            tickvault_app::dhan_live_crossverify_boot::CrossverifyBootDeps {
+                questdb_exec_url: format!(
+                    "http://{}:{}/exec",
+                    config.questdb.host, config.questdb.http_port
+                ),
+                intraday_url: format!(
+                    "{}{}",
+                    config.dhan.rest_api_base_url,
+                    tickvault_common::constants::DHAN_CHARTS_INTRADAY_PATH
+                ),
+                config: tickvault_app::dhan_live_crossverify::DhanLiveCrossverifyConfig::default(),
+                questdb: config.questdb.clone(),
+                calendar: std::sync::Arc::clone(&trading_calendar),
+                // Plan item 51e/51f (§12.15.13-14): the boot set's basis goes
+                // into the day's subscribe record, so a day that only ever
+                // ran on the four-index fallback is refused, never recorded.
+                universe_basis: tickvault_app::xverify_day_record::universe_basis(
+                    config.dhan_universe.live_subscription_from_master,
+                    &main_feed_instruments,
+                    &tickvault_app::dhan_feed_stack::hardcoded_index_universe(),
+                ),
+            },
+            &main_feed_instruments,
+        )
+    });
+    // K4 (2026-10-26): 15:45 IST ticks conservation check + boot downtime row; Dhan lane only.
+    let _tick_conservation = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::tick_conservation::spawn_tick_conservation(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+            process_start_ist_nanos,
+            previous_process_last_receipt,
+        )
+    });
+    // LF-6a handshake timing (09:25 IST); expiry-scope check (15:50); LF-7 fill report. Own tasks.
+    let _network_rtt = tickvault_app::network_rtt::spawn_network_rtt_session(&config);
+    let _expiry_scope = config.feeds.dhan_enabled.then(|| {
+        tickvault_app::expiry_scope_check::spawn_expiry_scope_check(
+            config.questdb.clone(),
+            std::sync::Arc::clone(&trading_calendar),
+        )
+    });
+    tickvault_app::live_fill_report::start(&config, &trading_calendar, process_start_ist_nanos);
     // =======================================================================
     // Boot completion signals (deploy-hang fix 2026-07-13; unconditional +
     // non-blocking since PR-C2).
@@ -2377,15 +4013,8 @@ async fn async_main() -> Result<()> {
     {
         let bc_feed_runtime = std::sync::Arc::clone(&feed_runtime);
         let bc_dhan_enabled = config.feeds.dhan_enabled;
-        let bc_groww_enabled = config.feeds.groww_enabled;
         tokio::spawn(async move {
-            emit_boot_completed_when_feed_live(
-                &bc_feed_runtime,
-                bc_dhan_enabled,
-                bc_groww_enabled,
-                false,
-            )
-            .await;
+            emit_boot_completed_when_feed_live(&bc_feed_runtime, bc_dhan_enabled, false).await;
         });
     }
 
@@ -2403,6 +4032,7 @@ async fn async_main() -> Result<()> {
         trading_calendar.clone(),
         dhan_feed_shutdown,
         dhan_feed_stack_monitor,
+        ws_frame_spill,
     )
     .await
 }
@@ -2428,7 +4058,10 @@ async fn async_main() -> Result<()> {
 ///    it owns the /health `questdb_reachable` flag write (see the param
 ///    note below).
 async fn run_slow_boot_observability(
-    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
+    // 2026-09-02 (audit finding 13): the `tick_rx` broadcast receiver this
+    // task took is DELETED with the publisher-less process tick broadcast.
+    // Its `recv()` arm never once fired since PR-C2 (2026-07-14); see
+    // `ticks_observed` below for what that means for the starved detector.
     questdb_config: tickvault_common::config::QuestDbConfig,
     // PR-C2 (2026-07-13): the deleted Dhan pool watchdog was the ONLY
     // production writer of the /health `questdb_reachable` flag — without a
@@ -2470,7 +4103,18 @@ async fn run_slow_boot_observability(
     // The pair is what separates "nothing is stalling" from "I can see
     // nothing" — a distinction the scan's own return value cannot make, since
     // an empty tracker and a healthy universe both yield zero.
-    let mut ticks_observed: u64 = 0;
+    //
+    // 2026-09-02 (audit finding 13): `ticks_observed` is a documented CONSTANT
+    // zero. The broadcast it counted arrivals on had no production publisher
+    // since PR-C2 (2026-07-14) — every `tick_tx.send` in the workspace is
+    // inside `#[cfg(test)]` — so it never incremented, and the channel is now
+    // deleted rather than kept as a 40 MB `ParsedTick` ring nobody fed. The
+    // starved detector below therefore keeps saying exactly what it said
+    // before: with the live lane ON this scan can see NOTHING, because the
+    // lane folds ticks internally; RISK-GAP-03 is the per-instrument silence
+    // signal that IS wired. Wiring a real tick source here means feeding
+    // `tick_gap_tracker.record_tick` from it and making this a live count.
+    let ticks_observed: u64 = 0;
     let mut stale_scans: u32 = 0;
     let mut starved_reported = false;
 
@@ -2501,32 +4145,12 @@ async fn run_slow_boot_observability(
     // same starvation also affected total-silence incidents pre-C2).
     let mut qdb_ping_ticker = tokio::time::interval(qdb_health_interval);
     qdb_ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 2026-09-02: the `tick_rx.recv()` select arm that fed
+    // `tick_gap_tracker.record_tick` is DELETED with the publisher-less
+    // broadcast (audit finding 13). The tracker stays, empty, so the
+    // starved-detector arithmetic below is unchanged and honest.
     loop {
         tokio::select! {
-            recv = tick_rx.recv() => match recv {
-                Ok(tick) => {
-                    ticks_observed = ticks_observed.saturating_add(1);
-                    // Gap detection — the tracker fires its own log/metric on
-                    // ERROR thresholds; no backfill request is published
-                    // (in-market backfill disabled by user policy).
-                    // I-P1-11 composite: security_id alone is not unique.
-                    let _ = tick_gap_tracker.record_tick(
-                        tick.security_id,
-                        tick.exchange_segment_code,
-                        tick.exchange_timestamp,
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        skipped,
-                        "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
-                    return;
-                }
-            },
             _ = qdb_ping_ticker.tick() => {
                 // Audit finding #2 (2026-04-24): periodic per-instrument stall
                 // scan every 30 s — cadence-tracked so the scan runs even when
@@ -2560,17 +4184,28 @@ async fn run_slow_boot_observability(
                         starved_reported,
                     ) {
                         starved_reported = true;
-                        error!(
-                            code = tickvault_common::error_code::ErrorCode::RiskGapTickGap
-                                .code_str(),
+                        // ⚠ DOWNGRADED 2026-09-23 — ERROR (coded) → WARN (uncoded).
+                        //
+                        // Since 2026-09-02 `ticks_observed` is structurally 0 (the
+                        // broadcast arm feeding it was deleted, see above), so with
+                        // the live lane enabled this notice is not a detection — it
+                        // is a CERTAINTY, emitted on every boot four scans in. As a
+                        // coded ERROR it matched the RISK-GAP-03 log-filter alarm and
+                        // paged the operator every trading morning (~08:34 IST) for a
+                        // fact that never changes. The real per-instrument silence
+                        // signal is the lane's own 30s scan in `dhan_feed_stack`,
+                        // which carries the code and IS gated to the continuous
+                        // session. This line keeps the honesty (it still says the
+                        // detector is blind) and the counter, and drops the page.
+                        warn!(
                             stale_scans,
                             "the per-instrument stall detector has run {stale_scans} scans and \
                              observed ZERO ticks while the live feed is enabled. It is reporting \
                              no stalled instruments because it can see no instruments — not \
                              because none are stalling. Its input is the process tick broadcast, \
                              which the live lane does not publish to; the lane's own 30s silence \
-                             scan (RISK-GAP-03) is the signal that IS wired. Treat this \
-                             detector's verdict as absent, not as healthy.",
+                             scan is the signal that IS wired. Treat this detector's verdict as \
+                             absent, not as healthy.",
                             stale_scans = stale_scans
                         );
                         metrics::counter!("tv_stall_detector_starved_total").increment(1);
@@ -2645,7 +4280,87 @@ const SEAL_WRITER_SHUTDOWN_BUDGET_SECS: u64 = 75;
 const SEAL_WRITER_SHUTDOWN_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(SEAL_WRITER_SHUTDOWN_BUDGET_SECS);
 
-fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConfig) {
+/// Stop flag for the `tv-seal-escalate` thread, reachable from shutdown.
+///
+/// Held in a static for exactly the reason `SEAL_WRITER_CANCEL` is: a
+/// shutdown signal that the shutdown path cannot reach is not a signal. The
+/// WAL spill writer carried the detached version of this defect until
+/// 2026-08-28 and lost every queued record at exit.
+static SEAL_ESCALATION_STOP: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
+
+/// Seals handed to the escalation thread and not yet written (audit PR15).
+/// Read at shutdown so an abandoned queue reports how many seals it held.
+static SEAL_ESCALATION_PENDING: std::sync::OnceLock<
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+> = std::sync::OnceLock::new();
+
+/// Join handle for the `tv-seal-escalate` thread.
+static SEAL_ESCALATION_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// The seal writer's spill directory, where its crash marker lives, so the
+/// shutdown can mark the marker clean once the escalation queue has drained
+/// (audit PR31b-1). Set once, beside `SEAL_WRITER_HANDLE`.
+static SEAL_UNWRITTEN_MARK_DIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Budget for marking the crash marker clean at shutdown: one small write and
+/// a rename, which take milliseconds on a healthy disk. Bounded so a stalled
+/// disk cannot hold the shutdown before the WAL floor drains.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS: u64 = 2;
+
+/// Budget for releasing the dual-instance lock at shutdown (audit CONC-4,
+/// 2026-10-11): one SSM read and one delete, normally well under a second.
+/// Bounded so an unreachable SSM cannot hold the stop; the 90s TTL clears
+/// the lock if the release does not finish. Counted in the sequential sum
+/// `shutdown_budget_fits_systemd_guard.rs` checks.
+const INSTANCE_LOCK_RELEASE_BUDGET_SECS: u64 = 3;
+
+/// [`INSTANCE_LOCK_RELEASE_BUDGET_SECS`] as a `Duration`.
+const INSTANCE_LOCK_RELEASE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(INSTANCE_LOCK_RELEASE_BUDGET_SECS);
+
+/// [`SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS`] as a `Duration`.
+const SEAL_UNWRITTEN_MARK_FINISH_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_UNWRITTEN_MARK_FINISH_BUDGET_SECS);
+
+/// Budget for draining the seal-escalation queue at shutdown.
+///
+/// DERIVED, not guessed: the queue holds at most
+/// `SEAL_ESCALATION_QUEUE_DEPTH` records (250,000 at `TF_COUNT` 10, one whole
+/// close burst; the figure read 225,000 until audit PR40a) of 128 bytes,
+/// written `SEAL_ESCALATION_BATCH` (1,024) per `write(2)`: ~245 writes,
+/// ~32 MB. On a healthy volume that is well under a second; at a degraded
+/// 10 ms/write it is ~2.5 s and at a degraded 20 MB/s ~1.6 s, so 5s covers
+/// both with a margin. The storage test
+/// `the_queue_depth_is_drainable_inside_the_shutdown_budget` pins both.
+///
+/// What it does NOT cover: a disk that REFUSES the batch write. Each seal of
+/// a failed batch then goes to the DLQ one record at a time (an open and a
+/// JSON line per seal), which is orders of magnitude slower, so a full queue
+/// on a failing disk does not drain in 5 s. The seals still queued at the
+/// deadline are counted on `SEAL_ESCALATION_ABANDONED_COUNTER` and named in
+/// the shutdown `error!`, never dropped silently. Unmeasured: no harness times
+/// the DLQ fallback path.
+///
+/// Counted into the systemd `TimeoutStopSec` arithmetic by
+/// `crates/app/tests/shutdown_budget_fits_systemd_guard.rs`, which is the
+/// only thing that keeps the four sequential budgets and the unit file from
+/// drifting apart.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS: u64 = 5;
+
+/// [`SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS`] as a `Duration`.
+const SEAL_ESCALATION_SHUTDOWN_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(SEAL_ESCALATION_SHUTDOWN_BUDGET_SECS);
+
+/// How often the shutdown poll re-checks whether the escalation thread is done.
+const SEAL_ESCALATION_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(10); // APPROVED: this IS the named constant the rule asks for
+
+fn spawn_seal_writer_loop(
+    questdb_config: &tickvault_common::config::QuestDbConfig,
+    tick_storage: &tickvault_common::config::TickStorageConfig,
+) {
     use tickvault_storage::seal_writer_loop::{run_seal_writer_loop, seal_drain_interval};
     use tickvault_storage::seal_writer_runner::SealWriterRunner;
 
@@ -2687,8 +4402,23 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
     // by the saturation counter below, not by another guess.
     const SEAL_MAX_DRAIN_PER_CYCLE: usize = 16_384;
 
-    match SealWriterRunner::new(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE) {
+    // ITEM DT: the candle rows follow the tick writer's `[tick_storage]
+    // own_ilp_encoder` switch (default off, the library encoder).
+    let encoder = if tick_storage.own_ilp_encoder {
+        tickvault_storage::tick_ilp::TickIlpEncoder::Own
+    } else {
+        tickvault_storage::tick_ilp::TickIlpEncoder::Library
+    };
+    match SealWriterRunner::new_with_encoder(questdb_config, SEAL_MAX_DRAIN_PER_CYCLE, encoder) {
         Ok(runner) => {
+            // Audit PR31b-2: keep what the previous process's crash marker
+            // said before the writer loop overwrites it. Published before the
+            // sender, so the candle warm-up, which waits for the sender, always
+            // finds it.
+            let _ = tickvault_storage::seal_writer_loop::publish_previous_unwritten(
+                tickvault_storage::seal_writer_loop::UnwrittenSealMark::in_dir(runner.spill_dir())
+                    .read_previous(),
+            );
             if !tickvault_storage::seal_writer_runner::set_global_seal_sender(runner.sender()) {
                 tracing::warn!(
                     "global seal sender already installed (idempotent skip) — first installer wins"
@@ -2700,7 +4430,95 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             // sealed candle. Both installs must happen before the runner moves
             // into the spawn below, for the same reason — the handles are
             // unreachable afterwards.
-            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(runner.overflow()) {
+            // The escalation offload is split BEFORE the overflow is
+            // installed, because `set_global_seal_overflow` takes ownership
+            // and the value is unreachable afterwards — the same
+            // install-order constraint the two lines above document.
+            //
+            // What this moves off the frame-drain task (2026-08-28): all
+            // three `escalate_refused_seal` call sites in `dhan_feed_stack`
+            // run on the drain, and each was charging it a spill-writer mutex
+            // acquisition plus a `write(2)` — and, when the spill failed, a
+            // `create_dir_all`, an `open`, a `serde_json::to_string` heap
+            // allocation and four more syscalls. Stalling that thread does
+            // not merely delay a candle: Dhan skips a slow consumer forward
+            // to "the latest available state" with no sequence number, so the
+            // intermediate ticks are discarded at THEIR side, invisibly.
+            let mut overflow = runner.overflow();
+            let sink = overflow.split_escalation_offload();
+            // Gated on the OnceLock, matching the two installs above.
+            //
+            // `spawn_seal_writer_loop` has exactly ONE production call site
+            // today, so a second entry is not reachable — but its two
+            // neighbours are both written to survive one, and this was not,
+            // which is the asymmetry an adversarial re-read of this diff
+            // found. Unguarded, a second entry would spawn a SECOND thread,
+            // overwrite the handle, and leave the FIRST one orphaned: its
+            // stop flag unreachable (the OnceLock already holds the first
+            // one), so shutdown would signal a thread it never joins and
+            // join a thread it never signalled. Dropping the sink instead
+            // disconnects the new sender, so the second overflow escalates
+            // inline — the documented lossless fallback.
+            if SEAL_ESCALATION_STOP.set(sink.stop_flag()).is_err() {
+                drop(sink);
+                tracing::warn!(
+                    "seal escalation thread already installed (idempotent skip) — this \
+                     overflow will escalate inline; first installer wins"
+                );
+            } else {
+                let _ = SEAL_ESCALATION_PENDING.set(sink.pending_count());
+                match std::thread::Builder::new()
+                    .name("tv-seal-escalate".to_string())
+                    .spawn(move || {
+                        sink.run(|seal| {
+                            // The paging path lives in this crate, above storage,
+                            // which is why the sink takes a callback rather than
+                            // calling it directly. A seal both disk tiers refuse
+                            // still fires AGGREGATOR-DROP-01 — the page is
+                            // deferred to this thread, never dropped.
+                            let timeframe = tickvault_trading::candles::TfIndex::from_ordinal(
+                                seal.tf_ordinal as usize,
+                            )
+                            .map_or("unknown", |tf| tf.display_name());
+                            tickvault_app::seal_loss_alarm::record_lost_seal(
+                                tickvault_app::seal_loss_alarm::SealLossReason::BothDiskTiersFailed,
+                                seal.security_id,
+                                seal.exchange_segment_code,
+                                timeframe,
+                            );
+                        });
+                    }) {
+                    Ok(handle) => {
+                        if let Ok(mut slot) = SEAL_ESCALATION_THREAD.lock() {
+                            *slot = Some(handle);
+                        }
+                        tracing::info!(
+                            queue_depth =
+                                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_QUEUE_DEPTH,
+                            "seal escalation thread spawned — refused seals no longer write to disk \
+                         on the frame-drain task"
+                        );
+                    }
+                    Err(err) => {
+                        // The sink (and its receiver) died with the closure, so
+                        // every `try_send` now returns `Disconnected` and falls
+                        // back to the inline cascade. Degraded to the
+                        // pre-2026-08-28 behaviour, never lossy — and loud,
+                        // because a silent fallback is how a fix stops applying
+                        // without anyone noticing.
+                        tracing::error!(
+                            code =
+                                tickvault_common::error_code::ErrorCode::HotPath02WriterQueueDrop
+                                    .code_str(),
+                            ?err,
+                            "failed to spawn the seal escalation thread — refused seals will write \
+                         to disk INLINE on the frame-drain task (pre-offload behaviour); watch \
+                         tv_seal_escalation_inline_fallback_total"
+                        );
+                    }
+                }
+            }
+            if !tickvault_storage::seal_writer_runner::set_global_seal_overflow(overflow) {
                 tracing::warn!(
                     "global seal overflow already installed (idempotent skip) — first installer wins"
                 );
@@ -2729,21 +4547,52 @@ fn spawn_seal_writer_loop(questdb_config: &tickvault_common::config::QuestDbConf
             //
             // Storing both halves keeps the sender alive for exactly the same
             // reason `forget` did, while making shutdown able to reach it.
-            let _ = SEAL_WRITER_CANCEL.set(cancel_tx);
-            let handle = tokio::spawn(async move {
-                run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
-            });
-            if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
-                *slot = Some(handle);
+            //
+            // Gated on the OnceLock, matching the three installs above.
+            //
+            // `let _ = SEAL_WRITER_CANCEL.set(cancel_tx)` reads as a discarded
+            // unit; it is a discarded SENDER. `OnceLock::set` returns
+            // `Err(value)` on a second call, so the `let _` DROPPED the only
+            // sender for the `cancel_rx` about to be moved into the spawn — and
+            // a seal-writer loop with no live sender is the one shape that loop
+            // cannot survive (see the `Err` arm of its cancel branch, fixed in
+            // the same change). Unguarded, a second entry here would have:
+            //   * spawned a loop that can never be cancelled,
+            //   * overwritten SEAL_WRITER_HANDLE, so shutdown joins the NEW
+            //     task and burns the whole 75s budget on it,
+            //   * left the FIRST loop — the one actually draining seals — never
+            //     signalled, so its final drain never runs and the day's tail
+            //     dies with the runtime.
+            //
+            // One added call site, the entire session's closing candles. Skip
+            // instead: first installer wins, and the already-running writer
+            // keeps draining.
+            if let Err(orphan) = SEAL_WRITER_CANCEL.set(cancel_tx) {
+                drop(orphan);
+                drop(cancel_rx);
+                tracing::warn!(
+                    "seal writer loop already installed (idempotent skip) — first installer \
+                     wins; this runner will not be spawned"
+                );
+            } else {
+                let _ = SEAL_UNWRITTEN_MARK_DIR.set(runner.spill_dir().to_path_buf());
+                let handle = tokio::spawn(async move {
+                    run_seal_writer_loop(runner, seal_drain_interval(), cancel_rx).await
+                });
+                if let Ok(mut slot) = SEAL_WRITER_HANDLE.lock() {
+                    *slot = Some(handle);
+                }
+                tracing::info!(
+                    interval_ms = seal_drain_interval().as_millis(),
+                    max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
+                    "seal writer task spawned — Engine B candle sealing enabled"
+                );
             }
-            tracing::info!(
-                interval_ms = seal_drain_interval().as_millis(),
-                max_drain_per_cycle = SEAL_MAX_DRAIN_PER_CYCLE,
-                "seal writer task spawned — Engine B candle sealing enabled"
-            );
         }
         Err(err) => {
             tracing::error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
                 ?err,
                 "failed to construct SealWriterRunner — candles will NOT seal this session"
             );
@@ -2832,16 +4681,16 @@ struct SharedInfraHandles {
     /// Drives `/health` + `/api/feeds/health`. The lane updates it; the API
     /// server reads it.
     health_status: SharedHealthStatus,
-    /// The PROCESS-shared tick broadcast. The sole subscriber task
-    /// (slow-boot observability) is spawned in `build_shared_infra` and has
-    /// already `.subscribe()`d to this before anything could publish.
-    /// PUBLISHER-LESS since PR-C2 (2026-07-14): the lane's
-    /// `run_tick_processor` — the only publisher — was deleted with the Dhan
-    /// live-WS lane, and Groww persists via its own writer + owns its own
-    /// aggregator instance. Kept (with its subscribers) so the seal-writer
-    /// install + channel wiring stay publisher-ready; the C3 universe-chain
-    /// deletion decides whether the idle consumers go too.
-    tick_broadcast_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
+    // 2026-09-02 (audit finding 13): the PROCESS-shared tick broadcast
+    // (`tick_broadcast_sender`) was REMOVED. The note that stood here said
+    // "PUBLISHER-LESS since PR-C2 (2026-07-14) … the C3 universe-chain
+    // deletion decides whether the idle consumers go too" — C3 never
+    // decided, and for seven weeks the field carried a 262,144-slot
+    // `ParsedTick` ring (~40 MB, `TICK_BROADCAST_CAPACITY`) with two
+    // subscribers that could never wake: every `tick_tx.send` in the
+    // workspace is inside `#[cfg(test)]`, and the revived Dhan live lane
+    // folds internally. A future real tick publisher re-creates the channel
+    // together with its consumers — never one without the other.
     // PR-C3 (2026-07-14): the PROCESS-shared order-update broadcast
     // (`order_update_sender`) was REMOVED — its publisher (the order-update
     // WS, retired 2026-07-14 per the Dhan noise lock) and its subscriber
@@ -2891,15 +4740,16 @@ async fn build_shared_infra(
         Ok(n) => n,
         Err(reason) => {
             error!(
+                code = tickvault_common::error_code::ErrorCode::Telegram01Dropped.code_str(),
+                source = "notifier_init_failed",
                 reason = %reason,
                 "SHARED-INFRA BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
             );
             return Err(anyhow::anyhow!(reason));
         }
     };
-    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer (defaults to `true`).
-    // 2026-07-07 UX overhaul: digest window from config; the drain loop
-    // also owns the episode stability ticker (green-close promotion).
+    // Wave 3-B Item 11: Telegram bucket-coalescer (default true); 2026-07-07: digest window
+    // from config, and the drain loop owns the episode stability ticker (green-close).
     let notifier = if config.features.telegram_bucket_coalescer {
         NotificationService::enable_coalescer(
             notifier,
@@ -2918,7 +4768,7 @@ async fn build_shared_infra(
     };
     // Boot bubble (2026-07-09): declare which feed lines the checklist
     // shows as pending from its first page.
-    notifier.set_boot_expectations(config.feeds.dhan_enabled, config.feeds.groww_enabled);
+    notifier.set_boot_expectations(config.feeds.dhan_enabled);
 
     // Positive boot signal (audit-findings Rule 11): the once-per-boot
     // BootHealthCheck ping with the real healthy/total container counts —
@@ -2944,15 +4794,15 @@ async fn build_shared_infra(
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
     // BOOT-03 (Wave-2-C Item 7.3): clock-skew boot gate. Wall-clock drift
-    // vs a trusted source (chronyc PRIMARY, QuestDB now() FALLBACK) that
-    // exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently split/merge trading
-    // days in QuestDB DEDUP keys — so HALT boot. Runs on every boot path
-    // before the seal-writer starts. QuestDB is up by here (ensure_infra_running
-    // above). A probe that CANNOT run (no chrony + QuestDB unreachable) degrades
-    // and PROCEEDS — a dev box without chrony must still boot (per
-    // test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // vs chronyc that exceeds CLOCK_SKEW_HALT_THRESHOLD_SECS can silently
+    // split/merge trading days in QuestDB DEDUP keys — so HALT boot. Runs on
+    // every boot path before the seal-writer starts. A probe that CANNOT run
+    // (no chrony) degrades and PROCEEDS — a dev box without chrony must still
+    // boot (per test_enforce_clock_skew_at_boot_unavailable_does_not_halt).
+    // ⚠ CORRECTED 2026-10-11 (audit CLOCK-3): the QuestDB now() FALLBACK is
+    // gone. QuestDB runs on this host and shares its clock, so it read ~0 and
+    // passed this gate exactly when chronyd had stopped.
     match infra::enforce_clock_skew_at_boot(
-        &config.questdb,
         tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS,
     )
     .await
@@ -2963,6 +4813,16 @@ async fn build_shared_infra(
                 source = sample.source,
                 "BOOT-03: clock-skew gate passed"
             );
+            // The gate above samples ONCE. `tv_clock_skew_seconds` is a gauge
+            // on an exporter with no idle timeout, so without this poller the
+            // 08:30 reading is re-rendered on every scrape and
+            // `tv-<env>-clock-skew-high` spends the whole session green on a
+            // pre-market number. Re-sample every 30s so the alarm and the
+            // dashboard panel track LIVE drift. See
+            // infra::spawn_clock_skew_poller for the full reasoning.
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
         Err(infra::ClockSkewError::ThresholdExceeded {
             skew_secs,
@@ -2986,22 +4846,35 @@ async fn build_shared_infra(
             ));
         }
         Err(unavailable) => {
-            // Both probes failed (no chrony + QuestDB now() unreachable) —
-            // degrade, do NOT halt. Dev boxes without chrony still boot.
+            // chronyc failed (no chrony, chronyd stopped, or chronyd not
+            // synchronised to any source) — degrade, do NOT
+            // halt. Dev boxes without chrony still boot. The skew is UNKNOWN,
+            // not a number (audit CLOCK-3, 2026-10-11).
             warn!(
+                code = tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                reason = "probe_unavailable",
                 error = %unavailable,
-                "BOOT-03: clock-skew probe unavailable — proceeding without the gate"
+                "BOOT-03: clock-skew probe unavailable — proceeding without the gate; \
+                 the skew is unknown until chronyc answers"
             );
+            // Still start the poller, so a chronyd that comes back is
+            // measured. Its own power-of-two BOOT-03 warn covers a probe that
+            // keeps failing.
+            infra::spawn_clock_skew_poller(std::time::Duration::from_secs(
+                tickvault_common::constants::CLOCK_SKEW_POLL_INTERVAL_SECS,
+            ));
         }
     }
 
     // --- Candle DDL + retired-object sweep (Track A, 2026-07-18) ---
-    // AWAITED INLINE, BEFORE the seal-writer spawn: the 21 `candles_<tf>`
+    // AWAITED INLINE, BEFORE the seal-writer spawn: the nine `candles_<tf>`
     // tables must be ensured WITH `DEDUP ENABLE UPSERT KEYS` before the
     // REST-era bar-fold's first seal can reach ILP, or a fresh QuestDB
     // volume auto-creates them WITHOUT DEDUP (silent duplicate-row window
     // — the bug the PR-C2/#1581 lane deletions left behind). Bounded by
-    // the module's 60s quiet-probe; a down QuestDB skips the DDL loudly.
+    // the module's readiness probe; a down QuestDB skips the DDL loudly. The
+    // one-shot fresh-start reset inside it has its own bound
+    // (`fresh_start_reset::RESET_WORST_CASE_SECS`).
     // Ordering pinned by crates/app/tests/ensure_ddl_boot_wiring_guard.rs.
     tickvault_app::candle_ddl_boot::run_candle_ddl_at_boot(&config.questdb).await;
 
@@ -3024,7 +4897,13 @@ async fn build_shared_infra(
     // Awaited INLINE here, beside the candle DDL, for the same ordering
     // reason: it must complete before the first ILP row can auto-create the
     // table with the wrong shape.
-    tickvault_storage::tick_persistence::ensure_ticks_table(&config.questdb).await;
+    //
+    // 2026-09-08: BOTH live-table ensures now run through ONE bounded retry
+    // loop (`run_live_table_ddl_at_boot`), because a single fire-and-forget
+    // attempt against a QuestDB that answered the readiness probe and then
+    // refused the DDL left the DEDUP key missing for the whole session. The
+    // `market_depth` half is described directly below; the two are ensured
+    // together so neither can be retried without the other.
 
     // --- `market_depth` DDL — the same class, and it matters MORE here ---
     //
@@ -3040,38 +4919,90 @@ async fn build_shared_infra(
     // above, because the loss is not duplicate rows but MISSING ones.
     //
     // Awaited INLINE, before the first depth ILP row can exist, for exactly
-    // the reason the two DDLs above are.
-    tickvault_storage::depth_persistence::ensure_market_depth_table(&config.questdb).await;
+    // the reason the two DDLs above are. The verdict is logged inside the
+    // loop (coded error on exhaustion); boot continues either way — a missing
+    // key is a degraded session, a halted boot is a dark one.
+    //
+    // PR31a: on give-up, re-run the ensure in the background. B1: the live
+    // writers post only into keyed tables (the loop arms that gate), since
+    // no re-run can key a table ILP auto-created; rows wait in spill/WAL
+    // until the re-run keys the table.
+    if !tickvault_app::candle_ddl_boot::run_live_table_ddl_at_boot(&config.questdb).await {
+        drop(tickvault_app::candle_ddl_boot::spawn_ensure_until_keyed(
+            config.questdb.clone(),
+            tickvault_app::candle_ddl_boot::DdlTables::Live,
+        ));
+    }
+
+    // --- Dhan 1-minute cross-verification audit tables ---
+    //
+    // RESTORED 2026-09-24 with the comparator (`no-rest-except-live-feed`
+    // §12.15). The three tables — `dhan_rest_1m_tape` and its two audit
+    // siblings — were retained with every row through the 2026-09-16 removal;
+    // their writer is back, so their DDL is back. Awaited inline so the
+    // tables exist before the first 15:41 run can write to them. On refusal
+    // (logged) the writer refuses to post and each run re-runs this ensure
+    // first (B1), so ILP never auto-creates an un-keyable table.
+    tickvault_storage::dhan_live_crossverify_persistence::ensure_dhan_live_crossverify_tables(
+        &config.questdb,
+    )
+    .await;
+
+    // --- Contract names BEFORE the seal writer's boot drain ---
+    // The drain rewrites spilled candles at once; a row written without its
+    // `contract` replaces a named row whole (DEDUP UPSERT). On 2026-10-09 the
+    // evening boots blanked every option name this way. Today's date, or the
+    // newest earlier day with a file (a boot after midnight).
+    let early_contract_names =
+        tickvault_app::dhan_contract_universe::publish_contract_labels_at_boot(
+            &tickvault_app::dhan_universe::today_ist_date(),
+        );
+    info!(
+        contract_names = early_contract_names,
+        "contract names published before the seal writer starts"
+    );
+
+    // --- QuestDB WAL-suspension watcher is EXPECTED (DA-13a review) ---
+    // The seal writer's task runs its boot drain at once, but the watcher is
+    // spawned only after `build_shared_infra` returns (always, in
+    // `async_main`), and its first verdict needs an HTTP round trip. Until
+    // then the watermark reads exactly like "no watcher", and the drain used
+    // to archive spill files on a 2xx that a WAL-suspended table sends while
+    // applying nothing. Marked here, before the seal writer starts, so a file
+    // flushed in that window waits for two clean probes instead.
+    tickvault_storage::wal_applied_watermark::applied_watermark().mark_probe_expected();
 
     // --- Seal-writer (installs the process-wide global_seal_sender) ---
-    spawn_seal_writer_loop(&config.questdb);
+    spawn_seal_writer_loop(&config.questdb, &config.tick_storage);
 
     // --- Scoreboard IST-midnight resets (RELOCATED, stage-3 sweep) ---
     spawn_scoreboard_midnight_reset_task();
 
-    // --- Tick broadcast channel (PROCESS-shared) ---
-    // Held for the process lifetime so the subscriber tasks never wake on a
-    // disconnected channel. PUBLISHER-LESS on the REST-only runtime (the
-    // lane's `run_tick_processor` died with the Dhan live WS; the Groww
-    // bridge died 2026-07-15) — the consumers below idle by construction.
-    let (tick_broadcast_sender, _tick_broadcast_default_rx) =
-        tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
-            tickvault_common::constants::TICK_BROADCAST_CAPACITY,
-        );
+    // --- Tick broadcast channel (PROCESS-shared) — DELETED 2026-09-02 ---
+    // Audit finding 13: the `broadcast::channel::<ParsedTick>(
+    // TICK_BROADCAST_CAPACITY)` that stood here had NO production publisher
+    // since PR-C2 (2026-07-14) — its own comment said so ("PUBLISHER-LESS …
+    // the consumers below idle by construction") and kept it anyway. A
+    // 262,144-slot ring of ~112-byte ticks is ~40 MB of resident memory on
+    // a box whose entire sizing argument is memory, allocated for two
+    // subscribers that could never wake. Removed together with both
+    // `.subscribe()`s (this task's and the day-OHLC consumer's). The
+    // constant `TICK_BROADCAST_CAPACITY` in `constants.rs` is now UNUSED
+    // and stays in place only because a `common` edit escalates to
+    // workspace-wide tests; a future real tick publisher re-creates the
+    // channel and its consumers together.
     // PR-C3 (2026-07-14): the order-update broadcast channel was removed
     // (publisher + subscriber both retired — see the SharedInfraHandles note).
 
-    // --- Subscriber task: slow-boot observability ---
-    // It `.subscribe()`s to `tick_broadcast_sender` HERE, in the hoisted
-    // prefix, before anything could publish — subscribe-before-publish is
-    // preserved by construction. (The tick-storage broadcast consumer was
+    // --- Slow-boot observability task ---
+    // Cadence-driven only (the 2s QuestDB ping + the 30s stall scan); it no
+    // longer subscribes to anything. (The tick-storage broadcast consumer was
     // REMOVED in this PR's PrevDayCache/TickStorage cleanup — see the dated
     // BATCH-5 note after the block below.) Stage-3 dead-WS sweep (2026-07-17): the
     // 21-TF TICK aggregator driver (`spawn_engine_b_aggregator`) is DELETED —
     // the seal-writer above stays, fed exclusively by the REST-era candle
     // fold (FOLD-01) further below.
     {
-        let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
         let obs_health = health_status.clone();
         // Does a live tick SOURCE exist this session?
@@ -3093,7 +5024,7 @@ async fn build_shared_infra(
             tickvault_app::dhan_feed_stack::FeedStackGate::Enabled
         );
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, obs_health, live_ticks_expected).await;
+            run_slow_boot_observability(questdb_cfg, obs_health, live_ticks_expected).await;
         });
         info!(
             live_ticks_expected,
@@ -3125,15 +5056,22 @@ async fn build_shared_infra(
             &config.market_ram_store,
             config.rest_candle_fold.catchup_days,
         );
-        let _ram_store_rehydrate =
-            tickvault_app::market_ram_store_boot::spawn_chain_day_rehydrate(config.questdb.clone());
+        // The chain-day rehydrate spawn was REMOVED 2026-09-16: it read
+        // today's rows back out of the per-minute option-chain table, whose
+        // WRITER went with the market-data REST legs
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10). Leaving it would
+        // have replayed the last pre-removal session into RAM on every boot
+        // as though it were today's — the §12.6 "reader pointed at a frozen
+        // table" REJECT. The chain-day store still installs and still fills
+        // forward from live publishes; what it no longer does is start a
+        // restarted session with anything behind it.
         let _ram_store_stats = tickvault_app::market_ram_store_boot::spawn_ram_store_stats_task();
         info!(
             spot_days = config.market_ram_store.spot_days,
             chain_row_cap = config.market_ram_store.chain_row_cap,
             "market_ram_store: RAM residency ARMED — spots month-deep (filled by \
-             the fold catch-up + live seals), options current-day (chain publishes \
-             + boot rehydrate); depth gauges show the honest fill level"
+             the fold catch-up + live seals), options current-day store installed; \
+             no boot rehydrate; depth gauges show the observed fill level"
         );
     } else {
         info!(
@@ -3151,30 +5089,63 @@ async fn build_shared_infra(
     // serde default OFF; base.toml opts in); supervised; cold path only.
     // FOLD-01 runbook: .claude/rules/project/rest-candle-fold-error-codes.md
     if config.rest_candle_fold.enabled {
-        let (fold_bar_tx, fold_bar_rx) =
-            tokio::sync::mpsc::channel(tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY);
-        if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
-            let _rest_candle_fold_supervisor =
-                tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
-                    config.rest_candle_fold.clone(),
-                    config.questdb.clone(),
-                    fold_bar_rx,
-                );
-            info!(
-                catchup_days = config.rest_candle_fold.catchup_days,
-                "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
-                 off persist-confirmed 1m bars; boot catch-up re-folds the stored \
-                 month into all 21 timeframes (candles_1m..candles_1d populate again)"
+        // 2026-09-17: the fold is ENABLED in config but has no input.
+        //
+        // Both of its sources went with the operator's sockets-only narrowing
+        // (`no-rest-except-live-feed-2026-06-27.md` §12.10): the live inlet's
+        // only producer was the per-minute spot leg's two flush-ok arms, and
+        // the boot catch-up re-folds from `rest_spot_1m`, which is RETAINED
+        // but frozen. `rest_candle_fold::LIVE_INLET_HAS_PRODUCER` carries
+        // that fact as a const so the refusal below is greppable and pinned,
+        // not a comment someone has to notice.
+        //
+        // Arming anyway is the expensive option, not the safe one: the task
+        // would install its channel, log a clean ARMED line, and receive
+        // nothing for the whole session — silently, because a first-wins
+        // `OnceLock` inlet has no observable emptiness. §12.10.7(g) requires
+        // this fold to be removed or explicitly recorded as inert; an inert
+        // thing that reports itself armed is recorded as WORKING.
+        if tickvault_app::rest_candle_fold::LIVE_INLET_HAS_PRODUCER {
+            let (fold_bar_tx, fold_bar_rx) = tokio::sync::mpsc::channel(
+                tickvault_app::rest_candle_fold::FOLD_BAR_CHANNEL_CAPACITY,
             );
+            if tickvault_app::rest_candle_fold::set_global_fold_bar_sender(fold_bar_tx) {
+                let _rest_candle_fold_supervisor =
+                    tickvault_app::rest_candle_fold::spawn_supervised_rest_candle_fold(
+                        config.rest_candle_fold.clone(),
+                        config.questdb.clone(),
+                        fold_bar_rx,
+                    );
+                info!(
+                    catchup_days = config.rest_candle_fold.catchup_days,
+                    "rest_candle_fold: REST-era candle derivation ARMED — spot legs hand \
+                     off persist-confirmed 1m bars; boot catch-up re-folds the stored \
+                     month into the seven minute-scale timeframes (candles_1m..candles_60m; \
+                     the 1s/3s/5s frames need live ticks)"
+                );
+            } else {
+                // LOW: first-wins refusal — a duplicate install means a second
+                // spawn attempt in one process (defensive; loud, never silent).
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded
+                        .code_str(),
+                    stage = "sender_install",
+                    "rest_candle_fold: global fold-bar sender was ALREADY installed — \
+                     duplicate fold spawn REFUSED (the first installation's task keeps \
+                     running; this receiver is dropped unused)"
+                );
+            }
         } else {
-            // LOW: first-wins refusal — a duplicate install means a second
-            // spawn attempt in one process (defensive; loud, never silent).
             error!(
                 code = tickvault_common::error_code::ErrorCode::RestCandleFold01Degraded.code_str(),
-                stage = "sender_install",
-                "rest_candle_fold: global fold-bar sender was ALREADY installed — \
-                 duplicate fold spawn REFUSED (the first installation's task keeps \
-                 running; this receiver is dropped unused)"
+                stage = "no_producer",
+                "rest_candle_fold: enabled in config but REFUSED to arm — nothing sends \
+                 into its live-bar inlet (the per-minute spot leg that did was removed), \
+                 and its boot catch-up source rest_spot_1m is retained but frozen. \
+                 Arming would log a clean start and then receive nothing, all session. \
+                 candles_* stay REST-underived; set [rest_candle_fold] enabled = false \
+                 to silence this, or restore a producer and flip \
+                 rest_candle_fold::LIVE_INLET_HAS_PRODUCER in the same change"
             );
         }
     } else {
@@ -3193,10 +5164,112 @@ async fn build_shared_infra(
         std::sync::Arc::clone(&feed_runtime),
         std::sync::Arc::clone(&feed_health),
     );
-    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
-        .await
-        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+    // Owner 2026-10-30: the speed-and-health panel reads this process's metrics.
+    if config.observability.metrics_enabled {
+        api_state.set_metrics_scrape_url(
+            tickvault_api::handlers::speed_health::metrics_scrape_url_for(
+                config.observability.metrics_bind_addr,
+                config.observability.metrics_port,
+            ),
+        );
+    }
+    let _movers = movers_universe_publisher::spawn(api_state.clone(), &config.operator_movers);
+    // Infra sweep row 12 (2026-09-08): this was ONE SSM call on the boot path
+    // with no retry — a transient SSM throttle or a cold-start DNS blip at
+    // 08:30 failed the whole boot, and the start-watchdog then paged for a
+    // box that had nothing wrong with it. Bounded: doubling backoff, capped at
+    // `API_BEARER_FETCH_MAX_ATTEMPTS` (an SSM that is truly down still fails the boot).
+    let mut bearer_from_retry = None;
+    let mut attempt: u32 = 1;
+    while attempt < API_BEARER_FETCH_MAX_ATTEMPTS {
+        match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
+            Ok(token) => {
+                bearer_from_retry = Some(token);
+                break;
+            }
+            Err(err) => {
+                let wait = API_BEARER_FETCH_BACKOFF_SECS << (attempt - 1).min(5);
+                warn!(
+                    attempt,
+                    max = API_BEARER_FETCH_MAX_ATTEMPTS,
+                    retry_in_secs = wait,
+                    error = %err,
+                    "GAP-SEC-01: SSM fetch for the API bearer token failed — retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+    // The FINAL attempt is written as the plain call so the api crate's
+    // ssm-only source pin (`test_main_rs_uses_ssm_only_no_env_fallback`)
+    // keeps finding the literal shape it scans for; retries above are
+    // additive and never introduce an env-var fallback.
+    let api_bearer_token = match bearer_from_retry {
+        Some(token) => token,
+        None => tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+            .await
+            .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token after every retry — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?,
+    };
     info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
+    // Operator sweep row 11 (2026-09-08): an EMPTY value disables bearer auth
+    // entirely — `ApiAuthConfig::from_token` documents that main.rs "halts in
+    // live mode rather than silently disabling", and until today nothing
+    // here did. The feed toggle is bearer-gated unconditionally precisely
+    // because port 3001 is publicly funnelled; an empty token on a live box
+    // is an open switch on the internet, so live mode refuses to boot on it.
+    // Paper mode keeps the documented dev passthrough, said out loud.
+    //
+    // Audit SEC-9 (2026-10-11): boot applies the SAME shape gate as rotation
+    // (32 to 512 visible ASCII characters, not one repeated character).
+    // Before, boot checked only emptiness, so a 3-character token guarded a
+    // publicly funnelled port. Live mode refuses to boot; paper mode keeps
+    // auth ENABLED on the loaded token and says so. Never logs the value or
+    // its length. **⚠ CHANGED 2026-10-11 (review of SEC-9):** the decision
+    // is the pure, unit-tested `bearer_token_boot_verdict`; this site only
+    // acts on it. Honest limit: production runs paper mode, so a weak token
+    // there still boots and guards the public port until SSM is fixed.
+    let bearer_boot_verdict = {
+        use secrecy::ExposeSecret as _;
+        tickvault_api::middleware::bearer_token_boot_verdict(
+            api_bearer_token.expose_secret(),
+            config.strategy.dry_run,
+        )
+    };
+    match bearer_boot_verdict {
+        tickvault_api::middleware::BearerTokenBootVerdict::Accept => {}
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperEmptyAuthDisabled => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                "the API bearer token in SSM is EMPTY — bearer auth is DISABLED for this paper-mode \
+                 session and every /api route including the feed toggle is open; store a token via \
+                 `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::PaperWeakAuthEnabled => {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                "the API bearer token in SSM is WEAK (shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character) — this paper-mode \
+                 session boots anyway and the publicly funnelled API port is guarded ONLY by that \
+                 weak token until it is replaced; rotate /tickvault/<env>/api/bearer-token to a \
+                 random value of 32 or more visible ASCII characters (live within 5 minutes)"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveEmpty => {
+            anyhow::bail!(
+                "GAP-SEC-01: the API bearer token in SSM is EMPTY and this is LIVE mode — refusing to \
+                 boot with bearer auth disabled on a publicly funnelled port"
+            );
+        }
+        tickvault_api::middleware::BearerTokenBootVerdict::RefuseLiveWeak => {
+            anyhow::bail!(
+                "GAP-SEC-01: the API bearer token in SSM is shorter than 32 or longer than 512 \
+                 characters, not all visible ASCII, or one repeated character — refusing to boot \
+                 LIVE on a weak token for a publicly funnelled port"
+            );
+        }
+    }
     let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
     // W2#7 (2026-07-10): supervised SSM re-read loop (slow-boot mirror of
     // the fast-arm spawn above) — token rotation without restart; fail-open
@@ -3226,14 +5299,17 @@ async fn build_shared_infra(
     info!(address = %bind_addr, "SHARED-INFRA BOOT: API server listening (/api/feeds reachable regardless of Dhan ON/OFF)");
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
-            error!(?err, "API server error");
+            error!(
+                code = tickvault_common::error_code::ErrorCode::ApiServer01Exited.code_str(),
+                ?err,
+                "API server error — the HTTP API stopped serving; trading lanes are unaffected"
+            );
         }
     });
 
     Ok(SharedInfraHandles {
         notifier,
         health_status,
-        tick_broadcast_sender,
         api_handle,
     })
 }
@@ -3252,14 +5328,90 @@ async fn build_shared_infra(
 /// Bounded in both directions on purpose. Unbounded, a hung or unreachable
 /// QuestDB holds the process past systemd's stop timeout, systemd escalates to
 /// SIGKILL, and we lose the exact tail this wait exists to save. Too short and
-/// a healthy-but-busy flush is cut off. 20s sits comfortably inside the
-/// service's stop timeout while being far longer than a flush of one
-/// sub-threshold ILP batch needs.
-const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 20;
+/// a healthy-but-busy flush is cut off.
+///
+/// RAISED 20 -> 30 on 2026-08-28, because 20 was not enough in the one mode
+/// nobody had costed: the SPAWN-FAILURE FALLBACK. Both offload spawns are
+/// allowed to fail and fall back to the synchronous writer, and in that mode
+/// the tail runs the depth flush and the tick flush back to back, each able to
+/// block for one full `ILP_REQUEST_TIMEOUT_SECS`, BEFORE the join deadline
+/// clock even starts. 5 + 5 + 12 = 22, inside a 20 s budget: the outer timer
+/// won and abandoned the lane task mid-join — the precise failure the assert
+/// below was written to prevent, arriving through the door it was not watching.
+///
+/// 30 s still sits far inside the unit's `TimeoutStopSec=120`
+/// (`deploy/systemd/tickvault.service`), so there is no new SIGKILL risk. If
+/// that unit value is ever lowered, this constant has to be re-checked by hand
+/// — a `.service` file is not visible to a compile-time assert, which is the
+/// honest limit of the guard below.
+const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS: u64 = 30;
+
+/// How long shutdown waits for the Dhan feed sockets to close before it stops
+/// the lane drain (Z11d, 2026-10-02). Runs FIRST, before every other budget
+/// in the sequential sum `shutdown_budget_fits_systemd_guard.rs` checks.
+///
+/// Sized from the close path, not guessed: a socket sees the stop within one
+/// 1 s idle poll, then spends at most two 2 s `CLOSE_HANDSHAKE_WAIT`s (the
+/// Close write and the drain of the peer's reply). 5 s covers that and keeps
+/// the guard's 20 s margin at `TimeoutStopSec=145`. (⚠ 2026-10-11, audit
+/// CONC-1: that sum missed two waits; the timeout is 165 now.)
+const DHAN_SOCKET_STOP_BUDGET_SECS: u64 = 5;
+
+/// [`DHAN_SOCKET_STOP_BUDGET_SECS`] as a `Duration`.
+const DHAN_SOCKET_STOP_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(DHAN_SOCKET_STOP_BUDGET_SECS);
 
 /// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`] as a `Duration`.
 const DHAN_LANE_SHUTDOWN_FLUSH_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS);
+
+/// The inner join must COMPLETE inside the outer budget, not be truncated by it.
+///
+/// `run_frame_drain`'s shutdown tail calls `shutdown_offload_writer`, which
+/// blocks up to `OFFLOAD_SHUTDOWN_GRACE_SECS` waiting for the tick writer to
+/// drain its queue. That whole tail runs under
+/// [`DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS`]. Until 2026-08-28 the inner wait
+/// (30 s) was LONGER than the outer budget (20 s), so on a slow QuestDB the
+/// outer timer always won: the lane task was abandoned mid-join and the
+/// writer thread died holding queued batches — no spill, no counter, no log.
+///
+/// The margin is not decoration. The tail also seals open buckets, flushes
+/// ticks, flushes depth and publishes counters before it ever reaches the
+/// join, so the join needs room left over, not merely "less than".
+///
+/// A compile-time assert rather than a test: two constants in two files that
+/// must agree are exactly the pair a future edit separates, and a build
+/// failure is the only kind of reminder that cannot be skipped.
+/// The pre-join work the tail must fit BEFORE the offload deadline starts.
+///
+/// DERIVED, not chosen. Until 2026-08-28 this was a hardcoded `5`, which was
+/// correct — and correct by coincidence, because it happened to equal one ILP
+/// request timeout. Two things were wrong with that. The timeout could be
+/// raised and leave the assert passing while the real shutdown ran over. And
+/// the worst case was never ONE timeout: in the spawn-failure fallback the
+/// tail flushes DEPTH synchronously and then TICKS synchronously, so it is
+/// two, back to back, before the join clock starts.
+///
+/// Deriving it from the timeout means raising the timeout moves this in
+/// lockstep and the build tells you if the budget no longer fits, rather than
+/// the box telling you by losing a session tail.
+const SHUTDOWN_GRACE_MARGIN_SECS: u64 =
+    2 * tickvault_storage::depth_persistence::ILP_REQUEST_TIMEOUT_SECS;
+const _: () = assert!(
+    tickvault_app_shutdown_grace() + SHUTDOWN_GRACE_MARGIN_SECS
+        <= DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+    "OFFLOAD_SHUTDOWN_GRACE_SECS + margin must fit inside \
+     DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS, or the offload join is abandoned \
+     mid-flight and the tick tail is lost silently. Lower the grace or raise \
+     the lane budget — and if you raise the lane budget, re-check it against \
+     the systemd stop timeout."
+);
+
+/// Indirection so the assert above reads the live value from the lane module
+/// rather than a copy. A copy is what rots.
+const fn tickvault_app_shutdown_grace() -> u64 {
+    tickvault_app::dhan_feed_stack::OFFLOAD_SHUTDOWN_GRACE_SECS
+}
 
 async fn run_process_runloop(
     api_handle: Option<tokio::task::JoinHandle<()>>,
@@ -3276,6 +5428,12 @@ async fn run_process_runloop(
     // never runs and the day's tail dies with the process.
     dhan_feed_shutdown: std::sync::Arc<tokio::sync::Notify>,
     dhan_feed_stack_monitor: Option<tokio::task::JoinHandle<()>>,
+    // The WAL spill, so the run loop can drain its writer queue before exit
+    // (2026-08-28). Threaded in for the same reason as the two above: this
+    // function owns the only place the drain can run, and until it did the
+    // writer thread was abandoned mid-queue with every record in it already
+    // reported to its caller as `Spilled`.
+    ws_frame_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Result<()> {
     // Truthfulness rider: the runtime is dry-run/paper only — no real-money
     // orders are placed. Render "RUNNING (paper)" so the boot Telegram cannot
@@ -3296,12 +5454,14 @@ async fn run_process_runloop(
     // otherwise the boot Telegram claimed Dhan capture OFF on every boot.
     notifier.notify(NotificationEvent::StartupComplete {
         mode,
-        spot_1m_enabled: config.spot_1m_rest.enabled
-            || (config.cadence.enabled && config.cadence.dhan_lane),
+        // 2026-09-16 removal: the config operands that stood here
+        // (`config.spot_1m_rest.enabled || (config.cadence.enabled &&
+        // config.cadence.dhan_lane)`) both evaluate TRUE today for legs that
+        // no longer exist — see DHAN_PER_MINUTE_LEGS_EXIST.
+        spot_1m_enabled: DHAN_PER_MINUTE_LEGS_EXIST,
         spot_1m_indices: u32::try_from(tickvault_common::constants::SPOT_1M_REST_INDICES.len())
             .unwrap_or(0),
-        chain_1m_enabled: config.option_chain_1m.enabled
-            || (config.cadence.enabled && config.cadence.dhan_lane),
+        chain_1m_enabled: DHAN_PER_MINUTE_LEGS_EXIST,
         chain_1m_underlyings: u32::try_from(
             tickvault_common::constants::CHAIN_1M_UNDERLYINGS.len(),
         )
@@ -3325,7 +5485,7 @@ async fn run_process_runloop(
 
     // 2026-07-15 shutdown classification: the signal kind that actually
     // ended the run (previously logged then DROPPED) is threaded into the
-    // ShutdownInitiated event so a scheduled 4:30 PM IST stop renders one
+    // ShutdownInitiated event so a scheduled 5:30 PM IST stop renders one
     // quiet line instead of paging like an incident.
     let final_signal: &'static str = if shutdown_reason == "market_close" {
         info!("market close reached — post-market housekeeping, API stays alive");
@@ -3351,101 +5511,100 @@ async fn run_process_runloop(
             );
         }
 
-        // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
-        // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
-        // 2026-07-13: the Dhan lane abort block that followed this sleep is
-        // deleted with the lane — the Groww lane self-manages via its own
-        // dormancy gates; the order-update WS stays alive until app shutdown.)
-        let drain = std::time::Duration::from_secs(
-            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
-        );
-        tokio::time::sleep(drain).await;
+        // Audit CONC-5 (2026-10-11): the drain sleep and the partition detach
+        // below are pre-emptible by a shutdown signal. Until this date a
+        // SIGTERM that landed here (a deploy or stop just after 15:30) reached
+        // no live signal stream, was lost, and systemd SIGKILLed the process
+        // after TimeoutStopSec. The detach is idempotent and runs again the
+        // next day, so abandoning it loses nothing.
+        let post_market_housekeeping = async {
+            // Drain buffer: let in-flight ticks (last 15:29 candle) settle in the
+            // Groww bridge / seal writer before post-market housekeeping. (PR-C2,
+            // 2026-07-13: the Dhan lane abort block that followed this sleep is
+            // deleted with the lane — the Groww lane self-manages via its own
+            // dormancy gates; the order-update WS stays alive until app shutdown.)
+            let drain = std::time::Duration::from_secs(
+                tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+            );
+            tokio::time::sleep(drain).await;
 
-        // Post-market: archive→verify→drop old QuestDB partitions (2026-07-13
-        // disk-pressure remediation). MUST run BEFORE the legacy detach cycle
-        // so a >retention_days partition is archived+dropped (disk freed, S3
-        // copy verified) rather than detached-unarchived (renamed inside the
-        // same volume, zero bytes freed). Gated on `archive_enabled` (serde
-        // default false) — a config rollback restores detach-only behaviour
-        // byte-identically. Fail-closed: a partition is dropped ONLY after
-        // its S3 copy is row-count- and size-verified; any failure keeps the
-        // partition and retries next run.
-        if config.partition_retention.archive_enabled {
-            match tickvault_storage::partition_archive::PartitionArchiver::new(
-                &config.questdb,
-                &config.partition_retention,
-            )
-            .await
+            // The daily archive sweep used to run HERE, inline. It now runs from
+            // `daily_archive_boot::spawn_supervised_daily_archive_loop`, spawned at
+            // boot, because this arm is unreachable on any run that started after
+            // 15:30 IST and is skipped entirely when shutdown arrives by SIGTERM —
+            // which is how the 17:30 box stop always arrives. Keeping a second copy
+            // here would give the sweep two drivers that could drift; there is now
+            // exactly one.
+
+            // Post-market: detach old QuestDB partitions (Phase B) — ONLY when the
+            // archive leg is OFF.
+            //
+            // Fixed 2026-10-11 (audit RET-1). This block used to run whatever
+            // `archive_enabled` said, on the claim that "the daily archive loop
+            // drops aged partitions first". The timing says otherwise: this arm
+            // runs ~2 s after the 15:30 close, while the archive window opens at
+            // 15:30:02 and its first pass lands minutes later. Both select on the
+            // same rolling `retention_days` cutoff for the Standard class (the
+            // audit tables), so the partition that crossed the line today was
+            // DETACHED here first — renamed inside the EBS volume, gone from
+            // `table_partitions()`, never exported, never freed — and the archive
+            // pass could not see it. With the archive leg on, it is the only drop
+            // path: it exports, verifies the S3 copy, then drops.
             {
-                Ok(Some(mut archiver)) => {
-                    let summary = archiver.archive_and_drop_old_partitions().await;
+                let retention_days = config.partition_retention.retention_days;
+                if config.partition_retention.archive_enabled {
                     info!(
-                        tables_scanned = summary.tables_scanned,
-                        partitions_considered = summary.partitions_considered,
-                        verified = summary.verified,
-                        dropped = summary.dropped,
-                        failed = summary.failed,
-                        rows_archived = summary.rows_archived,
-                        gzip_bytes_uploaded = summary.gzip_bytes_uploaded,
-                        csv_bytes_exported = summary.csv_bytes_exported,
-                        "post-market partition archive complete (verified S3 copy before every drop)"
+                        retention_days,
+                        "post-market partition detach skipped — the archive leg owns \
+                         retention (archive, verify, then drop)"
                     );
-                }
-                // Review round 1 F1b (fail-closed): no explicit archive
-                // bucket AND no explicit TV_ENVIRONMENT/ENVIRONMENT env var
-                // — archival skipped rather than guessing the prod bucket.
-                // The constructor already logged the actionable warn.
-                Ok(None) => {}
-                Err(err) => {
-                    error!(
-                        ?err,
-                        code = tickvault_common::error_code::ErrorCode::StorageGap04S3ArchiveFailed
-                            .code_str(),
-                        "partition archiver construction failed — archive cycle skipped \
-                         this run (fail-closed no-op; detach cycle still runs)"
-                    );
-                }
-            }
-        }
-
-        // Post-market: detach old QuestDB partitions (Phase B).
-        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
-        // KEPT even with the archive leg enabled: the archive cycle above drops
-        // aged partitions first, so this legacy cycle finds nothing new — but its
-        // `total_detached=…` log lines keep firing so the CloudWatch evidence
-        // trail (the 15:30 IST "partition" filter) continues uninterrupted.
-        {
-            let retention_days = config.partition_retention.retention_days;
-            if retention_days > 0 {
-                match tickvault_storage::partition_manager::PartitionManager::new(
-                    &config.questdb,
-                    retention_days,
-                ) {
-                    Ok(pm) => match pm.detach_old_partitions().await {
-                        Ok(count) => {
-                            info!(
-                                detached = count,
-                                retention_days, "post-market partition detach complete"
-                            );
-                        }
+                } else if retention_days > 0 {
+                    match tickvault_storage::partition_manager::PartitionManager::new(
+                        &config.questdb,
+                        retention_days,
+                    ) {
+                        Ok(pm) => match pm.detach_old_partitions().await {
+                            Ok(count) => {
+                                info!(
+                                    detached = count,
+                                    retention_days, "post-market partition detach complete"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(?err, "post-market partition detach failed (non-critical)");
+                            }
+                        },
                         Err(err) => {
-                            warn!(?err, "post-market partition detach failed (non-critical)");
+                            warn!(?err, "partition manager creation failed (non-critical)");
                         }
-                    },
-                    Err(err) => {
-                        warn!(?err, "partition manager creation failed (non-critical)");
                     }
                 }
             }
-        }
 
-        info!("post-market: housekeeping complete — scheduled tasks continue");
+            info!("post-market: housekeeping complete — scheduled tasks continue");
+        };
+        let signal_during_housekeeping = tokio::select! {
+            biased;
+            reason = wait_for_shutdown_signal() => Some(reason),
+            () = post_market_housekeeping => None,
+        };
+        if let Some(reason) = signal_during_housekeeping {
+            info!(
+                reason,
+                "shutdown signal during post-market housekeeping — skipping the rest"
+            );
+        }
 
         // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
         // No auto-shutdown — the daily reset signal at 16:00 IST handles
         // candle aggregator reset, indicator flush, etc. without stopping the app.
-        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
-        let reason = wait_for_shutdown_signal().await;
+        let reason = match signal_during_housekeeping {
+            Some(reason) => reason,
+            None => {
+                info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+                wait_for_shutdown_signal().await
+            }
+        };
         info!(
             reason,
             "shutdown signal received — stopping remaining services"
@@ -3456,9 +5615,8 @@ async fn run_process_runloop(
         shutdown_reason
     };
 
-    // Classify the stop (pure fn; fails toward ExternalStop — loud — on any
-    // doubt). Inputs are all in-process: the signal kind, the runtime
-    // source badge, the IST clock, and the trading calendar.
+    // Classify the stop (pure fn; loud on any doubt). In-process inputs: signal,
+    // runtime badge, IST clock, trading calendar and today's Muhurat session.
     let shutdown_class = {
         use chrono::{Datelike, Timelike};
         let now_ist =
@@ -3472,12 +5630,21 @@ async fn run_process_runloop(
             tickvault_core::notification::source_badge::runtime_source(),
             tickvault_core::notification::source_badge::RuntimeSource::Aws
         );
-        tickvault_app::shutdown_class::classify_shutdown(
+        // A deploy announces its own restart by writing a marker just before
+        // it stops the service; without this, every release paged as an
+        // unexpected stop. Consumed here, so a marker never outlives one stop.
+        let planned_deploy = tickvault_app::shutdown_class::take_planned_deploy_marker(
+            std::path::Path::new(tickvault_app::shutdown_class::PLANNED_DEPLOY_MARKER_PATH),
+            chrono::Utc::now().timestamp(),
+        );
+        tickvault_app::shutdown_class::classify_shutdown_with_deploy_marker(
             final_signal,
             is_aws,
             now_ist.time().num_seconds_from_midnight(),
             is_weekday,
             trading_calendar.is_trading_day(today_ist),
+            planned_deploy,
+            trading_calendar.muhurat_session_secs(today_ist),
         )
     };
     info!(
@@ -3485,15 +5652,21 @@ async fn run_process_runloop(
         class = ?shutdown_class,
         "shutdown classified"
     );
-    notifier.notify(NotificationEvent::ShutdownInitiated {
-        class: shutdown_class,
-    });
+    // The hot tasks wind down from here on purpose; the stall page must not
+    // read that as a stall (HOT-PATH-STALL-01, noise lock §2.8).
+    tickvault_storage::hot_path_telemetry::begin_shutdown();
+    // An evening drain restart is not news: the restarted app reports its
+    // own boot, so no shutdown message is sent for it (Quote 31: no new
+    // Telegram traffic for the hold).
+    if final_signal != "self_restart" {
+        notifier.notify(NotificationEvent::ShutdownInitiated {
+            class: shutdown_class,
+        });
+    }
 
-    // Cadence runner graceful teardown (verifier F2, 2026-07-15): the
-    // spawn's Notify previously parked unnotified in a `_cadence_shutdown`
-    // binding — the runner never saw a graceful shutdown. No-op when the
-    // scheduler is disabled / never spawned.
-    tickvault_app::cadence_boot::notify_cadence_shutdown();
+    // Cadence runner graceful teardown: REMOVED 2026-09-16 with the
+    // scheduler itself (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+    // Nothing is left to notify.
 
     // Second Ctrl+C → force exit.
     tokio::spawn(async {
@@ -3501,6 +5674,34 @@ async fn run_process_runloop(
         warn!("second shutdown signal received — forcing immediate exit");
         std::process::exit(1);
     });
+
+    // 5a. Close the Dhan feed sockets FIRST (Z11d, 2026-10-02).
+    //
+    // Until this step the sockets took no stop signal: the notify below
+    // stops only the frame DRAIN, so every socket kept reading and appending
+    // to the WAL right up to process exit while the WAL writer was shut down
+    // beneath it (step 5d), and records that landed after the writer's last
+    // empty poll were dropped with its channel. `WsFrameSpill::shutdown`
+    // documents "call AFTER the sockets are closed"; this is what closes them.
+    // Each socket parks through `close_capturing`, so frames read during the
+    // close handshake still reach the WAL and the ring, and the drain, still
+    // running, folds them. Bounded: a socket that will not close in time is
+    // reported and left, never waited on past the stop timeout.
+    let sockets_left_open =
+        tickvault_app::dhan_feed_stack::stop_feed_sockets(DHAN_SOCKET_STOP_BUDGET).await;
+    if sockets_left_open == 0 {
+        info!("Dhan live feed: every socket closed before the lane drain was stopped");
+    } else {
+        error!(
+            code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+            source = "socket_stop_incomplete",
+            sockets_left_open,
+            budget_secs = DHAN_SOCKET_STOP_BUDGET_SECS,
+            "Dhan live feed: sockets were still open when the socket-stop budget ran out — \
+             they may still append to the WAL while it shuts down, and those frames are \
+             counted as WAL drops rather than written"
+        );
+    }
 
     // 5b. Dhan live lane: seal + flush the day's tail (RESTORED 2026-08-14).
     //
@@ -3520,20 +5721,41 @@ async fn run_process_runloop(
     // ERROR rather than exiting quietly — a flush that did not finish is not
     // the same as one that did, and the operator must be able to tell.
     dhan_feed_shutdown.notify_one();
+    // Audit CONC-2 (2026-10-11): whether this shutdown saw the whole sealed-
+    // candle tail written. Cleared by a lane that overran its budget (it may
+    // still seal, and those seals go to the durable spill) and by any seal
+    // writer outcome other than a clean, residue-free drain. Read at 5b-2c.
+    let mut seal_tail_complete = true;
+    // CONC-4 review (2026-10-11): whether the lane is known to have stopped.
+    // A lane that failed or overran its budget may still be running, so the
+    // dual-instance lock is kept at 5b-4. True when no lane ran.
+    let mut lane_stopped_cleanly = true;
     if let Some(handle) = dhan_feed_stack_monitor {
         match tokio::time::timeout(DHAN_LANE_SHUTDOWN_FLUSH_BUDGET, handle).await {
             Ok(Ok(())) => info!("Dhan live feed: sealed and flushed cleanly on shutdown"),
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                %err,
-                "Dhan live feed: the lane task failed while shutting down — the day's tail may \
-                 not have been persisted"
-            ),
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
-                "Dhan live feed: the shutdown seal+flush did NOT finish within 20s — exiting \
-                 anyway so systemd does not SIGKILL us, but the day's tail may be incomplete"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                lane_stopped_cleanly = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    %err,
+                    "Dhan live feed: the lane task failed while shutting down — the day's tail may \
+                     not have been persisted"
+                );
+            }
+            // The budget is read from the constant — this line said "within 20s"
+            // for a month after the budget was raised to 30 (2026-08-28).
+            Err(_) => {
+                seal_tail_complete = false;
+                lane_stopped_cleanly = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::WsGapConnectionState.code_str(),
+                    budget_secs = DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS,
+                    "Dhan live feed: the shutdown seal+flush did NOT finish within \
+                     {DHAN_LANE_SHUTDOWN_FLUSH_BUDGET_SECS}s — exiting anyway so systemd does not \
+                     SIGKILL us, but the day's tail may be incomplete"
+                );
+            }
         }
     }
 
@@ -3552,17 +5774,34 @@ async fn run_process_runloop(
     if let Some(cancel) = SEAL_WRITER_CANCEL.get() {
         let _ = cancel.send(true);
     }
+    // Seals the writer's final drain left in memory (audit CONC-2), counted
+    // as lost in the crash marker at 5b-2c.
+    let mut seal_final_residue = 0_usize;
+    // Audit PR L, L2: main gave up on the writer, so the marker stays not clean.
+    let mut seal_writer_timed_out = false;
     let seal_handle = SEAL_WRITER_HANDLE.lock().ok().and_then(|mut s| s.take());
     if let Some(handle) = seal_handle {
         match tokio::time::timeout(SEAL_WRITER_SHUTDOWN_BUDGET, handle).await {
             Ok(Ok(outcome)) => {
+                seal_final_residue = outcome.final_residue;
+                if outcome.final_residue > 0 || outcome.mpsc_submit_dropped > 0 {
+                    seal_tail_complete = false;
+                }
                 if outcome.mpsc_submit_dropped > 0 {
                     error!(
                         code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
                         dropped = outcome.mpsc_submit_dropped,
+                        // Deep audit DA-14 review: why. A floor refusal wrote
+                        // nothing; the rest failed both disk writes.
+                        dropped_below_floor = outcome.mpsc_submit_dropped_below_floor,
+                        dropped_tiers_failed = outcome
+                            .mpsc_submit_dropped
+                            .saturating_sub(outcome.mpsc_submit_dropped_below_floor),
                         submitted = outcome.submitted_from_mpsc,
-                        "seal writer: seals were DROPPED on the final drain — all three \
-                         absorption tiers failed; these candles are gone"
+                        "seal writer: seals were DROPPED on the final drain: \
+                         dropped_below_floor were refused because free disk space is below the \
+                         seal floor (nothing was written), dropped_tiers_failed were lost after \
+                         the spill and the DLQ both failed; these candles are gone"
                     );
                 }
                 info!(
@@ -3574,21 +5813,210 @@ async fn run_process_runloop(
                     "seal writer: final drain complete on shutdown"
                 );
             }
-            Ok(Err(err)) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01
-                    .code_str(),
-                %err,
-                "seal writer: the task failed during its final drain — the day's tail may not \
-                 have been persisted"
-            ),
-            Err(_) => error!(
-                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
-                budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
-                "seal writer: the final drain did NOT finish within budget — exiting anyway so \
-                 systemd does not SIGKILL us, but the day's tail is incomplete"
-            ),
+            Ok(Err(err)) => {
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    %err,
+                    "seal writer: the task failed during its final drain — the day's tail may \
+                     not have been persisted"
+                );
+            }
+            Err(_) => {
+                seal_tail_complete = false;
+                seal_writer_timed_out = true;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    budget_secs = SEAL_WRITER_SHUTDOWN_BUDGET.as_secs(),
+                    writer_held_seals =
+                        tickvault_storage::seal_writer_loop::last_writer_held_seals(),
+                    "seal writer: the final drain did NOT finish within budget — exiting anyway \
+                     so systemd does not SIGKILL us, but the day's tail is incomplete"
+                );
+            }
         }
     }
+
+    // 5b-2b. Seal escalation thread drain (2026-08-28).
+    //
+    // AFTER the seal writer, because the writer's own final drain can still
+    // escalate; BEFORE the WAL floor, which must close last. Nothing can
+    // queue here any more — the drain that feeds it stopped at 5b.
+    //
+    // This exists because the offload created a queue, and an undrained
+    // bounded queue at exit is a silent loss no counter reports. That is not
+    // hypothetical in this codebase: it is verbatim the defect 5b-3 below
+    // closes on the WAL writer, found the same day.
+    if let Some(stop) = SEAL_ESCALATION_STOP.get() {
+        stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+    // Seals this step pages as lost, recorded in the crash marker below.
+    let mut seals_escalation_abandoned = 0_usize;
+    let escalation_handle = SEAL_ESCALATION_THREAD
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = escalation_handle {
+        // Poll rather than block: `JoinHandle::join` is unbounded, and an
+        // unbounded wait inside a bounded shutdown is how systemd's
+        // TimeoutStopSec turns into a SIGKILL that destroys the very tail
+        // every budget on this path exists to save.
+        let deadline = std::time::Instant::now() + SEAL_ESCALATION_SHUTDOWN_BUDGET;
+        while !handle.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(SEAL_ESCALATION_JOIN_POLL).await;
+        }
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                // CONC-2 review (2026-10-11): what it held is gone, so the
+                // tail is not complete whatever the pending count reads.
+                seal_tail_complete = false;
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                    "seal escalation thread PANICKED during its final drain — whatever it still held is gone"
+                );
+            } else {
+                info!("seal escalation: queue drained on shutdown");
+            }
+        } else {
+            // Abandoned, not joined — joining now would wait without bound.
+            // Not a complete tail whatever the pending count reads: a
+            // Relaxed read can be 0 while one item is mid-write (CONC-2
+            // review, 2026-10-11).
+            seal_tail_complete = false;
+            // Reported rather than swallowed: whatever is still queued dies
+            // with the process, and a loss nobody counts is the false-OK this
+            // whole shutdown path was rebuilt to stop producing.
+            //
+            // Counted in SEALS since audit PR15 (the counter's own name says
+            // "seals still queued"). It used to add 1 per abandonment
+            // whatever the queue held, which read the same for one seal and
+            // for a whole 250,000-seal burst.
+            let seals_abandoned = SEAL_ESCALATION_PENDING
+                .get()
+                .map_or(0, |p| p.load(std::sync::atomic::Ordering::Relaxed));
+            metrics::counter!(
+                tickvault_storage::seal_writer_runner::SEAL_ESCALATION_ABANDONED_COUNTER
+            )
+            .increment(seals_abandoned as u64);
+            seals_escalation_abandoned = seals_abandoned;
+            error!(
+                code = tickvault_common::error_code::ErrorCode::AggregatorDrop01.code_str(),
+                budget_secs = SEAL_ESCALATION_SHUTDOWN_BUDGET.as_secs(),
+                seals_abandoned,
+                "seal escalation: the queue did NOT drain within budget — exiting anyway so \
+                 systemd does not SIGKILL us, but seals still queued are lost"
+            );
+        }
+    }
+
+    // 5b-2c. Crash marker (audit PR31b-1, 2026-10-01).
+    //
+    // Only now can nothing in this process still write a sealed candle: the
+    // writer (5b-2) and the escalation queue (5b-2b) are drained, or have been
+    // given up on and paged. The writer left the marker NOT clean while the
+    // escalation queue held seals, so a kill during 5b-2b is reported at the
+    // next boot. Marking it clean here stops the next boot paging a loss this
+    // shutdown already paged; a writer that overran its budget is the one
+    // exception (audit PR L, L2): its count is kept NOT clean, since nothing
+    // else counted what it still held.
+    //
+    // Bounded like every other wait on this path: the finish is a file write
+    // and a rename, and on a stalled disk an overrun writer can hold the
+    // marker's lock inside its own write. It runs on a blocking thread, and
+    // past the budget the shutdown goes on to 5b-3; the marker then keeps the
+    // count the writer last wrote, which the next boot reports.
+    if let Some(dir) = SEAL_UNWRITTEN_MARK_DIR.get() {
+        let dir = dir.clone();
+        let now = chrono::Utc::now().timestamp();
+        let finish = tokio::task::spawn_blocking(move || {
+            // The writer's residue is lost as surely as the abandoned
+            // escalation queue, and an incomplete tail names the last real
+            // drain instant rather than `now` (audit CONC-2, 2026-10-11).
+            if seal_writer_timed_out {
+                // Not clean, with what the writer still held (audit PR L, L2).
+                return tickvault_storage::seal_writer_loop::finish_unwritten_mark_after_writer_timeout(
+                    &dir,
+                    seals_escalation_abandoned,
+                    tickvault_storage::seal_writer_loop::last_writer_held_seals(),
+                    now,
+                );
+            }
+            tickvault_storage::seal_writer_loop::finish_unwritten_mark_at_shutdown(
+                &dir,
+                seals_escalation_abandoned.saturating_add(seal_final_residue),
+                seal_tail_complete,
+                now,
+            )
+        });
+        if tokio::time::timeout(SEAL_UNWRITTEN_MARK_FINISH_BUDGET, finish)
+            .await
+            .is_err()
+        {
+            error!(
+                code =
+                    tickvault_common::error_code::ErrorCode::AggregatorSeal01IlpFailed.code_str(),
+                source = "unwritten_mark",
+                budget_secs = SEAL_UNWRITTEN_MARK_FINISH_BUDGET.as_secs(),
+                "seal writer: the crash marker could not be marked clean within budget — \
+                 the next boot may report the candles this shutdown already reported"
+            );
+        }
+    }
+
+    // 5b-3. WAL spill final drain (2026-08-28).
+    //
+    // LAST of the three, and it must be: this is the durable floor every tier
+    // above it falls back onto, so it can only be closed once nothing can still
+    // append to it — the sockets are shut (5b) and the seal writer is done
+    // (5b-2).
+    //
+    // Until now the writer thread was DETACHED. Its `JoinHandle` was discarded
+    // at the spawn, nothing signalled it, and nothing could: the only `Sender`
+    // lives inside `WsFrameSpill`, which the drain paths hold through an `Arc`,
+    // so the channel never closed and the thread stayed parked in `recv()`
+    // while the process exited around it. Up to 524,288 records — every one of
+    // them already reported to its caller as `Spilled` — went with it, counted
+    // by nothing: `persisted_total` counts `write_all` and `drop_critical`
+    // counts only what `try_send` refused outright.
+    //
+    // That is the same class fixed for the tick and depth ILP writers on
+    // 2026-08-28 (`tv_offload_writer_shutdown_incomplete_total`). The WAL, the
+    // one tier whose whole job is to be the thing that does not lose frames,
+    // was the tier still missing it.
+    if let Some(spill) = ws_frame_spill.as_ref() {
+        let abandoned =
+            spill.shutdown(tickvault_storage::ws_frame_spill::WAL_SPILL_SHUTDOWN_BUDGET);
+        if abandoned > 0 {
+            error!(
+                code = tickvault_common::error_code::ErrorCode::WsSpill01WriterRespawn.code_str(),
+                abandoned,
+                "WAL spill: {abandoned} captured frames were NEVER written — exiting anyway so \
+                 systemd does not SIGKILL us, but these frames are permanently lost"
+            );
+        }
+    }
+    // 5b-4. Release the dual-instance lock (audit CONC-4, 2026-10-11).
+    //
+    // AFTER the WAL floor, and only when every socket closed at 5a and the
+    // lane stopped cleanly inside its budget at 5b (CONC-4 review,
+    // 2026-10-11): only then can nothing here still dial Dhan. Otherwise
+    // the lock is kept, the heartbeat renews it until exit, and the 90s TTL
+    // clears it after the process has gone, so a waiting peer never dials
+    // while this process still can. The release flips the held flag off
+    // first, which refuses any late mint (RESILIENCE-03, logged at info as a
+    // stopping process, not paged as a peer). BEFORE the notifier flush, so
+    // a slow Telegram cannot eat the budget. Until this date the heartbeat
+    // was never told to stop and every clean stop left the lock in SSM for
+    // the 90s TTL, so a restart in market hours opened no socket for that
+    // long. Bounded: past the budget the TTL clears it as before.
+    let _ = tickvault_app::dhan_rest_stack::release_instance_lock_at_shutdown(
+        tickvault_app::dhan_rest_stack::ShutdownLockGate {
+            sockets_left_open,
+            lane_stopped_cleanly,
+        },
+        INSTANCE_LOCK_RELEASE_BUDGET,
+    )
+    .await;
 
     // 5c. Telegram UX overhaul (2026-07-07): flush pending coalesced
     // summaries + write the final episode snapshot (bounded 10s inside
@@ -3611,31 +6039,114 @@ async fn run_process_runloop(
 // Helper: Wait for shutdown signal (SIGINT or SIGTERM)
 // ---------------------------------------------------------------------------
 
+/// The SIGTERM and SIGINT streams, created on the first wait and kept for the
+/// process (audit CONC-5, 2026-10-11).
+///
+/// A tokio signal stream sees only signals delivered while it exists: a new
+/// stream subscribes at the current version, so a signal that arrived while
+/// no stream was alive is recorded and broadcast to no one. Until this date
+/// each wait built fresh streams and dropped them on return, so a SIGTERM in
+/// the gap between the two waits (the post-market drain sleep and the
+/// partition detach) was lost: tokio's handler stayed installed, the default
+/// kill did not run either, and systemd SIGKILLed the process after
+/// `TimeoutStopSec` with the live lane still unflushed. A stream kept here
+/// buffers a signal delivered between waits, and the next wait returns at
+/// once.
+#[cfg(unix)]
+struct ShutdownSignals {
+    /// `None` only when creating the SIGTERM stream failed.
+    terminate: Option<tokio::signal::unix::Signal>,
+    /// `None` only when creating the SIGINT stream failed.
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+/// See [`ShutdownSignals`]. `None` until the first wait, so a SIGTERM during
+/// boot keeps its default effect exactly as before.
+#[cfg(unix)]
+static SHUTDOWN_SIGNALS: tokio::sync::Mutex<Option<ShutdownSignals>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// One stream's next signal; never resolves when the stream does not exist.
+#[cfg(unix)]
+async fn next_signal(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(stream) => {
+            let _ = stream.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Waits for either SIGINT (Ctrl+C) or SIGTERM and returns the signal name.
 ///
 /// SIGTERM support enables graceful shutdown from Docker (`docker stop`).
+/// The streams persist across calls (see [`ShutdownSignals`]), so a signal
+/// delivered between two waits is returned by the next one. Cancel-safe:
+/// dropping the future drops only the lock guard, never the streams.
+///
+/// If one stream cannot be created, the other is still kept and waited on
+/// (CONC-5 review, 2026-10-11): before, a failed SIGINT stream also dropped a
+/// SIGTERM stream that had been created, leaving tokio's SIGTERM handler
+/// installed with no receiver, so SIGTERM did nothing at all.
 async fn wait_for_shutdown_signal() -> &'static str {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(err) => {
-                warn!(?err, "SIGTERM handler failed — falling back to SIGINT only");
-                let _ = tokio::signal::ctrl_c().await;
-                return "ctrl_c";
+        let mut slot = SHUTDOWN_SIGNALS.lock().await;
+        if slot.is_none() {
+            // First use only: the same moment the streams were created
+            // before, so boot-time SIGTERM behaviour is unchanged.
+            let terminate = signal(SignalKind::terminate());
+            let interrupt = signal(SignalKind::interrupt());
+            match (terminate, interrupt) {
+                (Ok(terminate), Ok(interrupt)) => {
+                    *slot = Some(ShutdownSignals {
+                        terminate: Some(terminate),
+                        interrupt: Some(interrupt),
+                    });
+                }
+                (Ok(terminate), Err(err)) => {
+                    warn!(?err, "SIGINT handler failed — waiting on SIGTERM only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: Some(terminate),
+                        interrupt: None,
+                    });
+                }
+                (Err(err), Ok(interrupt)) => {
+                    warn!(?err, "SIGTERM handler failed — waiting on SIGINT only");
+                    *slot = Some(ShutdownSignals {
+                        terminate: None,
+                        interrupt: Some(interrupt),
+                    });
+                }
+                (Err(term_err), Err(int_err)) => {
+                    drop(slot);
+                    warn!(
+                        ?term_err,
+                        ?int_err,
+                        "SIGTERM and SIGINT handlers failed — falling back to ctrl_c"
+                    );
+                    let _ = tokio::signal::ctrl_c().await;
+                    return "ctrl_c";
+                }
             }
+        }
+        let Some(signals) = slot.as_mut() else {
+            return "ctrl_c";
         };
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(err) = result {
-                    warn!(?err, "failed to listen for SIGINT");
-                }
+            () = next_signal(&mut signals.interrupt) => {
                 "ctrl_c"
             }
-            _ = sigterm.recv() => {
+            () = next_signal(&mut signals.terminate) => {
                 info!("SIGTERM received — initiating graceful shutdown");
                 "sigterm"
+            }
+            // Quote 31's evening drain: a planned restart (systemd starts
+            // the app again) so the boot catch-up replays the WAL backlog.
+            () = tickvault_app::evening_drain::self_restart_requested() => {
+                info!("evening drain restart requested — initiating graceful shutdown");
+                "self_restart"
             }
         }
     }
@@ -3654,6 +6165,88 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
+
+    /// Audit CONC-5 (2026-10-11): the shutdown-signal streams are created on
+    /// the first wait and outlive it, so a SIGTERM delivered while no wait is
+    /// running is returned by the next wait. Before the fix each wait built
+    /// and dropped its own streams, so a signal between two waits reached no
+    /// stream and the second wait never returned (bite: per-call streams fail
+    /// the last assertion).
+    ///
+    /// Sends a real SIGTERM to this test process with the system `kill`. The
+    /// handler stays installed for the rest of the test binary, so a later
+    /// SIGTERM or Ctrl+C to the binary is caught rather than killing it; under
+    /// nextest each test runs in its own process. This is the only test in
+    /// the binary that touches the signal streams, so they are bound to one
+    /// runtime.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sigterm_between_two_waits_is_returned_by_the_next_wait() {
+        let short = std::time::Duration::from_millis(5);
+        assert!(
+            tokio::time::timeout(short, wait_for_shutdown_signal())
+                .await
+                .is_err(),
+            "no signal was sent yet"
+        );
+        assert!(
+            SHUTDOWN_SIGNALS.lock().await.is_some(),
+            "the streams outlive the wait that created them"
+        );
+        // No wait is running now: the signal lands between two waits.
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill delivered SIGTERM");
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_shutdown_signal(),
+        )
+        .await
+        .expect("the buffered SIGTERM is returned by the next wait");
+        assert_eq!(got, "sigterm");
+    }
+
+    #[test]
+    fn reader_pin_report_covers_every_plan_and_never_reports_a_failed_pin_as_pinned() {
+        use tickvault_core::websocket::reader_runtime::ReaderCorePlan as Plan;
+        assert_eq!(
+            reader_pin_report(Plan::Pin(1), true, 1, 0),
+            ReaderPinReport::Pinned(1)
+        );
+        // The kernel refused: a coded warning, not a false "pinned".
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, -1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), true, 1, 1),
+            ReaderPinReport::Refused(_)
+        ));
+        assert!(matches!(
+            reader_pin_report(Plan::Pin(1), false, -1, 0),
+            ReaderPinReport::Unpinned(_)
+        ));
+        for plan in [Plan::Off, Plan::Unsupported, Plan::DefaultNotAllowed] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Unpinned(_)
+                ),
+                "{plan:?}"
+            );
+        }
+        for plan in [Plan::RefusedCoreZero, Plan::NotAllowed(7), Plan::Invalid] {
+            assert!(
+                matches!(
+                    reader_pin_report(plan, true, -1, 0),
+                    ReaderPinReport::Refused(_)
+                ),
+                "{plan:?}"
+            );
+        }
+    }
 
     #[test]
     fn stall_scan_reports_starved_only_when_it_can_see_nothing_and_should() {
@@ -3727,28 +6320,104 @@ mod tests {
         );
     }
 
-    // ── resolve_tokio_worker_threads (CPU isolation, Quote 17b 2026-08-19) ──
+    // ── runtime sizing (CPU isolation, Quote 17b 2026-08-19; host-derived
+    //    ITEM 11a 2026-08-23) ──
     //
-    // The runtime width is no longer `num_cpus`, so the parse that decides it
-    // is now on the boot path. Every one of these cases must yield a width the
-    // runtime builder accepts — a malformed tuning hint must never be able to
-    // stop the app from starting.
+    // The runtime width is no longer `num_cpus` NOR a constant chosen for one
+    // machine: it is derived from what this process may actually use, then
+    // clamped. Every case below must yield a width the runtime builder
+    // accepts — a malformed tuning hint, or an unreadable host, must never be
+    // able to stop the app from starting.
 
     #[test]
-    fn test_resolve_tokio_worker_threads_defaults_when_unset() {
+    fn test_clamp_worker_threads_never_returns_zero() {
+        // `Builder::worker_threads(0)` PANICS. A host that reports 0 — an
+        // unreadable cgroup line, a parse that lands on nothing — must still
+        // boot, so the floor is a safety bound and not a preference.
+        assert_eq!(clamp_worker_threads(0), MIN_TOKIO_WORKER_THREADS);
+        for host in 0..=64usize {
+            assert!(
+                clamp_worker_threads(host) >= 1,
+                "host allowance {host} produced a zero width"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clamp_worker_threads_holds_the_ceiling() {
+        // A bigger host must not silently widen the runtime past what the CPU
+        // isolation intends — the ceiling is the whole point of deriving
+        // rather than trusting.
         assert_eq!(
-            resolve_tokio_worker_threads(None),
-            DEFAULT_TOKIO_WORKER_THREADS,
-            "an absent override must fall back to the partition-consistent default"
+            clamp_worker_threads(64),
+            HOST_DERIVED_WORKER_CEILING,
+            "a 64-core host must still be clamped to the isolation ceiling"
+        );
+        assert_eq!(
+            clamp_worker_threads(HOST_DERIVED_WORKER_CEILING),
+            HOST_DERIVED_WORKER_CEILING,
+            "the boundary itself is legal"
         );
     }
 
     #[test]
+    fn test_clamp_worker_threads_passes_through_inside_the_band() {
+        // The 1-core dev container and the 4-vCPU prod box are the two shapes
+        // this actually runs on; both must come out as themselves.
+        for host in MIN_TOKIO_WORKER_THREADS..=HOST_DERIVED_WORKER_CEILING {
+            assert_eq!(
+                clamp_worker_threads(host),
+                host,
+                "a host allowance inside the band must pass through untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_cpu_allowance_is_always_usable() {
+        // Runs on whatever machine the suite is on — CI container, dev box,
+        // the prod host. The assertion is deliberately about the CONTRACT and
+        // not a number: whatever the host says, the result must be a width
+        // that boots, and its source must be one of the three we can produce.
+        let (cpus, source) = host_cpu_allowance();
+        assert!(
+            cpus >= 1,
+            "host allowance {cpus} is unusable — clamp would be papering over it"
+        );
+        assert!(
+            ["cgroup", "parallelism", "fallback"].contains(&source),
+            "unexpected allowance source {source:?}"
+        );
+        assert!(
+            clamp_worker_threads(cpus) >= 1,
+            "the clamped host allowance must be a width Builder::worker_threads accepts"
+        );
+    }
+
+    #[test]
+    fn test_resolve_tokio_worker_threads_defaults_to_the_host_derivation() {
+        // The fallback is the HOST-derived width, not a constant. This is the
+        // behaviour ITEM 11a exists for: an absent override on a 1-core box
+        // must not hand out the 4-vCPU box's answer.
+        for host_derived in 1..=HOST_DERIVED_WORKER_CEILING {
+            assert_eq!(
+                resolve_tokio_worker_threads(None, host_derived),
+                host_derived,
+                "an absent override must fall back to what the host allows"
+            );
+        }
+    }
+
+    #[test]
     fn test_resolve_tokio_worker_threads_honours_a_valid_override() {
-        assert_eq!(resolve_tokio_worker_threads(Some("4")), 4);
-        assert_eq!(resolve_tokio_worker_threads(Some("1")), 1);
+        // The operator's rollback path: an explicit value wins over the
+        // derivation, including a value ABOVE the host-derived clamp — that is
+        // the documented way to restore the pre-2026-08-19 behaviour without
+        // a rebuild.
+        assert_eq!(resolve_tokio_worker_threads(Some("4"), 1), 4);
+        assert_eq!(resolve_tokio_worker_threads(Some("1"), 4), 1);
         assert_eq!(
-            resolve_tokio_worker_threads(Some("  3  ")),
+            resolve_tokio_worker_threads(Some("  3  "), 2),
             3,
             "systemd Environment= values routinely carry surrounding whitespace"
         );
@@ -3757,25 +6426,26 @@ mod tests {
     #[test]
     fn test_resolve_tokio_worker_threads_is_fail_safe_on_garbage() {
         // Zero would make `Builder::worker_threads(0)` PANIC, which is the one
-        // outcome this function exists to make unreachable.
+        // outcome this function exists to make unreachable. Garbage falls back
+        // to the host derivation — never propagates, never refuses to boot.
         for bad in ["", "   ", "0", "-1", "two", "2.5", "99999999999999999999"] {
             assert_eq!(
-                resolve_tokio_worker_threads(Some(bad)),
-                DEFAULT_TOKIO_WORKER_THREADS,
-                "{bad:?} must fall back to the default, never propagate"
+                resolve_tokio_worker_threads(Some(bad), 2),
+                2,
+                "{bad:?} must fall back to the host derivation, never propagate"
             );
         }
     }
 
     #[test]
-    fn test_resolve_tokio_worker_threads_clamps_absurd_values_to_the_default() {
+    fn test_resolve_tokio_worker_threads_clamps_absurd_values() {
         assert_eq!(
-            resolve_tokio_worker_threads(Some("65")),
-            DEFAULT_TOKIO_WORKER_THREADS,
+            resolve_tokio_worker_threads(Some("65"), 2),
+            2,
             "above MAX_TOKIO_WORKER_THREADS the value is a typo, not a request"
         );
         assert_eq!(
-            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string())),
+            resolve_tokio_worker_threads(Some(&MAX_TOKIO_WORKER_THREADS.to_string()), 2),
             MAX_TOKIO_WORKER_THREADS,
             "the boundary itself is legal"
         );
@@ -3783,15 +6453,19 @@ mod tests {
 
     #[test]
     fn test_resolve_tokio_worker_threads_never_returns_zero() {
-        // Property-ish sweep: no byte string in this space may produce 0.
-        for n in 0..=300u32 {
-            let s = n.to_string();
-            assert!(
-                resolve_tokio_worker_threads(Some(&s)) >= 1,
-                "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
-            );
+        // Property-ish sweep over the whole reachable input space: no byte
+        // string, at any host derivation, may produce 0.
+        for host_derived in 1..=HOST_DERIVED_WORKER_CEILING {
+            for n in 0..=300u32 {
+                let s = n.to_string();
+                assert!(
+                    resolve_tokio_worker_threads(Some(&s), host_derived) >= 1,
+                    "input {s:?} produced a zero width — Builder::worker_threads(0) panics"
+                );
+            }
         }
     }
+
     // All pure helper tests moved to boot_helpers.rs in the lib target.
     // Tests below verify main.rs-specific smoke behavior.
 
@@ -3799,14 +6473,13 @@ mod tests {
 
     // ── build_feed_status_lines (Telegram feed parity, 2026-07-03) ──
     // The readiness + end-of-day messages must list EVERY enabled feed
-    // (Dhan, Groww, future) with honest unknowns — never fabricated data.
+    // with honest unknowns — never fabricated data.
 
     // ── boot_completed_should_emit truth table ──
-    // The alive signal (tv_boot_completed) must be published only when at least
-    // one ENABLED feed is running — so a boot where every enabled feed died
-    // withholds it and the boot-heartbeat alarm pages. No feed enabled emits
-    // (headless run must not false-page). A running-but-disabled feed never
-    // counts.
+    // The alive signal (tv_boot_completed) must be published only when the
+    // ENABLED feed is running — so a boot whose feed died withholds it and
+    // the boot-heartbeat alarm pages. No feed enabled emits (a headless run
+    // must not false-page). A running-but-disabled feed never counts.
 
     // ── compute_tick_freshness (SLO fractional coverage, 2026-07-03) ──
     // Pins the D2 fix: tick_freshness is 1 − silent/universe (clamped),
@@ -3814,58 +6487,23 @@ mod tests {
     // fails these tests.
 
     #[test]
-    fn test_boot_completed_should_emit_both_off_emits() {
-        // No feed enabled at all → emit (deliberately feed-less run must not
-        // false-page). Feed-running values are irrelevant here.
-        assert!(boot_completed_should_emit(false, false, false, false));
-        assert!(boot_completed_should_emit(false, false, true, true));
+    fn test_boot_completed_should_emit_feed_disabled_emits() {
+        // Deliberately feed-less run → emit; a headless shared-infra-only
+        // boot must not false-page. The running flag is irrelevant here.
+        assert!(boot_completed_should_emit(false, false));
+        assert!(boot_completed_should_emit(false, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_live() {
-        assert!(boot_completed_should_emit(true, false, true, false));
+    fn test_boot_completed_should_emit_feed_enabled_and_live() {
+        assert!(boot_completed_should_emit(true, true));
     }
 
     #[test]
-    fn test_boot_completed_should_emit_dhan_only_dead() {
-        // Dhan enabled but not running, Groww disabled → withhold (page).
-        assert!(!boot_completed_should_emit(true, false, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_groww_only_live() {
-        assert!(boot_completed_should_emit(false, true, false, true));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_groww_only_dead() {
-        assert!(!boot_completed_should_emit(false, true, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_only_dhan_live() {
-        assert!(boot_completed_should_emit(true, true, true, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_only_groww_live() {
-        assert!(boot_completed_should_emit(true, true, false, true));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_both_enabled_none_live() {
-        // Both enabled, neither running → withhold (page). This is the core
-        // alerting-hole case: previously the metric was published unconditionally.
-        assert!(!boot_completed_should_emit(true, true, false, false));
-    }
-
-    #[test]
-    fn test_boot_completed_should_emit_running_but_disabled_feed_does_not_count() {
-        // Dhan DISABLED but its running flag is somehow true (stale) — it must NOT
-        // count; only the ENABLED Groww matters, and Groww is dead → withhold.
-        assert!(!boot_completed_should_emit(false, true, true, false));
-        // Symmetric: Groww disabled-but-running, Dhan enabled-and-dead → withhold.
-        assert!(!boot_completed_should_emit(true, false, false, true));
+    fn test_boot_completed_should_emit_feed_enabled_and_dead_withholds() {
+        // The core alerting-hole case: the metric was once published
+        // unconditionally, so a dead feed still reported a healthy boot.
+        assert!(!boot_completed_should_emit(true, false));
     }
 
     // PR-C (2026-05-26): historical-fetch source-scan guards removed —
@@ -3874,20 +6512,6 @@ mod tests {
     #[test]
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_trading() {
-        // Trading day → 0 so the gate lets the app start.
-        assert_eq!(trading_day_gate_exit_code(true), 0);
-    }
-
-    #[test]
-    fn test_trading_day_gate_exit_code_non_trading() {
-        // Weekend/holiday → 75 so the gate self-stops the instance.
-        assert_eq!(trading_day_gate_exit_code(false), 75);
-        // 75 must be distinct from the fail-open load-error code 70.
-        assert_ne!(trading_day_gate_exit_code(false), 70);
     }
 
     #[test]
@@ -4035,21 +6659,6 @@ mod tests {
              default"
         );
     }
-
-    /// Step C ratchet: both run-mode log branches must exist — Groww-only
-    /// (Dhan off, Groww on) and idle (neither on, no crash).
-    #[test]
-    fn test_step_c_groww_only_and_idle_branches() {
-        let src = include_str!("main.rs");
-        assert!(
-            src.contains("GROWW-ONLY MODE"),
-            "Step C: the Groww-only run-mode branch must exist"
-        );
-        assert!(
-            src.contains("NO FEED ENABLED"),
-            "Step C: the no-feed idle branch must exist (idle, not crash)"
-        );
-    }
 }
 
 // Tick-conservation retirement (2026-07-18, dead-WS sweep follow-up): the
@@ -4060,197 +6669,6 @@ mod tests {
 // QuestDB `tick_conservation_audit` TABLE is retained (SEBI, forensic).
 // Runbook retirement banner:
 // `.claude/rules/project/tick-conservation-audit-error-codes.md`.
-
-/// Dual-feed scoreboard (operator directive 2026-07-10) — PROCESS-GLOBAL,
-/// spawned exactly once from `main()`'s prefix, gated on `[scoreboard]
-/// enabled` (the B12 rollback switch: `false` ⇒ nothing here spawns).
-///
-/// Two tasks:
-/// 1. Boot-time process-death reconciler — after a settle delay it
-///    synthesizes `process_death` episodes (blame `ours`, deterministic ts
-///    ⇒ DEDUP-idempotent) for connections that were "up" when the previous
-///    process died. See `feed_scoreboard_boot::reconcile_process_death_episodes`.
-/// 2. The daily aggregation at `[scoreboard] trigger_secs_of_day_ist`
-///    (default 15:45:00 IST) with the inner/outer supervisor idiom (the
-///    cross_verify_1m pattern): the inner task returns the summary; the
-///    outer watcher sends the `DualFeedDailyScorecard` Telegram on success
-///    and `DualFeedScorecardAborted` on Err/panic — the daily signal can
-///    never be silently dropped. Graceful-shutdown cancellation stays
-///    silent (normal teardown, not an abort).
-/// Groww per-minute spot 1m REST leg (operator grant 2026-07-13 — PR-2 of
-/// the Groww per-minute REST plan), called from the single process-global
-/// boot prefix (PR-C2, 2026-07-13: the FAST crash-recovery arm and its
-/// second call site are deleted). PROCESS-GLOBAL and deliberately NOT the
-/// deleted Dhan-gated `spawn_post_market_tasks` seam: this leg's token is
-/// the shared-minter SSM read (never the Dhan JWT), so a Dhan-off
-/// (Groww-only) session still runs it. Config-gated fail-safe: an absent
-/// `[groww_spot_1m]` section disables it. Supervised respawn wrapper;
-/// self-skips on non-trading days / past 15:30 IST (post the one bounded
-/// ~15:31 repair sweep).
-// TEST-EXEMPT: tokio::spawn wrapper over the unit-tested boot modules; the call site + the config gates pinned by crates/app/tests/groww_spot_1m_wiring_guard.rs + crates/app/tests/groww_chain_1m_wiring_guard.rs.
-fn spawn_groww_spot_1m_leg(
-    config: &ApplicationConfig,
-    notifier: &std::sync::Arc<NotificationService>,
-    trading_calendar: &std::sync::Arc<TradingCalendar>,
-    // Order-runtime mark tap (re-homed 2026-07-16 — the live-bridge tap
-    // died with the retired Groww live feed): rides into the spot +
-    // contract legs; `None` ⇒ `[order_runtime]` disabled, taps inert.
-    mark_forwarder: Option<tickvault_app::order_runtime::MarkForwarder>,
-) {
-    // 2026-07-14 auto-ladder (operator approval — the two-wave / seven
-    // burst tiers): the spot→chain sequencing channel is RETIRED — each
-    // Groww REST leg fires on its OWN minute-boundary timer; the shared
-    // session-scoped burst state below carries the configured tier + the
-    // 429 auto-demote latch across ALL Groww REST legs (one pooled Groww
-    // rate bucket ⇒ one demotion signal). Boot resets to the configured
-    // tier by construction (fresh state per process).
-    let chain_enabled = config.groww_option_chain_1m.enabled;
-    let burst = tickvault_app::groww_rest_burst::GrowwRestBurstState::new(
-        config.groww_rest_burst.tier,
-        config.groww_rest_burst.warm_up,
-    );
-    // PR-4 sequencing + selection handoff: the chain→contract channel +
-    // anchor store exist ONLY when BOTH legs are on (contract-off keeps
-    // the chain leg byte-identical to PR-3). The contract leg DEPENDS on
-    // the chain leg's per-minute anchors — enabled-without-chain is
-    // refused loudly, never a silent anchor-less loop.
-    let contract_enabled = config.groww_contract_1m.enabled && chain_enabled;
-    if config.groww_contract_1m.enabled && !chain_enabled {
-        warn!(
-            code = tickvault_common::error_code::ErrorCode::Spot1m01FetchDegraded.code_str(),
-            stage = "enabled_without_chain",
-            feed = "groww",
-            leg = "contract_1m",
-            "SPOT1M-01: [groww_contract_1m] is enabled but the chain leg \
-             ([groww_option_chain_1m]) is OFF — the contract leg needs the \
-             chain's per-minute ATM anchors; NOT spawned (enable the chain \
-             leg first)"
-        );
-    }
-    let (chain_minute_done_tx, chain_minute_done_rx, contract_anchor_store) = if contract_enabled {
-        let (tx, rx) = tokio::sync::watch::channel::<Option<u32>>(None);
-        let store: tickvault_app::groww_option_chain_1m_boot::GrowwChainAnchorStore =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        (Some(tx), Some(rx), Some(store))
-    } else {
-        (None, None, None)
-    };
-    if config.groww_spot_1m.enabled {
-        let _groww_spot1m_supervisor =
-            tickvault_app::groww_spot_1m_boot::spawn_supervised_groww_spot_1m(
-                tickvault_app::groww_spot_1m_boot::GrowwSpot1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    // OWN-FIRE spot closes → the dry-run runtime's marks.
-                    mark_forwarder: mark_forwarder.clone(),
-                },
-            );
-        info!(
-            tier = config.groww_rest_burst.tier.as_str(),
-            "groww_spot_1m: Groww per-minute spot 1m REST leg spawned \
-             (fires each minute close 09:16:00-15:30:00 IST; concurrent \
-             spot wave per the configured burst tier)"
-        );
-    } else {
-        info!("groww_spot_1m: disabled by config — Groww per-minute spot fetch not spawned");
-    }
-    // Groww per-minute option-chain leg: fires on its OWN minute-boundary
-    // timer (2026-07-14 auto-ladder — the spot→chain sequencing wait is
-    // retired); concurrent underlying wave per the shared burst tier.
-    // DEFAULT-OFF pending the first live probe — the probe-and-report
-    // path runs instead while disabled (one bounded chain call per
-    // underlying, Info verdict).
-    if chain_enabled {
-        let _groww_chain1m_supervisor =
-            tickvault_app::groww_option_chain_1m_boot::spawn_supervised_groww_chain_1m(
-                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    minute_done_tx: chain_minute_done_tx,
-                    anchor_store: contract_anchor_store.clone(),
-                    cadence_enabled: config.cadence.enabled,
-                },
-            );
-        info!(
-            tier = config.groww_rest_burst.tier.as_str(),
-            "groww_chain_1m: Groww per-minute option-chain leg spawned \
-             (fires each minute close on its own timer; concurrent \
-             underlying wave per the configured burst tier)"
-        );
-        // Groww per-contract 1m leg (PR-4, the fill-model leg): sequenced
-        // after the chain fire via the watch signal + fallback timer;
-        // selection = ATM window from the chain's in-memory anchors,
-        // hard-capped per minute. DEFAULT-OFF (depends on the chain leg).
-        if contract_enabled {
-            let _groww_contract1m_supervisor =
-                tickvault_app::groww_contract_1m_boot::spawn_supervised_groww_contract_1m(
-                    tickvault_app::groww_contract_1m_boot::GrowwContract1mTaskParams {
-                        notifier: notifier.clone(),
-                        calendar: std::sync::Arc::clone(trading_calendar),
-                        questdb: config.questdb.clone(),
-                        chain_minute_done: chain_minute_done_rx,
-                        anchor_store: contract_anchor_store,
-                        strikes_each_side: config.groww_contract_1m.strikes_each_side,
-                        burst: std::sync::Arc::clone(&burst),
-                        // OWN-FIRE contract closes → the option-leg marks.
-                        mark_forwarder: mark_forwarder.clone(),
-                    },
-                );
-            info!(
-                "groww_contract_1m: Groww per-minute contract candle leg \
-                 spawned (fires each minute close right after the Groww \
-                 chain fetch; ATM-window selection, sequential contract \
-                 pacing)"
-            );
-        } else {
-            info!(
-                "groww_contract_1m: disabled by config — Groww per-minute \
-                 contract fetch not spawned"
-            );
-        }
-    } else if config.groww_option_chain_1m.probe_and_report {
-        let _groww_chain1m_probe = tokio::spawn(
-            tickvault_app::groww_option_chain_1m_boot::run_groww_chain_1m_probe(
-                tickvault_app::groww_option_chain_1m_boot::GrowwChain1mTaskParams {
-                    notifier: notifier.clone(),
-                    calendar: std::sync::Arc::clone(trading_calendar),
-                    questdb: config.questdb.clone(),
-                    burst: std::sync::Arc::clone(&burst),
-                    minute_done_tx: None,
-                    anchor_store: None,
-                    cadence_enabled: config.cadence.enabled,
-                },
-            ),
-        );
-        info!(
-            "groww_chain_1m: pipeline OFF — one boot-time chain probe \
-             spawned (verdict via Telegram; persists nothing)"
-        );
-    } else {
-        info!("groww_chain_1m: disabled by config (probe off) — nothing spawned");
-    }
-    // 2026-07-14 off-hours rate probe (env-gated, DEFAULT OFF): arm with
-    // TICKVAULT_GROWW_RATE_PROBE=1 on an off-hours run to measure
-    // Groww's real burst tolerance (4→6→8→11 req/s steps). Refused
-    // inside the [08:30, 16:00) IST wall-clock blackout on ANY day
-    // (SECURITY-MEDIUM 2026-07-14 — no calendar dependency, so a stale
-    // holiday list can never fire the burst mid-session); the operator
-    // must also coordinate the run with BruteX's nightly bulk window
-    // (§9.7). Results are structured logs + counters only — NO data
-    // tables.
-    if std::env::var(tickvault_app::groww_rate_probe::GROWW_RATE_PROBE_ENV).as_deref() == Ok("1") {
-        tokio::spawn(tickvault_app::groww_rate_probe::run_groww_rate_probe());
-        info!(
-            "groww_rate_probe: armed via TICKVAULT_GROWW_RATE_PROBE=1 — \
-             escalating off-hours burst probe spawned (refuses to run \
-             inside the [08:30, 16:00) IST wall-clock blackout window)"
-        );
-    }
-}
 
 // TEST-EXEMPT: tokio::spawn wrapper over the unit-tested pure parts (decide_scoreboard_start / synthesize_process_death_episodes / SQL builders / parsers); spawn site pinned by test_feed_scoreboard_task_is_wired_into_main.
 fn spawn_feed_scoreboard_tasks(
@@ -4271,6 +6689,9 @@ fn spawn_feed_scoreboard_tasks(
         validate_scoreboard_backfill_date,
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+
+    // Plan PR AL-2 (2026-11-06): the rollup retry counter starts at a known 0.
+    tickvault_app::ws_connection_rollup::register_rollup_attempt_counters();
 
     // Config sanity (round-2 hostile review 2026-07-10): a typo'd trigger
     // ≥ 86400 slept past the 16:30 auto-stop every day — the task died at
@@ -4621,7 +7042,7 @@ fn spawn_feed_scoreboard_tasks(
         let runtime_enabled_now = if target_ist_day == today_day {
             Some((
                 sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Dhan),
-                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Groww),
+                sb_feed_runtime.is_enabled(tickvault_common::feed::Feed::Truedata),
             ))
         } else {
             None
@@ -4683,38 +7104,15 @@ fn spawn_feed_scoreboard_tasks(
         match inner.await {
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
-                    // Scoreboard PR-B (2026-07-10): the round-2 Groww
-                    // drops blind spot is CLOSED for its dominant failure
-                    // mode — the sidecar socket-death family now writes
-                    // `stall_restarted` rows (counted in the Stalls column),
-                    // so Groww's drops count (feed-disable + bridge-death)
-                    // renders as a measured number again. Honest residual
-                    // (runbook §6): in-sidecar reconnects that recover
-                    // FASTER than the 30s stall threshold remain invisible
-                    // to both columns on both card sides.
-                    let groww_line = to_line("Groww", &summary.groww);
-                    // Groww REST plan PR-5 (operator Quote 2, 2026-07-13):
-                    // the official minute-candle pull digest lines — the
-                    // four canonical feed/leg pairs always render (honest
-                    // "not measured yet" when a source is absent); the
-                    // contract leg lights up automatically once its
-                    // forensics rows land.
-                    let rest_legs = tickvault_app::feed_scoreboard_boot::build_rest_leg_score_lines(
-                        &summary.rest_legs,
-                    );
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
-                        groww: groww_line,
                         session_minutes: summary.session_minutes,
                         partial_coverage: summary.partial_coverage,
                         degraded: summary.degraded,
                         early_run: summary.early_run,
                         restart_partial: summary.restart_partial,
                         dhan_feed_off: summary.dhan_feed_off,
-                        groww_feed_off: summary.groww_feed_off,
-                        rest_legs,
-                        rest_legs_read_failed: summary.rest_legs_read_failed,
                     });
                 } else {
                     info!("feed_scoreboard: Telegram disabled — daily rows written only");

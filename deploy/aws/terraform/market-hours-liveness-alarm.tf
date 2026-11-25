@@ -96,7 +96,7 @@
 #   shifted to the market-hours window.
 #
 #   WEEKDAY NSE HOLIDAYS (2026-07-07 review fix): the open cron is holiday-blind
-#   (plain MON-FRI), but holiday-gate.sh SELF-STOPS the box on a definitive
+#   (plain MON-FRI), but the holiday gate SELF-STOPS the box on a definitive
 #   NSE-holiday verdict at boot (~08:32 IST) — so a blind 09:20 enable + OK
 #   reset would drive every breaching-on-missing member (this alarm +
 #   app-log-ingestion-silent) OK→ALARM against an intentionally-stopped box:
@@ -111,9 +111,9 @@
 #   holiday-blind self-healers kept restarting it all day (start-watchdog
 #   mode=check @ 08:45 IST self-start; aws-autopilot start-instances every
 #   15 min inside its 08:30-16:30 IST up-window, incl. the 03:45 UTC ≈ 09:15
-#   IST slot + GH cron jitter), and holiday-gate.sh re-stopped it ~2-3 min
+#   IST slot + GH cron jitter), and the holiday gate re-stopped it ~2-3 min
 #   after each boot — 1-3 min up-bursts that can bracket the 09:20 sample and
-#   restore the false page. Fix: holiday-gate.sh now stamps today's IST date
+#   restore the false page. Fix: the holiday gate now stamps today's IST date
 #   into the /tickvault/<env>/holiday-stop-date SSM param BEFORE the stop;
 #   (a) BOTH restarters consult it and skip the self-start (the war ends at
 #   the source — the box now genuinely stays stopped), and (b) this gate
@@ -134,56 +134,108 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# The market-hours liveness alarm — pages when tv_rest_1m_fire_heartbeat is
-# MISSING (app wedged / crash-looped / dead OR no REST 1m leg ever fired this
-# session; signal moved off tv_groww_exchange_lag_p99_seconds 2026-07-15 and
-# off the retired SLO score 2026-07-13). Actions gated to market hours.
-# HONEST SIGNAL CHOICE — tv_rest_1m_fire_heartbeat (2026-07-15):
-#   SIGNAL MOVED AGAIN 2026-07-15 (Groww live-feed retirement, operator
-#   directive: "remove the whole Groww live feed; keep only spot 1m and
-#   option chain for both brokers"). The previous gauge's ONLY sample
-#   producer — record_groww_tick in the deleted Groww bridge — died with
-#   the feed, so tv_groww_exchange_lag_p99_seconds would be MISSING all
-#   session and this breaching-on-missing alarm would false-SOS ~09:25 IST
-#   daily (the exact Phase-A failure shape, one knob later).
-#   New signal: tv_rest_1m_fire_heartbeat — an unlabeled gauge set ONCE PER
-#   PER-MINUTE FIRE by BOTH retained REST 1m spot legs
-#   (crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs,
-#   fire_one_minute). Deliberately NOT pre-registered at boot: the first
-#   set at the 09:16:01 IST fire IS the session-start signal, and
-#   metrics-exporter-prometheus re-renders the last value on every scrape
-#   thereafter — a WEDGED/DEAD/crash-looped process, or a session where NO
-#   REST leg ever fired, goes MISSING and pages. HONEST COVERAGE BOUND
-#   (2026-07-15 fix round): because the exporter re-renders the last gauge
-#   value on every scrape, a REST leg (or all of them) dying MID-SESSION
-#   after the first fire keeps the gauge published — that class is NOT
-#   covered here; it is owned by the legs' own persist-gated escalation
-#   pages (SPOT1M-01 / CHAIN-02 stage="escalation" filters). This alarm's
-#   real coverage = process/exporter death + never-fired sessions.
-#   The 1.0 value is a constant marker — only sample PRESENCE matters.
-#   BATCH-MODE note (2026-07-15 fix round): the Dhan spot leg's
-#   batch_catchup loop now ALSO stamps the heartbeat once per batch cycle,
-#   so every retained REST spot mode sets it; residual — a large
-#   batch_interval_minutes whose FIRST grid fire lands after the 09:20 IST
-#   gate-open + 5x60s eval still pages until that first cycle
-#   (per_minute is the supported default).
+# The market-hours liveness alarm — pages when the app's liveness signal is
+# MISSING (app wedged / crash-looped / dead). Actions gated to market hours.
+#
+# SIGNAL MOVED THREE TIMES, and each move is recorded because each was forced
+# by a producer dying rather than by a preference:
+#   2026-07-13  off the retired SLO score
+#   2026-07-15  off tv_groww_exchange_lag_p99_seconds (Groww live feed retired)
+#   2026-09-16  off tv_rest_1m_fire_heartbeat  ← current
+#
+# HONEST SIGNAL CHOICE — tv_dhan_feed_last_tick_age_secs (2026-09-16):
+#   The heartbeat's three producers (spot_1m_rest_boot.rs x2 and
+#   dhan_cadence_executor.rs) were deleted under the operator's sockets-only
+#   directive — "Bro just remove per minute price falls and 3.41 pm accuracy
+#   check alone dude okay" (no-rest-except-live-feed-2026-06-27.md §12.10).
+#
+#   ⚠ RE-POINTING WAS NOT OPTIONAL. This alarm is treat_missing_data =
+#   "breaching", so deleting the producers without acting would have paged
+#   EVERY gated market window, forever, for a metric nothing writes. A
+#   permanently-RED alarm is worse than a permanently-green one: green gets
+#   ignored, red gets MUTED — and muting this one silently disables the
+#   app-liveness signal, which is real.
+#
+#   ⚠ RETIRING IT WAS CONSIDERED AND REFUSED ON MEASUREMENT, not preference.
+#   The obvious argument is that tv-<env>-dhan-no-ticks-flowing already covers
+#   a dead app. Measured across the gated set:
+#     market-hours-liveness-missing  60s  x 5  = ~5 min to page
+#     dhan-no-ticks-flowing         300s  x 2  = ~10 min
+#     dhan-live-lane-down           300s  x 2  = ~10 min
+#     app-log-ingestion-silent      300s  x 3  = ~15 min
+#   This is the ONLY 60-second-period alarm in the entire gated set. Retiring
+#   it would have DOUBLED detection latency on the one failure class it exists
+#   for. period and evaluation_periods are therefore UNCHANGED by this move.
+#
+#   New signal: tv_dhan_feed_last_tick_age_secs, a gauge published on the live
+#   lane's 30-second silence timer, unconditionally and BEFORE the market-hours
+#   gate — so the series is dense from the drain's first second whether or not
+#   a frame ever arrives, which is precisely what a breaching-on-missing alarm
+#   needs. It was already EMF-selected (2026-08-21), so this move costs no new
+#   metric name and no user-data byte.
+#
+#   HONEST COVERAGE BOUND, carried forward unchanged in substance: this alarm
+#   covers process/exporter DEATH. It does not cover a live process whose data
+#   has gone stale — the exporter re-renders the last gauge value on every
+#   scrape, so a lane that stops receiving keeps publishing a (climbing) age.
+#   That class is owned by tv-<env>-dhan-no-ticks-flowing, which reads the same
+#   gauge with a Maximum >= 300 threshold. The two are complementary by design:
+#   this one is the ~5-minute MISSING-data detector, that one the ~10-minute
+#   STALE-data detector.
+#
 #   Evaluation shape, treat_missing_data = "breaching", dimensions and the
 #   09:20–15:35 IST window gate are UNCHANGED (metric_name-only swap).
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   alarm_name        = "tv-${var.environment}-market-hours-liveness-missing"
-  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_rest_1m_fire_heartbeat (set once per per-minute REST 1m fire by the retained Dhan + Groww spot legs, crates/app/src/spot_1m_rest_boot.rs + groww_spot_1m_boot.rs) has not been published for ~5 min. Signal moved 2026-07-15: the Groww live feed (the previous lag gauge's only sample producer) is retired per the operator directive; missing heartbeat in-window now means the app is WEDGED/CRASH-LOOPING/OOM-killed/DEAD OR both per-minute REST legs stopped firing — both need operator action between 09:15-15:30 IST. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl + the SPOT1M-01/CHAIN-02 runbook (rest-1m-pipeline-error-codes.md). See operator-charter-forever.md §C."
+  alarm_description = "App liveness signal ABSENT during MARKET HOURS — tv_dhan_feed_last_tick_age_secs (published every 30s by the live lane's silence timer, unconditionally and before the market-hours gate) has not been published for ~5 min. MISSING here means the PROCESS is gone: wedged, crash-looping, OOM-killed or dead. It does NOT mean the feed went quiet — a live process with a stale feed keeps publishing a climbing age, and that class is owned by tv-${var.environment}-dhan-no-ticks-flowing (same gauge, Maximum >= 300). Signal moved 2026-09-16: the previous metric (tv_rest_1m_fire_heartbeat) lost all three producers when the per-minute REST legs were removed under the operator's sockets-only directive; this alarm is the only ~5-minute detector in the gated set, so it was re-pointed rather than retired. Check: SSM → the box → 'systemctl status tickvault' + 'systemctl is-failed tickvault' + 'docker ps' + tail /opt/tickvault/logs/errors.jsonl. See operator-charter-forever.md §C."
 
-  # LessThanThreshold / threshold=0 / statistic=Maximum: the lag p99 is >= 0,
-  # so a present value never satisfies <0 (present = OK); a MISSING metric is
-  # forced BREACHING below. Same math as boot-heartbeat-alarm.tf.
+  # LessThanThreshold / threshold=0 / statistic=Maximum: the metric is an AGE
+  # in seconds and is therefore >= 0, so a present value never satisfies <0
+  # (present = OK); a MISSING metric is forced BREACHING below. Same math as
+  # boot-heartbeat-alarm.tf, and it holds for the re-pointed gauge for the same
+  # reason it held for the lag p99 and the heartbeat marker before it: all
+  # three are non-negative, so only ABSENCE can trip this comparison.
   comparison_operator = "LessThanThreshold"
   evaluation_periods  = 5 # five missing 60s periods = ~5 min absent before paging
-  # 2026-07-15 (Groww live retirement): was tv_groww_exchange_lag_p99_seconds
-  # — its only sample producer (the Groww bridge) is deleted; see the
-  # 2026-07-15 HONEST SIGNAL CHOICE block above. 2026-07-13 history: was
-  # tv_realtime_guarantee_score (lane-owned publisher, retired with the lane).
-  metric_name = "tv_rest_1m_fire_heartbeat"
+  # 2026-09-16 (sockets-only removal): was tv_rest_1m_fire_heartbeat, whose
+  # THREE producers — the cadence executor and two sites in the spot-1m boot
+  # module — were all deleted with the per-minute market-data REST legs under
+  # the operator's directive recorded in
+  # `no-rest-except-live-feed-2026-06-27.md` §12.10.
+  #
+  # ⚠ THIS RE-POINT IS NOT OPTIONAL, and it is the sharp edge of that removal.
+  # This alarm is `treat_missing_data = "breaching"` (see below), so deleting
+  # the producers WITHOUT moving the metric would have paged every gated
+  # market window, every trading day, forever. A permanently-RED alarm is
+  # WORSE than a permanently-green one: green gets ignored, red gets MUTED —
+  # and muting this one silently disables the app-liveness signal it exists
+  # to carry.
+  #
+  # RETIRING it was considered and REFUSED on measurement, not preference.
+  # `dhan-no-ticks-flowing` reads the same gauge but at 2 x 300s = ~10 min;
+  # this alarm is the ONLY 60-second-period alarm in the entire gated set, so
+  # retiring it would have DOUBLED detection latency on the one failure class
+  # it covers. `period` and `evaluation_periods` are therefore UNCHANGED: the
+  # ~5-minute detection is the whole point of keeping it.
+  #
+  # The replacement is a like-for-like liveness signal: published on the
+  # drain's 30-second silence timer, unconditionally and before the
+  # market-hours gate, so it is DENSE from the drain's first second and
+  # ABSENT exactly when the app is not running. Already EMF-selected, so this
+  # is a metric_name swap and costs nothing.
+  #
+  # The two alarms are complementary rather than duplicative: this one is the
+  # ~5-minute MISSING-data detector (the process or its exporter stopped
+  # publishing at all); `dhan-no-ticks-flowing` stays the ~10-minute
+  # STALE-data detector (the gauge is present and climbing).
+  #
+  # 2026-07-15 history (Groww live retirement): was
+  # tv_groww_exchange_lag_p99_seconds — its only sample producer (the Groww
+  # bridge) was deleted; see the 2026-07-15 HONEST SIGNAL CHOICE block above.
+  # 2026-07-13 history: was tv_realtime_guarantee_score (lane-owned
+  # publisher, retired with the lane).
+  metric_name = "tv_dhan_feed_last_tick_age_secs"
   namespace   = local.app_namespace
   period      = 60
   statistic   = "Maximum"
@@ -193,7 +245,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
   treat_missing_data = "breaching"
   dimensions         = local.app_dimensions
 
-  # Actions OFF by default; the window Lambda flips them ON 09:20–15:35 IST Mon-Fri
+  # Actions OFF by default; the window Lambda flips them ON 09:20–15:40 IST Mon-Fri
   # so the intentional nightly/weekend stop (metric absent) can never false-page.
   actions_enabled = false
   alarm_actions   = local.app_alarm_actions
@@ -227,7 +279,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_liveness_missing" {
 #         DescribeInstances error — a real trading day must never lose the
 #         liveness page), then reset each alarm to OK with the exact
 #         'market-hours window opened (09:20 IST)' reason.
-#   mode="close" (15:35 IST) → disable them again so the intentional
+#   mode="close" (15:40 IST since 2026-10-26) → disable them again so the intentional
 #     off-hours state never pages.
 # The weekday-NSE-holiday safety chain (2026-07-07 rounds 1+3) lives on in
 # the Rust port and is ratcheted by
@@ -269,7 +321,7 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
       {
         # Weekday-NSE-holiday safety (2026-07-07): the open path checks the
         # tv-app instance state before enabling the breaching-on-missing
-        # alarms (holiday-gate.sh self-stops the box on holidays, so a blind
+        # alarms (the holiday gate self-stops the box on holidays, so a blind
         # MON-FRI enable would false-page). DescribeInstances has no
         # resource-level scoping in IAM (AWS limitation), so "*" is required;
         # the Lambda only ever reads EC2_INSTANCE_ID. Same pattern as
@@ -280,7 +332,7 @@ resource "aws_iam_role_policy" "tv_market_hours_liveness_gate" {
       },
       {
         # Round-3 holiday-race hardening (2026-07-07): the open path reads
-        # the /tickvault/<env>/holiday-stop-date marker holiday-gate.sh
+        # the /tickvault/<env>/holiday-stop-date marker the holiday gate
         # stamps before its self-stop — marker == today is race-proof
         # (the single instance-state sample can be bracketed by a
         # restart-war up-burst). Read-only, scoped to that one parameter.
@@ -350,7 +402,9 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
       # 2026-07-17 (dashboard tidy): dhan-exchange-lag-p99-high retired —
       # its gauge's only publisher (run_dhan_lag_publisher, dormant since
       # the PR-C2 lane deletion) is deleted with the dead Dhan-lag chain.
-      # The gate now arms 3 alarms (dhan_live_lane_down joined 2026-08-18).
+      # Joined 2026-08-18. For HOW MANY alarms the gate arms, read ALARM_NAMES
+      # above -- it is the authoritative list. A count written in prose here
+      # goes stale the next time one is added, and six of them had (2026-09-08).
       ALARM_NAMES = join(",", [
         aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name,
         # aggregator_no_seals retired 2026-07-15 (dead monitor — see
@@ -359,6 +413,36 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # WS spawn (operator Dhan noise lock; the 4 Dhan-lane alarms left the
         # list 2026-07-13).
         aws_cloudwatch_metric_alarm.app_log_ingestion_silent.alarm_name,
+        # 2026-08-29 -- hot_path_02 was ADDED HERE AND REVERTED BEFORE SHIPPING.
+        # The finding is real; the obvious fix is wrong, and both are recorded
+        # so the next session does not re-make the mistake.
+        #
+        # THE FINDING (real): one block in `tick_persistence.rs` increments
+        # `tv_ticks_dropped_total` AND `tv_ticks_spilled_total` AND emits
+        # `error!(code = HOT-PATH-02)`. The noise lock gated `ticks_spilling`
+        # expressly so the 17:30 shutdown-flush rescue stops paging every
+        # evening -- but `hot_path_02` fires on the IDENTICAL event and is NOT
+        # gated. So the nightly false page survives the gate added to stop it,
+        # and every in-session rescue pages TWICE.
+        #
+        # WHY GATING THE CODE IS THE WRONG FIX: HOT-PATH-02 has **33 emit
+        # sites across four files** -- dhan_feed_stack (12), depth_persistence
+        # (11), tick_persistence (9) and seal_writer_loop (1). The seal writer
+        # is a different subsystem from the tick spill entirely. Adding this
+        # alarm to the gate silences all 33 overnight to quiet one, which is
+        # strictly worse than the double page it fixes.
+        #
+        # (An earlier draft of this very entry asserted "HOT-PATH-02 has one
+        # emit site". It does not. The claim was checked with one grep and
+        # reverted before it shipped -- recorded because a confident false
+        # premise attached to an alarm-silencing change is the exact failure
+        # this file keeps finding elsewhere.)
+        #
+        # THE RIGHT FIX, not taken here: scope the filter by `$.source` the way
+        # the WS-GAP-03 alarms do, so only the spill-rescue emit is gated and
+        # the other 32 sites keep paging. That needs a `source` field on that
+        # one emit site plus its own filter -- a code change, its own unit of
+        # work, and its own dated row in the noise lock.
         # 2026-08-18: dhan_live_lane_down JOINS the gate. It is not an
         # off-hours false-pager like the others here — it is the opposite
         # problem. Its treat_missing_data flipped notBreaching -> breaching in
@@ -369,6 +453,135 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # are one change: separating them re-creates the nightly false page the
         # old comment correctly warned about.
         aws_cloudwatch_metric_alarm.dhan_live_lane_down.alarm_name,
+        # 2026-08-21: dhan_no_ticks_flowing JOINS the gate, for the same reason
+        # and under the same rule as dhan_live_lane_down directly above.
+        #
+        # It treats missing data as breaching because a lane that dials and
+        # never receives a frame never REGISTERS its counter series at all —
+        # the drain's counter handles are built lazily inside the frame arm —
+        # so notBreaching would read a completely dark feed as health. That is
+        # the same blindness the flip above was made to fix, arriving from a
+        # different direction.
+        #
+        # `breaching` is only safe while something disables the actions
+        # overnight, and this list is that something. Authorization and the
+        # binding constraints are the dated §2.3b row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above.
+        aws_cloudwatch_metric_alarm.dhan_no_ticks_flowing.alarm_name,
+        # 2026-08-21: the two SPILL-TIER alarms JOIN the gate.
+        #
+        # Unlike the two directly above, these are notBreaching — a stopped box
+        # publishes nothing and that is health, not a failing drain. So they do
+        # not NEED the gate to avoid a missing-data page. They join it for the
+        # other reason: both fire at threshold 1 on a cumulative Sum, and the
+        # box's own shutdown flush is exactly when a last-moment spill is most
+        # likely. Without the gate that lands as a 17:30 page every evening it
+        # happens, on a box that is deliberately going away.
+        #
+        # Authorization and the binding constraints are the dated §2.3c row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES above (it is authoritative).
+        # 2026-10-22: depth_steering_stalled LEFT the gate with its alarm
+        # (deleted by the alarm review under operator Quote 37, noise-lock
+        # §2.14; depth is switched off). Restore both together if depth
+        # returns.
+        # 2026-09-08: aggregator_refusal_rate_high JOINS the gate, because it
+        # was firing on windows that lie ENTIRELY BEFORE THE MARKET OPENS.
+        #
+        # THE INCIDENT. The operator was paged at 09:07 IST with "more than a
+        # quarter of prices arrive with a bad time stamp -- normal is under
+        # 10%". The alarm's period is 300 s with evaluation_periods = 2, so the
+        # windows it judged spanned roughly 08:57-09:07 -- the pre-open, when
+        # almost nothing has printed.
+        #
+        # WHY THAT PRODUCES A HIGH RATIO WITH NOTHING WRONG. The numerator
+        # tv_aggregator_tick_refused_total folds SIX reason labels (the EMF
+        # processor sums label values into one series). Three of them --
+        # untraded_sentinel, untraded_timestamp, stale_trading_day -- are the
+        # "this instrument has not traded today" population, which before the
+        # bell is nearly every option strike in the universe. The ratio is
+        # therefore structurally high pre-open and says nothing about the feed.
+        # The 25% threshold was calibrated against SESSION-scale figures
+        # (2.41% on 2026-08-27, 7.0% on 2026-08-28), never against a pre-open
+        # window.
+        #
+        # WHY THE GATE IS THE RIGHT FIX AND NOT A NARROWED NUMERATOR. Splitting
+        # the benign reasons out of the numerator is the better long-term
+        # answer and is NOT taken here: the six reasons share one metric name
+        # by construction, so separating them means a new EMF name -- ~$0.30/mo
+        # against a September forecast of $142.24 and an automatic
+        # STOP_EC2_INSTANCES line at $135.00. That needs an operator lever, not
+        # a cost note. The gate costs nothing and removes the false page today.
+        #
+        # WHAT THE GATE DOES NOT FIX, stated so it is not mistaken for fixed:
+        # in-session the ratio still folds benign reasons into a defect
+        # threshold, so a genuine timestamp regression and a quiet market are
+        # still not distinguishable by this alarm alone. The per-reason split
+        # lives only in the 30-second AGGREGATOR-DROP-01 log line.
+        # 2026-08-26: dhan_worst_socket_deaf JOINS the gate — OPERATOR-APPROVED
+        # ("Yes, phone me", 2026-08-26).
+        #
+        # It is notBreaching, so unlike dhan_live_lane_down and
+        # dhan_no_ticks_flowing it does not NEED the gate to avoid a
+        # missing-data page. It needs the gate for the OTHER reason, and the
+        # reason is daily rather than occasional: after the 15:30 close every
+        # socket legitimately stops delivering, so the worst-connection age
+        # climbs past its 600 s threshold within ten minutes and this alarm
+        # would fire on a market that is simply shut — every single trading
+        # day, at ~15:40. That is the fastest possible way to train an operator
+        # to ignore an alarm, which is exactly what this file's own notes on
+        # the two alarms above warn about.
+        #
+        # Authorization and the binding constraints are the dated §2.3i row in
+        # dhan-rest-only-noise-lock-2026-07-14.md. Count: read ALARM_NAMES
+        # alarms — this one and the depth-steering sibling added the same day.
+        # 2026-09-01: the THREE "did it run?" alarms JOIN the gate.
+        #
+        # These are a different shape from everything above and the reason is
+        # arithmetic, not judgement. Each watches a Lambda whose EventBridge
+        # schedule is MON-FRI, with period = 86400, evaluation_periods = 1 and
+        # treat_missing_data = "breaching". On Saturday and Sunday the watched
+        # Lambda correctly does not run, so its Invocations datapoint is
+        # ABSENT, so every one of them breaches -- roughly six pages every
+        # weekend, on three checks that are working exactly as designed.
+        #
+        # treat_missing_data is deliberately NOT changed: ABSENCE IS THE
+        # CONDITION these alarms detect (a dropped schedule produces no
+        # invocation and therefore no error, which is why their sibling Errors
+        # alarms are structurally blind to it). Flipping them to notBreaching
+        # would silence the weekend noise by making the check itself blind --
+        # trading a false page for a false OK, which is the worse of the two.
+        #
+        # The gate is the correct half to change: it disables their ACTIONS
+        # from Friday 15:35 IST to Monday 09:20 IST, so the weekend ALARM
+        # transition happens silently, and the open path's reset-to-OK (which
+        # now runs BEFORE enable, corrected 2026-08-28) means Monday morning
+        # brings no spurious "recovered" page either.
+        #
+        # Detection is not materially weakened: all three watched Lambdas fire
+        # in the morning (08:45, 08:50, 08:50/09:20 IST), so a dropped weekday
+        # schedule is already missing by the time the gate opens at 09:20 --
+        # the reset to OK re-evaluates against a still-missing datapoint and
+        # pages within a minute or two.
+        #
+        # HONEST RESIDUAL: the open path skips enabling when the box is down or
+        # the holiday marker is today. So on a day the tv-app box fails to
+        # start, a simultaneously-dropped Lambda schedule would not page. That
+        # is accepted -- a box that did not start is itself already paged for
+        # loudly by the start-watchdog, and these three are checks ON the
+        # checks, not the primary signal.
+        #
+        # Count: read ALARM_NAMES above (it is authoritative).
+        # 2026-11-11 (operator Quote 53 alarm review): the deploy-watchdog and
+        # market-open-readiness did-it-run alarms were removed; the
+        # boot-heartbeat-gate one is KEPT, because that gate arms the kept
+        # boot-heartbeat-missing page. The Muhurat open below still skips it.
+        aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
+        # Joined 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x).
+        # The process publishes 0 for this gauge from its 08:30 boot until the
+        # lane dials at 09:00, and again after the post-close stand-down, so
+        # two legitimate-zero windows paged the operator before the open. It
+        # ships actions_enabled = false and is armed here only in-session.
+        aws_cloudwatch_metric_alarm.ws_no_alive_connections.alarm_name,
         # tick_gap_instruments_silent retired in PR-C3 (2026-07-14).
         # boundary_catchup_storm_dhan retired 2026-07-17 (stage-3 dead-WS
         # sweep — its metric's writer, the tick aggregator, is deleted).
@@ -376,13 +589,13 @@ resource "aws_lambda_function" "tv_market_hours_liveness_gate" {
         # groww_exchange_lag_p99_high retired 2026-07-15 (Groww live feed removal).
       ])
       # Weekday-NSE-holiday safety: the open path skips enabling when this
-      # instance is not up (holiday-gate.sh self-stop). Referencing
+      # instance is not up (the holiday gate self-stop). Referencing
       # aws_instance.tv_app.id from a Lambda env is cycle-free — the proven
       # pattern from start-watchdog-lambda.tf (the cycle concern in main.tf
       # applies only to the instance's OWN role policy).
       EC2_INSTANCE_ID = aws_instance.tv_app.id
       # Round-3 holiday-race hardening: the intentional-stop marker
-      # holiday-gate.sh writes before its self-stop. Checked FIRST on open —
+      # the holiday gate writes before its self-stop. Checked FIRST on open —
       # cannot be raced by a restart-war up-burst at the 09:20 sample.
       HOLIDAY_STOP_PARAM = "/tickvault/${var.environment}/holiday-stop-date"
     }
@@ -396,7 +609,7 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 
 # ---------------------------------------------------------------------------
 # Watch the watchman (round-13, 2026-07-06): the gate Lambda's 09:20 IST open
-# invocation is the ONLY path that arms the 2 gated alarms (the ALARM_NAMES
+# invocation is the ONLY path that arms the gated alarms (the ALARM_NAMES
 # env list above — the surviving 2026-07-06 silent-feed set; count 12 → 8 in
 # PR-C2 2026-07-14: realtime-guarantee-critical/-degraded + ws-pool-all-dead
 # + ws-failed-connections retired with the Dhan lane; → 7 same day via the
@@ -416,6 +629,10 @@ resource "aws_cloudwatch_log_group" "tv_market_hours_liveness_gate" {
 # INVOKES the Lambda (scheduler drop / disabled rule) produces no Errors
 # datapoint at all (notBreaching -> silent) — the explicit state = "ENABLED"
 # pins + the liveness alarms are the backstop.
+# (2026-09-23: the count history above stopped being maintained after
+# 2026-07-17 — it still read 2 while the live list held 12, and the list is
+# now 13 with ws-no-alive-connections. Count ALARM_NAMES; never quote a
+# number from this comment.)
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   alarm_name = "tv-${var.environment}-market-hours-gate-errors"
@@ -428,7 +645,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the
   # dead Dhan-lag publisher chain) lives HERE in
   # the comment; the description keeps only the operator-actionable core.
-  alarm_description   = "The market-hours gate Lambda FAILED - its 09:20 IST open invocation is the ONLY path that arms the 3 gated alarms (market-hours-liveness-missing, app-log-ingestion-silent, dhan-live-lane-down - the Lambda's ALARM_NAMES env is the authoritative list; trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain). A failed open leaves both disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed close leaves them armed overnight (false-page risk). NO green OK page ever follows this alarm (ok_actions suppressed - the Lambda runs 2x/day, so an auto-OK is aged-out, never a fix): manually re-arm/verify the 3 gated alarms (enable_alarm_actions / disable_alarm_actions) REGARDLESS, after reading the gate Lambda's log group."
+  alarm_description   = "The market-hours gate Lambda FAILED. Its 09:20 IST open invocation is the ONLY path that arms the gated alarms, and the Lambda's ALARM_NAMES env is the authoritative list - the ONLY place to read the current set. Do not trust any count or list written here or in a runbook: this description carried a hand-copied count until 2026-09-08 and it was wrong by 4x. A failed OPEN leaves every gated alarm disarmed for the session (the 2026-07-06 leg-3 zero-page class); a failed CLOSE leaves them armed overnight (false-page risk). NO green OK page follows this alarm - ok_actions are suppressed, because the Lambda runs twice a day so an auto-OK is an aged-out datapoint, never a fix. Read the gate Lambda log group, then manually re-arm or verify EVERY alarm named in ALARM_NAMES REGARDLESS."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -445,7 +662,7 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
   # close), so the post-ALARM auto-OK is always AGED-OUT, never a fix — a
   # recurring Rule-11 false-recovery green per failure episode. Worse, for
   # THIS watchman the green also invited skipping the manual re-arm of the
-  # 2 gated alarms (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
+  # gated alarms named in ALARM_NAMES (the leg-3 reconnect-storm pager + PR-C3's tick-gap alarm
   # retired 2026-07-14; groww-exchange-lag-p99-high + aggregator-no-seals
   # retired 2026-07-15 with the Groww live feed; boundary-catchup-storm-dhan
   # retired 2026-07-17 with the stage-3 tick-aggregator deletion;
@@ -457,10 +674,23 @@ resource "aws_cloudwatch_metric_alarm" "market_hours_gate_lambda_errors" {
 }
 
 # Open the liveness window at 09:20 IST (03:50 UTC) Mon-Fri — 5 min after the
-# 09:15 IST market open, giving the REST 1m legs' first fire (09:16:01 IST)
-# time to set tv_rest_1m_fire_heartbeat on a healthy session (2026-07-15
-# signal swap; was the Groww lag publisher's >= 50-sample budget before that,
-# and the SLO score's budget pre-2026-07-13).
+# 09:15 IST market open. The 09:20 minute is LOAD-BEARING for a reason that has
+# nothing to do with which metric this alarm reads: it is the exact minute the
+# boot-heartbeat window CLOSES, so the two hand over with no seam across the
+# market open (2026-07-09, boot-heartbeat-alarm.tf). Do not move it to suit a
+# signal.
+#
+# What the 5 minutes were originally FOR was giving the reading metric time to
+# produce its first sample on a healthy session — the REST legs' first fire at
+# 09:16:01 IST (2026-07-15 swap), the Groww lag publisher's >= 50-sample budget
+# before that, the SLO score's budget pre-2026-07-13.
+#
+# After the 2026-09-16 re-point that budget is no longer the binding
+# consideration: tv_dhan_feed_last_tick_age_secs is published on the lane's 30s
+# silence timer from the drain's first second — well before 09:15, let alone
+# 09:20 — so a healthy session has a dense series long before the window opens.
+# The handover is now the only reason this minute is what it is, and it is
+# sufficient on its own.
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   name                = "tv-${var.environment}-market-hours-liveness-open"
   description         = "Enable market-hours liveness alarm actions at 09:20 IST (Mon-Fri)"
@@ -472,12 +702,20 @@ resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_open" {
   state = "ENABLED"
 }
 
-# Close the window at 15:35 IST (10:05 UTC) Mon-Fri — 5 min after the 15:30 IST
-# market close, so post-close idle (and the 16:30 IST nightly stop) never pages.
+# Close the window at 15:40 IST (10:10 UTC) Mon-Fri, so post-close idle (and the
+# 16:30 IST nightly stop) never pages.
+#
+# 2026-10-26 (audit PR L4): was 15:35 IST (10:05 UTC), "5 min after the 15:30
+# IST market close". Since the NSE closing-auction change of 2026-08-03 the
+# session and the app's capture both end at 15:40 IST
+# (TICK_PERSIST_END_SECS_OF_DAY_IST), so the last five minutes of capture had
+# no app-death page. The feed still delivers equity packets in the closing
+# auction, so the tick-age alarms in ALARM_NAMES stay fed until 15:40
+# (Assumed from the session change; not measured on the box).
 resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_close" {
   name                = "tv-${var.environment}-market-hours-liveness-close"
-  description         = "Disable market-hours liveness alarm actions at 15:35 IST (Mon-Fri)"
-  schedule_expression = "cron(5 10 ? * MON-FRI *)"
+  description         = "Disable market-hours liveness alarm actions at 15:40 IST (Mon-Fri)"
+  schedule_expression = "cron(10 10 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_open" {
@@ -492,6 +730,119 @@ resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_close" {
   target_id = "tv-market-hours-liveness-close"
   arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
   input     = jsonencode({ mode = "close" })
+}
+
+# NSE Muhurat session arming — 2026-10-30 (owner: "go ahead and fix the
+# muhurat risk dude"; dated record in dhan-rest-only-noise-lock-2026-07-14.md
+# full text §2.15). The open/close crons above are MON-FRI, so on a weekend
+# Muhurat date (2026: Sunday 2026-11-08) the gated alarms stayed disarmed and a
+# dead app during the session reached nobody. Each Muhurat date with published
+# times (config/base.toml [[trading.muhurat_trading_dates]], mirrored in
+# var.muhurat_sessions and pinned equal by
+# crates/aws-lambdas/tests/muhurat_window_wiring_guard.rs) gets ONE dated open
+# and ONE dated close rule on the SAME gate Lambda, same ALARM_NAMES, same
+# holiday-marker and instance-state checks. No new alarm, no new page.
+#
+# Why session start + 20 minutes: the regular day opens at 09:20 for a 09:00
+# capture start; the same offset after the Muhurat pre-open start keeps the
+# no-ticks alarm from reading the app's uptime before the first tick (the
+# 2026-10-26 L4 reason arming at the old 13:30 placeholder was skipped as
+# unsafe: the reported pre-open is 14:05). Close at the configured session end.
+# Times stay on the same UTC date because var.muhurat_sessions refuses a
+# session outside 06:00-23:00 IST. Cost: 2 invokes per Muhurat date, free tier.
+locals {
+  muhurat_liveness_open_offset_minutes = 20
+  muhurat_liveness_windows = {
+    for s in var.muhurat_sessions : s.date => {
+      open_utc_minutes = (
+        tonumber(substr(s.session_start_ist, 0, 2)) * 60
+        + tonumber(substr(s.session_start_ist, 3, 2))
+        + local.muhurat_liveness_open_offset_minutes - 330
+      )
+      close_utc_minutes = (
+        tonumber(substr(s.session_end_ist, 0, 2)) * 60
+        + tonumber(substr(s.session_end_ist, 3, 2)) - 330
+      )
+      day   = tonumber(split("-", s.date)[2])
+      month = tonumber(split("-", s.date)[1])
+      year  = split("-", s.date)[0]
+    } if s.session_start_ist != ""
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_muhurat_open" {
+  for_each    = local.muhurat_liveness_windows
+  name        = "tv-${var.environment}-market-hours-liveness-muhurat-open-${each.key}"
+  description = "NSE Muhurat ${each.key}: enable market-hours liveness alarm actions 20 min after the session start"
+  schedule_expression = format(
+    "cron(%d %d %d %d ? %s)",
+    each.value.open_utc_minutes % 60,
+    floor(each.value.open_utc_minutes / 60),
+    each.value.day,
+    each.value.month,
+    each.value.year,
+  )
+  state = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_rule" "tv_market_hours_liveness_muhurat_close" {
+  for_each    = local.muhurat_liveness_windows
+  name        = "tv-${var.environment}-market-hours-liveness-muhurat-close-${each.key}"
+  description = "NSE Muhurat ${each.key}: disable market-hours liveness alarm actions at the session end"
+  schedule_expression = format(
+    "cron(%d %d %d %d ? %s)",
+    each.value.close_utc_minutes % 60,
+    floor(each.value.close_utc_minutes / 60),
+    each.value.day,
+    each.value.month,
+    each.value.year,
+  )
+  state = "ENABLED"
+}
+
+resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_muhurat_open" {
+  for_each  = local.muhurat_liveness_windows
+  rule      = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_open[each.key].name
+  target_id = "tv-market-hours-liveness-muhurat-open"
+  arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
+  # The did-it-run alarms watch MON-FRI Lambdas (Invocations < 1 over a
+  # day, breaching): armed on a weekend Muhurat date they would page for a
+  # check that correctly did not run, so the gate leaves them disarmed
+  # (market_hours_gate::alarms_to_open, a subset only). 2026-11-11 (operator
+  # Quote 53, docs/audits/2026-11-alarm-review.md): the deploy-watchdog and
+  # market-open-readiness ones were removed, so one is left to skip.
+  input = jsonencode({
+    mode = "open"
+    skip_alarms = [
+      aws_cloudwatch_metric_alarm.boot_heartbeat_gate_not_invoked.alarm_name,
+    ]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "tv_market_hours_liveness_muhurat_close" {
+  for_each  = local.muhurat_liveness_windows
+  rule      = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_close[each.key].name
+  target_id = "tv-market-hours-liveness-muhurat-close"
+  arn       = aws_lambda_function.tv_market_hours_liveness_gate.arn
+  input     = jsonencode({ mode = "close" })
+}
+
+resource "aws_lambda_permission" "tv_market_hours_liveness_muhurat_open" {
+  for_each      = local.muhurat_liveness_windows
+  statement_id  = "AllowExecutionFromEventBridgeMuhuratOpen${replace(each.key, "-", "")}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_open[each.key].arn
+}
+
+resource "aws_lambda_permission" "tv_market_hours_liveness_muhurat_close" {
+  for_each      = local.muhurat_liveness_windows
+  statement_id  = "AllowExecutionFromEventBridgeMuhuratClose${replace(each.key, "-", "")}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.tv_market_hours_liveness_gate.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.tv_market_hours_liveness_muhurat_close[each.key].arn
 }
 
 resource "aws_lambda_permission" "tv_market_hours_liveness_open" {
@@ -511,7 +862,7 @@ resource "aws_lambda_permission" "tv_market_hours_liveness_close" {
 }
 
 output "market_hours_liveness_alarm_name" {
-  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app OR a session where NO REST 1m leg ever fired, in the 09:20-15:35 IST window). Signal: the tv_rest_1m_fire_heartbeat gauge MISSING (treat_missing_data=breaching) — set once per per-minute fire by the retained REST 1m spot legs (spot_1m_rest_boot.rs + groww_spot_1m_boot.rs), in the CW-agent filter (user-data.sh.tftpl). Signal moved off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entry (app-log-ingestion-silent — list trimmed to 2 on 2026-07-17: boundary-catchup-storm-dhan retired with the stage-3 tick-aggregator deletion + dhan-exchange-lag-p99-high retired with the dead Dhan-lag chain; previously trimmed to 4 on 2026-07-15 with the Groww live-feed retirement)."
+  description = "Market-hours liveness alarm (pages on a wedged/crash-looped/dead app in the 09:20-15:40 IST window). Signal: the tv_dhan_feed_last_tick_age_secs gauge MISSING (treat_missing_data=breaching) — published every 30s by the live lane's silence timer, in the CW-agent EMF selector (deploy/aws/cloudwatch-agent.json). Signal moved off tv_rest_1m_fire_heartbeat on 2026-09-16 (the per-minute REST legs were removed under the operator's sockets-only directive, taking all three of that gauge's producers with them; re-pointed rather than retired because at 60s x 5 this is the only ~5-minute detector in the gated set), off tv_groww_exchange_lag_p99_seconds on 2026-07-15 (Groww live-feed retirement) and off tv_realtime_guarantee_score on 2026-07-13 (PR-C2). Takes over from the boot-heartbeat window at exactly 09:20 IST (2026-07-09 — no seam over the 09:15 open). The same gate Lambda also window-gates the other ALARM_NAMES entries."
   value       = aws_cloudwatch_metric_alarm.market_hours_liveness_missing.alarm_name
 }
 

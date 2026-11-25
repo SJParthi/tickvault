@@ -51,28 +51,94 @@ pub fn gate_result(mode: GateMode, enabled: bool) -> Value {
     json!({"mode": mode.as_str(), "enabled": enabled})
 }
 
+/// The mode the gate actually runs (2026-11-07). An `open` on a day that is
+/// not a regular NSE trading day (`nse_calendar`: weekend, NSE holiday,
+/// Muhurat date) runs as `close`: the box is stopped by the holiday gate
+/// within minutes of its 08:30 start, the app never sends its boot
+/// heartbeat, and an armed alarm paged "App boot heartbeat ABSENT" on every
+/// weekday NSE holiday (next: Tue 2026-11-10). Closing instead of skipping
+/// also disarms an alarm a missed close left armed. Pure.
+#[must_use]
+pub fn effective_mode(mode: GateMode, now_utc: chrono::DateTime<chrono::Utc>) -> GateMode {
+    if mode == GateMode::Open && !crate::nse_calendar::is_nse_trading_day_at(now_utc) {
+        GateMode::Close
+    } else {
+        mode
+    }
+}
+
 /// Entry point. UNPROVEN until deploy: the live CloudWatch legs run only
 /// in a real Lambda invoke.
 pub async fn handle(event: Value) -> Result<Value, Error> {
     let alarm_name =
         std::env::var("ALARM_NAME").map_err(|_| Error::from("ALARM_NAME env var is missing"))?;
-    let mode = GateMode::from_event(&event);
+    let requested = GateMode::from_event(&event);
+    let mode = effective_mode(requested, chrono::Utc::now());
+    if mode != requested {
+        info!(
+            alarm = %alarm_name,
+            "boot-heartbeat open skipped: not an NSE trading day — actions kept disabled"
+        );
+    }
 
     let config = crate::clients::sdk_config().await;
     let cw = crate::clients::cloudwatch(&config);
 
     match mode {
         GateMode::Open => {
-            cw.enable_alarm_actions()
-                .alarm_names(&alarm_name)
-                .send()
-                .await?;
-            // Reset to OK on open so a stale ALARM from a prior window does
-            // not immediately re-fire on the first enabled evaluation.
-            cw.set_alarm_state()
+            // ORDER IS LOAD-BEARING -- corrected 2026-08-28.
+            //
+            // Reset FIRST, enable SECOND. AWS runs an alarm's actions on
+            // `SetAlarmState` whenever the new state differs from the old one,
+            // so doing this the other way round paged the operator every single
+            // trading morning: the box stops at 17:30, `treat_missing_data =
+            // breaching` puts the alarm into ALARM overnight, and the 09:20
+            // reset to OK then fired `ok_actions` -- a "recovered" message for
+            // a condition that was the box being switched off on schedule.
+            //
+            // Dropping `ok_actions` would also have silenced the case that
+            // matters, where one of these alarms fires mid-session and really
+            // does recover. Resetting while actions are still disabled costs
+            // nothing and keeps that signal.
+            //
+            // It also closes the mirror-image hole: enabling first left a
+            // window in which a STALE ALARM had live actions, so the old order
+            // could fire a spurious alarm page as well as a spurious recovery.
+            // THE RESET MUST NOT BE ABLE TO BLOCK THE ARM (2026-08-28).
+            //
+            // This was `.await?`, and the `?` is the whole defect: a transient
+            // SetAlarmState failure propagated out of the handler and
+            // `enable_alarm_actions` below never ran — leaving the alarm
+            // action-DISABLED for the entire session it was being armed for.
+            // A best-effort tidy-up would have silenced the alarm it exists to
+            // arm, which is strictly worse than the stale-state page the reset
+            // is here to avoid.
+            //
+            // Recorded plainly because this is the SECOND time: the identical
+            // bug was found and fixed in `market_hours_gate.rs` earlier the same
+            // day, and left standing here — the guard that pinned the fix read
+            // `include_str!("market_hours_gate.rs")` and was structurally unable
+            // to see this file. A guard scoped to one of two identical call
+            // sites is a guard that certifies half a fix.
+            if let Err(err) = cw
+                .set_alarm_state()
                 .alarm_name(&alarm_name)
                 .state_value(aws_sdk_cloudwatch::types::StateValue::Ok)
                 .state_reason(BOOT_OPEN_STATE_REASON)
+                .send()
+                .await
+            {
+                tracing::error!(
+                    code = "LAMBDA-AWS-02",
+                    alarm = %alarm_name,
+                    error = %err,
+                    "could not reset the alarm to OK before arming it — arming anyway. \
+                     The cost of proceeding is one possible stale page; the cost of \
+                     returning here is an alarm that stays disabled all session."
+                );
+            }
+            cw.enable_alarm_actions()
+                .alarm_names(&alarm_name)
                 .send()
                 .await?;
             info!(alarm = %alarm_name, "enabled actions");
@@ -136,6 +202,39 @@ mod tests {
             gate_result(GateMode::Close, false),
             json!({"mode": "close", "enabled": false})
         );
+    }
+
+    /// Regression (2026-11-07): the 08:50 open on Tue 2026-11-10 (NSE
+    /// holiday) armed the alarm and it paged "boot heartbeat ABSENT" after
+    /// the holiday gate stopped the box. On a non-trading day open runs as
+    /// close; on a trading day it is unchanged; close is never changed.
+    #[test]
+    fn test_regression_effective_mode_open_on_a_non_trading_day_runs_as_close() {
+        use chrono::TimeZone;
+        // 03:20 UTC = 08:50 IST, the open cron.
+        let at = |d| chrono::Utc.with_ymd_and_hms(2026, 11, d, 3, 20, 0).unwrap();
+        assert_eq!(effective_mode(GateMode::Open, at(10)), GateMode::Close);
+        assert_eq!(effective_mode(GateMode::Open, at(7)), GateMode::Close);
+        assert_eq!(effective_mode(GateMode::Open, at(8)), GateMode::Close);
+        assert_eq!(effective_mode(GateMode::Open, at(9)), GateMode::Open);
+        assert_eq!(effective_mode(GateMode::Open, at(11)), GateMode::Open);
+        for d in [9, 10] {
+            assert_eq!(effective_mode(GateMode::Close, at(d)), GateMode::Close);
+        }
+    }
+
+    /// `handle` must act on the effective mode, not the raw event mode.
+    #[test]
+    fn handle_matches_on_the_effective_mode() {
+        let src = include_str!("alarm_gate.rs");
+        let handle = &src[src.find("pub async fn handle(").unwrap()..];
+        let handle = &handle[..handle.find("\n}\n").unwrap()];
+        let effective = handle
+            .find("let mode = effective_mode(requested, chrono::Utc::now());")
+            .expect("handle computes the effective mode");
+        let matched = handle.find("match mode {").expect("handle matches on mode");
+        assert!(effective < matched);
+        assert!(!handle.contains("let mode = GateMode::from_event(&event);"));
     }
 
     #[test]

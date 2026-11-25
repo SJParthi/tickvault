@@ -14,11 +14,11 @@
 ```
    OPERATOR DEMAND                MECHANICAL PROOF
    ──────────                     ──────────────
-   "100% code coverage"      ──►  scripts/coverage-gate.sh fails build if any crate drops below its ratcheted floor (app 63.3 … common 99.5; floors only move up, 100% is the target)
+   "100% code coverage"      ──►  scripts/coverage-gate.sh fails build if any crate drops below its ratcheted floor (app 86.4 … common 99.4, test-inclusive, raised 2026-11-13 (B3), plus production-only `[production]` floors; floors only move up, 100% is the target)
    "Zero tick loss"          ──►  chaos test zero_tick_loss_alert_guard.rs
    "WS never disconnect"     ──►  SubscribeRxGuard + pool watchdog ratchet tests
    "QuestDB never fail"      ──►  rescue→spill→DLQ 3-tier; chaos_questdb_docker_pause.rs
-   "O(1) latency"            ──►  Criterion bench p99 ≤100ns; bench-gate.sh fails on >5% drift
+   "O(1) latency"            ──►  Criterion bench p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤100ns; bench-gate.sh fails on >5% drift
    "100% audit"              ──►  cross-ref test: every ErrorCode mentioned in rule file
    ...                            ...
 ```
@@ -33,11 +33,11 @@ Every demand → mechanical proof → who fails the build.
 
 | # | Operator demand | Mechanical proof in indices-only architecture | Where it lives | Fails the build if... |
 |---|---|---|---|---|
-| 1 | 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (app 63.3 · core 90.2 · storage 91.2 · trading 96.9 · api 98.6 · common 99.5; floors only move up, 100% is the target); `scripts/coverage-gate.sh` runs post-merge | `.github/workflows/ci.yml` job `coverage-and-perf` | any crate drops below its ratcheted floor |
+| 1 | 100% code coverage | `quality/crate-coverage-thresholds.toml` ratcheted per-crate floors (app 86.4 · core 94.5 · storage 93.7 · trading 97.1 · api 98.6 · common 99.4, test-inclusive, raised 2026-11-13 (B3), plus production-only `[production]` floors; floors only move up, 100% is the target); `scripts/coverage-gate.sh` runs ~~post-merge~~ **⚠ CORRECTED 2026-10-11:** on every PR inside All Green (`all-green` needs `coverage-and-perf`), and again after merge | `.github/workflows/ci.yml` job `coverage-and-perf` | any crate drops below its ratcheted floor |
 | 2 | 100% audit coverage | Every typed `NotificationEvent` writes a row to a `<event>_audit` QuestDB table with DEDUP UPSERT KEYS | `crates/storage/src/*_audit_persistence.rs` (4 tables: order/auth/boot/selftest + 3 cross-verify + 3 option chain = 10 audit tables in the new arch) | a typed event ships without an audit row write |
 | 3 | 100% testing coverage | 22 test categories per `testing.md` (unit / integration / property / loom / dhat / fuzz / mutation / sanitizer / coverage / chaos / etc.); applied per touched crate | `.github/workflows/test.yml` + `.claude/rules/project/testing.md` | any of the 22 categories missing for a touched crate |
 | 4 | 100% code checks | 8 pre-commit + 12 pre-push + GitHub branch protection gates | `.claude/hooks/pre-commit-fast-gate.sh` + `pre-push-gate.sh` | banned-pattern / secret-scan / pub-fn-test / pub-fn-wiring / plan-verify / 9 invariants ANY one fires |
-| 5 | 100% code performance | DHAT zero-alloc tests; Criterion p99 budgets per hot-path bench; `scripts/bench-gate.sh` 5% regression gate | `quality/benchmark-budgets.toml` | any hot-path bench exceeds budget OR DHAT alloc count > 4 blocks / 8KB |
+| 5 | 100% code performance | DHAT zero-alloc tests; Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) budgets per hot-path bench; `scripts/bench-gate.sh` 5% regression gate | `quality/benchmark-budgets.toml` | any hot-path bench exceeds budget OR DHAT alloc count > 4 blocks / 8KB |
 | 6 | 100% monitoring | 10 CloudWatch metrics (free tier) covering boot/WS/ticks/QuestDB/auth/orders/PnL/kill switch/option chain age + 4 cross-verify | `aws-indices-only-locked-architecture.md` §4 | a counter exists without a Grafana panel (legacy) OR a CW alarm wired |
 | 7 | 100% logging | tracing macros mandatory (no `println!`/`dbg!`); ERROR logs route to CW Logs → SNS Lambda → Telegram | `crates/storage/tests/error_level_meta_guard.rs` | flush/persist/drain failure uses `warn!` instead of `error!` |
 | 8 | 100% alerting | 10 CloudWatch alarms in `aws-indices-only-locked-architecture.md` §4; `resilience_sla_alert_guard.rs` ratchet pins them | `crates/storage/tests/resilience_sla_alert_guard.rs` | a Prom counter has no matching alarm rule |
@@ -59,9 +59,9 @@ Every demand → mechanical proof → who fails the build.
 |---|---|---|---|
 | 1 | Zero data lost | **Bounded zero loss inside chaos envelope**: 200,000-seal ring (`SEAL_BUFFER_CAPACITY`) → NDJSON spill → DLQ. Beyond envelope, DLQ catches every payload as recoverable text. _(2026-07-18: the 100K tick rescue ring + `zero_tick_loss_alert_guard.rs` + `chaos_zero_tick_loss.rs` were DELETED with the dead tick chain, stage-2/4 sweeps)_ | `seal_ring.rs` lib ratchets + AGGREGATOR-DROP-01 pagers (`seal_drop_paging_wiring_guard.rs`) |
 | 2 | WS never disconnect | SEBI 24h JWT mandates ≥1 reconnect/day BY LAW (cannot promise "never"). **What we promise:** DETECT ≤5s, reconnect with `SubscribeRxGuard` preserving subscriptions, sleep-until-open post-close (WS-GAP-04), pool-slot supervised respawn within ~5s on unexpected clean exits (WS-GAP-05, W2#8). Plus: chaos-tested 65h Fri 16:00 → Mon 09:00 sleep/wake. | `ws_sleep_resilience.rs` + `SubscribeRxGuard` + `run_supervised_pool_slot` (W2#8) |
-| 3 | Never slow/locked/hanged | DHAT ≤4 alloc blocks / 8KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s fires coalesced Telegram. **Local hot path <1ms decision-to-wire.** Dhan-side ACK is 5–30ms (we do not control). | `dhat_*.rs` zero-alloc tests + Criterion benches + `tick_gap_detector.rs` |
+| 3 | Never slow/locked/hanged | DHAT ≤4 alloc blocks / 8KB across 10K calls; Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) ≤100ns enqueue; tick-gap >30s fires coalesced Telegram. **Local hot path <1ms decision-to-wire.** Dhan-side ACK is 5–30ms (we do not control). | `dhat_*.rs` zero-alloc tests + Criterion benches + `tick_gap_detector.rs` |
 | 4 | QuestDB never fail | QuestDB is a third-party process; we cannot prevent its failures. **What we promise:** ABSORB via 3-tier rescue→spill→DLQ + schema self-heal via `ALTER ADD COLUMN IF NOT EXISTS`. CW alarm fires within 30s. | `chaos_questdb_docker_pause.rs` + `ensure_*_table` self-heal + `tv-questdb-disconnected-30s` alarm |
-| 5 | O(1) latency | Hot path is `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded. **Bench-gated ≤5% regression.** | `quality/benchmark-budgets.toml` + `scripts/bench-gate.sh` |
+| 5 | O(1) latency | Hot path is `from_le_bytes` ~~+ `papaya` + `Arc<HashMap>` + SPSC bounded~~. **Bench-gated ≤5% regression.** **⚠ CORRECTED 2026-10-11:** hot-path lookups are a plain `HashMap` on the composite key (the candle aggregator rejects papaya on purpose); papaya is used only where other tasks read concurrently. The frame ring is one bounded channel with many producers (one per socket read task), not single-producer. A depth packet is O(levels), a tick packet O(1). | `quality/benchmark-budgets.toml` + `scripts/bench-gate.sh` |
 | 6 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS on every storage table. (At 4 IDX_I SIDs the composite is degenerate but invariant holds for future scaling.) | `dedup_segment_meta_guard.rs` ratchet + `security-id-uniqueness.md` rule |
 | 7 | Real-time proof | 7-layer telemetry (CW counter + gauge + tracing + Loki/CW Logs + Telegram + dashboard + audit table) per emission point. Cross-verify gates AT 15:31 IST daily + 08:05 IST morning. Market-open self-test at 09:16:30 IST. | §1 row 6 + `option-chain-z-plus-heart-piece.md` §4 + new `cross_verify/` module |
 
@@ -76,7 +76,7 @@ Operator says: "never miss / never disconnect / never fail / never slow." Below:
 | "Not even a single tick missed" | Network packet loss is physically possible | Bounded zero loss for the candle chain: 200K seal ring → spill → DLQ _(2026-07-18: the tick rescue ring + `TICK_BUFFER_CAPACITY` were deleted with the dead tick writer)_ | `SEAL_BUFFER_CAPACITY` constant + `seal_ring.rs` ratchet |
 | "WebSocket never disconnects" | SEBI 24h JWT forces reconnect; TCP RST can happen | Detect ≤5s, reconnect with sub preservation, ≤30s end-to-end RTO | `disaster-recovery.md` §5/§6 |
 | "QuestDB never fails" | Third-party process | Absorb via 3-tier + alarm within 30s | §2 row 4 |
-| "Never slow / locked / hanged" | OS scheduler can preempt | Hot-path DHAT bounded + Criterion p99 budgets + tick-gap detector >30s alarm | §2 row 3 |
+| "Never slow / locked / hanged" | OS scheduler can preempt | Hot-path DHAT bounded + Criterion p99 (CORRECTED 2026-10-12, TRU-2: bench-gate reads Criterion's MEDIAN against the budget, after merge and nightly only; no percentile is measured) budgets + tick-gap detector >30s alarm | §2 row 3 |
 | "100% guarantee no hallucination" | Words are not proof | **Every claim has a ratchet test that fails the build if claim breaks.** That is the only honest 100%. | This whole doc |
 
 Per operator-charter §F mandatory wording: **the only honest 100% claim is "100% inside the tested envelope, with ratcheted regression coverage."** Any other phrasing is rejected in review.

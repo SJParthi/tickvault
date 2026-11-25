@@ -17,6 +17,14 @@
 #   route: error! -> errors.jsonl -> CloudWatch Logs -> filter -> tv_errcode_*
 #   metric -> alarm (<=5 min) -> SNS tv-alerts -> Telegram webhook Lambda.
 #
+# CODES WITH NO ALARM (2026-10-12, deep audit OBS-7): most error codes have
+#   no filter here ON PURPOSE (the Dhan noise lock keeps the page set small).
+#   That is now a recorded decision: crates/common/tests/
+#   error_code_paging_decision_guard.rs fails the build when a code is
+#   neither referenced by terraform nor listed as log-only. The non-paging
+#   way to see the log-only codes is the logs MCP tool list_novel_signatures.
+#   A digest page for them needs a dated noise-lock row first.
+#
 # HONEST ALARM COUNT: this file takes the REAL total from 33 -> 41 alarms
 # (45 with the reconnect-storm + feed-stall-restarts [pager retired
 # 2026-07-15 with the Groww live feed] + readiness-lambda-errors
@@ -99,7 +107,34 @@
 # docs/audits/2026-07-14-rest-pipeline-adversarial-audit.md): +5 entries ->
 # 17 filters + 17 alarms (~+$0.50/mo; on top of the same-day REST-CANARY-01
 # retirement and the automation-gaps +3 above; 15 + 15 after the same-day
-# PR-C3 cross-verify retirement). The audit's single biggest systemic
+# PR-C3 cross-verify retirement).
+#
+#   MEASURED 2026-09-17 — the running-total chain above is the AUDIT TRAIL of
+#   what each dated change added or retired, and it is kept for that. It is NOT
+#   the current shape, and has not been since 2026-09-16. Counted in the file
+#   rather than carried forward: 4 standalone `aws_cloudwatch_log_metric_filter`
+#   resources, 3 standalone `aws_cloudwatch_metric_alarm` resources, and 20 live
+#   `error_code_alerts` map entries (5 filters, 4 alarms and 22 entries until
+#   2026-11-11, when the operator Quote 53 alarm review,
+#   docs/audits/2026-11-alarm-review.md, removed the preopen-ready pair and
+#   four map entries; stream-silent and its two schema filters were removed in
+#   its first draft and put back after review, noise-lock §2.3s;
+#   was 18 on 2026-09-17; +3 on 2026-09-24,
+#   when the three `ws-gap-03-xverify-*` verdicts came back with the restored
+#   1-minute cross-verification — noise-lock §2.5; +1 on 2026-09-27,
+#   `aggregator-stall-01`, audit PR40d — noise-lock §2.7; +1 on 2026-10-02,
+#   `hot-path-stall-01`, noise-lock §2.8; -1 on 2026-10-22, the depth
+#   swap-emptied entry, Quote 37 alarm review — noise-lock §2.14; +1 on
+#   2026-11-12, `clock-skew-01`, Quote 57 — noise-lock §2.22; +1 on
+#   2026-11-21, `dhan-feed-time-01`, owner cards 2026-11-20 — noise-lock
+#   §2.24). Re-count with:
+#     grep -c '^resource "aws_cloudwatch_log_metric_filter"' <this file>
+#     grep -c '^resource "aws_cloudwatch_metric_alarm"'      <this file>
+#   A count in a comment is a claim, and a claim carries a date — this repo has
+#   now recorded four constraints that expired while still being quoted, so the
+#   command is written down beside the number.
+#
+# The audit's single biggest systemic
 # weakness: REST-leg paging was app-emitted Telegram ONLY — a dead app
 # notifier (or Telegram bot) silenced AUTH-GAP-05 + SPOT1M/CHAIN entirely.
 # SCOPED sub-filters (a 2026-07-14 extension of the pinned coded shape —
@@ -111,16 +146,43 @@
 #     forced re-mint INCLUDING successful self-heals, and the operator
 #     ruled those pages noise ("silent-when-healing,
 #     loud-only-when-unobtainable").
-#   - spot1m-01-escalation / chain-02-escalation match ONLY the
-#     once-per-episode stage="escalation" edge lines — the per-minute
-#     stage="minute_failed" lines are sub-edge by design (the 3-minute
-#     escalation edge is the page; a plain code filter would over-page
-#     every failed minute).
-#   - chain-04-warmup matches ONLY the down-for-the-day stage="warmup"
-#     arm — the probe_* / warmup_no_token stages are log-only-by-design
-#     respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
-#   - chain-01 is a plain coded filter (both its stages — warmup +
-#     mid_session — are once-per-episode page-worthy).
+#   - ⚠ RETIRED 2026-09-16, annotated 2026-09-17 — the four bullets below
+#     describe filters that NO LONGER EXIST. They are `spot1m-01-escalation`,
+#     `chain-02-escalation`, `chain-04-warmup` and `chain-01`, deleted with the
+#     per-minute Dhan REST legs under the operator's sockets-only directive; the
+#     full tombstone with its reasoning sits beside the map entries below, and a
+#     grep for any of the four names returns ZERO in this file.
+#
+#     The text is KEPT rather than deleted because it is the only record of WHY
+#     the scoped-sub-filter shape exists at all, and that shape is still LIVE for
+#     `auth-gap-05-remint-failed` one bullet above — the drift guard
+#     (error_code_paging_filter_drift_guard.rs) accepts exactly one extra
+#     $.field clause, and this is where that allowance is justified. Deleting
+#     the paragraph would leave the surviving exception unexplained.
+#
+#     Read every verb below in the PAST tense:
+#
+#     - spot1m-01-escalation / chain-02-escalation matched ONLY the
+#       once-per-episode stage="escalation" edge lines — the per-minute
+#       stage="minute_failed" lines were sub-edge by design (the 3-minute
+#       escalation edge was the page; a plain code filter would have over-paged
+#       every failed minute).
+#     - chain-04-warmup matched ONLY the down-for-the-day stage="warmup"
+#       arm — the probe_* / warmup_no_token stages were log-only-by-design
+#       respawn-retry arms (rest-1m-pipeline-error-codes.md §2e).
+#     - chain-01 was a plain coded filter (both its stages — warmup +
+#       mid_session — were once-per-episode page-worthy).
+#
+# 2026-09-02 UPDATE (second-sweep finding 5 — dhan-rest-only-noise-lock
+# section 2.3p): +1 entry (RESOURCE-02, ~+$0.10/mo). The process's own memory
+# early warning was log-sink-only, and until the same change it could not
+# even reach its threshold: the systemd unit set no memory directive, the
+# cgroup reported `max`, and the resolver fell back to MemTotal (~31 GiB), so
+# its 80% line sat above anything the kernel would tolerate. The unit now
+# sets MemoryHigh=20G (raised from 15G; see the unit file) (a throttle, never a kill) and OOMScoreAdjust=-900,
+# so the page and the throttle share one real ceiling. Coded filter, eval
+# 3 / dta 1, ok_recovery = true: a repeat-emitter whose OK genuinely tracks
+# the RSS falling back under the line.
 # =============================================================================
 
 locals {
@@ -154,9 +216,21 @@ locals {
   # re-boots and re-emits roughly every failing boot cycle (each cycle spans
   # TOTP_MAX_RETRIES x 30s windows) -- a repeat-emitter whose OK ~= "stopped
   # firing" (secret reconciled, or the unit stopped). Caveat: if systemd's
-  # StartLimitBurst (8/600s) ever halts the restart loop while the secret is
-  # still wrong, emissions stop and the OK would be an aged-out false
-  # recovery -- borderline, kept ON with this stated residual.
+  # StartLimitBurst (5/3600s since 2026-09-03; was 8/600s) ever halts the
+  # restart loop while the secret is still wrong, emissions stop and the OK
+  # would be an aged-out false recovery.
+  #
+  # ⚠ THAT RESIDUAL GOT LARGER on 2026-09-03 and the caveat text had not
+  # moved with it. At 8/600s the trip point was 600/8 = 75s, and a failing
+  # TOTP boot cycle spans TOTP_MAX_RETRIES x 30s -- well above it -- so the
+  # limit essentially NEVER halted this loop and the false-recovery case was
+  # close to theoretical. At 5/3600s the trip point is 720s, which a failing
+  # boot cycle CAN reach, so the halt is now a normal outcome rather than an
+  # unlikely one. Kept ON, because the alarm firing at all is the signal that
+  # matters; the OK is what must be read with the caveat, and the caveat is
+  # now the common case. The desc below tells the operator to verify the app
+  # is up before treating an OK as recovery, which is the right instruction
+  # under either pair.
   # rest-canary-01 entry RETIRED 2026-07-14 with the REST canary module
   # (operator Dhan noise lock - dhan-rest-only-noise-lock-2026-07-14.md):
   # the retained spot-1m + option-chain legs self-detect a dead Dhan REST
@@ -180,22 +254,15 @@ locals {
     # dormant while dry_run=true. Flagged follow-up (NOT this PR): a 3-line
     # error!(code = ErrorCode::Dh906OrderError.code_str(), ...) at the
     # OmsError classification site converts this to a coded filter.
-    "dh-906" = {
-      pattern     = "\"DH-906\""
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # round-4: discrete per-order reject - auto-OK ~15 min later means the episode aged out, never "orders working again" (Rule-11 false-recovery)
-      desc        = "DH-906: Dhan order error - NEVER auto-retry; fix the order. NO recovered/OK page: a reject is a discrete event, so the auto-OK ~15 min later only means the episode aged out of the lookback. NOTE: pre-armed tripwire - no coded emit site exists and dry_run=true means no live orders today; the literal arrives inside Dhan's response text via OmsError. Runbook: .claude/rules/dhan/annexure-enums.md rule 11"
-    }
+    # "dh-906" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     "auth-gap-04" = {
       pattern     = "{ $.code = \"AUTH-GAP-04\" && $.level = \"ERROR\" }"
       period      = 300
       threshold   = 1
       eval        = 3
       dta         = 1
-      ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (8/600s) halts the loop, the OK would be aged-out - stated residual (see locals header)
+      ok_recovery = true # round-4 documented ambiguity: repeat-emits per failing boot cycle under systemd Restart=always, so OK ~= stopped firing; if StartLimitBurst (5/3600s since 2026-09-03) halts the loop, the OK would be aged-out - now the COMMON case, not a remote one (see locals header)
       desc        = "AUTH-GAP-04: TOTP secret likely rotated externally - auth is DEAD until the SSM totp-secret is reconciled with dhan.co. CAVEAT on the recovered/OK page: it is trustworthy while the systemd restart loop keeps re-emitting; if systemd's StartLimitBurst halted the unit, the OK only means emissions stopped - verify the app is actually up before treating it as recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
     # RETIRED (PR-C2, 2026-07-13 — Dhan live-WS lane deletion): the
@@ -227,6 +294,28 @@ locals {
       ok_recovery = false # round-4: discrete OOM-kill event - auto-OK means the episode aged out, not that the memory pressure is resolved (Rule-11 false-recovery)
       desc        = "PROC-01: kernel OOM kill detected in this cgroup (Severity Critical). NO recovered/OK page: an OOM kill is a discrete event, so the auto-OK ~15 min later only means the episode aged out - the leak/pressure behind it is not thereby fixed; watch tv_process_rss_bytes + host memory alarms for the real recovery. Runbook: .claude/rules/project/wave-4-error-codes.md"
     }
+    # ADDED 2026-09-02 (second-sweep finding 5; noise-lock section 2.3p).
+    # RESOURCE-02 is the process's OWN memory early warning — the one signal
+    # meant to fire BEFORE the OOM killer — and it was log-sink-only. Worse,
+    # it was unreachable: the systemd unit set no memory directive, so the
+    # cgroup reported `max`, the resolver fell back to MemTotal (~31 GiB), and
+    # 80% of the whole machine is a line the kernel acts before. The unit now
+    # carries MemoryHigh=20G (a THROTTLE — deliberately no MemoryMax, which
+    # would turn a spike into a kill of the only tick-capture process) and
+    # OOMScoreAdjust=-900 (killed AFTER QuestDB, whose loss the spill tier
+    # absorbs). This alarm is the page that pairs with that throttle.
+    #
+    # Two emit sites share the code: resource_monitor.rs (the RSS-vs-ceiling
+    # arm, the intended one) and subsystem_memory.rs (the sampler-died
+    # respawn arm). Both are genuine memory-observability failures and both
+    # warrant the same triage, so a plain coded filter is correct here.
+    #
+    # ok_recovery = true: the monitor re-evaluates every cycle and re-emits
+    # while RSS stays over the line, so an OK genuinely means the RSS fell
+    # back under it (or the operator restarted the app) — the DH-901 shape,
+    # not the discrete-event proc-01 shape.
+    # "resource-02" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     # AGGREGATOR-DROP-01 (added 2026-07-09 — audit finding): the ONLY
     # silent-data-loss path for a sealed candle (ring + spill + DLQ all
     # failed), Severity::Critical, previously paged NOBODY. Emit site:
@@ -240,6 +329,27 @@ locals {
     # ages out can never mean "the candles came back" (Rule-11
     # false-recovery; the PROC-01 precedent). The counter-side pager on
     # tv_seal_writer_drain_total{kind="dropped"} lives in seal-drop-alarm.tf.
+    #
+    # ⚠ DESCRIPTION CORRECTED 2026-08-25 — the code has THREE emit sites, not
+    # one, and the old description named only the first. Two of them are the
+    # sealed-candle family this entry was written for
+    # (seal_writer_loop.rs::record_cycle_observability, the consumer side; and
+    # seal_loss_alarm.rs::record_lost_seal, the producer side added 2026-08-19
+    # for the case where the writer never spawned and the drain counter reads a
+    # flat healthy zero). The THIRD is a different failure entirely:
+    # dhan_feed_stack.rs's 30-second silence-timer arm reports the per-window
+    # DELTAS of aggregator TICK REFUSALS under the same code. An operator paged
+    # by that arm was being handed a runbook about ring/spill/DLQ and disk
+    # space, for an incident about packet sanity checks and instrument-slot
+    # exhaustion. The threshold, period and eval are deliberately UNCHANGED —
+    # only the text an operator reads at 2am.
+    #
+    # That arm also EXCLUDES the by-design `out_of_session` refusal reason at
+    # the emit site, which is why the raw counter
+    # tv_dhan_feed_ingest_refused_total is deliberately NOT alarmed on the
+    # metric side: EMF folds its `reason` label by summing, so a metric alarm
+    # would page on normal pre-open traffic. Recorded in full in
+    # loss-and-retention-alarms.tf.
     "aggregator-drop-01" = {
       pattern     = "{ $.code = \"AGGREGATOR-DROP-01\" && $.level = \"ERROR\" }"
       period      = 300
@@ -247,7 +357,82 @@ locals {
       eval        = 3
       dta         = 1
       ok_recovery = false # 2026-07-09: discrete permanent data loss - the dropped sealed candles do not come back when the episode ages out (Rule-11 false-recovery; PROC-01 precedent)
-      desc        = "AGGREGATOR-DROP-01: sealed candle(s) DROPPED after ring + spill + DLQ ALL failed (Severity Critical - the only silent-data-loss path for sealed candles; by definition the host is out of memory AND out of disk AND data/dlq/ is unwritable). NO recovered/OK page: the loss is permanent - the auto-OK ~15 min later only means the episode aged out. Triage: docker/host state, df -h /data, ls -la data/spill/ data/dlq/; if the host is healthy and dirs writable, restart the app. Counter-side pager: tv-<env>-seal-writer-dropped (seal-drop-alarm.tf). Runbook: .claude/rules/project/wave-6-error-codes.md"
+      desc        = "AGGREGATOR-DROP-01 = permanent sealed-candle loss; read source and fields. (a) security_id/timeframe/cause: ring, spill and DLQ all failed (throttled). Check df -h /data, data/spill/, data/dlq/. (b) refused_price/refused_timestamp/refused_slot_exhausted, every 30s: ticks never folded into a candle. (c) source=crash_unwritten, at boot: the last process died holding seals_unwritten; find why. (d) source=seal_unrecovered: boot drain or replay gave up on seals (undecodable, refused); bytes in data/spill/archive/ for 7 days. (e) source=spill_retention: seal files over 7 days old were deleted unreplayed. (f) source=slot_exhausted: slot table full, same refusal as (b); raise AGGREGATOR_MAX_SLOTS, not disk. NO recovered/OK page. Counter pager: tv-<env>-seal-writer-dropped. Runbook: docs/error-runbooks/wave-6-error-codes.md"
+    }
+    # AGGREGATOR-STALL-01 (added 2026-09-27, audit PR40d, noise-lock §2.7 —
+    # the operator chose "Accept the wait" over a second disk or an in-memory
+    # overflow, and asked for it to be loud). Emit site:
+    # crates/storage/src/seal_writer_runner.rs::report_inline_stall, reached
+    # only when the frame drain itself waited >= SEAL_INLINE_WAIT_PAGE_MS
+    # (1,000 ms) writing a refused candle to disk, at most once a minute.
+    # Ungated: the drain only runs in session, so the line cannot fire off
+    # hours. ok_recovery = false: a wait that has ended is not a repair, and
+    # the ticks the exchange skipped during it do not come back.
+    "aggregator-stall-01" = {
+      pattern     = "{ $.code = \"AGGREGATOR-STALL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-09-27: the wait already ended when the line was written; an auto-OK would read as a repair nobody made
+      desc        = "AGGREGATOR-STALL-01 = the live feed stopped reading the socket for waited_ms (>= 1 s) while it wrote a refused candle to a stalled disk itself; the escalation queue was full or its thread had died. The candle reached disk unless outcome=Lost (that also fires AGGREGATOR-DROP-01). Ticks during the wait may have been skipped by the exchange. Fields: waited_ms, max_waited_ms, stalls since the last line (one line a minute at most). Check df -h /data, the EBS volume health and data/spill/. NO recovered/OK page. Runbook: docs/error-runbooks/wave-6-error-codes.md"
+    }
+    # HOT-PATH-STALL-01 (added 2026-10-02, noise-lock §2.8 — owner-approved
+    # "approve stall alarm"). Emit site:
+    # crates/storage/src/hot_path_telemetry.rs::report_stall, on the
+    # tv-telemetry OS thread: in session (09:00-15:40 IST) a watched heartbeat
+    # (main runtime, reader runtime, frame drain) at least 2 s old, or one
+    # hot-path stage sample at least 2 s long. Edge-triggered per signal,
+    # re-armed on recovery, at most one line a minute. ok_recovery = false: a
+    # stall that ended is not a repair, and ticks skipped meanwhile do not
+    # come back.
+    "hot-path-stall-01" = {
+      pattern     = "{ $.code = \"HOT-PATH-STALL-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-10-02: the stall already ended or is latched; an auto-OK would read as a repair nobody made
+      desc        = "HOT-PATH-STALL-01 = in session, a step on the Dhan live path stalled for at least 2 s: a tokio runtime or the frame drain made no progress (kind=heartbeat), or one socket hand-off, ring wait or runtime wake took that long (kind=stage). Socket reads may have waited and Dhan may have skipped ticks. Fields: signal, kind, stalled_secs, signals, missed_episodes (one line a minute at most). Check host CPU, disk, QuestDB, and the tv_task_heartbeat_age_seconds / tv_hot_path_stage_max_ns gauges. NO recovered/OK page. Runbook: docs/error-runbooks/hot-path-stall-error-codes.md"
+    }
+    # CLOCK-SKEW-01 (added 2026-11-12, noise-lock §2.22, Quote 57 — owner
+    # tapped "Page if 5 min in a row (Recommended)"). Emit site:
+    # crates/app/src/infra.rs::run_clock_skew_loop via
+    # crates/app/src/clock_offset_page.rs::ClockOffsetEpisode: chrony's
+    # offset over 1 ms for 5 consecutive minute samples inside 09:00-15:40
+    # IST, once per episode. A failed sample is a warn! with this code and is
+    # excluded by the level clause. ok_recovery = false: the rule forbids a
+    # recovery page.
+    "clock-skew-01" = {
+      pattern     = "{ $.code = \"CLOCK-SKEW-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-11-12: §2.22 forbids a recovery page; the episode ends silently
+      desc        = "CLOCK-SKEW-01 = chrony's clock offset was over 1 ms for 5 consecutive minute samples inside 09:00-15:40 IST. Signal, order and fill times read from this clock are off by about offset_ns (positive = clock ahead). Fields: offset_ns, consecutive_minutes, threshold_ns. Check chronyc tracking and chronyc sources on the box; host_capacity_minute.clock_offset_ns has the minute series. Once per episode. NO recovered/OK page. Runbook: docs/error-runbooks/clock-offset-and-network-rtt-error-codes.md"
+    }
+    # DHAN-FEED-TIME-01 (added 2026-11-21, owner cards 2026-11-20 "Yes, page
+    # me (Recommended)" / "After correction (Recommended)", noise-lock §2.24):
+    # the live main feed's trade times still look wrong after the Dhan
+    # trade-time correction, or no candle formed for 10 minutes while prices
+    # arrive, inside the session. At most once per cause per IST day (the
+    # latch is saved off the drain); the day is auto-held from the archive and
+    # the export. ok_recovery = false: §2.24 forbids a recovery page.
+    # 2026-11-21 (noise lock §2.24-a, owner card "Yes, always UTC
+    # (Recommended)"; daily-universe Quote 63): a THIRD reason pages through
+    # the same filter, source = "dhan_time_format_reverted" (Dhan went back to
+    # IST epoch): once per segment per IST day per process, 09:00-15:40 IST,
+    # and its day is auto-held too (the drain's feed-time scan hands it to the
+    # latch thread within 30 s). No terraform change was needed.
+    "dhan-feed-time-01" = {
+      pattern     = "{ $.code = \"DHAN-FEED-TIME-01\" && $.level = \"ERROR\" }"
+      period      = 300
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # 2026-11-21: §2.24 forbids a recovery page
+      desc        = "DHAN-FEED-TIME-01 = Dhan's live trade times look wrong during the session even after the 5 h 30 min correction (cause=prices_outside_session), or no candle formed for 10 minutes while prices arrive (cause=no_candles), or Dhan switched its trade times back to the old IST format (source=dhan_time_format_reverted; prints older than about 5.5 h are then shifted wrongly). In every case today is auto-held out of the archive and the export (within 30 s for the format reason); raw frames are kept. Once per cause per day (format reason: once per segment per day per process), no recovery page. Runbook: docs/error-runbooks/dhan-feed-time-error-codes.md"
     }
     # WAL-SUSPEND-01 (added 2026-07-10, W2 PR#6 — audit follow-up row 10):
     # a QuestDB table's WAL apply is SUSPENDED (post disk-full / apply
@@ -263,15 +448,8 @@ locals {
     # out would be a Rule-11 false recovery while the table is still
     # suspended; the real recovery signals are the falling-edge info!
     # line + tv_questdb_wal_suspended_tables returning to 0.
-    "wal-suspend-01" = {
-      pattern     = "{ $.code = \"WAL-SUSPEND-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-10: once-per-episode emitter - the auto-OK ~15 min later only means the datapoint aged out while the table may still be suspended (Rule-11 false-recovery; ws-reinject-01 precedent)
-      desc        = "WAL-SUSPEND-01: a QuestDB table's WAL apply is SUSPENDED - ingestion keeps ACKing rows while they silently stop becoming visible/applied (silent data-visibility loss; typical cause = a disk-full episode or a WAL apply error). Operator action: read the table/error_tag/error_message fields in the errors-jsonl stream, fix the underlying cause (df -h /data, QuestDB logs), then run ALTER TABLE <table> RESUME WAL in the QuestDB console - NEVER auto-executed (resuming into a still-broken disk replays the failure). NO recovered/OK page: the code fires once per suspension episode; recovery signal = the falling-edge recovery log + tv_questdb_wal_suspended_tables returning to 0. Runbook: .claude/rules/project/wal-suspension-error-codes.md"
-    }
+    # "wal-suspend-01" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
     # TICK-CONSERVE-01 (added 2026-07-14 — automation-gaps PR-3; RETIRED
     # 2026-07-18 — tick-conservation retirement, dead-WS sweep follow-up):
     # its ONLY emit site (crates/app/src/tick_conservation_boot.rs, the
@@ -315,70 +493,44 @@ locals {
       ok_recovery = false # 2026-07-14: once-per-episode mint failure - the retry-once latch holds, so the token stays dead for the session; auto-OK ~15 min later would be a Rule-11 false recovery
       desc        = "AUTH-GAP-05 forced re-mint FAILED: the mid-session watchdog detected a sustained dead Dhan token, issued its ONE forced re-mint for the episode, and the mint FAILED (permanent=true = a peer holds the dual-instance lock in-flight; permanent=false = mint HTTP/TOTP failure) - the token stays DEAD for the rest of the session (the retry-once latch holds; the 4h sweep backstop is lane-only per audit GAP-02). Successful self-heal re-mints deliberately do NOT page (trigger arm unmatched - silent-when-healing), and cooldown_skip=true mint-cooldown skips are excluded (non-terminal; the next re-arm window retries). NO recovered/OK page: recovery signal = tv_token_valid back to 1 / the next clean profile cycle. Runbook: .claude/rules/project/wave-4-error-codes.md (AUTH-GAP-05)"
     }
-    # SPOT1M-01 escalation edge (added 2026-07-14 — REST-audit GAP-03):
-    # the per-minute spot-1m REST legs (Dhan spot + Groww spot + Groww
-    # contract — all emit SPOT1M-01) page HIGH via app Telegram at the
-    # 3-consecutive-fully-failed-minutes edge; this filter is the CW
-    # backstop for exactly that edge. Stage-scoped: stage="escalation" is
-    # the ONCE-per-episode edge line (edge-latched, re-armed only after a
-    # fetch+persist-clean minute); the per-minute stage="minute_failed" /
-    # "boundary_skipped" / etc. lines fire every failed minute and are
-    # sub-edge by design — a plain code filter would over-page vs the
-    # designed 3-minute escalation (rest-1m-pipeline-error-codes.md §1).
-    "spot1m-01-escalation" = {
-      pattern     = "{ $.code = \"SPOT1M-01\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-episode edge - the recovery signal is the leg's own typed Info recovery Telegram / rows landing again, not the datapoint aging out
-      desc        = "SPOT1M-01 escalation: a per-minute REST 1m candle leg (Dhan spot, Groww spot, or Groww contract - read the feed/leg fields in the errors-jsonl stream) fully failed 3+ consecutive minutes (persist-gated: fetch-ok-but-lost rows count as failed). Fires once per episode (edge-latched). Triage: cross-check DH-901 (REST surface/token; the REST canary was retired 2026-07-14 with the Dhan noise lock), tv_spot1m_fetch_total outcome rates, QuestDB health for persist-gated episodes. NO recovered/OK page: recovery = the leg's typed recovery Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-02 escalation edge (added 2026-07-14 — REST-audit GAP-03):
-    # same contract as spot1m-01-escalation for the option-chain legs
-    # (Dhan + Groww). stage="escalation" only — per-minute sub-edge lines
-    # deliberately unmatched.
-    "chain-02-escalation" = {
-      pattern     = "{ $.code = \"CHAIN-02\" && $.level = \"ERROR\" && $.stage = \"escalation\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-episode edge - same rationale as spot1m-01-escalation
-      desc        = "CHAIN-02 escalation: a per-minute option-chain REST leg (Dhan or Groww - read the feed field) fully failed 3+ consecutive minutes (persist-gated). Fires once per episode (edge-latched). Triage: spot leg healthy + chain failing = chain-API-surface problem (entitlement wobble short of CHAIN-01, gateway); both failing = REST/token (AUTH-GAP runbooks). NO recovered/OK page: recovery = the typed ChainFetchRecovered Telegram + rows landing again. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-01 (added 2026-07-14 — REST-audit GAP-03): entitlement absent.
-    # Plain coded filter is safe: BOTH stages (warmup = day-down at boot,
-    # mid_session = revoked intra-day) fire ONCE per day/episode and are
-    # page-worthy; the probe-only path never emits CHAIN-01 (info!-level
-    # verdict only — verified 2026-07-14, option_chain_1m_boot.rs).
-    "chain-01" = {
-      pattern     = "{ $.code = \"CHAIN-01\" && $.level = \"ERROR\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-day emitter - the entitlement stays absent when the datapoint ages out (Rule-11 false-recovery)
-      desc        = "CHAIN-01: Dhan Option Chain Data-API entitlement ABSENT (DH-902/806 class) - the chain pipeline is DOWN for the day (warmup stage) or was revoked mid-session (mid_session stage). Operator action: verify the account's Data-API plan on the Dhan portal; restoring the entitlement auto-resumes at the next trading-day boot. NO recovered/OK page: the entitlement does not return when the episode ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
-    # CHAIN-04 warmup arm (added 2026-07-14 — REST-audit GAP-03): the
-    # day-start expirylist warmup exhausted its bounded retries — the
-    # chain pipeline is DOWN FOR THE DAY (expiries are never guessed).
-    # Stage-scoped to "warmup" ONLY: the probe_client_build /
-    # probe_no_token / probe_inconclusive / probe_task_exit /
-    # warmup_no_token stages are log-only-by-design transient/respawn
-    # arms (warmup_no_token REPEATS every ~30s supervisor respawn until a
-    # token exists — the AUTH-GAP runbooks own the token page); a plain
-    # code filter would page on all of them.
-    "chain-04-warmup" = {
-      pattern     = "{ $.code = \"CHAIN-04\" && $.level = \"ERROR\" && $.stage = \"warmup\" }"
-      period      = 300
-      threshold   = 1
-      eval        = 3
-      dta         = 1
-      ok_recovery = false # 2026-07-14: once-per-day emitter - the day stays chain-less when the datapoint ages out; recovery = the next trading-day boot's clean warmup
-      desc        = "CHAIN-04 warmup FAILED: the day-start option-chain expirylist warmup exhausted its bounded retries - the chain pipeline is DOWN FOR THE DAY (expiry dates are never guessed; no mid-day retry by design). Triage: cross-check DH-901 + the WS feed (the REST canary was retired 2026-07-14); a healthy REST surface with only the expirylist failing points at the option-chain API specifically. Restart the app once the REST surface is healthy to re-run the warmup, else tomorrow's boot re-warms. NO recovered/OK page: the day stays down when the datapoint ages out. Runbook: .claude/rules/project/rest-1m-pipeline-error-codes.md"
-    }
+    # ── RETIRED 2026-09-16: the four per-minute REST-leg filters ──────────
+    #
+    # `spot1m-01-escalation`, `chain-02-escalation`, `chain-01` and
+    # `chain-04-warmup` lived here. Each was the CloudWatch backstop for a
+    # coded error emitted by the per-minute Dhan spot-1m / option-chain REST
+    # pulls (`spot_1m_rest_boot.rs`, `option_chain_1m_boot.rs`, and the
+    # cadence executor that later re-fired the same HTTP).
+    #
+    # Those legs were REMOVED on 2026-09-16 under the operator's sockets-only
+    # directive — "Bro just remove per minute price falls and 3.41 pm accuracy
+    # check alone dude okay" (`no-rest-except-live-feed-2026-06-27.md` §12.10).
+    # SPOT1M-01, CHAIN-01, CHAIN-02 and CHAIN-04 now have ZERO emit sites
+    # anywhere in `crates/*/src`, so all four filters could only ever match
+    # nothing.
+    #
+    # ⚠ THEY GO IN THE SAME CHANGE AS THEIR EMIT SITES. A filter whose producer
+    # is gone reads PERMANENTLY GREEN, which is the dead-monitor class this
+    # repository retired twice before (`ws-reinject-01` 2026-07-17,
+    # `tick-conserve-01` 2026-07-18) and the reason §12.6 of the rule file makes
+    # "removes a leg's HTTP while leaving its ALARM in place" an explicit REJECT.
+    #
+    # ⚠ A stale claim these descriptions carried, corrected on the way out: two
+    # of them told the operator to "cross-check DH-901 + the WS feed (the REST
+    # canary was retired 2026-07-14)". That retirement's own rationale was that
+    # "the legs self-detect REST death in ~3-4 min via their own escalation
+    # edges" — the legs are gone, so that reasoning is void. The Dhan REST
+    # surface's health is now covered by the AUTH family above (DH-901,
+    # AUTH-GAP-05) and by the token-health gauge, which is what the auth phases
+    # in `dhan_rest_stack` exist to keep alive: a socket cannot dial without the
+    # JWT those phases produce. Recorded here so the next reader does not chase
+    # a canary that was deleted on a premise that no longer holds.
+    #
+    # Cost: −4 alarms ≈ −$0.40/mo. Their derived metrics were sparse
+    # (dimensionless, billed only in hours a code fired), so the saving is
+    # small and the point is the four green tiles that can no longer mislead.
+    #
+    # The AUTH-GAP-05 entry directly above is UNTOUCHED — its emit site is the
+    # mid-session token watchdog, which `dhan_rest_stack` still spawns.
     # =====================================================================
     # 2026-08-11 — CRITICAL-SEVERITY PAGING GAP (+4 entries -> 15 filters +
     # 15 alarms, ~+$0.40/mo; see aws-budget.md COST NOTE 2026-08-11).
@@ -396,12 +548,12 @@ locals {
     # OrphanPositionDetected, RESILIENCE-01 -> DualInstanceDetected,
     # RESILIENCE-03 -> AuthenticationFailed, OMS-GAP-03 ->
     # CircuitBreakerOpened per dhan-rest-only-noise-lock §2a) and are NOT
-    # duplicated here on cost discipline; three are BLOCKED pending a dated
+    # duplicated here on cost discipline; two are BLOCKED pending a dated
     # operator quote (AUTH-GAP-01 / DATA-805 are Dhan-scoped, and
     # dhan-rest-only-noise-lock-2026-07-14.md §3 REJECTs any new Dhan-scoped
-    # page outside its 4-item family; GROWW-OCO-02 is compiled out by the
-    # non-default `groww_orders` cargo feature — Gate 2 of the §39 lattice —
-    # so an alarm for it would be dormant-by-construction). The FOUR below
+    # page outside its 4-item family; GROWW-OCO-02 was DELETED 2026-08-21 with the
+    # Groww order-side (its emit site is gone, so its ErrorCode variant is
+    # retired) — an alarm for it would have had no producer. The FOUR below
     # are the genuinely silent, genuinely reachable, genuinely unblocked
     # remainder. Ratchet: crates/storage/tests/
     # critical_errcode_alarm_coverage_guard.rs re-derives this whole
@@ -450,8 +602,16 @@ locals {
     # this entry does not touch that lock. ok_recovery = false: a discrete
     # book-loss event - the zeroed paper positions do not come back when the
     # datapoint ages out (the aggregator-drop-01 precedent).
+    #
+    # NARROWED 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x):
+    # OMS-GAP-06 has FOUR error! sites in order_runtime.rs and three of them
+    # (paper self-test failed, dangling self-test position, non-PAPER id at
+    # the paper filler) are self-test diagnostics that paged every morning the
+    # paper self-test tripped, under this "book SILENTLY ZEROED" description,
+    # which none of them is. The page now matches only the respawn arm, which
+    # carries source = "runtime_respawn". The other three stay in errors.jsonl.
     "oms-gap-06" = {
-      pattern     = "{ $.code = \"OMS-GAP-06\" && $.level = \"ERROR\" }"
+      pattern     = "{ $.code = \"OMS-GAP-06\" && $.level = \"ERROR\" && $.source = \"runtime_respawn\" }"
       period      = 300
       threshold   = 1
       eval        = 3
@@ -600,9 +760,18 @@ locals {
     # "the feed is healthy again" from "one sparse contract happened to trade".
     # An OK page that means the second while reading as the first is worse than
     # no page at all.
+    #
+    # 2026-11-06 (noise lock dated row, owner card "Yes, quieter
+    # (Recommended)"): period 3600 -> 300. With an hour-long window one
+    # emit held the alarm in ALARM for up to an hour after the condition
+    # ended, so it read as a live problem long after silence cleared. At
+    # 300 s the alarm clears 5 minutes after the last emit. The emit side's
+    # 30-minute cooldown between pages is unchanged, so a 300 s window does
+    # not bring back the 2026-08-14 burst of ~50 messages; ok_recovery stays
+    # false (no OK page).
     "risk-gap-03" = {
       pattern     = "{ $.code = \"RISK-GAP-03\" && $.level = \"ERROR\" }"
-      period      = 3600
+      period      = 300
       threshold   = 1
       eval        = 1
       dta         = 1
@@ -612,6 +781,118 @@ locals {
       # crates/common/tests/error_code_paging_filter_drift_guard.rs.
       desc = "RISK-GAP-03: the live feed is CONNECTED BUT HEARING NOTHING from instruments it subscribed. The 30s silence scan found instruments quiet beyond their own learned cadence, or that never ticked at all - the second is the serious one, because a subscribe that silently did not take leaves NO other trace: no payload, no parse failure, no error, and every loss counter reads a healthy zero. Once per episode, session-gated so the legitimately-silent pre-open never pages. Triage on the dashboard live-lane row: never_ticked climbing means subscriptions are not taking (check tv_dhan_ws_subscribe_failed_total and the subscribe batches in the app log); silent climbing while never_ticked stays 0 is usually a thin universe on a quiet day, not a fault. Runbook: .claude/rules/project/gap-enforcement.md"
     }
+
+    # 2026-08-22 (operator: "Fix and resolve wvrytni fdude okay", given in direct
+    # response to a message naming this fix, its cost and that it needed his go —
+    # the §2.3d dated authorization).
+    #
+    # The pattern carries THREE conditions, not the usual two, and that is the
+    # whole design. WS-GAP-03 is the WebSocket connection-state code with ~50
+    # emit sites — every dial failure, reconnect and pool event uses it — so a
+    # bare `$.code = "WS-GAP-03"` filter would page on ordinary connection
+    # churn. That is the RISK-GAP-03 noise trap (25 pages in one session) with
+    # 50x the surface. `$.source = "fell_back_to_indices"` appears on exactly
+    # one ERROR emit: the universe-collapse arm in dhan_live_universe.rs. The
+    # sibling emits on that path are `info!`, so `$.level = "ERROR"` already
+    # excludes them; the source condition excludes the other 49 sites.
+    #
+    # ok_recovery = false, matching the discrete-event precedent above: the
+    # universe is chosen ONCE per boot, so an auto-OK an hour later means the
+    # datapoint aged out, never that the next session widened correctly.
+    "ws-gap-03-universe-collapse" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"fell_back_to_indices\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # chosen once per boot - an auto-OK means the datapoint aged out, not that the next session widened
+      desc        = "WS-GAP-03 universe collapse: the DHAN live feed fell back to the 4-instrument index universe. Either today's master exceeded the authorized capacity envelope, or it produced no usable widening (artifact unreadable, absent or empty). The session is running 4 instruments instead of the authorized ~24,600 and nothing else reports it: the 4 indices still tick, so the no-ticks alarm stays green and every loss counter reads a healthy zero. Triage from the same log line: capacity vs master_entries at/over the cap means the universe outgrew 25,000 (a vendor option-chain expansion is the usual cause); master_entries 0 means the artifact did not load. The running session adds today's list when it lands; restart only if it never does. Runbook: .claude/rules/project/dhan-rest-only-noise-lock-2026-07-14.md"
+    }
+
+    # ── RESTORED 2026-09-24: the three cross-verify filters ───────────────
+    #
+    # Retired 2026-09-16 with the comparator (sockets-only narrowing,
+    # `no-rest-except-live-feed-2026-06-27.md` §12.10). RESTORED 2026-09-24
+    # with it, on the operator's instruction recorded verbatim in §12.15:
+    # "Bro use the 1 min cross verification alone ... then go ahead with this
+    # S3 also dude okay?". The dated noise-lock row is
+    # `dhan-rest-only-noise-lock-2026-07-14.md` §2.5.
+    #
+    # Emit sites: `crates/app/src/dhan_live_crossverify_boot.rs`, one per
+    # `$.source` value. Shape, thresholds and `ok_recovery = false` are the
+    # removed entries unchanged — nothing new is invented.
+    #
+    # What is new is the consequence: the day marker the S3 daily archive
+    # waits for is written ONLY on a measured verdict, so a vacuous or failed
+    # run also HOLDS that day's S3 archive (bounded at
+    # MAX_CROSSVERIFY_HOLD_DAYS). These two alarms are how the operator learns
+    # the archive is waiting.
+    #
+    # Cost: +3 alarms ≈ $0.30/mo. The same removal deleted four REST-leg
+    # filters (spot1m-01-escalation, chain-02-escalation, chain-01,
+    # chain-04-warmup, ≈ $0.40/mo) whose producers stay deleted, so the bill is
+    # $0.10/mo lower than before 2026-09-16. No new EMF metric name.
+    "ws-gap-03-xverify-vacuous" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_vacuous\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run compared
+      desc        = "WS-GAP-03 cross-verify VACUOUS: the 15:41 comparison of our 1-minute candles against Dhan's own 1-minute record RAN and compared ZERO minutes. This is not a pass - it is no measurement at all. Today's S3 archive is HELD until a measured run lands (at most 3 days, then it archives anyway with a loud error). Triage from the same log line: missing_live high means the live lane produced no candles (check tv_dhan_feed_last_tick_age_secs and the no-ticks alarm); missing_rest high means Dhan's historical API did not serve the day. Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
+
+    "ws-gap-03-xverify-failed" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_failed\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run ran
+      desc        = "WS-GAP-03 cross-verify FAILED TO RUN: the 15:41 comparison of our 1-minute candles against Dhan's own 1-minute record errored out, so the day's candles are UNVERIFIED and today's S3 archive is HELD (at most 3 days). A restart of the app re-runs the check immediately. Triage: the same log line carries the underlying error in its err field; a token or QuestDB failure is the usual cause. Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
+
+    "ws-gap-03-xverify-diverged" = {
+      pattern     = "{ $.code = \"WS-GAP-03\" && $.level = \"ERROR\" && $.source = \"xverify_diverged\" }"
+      period      = 3600
+      threshold   = 1
+      eval        = 1
+      dta         = 1
+      ok_recovery = false # runs once per session - an auto-OK means the datapoint aged out, not that the next run agreed
+      desc        = "WS-GAP-03 cross-verify MASS DIVERGENCE: the 15:41 comparison ran and found MORE THAN HALF of the compared open/high/low/close prices disagreeing with Dhan's own 1-minute record. That is not sampling noise - the two records are not describing the same market, so treat the day's candles as untrustworthy until explained. The day counts as measured, so the S3 archive proceeds. Triage from the same log line: minutes_compared is the denominator, cells_diverged the numerator, noise_p95_paise / noise_max_paise say whether it is a small systematic offset or wholesale (wrong instruments, clock fault). Runbook: .claude/rules/project/no-rest-except-live-feed-2026-06-27.md"
+    }
+
+    # REMOVED 2026-10-22: the depth-socket swap-emptied entry (noise-lock
+    # section 2.3m) was deleted by the alarm review under operator Quote 37
+    # (noise-lock section 2.14, docs/audits/2026-10-alarm-review.md). The swap
+    # runs only on depth sockets, which are switched off since 2026-10-21, so
+    # the filter could not match. Turning depth back on must restore it.
+    # SCOREBOARD-01 — 2026-09-02. Authorized by the operator's reaffirmation
+    # that day; the dated quote is in
+    # dhan-rest-only-noise-lock-2026-07-14.md section 2.3q, recorded BEFORE
+    # this entry per the rule-file-first law.
+    #
+    # WHY IT WAS INVISIBLE. A 2026-09-02 sweep of every write path found
+    # ws_connection_rollup.rs is the ONE file whose flush-failure arm has no
+    # counter at all — and SCOREBOARD-01 is Severity::Medium, so
+    # error_code_alarm_coverage_guard never required it to be alarmed either.
+    # Between the two it was log-sink-only by accident, not by decision: a
+    # failed flush loses the WHOLE per-connection day summary and nothing
+    # anywhere reports it.
+    #
+    # WHY THIS IS A SAFE PAGE, NOT NOISE. The rollup runs ONCE per day, after
+    # close. A failure is a single discrete event on a cold path, so this can
+    # fire at most once a day and cannot flap — unlike risk-gap-03, which
+    # produced 25 pages in one session and is the noise case this file
+    # records. eval 1 / dta 1 because a once-daily emitter has no second
+    # datapoint to wait for.
+    #
+    # ok_recovery = false: the rollup does not retry within the day, so an OK
+    # an hour later is the datapoint ageing out, never the summary arriving.
+    # The underlying ws_event_audit and feed_episode_audit rows are unaffected
+    # and the day can be re-rolled by hand.
+    # "scoreboard-01" REMOVED 2026-11-11 (operator Quote 53, alarm review
+    # docs/audits/2026-11-alarm-review.md): its filter and alarm go together.
   }
 }
 
@@ -676,4 +957,312 @@ resource "aws_cloudwatch_metric_alarm" "error_code" {
   # suppression branch in the telegram-webhook Lambda - benefits every
   # future alarm PR.
   ok_actions = each.value.ok_recovery ? local.app_alarm_ok : []
+}
+
+# ---------------------------------------------------------------------------
+# Pre-open readiness — did the attach finish by 09:12 IST?
+# (operator 2026-08-22, recorded in dhan-rest-only-noise-lock-2026-07-14.md
+#  §2.3e BEFORE this terraform, per the rule-file-first law)
+#
+# A SEPARATE pair rather than another `local.error_code_alerts` entry, because
+# that map's shared metric_transformation hardcodes `value = "1"` — a COUNT.
+# This one needs the NUMBER: `value = "$.ready_at_ist_secs"` extracts the field
+# itself, so the metric IS the readiness second.
+#
+# Why that matters beyond tidiness: it costs ZERO user-data bytes, and the
+# log-filter lane is already in place and already carries the value.
+#
+# CORRECTED TWICE, 2026-08-25 — both the original claim and the first
+# correction were wrong, in opposite directions, and the measured numbers are
+# recorded here so there is no third time.
+#
+#   * This comment used to say the gauge "cannot ship — the user-data
+#     template renders at exactly its 15,872-byte budget with nothing free".
+#     STALE: the Groww removal and a metric rename freed space.
+#     `user_data_size_guard` measures the render at 15,841 bytes = 31 FREE.
+#   * The first correction then claimed the name was 31 bytes and so still
+#     did not fit. ALSO WRONG — that is the length of a DIFFERENT metric.
+#     `tv_dhan_preopen_ready_secs` is 26 bytes; with its separating pipe, 27.
+#     It WOULD fit in the 31 free bytes today.
+#
+# So the honest position is: the EMF route is no longer BLOCKED for this
+# gauge, and the log-filter route is kept anyway — because it already works,
+# costs nothing, and does not spend the last of a budget whose exhaustion is
+# what forced this design in the first place. That is a choice with a reason,
+# not a constraint. (For scale: `tv_dhan_feed_xverify_runs_total` is 31 bytes,
+# so with its pipe it needs 32 and genuinely does NOT fit — one byte over.)
+#
+# Filtered on the INFO completion line, NOT the ERROR line that fires on a
+# miss. The ERROR line would only ever produce a datapoint on a BAD morning —
+# alarmable, but it could never answer "how early were we today?", which is the
+# question that re-tunes STOCK_OPTION_PRICING_QUORUM_PERCENT from evidence
+# instead of defending it.
+# metric filter "preopen_ready" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
+
+# alarm "preopen_ready_late" REMOVED 2026-11-11 (operator Quote 53, alarm review
+# docs/audits/2026-11-alarm-review.md). The comments above are kept as history.
+
+# ---------------------------------------------------------------------------
+# HOT-PATH-02 — the persistence layer's own loss code (2026-08-25)
+#
+# THE GAP: HOT-PATH-02 has TEN `error!` emit sites — five in
+# `tick_persistence.rs`, five in `depth_persistence.rs` — and had no filter in
+# this file. It is the code every persistence-side loss line carries: a tick
+# flush that failed and was rescued to a spill file, a flush whose rescue ALSO
+# failed (permanently lost), a depth flush with no QuestDB connection, a depth
+# flush that failed and discarded its buffer, and the table-ensure failures
+# that can leave `ticks` auto-created WITHOUT its 5-key DEDUP — which silently
+# collapses intra-second ticks. For the DEPTH path it is the only remaining
+# loss signal at all: depth has no spill tier, so a discarded buffer is gone.
+#
+# WHY A STANDALONE PAIR, NOT A `local.error_code_alerts` ENTRY. That map is
+# lockstepped to the documented paging list in
+# `.claude/rules/project/observability-architecture.md` by
+# `error_code_paging_filter_drift_guard.rs::tf_map_and_doc_paging_list_agree_bidirectionally`,
+# so a map entry must land in the same change as its doc line. This change owns
+# terraform only. The standalone form is the same shape the `preopen_ready`
+# pair above uses and behaves identically at runtime. FLAGGED FOLLOW-UP for
+# whoever owns the rules tree next: move this into the map and add the doc
+# line, so "which codes page?" stays answerable from one place.
+#
+# SEVERITY NOTE: HOT-PATH-02 is `Severity::Low` in the enum, so
+# `error_code_alarm_coverage_guard.rs` never required a decision here — which
+# is precisely how ten emit sites on the tick and depth write paths ended up
+# with no pager. The severity is arguably wrong; changing it is a Rust-side
+# call and is deliberately not made from terraform.
+#
+# ALWAYS ARMED, no market-hours gate: the table-ensure arms fire at BOOT
+# (08:30 IST, before the gate opens at 09:20), and a discarded row is a
+# permanently missing row at any hour.
+#
+# eval 3 / dta 1 mirrors the coded entries above: a persistent condition
+# repeat-emits and holds ALARM across <=15-minute gaps, while a single
+# discarded buffer still pages on its own datapoint.
+resource "aws_cloudwatch_log_metric_filter" "hot_path_02" {
+  name           = "tv-${var.environment}-errcode-hot-path-02"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  # 2026-09-23 (dhan-rest-only-noise-lock-2026-07-14.md §2.3x): a RESCUED flush
+  # (rows written to the spill file, re-ingestable) is a degrade, not a loss,
+  # and paged the operator anyway. Those emit sites now carry
+  # `source = "rescued_to_spill"` and are excluded here. Every LOSS arm carries
+  # no such source and still pages.
+  #
+  # WHY `NOT EXISTS || !=` AND NOT A BARE `!=`: most HOT-PATH-02 emit sites
+  # (dhan_feed_stack, main, candle_ddl_boot, seal_writer_loop, ws_audit_consumer
+  # and the storage ensure arms) carry NO `source` field at all. Whether a bare
+  # `$.source != "x"` MATCHES an event with no `source` is UNVERIFIED from this
+  # repo (docs host blocked, logs:TestMetricFilter denied to the agent). The OR
+  # is correct under EITHER reading, so a missing field can never silence a
+  # loss. If the provider rejects the syntax at apply, the old filter survives
+  # the failed update — noisier, never silent.
+  pattern = "{ $.code = \"HOT-PATH-02\" && $.level = \"ERROR\" && ($.source NOT EXISTS || $.source != \"rescued_to_spill\") }"
+  metric_transformation {
+    name      = "tv_errcode_hot_path_02"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # NO dimensions (errors.jsonl carries no host field and filters cannot emit
+    # constant ones) and NO default_value (that emits a datapoint for every
+    # NON-matching event, making the metric always-billed). Sparse metric +
+    # treat_missing_data = notBreaching is the correct, near-free pairing.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "hot_path_02" {
+  alarm_name          = "tv-${var.environment}-errcode-hot-path-02"
+  alarm_description   = "HOT-PATH-02: the persistence layer lost or could not write rows. Read the fields. A flush whose rows were RESCUED to the spill file (source=rescued_to_spill) does NOT page since 2026-09-23 - it is on disk and re-ingestable. `dropped` with a spill_error = the rescue failed too and those ticks are permanently gone. On the DEPTH path `dropped` is always permanent - depth has no spill tier, so the writer discards its buffer to stop one rejected row wedging the session. stage=ensure_client_build or ensure_ddl is the quiet one: the ticks table may have been auto-created WITHOUT its 5-key DEDUP, which silently collapses intra-second ticks until a later ensure succeeds - verify with SHOW COLUMNS / the table's DEDUP keys. Raw frames remain in the write-ahead log. Runbook: docs/error-runbooks/wave-1-error-codes.md"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 3
+  datapoints_to_alarm = 1
+  metric_name         = "tv_errcode_hot_path_02"
+  namespace           = local.app_namespace
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  # Dimensionless, matching its filter (see the filter comment).
+  alarm_actions = local.app_alarm_actions
+  # NO ok_actions. Rows that were discarded do not come back, and rows that
+  # were rescued to a spill file are still not in QuestDB until someone
+  # re-ingests them - so an auto-OK when the datapoint ages out would report a
+  # recovery that nobody performed (Rule 11, the ok_recovery = false precedent
+  # above).
+  ok_actions = []
+}
+
+# ---------------------------------------------------------------------------
+# THE WATCHER OF THE WATCHERS (2026-09-02)
+#
+# Every one of the coded-error filters above reads `$.code` -- the FLAT schema.
+# The agent ships TWO files into this one log group, and only one of them
+# carries that shape:
+#
+#   data/logs/machine/errors.jsonl.2*  ->  {"level":"ERROR","code":"X",...}
+#   data/logs/machine/app.2*           ->  {"level":"ERROR","fields":{"code":"X"}}
+#
+# TIMESTAMPS DIFFER TOO (2026-10-12, deep audit OBS-15): errors.jsonl stamps
+# UTC, the app log stamps IST. A Logs Insights query over both must convert.
+#
+# So 25 of the 27 filters on this log group depend on ONE file reaching
+# CloudWatch (MEASURED live 2026-09-02, not counted from source: one is a bare
+# "DH-906" term filter that matches either schema, and tv-<env>-preopen-ready-
+# secs reads $.fields.ready_at_ist_secs and would survive). If that file's
+# glob stops matching -- exactly the 2026-07-06 incident signature, a
+# data/logs/machine/ reorg that left the agent tailing paths that no longer
+# existed -- every one of them goes permanently silent.
+#
+# And the guard that exists for that class cannot see it:
+# `app_log_ingestion_silent` (log-retention.tf) watches AWS/Logs
+# IncomingLogEvents dimensioned on the LOG GROUP, so it fires only if the
+# WHOLE group goes quiet. With app.log still flowing the group looks perfectly
+# healthy while the alarms it feeds are dead. That is a false OK on the
+# alerting path itself: the thing that tells you your alarms died is blind to
+# the only way they realistically die.
+#
+# The fix is a DETECTOR for the exact signature rather than a restructure.
+# Splitting the two files into separate log groups would give per-group
+# IncomingLogEvents for each, but it invalidates every runbook and saved query
+# that names /tickvault/<env>/app. Making those filters match both schemas
+# would double-count every error and silently break all 25 thresholds. Both
+# "fixes" cost more than the gap. Counting each schema separately costs two
+# metric filters and answers the question directly.
+# ---------------------------------------------------------------------------
+
+# Errors visible in the FLAT schema -- the population those 25 filters can see.
+resource "aws_cloudwatch_log_metric_filter" "log_schema_flat_errors" {
+  name           = "tv-${var.environment}-log-schema-flat-errors"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  # `= *` is CloudWatch's EXISTENCE test (unquoted), the same form the
+  # preopen_ready filter above uses. Anchored on the FIELD rather than on any
+  # message text: prose gets reworded, a field name is the contract.
+  pattern = "{ $.level = \"ERROR\" && $.code = * }"
+  metric_transformation {
+    name      = "tv_log_errors_flat_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+    # Sparse by design, like every filter above: billed only in hours that
+    # actually produce datapoints.
+  }
+}
+
+# The same errors as seen in the NESTED schema -- app.log's shape. This is the
+# control. It is what proves the app is still producing errors when the flat
+# count is zero, which is the difference between "a quiet session" and "the
+# stream that feeds 27 alarms has stopped arriving".
+resource "aws_cloudwatch_log_metric_filter" "log_schema_nested_errors" {
+  name           = "tv-${var.environment}-log-schema-nested-errors"
+  log_group_name = aws_cloudwatch_log_group.tv_app.name
+  pattern        = "{ $.level = \"ERROR\" && $.fields.code = * }"
+  metric_transformation {
+    name      = "tv_log_errors_nested_total"
+    namespace = "Tickvault/Prod"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+# Fires ONLY on the divergence, never on either count alone.
+#
+# A quiet session with zero errors of either shape is HEALTHY and must not
+# page -- which is why this cannot be an alarm on the flat count being zero.
+# The signature of the real failure is asymmetric: the app is demonstrably
+# still emitting errors (nested > 0) while the file the alarms read produces
+# none (flat == 0). Only that combination is a defect, so only that
+# combination alarms.
+#
+# The nested threshold is 5 rather than 1 deliberately. At the boundary of a
+# 5-minute period the two files can legitimately land in different windows for
+# one or two events; five errors present in one schema and none at all in the
+# other is not a boundary artifact.
+resource "aws_cloudwatch_metric_alarm" "errcode_stream_silent" {
+  alarm_name        = "tv-${var.environment}-errcode-stream-silent"
+  alarm_description = <<-EOT
+    The log stream that every coded-error alarm depends on has STOPPED arriving,
+    while the app is still producing errors.
+
+    25 of the 27 metric filters on this log group read $.code, which only
+    exists in data/logs/machine/errors.jsonl. This alarm fires when the app.log
+    stream shows errors ($.fields.code) and errors.jsonl shows none -- meaning
+    those 25 alarms are silent and CANNOT fire, whatever breaks next.
+
+    The log group still looks healthy, so app-log-ingestion-silent will NOT
+    catch this. That is why this alarm exists.
+
+    Triage on the box via SSM:
+      sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+      sudo tail -n 40 /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+      ls -la /opt/tickvault/data/logs/machine/
+    The agent's collect_list globs must match deploy/aws/cloudwatch-agent.json
+    (machine/errors.jsonl.2* + machine/app.2*). The 2026-07-06 signature is a
+    glob that no longer matches after a log-directory reorg.
+  EOT
+
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  threshold           = 1
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+
+  # No data at all = a session with no errors in EITHER schema = healthy.
+  treat_missing_data = "notBreaching"
+
+  metric_query {
+    id = "verdict"
+    # FILL(flat, 0) is load-bearing, not decoration. A metric filter emits a
+    # datapoint ONLY when a matching line arrives, so in the exact failure this
+    # alarm exists for -- errors.jsonl not arriving -- `flat` has NO datapoints
+    # at all. CloudWatch metric math drops any period where an input is
+    # missing, so a bare `flat < 1` would silently evaluate to nothing and the
+    # alarm would be blind in its own target case. FILL is AWS's documented
+    # tool for "a metric that only reports when the value is non-zero", which
+    # is precisely what a log metric filter is.
+    #
+    # `nested` is deliberately NOT filled: it supplies the timestamp grid, and
+    # in the failure case it is the series that HAS data. A period where
+    # neither file reports anything therefore yields no datapoint at all and
+    # falls through to treat_missing_data below -- a quiet session stays quiet.
+    expression  = "IF(nested >= 5 AND FILL(flat, 0) < 1, 1, 0)"
+    label       = "errors.jsonl stream silent while app.log still has errors"
+    return_data = true
+  }
+
+  metric_query {
+    id = "flat"
+    metric {
+      metric_name = "tv_log_errors_flat_total"
+      namespace   = "Tickvault/Prod"
+      period      = 300
+      stat        = "Sum"
+    }
+  }
+
+  metric_query {
+    id = "nested"
+    metric {
+      metric_name = "tv_log_errors_nested_total"
+      namespace   = "Tickvault/Prod"
+      period      = 300
+      stat        = "Sum"
+    }
+  }
+
+  # `local.app_alarm_actions`, the same indirection every alarm in this repo
+  # uses -- NOT a direct topic reference. A direct `aws_sns_topic.tv_alerts.arn`
+  # resolves to the same topic today and silently stops matching the moment
+  # that local gains a second target; the comment on the preopen-ready alarm
+  # above records the same lesson from its own first draft.
+  alarm_actions = local.app_alarm_actions
+
+  # No ok_actions. Recovery here means an operator repaired the agent or the
+  # glob; a datapoint ageing out of the window is not that, and a green
+  # "recovered" page for an aged-out datapoint is the false-OK class this file
+  # records repeatedly.
+  ok_actions = []
+
+  tags = {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Purpose     = "watch-the-watchers"
+  }
 }

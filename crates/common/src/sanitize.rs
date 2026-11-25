@@ -34,17 +34,72 @@ pub const MAX_AUDIT_STR_LEN: usize = 1024;
 /// row that the server accepts as garbage or rejects entirely.
 pub const ILP_SYMBOL_MAX_BYTES: usize = 256;
 
+/// Is this character forbidden inside an ILP SYMBOL value?
+///
+/// Extracted 2026-08-26 because the predicate existed TWICE — once in the
+/// `needs_strip` fast-path check and once in the `filter` that does the
+/// stripping — and two copies of a strip-set is exactly how a widening gets
+/// applied to one and not the other. Then the fast path says "clean, borrow
+/// it" while the filter would have removed something, or the reverse: an
+/// allocation whose output is identical to its input. One list, two callers.
+///
+/// Four classes, and the last is the 2026-08-26 addition:
+///
+/// 1. `,` and `=` — the ILP line-protocol TAG delimiters. A raw one splits
+///    the row into fields the server never meant to see.
+/// 2. `\n` / `\r` — ILP line terminators.
+/// 3. Every Unicode `Cc` control (`char::is_control`), which covers ASCII
+///    C0, DEL, and the C1 block U+0080..U+009F.
+/// 4. **BiDi overrides / isolates, zero-width characters and the BOM.**
+///
+/// Class 4 is what [`sanitize_ilp_string`] has stripped since the Wave-2-D
+/// audit, for two stated reasons: display-spoofing (U+202E reverses the
+/// rendering of everything after it — the "Trojan Source" shape) and
+/// grep/jq breakage on the audit logs. Both reasons apply to a SYMBOL, and
+/// a SYMBOL has a third that a STRING does not:
+///
+/// **QuestDB SYMBOL is the interned, `GROUP BY`, `WHERE`-clause column
+/// type.** `"NIFTY"` and `"NIF\u{200b}TY"` render identically in the console
+/// and are two DISTINCT symbols. So a single zero-width character in a
+/// vendor CSV silently splits one instrument into two: `WHERE symbol_name =
+/// 'NIFTY'` misses those rows and returns a confidently wrong answer, with
+/// no error anywhere. That is worse than a corrupted STRING, which at least
+/// looks corrupted.
+///
+/// Reachable, not theoretical — the SYMBOL values reaching this function
+/// include `symbol_name` / `underlying_symbol` / `isin` from the Dhan master
+/// and niftyindices CSVs (`instrument_lifecycle_persistence`,
+/// `index_constituency_persistence`, `feed_scoreboard_persistence`) and
+/// broker push-payload values (`order_update_events_persistence`,
+/// `position_update_events_persistence`). A UTF-8 BOM leading a CSV is
+/// ordinary, and one that survives header parsing lands in the first field
+/// of the first row.
+#[must_use]
+fn symbol_char_is_banned(c: char) -> bool {
+    matches!(c, '\n' | '\r' | ',' | '=')
+        || c.is_control()
+        || matches!(c,
+            '\u{202a}'..='\u{202e}'   // BiDi embeddings + overrides
+            | '\u{2066}'..='\u{2069}' // BiDi isolates
+            | '\u{200b}'..='\u{200f}' // zero-widths + LRM/RLM
+            | '\u{feff}'              // BOM / zero-width no-break space
+        )
+}
+
 /// Canonical ILP SYMBOL sanitiser — single source of truth for every
 /// movers/audit/persistence writer that calls `Buffer::symbol(...)` or
 /// `Buffer::column_str(...)` on potentially untrusted input.
 ///
 /// Three guarantees:
 ///
-/// 1. **Strip ILP-structural delimiters**: `\n`, `\r`, `,`, `=`, plus
-///    every ASCII control character. The upstream `questdb-rs` crate
-///    rejects some of these but the precise rejected-character set has
-///    drifted across library versions; strip defensively before they
-///    reach the buffer.
+/// 1. **Strip everything [`symbol_char_is_banned`] rejects**: the ILP
+///    delimiters `,` and `=`, the line terminators `\n` / `\r`, every
+///    Unicode control character, and (since 2026-08-26) the BiDi /
+///    zero-width / BOM class that can silently split one SYMBOL into two
+///    identical-looking values. The upstream `questdb-rs` crate rejects
+///    some of these but the precise rejected-character set has drifted
+///    across library versions; strip defensively before they reach the
+///    buffer.
 ///
 /// 2. **UTF-8-safe length cap** at `ILP_SYMBOL_MAX_BYTES`. Truncates at
 ///    the last char boundary ≤ the cap so multi-byte UTF-8 sequences
@@ -53,6 +108,15 @@ pub const ILP_SYMBOL_MAX_BYTES: usize = 256;
 /// 3. **Borrow-friendly**: returns `Cow::Borrowed(input)` on the common
 ///    clean+within-cap path (zero allocation). `Cow::Owned(_)` only when
 ///    sanitisation actually happened.
+///
+/// Legitimate non-ASCII is PRESERVED — an em dash, `é`, `₹`, an emoji all
+/// pass through. This is deliberately weaker than
+/// [`ilp_symbol_is_clean`], which refuses every non-ASCII byte: that one
+/// answers "is this constant provably safe at compile time", and refusing
+/// what it cannot cheaply reason about is the right answer THERE. Here the
+/// input is real vendor data and discarding every accented character in it
+/// would be data loss, not safety. So `ilp_symbol_is_clean(sanitize_ilp_symbol(x))`
+/// is NOT an invariant and must not be asserted as one.
 ///
 /// Pure function, O(n) over input length, runs at the cold ILP-build
 /// cadence (typically ≤ a few dozen rows/second) so allocation on the
@@ -74,19 +138,21 @@ pub const ILP_SYMBOL_MAX_BYTES: usize = 256;
 /// let dirty = "RELIANCE,INDUSTRIES";
 /// let out = sanitize_ilp_symbol(dirty);
 /// assert_eq!(out, "RELIANCEINDUSTRIES");
+///
+/// // A zero-width space would otherwise make a SECOND, identical-looking
+/// // symbol that `WHERE symbol_name = 'NIFTY'` never matches.
+/// assert_eq!(sanitize_ilp_symbol("NIF\u{200b}TY"), "NIFTY");
 /// ```
 #[must_use]
 pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
-    let needs_strip = input
-        .chars()
-        .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
+    let needs_strip = input.chars().any(symbol_char_is_banned);
     let needs_truncate = input.len() > ILP_SYMBOL_MAX_BYTES;
     if !needs_strip && !needs_truncate {
         return std::borrow::Cow::Borrowed(input);
     }
     let cleaned: String = input
         .chars()
-        .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
+        .filter(|c| !symbol_char_is_banned(*c))
         .collect();
     // Truncate to ILP_SYMBOL_MAX_BYTES respecting UTF-8 char boundaries.
     let bounded = if cleaned.len() > ILP_SYMBOL_MAX_BYTES {
@@ -539,6 +605,54 @@ fn redact_param_value(input: &str, key: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Is this string already an ILP-safe SYMBOL value, needing no sanitising?
+///
+/// # Why a `const fn` and not just calling [`sanitize_ilp_symbol`]
+///
+/// The ILP write paths pass CLOSED SETS of `&'static str` labels — the eight
+/// segment names, `d20`/`d200`/`d5`, `bid`/`ask`, the feed names. Running the
+/// sanitiser on them re-derives, at runtime, an answer that was fixed when the
+/// constant was written. `sanitize_ilp_symbol` returns `Cow::Borrowed` for
+/// clean input, so it ALLOCATES NOTHING and DHAT cannot see it — which is
+/// exactly why it went unnoticed: the depth writer calls it FOUR times per row
+/// and the tick writer twice, on a path whose own measured volume is
+/// ~1.53e9 depth rows per session. That is billions of character scans a
+/// session to re-confirm that the literal `"bid"` contains no comma.
+///
+/// This function answers the same question at COMPILE time, so a
+/// `const _: () = assert!(ilp_symbol_is_clean(X));` beside each constant makes
+/// a dirty label a BUILD FAILURE and the runtime scan unnecessary. That is
+/// principle 2 in its literal form: O(1) — in fact zero — or fail at compile
+/// time.
+///
+/// # Deliberately STRICTER than the sanitiser
+///
+/// Any byte outside printable ASCII is rejected, where `sanitize_ilp_symbol`
+/// strips only the specific offenders. A byte scan cannot cheaply decide
+/// `char::is_control` for the U+0080..U+009F range, and getting that wrong in
+/// the permissive direction would emit malformed ILP. So this refuses
+/// everything it is not certain about: a `true` result is a guarantee, a
+/// `false` result only means "use the sanitiser". Every label in this
+/// workspace is printable ASCII.
+#[must_use]
+pub const fn ilp_symbol_is_clean(input: &str) -> bool {
+    if input.len() > ILP_SYMBOL_MAX_BYTES {
+        return false;
+    }
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Below 0x20 is ASCII control; 0x7F is DEL and above it is non-ASCII,
+        // both refused rather than reasoned about. Comma and equals are the
+        // ILP line-protocol delimiters.
+        if b < 0x20 || b >= 0x7F || b == b',' || b == b'=' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1342,5 +1456,148 @@ mod tests {
         // Pin the constant so a future "let's bump to 1KB" PR is
         // forced to update tests + dashboards together.
         assert_eq!(ILP_SYMBOL_MAX_BYTES, 256);
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-08-26: the BiDi / zero-width / BOM class in a SYMBOL value.
+    //
+    // Found by asking whether `ilp_symbol_is_clean(sanitize_ilp_symbol(x))`
+    // holds. It does NOT, and it should not — the const predicate refuses
+    // every non-ASCII byte on purpose. But probing it surfaced a REAL
+    // asymmetry underneath: `sanitize_ilp_string` has stripped this class
+    // since the Wave-2-D audit and `sanitize_ilp_symbol` never did, while
+    // the vendor CSV fields that reach it (`symbol_name`,
+    // `underlying_symbol`, `isin`) are SYMBOL columns — the interned,
+    // GROUP-BY, WHERE-clause type where a lookalike is worse than a
+    // corruption, because it is invisible.
+    // -----------------------------------------------------------------
+
+    /// The consequence, stated as the thing an operator would actually hit:
+    /// two byte-DIFFERENT inputs that render identically must become the
+    /// SAME symbol, so `WHERE symbol_name = 'NIFTY'` cannot silently miss
+    /// rows.
+    #[test]
+    fn test_sanitize_ilp_symbol_lookalikes_collapse_to_one_symbol() {
+        let plain = sanitize_ilp_symbol("NIFTY").into_owned();
+        for lookalike in [
+            "NIF\u{200b}TY",         // zero-width space
+            "\u{feff}NIFTY",         // leading BOM, the ordinary CSV shape
+            "NIFTY\u{200d}",         // zero-width joiner
+            "NIF\u{202e}TY",         // right-to-left override
+            "\u{2066}NIFTY\u{2069}", // BiDi isolate pair
+        ] {
+            assert_eq!(
+                sanitize_ilp_symbol(lookalike).as_ref(),
+                plain,
+                "{lookalike:?} must not become a second, identical-looking symbol"
+            );
+        }
+    }
+
+    /// The over-stripping guard, and it is the half that matters: the fix
+    /// must not become "discard every non-ASCII character", which would be
+    /// data loss dressed as safety. Legitimate non-ASCII survives.
+    #[test]
+    fn test_sanitize_ilp_symbol_preserves_legitimate_non_ascii() {
+        for keep in ["ETF—NIFTY50", "CAFÉ", "₹500CE", "NIFTY😀"] {
+            assert_eq!(
+                sanitize_ilp_symbol(keep).as_ref(),
+                keep,
+                "{keep:?} is legitimate vendor text and must pass through"
+            );
+        }
+    }
+
+    /// Drift guard for the reason the predicate was extracted at all: the
+    /// fast path (`needs_strip` → borrow) and the filter (which actually
+    /// strips) are two readers of one list. If they ever disagree, either a
+    /// borrow returns unsanitised input, or an allocation returns something
+    /// byte-identical to what it was given. Borrowed MUST mean unchanged.
+    #[test]
+    fn test_sanitize_ilp_symbol_borrowed_iff_unchanged() {
+        for input in [
+            "NIFTY",
+            "",
+            "IDX_I",
+            "ETF—NIFTY50",
+            "a,b",
+            "a=b",
+            "a\nb",
+            "a\u{200b}b",
+            "\u{feff}a",
+            "a\u{202e}b",
+            "a\u{0080}b",
+            "NIFTY😀",
+        ] {
+            let out = sanitize_ilp_symbol(input);
+            let borrowed = matches!(out, std::borrow::Cow::Borrowed(_));
+            assert_eq!(
+                borrowed,
+                out.as_ref() == input,
+                "borrow/strip disagreement on {input:?}: borrowed={borrowed}, \
+                 output={:?}",
+                out.as_ref()
+            );
+        }
+    }
+
+    /// Sanitising twice must equal sanitising once. A sanitiser that is not
+    /// idempotent means the value that reaches the database depends on how
+    /// many writers it passed through.
+    #[test]
+    fn test_sanitize_ilp_symbol_is_idempotent() {
+        for input in [
+            "NIFTY",
+            "NIF\u{200b}TY",
+            "\u{feff}a,b=c\nd",
+            &"x".repeat(ILP_SYMBOL_MAX_BYTES + 7),
+            &"₹".repeat(120),
+        ] {
+            let once = sanitize_ilp_symbol(input).into_owned();
+            let twice = sanitize_ilp_symbol(&once).into_owned();
+            assert_eq!(once, twice, "not idempotent for {input:?}");
+        }
+    }
+
+    /// The output can never carry an ILP-structural character, whatever the
+    /// input — the guarantee the ILP encoder is entitled to assume.
+    #[test]
+    fn test_sanitize_ilp_symbol_output_is_never_ilp_structural() {
+        for input in [
+            "a,b=c\nd\re",
+            "\u{feff}\u{200b}\u{202e}",
+            "\u{0000}\u{001f}\u{007f}\u{0085}\u{009f}",
+            "normal",
+        ] {
+            let out = sanitize_ilp_symbol(input);
+            assert!(
+                !out.chars().any(super::symbol_char_is_banned),
+                "banned char survived from {input:?} into {:?}",
+                out.as_ref()
+            );
+            assert!(out.len() <= ILP_SYMBOL_MAX_BYTES);
+        }
+    }
+
+    /// The two functions are NOT round-trip partners, and this pins that on
+    /// purpose so nobody later "fixes" the sanitiser to satisfy an
+    /// invariant that was never the contract. `ilp_symbol_is_clean` answers
+    /// a compile-time question about `&'static str` constants and refuses
+    /// everything it cannot cheaply reason about; the sanitiser handles
+    /// real vendor data and keeps it.
+    #[test]
+    fn test_is_clean_is_deliberately_stricter_than_the_sanitiser() {
+        let sanitised = sanitize_ilp_symbol("CAFÉ");
+        assert_eq!(sanitised.as_ref(), "CAFÉ", "non-ASCII must survive");
+        assert!(
+            !ilp_symbol_is_clean(sanitised.as_ref()),
+            "if this ever passes, the const predicate started reasoning about \
+             non-ASCII — re-read both docs before assuming that is an \
+             improvement"
+        );
+        // ASCII output, however, always satisfies both.
+        assert!(ilp_symbol_is_clean(
+            sanitize_ilp_symbol("NIF\u{200b}TY").as_ref()
+        ));
     }
 }

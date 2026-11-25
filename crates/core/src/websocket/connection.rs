@@ -54,7 +54,7 @@
 //! # Complexity
 //! | Path | Cost | Note |
 //! |---|---|---|
-//! | [`classify_frame`] | O(1), zero alloc | length check + two fixed-offset byte reads |
+//! | [`classify_frame`] | O(1) on the exact-length path; **O(packets per frame)** on the stacked walk, zero alloc either way | An exact-length frame is a length check plus two fixed-offset byte reads. A main-feed frame of any OTHER length walks packet boundaries looking for a stacked disconnect (`stacked_disconnect_reason`), bounded by `MAX_PACKETS_PER_FRAME` (70,000). Since 2026-09-27 (audit PR21) a depth frame of any other length is walked the same way by the depth splitter (`stacked_depth_disconnect_reason`), same bound; the depth drain then walks the same frame a second time, O(packets) again. Corrected 2026-08-26: this row still claimed the pre-2026-08-25 cost, which is the stale-complexity-claim class this repo has recorded five times. |
 //! | [`DhanFeedSocketImpl::recv`] steady state | O(1), zero alloc *of ours* | `Bytes` move; tungstenite owns the decode buffer |
 //! | [`build_feed_url`] | O(n) in url length, allocates | cold path, once per dial |
 //! | [`build_subscribe_payload`] | O(n) in batch, allocates | cold path, ~50 messages per connect |
@@ -76,19 +76,23 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tickvault_common::constants::{
     DEEP_DEPTH_HEADER_OFFSET_FEED_CODE, DEEP_DEPTH_HEADER_SIZE, DISCONNECT_PACKET_SIZE,
-    RESPONSE_CODE_DISCONNECT,
+    MAX_PACKETS_PER_FRAME, RESPONSE_CODE_DISCONNECT,
 };
 use tickvault_common::error_code::ErrorCode;
 use tickvault_common::sanitize::redact_url_params;
-use tickvault_common::types::FeedMode;
+use tickvault_common::types::{ExchangeSegment, FeedMode};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes as WsBytes, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+// 2026-11-13 (audit B2 finding 7): the dial goes through our own TCP connect so
+// the socket has SO_KEEPALIVE on; same arguments as the library call it replaced.
+use super::ws_dial::dial_ws_tls_with_keepalive;
 use tracing::{debug, error, warn};
 use zeroize::Zeroizing;
 
@@ -99,10 +103,13 @@ use zeroize::Zeroizing;
 pub use zeroize::Zeroizing as FeedTokenBuffer;
 
 use super::pool_budget::{DhanEndpointType, MAIN_FEED_INSTRUMENTS_PER_CONNECTION};
-use super::pool_supervisor::{DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument};
+use super::pool_supervisor::{
+    DhanFeedSocket, SocketEvent, SocketFailure, SubscribeInstrument, WriteReply, WriteTicket,
+};
 use super::subscription_builder::{
     build_subscription_messages, build_twenty_depth_subscription_messages,
-    build_two_hundred_depth_subscription_message,
+    build_twenty_depth_unsubscription_messages, build_two_hundred_depth_subscription_message,
+    build_two_hundred_depth_unsubscription_message, build_unsubscription_messages,
 };
 use super::tls::{build_websocket_tls_connector, build_websocket_tls_connector_no_alpn};
 use super::types::{DisconnectCode, InstrumentSubscription};
@@ -211,17 +218,366 @@ const FEED_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long, after OUR side has sent (or answered) a WebSocket Close frame,
+/// the socket waits for the peer's half of the close handshake before the
+/// connection is dropped and the next dial can begin.
+///
+/// **Added 2026-09-02 (audit finding 4).** [`DhanFeedSocket::close`] used to
+/// send the Close frame and return immediately, so the supervisor's redial
+/// arm could be dialing the replacement socket while the old one was still a
+/// half-open connection on Dhan's side. Dhan enforces its 5-per-endpoint cap
+/// by killing the OLDEST socket (its 805 semantics), so if a not-yet-torn-down
+/// socket still counts against that cap, an instant redial gets a HEALTHY
+/// sibling killed to make room for the replacement.
+///
+/// Whether Dhan actually counts a half-open socket against the cap is
+/// **Assumed** — it is consistent with the 805-storm history in this file
+/// but has never been measured against the vendor. The wait is cheap and
+/// bounded, and it is the direction that cannot make things worse: a peer
+/// that answers promptly ends it early, and a peer that never answers costs
+/// at most this constant on a path that is about to sleep for a backoff
+/// rung anyway.
+///
+/// Two seconds: longer than an Indian-internet round trip by an order of
+/// magnitude, shorter than the shortest non-zero ladder rung, and inside the
+/// 2 s swap budget this file already accepts on the drain task. **Skipped on
+/// a bare TCP reset** — there is no peer left to answer, and waiting would
+/// only delay a recovery that is already overdue. The backoff maths in
+/// `pool_supervisor` is untouched: this wait runs BEFORE the rung sleep, not
+/// instead of it.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `DIAL_TIMEOUT` above.
+pub const CLOSE_HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
+
+/// How the bounded close handshake ended. Debug/log surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseHandshake {
+    /// The last read ended in a reset or a dead stream: nothing to wait for.
+    Skipped,
+    /// The peer's Close reply (or its stream end) arrived inside the bound.
+    Completed,
+    /// The bound elapsed with no reply: the socket is dropped regardless.
+    TimedOut,
+}
+
+impl CloseHandshake {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Completed => "completed",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Waits, bounded by [`CLOSE_HANDSHAKE_WAIT`], for the peer to finish the
+/// WebSocket close handshake after our Close frame has gone out.
+///
+/// Generic over the stream so the bound is testable against a scripted peer
+/// under `tokio::time::pause` — the real socket is `DhanFeedSocketImpl::close`.
+/// Returns on the peer's Close, on stream end, on a read error, or at the
+/// bound — whichever is first.
+///
+/// Every binary frame that still carries market data is handed to `on_frame`
+/// as it arrives, exactly as [`DhanFeedSocket::recv`] would have handed it up:
+/// a data frame, or a disconnect stacked behind data. A lone disconnect packet
+/// and control frames carry no data and are skipped. Until 2026-10-02 every
+/// frame read here was DISCARDED with no count, so each redial (depth-200
+/// rotation, ghost redial, idle teardown, park) lost whatever Dhan delivered
+/// between our Close and its reply, for up to [`CLOSE_HANDSHAKE_WAIT`].
+///
+/// Also returns the FIRST Dhan disconnect code read here, lone or stacked
+/// behind data (audit PR L1, 2026-10-26). Until then a lone disconnect packet
+/// was skipped and a stacked one was handed up as data only, so a code that
+/// arrived during the close (an 805 after a failed write, for one) was never
+/// classified: an 805 did not park, an 807 redialled without a refresh.
+async fn await_close_handshake<S, F>(
+    stream: &mut S,
+    last_read_ended_by_reset: bool,
+    endpoint: DhanEndpointType,
+    mut on_frame: F,
+) -> (CloseHandshake, Option<DisconnectCode>)
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    F: FnMut(Bytes),
+{
+    if last_read_ended_by_reset {
+        return (CloseHandshake::Skipped, None);
+    }
+    let mut first_code = None;
+    let drain = async {
+        loop {
+            match stream.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(Message::Binary(payload))) => {
+                    note_close_drain_frame(endpoint, payload, &mut on_frame, &mut first_code);
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    };
+    let verdict = match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, drain).await {
+        Ok(()) => CloseHandshake::Completed,
+        Err(_elapsed) => CloseHandshake::TimedOut,
+    };
+    (verdict, first_code)
+}
+
+/// Upper bound on frames [`drain_ready_frames`] reads in one close.
+///
+/// A socket that is never pending would otherwise hold the connection task
+/// here. 4,096 frames is far more than one receive buffer holds at the
+/// measured frame sizes; anything past it is dropped with the socket, as
+/// every frame was before this drain existed.
+const CLOSE_READY_DRAIN_MAX_FRAMES: usize = 4_096;
+
+/// Reads, WITHOUT waiting, every frame already readable on `stream`, handing
+/// data to `on_frame` and recording the first disconnect code.
+///
+/// Audit PR L1 (2026-10-26): when our Close frame could not be sent inside
+/// [`CLOSE_HANDSHAKE_WAIT`], `close` returned at once and every frame already
+/// in the receive buffer was dropped uncounted. Waiting a second bound would
+/// delay the redial (the peer is not draining our writes), but frames that are
+/// already here cost nothing to read. Stops at the first poll that is not
+/// ready, at the peer's Close, at stream end or an error, or at
+/// [`CLOSE_READY_DRAIN_MAX_FRAMES`]. Returns the number of messages read.
+fn drain_ready_frames<S, F>(
+    stream: &mut S,
+    endpoint: DhanEndpointType,
+    on_frame: &mut F,
+    first_code: &mut Option<DisconnectCode>,
+) -> usize
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    F: FnMut(Bytes),
+{
+    let mut read = 0usize;
+    while read < CLOSE_READY_DRAIN_MAX_FRAMES {
+        let Some(Some(Ok(message))) = stream.next().now_or_never() else {
+            break;
+        };
+        read = read.saturating_add(1);
+        match message {
+            Message::Close(_) => break,
+            Message::Binary(payload) => {
+                note_close_drain_frame(endpoint, payload, on_frame, first_code);
+            }
+            _ => {}
+        }
+    }
+    read
+}
+
+/// One binary frame read while closing: data goes to `on_frame` (and is
+/// counted), and the first disconnect code is kept.
+fn note_close_drain_frame<F>(
+    endpoint: DhanEndpointType,
+    payload: WsBytes,
+    on_frame: &mut F,
+    first_code: &mut Option<DisconnectCode>,
+) where
+    F: FnMut(Bytes),
+{
+    let (carries_data, code) = close_drain_frame_verdict(endpoint, &payload);
+    if first_code.is_none() {
+        *first_code = code;
+    }
+    if carries_data {
+        metrics::counter!(
+            "tv_dhan_ws_close_drain_frames_total",
+            "endpoint" => endpoint.as_str()
+        )
+        .increment(1);
+        on_frame(ws_bytes_to_bytes(payload));
+    }
+}
+
+/// Whether a binary frame read during the close handshake carries market
+/// data, and the disconnect code it carries if any: the same verdict `recv`
+/// reaches (a data frame, or a disconnect stacked behind data). A lone
+/// disconnect packet carries no data but still carries its code. O(packets)
+/// through [`classify_frame`], on the close path only.
+fn close_drain_frame_verdict(
+    endpoint: DhanEndpointType,
+    frame: &[u8],
+) -> (bool, Option<DisconnectCode>) {
+    match classify_frame(endpoint, frame) {
+        FrameClass::Data => (true, None),
+        FrameClass::Disconnect(found) => {
+            let control = match endpoint {
+                DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
+                    crate::parser::depth::DEPTH_DISCONNECT_PACKET_SIZE
+                }
+                DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate => {
+                    DISCONNECT_PACKET_SIZE
+                }
+            };
+            (frame.len() > control, Some(found))
+        }
+    }
+}
+
+/// How our half of the close frame went. Debug/log surface only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseFrameSend {
+    /// The Close frame was written and flushed.
+    Sent,
+    /// The write failed — the peer is already gone, which is the state we want.
+    Failed,
+    /// The write did not finish inside [`CLOSE_HANDSHAKE_WAIT`]: the socket is
+    /// dropped without waiting for the peer, so the connection task can redial.
+    TimedOut,
+}
+
+/// Sends our Close frame, bounded by [`CLOSE_HANDSHAKE_WAIT`].
+///
+/// # Why this is bounded (hostile review 2026-09-22, MEDIUM)
+/// Until the reader/writer split this was a bare `stream.close(None).await`.
+/// A close is a WRITE plus a FLUSH, and a peer that has stopped reading — a
+/// full TCP send window, a half-open socket behind a NAT that dropped the
+/// flow — never drains it. The await then never returns, the connection task
+/// never reaches its redial, and the socket stays dark with no counter moving:
+/// the one failure every liveness check in this file is built to prevent,
+/// reached through the shutdown door instead of the read loop.
+///
+/// `WebSocketStream::close(msg)` is exactly `self.send(Message::Close(msg))`
+/// (tokio-tungstenite 0.29, `lib.rs`), so this is the same wire bytes, only
+/// bounded. Generic over the sink so the bound is testable against a peer whose
+/// flush never completes, under `tokio::time::pause`.
+async fn send_close_frame_bounded<S>(sink: &mut S) -> (CloseFrameSend, Option<String>)
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match tokio::time::timeout(CLOSE_HANDSHAKE_WAIT, sink.send(Message::Close(None))).await {
+        Ok(Ok(())) => (CloseFrameSend::Sent, None),
+        Ok(Err(err)) => (CloseFrameSend::Failed, Some(safe_err(&err))),
+        Err(_elapsed) => (CloseFrameSend::TimedOut, None),
+    }
+}
+
 /// How long one subscribe message may take to reach the socket. A blocked write
 /// while the pool waits is the same disconnect hazard as a blocked read.
 // APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; the scanner matches the declaration itself. Same shape as `pool_supervisor::IDLE_POLL_INTERVAL`.
 pub const SUBSCRIBE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the CLIENT KEEPALIVE PING may take to reach the socket.
+///
+/// # Why this is separate from `SUBSCRIBE_SEND_TIMEOUT`
+///
+/// This send is awaited on the task that OWNS THE SOCKET — the one loop whose
+/// only job is to keep calling `recv()`. At the shared 10 s bound it was the
+/// single largest term in the worst-case time the socket goes unread (~15 s,
+/// alongside the 5 s top-up budget). Dhan's distribution layer classifies
+/// clients fast / normal / slow and skips a slow consumer forward to "the
+/// latest available state"; the feed carries no sequence number, so ticks lost
+/// that way are invisible to every counter we own. A reader that stops polling
+/// for ten seconds is how that classification is earned.
+///
+/// ⚠ CORRECTED 2026-09-22 (plan item 44f): the paragraph above describes the
+/// pre-split code. Every write — the ping included — now runs on the socket's
+/// writer task, so the reader keeps calling `recv()` while a write is stuck;
+/// the ping no longer delays a read at all. This bound now limits how long one
+/// stuck ping can hold the WRITER, which is what keeps the next swap's write
+/// from queueing behind it.
+///
+/// # Why shortening the SHARED constant instead would have been wrong
+///
+/// `SUBSCRIBE_SEND_TIMEOUT` also bounds `send_subscribe` and
+/// `send_unsubscribe` — including the BOOT subscribe, whose failure raises
+/// `SubscribeFailed` into the reconnect ladder and can PARK a socket at dial
+/// time. Tightening it globally would trade a latency problem for a
+/// won't-start problem. Found by adversarial review before this landed.
+///
+/// # Why 1 s is safe here specifically, and not merely shorter
+///
+/// A failed keepalive ping is ALREADY a no-op by design: the caller matches
+/// `Ok(()) | Err(SocketFailure) => {}` and the idle watchdog keeps governing
+/// the socket exactly as it did before this ping existed. So the only thing a
+/// tighter bound can cost is a ping that would have succeeded between 1 s and
+/// 10 s — on a socket that is, by construction, already in trouble at that
+/// point. Against Dhan's 40 s silent-socket close and the 27 s idle threshold,
+/// one second is ample for a healthy write.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; same shape as `SUBSCRIBE_SEND_TIMEOUT` above.
+pub const PING_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Counter: control / non-data frames observed and skipped (ping, pong, text,
 /// raw). Labels: `endpoint`, `kind`.
 pub const CONTROL_FRAME_METRIC: &str = "tv_dhan_ws_control_frames_total";
 
+/// The `kind` label values of [`CONTROL_FRAME_METRIC`], in handle-table order.
+const CONTROL_FRAME_KINDS: [&str; 4] = ["ping", "pong", "text", "raw"];
+
+/// Index of `endpoint` in [`DhanEndpointType::ALL`] order. O(1).
+const fn endpoint_index(endpoint: DhanEndpointType) -> usize {
+    match endpoint {
+        DhanEndpointType::MainFeed => 0,
+        DhanEndpointType::Depth20 => 1,
+        DhanEndpointType::Depth200 => 2,
+        DhanEndpointType::OrderUpdate => 3,
+    }
+}
+
+/// Pre-resolved [`CONTROL_FRAME_METRIC`] handles, endpoint x kind (audit J4,
+/// 2026-10-26). `metrics::counter!` with non-literal labels builds a label
+/// `Vec` and looks the key up in the recorder on every call, and Dhan pings
+/// every socket every 10 s, so the read task allocated per ping. The sixteen
+/// handles are built once, on the first control frame; every later frame is
+/// one `OnceLock` load, two array indexes and one relaxed add, no allocation.
+/// Same shape as `parser::dispatcher`'s counter table.
+static CONTROL_FRAME_COUNTERS: std::sync::OnceLock<[[metrics::Counter; 4]; 4]> =
+    std::sync::OnceLock::new();
+
+/// The handle for `endpoint` x `kind_index` ([`CONTROL_FRAME_KINDS`]). An
+/// out-of-range kind clamps to `raw`, never panics.
+#[inline]
+fn control_frame_counter(
+    endpoint: DhanEndpointType,
+    kind_index: usize,
+) -> &'static metrics::Counter {
+    let table = CONTROL_FRAME_COUNTERS.get_or_init(|| {
+        std::array::from_fn(|e| {
+            std::array::from_fn(|k| {
+                metrics::counter!(
+                    CONTROL_FRAME_METRIC,
+                    "endpoint" => DhanEndpointType::ALL[e].as_str(),
+                    "kind" => CONTROL_FRAME_KINDS[k],
+                )
+            })
+        })
+    });
+    let kind = kind_index.min(CONTROL_FRAME_KINDS.len() - 1);
+    &table[endpoint_index(endpoint)][kind]
+}
+
+/// Client-originated keepalive pings, by endpoint and outcome.
+///
+/// Local-exporter only — deliberately NOT added to the EMF selector, because
+/// `user-data.sh.tftpl` renders at exactly its 15,872-byte budget with zero
+/// bytes free (measured 2026-08-26). The condition this guards already pages
+/// through the existing depth/silence signals; this counter exists so the
+/// fix can be VERIFIED on the box (`sent` climbing, and the matching
+/// `tv_dhan_ws_control_frames_total{kind="pong",endpoint="depth_200"}` series
+/// coming into existence for the first time), not so it can page.
+pub const CLIENT_KEEPALIVE_PING_METRIC: &str = "tv_dhan_ws_client_keepalive_ping_total";
+
 /// Counter: a dial failed. Labels: `endpoint`, `reason`.
 pub const DIAL_FAILED_METRIC: &str = "tv_dhan_ws_dial_failed_total";
+
+/// The `reason` of a dial the server answered with an HTTP status other than
+/// 101 (review fix 2026-10-06, round 4). Dhan opened no WebSocket for it, so
+/// it can never have evicted another socket; before, it was counted as
+/// `connect` with every transport error.
+pub const DIAL_FAILURE_UPGRADE_REFUSED: &str = "upgrade_refused";
+
+/// The bounded `reason` of a dial whose handshake returned an error: a
+/// non-101 response is [`DIAL_FAILURE_UPGRADE_REFUSED`], anything else
+/// (TCP, TLS, I/O, protocol) is `connect`. O(1), no allocation.
+fn dial_failure_label(err: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    if matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)) {
+        DIAL_FAILURE_UPGRADE_REFUSED
+    } else {
+        "connect"
+    }
+}
 
 /// Counter: a subscribe message could not be sent. Labels: `endpoint`, `reason`.
 pub const SUBSCRIBE_FAILED_METRIC: &str = "tv_dhan_ws_subscribe_failed_total";
@@ -241,6 +597,53 @@ pub const fn max_frame_bytes(endpoint: DhanEndpointType) -> usize {
         DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate => MAIN_FEED_MAX_FRAME_BYTES,
         DhanEndpointType::Depth20 => DEPTH_20_MAX_FRAME_BYTES,
         DhanEndpointType::Depth200 => DEPTH_200_MAX_FRAME_BYTES,
+    }
+}
+
+/// Oversize refusals seen per endpoint, in [`DhanEndpointType::ALL`] order.
+/// Process-wide on purpose: the throttle must span reconnects, because each
+/// refusal tears the socket down and the next one arrives on a new socket.
+static OVERSIZE_REFUSALS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Reports a frame the WebSocket cap refused (Z11c, 2026-10-02).
+///
+/// The refused frame never reaches the WAL: whatever ticks it carried are
+/// gone, and Dhan does not resend. It used to share the transport arm's
+/// `warn!`, which carries no `source` and so could never be told apart from an
+/// ordinary disconnect. It is now an `error!` with `source = "frame_oversize"`
+/// and the cap that refused it. Every existing WS-GAP-03 metric filter also
+/// requires a specific other `source`, so this line pages nothing by itself;
+/// it is log-sink evidence, and an alarm on it needs the operator's dated
+/// quote in the noise-lock file first.
+///
+/// Throttled to powers of two per endpoint (1st, 2nd, 4th, …). The refusal
+/// counter `FRAME_REFUSED_METRIC{reason="oversize"}` still counts every one.
+/// Cold path: once per refused frame, which already costs a reconnect.
+#[cold]
+#[inline(never)]
+fn report_oversize_refusal(
+    endpoint: DhanEndpointType,
+    err: &tokio_tungstenite::tungstenite::Error,
+) {
+    let seen = OVERSIZE_REFUSALS[endpoint_index(endpoint)]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    if seen.is_power_of_two() {
+        error!(
+            code = ErrorCode::WsGapConnectionState.code_str(),
+            source = "frame_oversize",
+            endpoint = endpoint.as_str(),
+            cap = max_frame_bytes(endpoint),
+            refusals = seen,
+            detail = %safe_err(err),
+            "Dhan feed frame REFUSED by the WebSocket size cap — it never reached the \
+             WAL, so any ticks in it are lost; the socket reconnects"
+        );
     }
 }
 
@@ -463,6 +866,88 @@ fn safe_err(err: &impl std::fmt::Display) -> String {
 /// exist before any depth is claimed as captured.
 pub const DEFAULT_MAIN_FEED_MODE: FeedMode = FeedMode::Full;
 
+/// The mode Dhan actually serves for `IDX_I`, which is NOT the configured one.
+///
+/// **An index is a computed number, not a traded instrument.** It has no order
+/// book, so there are no bid/ask levels for a Full (code 21) packet to carry.
+/// Dhan does not answer that request with an error — it accepts the subscribe
+/// and sends NOTHING AT ALL, which is indistinguishable from a quiet
+/// instrument and is why this survived three sessions undetected.
+///
+/// **Measured on the box, 2026-08-21.** 163,934 packets were walked frame by
+/// frame out of the live capture log. Every one was `code 8 / segment 1 or 2`
+/// (Full, NSE_EQ or NSE_FNO). There were ZERO packets on segment 0 — including
+/// zero `code 6` PrevClose, which Dhan support CONFIRMED (Ticket #5525125) is
+/// emitted for IDX_I on ANY subscription in ANY mode. A subscription that
+/// never draws even its one guaranteed packet was never accepted. The lane's
+/// own detector agreed independently: `never_ticked` has equalled the IDX_I
+/// count exactly, every day — 4 when four seeds were subscribed, 119 once the
+/// master-sourced indices arrived.
+///
+/// **This restores a partition that already existed and was lost.** The
+/// pre-retirement lane sorted indices into their own Quote-mode batch;
+/// `docs/rules-archive/live-market-feed-subscription.md:279` records it as the
+/// `idx_instruments` partition, chosen so the Quote packet's `day_open` /
+/// `day_high` / `day_low` come from the exchange rather than being tracked
+/// app-side. The lane was deleted 2026-07-17 and rebuilt in the 2026-08-09
+/// revival with ONE global mode and no partition, so `idx_instruments` has
+/// zero occurrences on the tree today.
+///
+/// **Nothing is given up by not asking for depth here.** An index has no depth
+/// to lose. Full stays the mode for every instrument that has a book.
+///
+/// **UNVERIFIED-LIVE, and deliberately loud rather than assumed.** Whether
+/// Quote (17) is served for IDX_I on this account is not settled in this
+/// repository: `docs/dhan-support/2026-05-18-idx-i-quote-full-mode-support.md`
+/// asked Dhan this exact question and no answer is recorded, and an older
+/// uncited note claimed Dhan forces Ticker (15) for indices. If Quote is also
+/// refused, the failure is IDENTICAL in shape to today's — silence — so the
+/// verification is the RISK-GAP-03 never-ticked count, which must fall to zero
+/// for the index set on the first session after this lands. If it does not,
+/// `Ticker` is the next value to try, and this constant is the one line to
+/// change.
+pub const IDX_I_FEED_MODE: FeedMode = FeedMode::Quote;
+
+/// The mode to subscribe `segment` in, given the configured main-feed mode.
+///
+/// Total and O(1). Indices take [`IDX_I_FEED_MODE`]; everything else takes the
+/// caller's configured mode unchanged.
+#[must_use]
+pub fn feed_mode_for_segment(segment: ExchangeSegment, configured: FeedMode) -> FeedMode {
+    if matches!(segment, ExchangeSegment::IdxI) {
+        IDX_I_FEED_MODE
+    } else {
+        configured
+    }
+}
+
+/// Splits a main-feed batch into `(indices, others)`.
+///
+/// # Zero-loss property
+///
+/// `indices.len() + others.len() == batch.len()`, and concatenating the two
+/// reproduces every instrument in `batch` exactly once. That is the property
+/// worth pinning: a partition that dropped or duplicated an instrument would
+/// leave it unsubscribed (silent, since a stream that never arrives leaves
+/// nothing to count) or double-subscribed against the per-connection cap.
+#[must_use]
+pub fn partition_index_batch(
+    batch: &[SubscribeInstrument],
+) -> (Vec<SubscribeInstrument>, Vec<SubscribeInstrument>) {
+    // O(1) EXEMPT: begin — cold path, runs at connect/top-up time, not per tick.
+    let mut indices: Vec<SubscribeInstrument> = Vec::new();
+    let mut others: Vec<SubscribeInstrument> = Vec::new();
+    for instrument in batch {
+        if matches!(instrument.segment, ExchangeSegment::IdxI) {
+            indices.push(*instrument);
+        } else {
+            others.push(*instrument);
+        }
+    }
+    (indices, others)
+    // O(1) EXEMPT: end
+}
+
 /// Why a subscribe payload could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SubscribePayloadError {
@@ -562,6 +1047,72 @@ pub fn build_subscribe_payload(
     messages.pop().ok_or(SubscribePayloadError::EmptyBatch)
 }
 
+/// The unsubscribe twin of [`build_subscribe_payload`].
+///
+/// **ADDED 2026-08-26** for the per-minute at-the-money re-selection: a depth
+/// socket that swaps which strike it carries must drop the old one, and until
+/// now nothing in the transport could say so — the three message builders
+/// existed and had no caller.
+///
+/// It mirrors the subscribe path deliberately, arm for arm, because the two
+/// must agree on what a batch MEANS. If depth-200 rejects a 2-instrument
+/// subscribe and its unsubscribe silently accepted one, a swap could send an
+/// unsubscribe the socket never applied and then a subscribe that takes the
+/// connection over its one-instrument limit — which Dhan answers with a Fatal
+/// 804.
+///
+/// # Errors
+///
+/// The same shapes as [`build_subscribe_payload`]: an empty batch, a
+/// depth-200 batch of more than one, a segment the depth endpoints refuse, or
+/// a batch that split into anything other than exactly one message.
+pub fn build_unsubscribe_payload(
+    endpoint: DhanEndpointType,
+    feed_mode: FeedMode,
+    batch: &[SubscribeInstrument],
+) -> Result<String, SubscribePayloadError> {
+    let Some(first) = batch.first() else {
+        return Err(SubscribePayloadError::EmptyBatch);
+    };
+
+    if endpoint == DhanEndpointType::Depth200 {
+        if batch.len() > 1 {
+            return Err(SubscribePayloadError::Depth200Overfull { got: batch.len() });
+        }
+        return build_two_hundred_depth_unsubscription_message(first.segment, first.security_id)
+            .map_err(|reason| SubscribePayloadError::Refused { reason });
+    }
+
+    let mut instruments = Vec::with_capacity(batch.len());
+    for instrument in batch {
+        instruments.push(InstrumentSubscription::new(
+            instrument.segment,
+            instrument.security_id,
+        ));
+    }
+    let mut messages = match endpoint {
+        // NOT segment-validated, and the asymmetry with the subscribe arm is
+        // deliberate rather than an oversight. Subscribe refuses a BSE_FNO
+        // contract because depth is NSE-only at the vendor and a BSE subscribe
+        // comes back as SILENCE — indistinguishable from a quiet book.
+        // Unsubscribe has no such failure mode: dropping an instrument the
+        // socket does not hold is a no-op, while REFUSING to drop one would
+        // strand it subscribed, which is the outcome the refusal exists to
+        // prevent. Fail-safe runs the opposite way on this path.
+        DhanEndpointType::Depth20 => {
+            build_twenty_depth_unsubscription_messages(&instruments, batch.len())
+        }
+        _ => build_unsubscription_messages(&instruments, feed_mode, batch.len()),
+    };
+    if messages.len() != 1 {
+        return Err(SubscribePayloadError::BatchSplit {
+            instruments: batch.len(),
+            messages: messages.len(),
+        });
+    }
+    messages.pop().ok_or(SubscribePayloadError::EmptyBatch)
+}
+
 // ---------------------------------------------------------------------------
 // Frame classification — control plane only
 // ---------------------------------------------------------------------------
@@ -576,8 +1127,13 @@ pub enum FrameClass {
 }
 
 /// Classifies one inbound binary message as data or a disconnect control
-/// packet. O(1), zero allocation, total — any shape that is not exactly a
-/// disconnect packet is [`FrameClass::Data`] and is handed up untouched.
+/// packet. Zero allocation and total. **Not O(1):** a frame of exactly a
+/// disconnect packet's size is O(1), and every other frame on the main feed
+/// and the depth feeds -- which is nearly every depth frame, since one book
+/// packet alone is larger -- is walked packet by packet looking for a STACKED
+/// disconnect, O(packets) bounded by `MAX_PACKETS_PER_FRAME`. A frame with no
+/// disconnect in it, or one that does not walk cleanly, is
+/// [`FrameClass::Data`] and is handed up untouched.
 ///
 /// The two feeds carry the disconnect packet differently and conflating them
 /// would misread a real data frame as a disconnect:
@@ -605,6 +1161,43 @@ pub fn classify_frame(endpoint: DhanEndpointType, frame: &[u8]) -> FrameClass {
         }
     };
     if frame.len() != expected_len {
+        // A Dhan frame STACKS packets, so a disconnect can arrive with data
+        // ahead of it. Until 2026-08-25 this arm returned `Data` for every such
+        // frame, so `[quote][disconnect 804]` never became
+        // `SocketEvent::Closed{code}` -- the drain decoded the disconnect and
+        // counted it as untyped "non-tick" traffic, and the reason reached no
+        // log, no metric and no classifier. The socket then closed on TCP with
+        // `code: None`, which `classify_disconnect` reads as Transient, so the
+        // ladder retried the IDENTICAL over-limit subscribe set forever: the
+        // exact self-amplifying loop the Fatal class was added to stop.
+        //
+        // The depth feeds walk too since audit PR21 (2026-09-27). They were
+        // left out on the reasoning that their drain "already counts a
+        // stacked disconnect" -- it counted it and threw the REASON away, so a
+        // stacked 805 closed the socket later with no code, read as a routine
+        // drop, redialled one more connection into an account Dhan had just
+        // called full, and never set the process-wide 805 breaker. The walk
+        // uses the depth parser's own splitter (`split_depth_frame`), which
+        // sizes each packet from its header, so no boundary is guessed here.
+        let stacked = match endpoint {
+            DhanEndpointType::MainFeed => {
+                crate::parser::dispatcher::stacked_disconnect_reason(frame, MAX_PACKETS_PER_FRAME)
+            }
+            DhanEndpointType::Depth20 => crate::parser::depth::stacked_depth_disconnect_reason(
+                frame,
+                crate::parser::depth::DepthFeedKind::Twenty,
+                MAX_PACKETS_PER_FRAME,
+            ),
+            DhanEndpointType::Depth200 => crate::parser::depth::stacked_depth_disconnect_reason(
+                frame,
+                crate::parser::depth::DepthFeedKind::TwoHundred,
+                MAX_PACKETS_PER_FRAME,
+            ),
+            DhanEndpointType::OrderUpdate => None,
+        };
+        if let Some(reason) = stacked {
+            return FrameClass::Disconnect(DisconnectCode::from_u16(reason));
+        }
         return FrameClass::Data;
     }
     let Some(&code) = frame.get(code_offset) else {
@@ -651,11 +1244,399 @@ impl DhanSocketParams {
     /// Params for `endpoint` in the scope-locked [`DEFAULT_MAIN_FEED_MODE`].
     #[must_use]
     pub fn new(endpoint: DhanEndpointType, base_url: String, client_id: String) -> Self {
+        // Seed every subscribe/unsubscribe failure reason for THIS endpoint.
+        //
+        // A silently-failed subscribe is the worst failure this file can
+        // produce: the socket stays open and healthy-looking while carrying
+        // nothing, so absence against a seeded key is the only evidence that
+        // exists. A live sweep on 2026-08-29 found the metric had never
+        // published at all — the CloudWatch agent drops the first sample of a
+        // series it has never seen, so the very first failure was the one
+        // guaranteed to be invisible.
+        for reason in [
+            "payload",
+            "send",
+            "timeout",
+            "not_connected",
+            "unsubscribe_payload",
+            "unsubscribe_send",
+            // ⚠ VACUOUS IN PRODUCTION — seeded anyway, deliberately.
+            //
+            // `send_unsubscribe` has ONE production call site and it wraps this
+            // function in `SWAP_WIRE_BUDGET` (1 s), while the write below is
+            // bounded by `SUBSCRIBE_SEND_TIMEOUT` (10 s). The outer budget
+            // always elapses first and drops this future, so the timeout arm
+            // never runs and this reason can never increment from the swap.
+            // ⚠ CORRECTED 2026-09-22 (plan item 44f): that described the
+            // pre-split code. The write now runs on the socket's writer task,
+            // which keeps it past the swap's budget, so this reason IS
+            // reachable — by a swap's stuck write, by probe Arm A, and by an
+            // unsubscribe-only swap. The rest of this note stands.
+            //
+            // It stays seeded rather than removed for two reasons: the arm IS
+            // reachable if the function is ever called unwrapped, and deleting
+            // the series would make it unseeded — and therefore invisible on
+            // its first real increment — the day the budgets change. What must
+            // NOT happen is citing a zero here as evidence that an unsubscribe
+            // reached the wire; that claim rests on the three reachable
+            // `unsubscribe_*` reasons and the coded `WS-GAP-02` log lines.
+            // Pinned by
+            // `pool_supervisor::tests::the_swap_budget_wins_so_the_inner_unsubscribe_timeout_is_vacuous`.
+            "unsubscribe_timeout",
+            "unsubscribe_not_connected",
+        ] {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
+        // The two sibling families in this file, seeded here for the same
+        // reason and found by the 2026-08-29 adversarial sweep AFTER the
+        // subscribe family above was already fixed. Both carry LIVE CloudWatch
+        // alarms, so an unseeded first episode is an alarm that cannot fire on
+        // the occurrence that matters.
+        //
+        // dial_failed: the socket never opened at all. On a cold 08:30 boot
+        // this is the FIRST thing that can go wrong and the first sample is
+        // exactly the one the agent discards.
+        for reason in [
+            "bad_url",
+            "connect",
+            "no_token",
+            "timeout",
+            "tls_config",
+            DIAL_FAILURE_UPGRADE_REFUSED,
+        ] {
+            metrics::counter!(
+                DIAL_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
+        // frame_refused: the read path rejected a frame. `oversize` means a
+        // frame larger than this endpoint's cap — silent tick loss with the
+        // socket still up.
+        for reason in ["oversize", "transport"] {
+            metrics::counter!(
+                FRAME_REFUSED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => reason,
+            )
+            .increment(0);
+        }
         Self {
             endpoint,
             base_url,
             client_id,
             feed_mode: DEFAULT_MAIN_FEED_MODE,
+        }
+    }
+}
+
+/// The full socket, before it is split into its two halves.
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// The read half, polled by the connection's own task.
+type WsReader = futures_util::stream::SplitStream<WsStream>;
+/// The write half, owned by the writer task.
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
+
+/// Depth of the queue feeding the writer task.
+///
+/// The drain keeps ONE write in flight (a swap, a top-up batch, a replay
+/// batch or a ping), so the queue never holds more than that one job in
+/// normal operation; the headroom exists so a burst of submissions cannot
+/// turn into a refused write. A full queue fails the submission — it never
+/// blocks the caller, because the caller is the task that must keep reading.
+const WIRE_WRITE_QUEUE_DEPTH: usize = 8;
+
+/// How long [`DhanFeedSocket::close`] waits for the writer task to hand its
+/// write half back. The writer answers a stop at its next poll — even
+/// mid-write, because the write is raced against the stop — so this is a
+/// safety bound, not a wait anyone should observe.
+// APPROVED: this line IS the named constant the no-hardcoded-Duration rule asks for; same shape as `PING_SEND_TIMEOUT` above.
+const WRITER_STOP_WAIT: Duration = Duration::from_secs(1);
+
+/// Which kind of write a job carries: selects the timeout, the counters and
+/// the log lines, exactly as the three inline write paths did before the
+/// split.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WireWriteKind {
+    Subscribe,
+    Unsubscribe,
+    Ping,
+}
+
+/// One write job for the writer task: up to two prebuilt messages (the main
+/// feed's index split), their instrument counts for the logs, and the reply
+/// that answers the caller's ticket.
+struct WireWrite {
+    kind: WireWriteKind,
+    messages: [Option<Message>; 2],
+    instruments: [usize; 2],
+    reply: WriteReply,
+}
+
+/// Handle to one connection's writer task.
+struct WireWriter {
+    jobs: tokio::sync::mpsc::Sender<WireWrite>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<WsSink>,
+}
+
+impl WireWriter {
+    /// Stops the writer and returns its write half, or `None` when the task
+    /// could not hand it back within [`WRITER_STOP_WAIT`] (it is then
+    /// aborted, which drops the half and releases the connection).
+    async fn stop(self, endpoint: DhanEndpointType) -> Option<WsSink> {
+        let WireWriter { jobs, stop, task } = self;
+        drop(jobs);
+        if stop.send(()).is_err() {
+            // The task already returned on its own — its join below still
+            // yields the write half.
+        }
+        let abort = task.abort_handle();
+        match tokio::time::timeout(WRITER_STOP_WAIT, task).await {
+            Ok(Ok(sink)) => Some(sink),
+            Ok(Err(_join)) => {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    "Dhan feed writer task ended without returning its write half"
+                );
+                None
+            }
+            Err(_elapsed) => {
+                abort.abort();
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    wait_ms = WRITER_STOP_WAIT.as_millis(),
+                    "Dhan feed writer task did not stop in time — aborted"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The writer task: owns the write half and performs queued jobs one at a
+/// time, in order, so a later write can never overtake an earlier one.
+///
+/// Every job is raced against the stop signal, so a close never waits behind
+/// a write stuck on a full send buffer. A job interrupted that way answers
+/// `Err(SocketFailure)` — the answer a write on a dying socket has always
+/// given. Returns the write half so `close` can send the Close frame.
+async fn run_wire_writer(
+    mut sink: WsSink,
+    mut jobs: tokio::sync::mpsc::Receiver<WireWrite>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    endpoint: DhanEndpointType,
+) -> WsSink {
+    loop {
+        let job = tokio::select! {
+            biased;
+            _ = &mut stop => return sink,
+            next = jobs.recv() => match next {
+                Some(job) => job,
+                None => return sink,
+            },
+        };
+        let WireWrite {
+            kind,
+            messages,
+            instruments,
+            reply,
+        } = job;
+        let outcome = tokio::select! {
+            biased;
+            _ = &mut stop => {
+                reply.send(Err(SocketFailure));
+                return sink;
+            }
+            outcome = write_job(&mut sink, kind, messages, instruments, endpoint) => outcome,
+        };
+        reply.send(outcome);
+    }
+}
+
+/// Performs one job's writes in order; the first failure ends the job.
+async fn write_job(
+    sink: &mut WsSink,
+    kind: WireWriteKind,
+    messages: [Option<Message>; 2],
+    instruments: [usize; 2],
+    endpoint: DhanEndpointType,
+) -> Result<(), SocketFailure> {
+    if kind == WireWriteKind::Ping {
+        return write_ping(sink, endpoint).await;
+    }
+    for (message, count) in messages.into_iter().zip(instruments) {
+        if let Some(message) = message {
+            write_batch(sink, kind, message, count, endpoint).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes ONE subscribe or unsubscribe message, bounded by
+/// [`SUBSCRIBE_SEND_TIMEOUT`], with the counters and log lines the inline
+/// write paths used before the split.
+async fn write_batch(
+    stream: &mut WsSink,
+    kind: WireWriteKind,
+    message: Message,
+    instruments: usize,
+    endpoint: DhanEndpointType,
+) -> Result<(), SocketFailure> {
+    let unsubscribe = kind == WireWriteKind::Unsubscribe;
+    let send = stream.send(message);
+    match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
+        Ok(Ok(())) => {
+            if unsubscribe {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments, "Dhan unsubscribe batch sent"
+                );
+            } else {
+                debug!(
+                    endpoint = endpoint.as_str(),
+                    instruments, "Dhan subscribe batch sent"
+                );
+            }
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if unsubscribe { "unsubscribe_send" } else { "send" },
+            )
+            .increment(1);
+            if unsubscribe {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    reason = %safe_err(&err),
+                    "Dhan unsubscribe batch could not be written to the socket"
+                );
+            } else {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    reason = %safe_err(&err),
+                    "Dhan subscribe batch could not be written to the socket"
+                );
+            }
+            Err(SocketFailure)
+        }
+        Err(_elapsed) => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if unsubscribe { "unsubscribe_timeout" } else { "timeout" },
+            )
+            .increment(1);
+            if unsubscribe {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan unsubscribe batch write timed out"
+                );
+            } else {
+                warn!(
+                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                    endpoint = endpoint.as_str(),
+                    instruments,
+                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
+                    "Dhan subscribe write stalled past its deadline"
+                );
+            }
+            Err(SocketFailure)
+        }
+    }
+}
+
+/// Writes ONE keepalive Ping, bounded by its own [`PING_SEND_TIMEOUT`].
+///
+/// A failed send is counted and logged, never escalated: if Dhan does not
+/// answer pings on this endpoint the idle watchdog keeps governing the socket
+/// exactly as it did before 2026-08-26.
+async fn write_ping(stream: &mut WsSink, endpoint: DhanEndpointType) -> Result<(), SocketFailure> {
+    // `from_static(&[])` — an empty ping payload that provably allocates
+    // nothing (it points at a static empty slice). Dhan needs no payload —
+    // the frame itself is the probe.
+    let send = stream.send(Message::Ping(bytes::Bytes::from_static(&[])));
+    match tokio::time::timeout(PING_SEND_TIMEOUT, send).await {
+        Ok(Ok(())) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "sent",
+            )
+            .increment(1);
+            Ok(())
+        }
+        Ok(Err(err)) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "send_failed",
+            )
+            .increment(1);
+            debug!(
+                endpoint = endpoint.as_str(),
+                reason = %safe_err(&err),
+                "client keepalive ping could not be sent — the idle watchdog still \
+                 governs this socket, so this degrades to the pre-2026-08-26 behaviour"
+            );
+            Err(SocketFailure)
+        }
+        Err(_elapsed) => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "timeout",
+            )
+            .increment(1);
+            Err(SocketFailure)
+        }
+    }
+}
+
+/// Counts a submission the writer's queue refused — nothing reached the wire.
+fn count_write_failure(endpoint: DhanEndpointType, kind: WireWriteKind, reason: &'static str) {
+    match kind {
+        WireWriteKind::Ping => {
+            metrics::counter!(
+                CLIENT_KEEPALIVE_PING_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "outcome" => "send_failed",
+            )
+            .increment(1);
+        }
+        WireWriteKind::Subscribe | WireWriteKind::Unsubscribe => {
+            metrics::counter!(
+                SUBSCRIBE_FAILED_METRIC,
+                "endpoint" => endpoint.as_str(),
+                "reason" => if kind == WireWriteKind::Unsubscribe {
+                    "unsubscribe_send"
+                } else {
+                    "send"
+                },
+            )
+            .increment(1);
+            warn!(
+                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                endpoint = endpoint.as_str(),
+                reason,
+                "Dhan (un)subscribe could not be queued for the socket writer — nothing \
+                 was written"
+            );
         }
     }
 }
@@ -667,9 +1648,44 @@ impl DhanSocketParams {
 pub struct DhanFeedSocketImpl<T: FeedTokenSource> {
     params: DhanSocketParams,
     token: T,
-    /// The live socket. `None` before the first dial and after every close, so
-    /// a stale stream can never be written to.
-    stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    receive_buffer_slot: Option<u8>,
+    receive_buffer: Option<super::receive_buffer::Registration>,
+    /// The READ half of the live socket. `None` before the first dial and
+    /// after every close, so a stale stream can never be read.
+    ///
+    /// Split from the write half on 2026-09-22 (plan item 44f): the write
+    /// half lives in the writer task behind [`WireWriter`], so a write stuck
+    /// behind a full send buffer never stops this half being polled.
+    stream: Option<WsReader>,
+    /// The writer task that owns the WRITE half, and the queue feeding it.
+    /// Present exactly when `stream` is.
+    writer: Option<WireWriter>,
+    /// Bumped on every successful dial. Every write is stamped with the
+    /// generation it was issued under, so an answer from a replaced
+    /// connection can be recognised and ignored — see
+    /// [`DhanFeedSocket::write_generation`].
+    generation: u64,
+    /// Why the last dial failed, as one of the transport's bounded labels.
+    ///
+    /// A `&'static str` from a fixed set, never a formatted error: a
+    /// tungstenite error's `Display` embeds the request URL, and that URL
+    /// carries the JWT in its query string.
+    last_dial_failure_reason: &'static str,
+    /// Whether the most recent read ended in a bare reset / dead stream
+    /// rather than a frame or a Close. Read by [`DhanFeedSocket::close`] to
+    /// decide whether the peer can still answer a close handshake — see
+    /// [`CLOSE_HANDSHAKE_WAIT`]. `false` after every successful read and
+    /// every successful dial.
+    last_read_ended_by_reset: bool,
+    /// A disconnect that arrived STACKED behind market data, owed to the
+    /// supervisor as `SocketEvent::Closed` on the NEXT `recv`.
+    ///
+    /// Since audit PR21 (2026-09-27) the frame that carried it is handed up
+    /// first as an ordinary `SocketEvent::Frame`, so the data packets ahead of
+    /// the control packet reach the write-ahead log like any other frame
+    /// instead of being thrown away with the close. Cleared on every dial and
+    /// every close, so a code owed by one connection can never close the next.
+    pending_close: Option<DisconnectCode>,
 }
 
 impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
@@ -679,8 +1695,21 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         Self {
             params,
             token,
+            receive_buffer_slot: None,
+            receive_buffer: None,
             stream: None,
+            writer: None,
+            generation: 0,
+            last_dial_failure_reason: "unknown",
+            last_read_ended_by_reset: false,
+            pending_close: None,
         }
+    }
+    /// Use the planner’s global slot for this session’s read-only kernel gauge.
+    #[must_use]
+    pub const fn with_receive_buffer_slot(mut self, global_index: u8) -> Self {
+        self.receive_buffer_slot = Some(global_index);
+        self
     }
 
     /// The endpoint type this socket serves.
@@ -701,7 +1730,13 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         loggable_url(&self.params.base_url)
     }
 
-    fn count_dial_failure(&self, reason: &'static str) {
+    /// Counts a dial failure AND records its reason for the audit row.
+    ///
+    /// One site does both deliberately: a counter incremented without the
+    /// reason recorded is how the reason came to exist only inside a folded
+    /// CloudWatch label in the first place.
+    fn count_dial_failure(&mut self, reason: &'static str) {
+        self.last_dial_failure_reason = reason;
         metrics::counter!(
             DIAL_FAILED_METRIC,
             "endpoint" => self.params.endpoint.as_str(),
@@ -709,13 +1744,201 @@ impl<T: FeedTokenSource> DhanFeedSocketImpl<T> {
         )
         .increment(1);
     }
+    /// Builds ONE subscribe or unsubscribe message.
+    ///
+    /// A payload that cannot be built is counted and logged here, exactly as
+    /// before the split, and reported as `None`. The unsubscribe arm
+    /// deliberately reuses the subscribe path's failure metrics and error
+    /// code (added 2026-08-26 for the per-minute re-selection): an operator
+    /// asking "did this socket fail to change what it is subscribed to?"
+    /// wants one answer, and the `reason` label separates the cases.
+    fn build_message(
+        &self,
+        kind: WireWriteKind,
+        batch: &[SubscribeInstrument],
+        feed_mode: FeedMode,
+    ) -> Option<Message> {
+        let endpoint = self.params.endpoint;
+        let built = if kind == WireWriteKind::Unsubscribe {
+            build_unsubscribe_payload(endpoint, feed_mode, batch)
+        } else {
+            build_subscribe_payload(endpoint, feed_mode, batch)
+        };
+        match built {
+            Ok(payload) => Some(Message::Text(payload.into())),
+            Err(err) => {
+                if kind == WireWriteKind::Unsubscribe {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "unsubscribe_payload",
+                    )
+                    .increment(1);
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        instruments = batch.len(),
+                        reason = %err,
+                        "Dhan unsubscribe payload could not be built — the instrument stays \
+                         subscribed, so this socket keeps carrying a contract that is no longer \
+                         the one that was chosen"
+                    );
+                } else {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "payload",
+                    )
+                    .increment(1);
+                    error!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        instruments = batch.len(),
+                        reason = %err,
+                        "Dhan subscribe payload could not be built — the socket would be live but \
+                         blind, so the connection is torn down instead"
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Builds the one or two messages a (un)subscribe needs and hands them to
+    /// the writer as ONE job.
+    ///
+    /// Only the main feed splits: indices go in [`IDX_I_FEED_MODE`] and
+    /// everything else in the configured mode, because Dhan serves an `IDX_I`
+    /// Full subscription with SILENCE rather than an error (see
+    /// [`IDX_I_FEED_MODE`]). One Dhan message carries exactly one
+    /// `RequestCode`, so the two modes cannot share a message. The unsubscribe
+    /// mirrors it arm for arm — the unsubscribe code is derived from the feed
+    /// mode, so an index removed with the Full code would never be removed.
+    ///
+    /// Both halves are BUILT before either is sent: a payload that cannot be
+    /// built fails the whole job without writing its sibling, so a partial
+    /// success can no longer leave the socket live and blind for one half.
+    fn submit_batch(&mut self, kind: WireWriteKind, batch: &[SubscribeInstrument]) -> WriteTicket {
+        let configured = self.params.feed_mode;
+        let mut messages: [Option<Message>; 2] = [None, None];
+        let mut instruments = [0usize; 2];
+        let split = if self.params.endpoint == DhanEndpointType::MainFeed {
+            let (indices, others) = partition_index_batch(batch);
+            if indices.is_empty() {
+                None
+            } else {
+                Some((indices, others))
+            }
+        } else {
+            None
+        };
+        match split {
+            None => {
+                let Some(message) = self.build_message(kind, batch, configured) else {
+                    return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                };
+                messages[0] = Some(message);
+                instruments[0] = batch.len();
+            }
+            Some((indices, others)) => {
+                if !others.is_empty() {
+                    let Some(message) = self.build_message(kind, &others, configured) else {
+                        return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                    };
+                    messages[0] = Some(message);
+                    instruments[0] = others.len();
+                }
+                let Some(message) = self.build_message(kind, &indices, IDX_I_FEED_MODE) else {
+                    return WriteTicket::resolved(self.generation, Err(SocketFailure));
+                };
+                messages[1] = Some(message);
+                instruments[1] = indices.len();
+            }
+        }
+        self.submit(kind, messages, instruments)
+    }
+
+    /// Queues one job on the writer and returns its ticket — never awaits.
+    ///
+    /// A socket that is not connected, or a writer whose queue is closed or
+    /// full, answers at once with a failure, counted under the same labels
+    /// the inline writes used.
+    fn submit(
+        &mut self,
+        kind: WireWriteKind,
+        messages: [Option<Message>; 2],
+        instruments: [usize; 2],
+    ) -> WriteTicket {
+        let endpoint = self.params.endpoint;
+        let generation = self.generation;
+        let Some(writer) = self.writer.as_ref() else {
+            match kind {
+                WireWriteKind::Ping => {}
+                WireWriteKind::Subscribe => {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "not_connected",
+                    )
+                    .increment(1);
+                    warn!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        "subscribe attempted with no live Dhan socket"
+                    );
+                }
+                WireWriteKind::Unsubscribe => {
+                    metrics::counter!(
+                        SUBSCRIBE_FAILED_METRIC,
+                        "endpoint" => endpoint.as_str(),
+                        "reason" => "unsubscribe_not_connected",
+                    )
+                    .increment(1);
+                    warn!(
+                        code = ErrorCode::WsGapSubscriptionBatching.code_str(),
+                        endpoint = endpoint.as_str(),
+                        "unsubscribe attempted with no live Dhan socket"
+                    );
+                }
+            }
+            return WriteTicket::resolved(generation, Err(SocketFailure));
+        };
+        let (ticket, reply) = WriteTicket::pending(generation);
+        let job = WireWrite {
+            kind,
+            messages,
+            instruments,
+            reply,
+        };
+        if writer.jobs.try_send(job).is_err() {
+            // The writer is gone (its socket died) or behind by a full queue.
+            // Either way nothing reached the wire. The job — and with it the
+            // reply — is dropped here, so the ticket resolves as a failure.
+            count_write_failure(endpoint, kind, "queue_refused");
+        }
+        ticket
+    }
 }
 
 impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
+    fn last_dial_failure_reason(&self) -> &'static str {
+        self.last_dial_failure_reason
+    }
     async fn connect(&mut self) -> Result<(), SocketFailure> {
         // A previous socket must be gone before a new one is dialed, or the
         // pool budget is silently exceeded and Dhan kills the OLDEST member.
-        self.close().await;
+        // The supervisor closes (and captures) every socket before it redials,
+        // so a stream left here is unexpected; a data frame drained from it has
+        // no sink at this point and is counted, never silently dropped.
+        let stale_endpoint = self.params.endpoint;
+        self.close(|_frame| {
+            metrics::counter!(
+                "tv_dhan_ws_close_drain_discarded_total",
+                "endpoint" => stale_endpoint.as_str()
+            )
+            .increment(1);
+        })
+        .await;
 
         let endpoint = self.params.endpoint;
         let Some(token) = self.token.current_token() else {
@@ -800,7 +2023,9 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         // affect the depth-200 no-ALPN carve-out above (a socket option and a
         // TLS config are orthogonal), and is standard practice for trading
         // sockets. Pinned by `dial_disables_nagle_on_every_endpoint`.
-        let dial = connect_async_tls_with_config(request, config, true, Some(connector));
+        // The TCP socket also has SO_KEEPALIVE on (`ws_dial`, 2026-11-13), so the
+        // kernel keepalive ladder in the sysctl file is the backstop it claims.
+        let dial = dial_ws_tls_with_keepalive(request, config, true, Some(connector));
         let outcome = match tokio::time::timeout(DIAL_TIMEOUT, dial).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -825,11 +2050,32 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     max_frame_bytes = max_frame_bytes(endpoint),
                     "Dhan feed socket connected"
                 );
-                self.stream = Some(stream);
+                self.receive_buffer = self.receive_buffer_slot.and_then(|slot| {
+                    super::receive_buffer::Registration::attach(slot, stream.get_ref().get_ref())
+                });
+                // Split: the read half stays here, the write half moves into
+                // the writer task (plan item 44f). The read half's own
+                // `poll_next` still flushes the automatic pong — tungstenite's
+                // `read` "never blocks on write" — so splitting cannot starve
+                // the pong the peer's keepalive depends on.
+                let (sink, reader) = stream.split();
+                let (jobs, queue) = tokio::sync::mpsc::channel(WIRE_WRITE_QUEUE_DEPTH);
+                let (stop, stop_rx) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(run_wire_writer(sink, queue, stop_rx, endpoint));
+                self.stream = Some(reader);
+                self.writer = Some(WireWriter { jobs, stop, task });
+                self.generation = self.generation.wrapping_add(1);
+                self.last_read_ended_by_reset = false;
+                self.pending_close = None;
                 Ok(())
             }
             Err(err) => {
-                self.count_dial_failure("connect");
+                // Review fix 2026-10-06, round 4: a response other than 101
+                // (HTTP 400, 401, 429 ...) proves the server opened no
+                // WebSocket, so this dial evicted nobody; the 805 probe
+                // attribution drops its dial stamp on this label. Every other
+                // failure here stays `connect`.
+                self.count_dial_failure(dial_failure_label(&err));
                 warn!(
                     code = ErrorCode::WsGapConnectionState.code_str(),
                     endpoint = endpoint.as_str(),
@@ -842,91 +2088,45 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
-    async fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> Result<(), SocketFailure> {
-        let endpoint = self.params.endpoint;
-        let payload = match build_subscribe_payload(endpoint, self.params.feed_mode, batch) {
-            Ok(p) => p,
-            Err(err) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "payload",
-                )
-                .increment(1);
-                error!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %err,
-                    "Dhan subscribe payload could not be built — the socket would be live but \
-                     blind, so the connection is torn down instead"
-                );
-                return Err(SocketFailure);
-            }
-        };
+    fn write_generation(&self) -> u64 {
+        self.generation
+    }
 
-        let Some(stream) = self.stream.as_mut() else {
-            metrics::counter!(
-                SUBSCRIBE_FAILED_METRIC,
-                "endpoint" => endpoint.as_str(),
-                "reason" => "not_connected",
-            )
-            .increment(1);
-            warn!(
-                code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                endpoint = endpoint.as_str(),
-                "subscribe attempted with no live Dhan socket"
-            );
-            return Err(SocketFailure);
-        };
+    /// Subscribes `batch`, splitting indices into their own message — see
+    /// `submit_batch`. Both halves must reach the wire for the subscribe to
+    /// count as sent.
+    fn send_subscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
+        self.submit_batch(WireWriteKind::Subscribe, batch)
+    }
 
-        let send = stream.send(Message::Text(payload.into()));
-        match tokio::time::timeout(SUBSCRIBE_SEND_TIMEOUT, send).await {
-            Ok(Ok(())) => {
-                debug!(
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    "Dhan subscribe batch sent"
-                );
-                Ok(())
-            }
-            Ok(Err(err)) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "send",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    reason = %safe_err(&err),
-                    "Dhan subscribe batch could not be written to the socket"
-                );
-                Err(SocketFailure)
-            }
-            Err(_elapsed) => {
-                metrics::counter!(
-                    SUBSCRIBE_FAILED_METRIC,
-                    "endpoint" => endpoint.as_str(),
-                    "reason" => "timeout",
-                )
-                .increment(1);
-                warn!(
-                    code = ErrorCode::WsGapSubscriptionBatching.code_str(),
-                    endpoint = endpoint.as_str(),
-                    instruments = batch.len(),
-                    timeout_secs = SUBSCRIBE_SEND_TIMEOUT.as_secs(),
-                    "Dhan subscribe write stalled past its deadline"
-                );
-                Err(SocketFailure)
-            }
-        }
+    fn send_unsubscribe(&mut self, batch: &[SubscribeInstrument]) -> WriteTicket {
+        self.submit_batch(WireWriteKind::Unsubscribe, batch)
+    }
+
+    /// Queues ONE client-originated keepalive Ping.
+    ///
+    /// Only reached for endpoints where [`DhanEndpointType::needs_client_keepalive_ping`]
+    /// is true — see that method for the measurement showing depth-200 receives
+    /// zero server pings, and why that quietly turned the idle watchdog into a
+    /// liquidity detector.
+    ///
+    /// It does **not** touch the idle watchdog. The reset stays on the **Pong
+    /// we receive back** (`Message::Pong` -> `SocketEvent::KeepAlive` ->
+    /// `ConnEvent::KeepAliveReceived` -> `record_activity`). Resetting on SEND
+    /// would defeat the watchdog outright. A failed send is counted and
+    /// logged by the writer (`write_ping`), never escalated.
+    fn send_ping(&mut self) -> WriteTicket {
+        self.submit(WireWriteKind::Ping, [None, None], [0, 0])
     }
 
     async fn recv(&mut self) -> SocketEvent {
         let endpoint = self.params.endpoint;
+        // The previous read handed up a frame whose data sat AHEAD of a
+        // disconnect packet; the close it carried is delivered now, before
+        // anything else is read (audit PR21).
+        if let Some(code) = self.pending_close.take() {
+            return SocketEvent::Closed { code: Some(code) };
+        }
         let Some(stream) = self.stream.as_mut() else {
             return SocketEvent::Closed { code: None };
         };
@@ -943,6 +2143,9 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         {
             let Some(message) = stream.next().await else {
                 debug!(endpoint = endpoint.as_str(), "Dhan feed stream ended");
+                // The peer is already gone: nothing can answer a close
+                // handshake, so `close()` must not wait for one.
+                self.last_read_ended_by_reset = true;
                 return SocketEvent::Closed { code: None };
             };
             let message = match message {
@@ -963,22 +2166,83 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                         "reason" => reason,
                     )
                     .increment(1);
-                    warn!(
-                        code = ErrorCode::WsGapConnectionState.code_str(),
-                        endpoint = endpoint.as_str(),
-                        reason,
-                        detail = %safe_err(&err),
-                        "Dhan feed read failed — treating as a disconnect so the supervisor's \
-                         ladder reconnects"
-                    );
+                    if reason == "oversize" {
+                        report_oversize_refusal(endpoint, &err);
+                    } else {
+                        warn!(
+                            code = ErrorCode::WsGapConnectionState.code_str(),
+                            endpoint = endpoint.as_str(),
+                            reason,
+                            detail = %safe_err(&err),
+                            "Dhan feed read failed — treating as a disconnect so the supervisor's \
+                             ladder reconnects"
+                        );
+                    }
+                    // A read error is the bare-reset shape (the
+                    // `ResetWithoutClosingHandshake` class this file's
+                    // history is full of): no peer left to answer a Close.
+                    self.last_read_ended_by_reset = true;
                     return SocketEvent::Closed { code: None };
                 }
             };
+            // A frame arrived, so the stream is alive: whatever this turns
+            // out to be — data, a control frame, a Dhan disconnect packet or
+            // the peer's own Close — a close handshake can still complete.
+            self.last_read_ended_by_reset = false;
 
             match message {
                 Message::Binary(payload) => {
                     match classify_frame(endpoint, &payload) {
-                        FrameClass::Disconnect(code) => SocketEvent::Closed { code: Some(code) },
+                        FrameClass::Disconnect(code) => {
+                            // A STACKED disconnect carries whole data packets
+                            // AHEAD of the control packet. Until audit PR21
+                            // (2026-09-27) this arm turned the WHOLE frame into
+                            // a `Closed` event, so those packets reached no
+                            // write-ahead log, no ring and no counter: real
+                            // market data lost on every stacked disconnect,
+                            // measured only by a `stacked_disconnect_discard`
+                            // log line. Depth frames reach this arm too since
+                            // the same PR, so leaving it would have added a
+                            // depth loss path on top of the main-feed one.
+                            //
+                            // Now the frame is handed up UNTOUCHED as
+                            // `SocketEvent::Frame` and the close is owed on
+                            // the next `recv` (`pending_close`). The drain
+                            // captures and decodes the data exactly as for any
+                            // frame (it already counts a disconnect packet it
+                            // meets), and the supervisor still receives the
+                            // TYPED code one read later, so the classifier,
+                            // the 805 breaker and the reconnect ladder act on
+                            // it unchanged. A LONE disconnect carries no data
+                            // and still becomes `Closed` at once.
+                            //
+                            // The control packet is 10 bytes on the main feed
+                            // and 14 on the depth feeds (12-byte header).
+                            let control = match endpoint {
+                                DhanEndpointType::Depth20 | DhanEndpointType::Depth200 => {
+                                    crate::parser::depth::DEPTH_DISCONNECT_PACKET_SIZE
+                                }
+                                DhanEndpointType::MainFeed | DhanEndpointType::OrderUpdate => {
+                                    DISCONNECT_PACKET_SIZE
+                                }
+                            };
+                            let data_bytes = payload.len().saturating_sub(control);
+                            if data_bytes > 0 {
+                                debug!(
+                                    source = "stacked_disconnect_captured",
+                                    endpoint = endpoint.as_str(),
+                                    data_bytes,
+                                    frame_bytes = payload.len(),
+                                    disconnect_code = code.as_u16(),
+                                    "a disconnect arrived stacked behind market data; the frame \
+                                     is handed up whole and the close follows on the next read"
+                                );
+                                self.pending_close = Some(code);
+                                SocketEvent::Frame(ws_bytes_to_bytes(payload))
+                            } else {
+                                SocketEvent::Closed { code: Some(code) }
+                            }
+                        }
                         // `Bytes` -> `bytes::Bytes` is a refcount move, not a
                         // copy: the whole point of this type on this path.
                         FrameClass::Data => SocketEvent::Frame(ws_bytes_to_bytes(payload)),
@@ -996,18 +2260,15 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
                     SocketEvent::Closed { code: None }
                 }
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
-                    let kind = match message {
-                        Message::Ping(_) => "ping",
-                        Message::Pong(_) => "pong",
-                        Message::Text(_) => "text",
-                        _ => "raw",
+                    // Index into CONTROL_FRAME_KINDS; a pre-resolved handle, so
+                    // a ping costs no allocation on the read task (audit J4).
+                    let kind_index = match message {
+                        Message::Ping(_) => 0,
+                        Message::Pong(_) => 1,
+                        Message::Text(_) => 2,
+                        _ => 3,
                     };
-                    metrics::counter!(
-                        CONTROL_FRAME_METRIC,
-                        "endpoint" => endpoint.as_str(),
-                        "kind" => kind,
-                    )
-                    .increment(1);
+                    control_frame_counter(endpoint, kind_index).increment(1);
                     // RETURN, do not loop (2026-08-19).
                     //
                     // This arm used to increment the counter and fall through
@@ -1030,19 +2291,98 @@ impl<T: FeedTokenSource> DhanFeedSocket for DhanFeedSocketImpl<T> {
         }
     }
 
-    async fn close(&mut self) {
-        let Some(mut stream) = self.stream.take() else {
-            return;
+    fn take_owed_close(&mut self) -> Option<DisconnectCode> {
+        self.pending_close.take()
+    }
+
+    async fn close<F>(&mut self, mut on_frame: F) -> Option<DisconnectCode>
+    where
+        F: FnMut(Bytes) + Send,
+    {
+        self.receive_buffer = None;
+        // A close owed by this connection is handed back, not wiped (audit
+        // PR L1, 2026-10-26): the caller classifies it. Until then a stacked
+        // 805 owed here was erased when a failed write closed the socket first.
+        let owed = self.pending_close.take();
+        let writer = self.writer.take();
+        let Some(reader) = self.stream.take() else {
+            // No read half: dropping the writer (if any) stops its task.
+            drop(writer);
+            return owed;
         };
-        // Best effort. A close that fails means the peer is already gone, which
-        // is exactly the state we are trying to reach.
-        if let Err(err) = stream.close(None).await {
+        // Stop the writer and take its write half back, so the Close below
+        // goes out on the same connection exactly as it did before the split.
+        let Some(sink) = (match writer {
+            Some(writer) => writer.stop(self.params.endpoint).await,
+            None => None,
+        }) else {
             debug!(
                 endpoint = self.params.endpoint.as_str(),
-                reason = %safe_err(&err),
+                "Dhan feed socket writer did not hand its write half back — the socket is \
+                 dropped without a close frame, which still releases the connection"
+            );
+            return owed;
+        };
+        let Ok(mut stream) = reader.reunite(sink) else {
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                "Dhan feed socket halves did not belong together — dropped without a close frame"
+            );
+            return owed;
+        };
+        // Best effort, and BOUNDED. A close that fails means the peer is already
+        // gone, which is exactly the state we are trying to reach. A close that
+        // never finishes (a peer that stopped reading) must not strand the
+        // connection task short of its redial — see `send_close_frame_bounded`.
+        let (sent, reason) = send_close_frame_bounded(&mut stream).await;
+        if sent != CloseFrameSend::Sent {
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                close_frame = ?sent,
+                reason = reason.as_deref().unwrap_or(""),
+                wait_bound_ms = CLOSE_HANDSHAKE_WAIT.as_millis(),
                 "Dhan feed socket close was not clean — the socket is dropped regardless"
             );
         }
+        if sent == CloseFrameSend::TimedOut {
+            // The peer is not draining our writes, so it will not send a Close
+            // reply either: waiting a second bound would only delay the redial.
+            // Frames ALREADY readable are still read, without waiting (audit
+            // PR L1): they used to be dropped with the socket, uncounted.
+            let mut first_code = None;
+            let read = drain_ready_frames(
+                &mut stream,
+                self.params.endpoint,
+                &mut on_frame,
+                &mut first_code,
+            );
+            debug!(
+                endpoint = self.params.endpoint.as_str(),
+                frames_read = read,
+                "Dhan feed close frame stalled — read the frames already buffered, then dropped \
+                 the socket"
+            );
+            return owed.or(first_code);
+        }
+        // Give the peer its half of the close handshake, bounded — see
+        // `CLOSE_HANDSHAKE_WAIT` for why an instant redial on top of a
+        // half-open socket can get a HEALTHY sibling killed (Assumed: that
+        // Dhan counts the half-open socket against its per-endpoint cap).
+        // Skipped when the last read was a reset: nothing is left to answer.
+        let (verdict, first_code) = await_close_handshake(
+            &mut stream,
+            self.last_read_ended_by_reset,
+            self.params.endpoint,
+            on_frame,
+        )
+        .await;
+        debug!(
+            endpoint = self.params.endpoint.as_str(),
+            close_handshake = verdict.as_str(),
+            wait_bound_ms = CLOSE_HANDSHAKE_WAIT.as_millis(),
+            "Dhan feed socket closed"
+        );
+        owed.or(first_code)
     }
 }
 
@@ -1113,12 +2453,94 @@ fn ws_bytes_to_bytes(payload: WsBytes) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use tickvault_common::constants::{
         DHAN_MAIN_FEED_WS_BASE_URL, DHAN_TWENTY_DEPTH_WS_BASE_URL,
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, TWENTY_DEPTH_PACKET_SIZE,
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, RESPONSE_CODE_FULL, RESPONSE_CODE_OI,
+        RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TWENTY_DEPTH_PACKET_SIZE,
         TWO_HUNDRED_DEPTH_PACKET_SIZE,
     };
     use tickvault_common::types::{ExchangeSegment, SecurityId};
+
+    /// Review fix 2026-10-06, round 4: a non-101 answer (the 2026-08-12 HTTP
+    /// 400 blackout, a 429 storm) is labelled `upgrade_refused`, the label the
+    /// 805 probe attribution reads as "no socket opened"; every other
+    /// handshake error stays `connect`.
+    #[test]
+    fn test_dial_failure_label_separates_a_refused_upgrade() {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::http::Response;
+        for status in [400u16, 401, 403, 429, 500, 503] {
+            let response = Response::builder()
+                .status(status)
+                .body(None)
+                .expect("a response with a valid status builds");
+            assert_eq!(
+                dial_failure_label(&Error::Http(Box::new(response))),
+                DIAL_FAILURE_UPGRADE_REFUSED,
+                "HTTP {status}"
+            );
+        }
+        assert_eq!(dial_failure_label(&Error::ConnectionClosed), "connect");
+        assert_eq!(
+            dial_failure_label(&Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused
+            ))),
+            "connect"
+        );
+        assert_eq!(DIAL_FAILURE_UPGRADE_REFUSED, "upgrade_refused");
+    }
+
+    /// The keepalive ping must NOT share the subscribe timeout.
+    ///
+    /// This send is awaited on the socket-owning task, so its bound is the
+    /// largest term in the worst-case time the socket goes unread — and a
+    /// reader that stops polling is what Dhan's backpressure layer classifies
+    /// as a slow consumer, which is skipped forward with no sequence number
+    /// for us to detect the loss.
+    ///
+    /// The guard exists in BOTH directions, and the second is the one that
+    /// matters. Collapsing them by pointing the ping back at
+    /// `SUBSCRIBE_SEND_TIMEOUT` re-opens the 10 s stall. But "fixing" it the
+    /// other way — pointing SUBSCRIBE at the 1 s ping bound — is worse: that
+    /// constant also bounds the BOOT subscribe, whose failure raises
+    /// `SubscribeFailed` into the reconnect ladder and can PARK a socket at
+    /// dial time. So this asserts the split, not merely that the ping is fast.
+    #[test]
+    fn the_keepalive_ping_has_its_own_send_bound() {
+        assert!(
+            PING_SEND_TIMEOUT < SUBSCRIBE_SEND_TIMEOUT,
+            "the ping bound must stay strictly tighter than the subscribe bound: it is \
+             awaited on the socket-owning task, the subscribe bound is not"
+        );
+        assert!(
+            SUBSCRIBE_SEND_TIMEOUT >= Duration::from_secs(10),
+            "SUBSCRIBE_SEND_TIMEOUT must stay >= 10s. It bounds the BOOT subscribe, and a \
+             short bound there turns ordinary write latency into SubscribeFailed -> \
+             reconnect ladder -> a parked socket. Tighten the PING bound instead."
+        );
+
+        let src = include_str!("connection.rs");
+        let marker = concat!("#[cfg(", "test)]");
+        let production = src.split(marker).next().unwrap_or(src);
+
+        // Anchor on the ping body itself, not the file: a match elsewhere in
+        // the file would let this pass while the ping still used the shared
+        // bound, which is the way a source scan goes vacuous.
+        let ping_body = production
+            .split("let send = stream.send(Message::Ping(")
+            .nth(1)
+            .and_then(|s| s.split("Ok(Ok(())) =>").next())
+            .expect("send_ping must still send a Ping frame");
+        assert!(
+            ping_body.contains("timeout(PING_SEND_TIMEOUT"),
+            "send_ping must await on PING_SEND_TIMEOUT, not the shared subscribe bound"
+        );
+        assert!(
+            !ping_body.contains("SUBSCRIBE_SEND_TIMEOUT"),
+            "send_ping must not reference SUBSCRIBE_SEND_TIMEOUT at all"
+        );
+    }
 
     /// EVERY endpoint's URL must yield a request-target starting with `/`.
     ///
@@ -1300,6 +2722,57 @@ mod tests {
         );
     }
 
+    /// The unsubscribe half of an in-place change (scope lock 2026-10-02):
+    /// the main feed's code follows the feed mode (16/18/22), depth-20 is 25,
+    /// ids stay strings, and one message carries at most 100 instruments.
+    #[test]
+    fn test_build_unsubscribe_payload_codes_and_per_message_cap() {
+        let batch = |n: u32| -> Vec<SubscribeInstrument> {
+            (0..n)
+                .map(|i| SubscribeInstrument {
+                    security_id: SecurityId::from(1_000 + i),
+                    segment: ExchangeSegment::NseFno,
+                })
+                .collect()
+        };
+        let code = |endpoint, mode, n| -> Option<u64> {
+            let payload = build_unsubscribe_payload(endpoint, mode, &batch(n)).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&payload).ok()?;
+            json.get("RequestCode")?.as_u64()
+        };
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Ticker, 1),
+            Some(16)
+        );
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Quote, 1),
+            Some(18)
+        );
+        assert_eq!(
+            code(DhanEndpointType::MainFeed, FeedMode::Full, 100),
+            Some(22)
+        );
+        assert_eq!(
+            code(DhanEndpointType::Depth20, FeedMode::Full, 50),
+            Some(25)
+        );
+        let payload =
+            build_unsubscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &batch(1))
+                .expect("one instrument builds");
+        assert!(
+            payload.contains("\"1000\""),
+            "SecurityId is a string: {payload}"
+        );
+        assert_eq!(
+            build_unsubscribe_payload(DhanEndpointType::MainFeed, FeedMode::Quote, &batch(101)),
+            Err(SubscribePayloadError::BatchSplit {
+                instruments: 101,
+                messages: 2
+            }),
+            "101 instruments must never go out as one message"
+        );
+    }
+
     const FAKE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMTA2NjU2ODgyIn0.sig";
 
     /// The main-feed base with a trailing slash, for the trim test.
@@ -1314,6 +2787,161 @@ mod tests {
         let mut s = String::from(DHAN_MAIN_FEED_WS_BASE_URL);
         s.push('/');
         s
+    }
+
+    /// The close-handshake wait (2026-09-02, audit finding 4): bounded on a
+    /// clean Close the peer never answers, SKIPPED entirely on a bare reset,
+    /// and ended early by the peer's own Close reply. Under the paused clock
+    /// the bound is asserted as an exact duration, not approximated.
+    #[tokio::test(start_paused = true)]
+    async fn the_close_handshake_wait_is_bounded_on_a_clean_close_and_skipped_on_a_reset() {
+        use futures_util::stream;
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+        // A peer that never answers our Close: wait exactly the bound.
+        let mut silent = stream::pending::<Item>();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut silent, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
+            CloseHandshake::TimedOut
+        );
+        assert_eq!(
+            started.elapsed(),
+            CLOSE_HANDSHAKE_WAIT,
+            "a clean close waits for the peer, bounded by the named constant"
+        );
+
+        // A bare TCP reset: there is no peer to wait for, and no time passes.
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut silent, true, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
+            CloseHandshake::Skipped
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a reset must not delay the recovery it already needs"
+        );
+
+        // A peer that answers: an in-flight data frame is drained and the
+        // Close reply ends the wait early.
+        let mut replying = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Ping(WsBytes::new())),
+            Ok(Message::Close(None)),
+        ]);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            await_close_handshake(&mut replying, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
+            CloseHandshake::Completed
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // A stream that has already ended completes at once as well.
+        let mut ended = stream::iter(Vec::<Item>::new());
+        assert_eq!(
+            await_close_handshake(&mut ended, false, DhanEndpointType::MainFeed, |_| {})
+                .await
+                .0,
+            CloseHandshake::Completed
+        );
+        assert_eq!(CloseHandshake::TimedOut.as_str(), "timed_out");
+        assert!(
+            CLOSE_HANDSHAKE_WAIT < DIAL_TIMEOUT,
+            "the handshake wait must never dominate a dial cycle"
+        );
+    }
+
+    /// The Close frame write is bounded (hostile review 2026-09-22, MEDIUM).
+    /// A peer that stops reading never lets the flush finish; before the bound
+    /// the connection task parked forever short of its redial. Bite: replace
+    /// the helper's `timeout` with a bare await and this test never returns.
+    #[tokio::test(start_paused = true)]
+    async fn the_close_frame_write_is_bounded_when_the_peer_stops_reading() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        type WsError = tokio_tungstenite::tungstenite::Error;
+
+        /// Accepts the frame, then never finishes flushing it.
+        struct StalledPeer;
+        impl futures_util::Sink<Message> for StalledPeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Pending
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let (sent, reason) = send_close_frame_bounded(&mut StalledPeer).await;
+        assert_eq!(sent, CloseFrameSend::TimedOut);
+        assert!(reason.is_none());
+        assert_eq!(
+            started.elapsed(),
+            CLOSE_HANDSHAKE_WAIT,
+            "a stalled close is abandoned at exactly the named bound"
+        );
+
+        /// A peer that is already gone: the write fails at once.
+        struct GonePeer;
+        impl futures_util::Sink<Message> for GonePeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Err(WsError::ConnectionClosed))
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+                Err(WsError::ConnectionClosed)
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let started = tokio::time::Instant::now();
+        let (sent, reason) = send_close_frame_bounded(&mut GonePeer).await;
+        assert_eq!(sent, CloseFrameSend::Failed);
+        assert!(reason.is_some_and(|r| !r.is_empty()));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // A healthy peer: the frame goes out and nothing waits.
+        #[derive(Default)]
+        struct HealthyPeer(Vec<Message>);
+        impl futures_util::Sink<Message> for HealthyPeer {
+            type Error = WsError;
+            fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+                self.0.push(item);
+                Ok(())
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let mut healthy = HealthyPeer::default();
+        let started = tokio::time::Instant::now();
+        let (sent, _) = send_close_frame_bounded(&mut healthy).await;
+        assert_eq!(sent, CloseFrameSend::Sent);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(matches!(healthy.0.as_slice(), [Message::Close(None)]));
     }
 
     /// A bare numeric SecurityId immediately before a JSON object close.
@@ -1720,15 +3348,152 @@ mod tests {
         // half of the flip that would silently fail: a constant changed with a
         // builder that still emitted 17 would subscribe Quote while every doc
         // claimed Full.
-        let batch = [instrument(13, ExchangeSegment::IdxI)];
+        //
+        // FIXTURE CORRECTED 2026-08-21. This asserted that an `IDX_I`
+        // instrument gets code 21 — the defect itself, written down as
+        // expected behaviour, exactly like the `stock_options == 0` assertion
+        // corrected in a2acb6a. Indices are the ONE segment that must not get
+        // 21 (see `IDX_I_FEED_MODE`), so the fixture is now a tradeable
+        // instrument, which is what this test was always about.
+        let batch = [instrument(59099, ExchangeSegment::NseFno)];
         let json =
             build_subscribe_payload(DhanEndpointType::MainFeed, DEFAULT_MAIN_FEED_MODE, &batch)
-                .expect("a single index subscribes");
+                .expect("a single derivative subscribes");
         assert!(json.contains("\"RequestCode\":21"), "{json}");
         assert!(
             !json.contains("\"RequestCode\":17"),
             "the Quote code must be gone, not merely joined: {json}"
         );
+    }
+
+    // -- IDX_I mode partition (2026-08-21) ---------------------------------
+
+    #[test]
+    fn feed_mode_for_segment_gives_an_index_quote_not_full() {
+        // The whole fix in one assertion. Dhan answers an IDX_I Full
+        // subscribe with silence, so a payload carrying 21 for segment 0 is
+        // the bug — measured as 0 IDX_I packets in 163,934 captured frames.
+        let batch = [instrument(13, ExchangeSegment::IdxI)];
+        let json = build_subscribe_payload(
+            DhanEndpointType::MainFeed,
+            feed_mode_for_segment(ExchangeSegment::IdxI, DEFAULT_MAIN_FEED_MODE),
+            &batch,
+        )
+        .expect("a single index subscribes");
+        assert!(json.contains("\"RequestCode\":17"), "{json}");
+        assert!(
+            !json.contains("\"RequestCode\":21"),
+            "an index must not ask for depth it does not have: {json}"
+        );
+    }
+
+    #[test]
+    fn feed_mode_for_segment_keeps_full_for_every_other_segment() {
+        // Non-vacuity. Without this, `feed_mode_for_segment` returning Quote
+        // unconditionally would satisfy the test above while silently
+        // downgrading all ~24,600 tradeable instruments off depth-5 — a far
+        // worse regression than the one being fixed.
+        for segment in [
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::BseFno,
+        ] {
+            assert_eq!(
+                feed_mode_for_segment(segment, FeedMode::Full),
+                FeedMode::Full,
+                "{segment:?} has an order book and must keep Full"
+            );
+        }
+    }
+
+    #[test]
+    fn feed_mode_for_segment_passes_the_configured_mode_through() {
+        // Guards the OTHER direction: if the scope lock ever moves the
+        // main-feed mode again, non-index instruments must follow it. A
+        // `FeedMode::Full` literal inside the helper would pass the test above
+        // and quietly pin the lane to Full forever.
+        assert_eq!(
+            feed_mode_for_segment(ExchangeSegment::NseFno, FeedMode::Ticker),
+            FeedMode::Ticker
+        );
+        assert_eq!(
+            feed_mode_for_segment(ExchangeSegment::IdxI, FeedMode::Ticker),
+            IDX_I_FEED_MODE,
+            "the index override wins over the configured mode, whatever it is"
+        );
+    }
+
+    #[test]
+    fn feed_mode_for_segment_makes_a_mixed_batch_two_messages() {
+        // Why the split is structural rather than stylistic: one Dhan message
+        // carries exactly one RequestCode, so a batch holding both an index
+        // and a derivative CANNOT be sent as a single payload without one of
+        // them getting the wrong mode. This pins the property that forces
+        // `send_subscribe` to emit two messages.
+        let idx = feed_mode_for_segment(ExchangeSegment::IdxI, DEFAULT_MAIN_FEED_MODE);
+        let fno = feed_mode_for_segment(ExchangeSegment::NseFno, DEFAULT_MAIN_FEED_MODE);
+        assert_ne!(
+            idx, fno,
+            "if these ever match, the partition in send_subscribe is dead code and \
+             should be removed rather than left to rot"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_loses_nothing_and_duplicates_nothing() {
+        // A partition that dropped an instrument would leave it unsubscribed
+        // and SILENT — there is no other evidence for that, which is the whole
+        // reason this class of bug survives. A duplicate would double-count
+        // against the per-connection cap.
+        let batch = [
+            instrument(13, ExchangeSegment::IdxI),
+            instrument(59099, ExchangeSegment::NseFno),
+            instrument(21, ExchangeSegment::IdxI),
+            instrument(2885, ExchangeSegment::NseEquity),
+        ];
+        let (indices, others) = partition_index_batch(&batch);
+        assert_eq!(indices.len(), 2);
+        assert_eq!(others.len(), 2);
+        assert_eq!(indices.len() + others.len(), batch.len());
+        assert!(indices.iter().all(|i| i.segment == ExchangeSegment::IdxI));
+        assert!(others.iter().all(|i| i.segment != ExchangeSegment::IdxI));
+        let mut seen: Vec<u64> = indices
+            .iter()
+            .chain(others.iter())
+            .map(|i| i.security_id)
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec![13, 21, 2885, 59099],
+            "every id survives exactly once"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_puts_an_all_index_batch_on_one_side() {
+        let batch = [
+            instrument(13, ExchangeSegment::IdxI),
+            instrument(25, ExchangeSegment::IdxI),
+        ];
+        let (indices, others) = partition_index_batch(&batch);
+        assert_eq!(indices.len(), 2);
+        assert!(
+            others.is_empty(),
+            "an all-index batch must not emit an empty second message — \
+             build_subscribe_payload refuses EmptyBatch and would tear the socket down"
+        );
+    }
+
+    #[test]
+    fn partition_index_batch_with_no_index_leaves_the_original_path() {
+        // Non-vacuity for the fast path in send_subscribe: with no index the
+        // batch is sent exactly as it was before this change.
+        let batch = [instrument(59099, ExchangeSegment::NseFno)];
+        let (indices, others) = partition_index_batch(&batch);
+        assert!(indices.is_empty());
+        assert_eq!(others.len(), 1);
     }
 
     // -- disconnect classification -----------------------------------------
@@ -1769,6 +3534,396 @@ mod tests {
                 "{endpoint}"
             );
         }
+    }
+
+    /// One zero-filled main-feed packet of `code`.
+    fn main_feed_packet(code: u8) -> Vec<u8> {
+        let len = crate::parser::dispatcher::main_feed_packet_len(&[code]).expect("known code");
+        let mut p = vec![0u8; len];
+        p[0] = code;
+        p
+    }
+
+    #[test]
+    fn a_disconnect_stacked_behind_data_reaches_the_supervisor() {
+        // THE 2026-08-25 regression, at the layer that actually gates
+        // `SocketEvent::Closed{code}`. A Dhan frame stacks packets, so
+        // `[quote][disconnect 804]` is a legal shape -- and the old
+        // `frame.len() != 10 => Data` test called it data. The drain then
+        // decoded the disconnect and counted it as untyped "non-tick"
+        // traffic, so the reason reached no log, no metric and no
+        // classifier; the socket closed on TCP with `code: None`, which
+        // `classify_disconnect` reads as Transient, and the ladder retried
+        // the IDENTICAL over-limit subscribe set forever.
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_disconnect(804));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Disconnect(DisconnectCode::InstrumentsExceedLimit),
+            "a stacked 804 must be classified so the supervisor can PARK, not retry"
+        );
+    }
+
+    /// 2026-10-02 (zero-loss audit): while the close handshake completes,
+    /// every frame that carries market data is handed on — a data frame and a
+    /// disconnect stacked behind data — and only a lone disconnect packet and
+    /// control frames are skipped. The peer's Close still ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn test_regression_the_close_handshake_hands_on_every_data_frame() {
+        use futures_util::stream;
+        let data = main_feed_packet(RESPONSE_CODE_QUOTE);
+        let mut stacked = main_feed_packet(RESPONSE_CODE_FULL);
+        stacked.extend_from_slice(&main_feed_disconnect(805));
+        let lone = main_feed_disconnect(805);
+        let mut peer = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                data.clone(),
+            ))),
+            Ok(Message::Ping(WsBytes::new())),
+            Ok(Message::Binary(WsBytes::from(lone))),
+            Ok(Message::Binary(WsBytes::from(stacked.clone()))),
+            Ok(Message::Close(None)),
+            Ok(Message::Binary(WsBytes::from(data.clone()))),
+        ]);
+        let mut handed: Vec<Bytes> = Vec::new();
+        let (verdict, first_code) =
+            await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
+                handed.push(f)
+            })
+            .await;
+        assert_eq!(verdict, CloseHandshake::Completed);
+        assert_eq!(
+            handed,
+            vec![Bytes::from(data), Bytes::from(stacked)],
+            "data and stacked-disconnect frames are kept; nothing after the Close is read"
+        );
+        // Audit PR L1: the lone 805 carried no data but its code is reported.
+        assert_eq!(first_code, Some(DisconnectCode::ExceededActiveConnections));
+    }
+
+    /// Regression (2026-10-26, audit PR L1): a disconnect stacked behind data
+    /// during the close was handed up as data only and its code was never
+    /// classified. The close now reports it.
+    #[tokio::test]
+    async fn test_regression_close_drain_reports_a_stacked_disconnect_code() {
+        use futures_util::stream;
+        let mut stacked = main_feed_packet(RESPONSE_CODE_FULL);
+        stacked.extend_from_slice(&main_feed_disconnect(807));
+        let mut peer = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                stacked.clone(),
+            ))),
+            Ok(Message::Close(None)),
+        ]);
+        let mut handed: Vec<Bytes> = Vec::new();
+        let (_, first_code) =
+            await_close_handshake(&mut peer, false, DhanEndpointType::MainFeed, |f| {
+                handed.push(f)
+            })
+            .await;
+        assert_eq!(
+            handed,
+            vec![Bytes::from(stacked)],
+            "the data still reaches the sink"
+        );
+        assert_eq!(first_code, Some(DisconnectCode::AccessTokenExpired));
+    }
+
+    /// Regression (2026-10-26, audit PR L1): when our Close frame could not
+    /// be sent, `close` returned without reading, so frames already in the
+    /// receive buffer were dropped uncounted. `drain_ready_frames` reads them
+    /// without waiting and stops at the first pending poll.
+    #[test]
+    fn test_regression_stalled_close_drains_buffered_frames_without_waiting() {
+        use futures_util::stream::{self, StreamExt as _};
+        let data = main_feed_packet(RESPONSE_CODE_FULL);
+        let lone = main_feed_disconnect(805);
+        let ready = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Binary(WsBytes::from(
+                data.clone(),
+            ))),
+            Ok(Message::Ping(WsBytes::new())),
+            Ok(Message::Binary(WsBytes::from(lone))),
+            Ok(Message::Binary(WsBytes::from(data.clone()))),
+        ]);
+        // Then nothing more is readable: the drain must stop, not wait.
+        let mut peer = ready.chain(stream::pending());
+        let mut handed: Vec<Bytes> = Vec::new();
+        let mut first_code = None;
+        let read = drain_ready_frames(
+            &mut peer,
+            DhanEndpointType::MainFeed,
+            &mut |f| handed.push(f),
+            &mut first_code,
+        );
+        assert_eq!(read, 4);
+        assert_eq!(handed, vec![Bytes::from(data.clone()), Bytes::from(data)]);
+        assert_eq!(first_code, Some(DisconnectCode::ExceededActiveConnections));
+
+        // A peer's Close ends it; nothing after the Close is read.
+        let mut closing = stream::iter(vec![
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(Message::Close(None)),
+            Ok(Message::Binary(WsBytes::from(main_feed_packet(
+                RESPONSE_CODE_FULL,
+            )))),
+        ]);
+        let mut none: Vec<Bytes> = Vec::new();
+        let mut code = None;
+        assert_eq!(
+            drain_ready_frames(
+                &mut closing,
+                DhanEndpointType::MainFeed,
+                &mut |f| none.push(f),
+                &mut code
+            ),
+            1
+        );
+        assert!(none.is_empty() && code.is_none());
+    }
+
+    #[test]
+    fn a_stacked_805_is_classified_too() {
+        let mut frame = main_feed_packet(RESPONSE_CODE_FULL);
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_OI));
+        frame.extend_from_slice(&main_feed_disconnect(805));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Disconnect(DisconnectCode::ExceededActiveConnections)
+        );
+    }
+
+    /// The data half of a stacked disconnect is exactly the data packets.
+    ///
+    /// Audit PR21 (2026-09-27): that half is no longer thrown away -- the
+    /// Disconnect arm hands the whole frame up and owes the close to the next
+    /// read. What this pins is the arithmetic the arm uses to tell a stacked
+    /// frame (`data_bytes > 0`, hand it up) from a LONE disconnect
+    /// (`data_bytes == 0`, close at once): `payload.len() - control`.
+    #[test]
+    fn the_data_half_of_a_stacked_disconnect_is_exactly_the_data_packets() {
+        // One quote packet, then the 10-byte control packet.
+        let mut one_ahead = main_feed_packet(RESPONSE_CODE_QUOTE);
+        let quote_len = one_ahead.len();
+        one_ahead.extend_from_slice(&main_feed_disconnect(804));
+        assert_eq!(
+            one_ahead.len().saturating_sub(DISCONNECT_PACKET_SIZE),
+            quote_len,
+            "the data byte count must be the data packets alone"
+        );
+
+        // Two packets ahead: the count must grow with the data, not with the
+        // frame's mere existence.
+        let mut two_ahead = main_feed_packet(RESPONSE_CODE_FULL);
+        let full_len = two_ahead.len();
+        two_ahead.extend_from_slice(&main_feed_packet(RESPONSE_CODE_OI));
+        let both_len = two_ahead.len();
+        two_ahead.extend_from_slice(&main_feed_disconnect(805));
+        assert_eq!(
+            two_ahead.len().saturating_sub(DISCONNECT_PACKET_SIZE),
+            both_len
+        );
+        assert!(
+            both_len > full_len,
+            "fixture sanity: the second packet must actually add bytes, else \
+             this test would pass on a frame that stacks nothing"
+        );
+
+        // A LONE disconnect carries no data, so it closes at once.
+        let lone = main_feed_disconnect(805);
+        assert_eq!(lone.len(), DISCONNECT_PACKET_SIZE);
+        assert_eq!(lone.len().saturating_sub(DISCONNECT_PACKET_SIZE), 0);
+
+        // The same on depth: a 14-byte control packet behind a book packet.
+        let mut depth = depth20_book_packet();
+        let book_len = depth.len();
+        depth.extend_from_slice(&depth_disconnect(805));
+        assert_eq!(
+            depth
+                .len()
+                .saturating_sub(crate::parser::depth::DEPTH_DISCONNECT_PACKET_SIZE),
+            book_len
+        );
+    }
+
+    /// Source pin: a stacked disconnect hands its frame UP and owes the close,
+    /// and a lone one closes at once. Audit PR21 (2026-09-27) replaced the
+    /// discard this arm used to do.
+    #[test]
+    fn the_disconnect_arm_hands_stacked_data_up_before_closing() {
+        let src = include_str!("connection.rs");
+        let arm = src
+            .split("FrameClass::Disconnect(code) =>")
+            .nth(1)
+            .expect("the Disconnect arm must exist");
+        // Bound the window to the arm itself, not the whole rest of the file.
+        let arm = &arm[..arm
+            .find("FrameClass::Data =>")
+            .expect("the Data arm follows")];
+        let code_only: String = arm
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code_only.contains("saturating_sub(control)")
+                && code_only.contains("DEPTH_DISCONNECT_PACKET_SIZE")
+                && code_only.contains("DISCONNECT_PACKET_SIZE"),
+            "the arm must subtract the control packet's own width for this \
+             endpoint to tell a stacked frame from a lone disconnect"
+        );
+        assert!(
+            code_only.contains("self.pending_close = Some(code)")
+                && code_only.contains("SocketEvent::Frame(ws_bytes_to_bytes(payload))"),
+            "a stacked disconnect must hand the frame up and owe the close"
+        );
+        assert!(
+            code_only.contains("if data_bytes > 0"),
+            "only a frame that carries data may be handed up; a lone \
+             disconnect must close at once"
+        );
+        assert!(
+            !code_only.contains("stacked_disconnect_discard"),
+            "the discard this arm used to do must not come back"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_owed_close_is_delivered_on_the_next_recv_with_its_code() {
+        let mut socket = DhanFeedSocketImpl::new(
+            DhanSocketParams::new(
+                DhanEndpointType::Depth200,
+                main_feed_base(),
+                fake_client_id(),
+            ),
+            || None,
+        );
+        socket.pending_close = Some(DisconnectCode::ExceededActiveConnections);
+        assert_eq!(
+            socket.recv().await,
+            SocketEvent::Closed {
+                code: Some(DisconnectCode::ExceededActiveConnections)
+            },
+            "the owed close must carry its typed code, or the 805 breaker never trips"
+        );
+        assert_eq!(
+            socket.recv().await,
+            SocketEvent::Closed { code: None },
+            "an owed close is delivered once, never twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_close_clears_an_owed_close_so_it_cannot_close_the_next_connection() {
+        let mut socket = DhanFeedSocketImpl::new(
+            DhanSocketParams::new(
+                DhanEndpointType::Depth20,
+                main_feed_base(),
+                fake_client_id(),
+            ),
+            || None,
+        );
+        socket.pending_close = Some(DisconnectCode::ExceededActiveConnections);
+        socket.close(|_| {}).await;
+        assert_eq!(socket.pending_close, None);
+        assert_eq!(socket.recv().await, SocketEvent::Closed { code: None });
+    }
+
+    #[test]
+    fn a_multi_packet_data_frame_stays_data() {
+        // Non-vacuity in the other direction: the walk must not turn ordinary
+        // stacked market data into a fabricated disconnect, which would park
+        // a healthy socket on a code we invented.
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_FULL));
+        frame.extend_from_slice(&main_feed_packet(RESPONSE_CODE_TICKER));
+        assert_eq!(
+            classify_frame(DhanEndpointType::MainFeed, &frame),
+            FrameClass::Data
+        );
+    }
+
+    #[test]
+    fn the_main_feed_walk_is_never_applied_to_a_depth_frame() {
+        // Depth carries a length-prefixed header whose packet sizes the
+        // main-feed table does not own. A main-feed-LAYOUT stack arriving on a
+        // depth socket does not walk under the depth splitter either, so it
+        // stays data: each feed is walked only by its own parser (audit PR21
+        // gave the depth feeds their own walk; see the tests below).
+        let mut frame = main_feed_packet(RESPONSE_CODE_QUOTE);
+        frame.extend_from_slice(&main_feed_disconnect(804));
+        for endpoint in [DhanEndpointType::Depth20, DhanEndpointType::Depth200] {
+            assert_eq!(
+                classify_frame(endpoint, &frame),
+                FrameClass::Data,
+                "{endpoint}"
+            );
+        }
+    }
+
+    /// A depth-20 book packet: 332 bytes, header length 332, feed code 41.
+    fn depth20_book_packet() -> Vec<u8> {
+        let len = DEEP_DEPTH_HEADER_SIZE + 20 * 16;
+        let mut packet = vec![0u8; len];
+        packet[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+        packet[DEEP_DEPTH_HEADER_OFFSET_FEED_CODE] = 41;
+        packet[3] = 2;
+        packet
+    }
+
+    /// A depth-200 book packet with zero rows: 12 bytes, feed code 41.
+    fn depth200_empty_book_packet() -> Vec<u8> {
+        let mut packet = vec![0u8; DEEP_DEPTH_HEADER_SIZE];
+        packet[0..2].copy_from_slice(&(DEEP_DEPTH_HEADER_SIZE as u16).to_le_bytes());
+        packet[DEEP_DEPTH_HEADER_OFFSET_FEED_CODE] = 41;
+        packet[3] = 2;
+        packet
+    }
+
+    #[test]
+    fn test_a_depth20_805_stacked_behind_book_packets_is_classified() {
+        // Regression (audit PR21, 2026-09-27): this frame was DATA, so the 805
+        // never reached the supervisor, the breaker stayed open, and the
+        // socket redialled into a full account.
+        let mut frame = depth20_book_packet();
+        frame.extend_from_slice(&depth20_book_packet());
+        frame.extend_from_slice(&depth_disconnect(805));
+        assert_eq!(
+            classify_frame(DhanEndpointType::Depth20, &frame),
+            FrameClass::Disconnect(DisconnectCode::from_u16(805))
+        );
+    }
+
+    #[test]
+    fn test_a_depth200_805_stacked_behind_a_book_packet_is_classified() {
+        let mut frame = depth200_empty_book_packet();
+        frame.extend_from_slice(&depth_disconnect(805));
+        assert_eq!(
+            classify_frame(DhanEndpointType::Depth200, &frame),
+            FrameClass::Disconnect(DisconnectCode::from_u16(805))
+        );
+    }
+
+    #[test]
+    fn test_a_stacked_depth_book_frame_without_a_disconnect_stays_data() {
+        let mut frame = depth20_book_packet();
+        frame.extend_from_slice(&depth20_book_packet());
+        assert_eq!(
+            classify_frame(DhanEndpointType::Depth20, &frame),
+            FrameClass::Data
+        );
+    }
+
+    #[test]
+    fn test_a_mis_framed_depth_stack_is_never_read_as_a_disconnect() {
+        // Fail-safe direction: a disconnect followed by a tail the splitter
+        // cannot size is data, never a reason we invented.
+        let mut frame = depth20_book_packet();
+        frame.extend_from_slice(&depth_disconnect(805));
+        frame.extend_from_slice(&[7u8; 5]);
+        assert_eq!(
+            classify_frame(DhanEndpointType::Depth20, &frame),
+            FrameClass::Data
+        );
     }
 
     #[test]
@@ -1827,11 +3982,28 @@ mod tests {
     fn test_classification_is_total_over_short_and_empty_frames() {
         // Fail-safe direction: anything unrecognised is DATA. A false
         // "disconnect" would park a healthy connection on an invented code.
+        //
+        // AMENDED 2026-08-25 with the stacked-disconnect walk. This loop fills
+        // every length with the disconnect response code itself, so any length
+        // that is an exact MULTIPLE of the 10-byte disconnect packet is not
+        // "unrecognised" at all -- it is N well-formed disconnect packets
+        // stacked, which is precisely the shape the walk exists to catch. The
+        // blanket assertion held before only because no walk existed; keeping
+        // it would now pin the bug rather than the invariant.
+        //
+        // The invariant this test protects is UNCHANGED and still non-vacuous:
+        // every length that does NOT resolve into whole packets must be DATA,
+        // and 15 of the 21 lengths here exercise exactly that.
         for len in 0usize..=20 {
             let frame = vec![RESPONSE_CODE_DISCONNECT; len];
             for endpoint in DhanEndpointType::ALL {
                 let class = classify_frame(endpoint, &frame);
-                if len == DISCONNECT_PACKET_SIZE || len == DEEP_DEPTH_HEADER_SIZE + 2 {
+                let walks_into_whole_disconnect_packets =
+                    len > 0 && len % DISCONNECT_PACKET_SIZE == 0;
+                if len == DISCONNECT_PACKET_SIZE
+                    || len == DEEP_DEPTH_HEADER_SIZE + 2
+                    || walks_into_whole_disconnect_packets
+                {
                     // May be either, depending on layout — the point is only
                     // that it does not panic.
                     let _ = class;
@@ -1869,7 +4041,7 @@ mod tests {
             ),
             || None,
         );
-        socket.close().await;
+        socket.close(|_| {}).await;
         assert!(!socket.is_connected());
     }
 
@@ -1937,9 +4109,51 @@ mod tests {
     // -- structural proofs --------------------------------------------------
 
     #[test]
+    fn test_control_frame_counter_returns_one_pre_resolved_handle_per_endpoint_and_kind() {
+        // Audit J4: the ping/pong arm must reuse a handle built once, never
+        // build a label set per frame. The same (endpoint, kind) always maps
+        // to the same static handle; distinct pairs map to distinct ones.
+        let mut seen: Vec<*const metrics::Counter> = Vec::new();
+        for endpoint in DhanEndpointType::ALL {
+            assert_eq!(DhanEndpointType::ALL[endpoint_index(endpoint)], endpoint);
+            for kind in 0..CONTROL_FRAME_KINDS.len() {
+                let first = control_frame_counter(endpoint, kind) as *const metrics::Counter;
+                let again = control_frame_counter(endpoint, kind) as *const metrics::Counter;
+                assert_eq!(first, again, "{endpoint:?} kind {kind} re-resolved");
+                assert!(
+                    !seen.contains(&first),
+                    "{endpoint:?} kind {kind} shares a slot"
+                );
+                seen.push(first);
+            }
+        }
+        assert_eq!(seen.len(), 16);
+        // An out-of-range kind clamps to `raw` instead of panicking.
+        assert_eq!(
+            control_frame_counter(DhanEndpointType::MainFeed, 99) as *const metrics::Counter,
+            control_frame_counter(DhanEndpointType::MainFeed, 3) as *const metrics::Counter,
+        );
+        assert_eq!(CONTROL_FRAME_KINDS, ["ping", "pong", "text", "raw"]);
+    }
+
+    #[test]
+    fn test_the_control_frame_arm_uses_the_pre_resolved_handles() {
+        let src = include_str!("connection.rs");
+        let test_marker = concat!("#[cfg(", "test)]");
+        let production = src.split(test_marker).next().unwrap_or(src);
+        assert!(production.contains("control_frame_counter(endpoint, kind_index).increment(1);"));
+        // The metric name is passed to `counter!` exactly once: inside the
+        // one-time table build.
+        assert_eq!(production.matches("CONTROL_FRAME_METRIC,").count(), 1);
+    }
+
+    #[test]
     fn test_the_production_half_never_dials_without_an_explicit_config() {
         // The security property this module exists for: `None` as the config
         // argument inherits tungstenite's 64 MiB message ceiling.
+        // This scans connection.rs only; `crates/core/tests/
+        // websocket_connect_config_guard.rs` scans every `connect_async*` call
+        // in crates/*/src (audit J4, 2026-10-26).
         let src = include_str!("connection.rs");
         let test_marker = concat!("#[cfg(", "test)]");
         let production = src.split(test_marker).next().unwrap_or(src);
@@ -1948,7 +4162,7 @@ mod tests {
             "the dial must build an explicit config"
         );
         assert!(
-            !production.contains("connect_async_tls_with_config(request, None"),
+            !production.contains("dial_ws_tls_with_keepalive(request, None"),
             "no dial may pass None for the WebSocket config"
         );
         assert!(
@@ -2020,7 +4234,7 @@ mod tests {
             ),
             || None,
         );
-        socket.close().await;
+        socket.close(|_| {}).await;
         assert!(!socket.is_connected());
         drop(socket);
     }
@@ -2061,5 +4275,89 @@ mod tests {
                 "{name} must not derive Debug — it would become a credential leak surface"
             );
         }
+    }
+
+    // --- Z11c: an oversize refusal is an error with its own source -----------
+
+    /// A `Write` sink the test subscriber logs into.
+    #[derive(Clone, Default)]
+    struct Z11cSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Z11cSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The pin for Z11c: a frame the cap refused was a `warn!` with no
+    /// `source`, indistinguishable from an ordinary disconnect although the
+    /// frame (and any ticks in it) never reached the WAL.
+    #[test]
+    fn test_regression_oversize_refusal_logs_error_with_source_frame_oversize() {
+        let sink = Z11cSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let err = tokio_tungstenite::tungstenite::Error::Capacity(
+            tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                size: 9_000_000,
+                max_size: MAIN_FEED_MAX_FRAME_BYTES,
+            },
+        );
+        // `OrderUpdate` never reaches this module in production, so no other
+        // test moves its slot of the process-wide throttle.
+        crate::test_support::keep_callsite_interest_shared();
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..4 {
+                report_oversize_refusal(DhanEndpointType::OrderUpdate, &err);
+            }
+        });
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("frame_oversize"))
+            .collect();
+        assert_eq!(lines.len(), 3, "logged at refusals 1, 2 and 4 only:\n{out}");
+        for line in &lines {
+            assert!(line.contains("ERROR"), "an error, not a warning: {line}");
+            assert!(line.contains("WS-GAP-03"), "{line}");
+            assert!(
+                line.contains(&format!("cap={}", MAIN_FEED_MAX_FRAME_BYTES)),
+                "{line}"
+            );
+        }
+    }
+
+    /// The read arm routes `Capacity` to the oversize report and keeps every
+    /// other read failure on the transport `warn!`.
+    #[test]
+    fn the_read_error_arm_splits_oversize_from_transport() {
+        let src = include_str!("connection.rs");
+        let arm_at = src
+            .find("if reason == \"oversize\" {")
+            .expect("the read-error arm branches on the oversize reason");
+        let arm = &src[arm_at..arm_at + 900];
+        let report = arm
+            .find("report_oversize_refusal(endpoint, &err)")
+            .expect("oversize goes to report_oversize_refusal");
+        let transport = arm.find("warn!(").expect("transport stays a warn!");
+        assert!(
+            report < transport,
+            "oversize is handled before the transport warn!"
+        );
+        let helper_at = src
+            .find("fn report_oversize_refusal(")
+            .expect("helper exists");
+        let helper = &src[helper_at..helper_at + 1200];
+        assert!(helper.contains("error!("), "the oversize line is an error!");
+        assert!(helper.contains("source = \"frame_oversize\""));
+        assert!(helper.contains("cap = max_frame_bytes(endpoint)"));
     }
 }

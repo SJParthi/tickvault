@@ -35,16 +35,38 @@
 //! grow with tick count**. A byte ceiling here would either be permanently red
 //! or so loose it proved nothing.
 //!
-//! Blocks are the honest signal. The same 10,000 folds took **276 blocks** —
-//! amortised growth (a handful of buffer doublings), not one allocation per
-//! tick. A reintroduced per-tick `to_string()` would add ~10,000 blocks and be
-//! impossible to miss, while adding only ~100 KB of bytes, which would have
-//! hidden comfortably inside a byte budget.
+//! Blocks are the honest signal. A reintroduced per-tick `to_string()` would
+//! add ~10,000 blocks and be impossible to miss, while adding only ~100 KB of
+//! bytes -- which would have hidden comfortably inside a byte budget.
 //!
-//! So: **≤ 512 blocks across 10,000 folds.** That is ~20× headroom over
-//! today's 276 and still ~20× below a genuine per-tick regression. Bytes are
-//! recorded in the failure message for diagnosis but are deliberately NOT
-//! asserted.
+//! So: **<= 256 blocks across 10,000 folds**, against a measured **11**.
+//! *(2026-10-26, plan item K6: the tick row buffer is now reserved at 2 MiB
+//! before the measured region, so the measured figure is **0 blocks / 0 bytes**;
+//! the 11 were its doublings. The budget is unchanged.)*
+//!
+//! **CORRECTED 2026-08-22, twice over.** This paragraph read "<= 512 blocks
+//! ... ~20x headroom over today's 276" while the constant below said 7_000 --
+//! and the constant's own comment claimed the seam allocates "~5,100 blocks per
+//! 10,000 ticks: roughly one every two ticks", called that a real finding, and
+//! set the budget as a ratchet at that rate.
+//!
+//! Re-measured today, three ways, the seam allocates **11 blocks per 10,000
+//! folds** -- 4.19 MB of row-buffer doublings, amortised, with no per-tick
+//! allocation at all. The 5,100 figure was the cross-contaminated measurement
+//! that `DHAT_LOCK` was added to eliminate; that lock's own doc names the same
+//! number. The lock fixed the measurement and nobody re-measured, so the
+//! budget kept the bad number and the comment promoted it into a property of
+//! the code.
+//!
+//! Two wrong numbers pointing in opposite directions, in one file, both read
+//! before the constant they describe. The correction that matters is not the
+//! header: it is that a 7,000 ceiling could not catch what this gate exists to
+//! catch. Anything up to ~0.7 allocations per tick passed it silently.
+//!
+//! Bytes are recorded in the failure message for diagnosis but are deliberately
+//! NOT asserted -- this seam appends each tick to the row buffer, so bytes are
+//! SUPPOSED to grow with tick count, and a byte ceiling would be either
+//! permanently red or so loose it proved nothing.
 //!
 //! CI ENFORCEMENT: deliberately UN-gated (no `#![cfg(feature = "dhat")]`) — the
 //! house pattern — so the normal Test (app) lane runs it on every PR, while the
@@ -66,22 +88,32 @@ const FOLDS: u64 = 10_000;
 
 /// Ceilings. Deliberately generous in absolute terms and tight in SCALING
 /// terms: 10,000 folds may not cost 10,000 allocations.
-// MEASURED, and deliberately NOT called zero-alloc.
+// MEASURED 2026-08-22: **11 blocks** for 10,000 folds, and 9 for the frame
+// gate below. Both are amortised buffer growth -- 4.19 MB of row-buffer
+// doublings -- not one allocation per tick. The seam does NOT allocate per
+// tick.
 //
-// This was 512 while the fixtures carried a 1970 timestamp, so every tick was
-// refused and the gate measured the REFUSAL path — 276 blocks for work that
-// never happened. With real session timestamps the fold actually runs, and it
-// allocates ~5,100 blocks per 10,000 ticks: roughly one every two ticks.
+// This constant was 7_000, on a comment stating that the fold "allocates
+// ~5,100 blocks per 10,000 ticks: roughly one every two ticks", called a REAL
+// FINDING and left as a ratchet at that rate. It was not a finding. It was the
+// cross-contaminated measurement that `DHAT_LOCK`, forty lines below, was added
+// to eliminate -- its own doc names the number: *"reported 5,114 then 10,515
+// blocks for identical work on consecutive runs"*. `dhat::Profiler` is
+// PROCESS-global, so two profiled tests in one binary measure each other. The
+// lock fixed the measurement; nobody re-measured afterwards, so the budget kept
+// the contaminated number and the comment promoted it to a property of the
+// code.
 //
-// That is a REAL FINDING about the seam, not a budget to wave through, and it
-// is recorded rather than absorbed: the fold path allocates per tick today.
-// Chasing it needs a DHAT breakdown by call site and is beyond this change.
+// The cost of leaving it: at 7,000 this ratchet could not catch what it was
+// written for. The 2026-08-14 regression added ~1 block per tick (~10,000) and
+// would still fail -- but anything up to ~0.7 allocations per tick sailed
+// through a gate whose entire purpose is to catch per-tick allocation.
 //
-// So this is a RATCHET at the measured rate, not a zero-allocation claim. It
-// still catches a doubling — the 2026-08-14 regression added ~1 block per tick,
-// which would land near 15,000 and fail this by 2x. It does not certify the
-// seam as allocation-free, and no comment here should be read as saying so.
-const MAX_BLOCKS: u64 = 7_000;
+// 256 is ~23x headroom over the measured 11 (buffer doublings grow
+// logarithmically, so real growth cannot approach it) and ~39x below a
+// one-per-tick regression. If this ever goes red, find the allocation -- do NOT
+// raise the ceiling.
+const MAX_BLOCKS: u64 = 256;
 
 /// An exchange timestamp inside a real trading session (epoch seconds).
 ///
@@ -91,6 +123,46 @@ const MAX_BLOCKS: u64 = 7_000;
 /// refusal path instead of the fold — quietly, because a refusal allocates less
 /// and the budget still looks nearly met.
 const SESSION_EPOCH_SECS: u32 = 1_786_800_000;
+
+/// A RECEIPT instant that lands inside the same trading session (UTC nanos).
+///
+/// The third instance of the bug this file already documents twice, and the
+/// first one the older two could not catch (2026-09-05).
+///
+/// `SESSION_EPOCH_SECS` above fixed the LTT after `1_000` — January 1970 — made
+/// the aggregator refuse every tick and the budget measure the REFUSAL path.
+/// The RECEIPT was left at `1_000_000` ns: also January 1970, and after
+/// `from_parsed_tick` adds `IST_UTC_OFFSET_NANOS` it reads as **05:30:00 IST**.
+///
+/// That was inert until the session-window gate began refusing any row whose
+/// `ts` OR `received_at` falls outside 09:00-15:39:59.999 IST. With a 1970
+/// receipt every frame is refused, so both frame gates would measure the
+/// refusal path while still reporting a pass — the exact failure their own
+/// comments were written about, arriving through the one clock nobody had
+/// reason to look at.
+///
+/// UTC, not IST: `from_parsed_tick` ADDS the offset, so this is
+/// `SESSION_EPOCH_SECS` minus 5h30m, landing on 13:20:00 IST.
+const SESSION_RECEIPT_NANOS: i64 = (SESSION_EPOCH_SECS as i64 - 19_800) * 1_000_000_000;
+
+/// 2026-11-17 (plan ITEM DT "PR 0, measure first"): the Full gates time the
+/// inline depth of about 1 in 64 packets (`drain_inline_depth`, jittered gaps
+/// of 32..=95 calls from a fixed seed). Each gate warms up with 16 packets on
+/// a fresh `LiveIngest` (calls 1..=16, none sampled), then measures 10,000
+/// (calls 17..=10,016), so exactly 149 sampled packets fall inside the DHAT
+/// window; the count is pinned by the sampler's own unit test
+/// `test_dhat_window_holds_149_samples`. Both gates hold `DHAT_LOCK` and no
+/// other test here writes inline depth, so the process-wide stage delta is
+/// exact.
+const SAMPLED_FULL_PACKETS: u64 = 149;
+
+/// Samples recorded so far on the `drain_inline_depth` stage.
+fn inline_depth_stage_count() -> u64 {
+    tickvault_storage::hot_path_telemetry::stage_snapshot(
+        tickvault_storage::hot_path_telemetry::Stage::DrainInlineDepth,
+    )
+    .count
+}
 
 /// A tick shaped like a real Quote packet for one of the index instruments.
 fn tick(security_id: u64, price: f32, exchange_ts: u32) -> ParsedTick {
@@ -115,6 +187,22 @@ static DHAT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn ingest_tick_seam_does_not_allocate_per_tick() {
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    // The four instruments are STOCK-OPTION contracts to the ranking layer, so
+    // the per-tick `observe` (the 2026-09-06 volume board) runs INSIDE the
+    // measured window instead of short-circuiting on "not a contract". Until
+    // 2026-09-08 this gate measured a seam that skipped the board entirely —
+    // vacuous for the one per-tick structure added since it was written.
+    tickvault_app::contract_underlying_map::global_contract_underlying_map().publish_from_legs(
+        &(0..4i64)
+            .map(|i| tickvault_app::contract_underlying_map::LegIds {
+                contract_security_id: 13 + i,
+                underlying_security_id: 1_000 + i,
+                contract_segment: tickvault_common::types::ExchangeSegment::IdxI,
+                family: tickvault_app::option_rank::OptionFamily::Stock,
+                lot_size: 75,
+            })
+            .collect::<Vec<_>>(),
+    );
 
     // WARM-UP, OUTSIDE the measured window. First touch of an instrument
     // allocates its aggregator slot and registers its metric keys — a real
@@ -122,7 +210,9 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     // would make this gate fail for the wrong reason and teach the next reader
     // to raise the budget instead of finding the leak.
     for i in 0..4u64 {
-        let _ = ingest.ingest_tick_at(&tick(13 + i, 100.0, SESSION_EPOCH_SECS), i as u64, 0, 1_000);
+        let mut t = tick(13 + i, 100.0, SESSION_EPOCH_SECS);
+        t.volume = 1;
+        let _ = ingest.ingest_tick_at(&t, i, 0, 1_000);
     }
 
     let profiler = dhat::Profiler::builder().testing().build();
@@ -130,7 +220,7 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
     for n in 0..FOLDS {
         // Vary price and timestamp so the fold does real work — a constant
         // tick could be short-circuited and would prove nothing.
-        let t = tick(
+        let mut t = tick(
             13 + (n % 4),
             100.0 + (n % 97) as f32 * 0.05,
             // See SESSION_EPOCH_SECS. This gate shipped with `1_000` — January
@@ -141,6 +231,11 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
             // either way. Found 2026-08-15 while diagnosing the frame gate.
             SESSION_EPOCH_SECS + (n % 600) as u32,
         );
+        // Cumulative volume, rising every tick, so the 2026-09-06 volume board
+        // (`observe`, per accepted tick) does real work inside the window. A
+        // zero is ignored before the board is touched, which is what made this
+        // gate vacuous for that seam until 2026-09-08.
+        t.volume = 2 + n as u32;
         let _ = ingest.ingest_tick_at(&t, n, (n % 3) as u32, 1_000 + n);
     }
 
@@ -169,6 +264,11 @@ fn ingest_tick_seam_does_not_allocate_per_tick() {
 
 #[test]
 fn gate_is_not_vacuous() {
+    // Serialised with the profiled gates (Quote 61 review, 2026-11-14): an
+    // ingest built and dropped here moves process-wide state the wrong-day
+    // gate reads (the aux repeat gap epoch), and its allocations would land in
+    // another test's profiling window.
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The budget above is an UPPER bound, which a loop that never ran would
     // satisfy trivially. This proves the seam does real work.
     //
@@ -198,6 +298,95 @@ fn gate_is_not_vacuous() {
     );
 }
 
+/// The REFUSAL path must not allocate either — the pre-open case.
+///
+/// Added 2026-09-05, and it exists because fixing one bug hid another.
+///
+/// The session-window gate refuses any row whose `ts` or `received_at` falls
+/// outside 09:00-15:39:59.999 IST. Its first version called
+/// `metrics::counter!(NAME, "feed" => .., "reason" => ..)` at the refusal
+/// site; both label values are non-literal, which drops the macro to its
+/// allocating arm — the mechanism CLAUDE.md records from `record_ws_lag`. CI
+/// measured 10,010 blocks over 10,000 ticks against a ceiling of 500.
+///
+/// It looked like a rare path. It is not: OUTSIDE the session window EVERY
+/// tick is a refusal, so the pre-open burst — the busiest stretch of the
+/// morning — allocated once per tick on the drain task.
+///
+/// The gates above can no longer catch a regression here, because giving them
+/// an in-window receipt (the whole point of `SESSION_RECEIPT_NANOS`) means
+/// they never take the refusal arm. This one feeds a receipt at 05:30 IST on
+/// purpose, so every frame is refused and the budget measures exactly the path
+/// production takes before 09:00.
+#[test]
+fn out_of_window_refusal_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    fn quote_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 50];
+        buf[0] = 4;
+        buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&ltp.to_le_bytes());
+        buf[14..18].copy_from_slice(&ltt.to_le_bytes());
+        buf
+    }
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(200);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&quote_packet(
+                13 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    // 1_000_000 ns is January 1970, which after the IST offset reads as
+    // 05:30:00 IST -- deliberately out of window, so every row is refused.
+    const PRE_OPEN_RECEIPT_NANOS: i64 = 1_000_000;
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    let c = counters();
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), PRE_OPEN_RECEIPT_NANOS, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500;
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for (n, f) in frames.iter().enumerate() {
+        let _ = drain_main_feed_frame(&mut ingest, f, PRE_OPEN_RECEIPT_NANOS, 1_000 + n as u64, c);
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert!(
+        stats.total_blocks <= 500,
+        "the REFUSAL path allocated {} blocks over {} ticks (ceiling 500). \
+         Outside 09:00-15:39 IST every tick takes this path, so a per-tick \
+         allocation here is a per-tick allocation through the whole pre-open.",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
+
 /// The FRAME seam — the function the original allocation actually lived in.
 ///
 /// # Why this test exists on top of the one above
@@ -224,7 +413,7 @@ fn gate_is_not_vacuous() {
 /// Blocks, not bytes, for the same reason the fold gate gives: the row buffer
 /// is supposed to grow with tick count. A frame carrying 4 packets folded
 /// 2,500 times is 10,000 ticks through the same path as the gate above, so the
-/// same 512-block ceiling applies and means the same thing.
+/// same 256-block ceiling applies and means the same thing.
 #[test]
 fn frame_drain_seam_does_not_allocate_per_tick() {
     let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -263,7 +452,7 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
                 // than the fold it claims to gate: 1,536 blocks that would
                 // have looked like a near-pass rather than a broken test.
                 // The non-vacuity companion is what caught it.
-                SESSION_EPOCH_SECS + (n % 600) as u32,
+                SESSION_EPOCH_SECS + u32::try_from(n / 4).expect("fixture time fits"),
             ));
         }
         CapturedFrame {
@@ -271,18 +460,58 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: (n % 4) as u8,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
             bytes: bytes.into(),
         }
     }
 
-    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
-    let c = counters();
-
-    // Warm-up OUTSIDE the window, same reasoning as the fold gate: first touch
-    // of an instrument allocates its slot and registers its metric keys.
-    for n in 0..4u64 {
-        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), 1_000_000, 1_000, c);
+    fn receipt_nanos(n: u64) -> i64 {
+        SESSION_RECEIPT_NANOS + i64::try_from(n / 4).expect("fixture time fits") * 1_000_000_000
     }
+
+    // Readback stays OUTSIDE DHAT. Prices change even for equal-time frames,
+    // so this detects omitted updates that a final timestamp alone misses.
+    fn assert_spots(ingest: &LiveIngest, n: u64) {
+        use tickvault_common::types::ExchangeSegment;
+        let spots = ingest.spot_prices();
+        let expected_secs = SESSION_EPOCH_SECS + u32::try_from(n / 4).expect("fixture time fits");
+        let expected_paise = 10_000 + i64::try_from(n % 97).expect("price step fits") * 5;
+        for id in 13..17u64 {
+            assert_eq!(
+                spots.latest_exchange_secs(id, ExchangeSegment::IdxI),
+                Some(expected_secs)
+            );
+            assert_eq!(
+                spots.latest_paise(id, ExchangeSegment::IdxI),
+                Some(expected_paise)
+            );
+        }
+        assert_eq!(spots.tracked(), 4);
+        assert_eq!(spots.refusals(), (0, 0, 0, 0));
+        assert_eq!(spots.future_day_refusals(), 0);
+        assert_eq!(spots.future_time_capped(), 0);
+    }
+
+    const WARMUP_FRAMES: u64 = 4;
+    let c = counters();
+    let warmed_ingest = || {
+        let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+        ingest
+            .spot_prices()
+            .reset_for_trading_day(tickvault_app::spot_price_store::ist_day_of(
+                SESSION_EPOCH_SECS,
+            ));
+        // Warm first-key inserts and metrics registration outside DHAT.
+        for n in 0..WARMUP_FRAMES {
+            let out = drain_main_feed_frame(&mut ingest, &frame(n, n), receipt_nanos(n), 1_000, c);
+            assert_eq!(out.folded, 4);
+            assert_spots(&ingest, n);
+        }
+        ingest
+    };
 
     const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, as above
 
@@ -300,14 +529,36 @@ fn frame_drain_seam_does_not_allocate_per_tick() {
     // permanently unguarded while looking guarded. The fold gate above never
     // had this problem because its fixture is a plain struct that never
     // touches the heap; a frame is bytes, so it must be built up front.
-    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(100 + n, n)).collect();
+    // Do not rewind after warmup or cycle older exchange timestamps into the
+    // same store. Receipt advances with the wire time to avoid future caps.
+    let frames: Vec<CapturedFrame> = (WARMUP_FRAMES..WARMUP_FRAMES + FRAMES)
+        .map(|n| frame(100 + n, n))
+        .collect();
 
+    let mut ingest = warmed_ingest();
+    let mut measured_folded = 0u64;
     let profiler = dhat::Profiler::builder().testing().build();
-    for (n, f) in frames.iter().enumerate() {
-        let _ = drain_main_feed_frame(&mut ingest, f, 1_000_000 + n as i64, 1_000 + n as u64, c);
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut ingest, f, receipt_nanos(n), 1_000 + n, c);
+        measured_folded += out.folded;
     }
     let stats = dhat::HeapStats::get();
     drop(profiler);
+    assert_eq!(measured_folded, FRAMES * 4);
+    assert_eq!(ingest.pending_rows(), (FRAMES + WARMUP_FRAMES) * 4);
+    assert_spots(&ingest, WARMUP_FRAMES + FRAMES - 1);
+
+    // Re-exercise the exact sequence AFTER measurement on an independent
+    // ingest. This proves each accepted spot update without profiling the
+    // readback helpers or pre-warming the whole workload before DHAT.
+    let mut proof_ingest = warmed_ingest();
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut proof_ingest, f, receipt_nanos(n), 1_000 + n, c);
+        assert_eq!(out.folded, 4);
+        assert_spots(&proof_ingest, n);
+    }
+    assert_eq!(proof_ingest.pending_rows(), (FRAMES + WARMUP_FRAMES) * 4);
+    drop(proof_ingest);
 
     assert!(
         stats.total_blocks <= MAX_BLOCKS,
@@ -331,6 +582,8 @@ fn frame_drain_gate_is_not_vacuous() {
     use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
     use tickvault_core::websocket::pool_budget::DhanEndpointType;
     use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+    // Serialised with the profiled gates, for the reason in `gate_is_not_vacuous`.
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut buf = vec![0u8; 50];
     buf[0] = 4;
@@ -353,9 +606,13 @@ fn frame_drain_gate_is_not_vacuous() {
             endpoint: DhanEndpointType::MainFeed,
             connection_index: 0,
             received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
             bytes: buf.into(),
         },
-        1_000_000,
+        SESSION_RECEIPT_NANOS,
         1_000,
         counters(),
     );
@@ -366,4 +623,523 @@ fn frame_drain_gate_is_not_vacuous() {
          allocation budget above is measuring an empty loop. outcome={out:?}"
     );
     assert!(ingest.tracked_instruments() > 0);
+}
+
+/// The PRODUCTION shape: a Full (code 8) packet through a lane with the
+/// inline-depth sink wired.
+///
+/// # Why this exists as a separate gate
+///
+/// Every gate above builds a **Quote** packet (code 4, 50 bytes) and a
+/// `LiveIngest` with **no depth sink**. Production is neither:
+/// `DEFAULT_MAIN_FEED_MODE` is `FeedMode::Full` (code 8, 162 bytes, five depth
+/// levels) since 2026-08-19, and the boot site wires `with_inline_depth`
+/// UNCONDITIONALLY. So the branch that does the most per-packet work in
+/// production — the depth fold, ten `DepthRow` appends per packet — was
+/// measured by nothing.
+///
+/// That is the `record_ws_lag` failure mode exactly. That path allocated twice
+/// per tick for months, roughly 36 million allocations an hour, while three
+/// correct comments warned against precisely it. Comments did not catch it; a
+/// DHAT test did. A gate that measures a packet type production does not send
+/// is a comment with a test's reputation.
+///
+/// # What the budget means
+///
+/// Full does strictly more work than Quote — a 162-byte parse and ten depth
+/// rows instead of a 50-byte parse and none — so its ceiling is higher than the
+/// Quote gate's and says nothing about zero-allocation. It is a RATCHET at the
+/// measured rate. It catches a doubling, which is the regression class that has
+/// actually happened here; it does not certify the path allocation-free, and no
+/// comment here should be read as saying so.
+#[test]
+fn full_mode_frame_with_inline_depth_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::DepthIngest;
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    /// One 162-byte Full packet, built to the wire layout in
+    /// `crates/core/src/parser/full_packet.rs`.
+    ///
+    /// The depth levels are filled with non-zero values on purpose: a block of
+    /// zeros can be folded by a short-circuit that a real book would not take,
+    /// and the gate would then measure less work than production does.
+    fn full_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; tickvault_common::constants::FULL_QUOTE_PACKET_SIZE];
+        buf[0] = tickvault_common::constants::RESPONSE_CODE_FULL;
+        buf[1..3].copy_from_slice(
+            &(tickvault_common::constants::FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes(),
+        );
+        buf[3] = 1; // NSE_EQ — a segment that HAS an order book
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTP
+            ..tickvault_common::constants::QUOTE_OFFSET_LTP + 4]
+            .copy_from_slice(&ltp.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTT
+            ..tickvault_common::constants::QUOTE_OFFSET_LTT + 4]
+            .copy_from_slice(&ltt.to_le_bytes());
+        for level in 0..tickvault_common::constants::MARKET_DEPTH_LEVELS {
+            let base = tickvault_common::constants::FULL_OFFSET_DEPTH_START
+                + level * tickvault_common::constants::MARKET_DEPTH_LEVEL_SIZE;
+            let step = level as u32 + 1;
+            buf[base..base + 4].copy_from_slice(&(100u32 * step).to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&(200u32 * step).to_le_bytes());
+        }
+        buf
+    }
+
+    /// Four packets stacked in ONE frame — the real shape, as above.
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(4 * tickvault_common::constants::FULL_QUOTE_PACKET_SIZE);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&full_packet(
+                5000 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_inline_depth(DepthIngest::for_test());
+    let c = counters();
+
+    // Warm-up OUTSIDE the window: first touch of an instrument allocates its
+    // slot and registers its metric keys, and that cost is per-universe, not
+    // per-tick.
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks
+
+    // EVERY FIXTURE BUILT BEFORE THE PROFILER STARTS, so the measurement is of
+    // the drain and not of the test's own Vec growth.
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    // 2026-11-17 (plan ITEM DT): read outside the window, so a SAMPLED
+    // packet (`drain_inline_depth`, about 1 in 64) is proven inside it.
+    let depth_samples_before = inline_depth_stage_count();
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut folded = 0u64;
+    let mut depth_rows = 0u64;
+    for f in &frames {
+        let out = drain_main_feed_frame(&mut ingest, f, SESSION_RECEIPT_NANOS, 1_000, c);
+        folded += out.folded;
+        depth_rows += out.inline_depth_rows;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        inline_depth_stage_count() - depth_samples_before,
+        SAMPLED_FULL_PACKETS,
+        "the window must time the inline depth of its 149 sampled Full packets"
+    );
+
+    // NON-VACUITY FIRST. A Full packet that parses but is refused would make
+    // every allocation number below meaningless while looking like a pass —
+    // which is exactly how the 1970-timestamp bug hid in the gate above.
+    assert_eq!(
+        folded,
+        FRAMES * 4,
+        "every packet must FOLD, or the budget measures the refusal path"
+    );
+
+    // And the depth half specifically must have run — with the EXACT row count
+    // production would produce. `> 0` would pass on a single stray append; ten
+    // rows per packet (five levels, both sides) is the shape that proves the
+    // whole fold ran for every packet, which is the gap this gate closes.
+    assert_eq!(
+        depth_rows,
+        FRAMES * 4 * 10,
+        "the inline-depth sink must append ten rows per packet, or this gate \
+         measures a Full packet with the depth branch skipped — the very shape \
+         it exists to cover"
+    );
+
+    // Ceiling. MEASURED: 19 blocks over 10,000 ticks AND 100,000 depth-row
+    // appends — the depth fold is allocation-free at production scale, which is
+    // worth stating because it was previously unmeasured rather than known.
+    //
+    // 500, not a round 60,000: a per-tick allocation here would land at 10,000+,
+    // so hundreds is already a 25x signal, and a slack ceiling is a gate that
+    // passes while the thing it guards regresses. This is still a RATCHET at the
+    // measured rate, not a zero-allocation claim.
+    const MAX_BLOCKS_FULL: u64 = 500;
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS_FULL,
+        "Full-mode frame drain with inline depth allocated {} blocks over {} ticks \
+         (ceiling {MAX_BLOCKS_FULL}). This is the production packet shape; a rise \
+         here is a per-tick allocation on the live path.",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
+
+/// Plan item 49e step 3: the same production Full-packet shape with
+/// `[depth_storage] array_rows` ON, so each packet's five-level book becomes
+/// two `market_depth_book` rows (one bid, one ask) built in the `BookMode`
+/// scratch arrays, which are allocated once when the sink is built (since
+/// speed fix 5, 2026-11-17: in stack arrays inside `append_inline_depth_book`).
+///
+/// ⚠ CORRECTED 2026-11-17 (speed fix 5 review): this said it "covers
+/// `append_book_slots`, the append the depth-20 and depth-200 socket drains
+/// share". Since speed fix 5 the inline book goes to the writer as one pair
+/// (`DepthWriter::append_book_pair`) and never reaches `append_book_slots`,
+/// so this gate measures the pair path (inside `drain_main_feed_frame`, no
+/// flush and no name republish in the window; the hand-off and the
+/// republish are measured by `crates/storage/tests/dhat_depth_book_hand_off.rs`).
+/// `append_book_slots` is measured by
+/// `dhat_depth_drain.rs::depth20_book_drain_does_not_allocate_per_packet`.
+#[test]
+fn full_mode_frame_with_inline_depth_book_rows_does_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::DepthIngest;
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    fn full_packet(security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; tickvault_common::constants::FULL_QUOTE_PACKET_SIZE];
+        buf[0] = tickvault_common::constants::RESPONSE_CODE_FULL;
+        buf[1..3].copy_from_slice(
+            &(tickvault_common::constants::FULL_QUOTE_PACKET_SIZE as u16).to_le_bytes(),
+        );
+        buf[3] = 1; // NSE_EQ
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTP
+            ..tickvault_common::constants::QUOTE_OFFSET_LTP + 4]
+            .copy_from_slice(&ltp.to_le_bytes());
+        buf[tickvault_common::constants::QUOTE_OFFSET_LTT
+            ..tickvault_common::constants::QUOTE_OFFSET_LTT + 4]
+            .copy_from_slice(&ltt.to_le_bytes());
+        for level in 0..tickvault_common::constants::MARKET_DEPTH_LEVELS {
+            let base = tickvault_common::constants::FULL_OFFSET_DEPTH_START
+                + level * tickvault_common::constants::MARKET_DEPTH_LEVEL_SIZE;
+            let step = level as u32 + 1;
+            buf[base..base + 4].copy_from_slice(&(100u32 * step).to_le_bytes());
+            buf[base + 4..base + 8].copy_from_slice(&(200u32 * step).to_le_bytes());
+        }
+        buf
+    }
+
+    fn frame(seq: u64, n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(4 * tickvault_common::constants::FULL_QUOTE_PACKET_SIZE);
+        for i in 0..4u32 {
+            bytes.extend_from_slice(&full_packet(
+                5000 + i,
+                100.0 + (n % 97) as f32 * 0.05,
+                SESSION_EPOCH_SECS + (n % 600) as u32,
+            ));
+        }
+        CapturedFrame {
+            seq,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: tickvault_storage::ws_frame_spill::receipt_nanos_from(
+                std::time::Instant::now(),
+            ),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    // `since` = 1 ns: every frame here was received after it, so every packet
+    // takes the book path.
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_inline_depth(DepthIngest::for_test_book(1));
+    let c = counters();
+    for n in 0..4u64 {
+        let _ = drain_main_feed_frame(&mut ingest, &frame(n, n), SESSION_RECEIPT_NANOS, 1_000, c);
+    }
+
+    const FRAMES: u64 = 2_500; // x4 packets = 10,000 ticks, 20,000 book rows
+    let frames: Vec<CapturedFrame> = (0..FRAMES).map(|n| frame(1_000 + n, n)).collect();
+
+    let depth_samples_before = inline_depth_stage_count();
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut folded = 0u64;
+    let mut depth_levels = 0u64;
+    for f in &frames {
+        let out = drain_main_feed_frame(&mut ingest, f, SESSION_RECEIPT_NANOS, 1_000, c);
+        folded += out.folded;
+        depth_levels += out.inline_depth_rows;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        inline_depth_stage_count() - depth_samples_before,
+        SAMPLED_FULL_PACKETS,
+        "the window must time the inline depth of its 149 sampled Full packets"
+    );
+
+    assert_eq!(folded, FRAMES * 4, "every packet must fold");
+    // The book path counts LEVELS stored, the same unit as the level path, so
+    // ten per packet proves both book rows were appended for every packet.
+    assert_eq!(
+        depth_levels,
+        FRAMES * 4 * 10,
+        "the book sink must store all ten levels of every packet"
+    );
+    assert!(
+        ingest
+            .depth_sink()
+            .is_some_and(|d| !d.pending_book_bytes().is_empty()),
+        "the gate must measure the book path, not the level path"
+    );
+
+    // Ceiling. MEASURED 2026-10-09: 18 blocks over 10,000 ticks and 20,000
+    // book-row appends (the level-row gate above measures 19 for 100,000 level
+    // rows). Same 500 ceiling and reasoning as that gate: a per-tick
+    // allocation lands at 10,000+. A RATCHET at the measured rate, not a
+    // zero-allocation claim; the buffer's amortised doubling is the residue.
+    const MAX_BLOCKS_BOOK: u64 = 500;
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS_BOOK,
+        "Full-mode frame drain with book rows allocated {} blocks over {} ticks \
+         (ceiling {MAX_BLOCKS_BOOK})",
+        stats.total_blocks,
+        FRAMES * 4
+    );
+}
+
+/// Operator Quote 61 (2026-11-14): the wrong-day (`no_trade_today`) path,
+/// where an exact repeat of a contract's previous row is SKIPPED by a map
+/// keyed on `(security_id, segment)` and pre-sized at 25,000 keys. Inside the
+/// window: 4 contracts repeating (skip) with a price change every 200 packets
+/// (write and update in place), and a NEW contract every 10th packet (1,000
+/// first rows: write and insert). The inserts are what measure the pre-size:
+/// a map built unsized grows about ten times on the way to 1,000 keys.
+///
+/// Non-vacuity: every tick must come back `RefusedWrongDay`, and the rows
+/// staged across the window must equal the count a plain model of the rule
+/// predicts (a filter that never skips, or always skips, fails here).
+#[test]
+fn wrong_day_repeats_do_not_allocate_per_tick() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::collections::HashMap;
+    use tickvault_app::dhan_feed_stack::IngestOutcome;
+
+    let wrong_day = |sid: u64, price: f32| {
+        let mut t = tick(sid, price, SESSION_EPOCH_SECS - 86_400);
+        t.exchange_segment_code = 2; // NSE_FNO
+        t.received_at_nanos = SESSION_RECEIPT_NANOS;
+        t
+    };
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8);
+    // Warm-up outside the window: first touch of each repeating contract.
+    for i in 0..4u64 {
+        let _ = ingest.ingest_tick_at(&wrong_day(70_000 + i, 50.0), i, 0, 1_000);
+    }
+
+    let ticks: Vec<_> = (0..FOLDS)
+        .map(|n| {
+            if n % 10 == 9 {
+                wrong_day(80_000 + n / 10, 60.0)
+            } else {
+                wrong_day(70_000 + n % 4, 50.0 + ((n / 200) as f32) * 0.05)
+            }
+        })
+        .collect();
+    // The rule, modelled outside the window: write when the price differs
+    // from the contract's last written price (the warm-up wrote 50.0).
+    let mut model: HashMap<u64, u32> = (0..4u64).map(|i| (70_000 + i, 50.0f32.to_bits())).collect();
+    let expected_writes = ticks
+        .iter()
+        .filter(|t| {
+            model.insert(t.security_id, t.last_traded_price.to_bits())
+                != Some(t.last_traded_price.to_bits())
+        })
+        .count();
+    let rows_before = ingest.pending_rows();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut wrong_day_outcomes = 0u64;
+    for (n, t) in ticks.iter().enumerate() {
+        let n = n as u64;
+        if matches!(
+            ingest.ingest_tick_at(t, 100 + n, 0, 1_000 + n),
+            IngestOutcome::RefusedWrongDay
+        ) {
+            wrong_day_outcomes += 1;
+        }
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    assert_eq!(
+        wrong_day_outcomes, FOLDS,
+        "every tick must take the wrong-day path, or this gate measures another one"
+    );
+    assert_eq!(
+        ingest.pending_rows() - rows_before,
+        expected_writes as u64,
+        "rows staged across the window must match the rule (both arms ran)"
+    );
+    assert!(
+        expected_writes > 1_000 && expected_writes < 2_000,
+        "the window must hold both writes and skips: {expected_writes} writes"
+    );
+    assert!(
+        stats.total_blocks <= 4,
+        "the no_trade_today repeat filter allocated {} blocks over {FOLDS} packets \
+         (ceiling 4): a per-packet allocation, or a map that grows, on the live drain",
+        stats.total_blocks
+    );
+}
+
+/// The POST-CUTOVER drain (2026-11-21 review): from WAL receipt 2026-11-20
+/// 00:00 IST every Dhan trade time is UTC epoch and the dispatcher adds
+/// +19,800 s, which is the permanent production state. Every gate above runs
+/// with August receipts and the inert reversion guard, so none of this
+/// branch's per-frame and per-tick drain work ran under the profiler:
+/// `LttController::on_frame` (its once-a-minute counter publish and its day
+/// roll), `LttController::observe` and `LttDetector::vote` on every live index
+/// and NSE stock print, and the corrected dispatch.
+///
+/// This window builds the production guard (`act`), drives WAL-stamped
+/// frames of 3 index + 3 NSE stock Quote packets with UTC raw times and
+/// receipts from 2026-11-20 10:00 IST, one second apart, for 2,500 frames
+/// (about 42 minutes, so the publish fires about 41 times inside the window),
+/// and holds the same block budget as the frame gate above. It also asserts
+/// the votes, verdicts and publishes moved inside the window, so the window
+/// is not empty. MEASURED 2026-11-21 (x86 dev container): 0 blocks, 0 bytes.
+#[test]
+fn post_cutover_frame_drain_with_reversion_guard_does_not_allocate() {
+    let _serial = DHAT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use tickvault_app::dhan_feed_stack::{counters, drain_main_feed_frame};
+    use tickvault_common::config::LttUtcAutocorrect;
+    use tickvault_core::websocket::pool_budget::DhanEndpointType;
+    use tickvault_core::websocket::pool_supervisor::CapturedFrame;
+
+    /// 2026-11-20 10:00:00 IST as UTC epoch seconds.
+    const START_UTC_SECS: i64 = 1_795_152_600 - 3_600;
+    const SIDS: [(u8, u32); 6] = [
+        (0, 13),
+        (0, 25),
+        (0, 51),
+        (1, 2_885),
+        (1, 1_333),
+        (1, 1_594),
+    ];
+    const WARMUP_FRAMES: u64 = 4;
+    const FRAMES: u64 = 2_500;
+
+    fn quote_packet(segment: u8, security_id: u32, ltp: f32, ltt: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 50];
+        buf[0] = 4; // RESPONSE_CODE_QUOTE
+        buf[1..3].copy_from_slice(&50u16.to_le_bytes());
+        buf[3] = segment;
+        buf[4..8].copy_from_slice(&security_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&ltp.to_le_bytes());
+        buf[14..18].copy_from_slice(&ltt.to_le_bytes());
+        buf
+    }
+
+    fn receipt_nanos(n: u64) -> i64 {
+        (START_UTC_SECS + i64::try_from(n).expect("fits")) * 1_000_000_000
+    }
+
+    /// Dhan's raw UTC trade time for frame `n` (receipt second, UTC epoch).
+    fn raw_utc(n: u64) -> u32 {
+        u32::try_from(START_UTC_SECS + i64::try_from(n).expect("fits")).expect("fits")
+    }
+
+    fn frame(n: u64) -> CapturedFrame {
+        let mut bytes = Vec::with_capacity(50 * SIDS.len());
+        for (segment, sid) in SIDS {
+            bytes.extend_from_slice(&quote_packet(
+                segment,
+                sid,
+                100.0 + (n % 97) as f32 * 0.05,
+                raw_utc(n),
+            ));
+        }
+        CapturedFrame {
+            seq: 100 + n,
+            endpoint: DhanEndpointType::MainFeed,
+            connection_index: (n % 4) as u8,
+            received_at: std::time::Instant::now(),
+            received_at_nanos: receipt_nanos(n),
+            wal_backed: true,
+            bytes: bytes.into(),
+        }
+    }
+
+    let c = counters();
+    let mut ingest = LiveIngest::new(TickWriter::for_test(Feed::Dhan), 8)
+        .with_ltt_correction(LttUtcAutocorrect::Act, None);
+    let corrected_first = raw_utc(0) + 19_800;
+    ingest
+        .spot_prices()
+        .reset_for_trading_day(tickvault_app::spot_price_store::ist_day_of(corrected_first));
+    // Warm first-key inserts, the guard's first publish and metrics
+    // registration outside DHAT.
+    for n in 0..WARMUP_FRAMES {
+        let out = drain_main_feed_frame(&mut ingest, &frame(n), receipt_nanos(n), 1_000, c);
+        assert_eq!(out.folded, 6, "warm-up frame {n} folded: {out:?}");
+    }
+    let frames: Vec<CapturedFrame> = (WARMUP_FRAMES..WARMUP_FRAMES + FRAMES).map(frame).collect();
+    let before = ingest.ltt_controller().counts();
+
+    let mut measured_folded = 0u64;
+    let profiler = dhat::Profiler::builder().testing().build();
+    for (n, f) in (WARMUP_FRAMES..).zip(&frames) {
+        let out = drain_main_feed_frame(&mut ingest, f, receipt_nanos(n), 1_000 + n, c);
+        measured_folded += out.folded;
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+
+    // Not empty: every new drain step ran inside the window.
+    let after = ingest.ltt_controller().counts();
+    assert_eq!(measured_folded, FRAMES * 6);
+    assert_eq!(
+        after.votes - before.votes,
+        FRAMES * 6,
+        "every index and NSE stock print voted"
+    );
+    assert!(
+        after.utc_verdicts > before.utc_verdicts,
+        "the detector decided inside the window: {before:?} -> {after:?}"
+    );
+    assert!(
+        after.publishes >= before.publishes + 40,
+        "the once-a-minute counter publish ran inside the window: {before:?} -> {after:?}"
+    );
+    assert_eq!(after.reversion_reports, 0, "UTC prints never page");
+    // The corrected time is what was stored for the last index print.
+    let last = WARMUP_FRAMES + FRAMES - 1;
+    assert_eq!(
+        ingest
+            .spot_prices()
+            .latest_exchange_secs(13, tickvault_common::types::ExchangeSegment::IdxI),
+        Some(raw_utc(last) + 19_800),
+        "the dispatcher corrected the trade time"
+    );
+
+    assert!(
+        stats.total_blocks <= MAX_BLOCKS,
+        "PER-TICK ALLOCATION ON THE POST-CUTOVER FRAME SEAM.\n\n\
+         {FRAMES} frames x 6 packets allocated {} blocks ({} bytes); the budget \
+         is {MAX_BLOCKS}. This window covers the trade-time reversion guard \
+         (per-frame publish and day roll, per-print vote) and the corrected \
+         dispatch, which no other gate profiles.",
+        stats.total_blocks,
+        stats.total_bytes
+    );
 }

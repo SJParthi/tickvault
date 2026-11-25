@@ -38,8 +38,15 @@ use std::process::Command;
 // The 16 sockets, from websocket-connection-scope-lock.md (operator, 2026-08-09)
 // ---------------------------------------------------------------------------
 
-/// 5 main-feed + 5 depth-20 + 5 depth-200 + 1 order-update.
+/// 5 main-feed + 5 depth-20 + 5 depth-200 + 1 order-update, on the PRIMARY account.
 const AUTHORIZED_WEBSOCKETS: u64 = 16;
+
+/// The second, depth-only Dhan account (websocket-connection-scope-lock.md
+/// § "2026-09-26 — A SECOND DHAN ACCOUNT"): 5 depth-20 + 5 depth-200 more.
+/// It ships OFF. Its sockets count toward the budget below only when the
+/// terraform switch `dhan_depth_account_enabled` defaults to `true`, which is
+/// exactly the moment they can exist.
+const DEPTH_ACCOUNT_WEBSOCKETS: u64 = 10;
 
 /// Dhan pings every 10 s and CLOSES if the client has not answered within 40 s.
 /// Documented for BOTH the live feed (`docs/dhan-ref/03`) and full market depth
@@ -72,10 +79,18 @@ const INSTANCE_RAM_GIB: &[(&str, u64)] = &[
 /// why the total here (30 GiB) is slightly above the 29.3 GiB the conf file
 /// states: the conf shows the real arithmetic, the guard leaves no rounding
 /// slack to hide in.
-const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 16;
+///
+/// **2026-10-22 (operator Quote 38, "Re-size from measured use"): 16 → 6.**
+/// The 16 above was a sum of ASSUMED rows sized for the 32 GiB box and does not
+/// fit the 16 GiB r8g.large at all. The owner chose to re-derive it from
+/// measurement: 2 × the highest whole-box use measured (about 3 GB, 2026-10-21,
+/// app running). Assumed until a full trading day is measured on r8g.large.
+const NON_QUESTDB_NON_SOCKET_GIB_HIGH: u64 = 6;
 
 const SYSCTL_CONF: &str = "deploy/aws/sysctl/99-tickvault-net.conf";
-const VERIFIER: &str = "deploy/aws/sysctl/verify-net-tuning.sh";
+const VERIFIER: &str = "crates/app/src/host_tuning.rs";
+/// How the boot unit invokes the verifier (audit D6b, 2026-10-01).
+const VERIFIER_CALL: &str = "tickvault-host host-tuning verify";
 const USER_DATA: &str = "deploy/aws/terraform/user-data.sh.tftpl";
 const COMPOSE: &str = "deploy/docker/docker-compose.yml";
 const TF_VARS: &str = "deploy/aws/terraform/variables.tf";
@@ -142,6 +157,35 @@ fn locked_instance_type(tf: &str) -> Option<String> {
     Some(v.trim().trim_matches('"').to_string())
 }
 
+/// The terraform `dhan_depth_account_enabled` default. Absent or unparseable
+/// reads as `true` — fail-closed: a switch this guard cannot read must not be
+/// allowed to hide ten sockets from the budget.
+fn depth_account_enabled_default(tf: &str) -> bool {
+    let Some(idx) = tf.find("variable \"dhan_depth_account_enabled\"") else {
+        return true;
+    };
+    let rest = &tf[idx..];
+    let block_end = rest[1..].find("variable \"").map_or(rest.len(), |n| n + 1);
+    let Some(line) = rest[..block_end]
+        .lines()
+        .find(|l| l.trim_start().starts_with("default"))
+    else {
+        return true;
+    };
+    line.split_once('=')
+        .is_none_or(|(_, v)| v.trim() != "false")
+}
+
+/// Sockets that can exist at once: the primary account's 16, plus the depth
+/// account's 10 when its switch is on.
+fn authorized_websockets(tf: &str) -> u64 {
+    if depth_account_enabled_default(tf) {
+        AUTHORIZED_WEBSOCKETS + DEPTH_ACCOUNT_WEBSOCKETS
+    } else {
+        AUTHORIZED_WEBSOCKETS
+    }
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -170,7 +214,8 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
         });
 
     // Worst case: every authorized socket pinned at the per-socket ceiling.
-    let socket_worst_case = rmem_max * AUTHORIZED_WEBSOCKETS;
+    let sockets = authorized_websockets(&read(TF_VARS));
+    let socket_worst_case = rmem_max * sockets;
 
     let questdb = compose_mem_limit_bytes(&read(COMPOSE), "tv-questdb")
         .expect("docker-compose.yml no longer declares a QuestDB mem_limit default");
@@ -200,7 +245,6 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
          connection app-side to (budget / actual connection count) so the total \
          is bounded by design (PR #1738), or move to a bigger instance under a \
          dated operator quote.",
-        sockets = AUTHORIZED_WEBSOCKETS,
         per = rmem_max / (1024 * 1024),
         sock = socket_worst_case / (1024 * 1024),
         qdb = questdb / (1024 * 1024),
@@ -219,6 +263,51 @@ fn sixteen_sockets_of_receive_buffer_fit_the_locked_instance() {
          not a margin, it is a coincidence",
         headroom / (1024 * 1024)
     );
+}
+
+/// 2026-09-26: the scope lock REJECTS "defaulting the depth account on before
+/// the 26-socket sizing is recorded". This is where it is recorded, and this
+/// test keeps the record honest: the conf file must state the 26-socket
+/// arithmetic, and while that arithmetic does not leave the same 1 GiB
+/// headroom the 16-socket budget must, the switch must stay off.
+#[test]
+fn the_twenty_six_socket_budget_is_recorded_and_gates_the_depth_account() {
+    let conf = read(SYSCTL_CONF);
+    assert!(
+        conf.contains("26 sockets x 64 MiB ceiling = 1.625 GiB"),
+        "99-tickvault-net.conf must record the 26-socket arithmetic for the \
+         second, depth-only Dhan account (websocket-connection-scope-lock.md \
+         § 2026-09-26)"
+    );
+
+    let rmem_max = sysctl_value(&conf, "net.core.rmem_max").expect("no rmem_max");
+    let instance = locked_instance_type(&read(TF_VARS)).expect("no instance_type default");
+    let host_gib = INSTANCE_RAM_GIB
+        .iter()
+        .find(|(name, _)| *name == instance)
+        .map(|(_, gib)| *gib)
+        .expect("instance type is in the RAM table (the budget test above pins this)");
+    let questdb = compose_mem_limit_bytes(&read(COMPOSE), "tv-questdb").expect("no QuestDB cap");
+    let total = rmem_max * (AUTHORIZED_WEBSOCKETS + DEPTH_ACCOUNT_WEBSOCKETS)
+        + questdb
+        + NON_QUESTDB_NON_SOCKET_GIB_HIGH * GIB;
+    let host = host_gib * GIB;
+    let fits_with_headroom = total + GIB <= host;
+
+    if !fits_with_headroom {
+        assert!(
+            !depth_account_enabled_default(&read(TF_VARS)),
+            "the depth account is switched on, but 26 sockets x {} MiB + QuestDB \
+             {} MiB + {} MiB worst case = {} MiB leaves under 1 GiB of the {} MiB \
+             host. Bound the total first (per-connection SO_RCVBUF, or a smaller \
+             QuestDB cap), then switch the account on.",
+            rmem_max / (1024 * 1024),
+            questdb / (1024 * 1024),
+            NON_QUESTDB_NON_SOCKET_GIB_HIGH * 1024,
+            total / (1024 * 1024),
+            host / (1024 * 1024),
+        );
+    }
 }
 
 #[test]
@@ -292,11 +381,13 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
     // restarts every weekday, so the tuning it applied was silently stale on
     // every boot after the first. The unit re-applies it every boot.
     //
+    // 2026-10-01 (audit D6b) — the verifier is now `tickvault host-tuning
+    // verify`, a subcommand of the app binary, not a shell script.
+    //
     // The invariant is unchanged and still fully enforced — install, then
-    // apply, then verify, in that order. Only the file it is read from moved.
-    // Verifying BEFORE applying would describe the pre-tuning kernel, which is
-    // exactly the false-OK this chain exists to prevent, so the ORDER check is
-    // kept verbatim.
+    // apply, then verify, in that order. Verifying BEFORE applying would
+    // describe the pre-tuning kernel, which is exactly the false-OK this chain
+    // exists to prevent, so the ORDER check is kept verbatim.
     let unit = read("deploy/systemd/tickvault-host-tuning.service");
 
     assert!(
@@ -304,8 +395,8 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
         "the boot unit no longer installs the sysctl file"
     );
     assert!(
-        unit.contains("verify-net-tuning.sh"),
-        "the boot unit no longer runs verify-net-tuning.sh. Applying tuning \
+        unit.contains(VERIFIER_CALL),
+        "the boot unit no longer runs `{VERIFIER_CALL}`. Applying tuning \
          without verifying it lands is the false-OK this whole chain exists to \
          prevent."
     );
@@ -314,7 +405,7 @@ fn user_data_runs_the_verifier_after_applying_the_sysctl_file() {
         .find("sysctl --system")
         .expect("the boot unit no longer applies sysctls");
     let verify = unit
-        .find("verify-net-tuning.sh")
+        .find(VERIFIER_CALL)
         .expect("no verifier call in the boot unit");
     assert!(
         apply < verify,
@@ -353,59 +444,37 @@ fn verifier_checks_every_load_bearing_setting_the_sysctl_file_sets() {
     ] {
         assert!(
             verifier.contains(key),
-            "verify-net-tuning.sh does not check `{key}`, but \
-             99-tickvault-net.conf sets it. A verifier that covers a subset \
-             reports success it has not established."
+            "{VERIFIER} does not check `{key}`, but 99-tickvault-net.conf sets \
+             it. A verifier that covers a subset reports success it has not \
+             established."
         );
     }
 }
 
 #[test]
 fn verifier_exits_nonzero_when_the_kernel_is_untuned() {
-    // Runs the real script against THIS host, which is a stock CI container and
-    // therefore genuinely untuned. If the script ever returned 0 here it would
-    // be reporting a tuning that provably is not present.
-    let path = repo_root().join(VERIFIER);
-    let out = Command::new("bash")
-        .arg(&path)
-        .output()
-        .expect("could not execute verify-net-tuning.sh");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Runs the real check against THIS host, which is a stock CI container and
+    // therefore genuinely untuned. If it ever reported zero failures here it
+    // would be reporting a tuning that provably is not present.
+    let (failures, report) = tickvault_app::host_tuning::verify_this_host();
 
     // A tuned host would legitimately pass; only assert the failure shape when
     // this host is actually untuned, so the guard cannot false-fail on a box
     // that has the settings applied.
-    if stdout.contains("BELOW") || stdout.contains("UNREADABLE") {
+    if report.contains("BELOW") || report.contains("UNREADABLE") {
         assert!(
-            !out.status.success(),
-            "verify-net-tuning.sh reported settings BELOW target yet exited 0 — \
-             a non-zero exit is the only part of this a caller can act on:\n{stdout}"
+            failures > 0,
+            "the verifier reported settings BELOW target yet counted no failure — \
+             the non-zero exit is the only part of this a caller can act on:\n{report}"
         );
         assert!(
-            stdout.contains("NOT APPLIED"),
+            report.contains("NOT APPLIED"),
             "a failing verification must say so in plain words, not just in an \
-             exit code nobody reads:\n{stdout}"
+             exit code nobody reads:\n{report}"
         );
     } else {
-        assert!(
-            out.status.success(),
-            "no failures reported yet exited non-zero"
-        );
+        assert_eq!(failures, 0, "no failures reported yet counted some");
     }
-}
-
-#[test]
-fn verifier_is_executable_and_syntactically_valid() {
-    let path = repo_root().join(VERIFIER);
-    let out = Command::new("bash")
-        .args(["-n", path.to_str().expect("path")])
-        .output()
-        .expect("bash -n failed to run");
-    assert!(
-        out.status.success(),
-        "verify-net-tuning.sh has a shell syntax error:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -438,4 +507,20 @@ fn parsers_are_self_tested() {
     let tf = "variable \"instance_type\" {\n  type = string\n  default = \"r8g.xlarge\"\n}\n";
     assert_eq!(locked_instance_type(tf), Some("r8g.xlarge".to_string()));
     assert_eq!(locked_instance_type("variable \"other\" {}"), None);
+
+    let off = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n  default = false\n}\n\
+               variable \"next\" {\n  default = true\n}\n";
+    assert!(!depth_account_enabled_default(off));
+    assert_eq!(authorized_websockets(off), 16);
+    let on = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n  default = true\n}\n";
+    assert!(depth_account_enabled_default(on));
+    assert_eq!(authorized_websockets(on), 26);
+    // Fail-closed: a switch the guard cannot find or read counts as ON, and
+    // the NEXT variable's default must never be read as this one's.
+    assert!(depth_account_enabled_default("variable \"other\" {}"));
+    let no_default = "variable \"dhan_depth_account_enabled\" {\n  type = bool\n}\n\
+                      variable \"next\" {\n  default = false\n}\n";
+    assert!(depth_account_enabled_default(no_default));
+    // The live file ships the account OFF.
+    assert!(!depth_account_enabled_default(&read(TF_VARS)));
 }

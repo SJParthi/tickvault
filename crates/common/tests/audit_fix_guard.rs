@@ -216,6 +216,11 @@ fn bench_gate_selftest_exists_and_covers_both_directions() {
         // The 2026-08-07 second incident: a real drift shape carrying ONE
         // outlier. Proven to FAIL against the pre-IQR gate and PASS after.
         "IQR ignores tails",
+        // 2026-10-11 noise floor: a sub-floor tiny-bench change passes, and the
+        // floor still fails a regression of real size or of unknown size.
+        "under the floor -> PASS (NOISE)",
+        "over the floor -> still FAILS",
+        "never NOISE, still FAILS",
     ] {
         assert!(
             body.contains(needle),
