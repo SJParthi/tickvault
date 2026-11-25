@@ -45,3 +45,5 @@ The one-minute narrated film, captions, animation, browser-tested comparison, ru
 ## November 25 merged Stocks release
 
 The narrated comparison, animation and offline table cover the tree merged in ff452b93e. CI recorded 18,736 tests passed and 39 skipped. Coverage reached 84.39% of measured production lines and 94.13% of distinct changed lines. All 106 measured medians met their absolute budgets. Two benchmarks exceeded the allowed slowdown against the previous candidate in a same-runner comparison. The table identifies the operations, units, samples and source revisions. [Download the release comparison](merged-release-comparison.zip) · [CI](https://github.com/SJParthi/tickvault/actions/runs/45634973126) · [Benchmarks](https://github.com/SJParthi/tickvault/actions/runs/45632817244)
+
+The instrument walkthrough follows the 218 F&O cash underlyings that had a recorded price during the midday check. It also shows how the page counts rows, how an after-close quote differs from a current trade, and why the daily audit still has an unexplained difference. [Download the narrated comparison, captions and chart](instrument-coverage.zip)
