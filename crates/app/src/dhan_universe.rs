@@ -217,7 +217,11 @@ pub(crate) const MAPPING_DIR: &str = "data/instrument-cache";
 /// resolved nothing usable" in every log line and counter.
 #[must_use]
 pub fn mapping_artifact_path(date_ist: &str) -> std::path::PathBuf {
-    std::path::Path::new(MAPPING_DIR).join(format!("dhan-nse-mapping-{date_ist}.json"))
+    mapping_artifact_in(std::path::Path::new(MAPPING_DIR), date_ist)
+}
+
+fn mapping_artifact_in(dir: &std::path::Path, date_ist: &str) -> std::path::PathBuf {
+    dir.join(format!("dhan-nse-mapping-{date_ist}.json"))
 }
 
 /// Path of the day's F&O stock UNDERLYING artifact.
@@ -1491,6 +1495,29 @@ fn write_mapping_atomic(
     observed: chrono::DateTime<chrono::Utc>,
     mtf: Option<DailyMtfTerms>,
 ) -> anyhow::Result<()> {
+    let _lock = write_broad_mapping(
+        std::path::Path::new(MAPPING_DIR),
+        date,
+        master,
+        index,
+        outcome,
+        observed,
+        mtf,
+    )?;
+    write_narrowed_spot_artifacts(date, master, outcome);
+    Ok(())
+}
+
+/// Keep the dated writer lock until its caller has also written the narrowed sets.
+fn write_broad_mapping(
+    dir: &std::path::Path,
+    date: &str,
+    master: &[tickvault_core::instrument::master_csv::MasterRow],
+    index: &tickvault_core::instrument::master_csv::IsinIndex,
+    outcome: &JoinOutcome,
+    observed: chrono::DateTime<chrono::Utc>,
+    mtf: Option<DailyMtfTerms>,
+) -> anyhow::Result<std::fs::File> {
     // Path-traversal guard BEFORE the filename is built (§18 row 4). The date
     // is derived internally, but a validated input is validated regardless of
     // where it came from — that is what makes it a guard rather than a habit.
@@ -1498,16 +1525,16 @@ fn write_mapping_atomic(
         date.len() == 10 && date.bytes().all(|b| b.is_ascii_digit() || b == b'-'),
         "refusing to write a mapping for a malformed date {date:?}"
     );
-    std::fs::create_dir_all(MAPPING_DIR)?;
+    std::fs::create_dir_all(dir)?;
     // Concurrent refreshes must merge receipts from the last committed file.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(std::path::Path::new(MAPPING_DIR).join(".dhan-nse-mapping.lock"))?;
+        .open(dir.join(".dhan-nse-mapping.lock"))?;
     lock.lock()?;
-    let path = mapping_artifact_path(date);
+    let path = mapping_artifact_in(dir, date);
     let at = observed
         .timestamp()
         .saturating_add(i64::from(observed.timestamp_subsec_nanos() > 0));
@@ -1574,8 +1601,7 @@ fn write_mapping_atomic(
         "instrument mapping written"
     );
 
-    write_narrowed_spot_artifacts(date, master, outcome);
-    Ok(())
+    Ok(lock)
 }
 
 /// The two narrowed spot artifacts (F&O underlyings, NTM), each on its own
@@ -2053,12 +2079,13 @@ mod constituent_bound_tests {
 
 #[cfg(test)]
 /// Feed the real dated writer the same parsed master and constituent join
-/// that it receives from its network inputs, inside the caller's scratch cwd.
+/// that it receives from its network inputs, in the supplied artifact directory.
 pub(crate) fn write_mtf_mapping_fixture(
+    dir: &std::path::Path,
     observed_rfc3339: &str,
     last_modified: Option<&str>,
     multiplier: &str,
-) {
+) -> std::path::PathBuf {
     use tickvault_core::instrument::master_csv::{Constituent, MIN_PLAUSIBLE_MASTER_ROWS};
     let mut csv =
         String::from("SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES,INSTRUMENT,MTF_LEVERAGE");
@@ -2089,7 +2116,8 @@ pub(crate) fn write_mtf_mapping_fixture(
     );
     let index = build_isin_index(&detailed.rows);
     let outcome = join_constituents(&constituents, &index);
-    write_mapping_atomic(
+    write_broad_mapping(
+        dir,
         "2026-11-06",
         &detailed.rows,
         &index,
@@ -2098,6 +2126,7 @@ pub(crate) fn write_mtf_mapping_fixture(
         mtf,
     )
     .unwrap();
+    mapping_artifact_in(dir, "2026-11-06")
 }
 
 #[cfg(test)]

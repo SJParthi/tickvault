@@ -701,12 +701,26 @@ pub fn restamped(
 /// (cached by metadata, on the blocking pool) and one bounded query.
 // TEST-EXEMPT: thin wrapper over build_universe (driven by every route test below); needs a live QuestDB
 pub async fn build_live_universe(state: &SharedAppState, clock: LiveClock) -> MoversUniverse {
+    build_live_universe_in(
+        state,
+        clock,
+        Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+    )
+    .await
+}
+
+/// Build from the dated membership and F&O artifacts in the specified directory.
+pub async fn build_live_universe_in(
+    state: &SharedAppState,
+    clock: LiveClock,
+    artifact_dir: &Path,
+) -> MoversUniverse {
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     build_universe(FnoStocksInputs {
         client: state.questdb_http_client(),
         base_url: &base_url,
-        artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+        artifact_dir,
         market_open: clock.market_open,
         now_ist: clock.now_ist,
         read_at_ist: None,
@@ -2352,6 +2366,22 @@ mod tests {
             19_800
         );
         assert!(universe.fno.is_none() && universe.membership.is_none());
+    }
+    #[tokio::test]
+    async fn test_build_live_universe_in_reads_only_the_supplied_artifact_directory() {
+        let now_ist = at("2026-10-30 08:00:00");
+        let clock = LiveClock {
+            now_ist,
+            market_open: false,
+            now_epoch: now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64,
+        };
+        let state = fno_stocks::tests::mock_state(1);
+        for count in [1, 3] {
+            let fixture = Fixture::new(count);
+            let u = build_live_universe_in(&state, clock, &fixture.0).await;
+            assert!(u.valid());
+            assert_eq!(u.membership.unwrap().names.len(), count);
+        }
     }
     fn cached_universe(observed: i64) -> Arc<MoversUniverse> {
         use tickvault_common::operator_movers_universe::{

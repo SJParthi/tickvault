@@ -718,40 +718,22 @@ mod tests {
         use tickvault_common::operator_movers_universe::select;
         use tickvault_common::operator_movers_wire::SourceStatus;
         use tickvault_common::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
-        const CHILD: &str = "TV_TEST_MTF_DAILY_PUBLISH_DIR";
-        // The writer and reader use the production relative artifact directory.
-        // A child process gets its own cwd while other Rust tests run in parallel.
-        if let Some(dir) = std::env::var_os(CHILD) {
-            assert_eq!(
-                std::env::current_dir().unwrap(),
-                std::path::PathBuf::from(dir)
-            );
-            assert!(
-                std::env::current_dir()
-                    .unwrap()
-                    .starts_with(std::env::temp_dir())
-            );
-        } else {
-            let dir =
-                std::env::temp_dir().join(format!("tv-mtf-daily-publish-{}", std::process::id()));
-            std::fs::create_dir(&dir).unwrap();
-            let child = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg(std::thread::current().name().unwrap())
-                .env(CHILD, &dir)
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            std::fs::remove_dir_all(&dir).unwrap();
-            assert!(
-                child.status.success()
-                    && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
-                "child stdout {} stderr {}",
-                String::from_utf8_lossy(&child.stdout),
-                String::from_utf8_lossy(&child.stderr)
-            );
-            return;
+        struct FixtureDir(std::path::PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
         }
+        let path = std::env::temp_dir().join(format!(
+            "tv-mtf-stocks-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let directory = FixtureDir(path);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config: tickvault_common::config::ApplicationConfig = figment::Figment::new()
             .merge(Toml::string(include_str!("../../../config/base.toml")))
@@ -835,8 +817,12 @@ mod tests {
             ),
         ];
         for (index, &(observed, header, multiplier, cutoffs)) in checks.iter().enumerate() {
-            crate::dhan_universe::write_mtf_mapping_fixture(observed, header, multiplier);
-            let path = crate::dhan_universe::mapping_artifact_path("2026-11-06");
+            let path = crate::dhan_universe::write_mtf_mapping_fixture(
+                &directory.0,
+                observed,
+                header,
+                multiplier,
+            );
             let record: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             let receipt_count = record
@@ -852,7 +838,11 @@ mod tests {
                 let clock = clock(hour, minute, false);
                 let store = FakeStore::watching(clock.now_epoch);
                 let run = run_cycle(&store, &mut None, clock, true, || {
-                    build_live_universe(&state, clock)
+                    tickvault_api::handlers::stock_movers::build_live_universe_in(
+                        &state,
+                        clock,
+                        &directory.0,
+                    )
                 })
                 .await;
                 assert_eq!(run.outcome, PublishOutcome::Ok);

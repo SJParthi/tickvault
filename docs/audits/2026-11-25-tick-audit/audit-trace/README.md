@@ -17,7 +17,7 @@
 
 QuestDB deduplicates trade and quote rows using the timestamp, feed, segment, security ID and capture sequence. To investigate a warning, first read the original daily receipt, then repeat each dated table count and check WAL apply state. To identify an individual missing record, compare the keys of eligible captured market packets with the keys stored for the corresponding interval. Preserve the original audit when later evidence arrives. [Daily warning runbook](../../../error-runbooks/tick-conservation-error-codes.md)
 
-[Watch the narrated walkthrough](audit-trail.mp4) · [Play the animated comparison](audit-trail.gif) · [Open the offline comparison](comparison.html) · [View the still](audit-trail.png) · [Download the supporting evidence](evidence.zip)
+[Download the narrated walkthrough with captions](audit-film.zip) · [Play the animated comparison](audit-trail.gif) · [Open the offline comparison](comparison.html) · [View the still](audit-trail.png) · [Download the supporting evidence](evidence.zip)
 
 A paired experiment added a bitmap index on correlation ID in a disposable database. Query plans switched to index scans. Tail timings varied between repeated runs. At 100,000 unique IDs the indexed partition took 211.5 MiB more allocated space. No production schema change followed from this experiment.
 
