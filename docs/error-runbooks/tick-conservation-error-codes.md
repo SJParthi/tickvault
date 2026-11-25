@@ -30,7 +30,7 @@ and writes one row to `tick_conservation_audit` (DEDUP `ts, trading_date_ist, fe
 |---|---|---|
 | `match` | `exact` | the positive accepted and database counts agree for the full day |
 | `unverified` | `within_counted_losses` | fewer rows are visible than accepted. The process-wide spill, failure and deferral count could cover the difference. Earlier versions stored this reason with verdict `match`. |
-| `mismatch` | `unexplained_shortfall` | more rows are missing than every counted loss explains |
+| `mismatch` | `unexplained_shortfall` | accepted buffer writes exceed stored rows by more than the spill, failure and deferral counter explains |
 | `mismatch` | `extra_db_rows` | the table holds more of today's Dhan rows than this process accepted |
 | `unverified` | `count_unreadable` | the count query failed, timed out or returned a bad body; never a mismatch |
 | `unverified` | `no_rows` | nothing accepted and nothing stored; a zero baseline proves nothing |
@@ -50,12 +50,16 @@ Telegram (`dhan-rest-only-noise-lock-2026-07-14.md`).
 1. `select * from tick_conservation_audit order by ts desc limit 5` — the
    numbers behind the verdict (`accepted_rows`, `db_tick_rows`,
    `not_landed_rows`, `shortfall`, `count_reads`).
-2. `unexplained_shortfall`: check QuestDB's apply backlog
-   (`tv_questdb_wal_apply_lag_max`, `wal_tables()`) — rows still being applied
-   read as missing. Re-run the count by hand after the backlog drains. If it is
-   still short, look for loss counters that do not feed the ledger
-   (`tv_ticks_lost_total`, `tv_wal_shed_frames_lost_total`) and the
-   `HOT-PATH-02` lines for the day.
+2. For `unexplained_shortfall`, check `wal_tables()` for suspended tables or
+   outstanding transactions. Repeat the dated, feed-filtered count on both
+   `ticks` and `tick_quotes` after apply catches up. Record both counts and
+   the read time alongside the original receipt. Check `tv_ticks_lost_total`,
+   `tv_wal_shed_frames_lost_total` and the day's `HOT-PATH-02` lines.
+   Compare eligible captured keys with stored keys in the same interval to
+   identify missing records. Both tables deduplicate by timestamp, feed,
+   segment, security ID and capture sequence. Offering an existing key again
+   increases accepted writes while the database can still hold one row.
+   Replay telemetry counts frames, each of which can contain several packets.
 3. `extra_db_rows`: another writer stamped `feed='dhan'` on today's rows (a
    second process, or a WAL replay of a frame this process also wrote). Check
    for `RESILIENCE-01` and the boot's replay log line.
