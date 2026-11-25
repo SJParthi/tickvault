@@ -490,8 +490,7 @@ fn failed_deferred_restore_holds_every_unconfirmed_segment_for_retry() {
     let failed = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT);
     assert!(
         failed
-            .err()
-            .expect("failed restore must hold the pass")
+            .expect_err("failed restore must hold the pass")
             .to_string()
             .contains("could not be restored")
     );
