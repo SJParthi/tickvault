@@ -595,6 +595,11 @@ fn the_workflow_runs_the_re_measure_only_on_a_regression_and_regates() {
         "the restore and the save key must both end in the commit"
     );
     assert!(wf.contains("id: restore"), "the restore step needs an id");
+    // Criterion compares against base/. Restoring new/ or change/ would let
+    // a missing measurement from this run be supplied by an earlier run.
+    let cache_inputs =
+        "path: |\n            target/criterion/**/base\n            target/criterion/tv_ab_bins";
+    assert_eq!(wf.matches(cache_inputs).count(), 2);
     assert!(wf.contains("BENCH_AB_BASELINE_KEY: ${{ steps.restore.outputs.cache-matched-key }}"));
     let at = wf.find("- name: Run bench-gate").expect("gate step"); // APPROVED: test
     let gate = &wf[at..];
@@ -603,9 +608,11 @@ fn the_workflow_runs_the_re_measure_only_on_a_regression_and_regates() {
         gate.find(needle)
             .unwrap_or_else(|| panic!("gate step lost: {needle}"))
     };
+    assert!(gate.contains("BENCH_RECORD_VERDICT: '1'"));
+    assert!(gate.contains("BENCH_REQUIRE_ALL_BUDGETS: '1'"));
     let first = find("bash scripts/bench-gate.sh | tee gate-output.log && rc=0 || rc=$?");
     let tool = find(
-        "if [ \"$rc\" = 2 ] && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck",
+        "if [ \"$rc\" = 2 ] && grep -Fxq 'measured_rc=2' \"$GITHUB_OUTPUT\" && cargo run -q --profile bench -p tickvault-common --bin bench_ab_recheck",
     );
     let regate =
         find("then rc=0; bash scripts/bench-gate.sh | tee -a gate-output.log || rc=$?; fi");
@@ -672,6 +679,163 @@ fn the_step_summary_says_when_no_baseline_was_restored() {
 }
 
 #[test]
+fn a_full_workspace_gate_requires_current_measurements_for_every_budget_family() {
+    let temp = TempDir::new("budget-families");
+    let criterion = temp.0.join("criterion");
+    let quality = temp.0.join("quality");
+    std::fs::create_dir_all(&quality).expect("quality dir"); // APPROVED: test
+    std::fs::write(
+        quality.join("benchmark-budgets.toml"),
+        "[budgets]\nregistry_get = 50\ntoken_handle = 50\n",
+    )
+    .expect("test budgets"); // APPROVED: test
+    let check = |full: bool| {
+        Command::new("bash")
+            .current_dir(&temp.0)
+            .arg(repo_root().join("scripts/bench-gate.sh"))
+            .arg(&criterion)
+            .env("BENCH_REQUIRE_ALL_BUDGETS", if full { "1" } else { "0" })
+            .output()
+            .expect("benchmark gate") // APPROVED: test
+    };
+    write_bench(&criterion, "registry/get_hit", 1.0, -0.2, -0.3);
+    write_bench(&criterion, "token_handle/load", 1.0, 0.0, 0.0);
+    assert!(
+        check(true).status.success(),
+        "a signed improvement is valid"
+    );
+    let token = criterion.join("token_handle/load");
+    let change = token.join("change/estimates.json");
+    for improvement in [-0.5, -1.0] {
+        write_bench(
+            &criterion,
+            "token_handle/load",
+            1.0,
+            improvement,
+            improvement,
+        );
+        assert!(check(true).status.success(), "valid change {improvement}");
+    }
+    for invalid in [
+        "{}",
+        r#"{"mean":{"point_estimate":0}}"#,
+        r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":0.2,"upper_bound":0.1}}}"#,
+        r#"{"mean":{"point_estimate":-2,"confidence_interval":{"lower_bound":-1,"upper_bound":0}}}"#,
+        r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":-2,"upper_bound":0}}}"#,
+        r#"{"mean":{"point_estimate":-2,"confidence_interval":{"lower_bound":-2,"upper_bound":-2}}}"#,
+    ] {
+        std::fs::write(&change, invalid).expect("bad comparison"); // APPROVED: test
+        assert!(!check(true).status.success(), "{invalid}");
+    }
+    std::fs::remove_file(change).expect("cold result"); // APPROVED: test
+    assert!(check(true).status.success(), "a new bench has no baseline");
+    std::fs::rename(token.join("new"), token.join("base")).expect("restored baseline"); // APPROVED: test
+    let full = check(true);
+    assert_eq!(full.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&full.stdout).contains("configured budget: token_handle"));
+    assert!(check(false).status.success());
+}
+
+#[test]
+fn restored_and_remeasured_benchmarks_must_produce_comparisons() {
+    let temp = TempDir::new("restored-comparisons");
+    let criterion = temp.0.join("criterion");
+    let manifest = temp.0.join("restored");
+    let outputs = temp.0.join("outputs");
+    let quality = temp.0.join("quality");
+    std::fs::create_dir_all(&quality).expect("quality dir"); // APPROVED: test
+    std::fs::write(
+        quality.join("benchmark-budgets.toml"),
+        "[budgets]\nregistry_get = 50\n",
+    )
+    .expect("test budgets"); // APPROVED: test
+    let run = |cache_key: &str, expected_rc, measured| {
+        let output = Command::new("bash")
+            .current_dir(&temp.0)
+            .arg(repo_root().join("scripts/bench-gate.sh"))
+            .arg(&criterion)
+            .env("BENCH_REQUIRE_ALL_BUDGETS", "1")
+            .env("BENCH_RECORD_VERDICT", "1")
+            .env("GITHUB_OUTPUT", &outputs)
+            .env("BENCH_BASELINE_MANIFEST", &manifest)
+            .env("BENCH_AB_BASELINE_KEY", cache_key)
+            .output()
+            .expect("gate"); // APPROVED: test
+        assert_eq!(output.status.code(), Some(expected_rc), "{output:?}");
+        let marks = std::fs::read_to_string(&outputs).expect("gate outputs"); // APPROVED: test
+        assert_eq!(marks.lines().last(), Some(measured), "{output:?}");
+    };
+    let id = "registry/get_hit";
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    std::fs::remove_file(criterion.join(id).join("change/estimates.json")).expect("cold bench"); // APPROVED: test
+    run("", 0, "measured_rc=0");
+    run("warm", 3, "measured_rc=unmeasured");
+    std::fs::write(&manifest, "").expect("empty manifest"); // APPROVED: test
+    run("warm", 3, "measured_rc=unmeasured");
+    std::fs::write(&manifest, "retired/bench/base\n").expect("retired bench"); // APPROVED: test
+    run("warm", 0, "measured_rc=0");
+    std::fs::write(&manifest, format!("{id}/base\nretired/bench/base\n")).expect("warm manifest"); // APPROVED: test
+    run("warm", 3, "measured_rc=unmeasured");
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    run("warm", 0, "measured_rc=0");
+}
+
+#[test]
+fn only_completed_measurements_report_a_cacheable_verdict() {
+    let temp = TempDir::new("cache-verdict");
+    let criterion = temp.0.join("criterion");
+    let outputs = temp.0.join("github-output");
+    let check = |verdict| {
+        let run = Command::new("bash")
+            .arg("scripts/bench-gate.sh")
+            .arg(&criterion)
+            .current_dir(repo_root())
+            .env("BENCH_RECORD_VERDICT", "1")
+            .env("BENCH_BUDGET_MULTIPLIER", "1")
+            .env("GITHUB_OUTPUT", &outputs)
+            .output()
+            .expect("bench-gate.sh runs"); // APPROVED: test
+        let history = std::fs::read_to_string(&outputs).expect("read step outputs"); // APPROVED: test
+        assert_eq!(history.lines().last(), Some(verdict), "{run:?}");
+        run.status.code().expect("gate exited normally") // APPROVED: test
+    };
+    assert_eq!(check("measured_rc=unmeasured"), 3);
+    let id = "registry/get_hit";
+    // Zero elapsed time and a signed improvement have valid finite estimates.
+    // Estimates carry no throughput metadata for this per-call benchmark.
+    write_bench(&criterion, id, 0.0, -0.15, -0.21);
+    assert_eq!(check("measured_rc=0"), 0);
+    write_bench(&criterion, id, 100_000.0, 0.0, 0.0);
+    assert_eq!(check("measured_rc=1"), 1);
+    write_bench(&criterion, id, 100_000.0, 1.0, 0.9);
+    assert_eq!(check("measured_rc=2"), 2);
+    // A parsing failure can return the same status as an absolute breach.
+    // The last output must invalidate the previous measured verdict.
+    std::fs::write(criterion.join(id).join("new/estimates.json"), "{}").expect("write"); // APPROVED: test
+    assert_eq!(check("measured_rc=unmeasured"), 1);
+    let new_estimate = criterion.join(id).join("new/estimates.json");
+    for bad in ["-1", "-1e9999", "1e9999", "NaN", "null", r#""2""#] {
+        let json = format!(r#"{{"median":{{"point_estimate":{bad}}}}}"#);
+        std::fs::write(&new_estimate, json).expect("write"); // APPROVED: test
+        assert_ne!(check("measured_rc=unmeasured"), 0, "{bad}");
+    }
+    write_bench(&criterion, id, 2.0, 0.0, 0.0);
+    let change_estimate = criterion.join(id).join("change/estimates.json");
+    for bad in [
+        r#"{"mean":{"point_estimate":1e9999}}"#,
+        r#"{"mean":{"point_estimate":0,"confidence_interval":{"lower_bound":-1e9999}}}"#,
+        "{} {}",
+        "",
+    ] {
+        std::fs::write(&change_estimate, bad).expect("write"); // APPROVED: test
+        assert_ne!(check("measured_rc=unmeasured"), 0, "{bad}");
+    }
+    // Invalid JSON reaches jq's parser, which exits with its parse-error code.
+    std::fs::write(criterion.join(id).join("new/estimates.json"), "{").expect("write"); // APPROVED: test
+    assert_ne!(check("measured_rc=unmeasured"), 0);
+}
+
+#[test]
 fn the_baseline_is_saved_only_with_a_verdict_from_a_gate_step_that_finished() {
     let wf = std::fs::read_to_string(repo_root().join(".github/workflows/bench.yml"))
         .expect("bench.yml"); // APPROVED: test
@@ -684,7 +848,9 @@ fn the_baseline_is_saved_only_with_a_verdict_from_a_gate_step_that_finished() {
         "steps.bench.outcome == 'success'",
         "steps.gate.outcome != 'cancelled'",
         "steps.gate.outputs.gate_rc != ''",
-        "steps.gate.outputs.gate_rc != '2'",
+        "steps.gate.outputs.measured_rc == steps.gate.outputs.gate_rc &&",
+        "steps.gate.outputs.gate_rc == '0' || steps.gate.outputs.gate_rc == '1' ||",
+        "(steps.gate.outputs.gate_rc == '2' && github.event_name == 'workflow_dispatch' && inputs.reset_baseline == true)",
     ] {
         assert!(
             save.contains(needed),

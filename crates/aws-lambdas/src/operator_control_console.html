@@ -104,12 +104,18 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
 .stocks-open .tab{border:0;border-radius:0;background:none;color:#aaa;font:400 14px Arial;padding:24px 0}
 .stocks-open .tab.active{color:#00b386;border-bottom:2px solid #00b386;background:none}
 .stocks-open .toast{border-radius:3px;background:#242424;border-color:#444;color:#ddd}
-.market-ticker{height:48px;border-bottom:1px solid #242424;display:flex;align-items:stretch;overflow:hidden;background:#0a0a0a;padding:0 40px}
-.ticker-item{display:flex;align-items:center;gap:14px;min-width:245px;padding:0 24px 0 0;margin-right:24px;border-right:1px solid #252525;font-size:13px;white-space:nowrap}
-.ticker-item b{font-weight:400;color:#c6c6c6}.ticker-item span{color:#727272}.ticker-item small{font-size:10px;color:#666}
+.market-ticker{height:48px;border-bottom:1px solid #242424;display:flex;align-items:stretch;overflow-x:auto;background:#0a0a0a;padding:0 40px}
+.ticker-item{display:flex;align-items:center;gap:14px;min-width:max-content;padding:0 15px 0 0;margin-right:15px;border-right:1px solid #252525;font-size:13px;white-space:nowrap}
+.ticker-controls{display:grid;align-content:center;gap:2px;padding-right:20px;flex-shrink:0}.ticker-controls button{font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}.ticker-controls small,.ticker-item small{color:#aaa;font-size:11px}
+.ticker-item b{font-weight:400;color:#c6c6c6}.ticker-item span{color:#dedede}
 .stocks-layout{display:grid;grid-template-columns:400px minmax(0,1fr);gap:24px;margin:34px 40px 0}
 .stocks-sidebar{min-width:0}.watch-search{position:relative;height:42px}
-.watch-search:before{content:'⌕';position:absolute;left:14px;top:6px;color:#888;font-size:25px}
+.stocks-open .watch-submit{position:absolute;left:0;top:0;height:42px;width:40px;padding:0;background:transparent;color:#aaa;font-size:24px}
+.watch-results:not([hidden]){margin-top:4px;padding:8px;background:#151515;border:1px solid #303030;border-radius:4px;max-height:290px;overflow:auto}
+.watch-results p{color:#aaa;margin:4px;font-size:12px}.stocks-open .watch-result{display:block;width:100%;background:none;text-align:left;color:#ddd;font-weight:400;padding:9px 5px;border-bottom:1px solid #242424}
+.watch-result span{float:right;color:#00b386}.watch-slots{display:flex;gap:6px;padding:8px;border-bottom:1px solid #242424}
+.stocks-open .watch-slot{background:#111;border:1px solid #343434;border-radius:4px;color:#aaa;font-size:14px;padding:3px 9px}
+.stocks-open .watch-slot[aria-pressed=true]{color:#00b386;border-color:#116447}
 .stocks-open .watch-search input{height:42px;padding:0 42px;border:1px solid #242424;border-radius:3px;background:#111;font-size:13px}
 .watch-panel{margin-top:20px;background:#101010;border:1px solid #242424;min-height:calc(100vh - 235px);border-radius:3px}
 .watch-heading{height:52px;padding:0 16px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #242424;font-size:14px;color:#bbb}
@@ -229,19 +235,25 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
     </div>
 
     <section data-tab="movers" hidden>
-      <div class="market-ticker" aria-label="Index price availability">
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty 50</b><span>—</span><small>Quote unavailable</small></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Next 50</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Bank</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>India VIX</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>FinNifty</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>GIFT Nifty</b><span>—</span></div>
+      <div class="market-ticker" aria-label="Dhan index quotes">
+        <div class="ticker-controls"><button type="button" id="ticker-refresh">Refresh index quotes</button><small id="ticker-status" role="status">Last 60 seconds · IST</small></div>
+        <div class="ticker-item" data-quote-id="13"><b>Nifty 50</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="38"><b>Nifty Next 50</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="25"><b>Nifty Bank</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="21"><b>India VIX</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="27"><b>FinNifty</b><span>—</span><small></small></div>
+        <div class="ticker-item"><b>GIFT Nifty</b><small>No quote source</small></div>
       </div>
       <div class="stocks-layout">
         <aside class="stocks-sidebar" aria-label="Local stock watchlist">
-          <div class="watch-search"><input id="watch-search" type="search" maxlength="128" placeholder="Search this watchlist" aria-label="Search this watchlist"></div>
+          <form class="watch-search" id="watch-search-form" role="search">
+            <button type="submit" class="watch-submit" aria-label="Search mapped stocks by symbol" title="Search mapped stocks by symbol">⌕</button>
+            <input id="watch-search" type="search" maxlength="128" placeholder="Search stock symbols" aria-label="Filter this watchlist or press Enter to find mapped stocks" title="Type to filter this list. Press Enter to search mapped stocks.">
+          </form>
+          <div class="watch-results" id="watch-results" hidden><p id="watch-search-status" role="status"></p><div id="watch-matches"></div></div>
           <div class="watch-panel">
-            <div class="watch-heading">Watchlist 1 <span id="watch-count">0 stocks</span></div>
+            <div class="watch-heading"><b id="watch-title">First Watchlist</b><span id="watch-count">0 stocks</span></div>
+            <div class="watch-slots" id="watch-slots" role="group" aria-label="Choose watchlist"></div>
             <p class="watch-hint">Saved in this tab. Prices appear only for stocks in the current verified page.</p>
             <div id="watch-rows"></div>
           </div>
@@ -259,11 +271,11 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           </div>
           <div class="mover-toolbar">
             <div class="category-tabs" aria-label="Stocks category">
-              <button type="button" class="category-tab" disabled title="Intraday comparison data is not available">Intraday Movers</button>
+              <button type="button" class="category-tab" data-category="intraday" data-label="Change" aria-pressed="false" title="Today’s gainers and losers by change from previous close; starts with all mapped NSE equities">Intraday Movers</button>
               <button type="button" class="category-tab" disabled title="Benchmark comparison data is not available">Outperformers</button>
-              <button type="button" class="category-tab" disabled title="Margin funding data is not available">MTF</button>
-              <button type="button" class="category-tab" disabled title="Opening-range data is not available">Extreme Openings</button>
-              <button type="button" class="category-tab selected" aria-pressed="true">Price Movers</button>
+              <button type="button" class="category-tab" data-category="mtf" data-label="Change" aria-pressed="false" title="Stocks with a published Dhan margin trading multiplier for the selected date. Change is measured from previous close">MTF</button>
+              <button type="button" class="category-tab" data-category="extreme_openings" data-label="From open" aria-pressed="false" title="Select stocks whose session open equals the reported day low or high. From open measures the move to LTP">Extreme Openings</button>
+              <button type="button" class="category-tab selected" data-category="" data-label="Change" aria-pressed="true" title="Change from the previous close to the latest price">Price Movers</button>
               <button type="button" class="category-tab" disabled title="Breakout data is not available">Breakouts</button>
               <button type="button" class="category-tab" disabled title="Actual traded value is not captured">By Value</button>
             </div>
@@ -276,14 +288,14 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           <input type="hidden" id="movers-universe" value="fno"><input type="hidden" id="movers-index" value=""><input type="hidden" id="movers-direction" value="gainers">
           <template id="stock-row-template"><tr><td><input type="checkbox"></td><td><div class="stock-name"></div><div class="stock-detail"></div></td><td data-field="ltp"></td><td data-field="change"></td><td data-field="change_pct"></td><td data-field="value_cr" title="Actual traded value is not captured."></td><td data-field="volume" title="Stored day volume; zero or absent values do not prove reported volume."></td></tr></template>
           <template id="watch-row-template"><div class="watch-row"><button type="button" class="watch-open"><span><span class="watch-name"></span><small class="watch-market">NSE</small></span><span class="watch-quote"><span class="watch-price" title="Only current verified page prices are shown; individual stored ticks may be older."></span><small class="watch-change"></small></span></button><button type="button" class="watch-remove">×</button></div></template>
-          <div id="movers-messages" data-invalid_search="Search is too long or contains unsupported characters. Use a shorter stock symbol." hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — showing the last stored prices of the latest session (empty before 9:15 AM and on holidays)." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="Source reports stale prices." data-fresh="Newest stored tick: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
+          <div id="movers-messages" data-invalid_search="Search is too long or contains unsupported characters. Use a shorter stock symbol." hidden data-instance_stopped="The AWS instance is stopped. No prices can be read." data-instance_unavailable="AWS instance status could not be checked." data-bridge_unavailable="The private connection or installed movers helper is unavailable." data-credentials_unavailable="The app credential could not be loaded on the server." data-app_unauthorized="The app rejected its server-side credential." data-app_unavailable="The app could not serve movers." data-timeout="The movers request timed out." data-invalid_response="The server returned incomplete or invalid movers data." data-response_too_large="The response exceeded the safe transport size." data-busy="Another movers refresh is running. Try again shortly." data-closed="Market closed — showing the last stored prices of the latest session (empty before 9:15 AM and on holidays)." data-no_fno_list="Today's F&amp;O stock list is unavailable." data-no_mtf_list="Dhan MTF leverage is unavailable for this date and selection." data-no_index_list="Today's selected index membership is unavailable." data-no_data="No captured prices are available in this universe." data-unreachable="The price database is unreachable." data-query_failed="The price query failed." data-expired="Refresh required — snapshot freshness can no longer be confirmed." data-empty="No verified snapshot. Refresh to try again." data-locked="Unlock this tab to view movers." data-loading="Reading a verified snapshot…" data-stale="The latest recorded trade in this selection is over 60 seconds old. See Feeds for connection health." data-fresh="Newest stored tick: at most 60s old. Individual stocks may be older." data-unknown="Freshness unconfirmed — refresh before using these prices."></div>
           <div class="stocks-table-scroll">
             <table id="movers-table" class="stocks-table" aria-label="Stocks price movers"><thead><tr>
               <th><input id="stocks-select-all" type="checkbox" aria-label="Add or remove this page in watchlist"></th>
               <th><button class="sort-button" type="button" data-sort="name"><span class="sort-indicator"></span>Name</button></th>
               <th><button class="sort-button" type="button" data-sort="ltp"><span class="sort-indicator"></span>LTP</button></th>
-              <th><button class="sort-button" type="button" data-sort="change"><span class="sort-indicator"></span>Change</button></th>
-              <th><button class="sort-button" type="button" data-sort="change_pct"><span class="sort-indicator">▼</span>Change %</button></th>
+              <th><button class="sort-button" type="button" data-sort="change"><span class="sort-indicator"></span><span id="change-label">Change</span></button></th>
+              <th><button class="sort-button" type="button" data-sort="change_pct"><span class="sort-indicator">▼</span><span id="percent-label">Change %</span></button></th>
               <th><button class="sort-button" type="button" data-sort="value_cr" title="Actual traded value is not captured"><span class="sort-indicator"></span>Value (Cr.)</button></th>
               <th><button class="sort-button" type="button" data-sort="volume"><span class="sort-indicator"></span>Volume</button></th>
             </tr></thead><tbody id="movers-rows"></tbody></table>
@@ -292,7 +304,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           <p id="movers-status" class="mover-status" role="status" aria-live="polite">Open Stocks to load a snapshot.</p>
           <p id="movers-meta" class="mover-meta"></p>
           <div class="mover-page"><p id="movers-selection"></p><button id="movers-prev" type="button" disabled>Previous 20</button><button id="movers-next" type="button" disabled>Next 20</button></div>
-          <p class="stocks-note">NSE equities only. All = equities in today's recorded index mapping, not every exchange listing. Volume is stored day volume; zero or absent values are unavailable. <span id="movers-value-basis">Actual traded value is not captured; Value (Cr.) is unavailable.</span> Index membership and last-trade time are available on each stock name. Only Price Movers is available in this Stocks view. No order actions.</p>
+          <p class="stocks-note">NSE equities only. All = equities in today's recorded index mapping, not every exchange listing. Volume is stored day volume; zero or absent values are unavailable. <span id="movers-value-basis">Actual traded value is not captured; Value (Cr.) is unavailable.</span> Index membership and last-trade time are available on each stock name. <span id="category-basis">Change from the previous close to the latest price.</span> No order actions.</p>
         </main>
       </div>
     </section>
@@ -327,7 +339,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           <div id="alarms"></div>
           <div class="lbl" style="margin-top:14px">storage — disk space &amp; database size (on the box)</div>
           <div class="shields" id="storage"></div>
-          <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
+          <div class="muted" style="margin-top:8px">Root disk alarms watch for 20 GiB or less free and usage above 90%. A dash means the host measurement is unavailable.</div>
         </details>
       </div>
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
@@ -343,11 +355,11 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div class="lbl" style="margin-top:4px">live websocket — exchange stamp → arrived here, per socket</div>
         <div id="latws" style="overflow:auto"></div>
-        <div class="muted" style="margin-top:6px">One row per socket slot the app tracks (16: 5 main-feed, 5 depth-20, 5 depth-200, 1 order-update), read live
+        <div class="muted" style="margin-top:6px">The app lists 16 primary-account slots (5 main-feed, 5 depth-20, 5 depth-200, 1 order-update), read live
           from the app's own counters — NOT from the database. <b>instruments on wire</b> is what that socket is subscribed to right now;
           <b>frames delivered</b> is how many data-carrying messages it has produced this session; <b>last data</b> is how long ago the
           latest one arrived ("never" means it has not delivered once). A socket holding instruments with zero frames is highlighted —
-          that is the "connected but deaf" case. <b>ticks timed</b> is how many ticks had a usable exchange stamp for the lag columns. <b>±1 second floor:</b> the exchange sends its timestamp in whole
+          that is the "connected but deaf" case. <b>Receive buffer</b> is the kernel reading in bytes for a connected feed socket. A dash means the reading is unavailable. <b>ticks timed</b> is how many ticks had a usable exchange stamp for the lag columns. <b>±1 second floor:</b> the exchange sends its timestamp in whole
           seconds, so this shows outages and drift honestly but can never show milliseconds — treat a sub-second reading as
           "under a second", not as a precise number. Figures are bucket upper bounds, so they over-state slightly within a
           bucket. "+Inf" means slower than the largest bucket, i.e. unbounded. An empty table means the live feed produced no
@@ -512,6 +524,7 @@ RUNNING box with unreachable data keeps the real warnings below.
 -->
 <script>
 const $=id=>document.getElementById(id),$$=s=>document.querySelectorAll(s);
+const dismissedRead=Symbol('dismissed read');
 function keyLoad(){ try{ const o=JSON.parse(localStorage.getItem('tv_key')||'{}'); if(o.e>Date.now()&&typeof o.k==='string') return o.k; localStorage.removeItem('tv_key'); }catch(e){} return ''; }
 function keySave(v){ try{ localStorage.setItem('tv_key',JSON.stringify({k:v,e:Date.now()+2592e6})); }catch(e){} }
 let TOKEN=keyLoad(); try{ localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token'); }catch(e){}
@@ -523,11 +536,11 @@ function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textC
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
   TOKEN=v; keySave(v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
-function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+function lock(){ TOKEN=''; moversRequest?.controller.abort(dismissedRead); resetTicker(); clearWatchSearch(); moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
 
-function tab(name){ curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
+function tab(name){ if(curTab==='movers'&&name!==curTab)clearWatchSearch(); curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   $$('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
-  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers') loadMovers(); }
+  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers'){expireTicker();loadMovers();} }
 
 async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return null; }
   try{ const r=await fetch(location.href,{method:'POST',
@@ -538,7 +551,7 @@ async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return 
     if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
     if(!r.ok){ toast(j.error||('Error '+r.status)); return null; }
     return j;
-  }catch(e){ toast('Network error'); setLive(false); return null; } }
+  }catch(e){ if(signal?.reason===dismissedRead)return null; toast('Network error'); setLive(false); return null; } }
 
 function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''),10)||0; const from=lastTicks||0; lastTicks=target;
   const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
@@ -655,7 +668,7 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
 
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
-  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }
+  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; $('storage').textContent='Storage readings unavailable.'; return; }
   const cwFail=(j.alarms_firing===null||j.alarms_firing===undefined), al=j.alarms_firing||[];
   const alTxt=cwFail?'?':String(al.length), alCls=cwFail?'warn':(al.length?'bad':'ok');
   $('awsstrip').innerHTML='<span>💵 $'+esc(j.cost_mtd_usd||'—')+' spent this month</span>'+
@@ -663,36 +676,37 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTM
     '<span>💾 disk '+esc(j.disk_pct||'—')+' used</span>';
   if(cwFail){ $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; }
   else{ $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
-  const free=parseInt(j.disk_free_gb,10), pct=parseInt(j.disk_pct,10);
-  const freeOk=isNaN(free)?true:free>5; const pctOk=isNaN(pct)?true:pct<85;
+  const size=v=>/^\d+$/.test(v)?Number(v):NaN;
+  const free=size(j.disk_free_gb), used=size(j.disk_used_gb), db=size(j.db_size_gb);
+  const pct=/^(?:100|\d{1,2})%$/.test(j.disk_pct)?parseInt(j.disk_pct,10):NaN;
   $('storage').innerHTML=
-    shield('Disk free', (j.disk_free_gb?j.disk_free_gb+' GB':'—'), freeOk)+
-    shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
-    shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
+    (Number.isFinite(free)?shield('Disk free',free+' GiB',free>20):shieldIdle('Disk free'))+
+    (Number.isFinite(pct)?shield('Disk used',(Number.isFinite(used)?used+' GiB · ':'')+pct+'%',pct<=90):shieldIdle('Disk used'))+
+    (Number.isFinite(db)?shield('Database size',db+' GiB',true):shieldIdle('Database size')); }
 
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
-function fmtMs(s){ return (s===''||s==null)?'—':s+' ms'; }
+function measuredMs(s){ return typeof s==='number'||(typeof s==='string'&&/^-?\d+(?:\.\d+)?$/.test(s))?Number(s):NaN; }
 function fmtLagMs(v){ if(v==null||v==='') return '-'; if(typeof v==='string'&&/inf/i.test(v)) return 'over 60 s (slower than the last bucket)'; v=Number(v); if(!isFinite(v)) return '-';
   if(v>=1000) return (v/1000).toFixed(2)+' s'; return v.toFixed(2)+' ms'; } function fmtAge(s){ s=Number(s); return s<60?s.toFixed(0)+' s ago':s<3600?(s/60).toFixed(1)+' min ago':(s/3600).toFixed(1)+' h ago'; }
 async function loadLatency(){ $('latnet').dataset.loaded='1'; $('latnet').innerHTML='<span class="muted">measuring…</span>';
   $('latws').innerHTML='<span class="muted">measuring…</span>';
-  const j=await call('latency'); if(!j){ $('latnet').innerHTML=''; $('latws').innerHTML=''; return; }
+  const j=await call('latency'); if(!j){ $('latnet').textContent='Latency readings unavailable.'; $('latws').textContent='Socket readings unavailable.'; return; }
   const ws=Array.isArray(j.ws_latency)?j.ws_latency:[]; const live=ws.filter(r=>Number(r.frames||0)>0).length;
   if(ws.length){
-    let w='<div class="muted">'+live+' of '+ws.length+' sockets delivered data this session</div><table><tr><th>socket</th><th>pool</th><th>instruments on wire</th><th>frames delivered</th><th>last data</th><th>ticks timed</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
-    ws.forEach(r=>{ const f=Number(r.frames||0), dead=(Number(r.instruments||0)>0&&f===0); w+='<tr'+(dead?' class="warn"':'')+'><td><b>#'+esc(String(r.connection))+'</b></td><td>'+esc(String(r.endpoint||'?'))+'</td>'
-      +'<td>'+(r.instruments==null?'—':Number(r.instruments).toLocaleString())+'</td><td>'+f.toLocaleString()+'</td><td>'+(r.tick_age_secs==null?'never':fmtAge(r.tick_age_secs))+'</td><td>'+Number(r.samples||0).toLocaleString()+'</td>'
+    let w='<div class="muted">'+live+' of '+ws.length+' sockets delivered data this session</div><table><tr><th>socket</th><th>pool</th><th>instruments on wire</th><th>frames delivered</th><th>last data</th><th>receive buffer (bytes)</th><th>ticks timed</th><th>p50 exchange→here</th><th>p99 exchange→here</th></tr>';
+    ws.forEach(r=>{ const f=r.frames, dead=(Number(r.instruments)>0&&f===0); w+='<tr'+(dead?' class="warn"':'')+'><td><b>#'+esc(String(r.connection))+'</b></td><td>'+esc(String(r.endpoint||'?'))+'</td>'
+      +'<td>'+(r.instruments==null?'—':Number(r.instruments).toLocaleString())+'</td><td>'+(Number.isFinite(f)?f.toLocaleString():'—')+'</td><td>'+(r.tick_age_secs==null?(r.never_received?'never':'—'):fmtAge(r.tick_age_secs))+'</td><td>'+(Number.isSafeInteger(r.receive_buffer_bytes)&&r.receive_buffer_bytes>0?r.receive_buffer_bytes.toLocaleString():'—')+'</td><td>'+Number(r.samples||0).toLocaleString()+'</td>'
       +'<td>'+esc(fmtLagMs(r.p50_ms))+'</td><td>'+esc(fmtLagMs(r.p99_ms))+'</td></tr>'; });
     $('latws').innerHTML=w+'</table>';
   } else {
     $('latws').innerHTML='<span class="warn">no live sockets reported — the live feed is off, produced nothing, or the app is unreachable. This is NOT a zero-latency reading.</span>';
   }
-  const skew=Math.abs(parseFloat(j.clock_skew_ms));
+  const db=measuredMs(j.questdb_ms), skew=measuredMs(j.clock_skew_ms), order=j.order_place_avg_ns;
   $('latnet').innerHTML=
-    shield('QuestDB round-trip (box-wide)', fmtMs(j.questdb_ms), true)+
-    shield('Clock skew (box-wide)', fmtMs(j.clock_skew_ms), isNaN(skew)||skew<50)+
-    shield('Order placement', fmtNs(j.order_place_avg_ns), true); }
+    (Number.isFinite(db)&&db>=0?shield('QuestDB round-trip (box-wide)',db.toFixed(1)+' ms',true):shieldIdle('QuestDB round-trip (box-wide)'))+
+    (Number.isFinite(skew)?shield('Clock skew (box-wide)',skew.toFixed(1)+' ms',Math.abs(skew)<50):shieldIdle('Clock skew (box-wide)'))+
+    (Number.isFinite(order)&&order>=0?shield('Order placement',fmtNs(order),true):shieldIdle('Order placement')); }
 
 async function act(action,forceId){ if(!confirm('Run "'+action+'" on the trading box?')) return;
   const fEl=$(forceId||'force'); const force=!!(fEl&&fEl.checked); toast(action+'…');
@@ -744,76 +758,344 @@ function startAuto(){ stopAuto(); if($('auto').checked) timer=setInterval(()=>{ 
 function stopAuto(){ if(timer){ clearInterval(timer); timer=null; } }
 function autotoggle(){ $('auto').checked?startAuto():stopAuto(); }
 
-let moversReply=null,moversBusy=false,moversGeneration=0,moversReceived=0,moversObserved=0,moversRequestSeconds=0,moversLastAttempt=-Infinity,moversOffset=0,moversSort='change_pct',moversOrder='desc',moversVisible=[],watchPrices=[],moversNames=[],stockWatch=new Map();
+let moversRequest=null,moversReply=null,moversBusy=false,moversGeneration=0,moversReceived=0,moversObserved=0,moversRequestSeconds=0,moversLastAttempt=-Infinity,moversOffset=0,moversSort='change_pct',moversOrder='desc',moversVisible=[],watchPrices=[],moversNames=[],stockWatch=new Map();
 const watchKey=s=>s.segment+':'+s.security_id;
 function validWatch(s){return s&&Number.isSafeInteger(s.security_id)&&s.security_id>0&&s.segment==='NSE_EQ'&&typeof s.name==='string'&&s.name.length>0&&new TextEncoder().encode(s.name).length<=128&&!/[\x00-\x1f\x7f]/.test(s.name);}
-try{const raw=sessionStorage.getItem('tv_stock_watch')||'[]';if(raw.length<=20000){const saved=JSON.parse(raw);if(Array.isArray(saved)&&saved.length<=50)for(const s of saved)if(validWatch(s))stockWatch.set(watchKey(s),{security_id:s.security_id,segment:s.segment,name:s.name});}}catch(e){}
+const watchLabels=['First','Second','Third','Fourth','Fifth','Sixth'];
+function watchStorageKey(slot){return slot===0?'tv_stock_watch':'tv_stock_watch_'+(slot+1);}
+function restoreWatch(slot){
+  const entries=new Map();
+  try{
+    const raw=sessionStorage.getItem(watchStorageKey(slot))||'[]';
+    if(raw.length>20000)return entries;
+    const saved=JSON.parse(raw);
+    if(Array.isArray(saved)&&saved.length<=50)for(const s of saved)if(validWatch(s)){
+      entries.set(watchKey(s),{security_id:s.security_id,segment:s.segment,name:s.name});
+    }
+  }catch(e){}
+  return entries;
+}
+const watchLists=watchLabels.map((label,slot)=>restoreWatch(slot));
+let activeWatchSlot=0,watchSearchGeneration=0,watchExpiry=0,watchDeadline=0,watchExpireTimer=0,watchMatches=[],watchController=null;
+try{
+  const stored=sessionStorage.getItem('tv_stock_watch_slot');
+  if(/^[1-6]$/.test(stored))activeWatchSlot=Number(stored)-1;
+}catch(e){}
+stockWatch=watchLists[activeWatchSlot];
 function stockNode(tag,text,cls){const n=document.createElement(tag);if(text!==undefined)n.textContent=String(text);if(cls)n.className=cls;return n;}
 function stockSearchPrefix(name){let prefix='',bytes=0;const encoder=new TextEncoder();for(const point of name){const length=encoder.encode(point).length;if(bytes+length>32)break;prefix+=point;bytes+=length;}return prefix;}
 function stockNumber(n,signed=false){return typeof n!=='number'||!Number.isFinite(n)?'—':(signed&&n>0?'+':'')+n.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function stockVolume(s){const t=s.volume_text;if(typeof t==='string'&&/^[1-9]\d{0,19}$/.test(t)&&BigInt(t)<=18446744073709551615n)return BigInt(t).toLocaleString('en-IN');return Number.isSafeInteger(s.volume)&&s.volume>0?s.volume.toLocaleString('en-IN'):'—';}
-function saveWatch(){try{sessionStorage.setItem('tv_stock_watch',JSON.stringify([...stockWatch.values()]));}catch(e){toast('Watchlist works in this tab but could not be saved.');}}
-function setWatch(s,on){if(!validWatch(s))return;if(on&&stockWatch.size>=50&&!stockWatch.has(watchKey(s))){toast('This watchlist holds up to 50 stocks.');return;}if(on)stockWatch.set(watchKey(s),{security_id:s.security_id,segment:s.segment,name:s.name});else stockWatch.delete(watchKey(s));saveWatch();}
+function saveWatch(){try{sessionStorage.setItem(watchStorageKey(activeWatchSlot),JSON.stringify([...stockWatch.values()]));}catch(e){toast('Watchlist works in this tab but could not be saved.');}}
+function setWatch(s,on){
+  if(!validWatch(s))return false;
+  const key=watchKey(s);
+  if(!on)return stockWatch.delete(key);
+  if(stockWatch.has(key))return false;
+  if(stockWatch.size>=50){toast('This watchlist holds up to 50 stocks.');return false;}
+  stockWatch.set(key,{security_id:s.security_id,segment:s.segment,name:s.name});
+  return true;
+}
+function showWatchSlot(slot){
+  activeWatchSlot=slot;
+  stockWatch=watchLists[slot];
+  $('watch-title').textContent=watchLabels[slot]+' Watchlist';
+  for(const button of $('watch-slots').children)button.setAttribute('aria-pressed',String(Number(button.dataset.slot)===slot));
+}
+function clearWatchSearch(){
+  watchSearchGeneration++;
+  watchController?.abort(dismissedRead);
+  watchController=null;
+  clearTimeout(watchExpireTimer);
+  watchMatches=[];
+  $('watch-matches').replaceChildren();
+  $('watch-results').hidden=true;
+}
+function watchSearchStatus(message){
+  $('watch-results').hidden=false;
+  $('watch-search-status').textContent=message;
+}
+function expireWatchSearch(){
+  if(!watchMatches.length||performance.now()<watchExpiry&&Date.now()<watchDeadline)return;
+  clearWatchSearch();
+  watchSearchStatus('Search expired. Press Enter to search again.');
+}
+function renderWatchMatches(){
+  const focused=document.activeElement?.dataset.match;
+  const buttons=watchMatches.map((stock,index)=>{
+    const button=stockNode('button',stock.company_name?stock.company_name+' · '+stock.name:stock.name,'watch-result');
+    const saved=stockWatch.has(watchKey(stock));
+    button.type='button';
+    button.dataset.match=String(index);
+    button.setAttribute('aria-label',(saved?'Remove ':'Add ')+stock.name+(saved?' from ':' to ')+watchLabels[activeWatchSlot]+' Watchlist');
+    button.appendChild(stockNode('span',saved?'✓ Remove':'+ Add'));
+    return button;
+  });
+  $('watch-matches').replaceChildren(...buttons);
+  if(focused!==undefined)buttons[Number(focused)]?.focus({preventScroll:true});
+}
+async function searchWatch(event){
+  event.preventDefault();
+  if(watchController)return;
+  clearWatchSearch();
+  const search=$('watch-search').value.trim();
+  if(!TOKEN||!search)return;
+  if(new TextEncoder().encode(search).length>32||/[\x00-\x1f\x7f]/.test(search)){watchSearchStatus(moversMessage('invalid_search'));return;}
+  const generation=watchSearchGeneration, start=performance.now(),wallStart=Date.now();
+  const filter={fno_only:false,index:null,search,direction:'all',sort_by:'name',sort_order:'asc',offset:0,as_of:moversFilter().as_of};
+  watchSearchStatus('Searching mapped stock symbols…');
+  const controller=new AbortController();
+  watchController=controller;
+  const timeout=setTimeout(()=>controller.abort(),25000);
+  let j;
+  try{j=await call('stock-movers',{filter},controller.signal);}
+  finally{
+    clearTimeout(timeout);
+    if(watchController===controller)watchController=null;
+  }
+  if(!TOKEN||generation!==watchSearchGeneration)return;
+  const reply=verifiedMoversReply(j,filter);
+  if(!j){watchSearchStatus('Stock search unavailable. Press Enter to try again.');return;}
+  if(!reply||reply.result==='error'){watchSearchStatus(moversMessage(reply?.code||'invalid_response'));return;}
+  const snapshot=reply.snapshot;
+  if(!snapshot.universe_available||!['live','closed','stale'].includes(snapshot.status)){watchSearchStatus(moversMessage(snapshot.status));return;}
+  const lifetime=(reply.valid_until_epoch_secs-j.observed_at_epoch_secs-2)*1000;
+  watchExpiry=start+lifetime;
+  watchDeadline=wallStart+lifetime;
+  if(performance.now()>=watchExpiry||Date.now()>=watchDeadline){watchSearchStatus(moversMessage('expired'));return;}
+  if(!Number.isSafeInteger(snapshot.matching_total)||snapshot.matching_total<0||
+     snapshot.rows.length!==Math.min(20,snapshot.matching_total)||!snapshot.rows.every(validWatch)||
+     new Set(snapshot.rows.map(watchKey)).size!==snapshot.rows.length){watchSearchStatus(moversMessage('invalid_response'));return;}
+  watchMatches=snapshot.rows;
+  const summary=watchMatches.length?'Showing '+watchMatches.length+' of '+snapshot.matching_total+' mapped matches.':'No matching priced stocks in the recorded mapping.';
+  watchSearchStatus(summary+(snapshot.membership_status==='partial'?' Index mapping is partial.':''));
+  renderWatchMatches();
+  watchExpireTimer=setTimeout(expireWatchSearch,Math.max(0,Math.ceil(watchExpiry-performance.now())));
+}
 function renderWatch(){
-  const root=$('watch-rows'),q=$('watch-search').value.trim().toLowerCase(),prices=new Map(watchPrices.map(s=>[watchKey(s),s]));root.replaceChildren();$('watch-count').textContent=stockWatch.size+' stocks';
-  for(const s of stockWatch.values()){if(!s.name.toLowerCase().includes(q))continue;const row=$('watch-row-template').content.firstElementChild.cloneNode(true),open=row.querySelector('.watch-open'),price=prices.get(watchKey(s));open.dataset.watch=watchKey(s);open.title='Search current filters for '+s.name;row.querySelector('.watch-name').textContent=s.name;const current=price&&price.name===s.name,tone=current?(price.change_pct>0?'positive':price.change_pct<0?'negative':''):'';row.querySelector('.watch-price').textContent=current?stockNumber(price.ltp):'—';row.querySelector('.watch-quote').className='watch-quote '+tone;row.querySelector('.watch-change').textContent=current&&price.change_pct!=null?stockNumber(price.change,true)+' ('+stockNumber(price.change_pct,true)+'%)':'—';const remove=row.querySelector('.watch-remove');remove.dataset.remove=watchKey(s);remove.setAttribute('aria-label','Remove '+s.name);root.appendChild(row);}
-  if(!root.children.length)root.appendChild(stockNode('p',stockWatch.size?'No matching selected stocks.':'Select a stock checkbox to add it to this tab’s watchlist.','watch-empty'));
+  const root=$('watch-rows'),q=$('watch-search').value.trim().toLowerCase();
+  const prices=new Map(watchPrices.map(s=>[watchKey(s),s]));
+  const existing=new Map(Array.from(root.children,row=>[row.dataset.key,row]));
+  const visible=[];
+  $('watch-count').textContent=stockWatch.size+(stockWatch.size===1?' stock':' stocks');
+  for(const s of stockWatch.values()){
+    if(!s.name.toLowerCase().includes(q))continue;
+    const key=watchKey(s),price=prices.get(key);
+    const row=existing.get(key)||$('watch-row-template').content.firstElementChild.cloneNode(true);
+    row.dataset.key=key;
+    const open=row.querySelector('.watch-open'),remove=row.querySelector('.watch-remove');
+    open.dataset.watch=key;open.title='Search current filters for '+s.name;
+    row.querySelector('.watch-name').textContent=s.name;
+    const current=price&&price.name===s.name,tone=current?(price.change_pct>0?'positive':price.change_pct<0?'negative':''):'';
+    row.querySelector('.watch-price').textContent=current?stockNumber(price.ltp):'—';
+    row.querySelector('.watch-quote').className='watch-quote '+tone;
+    row.querySelector('.watch-change').textContent=current&&price.change_pct!=null?stockNumber(price.change,true)+' ('+stockNumber(price.change_pct,true)+'%)':'—';
+    remove.dataset.remove=key;remove.setAttribute('aria-label','Remove '+s.name);
+    visible.push(row);
+  }
+  if(!visible.length){
+    const empty=existing.get(undefined)||stockNode('p','','watch-empty');
+    empty.textContent=stockWatch.size?'No matching selected stocks.':'Select a stock checkbox to add it to this watchlist.';
+    visible.push(empty);
+  }
+  if(visible.length!==root.children.length||visible.some((row,i)=>row!==root.children[i]))root.replaceChildren(...visible);
 }
 function moversMessage(key){return $('movers-messages').getAttribute('data-'+key)||'Movers unavailable.';}
 function moversNote(key){$('movers-status').textContent=moversMessage(key);}
-function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder,as_of:$('movers-date').value?$('movers-date').value+'T'+($('movers-time').value||'15:30'):undefined};}
-function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order','as_of'].every(k=>a[k]===b[k]);}
+const quoteCells=$$('[data-quote-id]');
+let tickerGeneration=0, tickerClockOrigin=0;
+function resetTicker(){
+  tickerGeneration++;
+  const historical=Boolean($('movers-date').value);
+  $('ticker-refresh').disabled=historical;
+  $('ticker-status').textContent=historical?'Quotes available in current view':'Last 60 seconds · IST';
+  for(const cell of quoteCells){delete cell.dataset.expires;cell.removeAttribute('title');cell.querySelector('span').textContent='—';cell.querySelector('small').textContent='';}
+}
+function expireTicker(){
+  for(const cell of quoteCells)if(cell.dataset.expires && Math.max(performance.now(),Date.now()-tickerClockOrigin)>=Number(cell.dataset.expires)){
+    delete cell.dataset.expires;cell.querySelector('span').textContent='—';cell.querySelector('small').textContent+=' · expired';
+  }
+}
+async function refreshTicker(){
+  const button=$('ticker-refresh'),status=$('ticker-status');
+  if(!TOKEN || button.disabled)return;
+  resetTicker();
+  const generation=tickerGeneration,start=performance.now();
+  tickerClockOrigin=Date.now()-start;button.disabled=true;status.textContent='Reading index quotes…';
+  const query="SELECT security_id, ltp, ts, datediff('s',ts,dateadd('m',330,now())) age_s FROM ticks WHERE feed='dhan' AND segment='IDX_I' AND security_id IN (13,38,25,21,27) AND ts BETWEEN dateadd('m',329,now()) AND dateadd('m',330,now()) LATEST ON ts PARTITION BY security_id LIMIT 5";
+  const reply=sqlResult(await call('sql',{query},AbortSignal.timeout(20000)));
+  if(generation!==tickerGeneration)return;
+  button.disabled=false;
+  if(!reply || reply.columns.join(',')!=='security_id,ltp,ts,age_s'){status.textContent='Quote read unavailable';return;}
+  status.textContent='Last 60 seconds · IST';
+  for(const cell of quoteCells){
+    const row=reply.rows.find(r=>r[0]===cell.dataset.quoteId),stamp=cell.querySelector('small');
+    if(!row){stamp.textContent='No recent tick';continue;}
+    const price=Number(row[1]),age=Number(row[3]),time=tcell(row[2]);
+    if(!Number.isFinite(price)||price<=0||!/^\d+$/.test(row[3])||age>60||time===row[2]){stamp.textContent='Invalid quote';continue;}
+    cell.querySelector('span').textContent=stockNumber(price);stamp.textContent=time.slice(11);cell.title=time;
+    cell.dataset.expires=String(start+(59-age)*1000);
+  }
+  expireTicker();
+}
+$('ticker-refresh').addEventListener('click',refreshTicker);
+$('movers-date').addEventListener('change',resetTicker);
+let moversCategory,intradayOpened=false;
+function moversFilter(){return {category:moversCategory,fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder,as_of:$('movers-date').value?$('movers-date').value+'T'+($('movers-time').value||'15:30'):undefined};}
+function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order','as_of','category'].every(k=>a[k]===b[k]);}
 function indexLabel(name){const aliases={'Nifty 50':'Nifty 50','Nifty Bank':'Nifty Bank','Nifty Financial Services':'Fin Nifty','Nifty Next 50':'Nifty Next 50','Nifty Smallcap 50':'Nifty Small Cap 50','Nifty Midcap 50':'Nifty Mid Cap 50','Nifty 100':'NIFTY 100','Nifty 200':'NIFTY 200'};return Object.hasOwn(aliases,name)?aliases[name]:name;}
 function moversIndices(s){
   moversNames=s.index_names;const menu=$('universe-picker'),chosen=$('movers-index').value;menu.replaceChildren(new Option('All','all'),new Option('F&O Stocks','fno'));
   for(const n of moversNames){const o=new Option(indexLabel(n),'index:'+n);o.title=n;menu.add(o);}if(!moversNames.includes('India VIX')){const o=new Option('India VIX — unavailable','');o.disabled=true;o.title='No recorded constituent basket';menu.add(o,Math.min(5,menu.options.length));}
   if(chosen&&!moversNames.includes(chosen)){const o=new Option(chosen+' — unavailable','index:'+chosen);o.disabled=true;menu.add(o);}menu.value=chosen?'index:'+chosen:$('movers-universe').value;
 }
+function dailyWatchPrice(stock){
+  const change=stock.prev_close>0?stock.ltp-stock.prev_close:null;
+  return {...stock,change,change_pct:change===null?null:change/stock.prev_close*100};
+}
 function updateStockControls(){
   $$('[data-direction]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.direction===$('movers-direction').value)));
   $$('[data-sort]').forEach(b=>{const active=b.dataset.sort===moversSort;b.querySelector('.sort-indicator').textContent=active?(moversOrder==='asc'?'▲':'▼'):'';b.closest('th').setAttribute('aria-sort',active?(moversOrder==='asc'?'ascending':'descending'):'none');});
+}
+function moversExpired(){
+  const elapsed=Math.max(0,(performance.now()-moversReceived)/1000);
+  return moversObserved+moversRequestSeconds+2+elapsed>=moversReply.valid_until_epoch_secs;
 }
 function renderMovers(){
   const rows=$('movers-rows');rows.replaceChildren();moversVisible=[];watchPrices=[];renderWatch();$('movers-meta').textContent='';$('movers-selection').textContent='';$('movers-prev').disabled=$('movers-next').disabled=true;$('stocks-select-all').disabled=true;$('stocks-select-all').checked=false;updateStockControls();
   if(!moversReply){moversNote(TOKEN?'empty':'locked');return;}
   const reply=moversReply;if(reply.result==='error'){moversNote(reply.code);return;}if(reply.gen!==moversGeneration)return loadMovers();
   const s=reply.snapshot,elapsed=Math.max(0,(performance.now()-moversReceived)/1000),transport=Math.max(0,moversObserved-reply.captured_at_epoch_secs)+moversRequestSeconds+2,age=s.data_age_secs===null?null:Math.ceil(s.data_age_secs+transport+elapsed);
-  if(moversObserved+moversRequestSeconds+2+elapsed>=reply.valid_until_epoch_secs){moversNote('expired');return;}
-  const freshness=moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status),partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
-  $('movers-status').textContent=freshness+(partial?' Partial coverage — '+(s.membership_status==='unavailable'?'index memberships unavailable; ':s.membership_status==='partial'?'index membership incomplete; ':'')+(!s.fno_list_available?'F&O eligibility unknown; ':'')+(s.universe_available?s.universe_total-s.stocks_priced+' eligible stocks unpriced.':'eligible count unknown.'):'');
-  $('movers-meta').textContent=s.stocks_priced+' of '+(s.universe_available?s.universe_total:'unknown')+' eligible '+(s.filter.fno_only?'F&O stocks':'mapped equities')+' priced · newest stored tick '+(s.as_of_ist||'—')+' IST · conservative tick age '+(age===null?'unknown':age+'s')+' · snapshot '+new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+' IST';
+  if(moversExpired()){moversNote('expired');return;}
+  const freshness=s.filter.category==='extreme_openings'&&s.status==='no_data'?'No quotes with a usable session open, high and low.':moversMessage(s.status==='live'?(age!==null&&age<=60?'fresh':'unknown'):s.status),partial=s.stocks_priced<s.universe_total||s.membership_status!=='available'||!s.fno_list_available;
+  $('movers-status').textContent=freshness+(partial?' Partial coverage — '+(s.membership_status==='unavailable'?'index memberships unavailable; ':s.membership_status==='partial'?'index membership incomplete; ':'')+(!s.fno_list_available?'F&O eligibility unknown; ':'')+(s.universe_available?(s.universe_total-s.stocks_priced)+(s.filter.category==='extreme_openings'?' eligible stocks without a usable opening range.':' eligible stocks unpriced.'):'eligible count unknown.'):'');
+  $('movers-meta').textContent=s.stocks_priced+' of '+(s.universe_available?s.universe_total:'unknown')+' eligible '+(s.filter.fno_only?'F&O stocks':'mapped equities')+(s.filter.category==='extreme_openings'?' with usable opening ranges':' priced')+' · newest stored tick '+(s.as_of_ist||'—')+' IST · conservative tick age '+(age===null?'unknown':age+'s')+' · snapshot '+new Date(reply.captured_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})+' IST';
+  if(s.filter.category==='mtf'){
+    const coverage=s.mtf_coverage;
+    if(coverage){
+      const zero=coverage.assessed-coverage.eligible,unknown=coverage.selected-coverage.assessed;
+      const termsTime=new Date(coverage.observed_at_epoch_secs*1000).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'});
+      $('movers-meta').textContent+=` · Dhan MTF terms as of ${termsTime} IST · ${coverage.eligible} with leverage · ${zero} reported zero · ${unknown} unknown`;
+      if(!coverage.eligible&&s.universe_available&&['no_data','closed','live','stale','no_mtf_list'].includes(s.status)){
+        $('movers-status').textContent=unknown?'No published MTF multiplier among the assessed stocks. Some terms are unknown.':'No stocks in this selection have a published MTF multiplier.';
+      }
+    }else{
+      $('movers-meta').textContent='';
+      if(s.status==='no_mtf_list')moversNote('no_mtf_list');
+    }
+  }
   $('movers-value-basis').textContent=s.value_basis||'Actual traded value is not captured; Value (Cr.) is unavailable.';
   for(const stock of s.rows){
     const row=$('stock-row-template').content.firstElementChild.cloneNode(true),check=row.querySelector('input'),name=row.cells[1],membership=stock.indices.length?stock.indices.map(i=>s.index_names[i]).join(', '):s.membership_status==='unavailable'?'Membership unknown':'No recorded membership',fno=stock.fno===null?'F&O unknown':stock.fno?'F&O':'Not F&O';
-    check.dataset.watchId=String(stock.security_id);check.checked=stockWatch.has(watchKey(stock));check.disabled=!validWatch(stock);check.setAttribute('aria-label','Watch '+stock.name);if(check.disabled)check.title='Identifier exceeds browser precision.';name.querySelector('.stock-name').textContent=stock.company_name||stock.name;name.querySelector('.stock-detail').textContent=(stock.company_name?stock.name+' · ':'')+fno+' · '+membership;name.title=stock.name+' · '+membership+' · stored tick '+stock.last_trade_ist+' IST; individual ticks may be older.';
+    const leverage=s.filter.category==='mtf'?'MTF '+stock.mtf_leverage+'× · ':'';
+    check.dataset.watchId=String(stock.security_id);check.checked=stockWatch.has(watchKey(stock));check.disabled=!validWatch(stock);check.setAttribute('aria-label','Watch '+stock.name);if(check.disabled)check.title='Identifier exceeds browser precision.';name.querySelector('.stock-name').textContent=stock.company_name||stock.name;name.querySelector('.stock-detail').textContent=leverage+(stock.company_name?stock.name+' · ':'')+fno+' · '+membership;name.title=stock.name+' · '+leverage+membership+' · stored tick '+stock.last_trade_ist+' IST; individual ticks may be older.';
     const values=[stockNumber(stock.ltp),stockNumber(stock.change,true),stock.change_pct==null?'—':stockNumber(stock.change_pct,true)+'%',stockNumber(stock.value_cr),stockVolume(stock)];
     values.forEach((value,i)=>{const td=row.cells[i+2];td.textContent=value;td.className=value==='—'?'unavailable':i===1||i===2?(stock.change_pct>0?'positive':stock.change_pct<0?'negative':''):'';});rows.appendChild(row);
   }
-  moversVisible=s.rows;watchPrices=s.status==='live'&&age!==null&&age<=60?s.rows:[];renderWatch();$('stocks-select-all').disabled=!s.rows.some(validWatch);$('stocks-select-all').checked=s.rows.length>0&&s.rows.every(stock=>validWatch(stock)&&stockWatch.has(watchKey(stock)));
+  moversVisible=s.rows;watchPrices=s.status==='live'&&age!==null&&age<=60?(s.filter.category==='extreme_openings'?s.rows.map(dailyWatchPrice):s.rows):[];renderWatch();$('stocks-select-all').disabled=!s.rows.some(validWatch);$('stocks-select-all').checked=s.rows.length>0&&s.rows.every(stock=>validWatch(stock)&&stockWatch.has(watchKey(stock)));
   $('movers-selection').textContent='Showing '+(s.rows.length?s.filter.offset+1:0)+'–'+(s.rows.length?s.filter.offset+s.rows.length:0)+' of '+s.matching_total+' matches.';
   $('movers-prev').disabled=s.filter.offset===0;$('movers-next').disabled=s.filter.offset+s.rows.length>=s.matching_total;
 }
+function validMtfPage(snapshot,captured){
+  const coverage=snapshot.mtf_coverage;
+  if(coverage==null)return !snapshot.universe_available&&snapshot.rows.length===0&&snapshot.universe_total===0&&snapshot.stocks_priced===0;
+  const {selected,assessed,eligible,observed_at_epoch_secs:observed}=coverage;
+  const requested=snapshot.filter.as_of?Date.parse(snapshot.filter.as_of+':00+05:30')/1000:captured;
+  const cutoff=Math.min(captured,requested),istDay=epoch=>Math.floor((epoch+19800)/86400);
+  return [selected,assessed,eligible,observed].every(Number.isSafeInteger)&&
+    snapshot.universe_available&&eligible>=0&&eligible<=assessed&&assessed<=selected&&
+    observed>0&&observed<=cutoff&&istDay(observed)===istDay(cutoff)&&
+    eligible===snapshot.universe_total&&Number.isSafeInteger(snapshot.stocks_priced)&&
+    snapshot.rows.length<=snapshot.stocks_priced&&snapshot.stocks_priced<=eligible&&
+    snapshot.rows.every(stock=>Number.isFinite(stock?.mtf_leverage)&&stock.mtf_leverage>=1);
+}
+function verifiedMoversReply(j,filter){
+  const r=j?.movers;
+  if(j?.ok!==true||r?.version!==2||!Number.isSafeInteger(j.observed_at_epoch_secs)||
+     !Number.isSafeInteger(r.captured_at_epoch_secs)||r.captured_at_epoch_secs>j.observed_at_epoch_secs+5||
+     !Number.isSafeInteger(r.valid_until_epoch_secs)||r.valid_until_epoch_secs<=j.observed_at_epoch_secs||
+     r.valid_until_epoch_secs>r.captured_at_epoch_secs+60)return null;
+  if(r.result==='error')return r;
+  return r.result==='snapshot'&&sameMoversFilter(r.snapshot?.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names)&&(filter.category!=='mtf'||validMtfPage(r.snapshot,r.captured_at_epoch_secs))?r:null;
+}
 async function loadMovers(){
   if(moversBusy||!TOKEN||document.hidden)return;const filter=moversFilter();
+  if(moversReply?.result==='snapshot'&&!sameMoversFilter(moversReply.snapshot.filter,filter)){moversReply=null;renderMovers();}
   if(new TextEncoder().encode(filter.search).length>32||/[\x00-\x1f\x7f]/.test(filter.search)){moversReply={result:'error',code:'invalid_search'};renderMovers();return;}
   moversBusy=true;moversLastAttempt=performance.now();const generation=moversGeneration;$('movers-table').inert=$('movers-prev').disabled=$('movers-next').disabled=$('movers-refresh').disabled=true;moversNote('loading');const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),25000);
-  try{const j=await call('stock-movers',{filter},controller.signal);if(generation!==moversGeneration||!TOKEN)return;const r=j&&j.movers;
-    if(j&&j.ok===true&&r&&r.version===2&&Number.isSafeInteger(j.observed_at_epoch_secs)&&Number.isSafeInteger(r.captured_at_epoch_secs)&&r.captured_at_epoch_secs<=j.observed_at_epoch_secs+5&&Number.isSafeInteger(r.valid_until_epoch_secs)&&r.valid_until_epoch_secs>j.observed_at_epoch_secs&&r.valid_until_epoch_secs<=r.captured_at_epoch_secs+60&&(r.result==='error'||r.result==='snapshot'&&sameMoversFilter(r.snapshot&&r.snapshot.filter,filter)&&Array.isArray(r.snapshot.rows)&&Array.isArray(r.snapshot.index_names))){moversReply=r;r.gen=generation;if(r.result==='snapshot')moversIndices(r.snapshot);}else moversReply=null;
+  moversRequest={filter,controller};
+  try{const j=await call('stock-movers',{filter},controller.signal);if(generation!==moversGeneration||!TOKEN)return;
+    moversReply=verifiedMoversReply(j,filter);
+    if(moversReply){moversReply.gen=generation;if(moversReply.result==='snapshot')moversIndices(moversReply.snapshot);}
     moversObserved=j&&j.observed_at_epoch_secs||0;moversReceived=performance.now();moversRequestSeconds=Math.max(0,(moversReceived-moversLastAttempt)/1000);renderMovers();
-  }catch(e){moversReply=null;renderMovers();}finally{clearTimeout(timeout);moversBusy=false;$('movers-table').inert=$('movers-refresh').disabled=false;if(generation!==moversGeneration&&TOKEN&&curTab==='movers')loadMovers();}
+  }catch(e){if(generation===moversGeneration){moversReply=null;renderMovers();}}finally{clearTimeout(timeout);moversRequest=null;moversBusy=false;$('movers-table').inert=$('movers-refresh').disabled=false;if(generation!==moversGeneration&&TOKEN&&curTab==='movers')loadMovers();}
 }
-function changeMovers(offset=0){moversOffset=offset;moversGeneration++;updateStockControls();loadMovers();}
+function changeMovers(offset=0){
+  moversOffset=offset;
+  const next=moversFilter();
+  if(moversRequest&&sameMoversFilter(moversRequest.filter,next))return;
+  if(!sameMoversFilter(moversReply?.snapshot?.filter,next)||moversRequest){
+    moversGeneration++;moversReply=null;renderMovers();
+    if(moversRequest){moversNote('loading');moversRequest.controller.abort(dismissedRead);}
+  }
+  loadMovers();
+}
 $('movers-tab').addEventListener('click',()=>tab('movers'));$('movers-refresh').addEventListener('click',loadMovers);
 $('movers-apply').addEventListener('click',()=>changeMovers());$('movers-search').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();changeMovers();}});$('movers-date').addEventListener('change',()=>changeMovers());$('movers-time').addEventListener('change',()=>changeMovers());
 $('movers-prev').addEventListener('click',()=>changeMovers(Math.max(0,moversOffset-20)));$('movers-next').addEventListener('click',()=>changeMovers(moversOffset+20));
+const categoryButtons=$$('[data-category]');
+for(const button of categoryButtons)button.addEventListener('click',()=>{
+  if(button.getAttribute('aria-pressed')==='true')return;
+  moversCategory=button.dataset.category||undefined;
+  if(moversCategory==='intraday'&&!intradayOpened){
+    intradayOpened=true;$('movers-universe').value='all';$('movers-index').value='';$('universe-picker').value='all';
+  }
+  const extreme=moversCategory==='extreme_openings';
+  document.querySelector('[data-direction="gainers"]').textContent=extreme?'Open = Low':'Gainers';
+  document.querySelector('[data-direction="losers"]').textContent=extreme?'Open = High':'Losers';
+  for(const tab of categoryButtons){tab.classList.toggle('selected',tab===button);tab.setAttribute('aria-pressed',String(tab===button));}
+  $('change-label').textContent=button.dataset.label;$('percent-label').textContent=button.dataset.label+' %';
+  $('category-basis').textContent=button.title+'.';$('movers-table').setAttribute('aria-label','Stocks '+button.textContent);
+  moversSort='change_pct';moversOrder=$('movers-direction').value==='losers'?'asc':'desc';
+  changeMovers();
+});
 $$('[data-direction]').forEach(b=>b.addEventListener('click',()=>{$('movers-direction').value=b.dataset.direction;moversSort='change_pct';moversOrder=b.dataset.direction==='gainers'?'desc':'asc';changeMovers();}));
 $$('[data-sort]').forEach(b=>b.addEventListener('click',()=>{moversOrder=moversSort===b.dataset.sort&&moversOrder==='desc'?'asc':'desc';moversSort=b.dataset.sort;changeMovers();}));
 $('universe-picker').addEventListener('change',e=>{const value=e.target.value;$('movers-universe').value=value==='fno'?'fno':'all';$('movers-index').value=value.startsWith('index:')?value.slice(6):'';changeMovers();});
-$('watch-search').addEventListener('input',renderWatch);$('watch-rows').addEventListener('click',e=>{const remove=e.target.closest('[data-remove]'),open=e.target.closest('[data-watch]');if(remove){stockWatch.delete(remove.dataset.remove);saveWatch();renderMovers();}else if(open){const s=stockWatch.get(open.dataset.watch);if(s){$('movers-search').value=stockSearchPrefix(s.name);changeMovers();}}});
-$('movers-rows').addEventListener('change',e=>{const id=Number(e.target.dataset.watchId),s=moversVisible.find(s=>s.security_id===id&&s.segment==='NSE_EQ');if(s){setWatch(s,e.target.checked);renderMovers();}});
-$('stocks-select-all').addEventListener('change',e=>{for(const s of moversVisible)setWatch(s,e.target.checked);renderMovers();});
-setInterval(()=>{if(curTab==='movers'&&!document.hidden&&!moversBusy)renderMovers();},1000);
-document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
+function watchChanged(){saveWatch();renderMovers();renderWatchMatches();}
+for(const [slot,label] of watchLabels.entries()){
+  const button=stockNode('button',slot+1,'watch-slot');
+  button.type='button';button.dataset.slot=String(slot);button.setAttribute('aria-label',label+' Watchlist');
+  $('watch-slots').appendChild(button);
+}
+showWatchSlot(activeWatchSlot);
+$('watch-slots').addEventListener('click',event=>{
+  const button=event.target.closest('[data-slot]');
+  if(!button||Number(button.dataset.slot)===activeWatchSlot)return;
+  clearWatchSearch();$('watch-search').value='';showWatchSlot(Number(button.dataset.slot));
+  try{sessionStorage.setItem('tv_stock_watch_slot',String(activeWatchSlot+1));}catch(e){}
+  renderMovers();
+});
+$('watch-search-form').addEventListener('submit',searchWatch);
+$('watch-search').addEventListener('input',()=>{clearWatchSearch();renderWatch();});
+$('watch-search').addEventListener('keydown',event=>{if(event.key==='Escape')clearWatchSearch();});
+$('movers-date').addEventListener('change',clearWatchSearch);
+$('movers-time').addEventListener('change',clearWatchSearch);
+$('watch-matches').addEventListener('click',event=>{
+  const button=event.target.closest('[data-match]');
+  expireWatchSearch();
+  const stock=button&&watchMatches[Number(button.dataset.match)];
+  if(TOKEN&&stock&&setWatch(stock,!stockWatch.has(watchKey(stock))))watchChanged();
+});
+$('watch-rows').addEventListener('click',e=>{const remove=e.target.closest('[data-remove]'),open=e.target.closest('[data-watch]');if(remove){stockWatch.delete(remove.dataset.remove);watchChanged();}else if(open){const s=stockWatch.get(open.dataset.watch);if(s){$('movers-search').value=stockSearchPrefix(s.name);changeMovers();}}});
+$('movers-rows').addEventListener('change',e=>{const id=Number(e.target.dataset.watchId),s=moversVisible.find(s=>s.security_id===id&&s.segment==='NSE_EQ');if(s&&setWatch(s,e.target.checked))watchChanged();else renderMovers();});
+$('stocks-select-all').addEventListener('change',e=>{
+  let changed=false;
+  for(const stock of moversVisible)if(setWatch(stock,e.target.checked))changed=true;
+  if(changed)watchChanged();else renderMovers();
+});
+setInterval(()=>{if(curTab==='movers'&&!document.hidden){expireTicker();if(!moversBusy||(moversReply?.result==='snapshot'&&moversExpired()))renderMovers();}},1000);
+document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){expireTicker();renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
 moversIndices({index_names:[]});renderWatch();
 
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');

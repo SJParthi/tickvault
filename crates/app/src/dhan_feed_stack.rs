@@ -15474,7 +15474,8 @@ fn dial_planned_connections(plan: FeedStackPlan, ctx: DialContext<'_>) -> usize 
                 let dialled_generation = std::sync::Arc::clone(&dialled_generation);
                 move || feed_token_recording_generation(&dialled_generation)
             },
-        );
+        )
+        .with_receive_buffer_slot(planned.slot.global_index);
         // Endpoint decides the budget. Depth may exhaust depth; it may not
         // evict the feed that actually carries ticks.
         // Three classes, not two. depth-20 and depth-200 shared one budget

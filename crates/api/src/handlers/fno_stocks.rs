@@ -15,7 +15,7 @@
 //! | previous close | `ticks.close` of that row: on a Quote/Full packet Dhan carries the PREVIOUS session's close there (Ticket #5525125, `docs/dhan-ref/03-live-market-feed-websocket.md` §7.3). NULL on a row without it, and then change is `null` |
 //! | change, change % | `ltp − prev_close`, `change / prev_close × 100`, only when both are finite and positive |
 //! | volume | `ticks.volume`, the day's cumulative volume |
-//! | value (Cr.) | an ESTIMATE, `volume × ticks.avg_price ÷ 1 crore`. Dhan's reference does not define its "Value" column, so the page labels this a turnover estimate |
+//! | value (Cr.) | an ESTIMATE, `volume × ticks.avg_price ÷ 1 crore`. The feed stores a rounded average price, so this endpoint labels the result as a turnover estimate. The Stocks page requires actual traded value |
 //!
 //! The live spot universe is NOT only F&O stocks (config subscribes the Nifty
 //! Total Market list), so the F&O list is the filter, not the `NSE_EQ`
@@ -274,6 +274,14 @@ pub fn parse_fno_underlyings(bytes: &[u8]) -> Option<FnoUnderlyings> {
             }
         }
     }
+    // NSE dummy symbols such as 011NSETEST also appear in the Dhan derivatives
+    // master. Validate all identities before excluding these from Stocks.
+    // See NSE circular CMTR67144, Annexure 1.
+    names.retain(|_, symbol| {
+        !symbol.strip_suffix("NSETEST").is_some_and(|number| {
+            number.len() == 3 && number.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    });
     Some(FnoUnderlyings { names })
 }
 
@@ -395,20 +403,45 @@ pub(super) fn window_start(now_ist: chrono::NaiveDateTime) -> chrono::NaiveDateT
 pub(super) fn build_fno_stocks_sql(
     ids: &[u64],
     window_start_ist: chrono::NaiveDateTime,
-    window_end_ist: Option<chrono::NaiveDateTime>,
+    window_end_ist: chrono::NaiveDateTime,
     row_limit: usize,
 ) -> String {
-    let id_list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-    let end = window_end_ist.map_or_else(String::new, |end| {
-        format!(" AND ts <= '{}'", end.format("%Y-%m-%dT%H:%M:%S%.6fZ"))
-    });
+    build_equity_stocks_sql(ids, window_start_ist, window_end_ist, row_limit, None)
+}
+
+/// Price Movers can permit a wider interval for this date’s F&O
+/// IDs. The outer time predicate still prunes partitions before LATEST ON.
+pub(super) fn build_equity_stocks_sql(
+    ids: &[u64],
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+    row_limit: usize,
+    auction: Option<(&[u64], chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+) -> String {
+    let stamp = |t: chrono::NaiveDateTime| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let id_list = |ids: &[u64]| ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let (lower, upper, extra) = match auction {
+        Some((eligible, lower, upper)) if !eligible.is_empty() => (
+            lower,
+            upper,
+            format!(
+                " AND ((ts >= '{}' AND ts <= '{}') OR security_id IN ({}))",
+                stamp(start),
+                stamp(end),
+                id_list(eligible)
+            ),
+        ),
+        _ => (start, end, String::new()),
+    };
     format!(
-        "SELECT security_id, segment, ltp, close, volume, avg_price, ts FROM ticks \
-         WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}'{end} \
-         AND security_id IN ({id_list}) \
+        "SELECT security_id, segment, ltp, close, volume, avg_price, ts, open, high, low FROM ticks \
+         WHERE segment = '{}' AND feed = '{FNO_STOCKS_FEED}' AND ts >= '{}' AND ts <= '{}' \
+         AND security_id IN ({}){extra} \
          LATEST ON ts PARTITION BY security_id, segment LIMIT {row_limit}",
         segment_code_to_str(EXCHANGE_SEGMENT_NSE_EQ),
-        window_start_ist.format("%Y-%m-%dT%H:%M:%S%.6fZ"),
+        stamp(lower),
+        stamp(upper),
+        id_list(ids),
     )
 }
 
@@ -419,6 +452,9 @@ pub(super) struct TickRow {
     pub(super) segment_code: u8,
     pub(super) ltp: f64,
     pub(super) close: Option<f64>,
+    pub(super) session_open: Option<f64>,
+    pub(super) session_high: Option<f64>,
+    pub(super) session_low: Option<f64>,
     pub(super) volume: Option<u64>,
     pub(super) avg_price: Option<f64>,
     pub(super) ts: chrono::NaiveDateTime,
@@ -428,12 +464,21 @@ pub(super) struct TickRow {
 /// missing a mandatory field.
 fn parse_tick_row(row: &[serde_json::Value]) -> Option<TickRow> {
     let ts_text = row.get(6)?.as_str()?;
-    let ts = chrono::NaiveDateTime::parse_from_str(ts_text.get(..19)?, "%Y-%m-%dT%H:%M:%S").ok()?;
+    // QuestDB serializes its stored timestamp on the UTC axis. Tickvault already
+    // stores IST wall time on that axis, so do not add the IST offset again.
+    // Keep fractions for the window comparison, including older zone-less rows.
+    let ts = chrono::DateTime::parse_from_rfc3339(ts_text)
+        .map(|stamp| stamp.naive_utc())
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts_text, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()?;
     Some(TickRow {
         security_id: row.first()?.as_u64()?,
         segment_code: segment_str_to_code(row.get(1)?.as_str()?)?,
         ltp: row.get(2)?.as_f64()?,
         close: row.get(3).and_then(serde_json::Value::as_f64),
+        session_open: row.get(7).and_then(serde_json::Value::as_f64),
+        session_high: row.get(8).and_then(serde_json::Value::as_f64),
+        session_low: row.get(9).and_then(serde_json::Value::as_f64),
         volume: row.get(4).and_then(serde_json::Value::as_u64),
         avg_price: row.get(5).and_then(serde_json::Value::as_f64),
         ts,
@@ -624,12 +669,7 @@ pub(super) async fn compute_for_list(
         window_start(inputs.now_ist),
         inputs.now_ist + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS),
     ));
-    let sql = build_fno_stocks_sql(
-        &list.sorted_ids(),
-        start,
-        closed_window.map(|w| w.1),
-        FNO_STOCKS_QUERY_ROWS,
-    );
+    let sql = build_fno_stocks_sql(&list.sorted_ids(), start, end, FNO_STOCKS_QUERY_ROWS);
     let timeout = if open {
         inputs.timeout
     } else {
@@ -672,7 +712,8 @@ pub(super) async fn compute_for_list(
         return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
     };
     // A newest row inside the forward skew reads as age 0, never negative.
-    let age = (at - newest).num_seconds().max(0);
+    // Freshness on both Stocks routes follows their whole-second wire timestamps.
+    let age = (at.and_utc().timestamp() - newest.and_utc().timestamp()).max(0);
     let window_secs = closed_window.map_or(FNO_STOCKS_WINDOW_SECS, |(s, e)| {
         (e - s).num_seconds().clamp(1, FNO_STOCKS_MAX_WINDOW_SECS)
     });
@@ -820,7 +861,7 @@ pub(super) mod tests {
         let sql = build_fno_stocks_sql(
             &[1594, 2885],
             window_start(at(NOW)),
-            None,
+            at(NOW) + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS),
             FNO_STOCKS_QUERY_ROWS,
         );
         assert!(
@@ -978,12 +1019,12 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_closed_sql_carries_the_upper_bound_and_live_sql_does_not() {
+    fn test_both_sql_windows_bound_the_rows_before_latest_on() {
         let end = at("2026-10-30 15:40:00");
         let closed = build_fno_stocks_sql(
             &[1594],
             at("2026-10-30 09:15:00"),
-            Some(end),
+            end,
             FNO_STOCKS_QUERY_ROWS,
         );
         assert!(
@@ -995,10 +1036,16 @@ pub(super) mod tests {
         let live = build_fno_stocks_sql(
             &[1594],
             at("2026-10-30 09:15:00"),
-            None,
+            at(NOW) + chrono::Duration::seconds(FNO_STOCKS_FUTURE_SKEW_SECS),
             FNO_STOCKS_QUERY_ROWS,
         );
-        assert!(!live.contains("ts <="), "{live}");
+        let (predicates, _) = live
+            .split_once("LATEST ON")
+            .expect("latest row per security");
+        assert!(
+            predicates.contains("ts <= '2026-10-30T11:15:35.000000Z'"),
+            "{live}"
+        );
     }
 
     #[tokio::test]
@@ -1115,6 +1162,56 @@ pub(super) mod tests {
         let names: Vec<&str> = r.stocks.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["INFY"]);
         assert_eq!(r.data_age_secs, Some(5));
+    }
+
+    #[test]
+    fn test_stock_timestamp_preserves_questdb_fractions_and_checks_the_entire_field() {
+        let parse = |text: &str| {
+            let row = serde_json::json!([1594, "NSE_EQ", 100.0, 95.0, 1, 100.0, text]);
+            parse_tick_row(row.as_array().unwrap()).map(|r| r.ts)
+        };
+        let whole = at("2026-10-30 11:15:00");
+        let fractional = whole + chrono::Duration::microseconds(125_001);
+        for text in [
+            "2026-10-30T11:15:00.125001Z",
+            "2026-10-30T16:45:00.125001+05:30",
+            "2026-10-30T11:15:00.125001",
+        ] {
+            assert_eq!(parse(text), Some(fractional), "{text}");
+        }
+        assert_eq!(parse("2026-10-30T11:15:00Z"), Some(whole));
+        assert_eq!(parse("2026-10-30T11:15:00"), Some(whole));
+        for text in [
+            "2026-10-30T11:15:00garbage",
+            "2026-10-30T11:15:00Zignored",
+            "2026-10-30T11:15:00+25:00",
+        ] {
+            assert_eq!(parse(text), None, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fractional_window_accepts_in_range_tick_and_rejects_tick_past_end() {
+        let dir = list_dir("subsecond-window");
+        let now = at(NOW) + chrono::Duration::milliseconds(400);
+        let within = r#"[1594,"NSE_EQ",120.0,100.0,7,120.0,"2026-10-30T11:00:30.400001Z"]"#;
+        let outside = r#"[2885,"NSE_EQ",150.0,100.0,9,150.0,"2026-10-30T11:15:35.400001Z"]"#;
+        let url = mock("200 OK", dataset(&[within, outside])).await;
+        let result = compute_fno_stocks(FnoStocksInputs {
+            client: &reqwest::Client::new(),
+            base_url: &url,
+            artifact_dir: &dir,
+            market_open: true,
+            now_ist: now,
+            read_at_ist: None,
+            timeout: Duration::from_secs(2),
+        })
+        .await;
+        let ids: Vec<_> = result.stocks.iter().map(|s| s.security_id).collect();
+        assert_eq!(ids, [1594]);
+        assert_eq!(result.data_age_secs, Some(900));
+        assert_eq!(result.as_of_ist.as_deref(), Some("11:00:30"));
+        assert_eq!(result.status, "stale");
     }
 
     #[tokio::test]
@@ -1275,5 +1372,27 @@ pub(super) mod tests {
             Some("ABC")
         );
         assert!(parse_fno_underlyings(body("WRONG").as_bytes()).is_none());
+        assert!(parse_fno_underlyings(body("011NSETEST").as_bytes()).is_none());
+    }
+
+    #[test]
+    fn stock_list_removes_exchange_dummies_and_keeps_real_numeric_symbols() {
+        let mut symbols: Vec<_> = (1..=18).map(|n| format!("{n:02}1NSETEST")).collect();
+        symbols.extend(
+            ["360ONE", "20MICRONS", "TEST", "ABCNSETEST", "011NSETESTX"].map(str::to_owned),
+        );
+        let rows: Vec<_> = symbols.iter().enumerate().map(|(i,symbol)|
+            serde_json::json!({"index_name":FNO_UNDERLYING_TAG,"symbol":symbol,"security_id":i + 1,"exchange_segment":EXCHANGE_SEGMENT_NSE_EQ})
+        ).collect();
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"count":rows.len(),"mappings":rows})).unwrap();
+        let list = parse_fno_underlyings(&bytes).unwrap();
+        assert_eq!(list.len(), 5);
+        for (i, symbol) in symbols.iter().enumerate() {
+            assert_eq!(
+                list.name_of(i as u64 + 1, EXCHANGE_SEGMENT_NSE_EQ),
+                (i >= 18).then_some(symbol.as_str())
+            );
+        }
     }
 }

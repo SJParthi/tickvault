@@ -1,8 +1,8 @@
 //! In-process tick conservation ledger (plan item K4, 2026-10-26).
 //!
-//! The daily tick conservation check compares what this process ACCEPTED for
-//! the `ticks` table with what QuestDB holds for the day. The database side is
-//! one `count()` query; this module is the process side.
+//! The daily check compares buffer appends with the sum of the day's stored
+//! rows in `ticks` and `tick_quotes`. Reappending the same capture key increments
+//! this ledger again. QuestDB can replace the matching row during deduplication.
 //!
 //! ## What it counts
 //!

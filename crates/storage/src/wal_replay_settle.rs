@@ -89,6 +89,7 @@ use tracing::{error, info, warn};
 use crate::wal_applied_watermark::{
     AppliedSnapshot, AppliedWatermark, WATERMARK_DURABILITY_LAG_SECS, applied_watermark,
 };
+use crate::wal_segment_move::{ArchiveDecision, archive_segment, move_segment};
 use crate::ws_frame_spill::{
     ARCHIVE_SUBDIR, REPLAYING_SUBDIR, WalEndpoint, read_segment_frames_matching,
     try_wal_segments_in, wal_segments_in,
@@ -320,7 +321,7 @@ impl SettleState {
             // O(1) EXEMPT: cold settle step, staged × names (one round's segments)
             staged.retain(|seg| seg.file_name().is_some_and(|n| names.contains(&n)));
         }
-        let moved_names = rename_each(&staged, &settling_dir, "replay_settle_rename");
+        let moved_names = rename_each(&staged, &settling_dir, "replay_settle_rename", move_segment);
         let moved = moved_names.len() as u64;
         self.settled_any = true;
         self.dir = Some(wal_dir.to_path_buf());
@@ -409,8 +410,12 @@ impl SettleState {
             let paths: Vec<PathBuf> = batch.names.iter().map(|n| settling_dir.join(n)).collect(); // APPROVED: cold settle step
             // A failed rename leaves the segment in settling/, untracked:
             // the next boot recovers and re-reads it.
-            promoted =
-                promoted.saturating_add(rename_all(&paths, &archive_dir, "replay_settle_archive"));
+            promoted = promoted.saturating_add(
+                rename_each(&paths, &archive_dir, "replay_settle_archive", |from, to| {
+                    archive_segment(from, to, ArchiveDecision::SettledAfterAck)
+                })
+                .len() as u64,
+            );
             false
         });
         if held_now > 0 {
@@ -606,12 +611,17 @@ fn hold_batches(segments: u64, reason: &'static str) {
 /// Renames each file into `dst_dir` (created if missing). A failed rename
 /// leaves the file where it was, coded; returns how many moved.
 fn rename_all(files: &[PathBuf], dst_dir: &Path, source: &'static str) -> u64 {
-    rename_each(files, dst_dir, source).len() as u64
+    rename_each(files, dst_dir, source, move_segment).len() as u64
 }
 
 /// [`rename_all`], returning the names of the files that moved (W3: a batch
 /// tracks only what it really put in `settling/`).
-fn rename_each(files: &[PathBuf], dst_dir: &Path, source: &'static str) -> Vec<OsString> {
+fn rename_each(
+    files: &[PathBuf],
+    dst_dir: &Path,
+    source: &'static str,
+    move_one: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Vec<OsString> {
     if files.is_empty() {
         return Vec::new();
     }
@@ -622,7 +632,7 @@ fn rename_each(files: &[PathBuf], dst_dir: &Path, source: &'static str) -> Vec<O
             continue;
         };
         // O(1) EXEMPT: cold settle step, one rename per segment
-        match std::fs::rename(seg, dst_dir.join(name)) {
+        match move_one(seg, &dst_dir.join(name)) {
             Ok(()) => moved.push(name.to_os_string()),
             Err(err) => error!(
                 code = ErrorCode::HotPath01SyncFsFailed.code_str(),
@@ -753,6 +763,57 @@ mod tests {
         let _moved = st.settle(&dir, &wm, Instant::now(), start);
         assert!(st.held, "the settle step holds the set too");
         assert_eq!(st.promote(&wm, lagged(Instant::now())), SettleVerdict::Held);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_archive_provenance_distinguishes_a_partial_settle_from_a_legacy_collision() {
+        use crate::ws_frame_spill::confirm_replayed;
+        use rustix::fs::{getxattr, getxattr_query};
+        let dir = tmp("archive-collision");
+        let staged = dir.join(REPLAYING_SUBDIR);
+        let settling = dir.join(SETTLING_SUBDIR);
+        let archive = dir.join(ARCHIVE_SUBDIR);
+        std::fs::create_dir_all(&archive).unwrap();
+        let unique = "ws-frames-00000000000000000001.wal";
+        let blocked = "ws-frames-00000000000000000002.wal";
+        plant(&staged, unique);
+        plant(&staged, blocked);
+        std::fs::write(archive.join(blocked), b"earlier archive bytes").unwrap();
+        let wm = AppliedWatermark::new_for_tests();
+        let now = Instant::now();
+        let mut state = SettleState::new();
+        assert_eq!(state.settle(&dir, &wm, now, SettleBatchStart::of(&wm)), 2);
+        wm.note_questdb_probe(true);
+        wm.note_questdb_probe(true);
+        assert_eq!(state.promote(&wm, lagged(now)), SettleVerdict::Promoted(1));
+        assert_eq!(
+            std::fs::read(archive.join(blocked)).unwrap(),
+            b"earlier archive bytes"
+        );
+        assert_eq!(std::fs::read(settling.join(blocked)).unwrap(), b"x");
+        let attr = "user.tickvault.replay_archive.v1";
+        assert_eq!(
+            getxattr_query(archive.join(blocked), attr),
+            Err(rustix::io::Errno::NODATA)
+        );
+        assert_eq!(
+            getxattr_query(settling.join(blocked), attr),
+            Err(rustix::io::Errno::NODATA)
+        );
+        let mut value = [0u8; 32];
+        let n = getxattr(archive.join(unique), attr, &mut value[..]).unwrap();
+        assert_eq!(&value[..n], b"settled_after_ack");
+        plant(&staged, unique);
+        confirm_replayed(&dir);
+        assert!(staged.join(unique).is_file());
+        // Preserve the earlier capture before retrying the held segment.
+        std::fs::rename(archive.join(unique), dir.join("preserved-before-retry")).unwrap();
+        confirm_replayed(&dir);
+        assert!(!staged.join(unique).exists());
+        let n = getxattr(archive.join(unique), attr, &mut value[..]).unwrap();
+        assert_eq!(&value[..n], b"direct_confirm");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// c2: an acked batch is not archived until the durability lag has

@@ -314,7 +314,8 @@ pub fn tally_ticks_lost_once(
 }
 
 /// Starts the `tv-metrics-tally` thread: every [`TICKS_LOST_TALLY_INTERVAL`]
-/// one [`tally_ticks_lost_once`]. Its own OS thread, never the main runtime
+/// refresh socket receive buffers and run [`tally_ticks_lost_once`]. Its own
+/// OS thread, never the main runtime
 /// the frame drain shares; cold (one render every 30 s, the same work the
 /// CloudWatch agent's scrape already causes once a minute).
 fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle) {
@@ -322,6 +323,7 @@ fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle)
         .name("tv-metrics-tally".to_owned())
         .spawn(move || {
             loop {
+                tickvault_core::websocket::receive_buffer::refresh();
                 let _total = tally_ticks_lost_once(&handle);
                 // APPROVED-BLOCKING: this is the tally's own dedicated OS thread; sleeping here blocks nothing else.
                 std::thread::sleep(TICKS_LOST_TALLY_INTERVAL);
@@ -330,7 +332,7 @@ fn spawn_ticks_lost_tally(handle: metrics_exporter_prometheus::PrometheusHandle)
     if let Err(err) = spawned {
         tracing::warn!(
             error = %err,
-            "the ticks-lost tally thread did not start: host_capacity_minute.ticks_lost stays NULL"
+            "the metrics tally thread did not start: host_capacity_minute.ticks_lost stays NULL and socket receive buffers have only dial-time readings"
         );
     }
 }

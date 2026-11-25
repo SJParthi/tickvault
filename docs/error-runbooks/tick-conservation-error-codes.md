@@ -20,25 +20,25 @@ window closes at 15:40), on its own task, it compares:
 
 | Input | Source |
 |---|---|
-| accepted | `ticks` rows the Dhan writer appended for today (one relaxed add per row, in process) |
-| database | `select count() from ticks where ts in '<today>' and feed = 'dhan'` (30 s timeout) |
+| accepted | Dhan `ticks` and `tick_quotes` rows appended for today (one relaxed add per row, in process) |
+| database | Sum of today's Dhan row counts from `ticks` and `tick_quotes` (30 s timeout per query). Both must be readable. |
 | not landed | rows counted as spilled, failed or handed to the WAL replay (the sites that increment `tv_ticks_dropped_total`) |
 
 and writes one row to `tick_conservation_audit` (DEDUP `ts, trading_date_ist, feed`).
 
 | verdict | reason | meaning |
 |---|---|---|
-| `match` | `exact` | every accepted row is in the table |
-| `match` | `within_counted_losses` | the shortfall is no larger than the rows already counted as not landed |
-| `mismatch` | `unexplained_shortfall` | more rows are missing than every counted loss explains |
+| `match` | `exact` | the positive accepted and database counts agree for the full day |
+| `unverified` | `within_counted_losses` | fewer rows are visible than accepted. The process-wide spill, failure and deferral count could cover the difference. Earlier versions stored this reason with verdict `match`. |
+| `mismatch` | `unexplained_shortfall` | accepted buffer writes exceed stored rows by more than the spill, failure and deferral counter explains |
 | `mismatch` | `extra_db_rows` | the table holds more of today's Dhan rows than this process accepted |
 | `unverified` | `count_unreadable` | the count query failed, timed out or returned a bad body; never a mismatch |
 | `unverified` | `no_rows` | nothing accepted and nothing stored; a zero baseline proves nothing |
 | `partial` | `process_started_mid_day` | this process started at or after 09:00 IST (or on another day); it knows only its own rows, so no mismatch is claimed |
 
-A `mismatch` or `unverified` read is retried up to 3 times, 120 s apart,
-because a row QuestDB has acknowledged is countable only once its WAL is
-applied.
+For a mismatch, an unreadable count or a shortfall within counted losses, the
+check makes at most three reads in total, 120 s apart. QuestDB counts a row
+after its WAL is applied. A `no_rows` baseline settles immediately.
 
 ## TICK-CONSERVE-01 — the day did not reconcile
 
@@ -50,12 +50,16 @@ Telegram (`dhan-rest-only-noise-lock-2026-07-14.md`).
 1. `select * from tick_conservation_audit order by ts desc limit 5` — the
    numbers behind the verdict (`accepted_rows`, `db_tick_rows`,
    `not_landed_rows`, `shortfall`, `count_reads`).
-2. `unexplained_shortfall`: check QuestDB's apply backlog
-   (`tv_questdb_wal_apply_lag_max`, `wal_tables()`) — rows still being applied
-   read as missing. Re-run the count by hand after the backlog drains. If it is
-   still short, look for loss counters that do not feed the ledger
-   (`tv_ticks_lost_total`, `tv_wal_shed_frames_lost_total`) and the
-   `HOT-PATH-02` lines for the day.
+2. For `unexplained_shortfall`, check `wal_tables()` for suspended tables or
+   outstanding transactions. Repeat the dated, feed-filtered count on both
+   `ticks` and `tick_quotes` after apply catches up. Record both counts and
+   the read time alongside the original receipt. Check `tv_ticks_lost_total`,
+   `tv_wal_shed_frames_lost_total` and the day's `HOT-PATH-02` lines.
+   Compare eligible captured keys with stored keys in the same interval to
+   identify missing records. Both tables deduplicate by timestamp, feed,
+   segment, security ID and capture sequence. Offering an existing key again
+   increases accepted writes while the database can still hold one row.
+   Replay telemetry counts frames, each of which can contain several packets.
 3. `extra_db_rows`: another writer stamped `feed='dhan'` on today's rows (a
    second process, or a WAL replay of a frame this process also wrote). Check
    for `RESILIENCE-01` and the boot's replay log line.
@@ -73,9 +77,42 @@ only pre-v3 records), or for a gap of 5 s or less. A failed write is a coded
 
 ## Honest limits
 
-- The not-landed total is per process and can include `feed_aux_packets`
-  rows that shared a rescued batch: a tolerance, not an exact term. A real
-  loss smaller than the counted spills reads as `match`.
+The daily task writes the complete original ILP row to
+`data/spill/audit/tick_conservation_audit/` before attempting database
+delivery. It confirms the schema and DEDUP key, then sends the row. A database
+acknowledgement permits removal of the journal file. A refused schema or a
+lost write acknowledgement leaves the file available after a restart. Every
+minute, the drain checks the schema before each file and submits its original
+timestamp, day and feed. QuestDB uses those keys to collapse repeat submissions.
+
+`STORAGE-GAP-03` at `tick_conservation_audit_queued` means the receipt is
+on disk and database delivery is unconfirmed. At `tick_conservation_audit_write`,
+check the database and spill directory using the logged row identity. If both
+destinations fail, the daily task keeps the original receipt in memory and
+waits a minute after each failed write before trying again. New attempts stop at
+IST midnight on the audited date. An in-flight write can finish after midnight.
+If both destinations still refuse the receipt, the task logs `tick_conservation_audit_retry_expired` with
+the original fields so the next day can run. A process exit before either
+destination accepts the receipt also ends the in-memory retry. The
+table-labelled spill, replay, refusal and quarantine counters track the outcome.
+The shared audit drain uses `AUDIT-06` and the existing order-audit alarms
+for a stale backlog or permanent refusal. Check the table and source labels
+to identify conservation receipts.
+
+A crash before journal publication can still leave no receipt. Full storage,
+quota or an I/O error can prevent journaling. In that case the task attempts a
+direct write if the database confirms its schema. Directory sync failure
+after rename weakens power-loss durability. Schema confirmation and the
+subsequent ILP request are separate operations, so coordinate database
+restores or manual schema changes with the writer. Permanent rejections use
+the audit quarantine. Preserve outstanding files across restarts and
+rollbacks. These records describe daily counts. Use the tick and WAL checks
+for individual price updates.
+
+- The not-landed total spans the life of the process and can include
+  `feed_aux_packets` from a rescued batch. It cannot identify which of today's
+  rows are missing. Check WAL apply and replay progress when a shortfall
+  remains after the last read. Even equal counts do not verify row identities.
 - Frames lost before the drain folded them (`tv_ticks_lost_total`) were never
   accepted, so this check cannot see them; the WAL and its own counters do.
 - The previous process's last receipt is the receipt of the record with the

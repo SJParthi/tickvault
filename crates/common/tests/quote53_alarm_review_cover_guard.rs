@@ -36,7 +36,7 @@
 //!    `cloudwatch-agent.json` to the box with no terraform in the path, so
 //!    the trimmed config may not be in the tree before 1 December. This test
 //!    FAILS the build until then, by design. Delete it with test 8.
-//! 10. `wal-replay-restore-failed` is a data-loss path whose only page is
+//! 10. A failed WAL restore holds replay. Its only page is
 //!     the coded WS-SPILL-02 ERROR and the kept `errcode-ws-spill-02`.
 //! 11. The kept `boot-heartbeat-missing` ships disarmed and only its gate
 //!     arms it, so the gate keeps its Errors and did-it-run alarms.
@@ -602,9 +602,8 @@ fn the_trimmed_agent_config_is_not_merged_before_december() {
     );
 }
 
-/// Test 10. `wal-replay-restore-failed` was removed, but its failure is a data-loss
-/// path: a deferred segment that cannot be moved back stays in `replaying/`,
-/// where the confirm step archives it unread. Its only page now is the coded
+/// Test 10. `wal-replay-restore-failed` was removed. A deferred segment that
+/// cannot be moved back stays in `replaying/` and holds the pass. Its page is the coded
 /// `WS-SPILL-02` ERROR at that site, matched by the kept `errcode-ws-spill-02`
 /// filter. This pins all three links so narrowing the filter (by `source`,
 /// as §2.17 does elsewhere) cannot silently drop it, and the review row
@@ -624,7 +623,7 @@ fn the_wal_restore_failure_still_pages_through_ws_spill_02() {
     assert!(
         spill[call..msg].contains("code = ErrorCode::WsSpill02FrameDropped.code_str()"),
         "the WAL restore-failure line must stay a coded WS-SPILL-02 ERROR: it is the \
-         only page left for this data-loss path"
+         only page left for a failed restore"
     );
     // (b) The kept filter matches every WS-SPILL-02 ERROR, with no narrowing.
     let codes = code_only(&read(&format!("{TF_DIR}/error-code-alarms.tf")));
@@ -637,8 +636,7 @@ fn the_wal_restore_failure_still_pages_through_ws_spill_02() {
             "pattern     = \"{ $.code = \\\"WS-SPILL-02\\\" && $.level = \\\"ERROR\\\" }\""
         ),
         "errcode-ws-spill-02 must match every WS-SPILL-02 ERROR (no source filter): \
-         it is the only page for a WAL segment archived unread after a failed \
-         restore\n{entry}"
+         it is the only page for a WAL segment held after a failed restore\n{entry}"
     );
     // (c) The review row names the real cover.
     let review = read(REVIEW);

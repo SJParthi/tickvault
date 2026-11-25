@@ -1,0 +1,43 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:06.375
+A running counter adds up appended rows in memory.
+
+00:00:06.375 --> 00:00:12.500
+The saved audit receipt records the check, including counts and a verdict.
+
+00:00:12.500 --> 00:00:21.125
+Two writer paths each handled 1,000 timed receipts and 32 warm-ups. That makes 2,064 per run.
+
+00:00:21.125 --> 00:00:30.125
+In both local database runs, all 2,064 receipts and their 11 fields matched after restart.
+
+00:00:30.125 --> 00:00:40.500
+Separate local test. One known order correlation ID and the placed event matched one row in 100,000 generated paper records.
+
+00:00:40.500 --> 00:00:49.000
+The controls returned zero rows. After a database restart, all 100,000 paper-order records and both sample daily receipts remained.
+
+00:00:49.000 --> 00:00:57.750
+Checked at 15:45:17.000000 IST. The saved test row reported 2,064 accepted writes, 2,060 stored rows and 3 count reads.
+
+00:00:57.750 --> 00:01:07.125
+After the local database stopped, the same page automatically cleared both dated rows and reported “could not read”.
+
+00:01:07.125 --> 00:01:15.500
+The hosted ledger update measured 41 ns p99 over 200,000 calls.
+
+00:01:15.500 --> 00:01:25.250
+At 100,000 test order records, the known-ID database lookup measured 13.833 ms p99 over 400 requests.
+
+00:01:25.250 --> 00:01:33.875
+The restart test verified known audit receipts. A market-wide check also needs a trusted source record.
+
+00:01:33.875 --> 00:01:42.875
+In this example the source sent tick 2. Its missing database row identifies the gap.
+
+00:01:42.875 --> 00:01:53.625
+Production at 15:49 IST. The check reported 67,905,584 accepted and 55,744,893 database rows.
+
+00:01:53.625 --> 00:02:04.000
+At 17:01 IST a fresh count found 55,755,208 rows, 12,150,376 below the earlier accepted total.

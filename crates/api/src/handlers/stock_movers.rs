@@ -12,7 +12,8 @@
 //! test oracle (`oracle` module) and a property test proves the two equal.
 //!
 //! Complexity: cold path. Per build O(list rows) to read the lists and one
-//! bounded query; per request O(n log n) in [`select`], n ≤ 2,000 rows.
+//! bounded query. A cached-universe request still scans the input. Ranking
+//! takes O(m + p log p) comparisons for m matches and a page of p ≤ 20 rows.
 use super::fno_stocks::{self, FnoStocksInputs, FnoUnderlyings, QueryFailure, TickRow};
 use crate::response_cache::cached_json_response;
 use crate::state::SharedAppState;
@@ -28,9 +29,10 @@ use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
 use tickvault_common::operator_movers_universe::{
-    ListedStock, MAX_UNIVERSE_PRICE_ROWS, MoversUniverse, PriceRow, StockIndices,
-    UNIVERSE_DEFAULT_WINDOW_SECS, UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices,
-    select, snapshot_deadline,
+    ListedStock, MAX_DAILY_MAPPING_BYTES, MAX_MTF_HISTORY_INTERVALS, MAX_UNIVERSE_PRICE_ROWS,
+    MoversUniverse, MtfTerms, PriceRow, StockIndices, UNIVERSE_DEFAULT_WINDOW_SECS,
+    UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices, ist_date_of_epoch, select,
+    snapshot_deadline,
 };
 use tickvault_common::operator_movers_wire::{BridgeError, MAX_SOURCE_BYTES, MAX_SOURCE_ROWS};
 use tickvault_common::operator_stock_movers_wire::{
@@ -39,7 +41,6 @@ use tickvault_common::operator_stock_movers_wire::{
 
 /// Existing writer path, pinned against app::dhan_universe by an integration test.
 pub const INDEX_MAPPING_PREFIX: &str = "dhan-nse-mapping-";
-const MAX_MAPPING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MAPPING_ROWS: usize = 32_768;
 const CACHE_TTL_SECONDS: u64 = 2;
 const QUERY_TIMEOUT_SECONDS: u64 = 3;
@@ -56,12 +57,266 @@ type CachedUniverse = (Instant, Option<String>, Arc<MoversUniverse>, i64, bool);
 pub(crate) struct MoversCache {
     slot: tokio::sync::Mutex<Option<CachedUniverse>>,
 }
-#[derive(Deserialize)]
 struct MappingArtifact {
     trading_date_ist: String,
     resolved: usize,
     unresolved: usize,
     mappings: Vec<MappingEntry>,
+    mtf: MappingMtfFields,
+}
+
+/// Preserve optional MTF field occurrences until conflicts have been checked.
+/// Ordinary quote and index memberships survive a malformed auxiliary receipt.
+#[derive(Default)]
+struct MappingMtfFields {
+    mtf_leverage_by_security_id: Option<serde_json::Value>,
+    mtf_observed_at_epoch_secs: Option<serde_json::Value>,
+    mtf_source_modified_at_epoch_secs: Option<serde_json::Value>,
+    mtf_history: Option<serde_json::Value>,
+    // The outer option records an occurrence, including a legacy explicit null.
+    mtf_last_refresh_epoch_secs: Option<Option<i64>>,
+    mtf_latest_source_modified_at_epoch_secs: Option<Option<i64>>,
+    ambiguous: bool,
+}
+
+impl<'de> Deserialize<'de> for MappingArtifact {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = MappingArtifact;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("dated stock mapping with optional broker receipt")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                use tickvault_common::mtf_receipt_json::{MtfHistory, MtfLeverage, MtfScalar};
+
+                let (mut date, mut resolved, mut unresolved, mut mappings) =
+                    (None, None, None, None);
+                let mut mtf = MappingMtfFields::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    let (slot, value) = match key.as_str() {
+                        "trading_date_ist" => {
+                            read_required(&mut map, &mut date, "trading_date_ist")?;
+                            continue;
+                        }
+                        "resolved" => {
+                            read_required(&mut map, &mut resolved, "resolved")?;
+                            continue;
+                        }
+                        "unresolved" => {
+                            read_required(&mut map, &mut unresolved, "unresolved")?;
+                            continue;
+                        }
+                        "mappings" => {
+                            read_required(&mut map, &mut mappings, "mappings")?;
+                            continue;
+                        }
+                        "mtf_leverage_by_security_id" => (
+                            &mut mtf.mtf_leverage_by_security_id,
+                            map.next_value::<MtfLeverage>()?.0,
+                        ),
+                        "mtf_history" => (&mut mtf.mtf_history, map.next_value::<MtfHistory>()?.0),
+                        "mtf_observed_at_epoch_secs" => (
+                            &mut mtf.mtf_observed_at_epoch_secs,
+                            map.next_value::<MtfScalar>()?.0,
+                        ),
+                        "mtf_source_modified_at_epoch_secs" => (
+                            &mut mtf.mtf_source_modified_at_epoch_secs,
+                            map.next_value::<MtfScalar>()?.0,
+                        ),
+                        "mtf_last_refresh_epoch_secs"
+                        | "mtf_latest_source_modified_at_epoch_secs" => {
+                            let stamp = map.next_value::<Option<MtfScalar>>()?;
+                            let seconds = stamp.as_ref().and_then(|s| s.0.as_i64());
+                            let slot = if key == "mtf_last_refresh_epoch_secs" {
+                                &mut mtf.mtf_last_refresh_epoch_secs
+                            } else {
+                                &mut mtf.mtf_latest_source_modified_at_epoch_secs
+                            };
+                            mtf.ambiguous |= slot.replace(seconds).is_some()
+                                || (stamp.is_some() && seconds.is_none());
+                            continue;
+                        }
+                        _ => {
+                            // A historical interval's end never belongs to a current receipt.
+                            mtf.ambiguous |= key == "mtf_valid_before_epoch_secs";
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    mtf.ambiguous |= slot.replace(value).is_some();
+                }
+                Ok(MappingArtifact {
+                    trading_date_ist: date
+                        .ok_or_else(|| A::Error::missing_field("trading_date_ist"))?,
+                    resolved: resolved.ok_or_else(|| A::Error::missing_field("resolved"))?,
+                    unresolved: unresolved.ok_or_else(|| A::Error::missing_field("unresolved"))?,
+                    mappings: mappings.ok_or_else(|| A::Error::missing_field("mappings"))?,
+                    mtf,
+                })
+            }
+        }
+        de.deserialize_map(FieldsVisitor)
+    }
+}
+
+fn read_required<'de, A: serde::de::MapAccess<'de>, T: Deserialize<'de>>(
+    map: &mut A,
+    slot: &mut Option<T>,
+    field: &'static str,
+) -> Result<(), A::Error> {
+    if slot.is_some() {
+        return Err(serde::de::Error::duplicate_field(field));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// A previously verified set of terms is usable from observation until the
+/// next refresh first superseded it, even when that refresh found no terms.
+#[derive(Debug)]
+struct HistoricalMtfTerms {
+    terms: MtfTerms,
+    valid_before_epoch_secs: i64,
+}
+
+fn parse_mtf_terms(
+    date: &str,
+    observed: Option<i64>,
+    modified: Option<i64>,
+    entries: Option<&serde_json::Value>,
+) -> Option<MtfTerms> {
+    let observed = observed?;
+    let modified = modified?;
+    if modified > observed
+        || [observed, modified]
+            .into_iter()
+            .any(|t| ist_date_of_epoch(t).as_deref() != Some(date))
+    {
+        return None;
+    }
+    let entries = entries?.as_object()?;
+    if entries.is_empty() || entries.len() > MAX_MAPPING_ROWS {
+        return None;
+    }
+    let leverage_by_security_id = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let id: u64 = key.parse().ok()?;
+            let n = value.as_f64()?;
+            (id > 0 && id.to_string() == *key && (n == 0.0 || (n.is_finite() && n >= 1.0)))
+                .then_some((id, n))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    (!leverage_by_security_id.is_empty()).then_some(MtfTerms {
+        observed_at_epoch_secs: observed,
+        leverage_by_security_id,
+    })
+}
+
+impl MappingMtfFields {
+    fn mtf_versions(&self, date: &str) -> Option<(Option<MtfTerms>, Vec<HistoricalMtfTerms>)> {
+        if self.ambiguous {
+            return None;
+        }
+        let observed = self
+            .mtf_observed_at_epoch_secs
+            .as_ref()
+            .and_then(serde_json::Value::as_i64);
+        let published = self
+            .mtf_source_modified_at_epoch_secs
+            .as_ref()
+            .and_then(serde_json::Value::as_i64);
+        let current = parse_mtf_terms(
+            date,
+            observed,
+            published,
+            self.mtf_leverage_by_security_id.as_ref(),
+        );
+        let mut prior_publication = None;
+        let mut history = Vec::<HistoricalMtfTerms>::new();
+        if let Some(value) = &self.mtf_history {
+            let versions = value.as_array()?;
+            if versions.len() > MAX_MTF_HISTORY_INTERVALS {
+                return None;
+            }
+            for v in versions {
+                let publication = v.get("mtf_source_modified_at_epoch_secs")?.as_i64()?;
+                if prior_publication.is_some_and(|previous| publication < previous) {
+                    return None;
+                }
+                prior_publication = Some(publication);
+                let terms = parse_mtf_terms(
+                    date,
+                    v.get("mtf_observed_at_epoch_secs")
+                        .and_then(serde_json::Value::as_i64),
+                    Some(publication),
+                    v.get("mtf_leverage_by_security_id"),
+                )?;
+                let until = v.get("mtf_valid_before_epoch_secs")?.as_i64()?;
+                if until <= terms.observed_at_epoch_secs
+                    || ist_date_of_epoch(until).as_deref() != Some(date)
+                    || history
+                        .last()
+                        .is_some_and(|h| h.valid_before_epoch_secs > terms.observed_at_epoch_secs)
+                {
+                    return None;
+                }
+                history.push(HistoricalMtfTerms {
+                    terms,
+                    valid_before_epoch_secs: until,
+                });
+            }
+        }
+        // Historical cutoffs remain independently provable after a refresh with
+        // missing terms, unless its declared observation overlaps their interval.
+        if history
+            .last()
+            .is_some_and(|last| observed.is_some_and(|t| t < last.valid_before_epoch_secs))
+            || (current.is_some()
+                && published
+                    .zip(prior_publication)
+                    .is_some_and(|(new, old)| new < old))
+        {
+            return None;
+        }
+        if let Some(refresh) = self.mtf_last_refresh_epoch_secs.flatten() {
+            // An unknown refresh is only an ordering witness. The marker itself
+            // never starts an interval or supplies any security's leverage.
+            if ist_date_of_epoch(refresh).as_deref() != Some(date)
+                || current
+                    .as_ref()
+                    .is_some_and(|t| refresh < t.observed_at_epoch_secs)
+                || history
+                    .last()
+                    .is_some_and(|h| refresh < h.valid_before_epoch_secs)
+            {
+                return None;
+            }
+        }
+        // This watermark only constrains a receipt. It cannot supply missing terms.
+        if let Some(watermark) = self.mtf_latest_source_modified_at_epoch_secs.flatten() {
+            let refresh = self.mtf_last_refresh_epoch_secs.flatten()?;
+            let verified = if current.is_some() {
+                published
+            } else {
+                prior_publication
+            };
+            if ist_date_of_epoch(watermark).as_deref() != Some(date)
+                || watermark > refresh
+                || verified.is_some_and(|stamp| watermark < stamp)
+            {
+                return None;
+            }
+        }
+        Some((current, history))
+    }
 }
 #[derive(Deserialize)]
 struct MappingEntry {
@@ -72,19 +327,37 @@ struct MappingEntry {
 }
 #[derive(Debug)]
 struct Memberships {
+    mtf: Option<MtfTerms>,
+    mtf_history: Vec<HistoricalMtfTerms>,
     names: HashMap<(u64, u8), String>,
     indices: Vec<String>,
     by_stock: HashMap<(u64, u8), Vec<usize>>,
     partial: bool,
 }
+impl Memberships {
+    fn mtf_at(&self, cutoff: i64) -> Option<&MtfTerms> {
+        if let Some(current) = &self.mtf
+            && current.observed_at_epoch_secs <= cutoff
+        {
+            return Some(current);
+        }
+        let next = self
+            .mtf_history
+            .partition_point(|item| item.valid_before_epoch_secs <= cutoff);
+        let prior = self.mtf_history.get(next)?;
+        (prior.terms.observed_at_epoch_secs <= cutoff).then_some(&prior.terms)
+    }
+}
+
 fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
-    if bytes.len() > MAX_MAPPING_BYTES {
+    if bytes.len() > MAX_DAILY_MAPPING_BYTES {
         return None;
     }
     let artifact: MappingArtifact = serde_json::from_slice(bytes).ok()?;
     if artifact.trading_date_ist != date || artifact.mappings.len() > MAX_MAPPING_ROWS {
         return None;
     }
+    let (mtf, mtf_history) = artifact.mtf.mtf_versions(date).unwrap_or_default();
     let equity_rows: Vec<_> = artifact
         .mappings
         .into_iter()
@@ -137,6 +410,8 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
             .iter()
             .any(|(name, _)| indices.binary_search_by(|s| s.as_str().cmp(name)).is_err());
     Some(Memberships {
+        mtf,
+        mtf_history,
         names,
         indices,
         by_stock,
@@ -151,7 +426,7 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     let path = dir.join(format!("{INDEX_MAPPING_PREFIX}{date}.json"));
     let mut file = std::fs::File::open(&path).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_MAPPING_BYTES as u64 {
+    if !metadata.is_file() || metadata.len() > MAX_DAILY_MAPPING_BYTES as u64 {
         return None;
     }
     let modified = metadata.modified().ok()?;
@@ -160,7 +435,7 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
-        .take((MAX_MAPPING_BYTES + 1) as u64)
+        .take((MAX_DAILY_MAPPING_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .ok()?;
     let data = Arc::new(parse_memberships(&bytes, date)?);
@@ -183,6 +458,50 @@ struct ReadPlan {
     /// `(start, end, closed)` of the query window; `None` before the day's
     /// 09:15 on a closed read (nothing is queried).
     window: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime, bool)>,
+    /// Actual price observations only, for securities in this date's F&O list.
+    /// Membership does not certify the exchange's separate per-security CAS flag.
+    auction_window: Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)>,
+}
+
+/// NSE CM CAS FAQ v3 (Oct 23, §§72,81), revised FAQ effective Dec 7
+/// (Nov 9, §§12,17). Collection does not produce continuous trades. Preserve
+/// the last rolling window before collection and keep actual match times.
+fn cash_auction_window(
+    at: chrono::NaiveDateTime,
+    start: chrono::NaiveDateTime,
+    end: chrono::NaiveDateTime,
+    closed: bool,
+) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    use chrono::{Duration, NaiveDate, NaiveTime};
+    use tickvault_common::constants::{CAS_WINDOW_OPEN_SECS_OF_DAY_IST, MARKET_CLOSE_IST_NANOS};
+    let launch = NaiveDate::from_ymd_opt(2026, 8, 3)?;
+    let revision = NaiveDate::from_ymd_opt(2026, 12, 7)?;
+    let date = at.date();
+    if date < launch {
+        return None;
+    }
+    let day = date.and_time(NaiveTime::MIN);
+    if closed {
+        // The capture service may still stop at 15:40. Read any real prints
+        // already in storage through the revised cash auction close.
+        let later_end = at.min(day + Duration::minutes(15 * 60 + 45));
+        return (date >= revision && end < later_end).then_some((start, later_end));
+    }
+    let end_of_session = if date < revision {
+        Duration::nanoseconds(MARKET_CLOSE_IST_NANOS)
+    } else {
+        Duration::minutes(15 * 60 + 45)
+    };
+    if at >= day + end_of_session {
+        return None;
+    }
+    let collection = if date < revision {
+        Duration::seconds(i64::from(CAS_WINDOW_OPEN_SECS_OF_DAY_IST))
+    } else {
+        Duration::minutes(15 * 60 + 30)
+    };
+    let previous_window = fno_stocks::window_start(day + collection);
+    (previous_window < start).then_some((previous_window, end))
 }
 
 fn plan_read(
@@ -203,11 +522,14 @@ fn plan_read(
     } else {
         fno_stocks::closed_session_window(at).map(|(start, end)| (start, end, true))
     };
+    let auction_window =
+        window.and_then(|(start, end, closed)| cash_auction_window(at, start, end, closed));
     ReadPlan {
         observed,
         open,
         at,
         window,
+        auction_window,
     }
 }
 
@@ -260,6 +582,9 @@ fn assemble_universe(
     membership: Option<&Memberships>,
     fetched: Fetched,
 ) -> MoversUniverse {
+    let auction_window = plan
+        .auction_window
+        .filter(|_| fno.is_some_and(|f| !f.is_empty()));
     let prices = match (fetched, plan.window) {
         (Fetched::BeforeSession, _) | (Fetched::Rows(_), None) => UniversePrices::BeforeSession,
         (Fetched::NoQuery, _) => UniversePrices::Rows { rows: Vec::new() },
@@ -268,20 +593,39 @@ fn assemble_universe(
         (Fetched::Rows(rows), Some((start, end, _))) => UniversePrices::Rows {
             rows: rows
                 .into_iter()
-                .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+                .filter(|r| {
+                    if !r.ltp.is_finite() || r.ltp <= 0.0 {
+                        return false;
+                    }
+                    (start <= r.ts && r.ts <= end)
+                        || auction_window.is_some_and(|(lower, upper)| {
+                            lower <= r.ts
+                                && r.ts <= upper
+                                && fno.is_some_and(|f| {
+                                    f.names.contains_key(&(r.security_id, r.segment_code))
+                                })
+                        })
+                })
                 .map(|r| PriceRow {
                     security_id: r.security_id,
                     segment_code: r.segment_code,
                     ltp: r.ltp,
                     prev_close: r.close.filter(|p| p.is_finite() && *p > 0.0),
+                    session_open: r.session_open.filter(|p| p.is_finite() && *p > 0.0),
+                    session_high: r.session_high.filter(|p| p.is_finite() && *p > 0.0),
+                    session_low: r.session_low.filter(|p| p.is_finite() && *p > 0.0),
                     volume: r.volume,
                     ts_ist_secs: r.ts.and_utc().timestamp(),
                 })
                 .collect(),
         },
     };
-    let window_secs = match plan.window {
-        Some((start, end, true)) => (end - start)
+    let window_secs = match (plan.window, auction_window) {
+        (Some((_, _, closed)), Some((start, end))) => ((if closed { end } else { plan.at })
+            - start)
+            .num_seconds()
+            .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS),
+        (Some((start, end, true)), None) => (end - start)
             .num_seconds()
             .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS),
         _ => UNIVERSE_DEFAULT_WINDOW_SECS,
@@ -307,6 +651,19 @@ fn assemble_universe(
                 .collect();
             by_stock.sort_unstable_by_key(|s| (s.security_id, s.segment_code));
             UniverseMembership {
+                mtf: m
+                    .mtf_at(plan.at.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64)
+                    .map(|terms| MtfTerms {
+                        observed_at_epoch_secs: terms.observed_at_epoch_secs,
+                        leverage_by_security_id: m
+                            .names
+                            .keys()
+                            .chain(fno.into_iter().flat_map(|f| f.names.keys()))
+                            .filter_map(|(id, _)| {
+                                terms.leverage_by_security_id.get(id).map(|n| (*id, *n))
+                            })
+                            .collect(),
+                    }),
                 names: sorted_listed(&m.names),
                 indices: m.indices.clone(),
                 by_stock,
@@ -343,9 +700,17 @@ async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
         Some(_) if ids.is_empty() => Fetched::NoQuery,
         Some(_) if ids.len() > MAX_UNIVERSE_PRICE_ROWS => Fetched::Failed(QueryFailure::Refused),
         Some((start, window_end, closed)) => {
-            let end = closed.then_some(window_end);
             let bound = ids.len().max(fno_stocks::FNO_STOCKS_MAX_ROWS);
-            let sql = fno_stocks::build_fno_stocks_sql(&ids, start, end, bound + 1);
+            let eligible = plan
+                .auction_window
+                .and(fno.as_ref())
+                .map(|f| f.sorted_ids());
+            let auction = plan
+                .auction_window
+                .zip(eligible.as_deref())
+                .map(|((lower, upper), ids)| (ids, lower, upper));
+            let sql =
+                fno_stocks::build_equity_stocks_sql(&ids, start, window_end, bound + 1, auction);
             let timeout = if closed {
                 inputs.timeout.max(Duration::from_secs(
                     fno_stocks::FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS,
@@ -419,7 +784,11 @@ pub fn closed_read_key(clock: LiveClock) -> Option<ClosedReadKey> {
     match plan.window {
         Some((_, end, true)) if !plan.open => Some(ClosedReadKey {
             date_ist: plan.at.format("%Y-%m-%d").to_string(),
-            window_end_ist_secs: end.and_utc().timestamp(),
+            window_end_ist_secs: plan
+                .auction_window
+                .map_or(end, |(_, upper)| upper)
+                .and_utc()
+                .timestamp(),
         }),
         _ => None,
     }
@@ -453,12 +822,26 @@ pub fn restamped(
 /// (cached by metadata, on the blocking pool) and one bounded query.
 // TEST-EXEMPT: thin wrapper over build_universe (driven by every route test below); needs a live QuestDB
 pub async fn build_live_universe(state: &SharedAppState, clock: LiveClock) -> MoversUniverse {
+    build_live_universe_in(
+        state,
+        clock,
+        Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+    )
+    .await
+}
+
+/// Build from the dated membership and F&O artifacts in the specified directory.
+pub async fn build_live_universe_in(
+    state: &SharedAppState,
+    clock: LiveClock,
+    artifact_dir: &Path,
+) -> MoversUniverse {
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     build_universe(FnoStocksInputs {
         client: state.questdb_http_client(),
         base_url: &base_url,
-        artifact_dir: Path::new(fno_stocks::FNO_UNDERLYING_ARTIFACT_DIR),
+        artifact_dir,
         market_open: clock.market_open,
         now_ist: clock.now_ist,
         read_at_ist: None,
@@ -628,6 +1011,7 @@ mod oracle {
             let eligible = fno.map(|f| f.name_of(key.0, key.1).is_some());
             let volume_text = price.volume.map(|volume| volume.to_string());
             selected.push(MemberStock {
+                mtf_leverage: None,
                 price,
                 company_name: None,
                 volume_text,
@@ -647,6 +1031,7 @@ mod oracle {
             .take(SELECTION_LIMIT)
             .collect();
         let snapshot = Snapshot {
+            mtf_coverage: None,
             filter: filter.clone(),
             status,
             market_open: prices.market_open,
@@ -693,12 +1078,14 @@ mod oracle {
         reply
     }
 
-    /// The old `fno_stocks::compute_for_list`, with the query injected.
+    /// Per-filter reference calculation, including the dated cash-auction read
+    /// window. The reference selects each security's interval independently.
     fn compute_for_list(
         now_ist: chrono::NaiveDateTime,
         market_open: bool,
         read_at_ist: Option<chrono::NaiveDateTime>,
         list: &FnoUnderlyings,
+        fno: Option<&FnoUnderlyings>,
         query: &dyn Fn(&[u64]) -> Result<Vec<TickRow>, QueryFailure>,
     ) -> FnoStocksResponse {
         let observed_at_epoch_secs = now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
@@ -744,9 +1131,22 @@ mod oracle {
                 );
             }
         };
+        let auction = fno
+            .filter(|f| !f.is_empty())
+            .and_then(|_| cash_auction_window(at, start, end, !open));
         let rows: Vec<_> = rows
             .into_iter()
-            .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+            .filter(|r| {
+                let bounds = if fno
+                    .and_then(|f| f.name_of(r.security_id, r.segment_code))
+                    .is_some()
+                {
+                    auction.unwrap_or((start, end))
+                } else {
+                    (start, end)
+                };
+                r.ltp.is_finite() && r.ltp > 0.0 && (bounds.0..=bounds.1).contains(&r.ts)
+            })
             .collect();
         let newest = rows
             .iter()
@@ -758,8 +1158,12 @@ mod oracle {
             let status = if open { "no_data" } else { "closed" };
             return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
         };
-        let age = (at - newest).num_seconds().max(0);
-        let window_secs = closed_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
+        let age = (at.and_utc().timestamp() - newest.and_utc().timestamp()).max(0);
+        let measured_window = match auction {
+            Some((s, e)) => Some((s, if open { at } else { e })),
+            None => closed_window,
+        };
+        let window_secs = measured_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
             (e - s)
                 .num_seconds()
                 .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS)
@@ -839,7 +1243,7 @@ mod oracle {
             return finish_empty(if open { "no_data" } else { "closed" });
         }
         let list = FnoUnderlyings { names };
-        let prices = compute_for_list(now_ist, market_open, read_at_ist, &list, query);
+        let prices = compute_for_list(now_ist, market_open, read_at_ist, &list, fno, query);
         finish(prices, filter, membership, fno)
     }
 }
@@ -947,6 +1351,651 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn auction_windows_follow_the_effective_date_and_preserve_historical_cutoffs() {
+        for (clock, live, chosen, extra) in [
+            ("2026-07-31 15:34:00", true, None, None),
+            ("2026-08-03 15:14:59", true, None, None),
+            ("2026-11-25 15:15:00", true, None, None),
+            (
+                "2026-11-25 15:30:00",
+                true,
+                None,
+                Some(("15:00:00", "15:30:05")),
+            ),
+            (
+                "2026-11-25 15:34:59",
+                true,
+                None,
+                Some(("15:00:00", "15:35:04")),
+            ),
+            (
+                "2026-11-25 15:39:59",
+                true,
+                None,
+                Some(("15:00:00", "15:40:04")),
+            ),
+            ("2026-11-25 15:41:00", false, None, None),
+            ("2026-11-25 17:00:00", false, Some("15:34:00"), None),
+            ("2026-12-07 15:29:59", true, None, None),
+            (
+                "2026-12-07 15:34:00",
+                true,
+                None,
+                Some(("15:15:00", "15:34:05")),
+            ),
+            (
+                "2026-12-07 15:41:00",
+                false,
+                None,
+                Some(("09:15:00", "15:41:00")),
+            ),
+            ("2026-12-07 17:00:00", false, Some("15:39:00"), None),
+            (
+                "2026-12-07 17:00:00",
+                false,
+                Some("15:42:00"),
+                Some(("09:15:00", "15:42:00")),
+            ),
+            (
+                "2026-12-07 17:00:00",
+                false,
+                None,
+                Some(("09:15:00", "15:45:00")),
+            ),
+        ] {
+            let day = &clock[..10];
+            let p = plan_read(at(clock), live, chosen.map(|t| at(&format!("{day} {t}"))));
+            assert_eq!(
+                p.auction_window,
+                extra.map(|(a, b)| (at(&format!("{day} {a}")), at(&format!("{day} {b}")))),
+                "{clock} {chosen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auction_closed_reuse_key_keeps_moving_until_the_revised_match_ends() {
+        let key = |at| closed_read_key(clock(at, false)).unwrap();
+        assert_ne!(key("2026-12-07 15:41:00"), key("2026-12-07 15:42:00"));
+        assert_ne!(key("2026-12-07 15:44:59"), key("2026-12-07 15:45:00"));
+        assert_eq!(key("2026-12-07 15:45:00"), key("2026-12-07 18:00:00"));
+        assert_eq!(key("2026-11-25 15:40:00"), key("2026-11-25 18:00:00"));
+        assert!(
+            plan_read(at("2026-11-25 18:00:00"), true, None)
+                .auction_window
+                .is_none()
+        );
+        assert!(
+            plan_read(at("2026-12-07 15:45:00"), true, None)
+                .auction_window
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auction_sql_and_reader_keep_only_real_dated_fno_prices_inside_each_window() {
+        let fno = FnoUnderlyings {
+            names: [
+                ((2, EXCHANGE_SEGMENT_NSE_EQ), "STOCK002".into()),
+                ((4, EXCHANGE_SEGMENT_NSE_EQ), "STOCK004".into()),
+            ]
+            .into(),
+        };
+        for (date, now, live, cutoff, old_fno_stamp, non_fno_stamp, outside, expected_window) in [
+            (
+                "2026-11-25",
+                "15:30:00",
+                true,
+                None,
+                "15:14:59",
+                "15:14:59",
+                "14:59:59.999999",
+                1800,
+            ),
+            (
+                "2026-11-25",
+                "15:34:00",
+                true,
+                None,
+                "15:14:59",
+                "15:14:59",
+                "14:59:59.999999",
+                2040,
+            ),
+            (
+                "2026-12-07",
+                "17:00:00",
+                false,
+                Some("15:42:00"),
+                "15:41:59",
+                "15:41:59",
+                "15:42:00.000001",
+                23220,
+            ),
+        ] {
+            let at_time = |clock: &str| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &format!("{date} {clock}"),
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )
+                .unwrap()
+            };
+            let plan = plan_read(at_time(now), live, cutoff.map(at_time));
+            let mut artifact = mapping(4);
+            artifact["trading_date_ist"] = json!(date);
+            let membership =
+                parse_memberships(&serde_json::to_vec(&artifact).unwrap(), date).unwrap();
+            let ids = union_ids(Some(&fno), Some(&membership));
+            let (start, end, _) = plan.window.unwrap();
+            let (lower, upper) = plan.auction_window.unwrap();
+            let sql = fno_stocks::build_equity_stocks_sql(
+                &ids,
+                start,
+                end,
+                1001,
+                Some((&fno.sorted_ids(), lower, upper)),
+            );
+            assert!(
+                sql.contains("OR security_id IN (2,4)") && sql.contains("security_id IN (1,2,3,4)"),
+                "unexpected auction filter for {date} at {now}: {sql}"
+            );
+            let sample = |id, ts| TickRow {
+                security_id: id,
+                segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+                ltp: 102.0,
+                close: Some(100.0),
+                volume: Some(15),
+                avg_price: Some(101.0),
+                session_open: Some(100.0),
+                session_high: Some(102.0),
+                session_low: Some(100.0),
+                ts: at_time(ts),
+            };
+            let rows = vec![
+                sample(2, old_fno_stamp),
+                sample(1, non_fno_stamp),
+                sample(4, outside),
+                sample(3, "15:29:59"),
+            ];
+            let u = assemble_universe(
+                &plan,
+                Some(&fno),
+                Some(&membership),
+                Fetched::Rows(rows.clone()),
+            );
+            let age = (plan.at - at_time(old_fno_stamp)).num_seconds();
+            let s = snapshot(select(&u, &Filter::default()));
+            assert_eq!(s.rows.len(), 1);
+            assert_eq!(
+                (
+                    s.rows[0].price.security_id,
+                    s.rows[0].price.last_trade_ist.as_str()
+                ),
+                (2, old_fno_stamp)
+            );
+            assert_eq!(
+                s.status,
+                if live {
+                    SourceStatus::Stale
+                } else {
+                    SourceStatus::Closed
+                }
+            );
+            assert_eq!(s.data_age_secs, Some(age));
+            assert_eq!(s.window_secs, expected_window);
+            let all = snapshot(select(
+                &u,
+                &Filter {
+                    fno_only: false,
+                    ..Filter::default()
+                },
+            ));
+            assert_eq!((all.universe_total, all.stocks_priced), (4, 2));
+            let no_list = assemble_universe(&plan, None, Some(&membership), Fetched::Rows(rows));
+            let all = snapshot(select(
+                &no_list,
+                &Filter {
+                    fno_only: false,
+                    ..Filter::default()
+                },
+            ));
+            assert_eq!(all.stocks_priced, 1);
+        }
+    }
+
+    #[test]
+    fn test_raw_mtf_field_occurrences_preserve_only_provable_stock_terms() {
+        let now = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut base = serde_json::to_string(&mapping(3)).unwrap();
+        let object_end = base.pop().expect("serialized mapping object");
+        let parse = |optional: &str| {
+            let raw = format!("{base},{optional}{object_end}");
+            let result = parse_memberships(raw.as_bytes(), DATE).expect("ordinary stock mappings");
+            assert_eq!(result.names.len(), 3);
+            result
+        };
+        let current = |map: &str| {
+            format!(
+                r#""mtf_observed_at_epoch_secs":{now},"mtf_source_modified_at_epoch_secs":{now},"mtf_leverage_by_security_id":{map}"#
+            )
+        };
+        for ambiguous in [
+            r#""1":0,"1":2"#,
+            r#""1":2,"1":0"#,
+            r#""1":2,"1":2"#,
+            r#""1":0,"\u0031":2"#,
+            r#""01":0,"1":2"#,
+        ] {
+            let map = format!(r#"{{{ambiguous},"2":1,"3":0}}"#);
+            let valid = parse(&current(&map));
+            let terms = &valid.mtf_at(now).unwrap().leverage_by_security_id;
+            assert_eq!(terms.keys().copied().collect::<Vec<_>>(), [2, 3]);
+            assert_eq!((terms[&2], terms[&3]), (1.0, 0.0));
+            let end = now + 1;
+            let historical = parse(&format!(
+                r#""mtf_history":[{{{},"mtf_valid_before_epoch_secs":{end}}}]"#,
+                current(&map)
+            ));
+            assert_eq!(
+                historical.mtf_at(now).unwrap().leverage_by_security_id,
+                *terms
+            );
+            assert!(historical.mtf_at(end).is_none());
+        }
+        let ordinary = current(r#"{"1":2}"#);
+        for marker in [
+            "mtf_last_refresh_epoch_secs",
+            "mtf_latest_source_modified_at_epoch_secs",
+        ] {
+            let legacy = format!(r#"{ordinary},"{marker}":null"#);
+            assert_eq!(
+                parse(&legacy).mtf_at(now).unwrap().leverage_by_security_id[&1],
+                2.0
+            );
+            for malformed in [r#""unknown""#, "false", "{}", "[]", "1.25"] {
+                assert!(
+                    parse(&format!(r#"{ordinary},"{marker}":{malformed}"#))
+                        .mtf_at(now)
+                        .is_none()
+                );
+            }
+            let repeated = format!(r#"{legacy},"{marker}":null"#);
+            assert!(parse(&repeated).mtf_at(now).is_none());
+        }
+        let cap = now + 1;
+        for inconsistent in [
+            format!(r#"{ordinary},"mtf_observed_at_epoch_secs":{now}"#),
+            format!(r#"{ordinary},"mtf_leverage_by_security_id":{{"1":3}}"#),
+            format!(r#"{ordinary},"mtf_valid_before_epoch_secs":{now}"#),
+            format!(r#"{ordinary},"mtf_history":[],"mtf_history":[]"#),
+            format!(
+                r#"{ordinary},"mtf_last_refresh_epoch_secs":{now},"mtf_latest_source_modified_at_epoch_secs":{cap}"#
+            ),
+            format!(r#"{ordinary},"mtf_latest_source_modified_at_epoch_secs":{now}"#),
+            format!(
+                r#""mtf_history":[{{{ordinary},"mtf_source_modified_at_epoch_secs":{now},"mtf_valid_before_epoch_secs":{cap}}}]"#
+            ),
+            format!(
+                r#""mtf_history":[{{{ordinary},"mtf_valid_before_epoch_secs":{now},"mtf_valid_before_epoch_secs":{cap}}}]"#
+            ),
+        ] {
+            assert!(parse(&inconsistent).mtf_at(now).is_none(), "{inconsistent}");
+        }
+        let extension = format!(r#"{ordinary},"extra":{{"flag":true,"flag":false}},"extra":0"#);
+        assert_eq!(
+            parse(&extension)
+                .mtf_at(now)
+                .unwrap()
+                .leverage_by_security_id[&1],
+            2.0
+        );
+    }
+
+    #[test]
+    fn test_raw_mtf_entry_limit_counts_occurrences_even_for_repeated_keys() {
+        let now = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut ordinary = serde_json::to_string(&mapping(1)).unwrap();
+        let object_end = ordinary.pop().expect("serialized mapping object");
+        let entries = (1..=MAX_MAPPING_ROWS)
+            .map(|id| format!(r#""{id}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (tail, expected_known) in [("", true), (r#","1":0"#, false)] {
+            let raw = format!(
+                r#"{ordinary},"mtf_observed_at_epoch_secs":{now},"mtf_source_modified_at_epoch_secs":{now},"mtf_leverage_by_security_id":{{{entries}{tail}}}{object_end}"#
+            );
+            let memberships = parse_memberships(raw.as_bytes(), DATE).unwrap();
+            assert_eq!(memberships.names.len(), 1);
+            assert_eq!(memberships.mtf_at(now).is_some(), expected_known);
+        }
+    }
+
+    #[tokio::test]
+    async fn mtf_history_uses_the_selected_instant_after_same_day_replacement() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let fixture = Fixture::new(2);
+        let path = fixture.0.join(format!("{INDEX_MAPPING_PREFIX}{DATE}.json"));
+        let open = at("2026-10-30 09:30:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let hour = 3_600;
+        let terms = |observed: i64, multiple: f64| {
+            json!({
+                "mtf_observed_at_epoch_secs": observed,
+                "mtf_source_modified_at_epoch_secs": observed - 1,
+                "mtf_leverage_by_security_id": {"1": 0, "2": multiple}
+            })
+        };
+        let mut disk = mapping(2);
+        let first = terms(open, 1.0);
+        disk.as_object_mut()
+            .unwrap()
+            .extend(first.as_object().unwrap().clone());
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let previous_file = load_memberships(&fixture.0, DATE).unwrap();
+        assert!(previous_file.mtf_at(open).is_some());
+
+        let mut interval = first;
+        interval["mtf_valid_before_epoch_secs"] = json!(open + hour / 2);
+        disk["mtf_history"] = json!([interval]);
+        disk.as_object_mut()
+            .unwrap()
+            .extend(terms(open + hour, 3.75).as_object().unwrap().clone());
+        // The real reader keys its parsed cache on the replaced artifact's metadata.
+        let staged = path.with_extension("tmp");
+        std::fs::write(&staged, serde_json::to_vec(&disk).unwrap()).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        let replaced = load_memberships(&fixture.0, DATE).unwrap();
+        assert!(!Arc::ptr_eq(&previous_file, &replaced));
+
+        for (minute, expected) in [
+            ("09:29", None),
+            ("09:30", Some(1.0)),
+            ("09:59", Some(1.0)),
+            ("10:00", None),
+            ("10:29", None),
+            ("10:30", Some(3.75)),
+        ] {
+            let filter = Filter {
+                category: Some(MoversCategory::Mtf),
+                fno_only: false,
+                as_of: Some(format!("{DATE}T{minute}")),
+                ..Filter::default()
+            };
+            let url = http("200 OK", prices(2, "2026-10-30T09:20:00Z")).await;
+            let result = snapshot(run(&fixture.0, &url, false, filter).await);
+            match expected {
+                Some(leverage) => {
+                    assert_eq!(result.rows.len(), 1, "{minute}");
+                    assert_eq!(result.rows[0].mtf_leverage, Some(leverage), "{minute}");
+                }
+                None => {
+                    assert_eq!(result.status, SourceStatus::NoMtfList, "{minute}");
+                    assert!(result.rows.is_empty());
+                }
+            }
+        }
+
+        // An unknown refresh omitted all active terms, but the saved interval still
+        // answers requests before it closed. A gap never inherits earlier leverage.
+        for key in [
+            "mtf_observed_at_epoch_secs",
+            "mtf_source_modified_at_epoch_secs",
+            "mtf_leverage_by_security_id",
+        ] {
+            disk.as_object_mut().unwrap().remove(key);
+        }
+        let frozen = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+        assert_eq!(
+            frozen.mtf_at(open).unwrap().leverage_by_security_id[&2],
+            1.0
+        );
+        assert!(frozen.mtf_at(open + hour / 2).is_none());
+        assert!(frozen.mtf_at(open + hour).is_none());
+    }
+
+    #[test]
+    fn mtf_history_refuses_malformed_overlapping_and_wrong_day_proofs_without_losing_indices() {
+        let begin = at("2026-10-30 09:30:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let interval = |observed, end| {
+            json!({
+                "mtf_observed_at_epoch_secs": observed,
+                "mtf_source_modified_at_epoch_secs": begin - 60,
+                "mtf_valid_before_epoch_secs": end,
+                "mtf_leverage_by_security_id":{"2":2.5}
+            })
+        };
+        let first = interval(begin, begin + 60);
+        let second = interval(begin + 60, begin + 120);
+        let mut disk = mapping(2);
+        disk["mtf_history"] = json!([first, second]);
+        disk["mtf_observed_at_epoch_secs"] = json!(begin + 120);
+        disk["mtf_source_modified_at_epoch_secs"] = json!(begin);
+        disk["mtf_leverage_by_security_id"] = json!({"2": 4.0});
+        let valid = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+        assert_eq!(
+            valid.mtf_at(begin + 59).unwrap().observed_at_epoch_secs,
+            begin
+        );
+        assert_eq!(
+            valid.mtf_at(begin + 60).unwrap().observed_at_epoch_secs,
+            begin + 60
+        );
+        assert_eq!(
+            valid.mtf_at(begin + 120).unwrap().leverage_by_security_id[&2],
+            4.0
+        );
+
+        let mut rolled_back = second.clone();
+        rolled_back["mtf_source_modified_at_epoch_secs"] = json!(begin - 61);
+        let mut partial = disk.clone();
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("mtf_source_modified_at_epoch_secs");
+        let parsed = parse_memberships(&serde_json::to_vec(&partial).unwrap(), DATE).unwrap();
+        assert!(parsed.mtf_at(begin + 119).is_some() && parsed.mtf_at(begin + 120).is_none());
+        partial["mtf_observed_at_epoch_secs"] = json!(begin + 119);
+        let overlap = parse_memberships(&serde_json::to_vec(&partial).unwrap(), DATE).unwrap();
+        assert!(overlap.mtf_at(begin + 119).is_none());
+        let mut rollback = disk.clone();
+        rollback["mtf_source_modified_at_epoch_secs"] = json!(begin - 61);
+        let rollback = parse_memberships(&serde_json::to_vec(&rollback).unwrap(), DATE).unwrap();
+        assert!(rollback.mtf_at(begin).is_none() && rollback.mtf_at(begin + 120).is_none());
+        assert_eq!(rollback.names.len(), 2);
+        for refresh in [json!("unknown"), json!(begin - 86_400), json!(begin + 119)] {
+            disk["mtf_last_refresh_epoch_secs"] = refresh;
+            let m = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+            assert!(m.mtf_at(begin).is_none() && m.mtf_at(begin + 120).is_none());
+            assert_eq!(m.names.len(), 2);
+        }
+        disk["mtf_last_refresh_epoch_secs"] = json!(begin + 120);
+        for bad in [
+            json!("bad"),
+            json!([first, first]),
+            json!([first, rolled_back]),
+            json!([second, first]),
+            json!([interval(begin, begin)]),
+            json!([interval(begin, begin + 86_400)]),
+            json!([interval(begin - 86_400, begin)]),
+            json!([interval(begin, begin + 121)]),
+            json!([interval(begin, begin + 61), second]),
+            json!([{"mtf_valid_before_epoch_secs":begin + 1}]),
+            json!(vec![serde_json::Value::Null; MAX_MTF_HISTORY_INTERVALS + 1]),
+        ] {
+            disk["mtf_history"] = bad;
+            let parsed = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+            assert!(parsed.mtf_at(begin).is_none() && parsed.mtf_at(begin + 120).is_none());
+            assert_eq!(parsed.names.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn mtf_reader_proves_eligibility_at_or_before_the_selected_ist_minute() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let f = Fixture::new(6);
+        let observed = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut artifact = mapping(6);
+        artifact["mtf_observed_at_epoch_secs"] = json!(observed);
+        artifact["mtf_source_modified_at_epoch_secs"] = json!(observed - 1800);
+        artifact["mtf_leverage_by_security_id"] =
+            json!({"2":1.0,"4":2.75,"6":0.0,"1":0.1,"3":"unexpected","05":4.0});
+        std::fs::write(
+            f.0.join(format!("{INDEX_MAPPING_PREFIX}{DATE}.json")),
+            serde_json::to_vec(&artifact).unwrap(),
+        )
+        .unwrap();
+        for (as_of, known) in [("09:59", false), ("10:00", true)] {
+            let filter = Filter {
+                category: Some(MoversCategory::Mtf),
+                fno_only: false,
+                as_of: Some(format!("{DATE}T{as_of}")),
+                ..Filter::default()
+            };
+            let url = http("200 OK", prices(6, "2026-10-30T09:58:30Z")).await;
+            let reply = run(&f.0, &url, true, filter.clone()).await;
+            assert!(reply.valid_at(reply.captured_at_epoch_secs, &filter));
+            let s = snapshot(reply);
+            assert_eq!(s.universe_available, known);
+            if known {
+                let c = s.mtf_coverage.unwrap();
+                assert_eq!((c.selected, c.assessed, c.eligible), (6, 3, 2));
+                assert_eq!(
+                    s.rows
+                        .iter()
+                        .map(|r| (r.price.security_id, r.mtf_leverage))
+                        .collect::<Vec<_>>(),
+                    [(4, Some(2.75)), (2, Some(1.0))]
+                );
+            } else {
+                assert_eq!(s.status, SourceStatus::NoMtfList);
+                assert!(s.rows.is_empty() && s.mtf_coverage.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mtf_mapping_is_optional_bounded_and_compact_at_full_master_cardinality() {
+        use tickvault_common::operator_movers_universe::MAX_UNIVERSE_BYTES;
+        let now = at("2026-10-30 10:00:00");
+        let observed = now.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut artifact = mapping(MAX_SOURCE_ROWS);
+        let terms: std::collections::BTreeMap<_, _> = (1..=10_102)
+            .map(|id| (id, if id <= 1_924 { 2.55 } else { 0.0 }))
+            .collect();
+        artifact["mtf_observed_at_epoch_secs"] = json!(observed);
+        artifact["mtf_source_modified_at_epoch_secs"] = json!(observed - 1800);
+        artifact["mtf_leverage_by_security_id"] = json!(terms);
+        let bytes = serde_json::to_vec(&artifact).unwrap();
+        assert!(bytes.len() < MAX_DAILY_MAPPING_BYTES);
+        assert!(parse_memberships(&bytes[..bytes.len() - 1], DATE).is_none());
+        let m = parse_memberships(&bytes, DATE).unwrap();
+        assert_eq!(
+            m.mtf.as_ref().unwrap().leverage_by_security_id.len(),
+            10_102
+        );
+        let fno = FnoUnderlyings {
+            names: [((2_000, EXCHANGE_SEGMENT_NSE_EQ), "FNO-ONLY".into())].into(),
+        };
+        let prices = union_ids(Some(&fno), Some(&m))
+            .into_iter()
+            .map(|security_id| TickRow {
+                security_id,
+                segment_code: EXCHANGE_SEGMENT_NSE_EQ,
+                ltp: 101.23,
+                close: Some(100.0),
+                session_open: Some(99.95),
+                session_high: Some(110.25),
+                session_low: Some(90.55),
+                volume: Some(2_345_678),
+                avg_price: Some(101.01),
+                ts: now,
+            })
+            .collect();
+        let u = assemble_universe(
+            &plan_read(now, true, None),
+            Some(&fno),
+            Some(&m),
+            Fetched::Rows(prices),
+        );
+        assert!(u.valid());
+        let t = u.membership.as_ref().unwrap().mtf.as_ref().unwrap();
+        assert_eq!(t.leverage_by_security_id.len(), MAX_SOURCE_ROWS + 1);
+        assert_eq!(t.leverage_by_security_id.get(&2_000), Some(&0.0));
+        let published = serde_json::to_vec(&u).unwrap();
+        assert!(
+            published.len() < MAX_UNIVERSE_BYTES,
+            "1,001 MTF terms and OHLC quotes occupied {} bytes (limit {MAX_UNIVERSE_BYTES})",
+            published.len()
+        );
+        for (key, invalid) in [
+            ("mtf_observed_at_epoch_secs", serde_json::Value::Null),
+            ("mtf_observed_at_epoch_secs", json!(observed - 86_400)),
+            ("mtf_observed_at_epoch_secs", json!("yesterday")),
+            ("mtf_source_modified_at_epoch_secs", serde_json::Value::Null),
+            ("mtf_source_modified_at_epoch_secs", json!(observed + 1)),
+            (
+                "mtf_source_modified_at_epoch_secs",
+                json!(observed - 86_400),
+            ),
+        ] {
+            let mut invalid_artifact = artifact.clone();
+            invalid_artifact[key] = invalid;
+            let m =
+                parse_memberships(&serde_json::to_vec(&invalid_artifact).unwrap(), DATE).unwrap();
+            assert!(m.mtf.is_none());
+            assert_eq!(m.names.len(), MAX_SOURCE_ROWS);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_historical_extreme_opening_uses_the_day_range_at_the_selected_cutoff() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let f = Fixture::new(6);
+        let rows = json!({"dataset": [
+            [2,"NSE_EQ",90.0,100.0,1,120.0,"2026-10-30T10:00:00Z",100.0,100.0,89.0],
+            [4,"NSE_EQ",130.0,100.0,1,120.0,"2026-10-30T10:00:00Z",0.0,131.0,100.0],
+            [6,"NSE_EQ",130.0,100.0,1,120.0,"2026-10-30T10:00:00.001Z",135.0,135.0,100.0],
+        ]});
+        let url = http("200 OK", rows.to_string()).await;
+        let filter = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            direction: Direction::Losers,
+            as_of: Some("2026-10-30T10:00".into()),
+            ..Filter::default()
+        };
+        let answer = snapshot(run(&f.0, &url, true, filter).await);
+        assert_eq!((answer.stocks_priced, answer.matching_total), (1, 1));
+        let row = &answer.rows[0].price;
+        assert_eq!(
+            (row.security_id, row.ltp, row.change, row.change_pct),
+            (2, 90.0, Some(-10.0), Some(-10.0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_historical_stocks_cutoff_keeps_exact_boundary_and_refuses_later_fractions() {
+        let f = Fixture::new(4);
+        let rows = json!({"dataset": [
+            [2,"NSE_EQ",120.0,100.0,1,120.0,"2026-10-30T10:00:00.000000Z"],
+            [4,"NSE_EQ",140.0,100.0,1,140.0,"2026-10-30T10:00:00.000001Z"],
+        ]});
+        let url = http("200 OK", rows.to_string()).await;
+        let filter = Filter {
+            as_of: Some("2026-10-30T10:00".into()),
+            ..Filter::default()
+        };
+        let answer = snapshot(run(&f.0, &url, true, filter).await);
+        let ids: Vec<_> = answer
+            .rows
+            .iter()
+            .map(|row| row.price.security_id)
+            .collect();
+        assert_eq!(ids, [2]);
+        assert_eq!(answer.stocks_priced, 1);
+        assert_eq!(answer.as_of_ist.as_deref(), Some("10:00:00"));
+        assert_eq!(answer.status, SourceStatus::Closed);
     }
 
     #[tokio::test]
@@ -1187,7 +2236,7 @@ mod tests {
         let mut conflict = value;
         conflict["mappings"][8]["symbol"] = json!("WRONG");
         assert!(parse_memberships(&serde_json::to_vec(&conflict).unwrap(), DATE).is_none());
-        assert!(parse_memberships(&vec![b' '; MAX_MAPPING_BYTES + 1], DATE).is_none());
+        assert!(parse_memberships(&vec![b' '; MAX_DAILY_MAPPING_BYTES + 1], DATE).is_none());
     }
     #[tokio::test]
     async fn index_and_fno_filter_the_universe_before_top_page() {
@@ -1485,9 +2534,22 @@ mod tests {
     async fn api_cache_answers_every_live_filter_from_one_universe_and_retains_original_clock() {
         let state = fno_stocks::tests::mock_state(1);
         let observed = chrono::Utc::now().timestamp() - 10;
-        seed_cache(&state, None, cached_universe(observed)).await;
+        let mut universe = cached_universe(observed);
+        Arc::make_mut(&mut universe)
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf = Some(MtfTerms {
+            observed_at_epoch_secs: observed,
+            leverage_by_security_id: [(1, 1.0)].into(),
+        });
+        seed_cache(&state, None, universe).await;
         for f in [
             Filter::default(),
+            Filter {
+                category: Some(tickvault_common::operator_stock_movers_wire::MoversCategory::Mtf),
+                ..Filter::default()
+            },
             Filter {
                 fno_only: false,
                 ..Filter::default()
@@ -1500,7 +2562,11 @@ mod tests {
                 reply.captured_at_epoch_secs, observed,
                 "original clock kept"
             );
-            assert_eq!(snapshot(reply).filter, f);
+            let answer = snapshot(reply);
+            if f.category.is_some() {
+                assert_eq!(answer.mtf_coverage.unwrap().eligible, 1);
+            }
+            assert_eq!(answer.filter, f);
         }
         // A chosen minute is a different universe: never served from the live one.
         let response = get_stock_movers(
@@ -1529,6 +2595,22 @@ mod tests {
         );
         assert!(universe.fno.is_none() && universe.membership.is_none());
     }
+    #[tokio::test]
+    async fn test_build_live_universe_in_reads_only_the_supplied_artifact_directory() {
+        let now_ist = at("2026-10-30 08:00:00");
+        let clock = LiveClock {
+            now_ist,
+            market_open: false,
+            now_epoch: now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64,
+        };
+        let state = fno_stocks::tests::mock_state(1);
+        for count in [1, 3] {
+            let fixture = Fixture::new(count);
+            let u = build_live_universe_in(&state, clock, &fixture.0).await;
+            assert!(u.valid());
+            assert_eq!(u.membership.unwrap().names.len(), count);
+        }
+    }
     fn cached_universe(observed: i64) -> Arc<MoversUniverse> {
         use tickvault_common::operator_movers_universe::{
             UNIVERSE_IST_OFFSET_SECS, ist_date_of_epoch,
@@ -1548,6 +2630,7 @@ mod tests {
             prices: UniversePrices::Rows { rows: Vec::new() },
             fno: Some(vec![listed.clone()]),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: vec![listed],
                 indices: vec!["Nifty 50".into()],
                 by_stock: vec![StockIndices {
@@ -1653,6 +2736,8 @@ mod tests {
             .map(|n| format!("{n:02}{}", "\\".repeat(MAX_INDEX_NAME_BYTES - 2)))
             .collect();
         let membership = Memberships {
+            mtf: None,
+            mtf_history: Vec::new(),
             names: HashMap::new(),
             indices,
             by_stock: (1..=20)
@@ -1946,6 +3031,9 @@ mod tests {
             segment_code: EXCHANGE_SEGMENT_NSE_EQ,
             ltp: 110.0,
             close: Some(100.0),
+            session_open: None,
+            session_high: None,
+            session_low: None,
             volume: Some(5),
             avg_price: None,
             ts: at("2026-10-30 15:29:00"),
@@ -2063,6 +3151,8 @@ mod select_equivalence {
             })
             .collect();
         Memberships {
+            mtf: None,
+            mtf_history: Vec::new(),
             names,
             indices,
             by_stock,
@@ -2105,6 +3195,9 @@ mod select_equivalence {
             segment_code: if seg == 0 { 0 } else { EXCHANGE_SEGMENT_NSE_EQ },
             ltp,
             close,
+            session_open: None,
+            session_high: None,
+            session_low: None,
             volume,
             avg_price: Some(101.0),
             ts: base + chrono::Duration::seconds(offset),
@@ -2165,6 +3258,7 @@ mod select_equivalence {
                 n => Some(INDEX_LABELS[usize::from(n - 2)].into()),
             },
             search: ["", "STOCK1", "stock0", "DUP", "q"][usize::from(search)].into(),
+            category: None,
             direction: [Direction::All, Direction::Gainers, Direction::Losers]
                 [usize::from(direction)],
             offset: usize::from(offset) * 20,

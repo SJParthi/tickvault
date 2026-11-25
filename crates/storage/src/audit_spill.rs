@@ -1,5 +1,4 @@
-//! Disk tier for the order-side audit writers (audit PR42b; `live_order_events`
-//! joined 2026-11-12, plan item LF-5).
+//! Disk tier for order-side audits and daily tick conservation receipts.
 //!
 //! # Why this exists
 //!
@@ -22,6 +21,9 @@
 //! `audit-rows-lost` (`tv_audit_spill_refused_rows_total`), not chain-loss
 //! (noise lock §2.22-a). A permanent refusal is counted on
 //! `tv_order_audit_chain_lost_total`.
+//!
+//! A daily tick conservation receipt uses the same directory protocol before
+//! its first send. A process exit during the request leaves the receipt replayable.
 //!
 //! # How an outage still pages
 //!
@@ -114,7 +116,7 @@ const TMP_EXTENSION: &str = "tmp";
 /// Process-wide sequence so two spills in the same nanosecond get distinct names.
 static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The order-side audit tables that spill.
+/// The audit tables that spill.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditSpillTable {
     /// `order_audit` (order consumer and Dhan push consumer both write it).
@@ -126,15 +128,18 @@ pub enum AuditSpillTable {
     /// `live_order_events` (plan item LF-5, 2026-11-12): the paper order event
     /// log of the live signal-timing work.
     LiveOrderEvents,
+    /// Daily market-data conservation receipts.
+    TickConservationAudit,
 }
 
 impl AuditSpillTable {
     /// Every table, for metric seeding.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::OrderAudit,
         Self::PnlAudit,
         Self::OrderLegPnl,
         Self::LiveOrderEvents,
+        Self::TickConservationAudit,
     ];
 
     /// The QuestDB table name, also the spill sub-directory name.
@@ -145,6 +150,9 @@ impl AuditSpillTable {
             Self::PnlAudit => crate::pnl_audit_persistence::PNL_AUDIT_TABLE,
             Self::OrderLegPnl => crate::order_leg_pnl_persistence::ORDER_LEG_PNL_TABLE,
             Self::LiveOrderEvents => crate::live_order_events_persistence::LIVE_ORDER_EVENTS_TABLE,
+            Self::TickConservationAudit => {
+                crate::tick_conservation_audit_persistence::TICK_CONSERVATION_AUDIT_TABLE
+            }
         }
     }
 
@@ -156,6 +164,7 @@ impl AuditSpillTable {
             Self::PnlAudit => "pnl_audit_spill_lost",
             Self::OrderLegPnl => "order_leg_pnl_spill_lost",
             Self::LiveOrderEvents => "live_order_events_spill_lost",
+            Self::TickConservationAudit => "tick_conservation_spill_lost",
         }
     }
 
@@ -172,6 +181,7 @@ impl AuditSpillTable {
             Self::PnlAudit => 1,
             Self::OrderLegPnl => 2,
             Self::LiveOrderEvents => 3,
+            Self::TickConservationAudit => 4,
         }
     }
 }
@@ -209,7 +219,7 @@ pub struct AuditSpill {
 impl AuditSpill {
     /// The production spill target for `table`.
     #[must_use]
-    // TEST-EXEMPT: one-line constructor; the spill tests in this file build the same struct and the four audit writers call it
+    // TEST-EXEMPT: one-line constructor; the spill tests in this file build the same struct and the audit writers call it
     pub fn for_table(table: AuditSpillTable) -> Self {
         Self {
             dir: table.default_dir(),
@@ -236,8 +246,8 @@ impl AuditSpill {
     ///
     /// O(files in the directory) for the cap check, bounded by
     /// [`AUDIT_SPILL_MAX_FILES_PER_TABLE`]; one file write, one `fsync` of the
-    /// file and one of the directory. Called only after a flush has already
-    /// failed, never on the steady-state path.
+    /// file and one of the directory. Order writers call it after a failed
+    /// flush. The daily conservation task calls it before sending its receipt.
     ///
     /// # Errors
     /// `StorageFull` when the directory is at its byte or file ceiling,
@@ -496,6 +506,15 @@ async fn drain_with_streak(
     let mut probed_past_head = false;
     quarantine_stale_tmp_files(dir, table);
     for path in crate::off_worker::off_worker(|| list_spill_files(dir)) {
+        let _receipt_owner = if table == AuditSpillTable::TickConservationAudit {
+            Some(
+                crate::tick_conservation_audit_persistence::RECEIPT_DELIVERY
+                    .lock()
+                    .await,
+            )
+        } else {
+            None
+        };
         let payload = match tokio::fs::read(&path).await {
             Ok(payload) => payload,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -517,6 +536,15 @@ async fn drain_with_streak(
                 tracing::debug!(%err, "could not remove an empty audit spill file");
             }
             continue;
+        }
+        // A database restore can replace the schema during a long-lived backlog.
+        // Each conservation file contains exactly one daily receipt.
+        if table == AuditSpillTable::TickConservationAudit
+            && !crate::tick_conservation_audit_persistence::ensure_schema_before_replay(client, url)
+                .await
+        {
+            outcome.failed = true;
+            break;
         }
         match post_file(&payload, url, client, dir, &path).await {
             PostVerdict::Accepted { rejected_rows } => {
@@ -796,12 +824,8 @@ fn quarantine_stale_tmp_files(dir: &Path, table: AuditSpillTable) {
 
 /// One flag per table, so the drain is spawned once however many writers
 /// share the table.
-static DRAIN_SPAWNED: [AtomicBool; AuditSpillTable::ALL.len()] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
+static DRAIN_SPAWNED: [AtomicBool; AuditSpillTable::ALL.len()] =
+    [const { AtomicBool::new(false) }; AuditSpillTable::ALL.len()];
 
 /// Spawns `table`'s drain task once per process. Later calls are no-ops.
 ///
@@ -846,6 +870,8 @@ async fn ensure_table(table: AuditSpillTable, questdb: &QuestDbConfig) -> bool {
         AuditSpillTable::LiveOrderEvents => {
             crate::live_order_events_persistence::ensure_live_order_events_table(questdb).await
         }
+        // This table confirms its schema immediately before every file POST.
+        AuditSpillTable::TickConservationAudit => true,
     }
 }
 
@@ -986,6 +1012,14 @@ pub(crate) mod test_support {
         status: &'static str,
         n: usize,
     ) -> (String, std::thread::JoinHandle<usize>) {
+        response_server(move |_| status, n)
+    }
+
+    /// Serves a response selected from the raw request for each test exchange.
+    pub(crate) fn response_server(
+        response: impl Fn(&str) -> &'static str + Send + 'static,
+        n: usize,
+    ) -> (String, std::thread::JoinHandle<usize>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
@@ -999,8 +1033,9 @@ pub(crate) mod test_support {
                         let _ = sock.set_nonblocking(false);
                         let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
                         let mut buf = [0u8; 65_536];
-                        let _ = sock.read(&mut buf);
-                        let _ = sock.write_all(status.as_bytes());
+                        let bytes = sock.read(&mut buf).unwrap_or_default();
+                        let reply = response(&String::from_utf8_lossy(&buf[..bytes]));
+                        let _ = sock.write_all(reply.as_bytes());
                         let _ = sock.flush();
                         served += 1;
                     }
@@ -1225,9 +1260,13 @@ mod tests {
             .collect();
         sources.sort_unstable();
         sources.dedup();
-        assert_eq!(sources.len(), 4);
+        assert_eq!(
+            dirs[4],
+            Path::new("data/spill/audit/tick_conservation_audit")
+        );
+        assert_eq!(sources.len(), AuditSpillTable::ALL.len());
         let indexes: Vec<usize> = AuditSpillTable::ALL.iter().map(|t| t.index()).collect();
-        assert_eq!(indexes, vec![0, 1, 2, 3]);
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
         assert_eq!(DRAIN_SPAWNED.len(), AuditSpillTable::ALL.len());
     }
 

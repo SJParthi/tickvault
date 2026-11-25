@@ -179,8 +179,8 @@ done
 expect "benches present, zero budget matches -> FAIL-CLOSED" 3 "$H"
 
 # --- Case I: empty Criterion tree -> FAIL-CLOSED ----------------------------
-# The benches-did-not-run / artifact-not-restored shape. Pre-fix this printed
-# "No benchmark estimates found — skipping." and exited 0.
+# Cover both a missing directory and one with no files.
+expect "criterion dir never created -> FAIL-CLOSED" 3 "$TMP/not-created"
 I_DIR="$TMP/i"
 mkdir -p "$I_DIR"
 expect "empty criterion dir -> FAIL-CLOSED" 3 "$I_DIR"

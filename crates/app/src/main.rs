@@ -1790,13 +1790,7 @@ async fn async_main() -> Result<()> {
         metrics::counter!("tv_ws_event_audit_write_errors_total", "stage" => stage).increment(0);
         metrics::counter!("tv_feed_gap_audit_write_errors_total", "stage" => stage).increment(0);
     }
-    for reason in [
-        "subscription_change",
-        "live_feed_lifecycle",
-        "live_feed_forward",
-        "full",
-        "closed",
-    ] {
+    for reason in tickvault_app::feed_scoreboard_boot::WS_AUDIT_DROP_REASONS {
         metrics::counter!("tv_ws_event_audit_dropped_total", "reason" => reason).increment(0);
     }
     metrics::counter!("tv_order_update_ws_audit_dropped_total").increment(0);

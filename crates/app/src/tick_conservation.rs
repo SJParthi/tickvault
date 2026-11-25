@@ -22,13 +22,13 @@
 //!
 //! | verdict | when |
 //! |---|---|
-//! | `unverified` | the count could not be read (error, timeout, bad body), or nothing was accepted and nothing is stored (a zero baseline proves nothing) |
+//! | `unverified` | the count is unreadable, both counts are zero, or a positive shortfall is within the process-wide not-landed total |
 //! | `partial` | this process started after 09:00 IST today (or on another day): it only knows its own rows, so no mismatch is claimed |
-//! | `match` | `accepted == database`, or the shortfall is within the rows counted as not landed |
+//! | `match` | the full-day accepted and database counts are equal and positive |
 //! | `mismatch` | the database holds MORE rows than accepted, or the shortfall exceeds every counted loss |
 //!
-//! An `unverified` or `mismatch` read is retried up to
-//! [`TICK_CONSERVATION_MAX_READS`] times, [`TICK_CONSERVATION_READ_SPACING_SECS`]
+//! An `unverified` (except `no_rows`) or `mismatch` read is retried, up to
+//! [`TICK_CONSERVATION_MAX_READS`] reads in total, [`TICK_CONSERVATION_READ_SPACING_SECS`]
 //! apart, because an acknowledged row is only countable once QuestDB has
 //! applied its WAL. A final `mismatch` logs one coded `error!`
 //! (`TICK-CONSERVE-01`), log only: no CloudWatch filter, no EMF name, no
@@ -56,8 +56,9 @@
 //! ## Honest limits
 //!
 //! - The not-landed total is per process and can include `feed_aux_packets`
-//!   rows that shared a rescued batch, so it is a tolerance, not an exact
-//!   term; a real loss smaller than the counted spills reads as `match`.
+//!   rows that shared a rescued batch. It cannot establish which of this
+//!   day's missing rows were rescued. Even an exact count compares totals,
+//!   not row identities.
 //! - Rows the boot WAL replay of a mid-day restart re-appends would be counted
 //!   twice against a database that already holds them; that process is
 //!   `partial` by construction, which is why `partial` never claims a
@@ -86,7 +87,9 @@ use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsType};
 use tickvault_storage::feed_gap_audit_persistence::FeedGapRow;
-use tickvault_storage::tick_conservation_audit_persistence::TickConservationRow;
+use tickvault_storage::tick_conservation_audit_persistence::{
+    AuditReceiptWrite, TickConservationRow, write_or_queue_tick_conservation_row,
+};
 use tickvault_storage::tick_conservation_ledger::TickConservationLedger;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -124,11 +127,11 @@ const _: () = assert!(TICK_CONSERVATION_CHECK_SECS_OF_DAY_IST < 16 * 3600);
 /// The outcome of one daily check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConservationVerdict {
-    /// Every accepted row is stored or counted as not landed.
+    /// The positive accepted and database counts are equal.
     Match,
     /// Rows are unaccounted for, or the database holds extra rows.
     Mismatch,
-    /// The database count was not read, or there was nothing to compare.
+    /// An unreadable count, empty baseline or possibly accounted-for shortfall.
     Unverified,
     /// This process did not cover the whole day; it never claims a mismatch.
     Partial,
@@ -179,7 +182,7 @@ pub const fn classify(i: ConservationInputs) -> (ConservationVerdict, &'static s
     if shortfall == 0 {
         (ConservationVerdict::Match, "exact")
     } else if shortfall <= i.not_landed_rows {
-        (ConservationVerdict::Match, "within_counted_losses")
+        (ConservationVerdict::Unverified, "within_counted_losses")
     } else {
         (ConservationVerdict::Mismatch, "unexplained_shortfall")
     }
@@ -398,7 +401,9 @@ async fn run_daily_checks(
     process_start_ist_nanos: i64,
     now_utc_nanos: &impl Fn() -> i64,
 ) {
+    use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
     use tickvault_storage::tick_conservation_audit_persistence::ensure_tick_conservation_audit_table;
+    spawn_audit_spill_drain_once(AuditSpillTable::TickConservationAudit, questdb);
     ensure_tick_conservation_audit_table(questdb).await;
     loop {
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
@@ -420,8 +425,11 @@ async fn run_daily_checks(
             )
             .await;
         }
-        // Sleep to just past the next IST midnight (a multi-day process).
+        // Retry can run to midnight. Begin the new day's scheduling immediately.
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
+        if ist_date_of(now_ist) != today {
+            continue;
+        }
         let to_midnight = NANOS_PER_DAY - now_ist.rem_euclid(NANOS_PER_DAY);
         let secs = u64::try_from(to_midnight / NANOS_PER_SEC).unwrap_or(0) + 5;
         tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -502,7 +510,11 @@ async fn run_one_check(
         process_start_ist_nanos,
     };
     report(&row, inputs);
-    persist(questdb, &row).await;
+    let retry_window = receipt_retry_window(day_ist_nanos, checked_at);
+    persist(&row, retry_window, |receipt| {
+        write_or_queue_tick_conservation_row(questdb, receipt)
+    })
+    .await;
 }
 
 /// Logs the verdict: a coded `error!` on `mismatch` (log only), a `warn!` on
@@ -517,15 +529,16 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
             not_landed_rows = inputs.not_landed_rows,
             shortfall = row.shortfall(),
             count_reads = row.count_reads,
-            "TICK-CONSERVE-01: today's ticks rows do not reconcile with the rows this \
-             process accepted, after every counted spill, failure and WAL deferral"
+            "TICK-CONSERVE-01: accepted buffer writes and stored trade and quote rows differ. \
+             Compare capture keys to distinguish repeated writes from missing rows"
         ),
         "unverified" => warn!(
             reason = row.reason,
             accepted_rows = inputs.accepted_rows,
+            db_tick_rows = row.db_tick_rows,
+            not_landed_rows = inputs.not_landed_rows,
             count_reads = row.count_reads,
-            "tick conservation: today's check is unverified (the database count was not \
-             read, or there was nothing to compare)"
+            "tick conservation: today's accepted and stored counts could not be confirmed"
         ),
         _ => info!(
             verdict = row.verdict,
@@ -538,19 +551,73 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
     }
 }
 
-async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
-    use tickvault_storage::tick_conservation_audit_persistence::TickConservationAuditWriter;
-    let mut writer = TickConservationAuditWriter::new(questdb);
-    let written = writer
-        .append_row(row)
-        .and_then(|()| crate::order_observability::blocking_flush(|| writer.flush()));
-    if let Err(err) = written {
-        error!(
+// A delayed check still gets an immediate write, even if its audited day has ended.
+fn receipt_retry_window(day: i64, checked_at: i64) -> Duration {
+    if day.div_euclid(NANOS_PER_DAY) == checked_at.div_euclid(NANOS_PER_DAY) {
+        Duration::from_nanos((NANOS_PER_DAY - checked_at.rem_euclid(NANOS_PER_DAY)).unsigned_abs())
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Keep the original receipt for another attempt when both durable paths refuse it.
+/// Waiting happens on the daily audit task, outside the feed and dashboard paths.
+async fn persist<'a, F>(
+    row: &'a TickConservationRow,
+    retry_window: Duration,
+    mut write: impl FnMut(&'a TickConservationRow) -> F,
+) where
+    F: std::future::Future<Output = anyhow::Result<AuditReceiptWrite>>,
+{
+    let deadline = tokio::time::Instant::now() + retry_window;
+    let result = match write(row).await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                stage = "tick_conservation_audit_write",
+                ?row,
+                ?err,
+                "daily receipt has no confirmed durable copy; keeping it in memory for retry until IST midnight"
+            );
+            let interval = Duration::from_secs(
+                tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS,
+            );
+            let result = loop {
+                let next_attempt = tokio::time::Instant::now() + interval;
+                tokio::time::sleep_until(next_attempt.min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "tick_conservation_audit_retry_expired",
+                        ?row,
+                        "daily receipt retry window ended with no confirmed database or journal copy"
+                    );
+                    return;
+                }
+                // A write already in flight can have published its journal. Let it
+                // report the outcome even if the audited day ends during the request.
+                match write(row).await {
+                    Ok(result) => break result,
+                    Err(err) => {
+                        tracing::debug!(?err, "daily receipt retry still has no confirmed copy")
+                    }
+                }
+            };
+            info!(
+                ?result,
+                ?row,
+                "daily receipt recovered after a failed write"
+            );
+            result
+        }
+    };
+    if result == AuditReceiptWrite::QueuedForReplay {
+        warn!(
             code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-            stage = "tick_conservation_audit_write",
-            verdict = row.verdict,
-            ?err,
-            "tick_conservation_audit: today's row was not written (the verdict is in this log)"
+            stage = "tick_conservation_audit_queued",
+            ?row,
+            "tick conservation receipt queued on disk; database delivery unconfirmed"
         );
     }
 }
@@ -558,6 +625,87 @@ async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_reoffers_original_receipt_only_while_both_durable_paths_fail() {
+        let row = TickConservationRow {
+            checked_at_ist_nanos: DAY + 100,
+            day_ist_nanos: DAY,
+            feed: Feed::Dhan,
+            verdict: "mismatch",
+            reason: "unexplained_shortfall",
+            accepted_rows: 4,
+            db_tick_rows: 2,
+            not_landed_rows: 0,
+            count_reads: 3,
+            process_start_ist_nanos: DAY,
+        };
+        let interval = tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS;
+        for target in [
+            AuditReceiptWrite::Acknowledged,
+            AuditReceiptWrite::QueuedForReplay,
+        ] {
+            for failures in [0, 2] {
+                let mut calls = 0;
+                let started = tokio::time::Instant::now();
+                persist(&row, Duration::from_secs(3 * interval), |receipt| {
+                    assert!(std::ptr::eq(receipt, &row));
+                    calls += 1;
+                    std::future::ready(if calls <= failures {
+                        Err(anyhow::anyhow!("database and journal unavailable"))
+                    } else {
+                        Ok(target)
+                    })
+                })
+                .await;
+                assert_eq!(calls, failures + 1);
+                assert_eq!(started.elapsed(), Duration::from_secs(failures * interval));
+            }
+        }
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY + 1),
+            Duration::ZERO
+        );
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY - 23),
+            Duration::from_nanos(23)
+        );
+        let calls = std::cell::Cell::new(0);
+        let finished = std::cell::Cell::new(false);
+        persist(&row, Duration::from_secs(interval + 1), |_| async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(anyhow::anyhow!("both refused"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            finished.set(true);
+            Ok(AuditReceiptWrite::QueuedForReplay)
+        })
+        .await;
+        assert!(
+            finished.get(),
+            "an attempt started before midnight finished"
+        );
+        assert_eq!(calls.get(), 2);
+        let mut late_calls = 0;
+        persist(&row, Duration::ZERO, |_| {
+            late_calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("prior-day check")))
+        })
+        .await;
+        assert_eq!(late_calls, 1);
+        let mut calls = 0;
+        let window = Duration::from_secs(2 * interval + 1);
+        let started = tokio::time::Instant::now();
+        persist(&row, window, |receipt| {
+            assert!(std::ptr::eq(receipt, &row));
+            calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("persistent dual failure")))
+        })
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(started.elapsed(), window);
+    }
 
     /// 2026-10-26 00:00 IST, in IST-epoch nanos.
     const DAY: i64 = 1_792_972_800_000_000_000;
@@ -670,15 +818,16 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shortfall_within_counted_losses_is_match() {
+    fn test_classify_shortfall_within_counted_losses_is_unverified() {
+        for (accepted, not_landed, db) in [(1_000, 40, 960), (1_000, 40, 999), (100, 100, 0)] {
+            assert_eq!(
+                classify(inputs(accepted, not_landed, Some(db))),
+                (ConservationVerdict::Unverified, "within_counted_losses")
+            );
+        }
         assert_eq!(
-            classify(inputs(1_000, 40, Some(960))),
-            (ConservationVerdict::Match, "within_counted_losses")
-        );
-        // Boundary: shortfall == not landed.
-        assert_eq!(
-            classify(inputs(1_000, 40, Some(960))).0,
-            ConservationVerdict::Match
+            classify(inputs(1_000, 40, Some(1_000))),
+            (ConservationVerdict::Match, "exact")
         );
     }
 
@@ -738,7 +887,7 @@ mod tests {
     fn test_classify_extremes_do_not_overflow() {
         assert_eq!(
             classify(inputs(u64::MAX, u64::MAX, Some(0))).0,
-            ConservationVerdict::Match
+            ConservationVerdict::Unverified
         );
         assert_eq!(
             classify(inputs(u64::MAX, 0, Some(0))).0,

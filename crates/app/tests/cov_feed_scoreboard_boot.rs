@@ -654,7 +654,13 @@ fn rich_responses(dropped_metric: u64) -> Responses {
         other_minutes: ok(EMPTY),
         metrics: ok(&format!(
             "# TYPE tv_ws_event_audit_dropped_total counter\n\
-             tv_ws_event_audit_dropped_total{{ws_type=\"main_feed\"}} {dropped_metric}\n"
+             tv_ws_event_audit_dropped_total{{reason=\"subscription_change\"}} {dropped_metric}\n\
+             tv_ws_event_audit_dropped_total{{reason=\"live_feed_lifecycle\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"live_feed_forward\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"full\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"closed\"}} 0\n\
+             tv_ws_event_audit_write_errors_total{{stage=\"append\"}} 0\n\
+             tv_ws_event_audit_write_errors_total{{stage=\"flush\"}} 0\n"
         )),
         write_status: 204,
         default: ok(EMPTY),
@@ -1452,4 +1458,224 @@ fn test_feed_scoreboard_synthesize_out_of_order_rows_pick_last_pre_and_earliest_
     assert_eq!(deaths[0].gap_upper_bound_secs, hms(11, 5) - hms(10, 0));
     assert!(deaths[0].market_hours);
     assert!(!deaths[0].post_close_restart);
+}
+
+#[tokio::test]
+async fn same_day_socket_audit_counters_control_stored_outcome() {
+    setup_env();
+    let drops = "tv_ws_event_audit_dropped_total";
+    let append = r#"tv_ws_event_audit_write_errors_total{stage="append"}"#;
+    let flush = r#"tv_ws_event_audit_write_errors_total{stage="flush"}"#;
+    // None omits the series from the scrape, matching an exporter with
+    // incomplete evidence. Values are strings so malformed samples survive.
+    let expected_reasons = [
+        "subscription_change",
+        "live_feed_lifecycle",
+        "live_feed_forward",
+        "full",
+        "closed",
+    ];
+    let scrape = |d: Option<&str>, a: Option<&str>, f: Option<&str>| {
+        let mut lines = Vec::new();
+        if let Some(raw) = d {
+            for reason in expected_reasons {
+                lines.push(format!("{drops}{{reason=\"{reason}\"}} {raw}"));
+            }
+        }
+        for (metric, value) in [(append, a), (flush, f)] {
+            if let Some(raw) = value {
+                lines.push(format!("{metric} {raw}"));
+            }
+        }
+        ok(&lines.join("\n"))
+    };
+    let writer_zeros = format!("{append} 0\n{flush} 0");
+    let zero = Some("0");
+    let pos = Some("3");
+    let bad = Some("NaN");
+    let cases = [
+        ("all zero", scrape(zero, zero, zero), true, "complete"),
+        ("producer drops", scrape(pos, zero, zero), true, "degraded"),
+        (
+            "fractional drops",
+            scrape(Some("0.5"), zero, zero),
+            true,
+            "partial",
+        ),
+        (
+            "zero plus invalid",
+            scrape(
+                Some(&format!("0\n{drops}{{reason=\"closed\"}} NaN")),
+                zero,
+                zero,
+            ),
+            true,
+            "partial",
+        ),
+        (
+            "positive plus invalid",
+            scrape(
+                Some(&format!("2\n{drops}{{reason=\"closed\"}} NaN")),
+                zero,
+                zero,
+            ),
+            true,
+            "degraded",
+        ),
+        ("HTTP 503", status(503), true, "partial"),
+        ("missing drops", scrape(None, zero, zero), true, "partial"),
+        ("invalid drops", scrape(bad, zero, zero), true, "partial"),
+        (
+            "missing writer counters",
+            scrape(zero, None, None),
+            true,
+            "partial",
+        ),
+        ("missing append", scrape(zero, None, zero), true, "partial"),
+        ("missing flush", scrape(zero, zero, None), true, "partial"),
+        ("invalid append", scrape(zero, bad, zero), true, "partial"),
+        (
+            "invalid flush",
+            scrape(zero, zero, Some("-1")),
+            true,
+            "partial",
+        ),
+        ("append rejected", scrape(zero, pos, zero), true, "degraded"),
+        (
+            "flush failed with unknown delivery",
+            scrape(zero, zero, pos),
+            true,
+            "partial",
+        ),
+        (
+            "append rejected with missing drops",
+            scrape(None, pos, pos),
+            true,
+            "degraded",
+        ),
+        (
+            "drops with missing writer counters",
+            scrape(pos, None, None),
+            true,
+            "degraded",
+        ),
+        (
+            "past day ignores failed scrape",
+            status(503),
+            false,
+            "complete",
+        ),
+        (
+            "past day ignores today's writer failures",
+            scrape(zero, pos, pos),
+            false,
+            "complete",
+        ),
+    ];
+    let mut cases = cases.to_vec();
+    for missing in expected_reasons {
+        let body = expected_reasons
+            .iter()
+            .filter(|&&r| r != missing)
+            .map(|r| format!("{drops}{{reason=\"{r}\"}} 0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cases.push((
+            missing,
+            ok(&format!("{body}\n{writer_zeros}")),
+            true,
+            "partial",
+        ));
+    }
+    cases.extend([
+        (
+            "one seed present",
+            ok(&format!("{drops}{{reason=\"full\"}} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "bare zero",
+            ok(&format!("{drops} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "bare positive",
+            ok(&format!("{drops} 1\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "unknown reason zero",
+            ok(&format!("{drops}{{reason=\"other\"}} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "subset with positive",
+            ok(&format!("{drops}{{reason=\"full\"}} 2\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "unknown reason positive",
+            ok(&format!("{drops}{{reason=\"new\"}} 2\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "zero-like noninteger",
+            scrape(Some("1e-400"), zero, zero),
+            true,
+            "partial",
+        ),
+    ]);
+    let mut discrepancies = Vec::new();
+    for (case, metrics, same_day, expected) in cases {
+        let mut r = rich_responses(0);
+        r.daily = ok(EMPTY);
+        r.boot = ok(EMPTY);
+        r.ws = ok(EMPTY);
+        r.metrics = metrics;
+        let server = FakeQuestDb::start(r);
+        let summary = run_feed_scoreboard(
+            &server.questdb(),
+            server.port,
+            DAY,
+            "2024-10-04".to_string(),
+            false,
+            false,
+            same_day,
+            0,
+            &[],
+            Some((true, false)),
+        )
+        .await
+        .expect("measurable day");
+        let writes = server.writes();
+        let row = writes
+            .iter()
+            .flat_map(|body| body.lines())
+            .find(|line| line.starts_with("feed_scoreboard_daily,") && line.contains("feed=dhan,"))
+            .expect("daily Dhan audit row");
+        let actual = row
+            .split_once("outcome=")
+            .expect("outcome tag")
+            .1
+            .split([',', ' '])
+            .next()
+            .expect("tag value");
+        println!(
+            "{case}: stored={actual}, expected={expected}, partial={} degraded={}",
+            summary.partial_coverage, summary.degraded
+        );
+        if actual != expected
+            || summary.partial_coverage != (expected == "partial")
+            || summary.degraded != (expected == "degraded")
+        {
+            discrepancies.push((case, actual.to_owned(), expected));
+        }
+    }
+    assert!(discrepancies.is_empty(), "{discrepancies:?}");
 }

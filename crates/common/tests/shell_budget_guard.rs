@@ -1070,7 +1070,7 @@ const CONSOLE_SHELL_SOURCES: &[(&str, usize, usize)] = &[
     (
         "crates/aws-lambdas/src/operator_control_commands.rs",
         27,
-        1766,
+        1819,
     ),
 ];
 
