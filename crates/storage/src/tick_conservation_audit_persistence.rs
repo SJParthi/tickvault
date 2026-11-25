@@ -32,6 +32,8 @@
 //! 2026-06-28: feed in every persisted key). Per feed and day, not per
 //! instrument, so I-P1-11's `(security_id, exchange_segment)` pair is N/A.
 
+use crate::audit_spill::{AuditSpill, AuditSpillTable};
+use crate::off_worker::off_worker;
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use tracing::{error, warn};
@@ -149,11 +151,9 @@ pub fn tick_conservation_audit_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Ensures the table (idempotent, self-healing). Failures are logged with a
-/// code and never block the caller; a failed ensure leaves the first ILP
-/// write to create the table without DEDUP until a later ensure succeeds.
-// TEST-EXEMPT: live-QuestDB DDL runner (DDL strings unit-tested below); the unreachable path is tested.
-pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig) {
+/// Returns true when QuestDB acknowledges every schema statement, including DEDUP.
+/// A failed ensure leaves the new receipt on disk until a later ensure succeeds.
+pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
@@ -171,17 +171,43 @@ pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig
                 ?err,
                 "tick_conservation_audit: HTTP client build failed — table not ensured"
             );
-            return;
+            return false;
         }
     };
+    ensure_schema(&client, &base_url).await
+}
+
+/// Verifies the key on the same database that will receive this file.
+pub(crate) async fn ensure_schema_before_replay(client: &reqwest::Client, write_url: &str) -> bool {
+    let Ok(exec) = reqwest::Url::parse(write_url).and_then(|url| url.join("exec")) else {
+        return false;
+    };
+    ensure_schema(client, exec.as_str()).await
+}
+
+async fn ensure_schema(client: &reqwest::Client, base_url: &str) -> bool {
     for ddl in &tick_conservation_audit_ddl_statements() {
         match client
-            .get(&base_url)
+            .get(base_url)
             .query(&[("query", ddl.as_str())])
             .send()
             .await
         {
-            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.json::<serde_json::Value>().await.ok();
+                if !body.as_ref().is_some_and(|reply| {
+                    reply.get("error").is_none()
+                        && reply.get("ddl").and_then(serde_json::Value::as_str) == Some("OK")
+                }) {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "tick_conservation_ensure_ddl",
+                        ddl = ddl.as_str(),
+                        "QuestDB did not acknowledge the audit schema statement"
+                    );
+                    return false;
+                }
+            }
             Ok(resp) => {
                 let status = resp.status();
                 error!(
@@ -191,16 +217,52 @@ pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig
                     ddl = ddl.as_str(),
                     "tick_conservation_audit: DDL returned non-2xx"
                 );
+                return false;
             }
-            Err(err) => error!(
-                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-                stage = "tick_conservation_ensure_ddl",
-                ?err,
-                ddl = ddl.as_str(),
-                "tick_conservation_audit: DDL request failed"
-            ),
+            Err(err) => {
+                error!(
+                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                    stage = "tick_conservation_ensure_ddl",
+                    ?err,
+                    ddl = ddl.as_str(),
+                    "tick_conservation_audit: DDL request failed"
+                );
+                return false;
+            }
         }
     }
+    true
+}
+
+/// Completion state for a single scheduled audit receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditReceiptWrite {
+    /// The immediate QuestDB request was acknowledged.
+    Acknowledged,
+    /// The original row was published to the local audit replay directory.
+    /// A process restart can drain it. A directory-sync failure is logged by
+    /// the spool and leaves survival of a subsequent power loss uncertain.
+    QueuedForReplay,
+}
+
+/// The journal and its drain share ownership while a file is in flight.
+/// The daily writer acquires the lock before publication, and a replay checks
+/// the file under this lock, so a healthy send and its drain cannot race.
+pub(crate) static RECEIPT_DELIVERY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Journals one complete receipt before attempting its keyed database write.
+///
+/// # Errors
+/// Returns an error if row encoding fails or neither the journal nor the
+/// database acknowledges the receipt.
+pub async fn write_or_queue_tick_conservation_row(
+    config: &QuestDbConfig,
+    row: &TickConservationRow,
+) -> Result<AuditReceiptWrite> {
+    let mut writer = TickConservationAuditWriter::new(config);
+    writer.append_row(row)?;
+    let spool = AuditSpill::for_table(AuditSpillTable::TickConservationAudit);
+    writer.deliver_receipt(config, &spool).await
 }
 
 /// Lazy ILP-over-HTTP writer. An unreachable QuestDB still builds
@@ -296,6 +358,50 @@ impl TickConservationAuditWriter {
             .context("designated timestamp")?;
         self.pending = self.pending.saturating_add(1);
         Ok(())
+    }
+
+    // One complete receipt goes into one immutable file with its original identity.
+    async fn deliver_receipt(
+        mut self,
+        config: &QuestDbConfig,
+        spool: &AuditSpill,
+    ) -> Result<AuditReceiptWrite> {
+        let _delivery = RECEIPT_DELIVERY.lock().await;
+        let journal = off_worker(|| spool.spill(self.buffer.as_bytes(), self.pending));
+        let result = if ensure_tick_conservation_audit_table(config).await {
+            off_worker(|| self.flush())
+        } else {
+            Err(anyhow::anyhow!(
+                "QuestDB has not confirmed the audit table's deduplication key"
+            ))
+        };
+
+        match (result, journal) {
+            (Ok(()), Ok(path)) => {
+                if let Err(err) = tokio::fs::remove_file(&path).await {
+                    warn!(code = ErrorCode::StorageGap03AuditWriteFailed.code_str(), ?err,
+                        path = %path.display(), "QuestDB acknowledged the receipt but journal removal failed; a keyed replay is safe");
+                }
+                Ok(AuditReceiptWrite::Acknowledged)
+            }
+            (Ok(()), Err(err)) => {
+                warn!(
+                    code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                    ?err,
+                    "QuestDB acknowledged the receipt after the local journal refused it"
+                );
+                Ok(AuditReceiptWrite::Acknowledged)
+            }
+            (Err(err), Ok(path)) => {
+                metrics::counter!("tv_audit_spill_rows_total", "table" => TICK_CONSERVATION_AUDIT_TABLE).increment(1);
+                tracing::debug!(?err, path = %path.display(), "receipt remains in its local journal for replay");
+                Ok(AuditReceiptWrite::QueuedForReplay)
+            }
+            (Err(err), Err(disk)) => {
+                metrics::counter!("tv_audit_spill_refused_rows_total", "table" => TICK_CONSERVATION_AUDIT_TABLE).increment(1);
+                Err(err.context(format!("local receipt journal refused the row ({disk})")))
+            }
+        }
     }
 
     /// Flushes buffered rows over ILP-HTTP.
@@ -431,6 +537,177 @@ mod tests {
         assert_eq!(w.pending(), 1);
     }
 
+    // The fixture either acknowledges every DDL or refuses the first. The
+    // disconnected ILP writer exercises the final-flush error after a good schema.
+    fn schema_server(ready: bool) -> (QuestDbConfig, std::thread::JoinHandle<usize>) {
+        use crate::audit_spill::test_support::status_server;
+        let (reply, n) = if ready {
+            (
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ddl\":\"OK\"}",
+                tick_conservation_audit_ddl_statements().len(),
+            )
+        } else {
+            (
+                "HTTP/1.1 503 Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                1,
+            )
+        };
+        let (url, server) = status_server(reply, n);
+        (fixture_config(&url), server)
+    }
+
+    fn fixture_config(url: &str) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".into(),
+            http_port: reqwest::Url::parse(url)
+                .expect("fixture URL")
+                .port()
+                .expect("port"),
+            pg_port: 1,
+            ilp_port: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_or_queue_tick_conservation_row_retains_exact_bytes_for_both_uncertain_outcomes()
+     {
+        use crate::audit_spill::test_support::TestDir;
+
+        for ready in [false, true] {
+            let (config, server) = schema_server(ready);
+            let dir = TestDir::new();
+            let spool =
+                AuditSpill::in_dir(AuditSpillTable::TickConservationAudit, dir.path().into());
+            let mut writer = TickConservationAuditWriter::for_test();
+            writer.append_row(&sample()).expect("append");
+            let original = writer.buffer.as_bytes().to_vec();
+            let result = writer
+                .deliver_receipt(&config, &spool)
+                .await
+                .expect("enqueue receipt");
+            assert_eq!(result, AuditReceiptWrite::QueuedForReplay);
+            let files = crate::tick_spill_replay::list_spill_files(dir.path());
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                std::fs::read(&files[0]).expect("published receipt"),
+                original
+            );
+            server.join().expect("schema server");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_refused_receipt_spill_returns_an_error() {
+        use crate::audit_spill::test_support::TestDir;
+
+        let (config, server) = schema_server(false);
+        let dir = TestDir::new();
+        let obstructed = dir.path().join("blocked");
+        std::fs::write(&obstructed, b"keep").expect("obstruct spill directory");
+        let spool = AuditSpill::in_dir(AuditSpillTable::TickConservationAudit, obstructed.clone());
+        let mut writer = TickConservationAuditWriter::for_test();
+        writer.append_row(&sample()).expect("append");
+        assert!(writer.deliver_receipt(&config, &spool).await.is_err());
+        assert_eq!(std::fs::read(obstructed).expect("original file"), b"keep");
+        server.join().expect("schema server");
+    }
+
+    const DDL_ACK: &str = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ddl\":\"OK\"}";
+
+    fn reply_to_questdb_request(request: &str) -> &'static str {
+        if request.starts_with("GET /exec?") {
+            DDL_ACK
+        } else {
+            assert!(request.starts_with("POST /write?"));
+            crate::audit_spill::test_support::OK_204
+        }
+    }
+
+    #[tokio::test]
+    async fn test_confirmed_receipt_with_and_without_a_writable_journal() {
+        use crate::audit_spill::test_support::{TestDir, response_server};
+
+        for disk_available in [false, true] {
+            let dir = TestDir::new();
+            let spool_dir = dir.path().join("journal");
+            if !disk_available {
+                std::fs::write(&spool_dir, b"blocked").expect("obstruct journal");
+            }
+            let n = tick_conservation_audit_ddl_statements().len() + 1;
+            let (url, server) = response_server(reply_to_questdb_request, n);
+            let config = fixture_config(&url);
+            let mut writer = TickConservationAuditWriter::new(&config);
+            writer.append_row(&sample()).expect("append");
+            let spool =
+                AuditSpill::in_dir(AuditSpillTable::TickConservationAudit, spool_dir.clone());
+            let result = writer
+                .deliver_receipt(&config, &spool)
+                .await
+                .expect("direct write");
+            assert_eq!(result, AuditReceiptWrite::Acknowledged);
+            assert_eq!(server.join().expect("schema and write server"), n);
+            if disk_available {
+                assert_eq!(
+                    std::fs::read_dir(spool_dir)
+                        .expect("journal directory")
+                        .count(),
+                    0
+                );
+            } else {
+                assert_eq!(std::fs::read(spool_dir).expect("obstruction"), b"blocked");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_schema_before_replay_requires_final_ddl_ack_and_retries_on_next_drain() {
+        use crate::audit_spill::{
+            drain_audit_spill_dir,
+            test_support::{TestDir, response_server},
+        };
+
+        let dir = TestDir::new();
+        let table = AuditSpillTable::TickConservationAudit;
+        let spool = AuditSpill::in_dir(table, dir.path().into());
+        let mut writer = TickConservationAuditWriter::for_test();
+        writer.append_row(&sample()).expect("append");
+        let original = writer.buffer.as_bytes().to_vec();
+        let path = spool.spill(&original, 1).expect("publish");
+        let client = crate::http_client::build_probe_client(3).expect("client");
+        let ddls = tick_conservation_audit_ddl_statements().len();
+        let (refused, server) = response_server(
+            |request| {
+                assert!(request.starts_with("GET /exec?"));
+                if request.contains("DEDUP+ENABLE") {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ddl\":\"OK\",\"error\":\"schema refused\"}"
+                } else {
+                    DDL_ACK
+                }
+            },
+            ddls + 1,
+        );
+        let waiting = drain_audit_spill_dir(
+            dir.path(),
+            table,
+            &format!("{refused}?precision=n"),
+            &client,
+        )
+        .await;
+        assert_eq!(server.join().expect("DDL server"), ddls);
+        assert!(waiting.failed);
+        assert_eq!(waiting.files_replayed, 0);
+        assert_eq!(std::fs::read(&path).expect("still waiting"), original);
+
+        let (ready, server) = response_server(reply_to_questdb_request, ddls + 1);
+        let landed =
+            drain_audit_spill_dir(dir.path(), table, &format!("{ready}?precision=n"), &client)
+                .await;
+        assert_eq!(server.join().expect("DDL and ILP server"), ddls + 1);
+        assert!(!landed.failed);
+        assert_eq!(landed.rows_replayed, 1);
+        assert!(!path.exists());
+    }
+
     #[tokio::test]
     async fn test_ensure_tick_conservation_audit_table_returns_when_questdb_is_unreachable() {
         let cfg = QuestDbConfig {
@@ -444,6 +721,9 @@ mod tests {
             ensure_tick_conservation_audit_table(&cfg),
         )
         .await;
-        assert!(done.is_ok(), "the ensure must return, not hang");
+        assert!(
+            matches!(done, Ok(false)),
+            "an unreachable schema cannot be ready"
+        );
     }
 }

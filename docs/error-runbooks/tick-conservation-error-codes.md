@@ -73,11 +73,31 @@ only pre-v3 records), or for a gap of 5 s or less. A failed write is a coded
 
 ## Honest limits
 
-The daily task makes one final attempt to write the audit row. If the append
-or flush fails, it logs `STORAGE-GAP-03` with stage
-`tick_conservation_audit_write` and does not queue the row for replay. After
-QuestDB recovers and its WAL catches up, look up the audit row by trading date
-and feed, then compare the stored verdict and counts with the check's log.
+The daily task writes the complete original ILP row to
+`data/spill/audit/tick_conservation_audit/` before attempting database
+delivery. It confirms the schema and DEDUP key, then sends the row. A database
+acknowledgement permits removal of the journal file. A refused schema or a
+lost write acknowledgement leaves the file available after a restart. Every
+minute, the drain checks the schema before each file and submits its original
+timestamp, day and feed. QuestDB uses those keys to collapse repeat submissions.
+
+`STORAGE-GAP-03` at `tick_conservation_audit_queued` means the receipt is
+on disk and database delivery is unconfirmed. At `tick_conservation_audit_write`,
+check the database and spill directory using the logged row identity. The
+table-labelled spill, replay, refusal and quarantine counters track the outcome.
+The shared audit drain uses `AUDIT-06` and the existing order-audit alarms
+for a stale backlog or permanent refusal. Check the table and source labels
+to identify conservation receipts.
+
+A crash before journal publication can still leave no receipt. Full storage,
+quota or an I/O error can prevent journaling. In that case the task attempts a
+direct write if the database confirms its schema. Directory sync failure
+after rename weakens power-loss durability. Schema confirmation and the
+subsequent ILP request are separate operations, so coordinate database
+restores or manual schema changes with the writer. Permanent rejections use
+the audit quarantine. Preserve outstanding files across restarts and
+rollbacks. These records describe daily counts. Use the tick and WAL checks
+for individual price updates.
 
 - The not-landed total spans the life of the process and can include
   `feed_aux_packets` from a rescued batch. It cannot identify which of today's

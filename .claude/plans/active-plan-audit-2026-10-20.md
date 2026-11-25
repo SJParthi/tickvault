@@ -3335,3 +3335,11 @@ hand-over sealed them).
 - [x] LATMIN-BOOT. 2026-11-18 (live): every boot or deploy logged one STORAGE-GAP-03 ERROR ("hot_path_latency_minute: flush failed", 8 times 14 to 18 Nov, at the first minute change, 08:31:00 IST on trading days) that recovered 30 s later with nothing lost: the writer's first flush is refused while the boot ensure task is still confirming the proof tables keyed (QuestDB starting), and the ensure task itself stays quiet for 10 tries 30 s apart. The writer now stays quiet over the same window (`boot_quiet_window` = `ENSURE_ATTEMPTS` x the retry interval, 300 s): a "not yet keyed" refusal inside it does not open a failure episode (`quiet_boot_refusal`, pure). Rows are retained and the overflow policy runs exactly as before; a send failure on keyed tables, or tables still unkeyed after the window, logs as before. One Acquire load per writer flush (`HotPathLatencyMinuteWriter::is_keyed`), writer thread only.
   - Files: crates/storage/src/hot_path_latency_minute.rs
   - Tests: test_quiet_boot_refusal_only_while_unkeyed_inside_the_window (bite-tested: dropping the keyed condition fails it), test_boot_quiet_window_saturates_and_scales_with_the_retry_interval, test_is_keyed_reads_the_readiness_gate
+
+### K4 follow-up — replay a daily conservation receipt after a write outage
+
+Publish the daily receipt's complete ILP row in the bounded audit disk tier before checking the schema or attempting its immediate write. The writer and drain share the file until QuestDB acknowledges it. Replay uses the original timestamp, trading day and feed. Confirm DEDUP immediately before every direct write and every file replay.
+
+Check healthy direct writes, process death during the first send, ambiguous acknowledgement, schema refusal and retry, unavailable disk and recovery after restart. Compare the local files and keyed QuestDB rows in an isolated fixture. A process crash before publication, or both unwriteable local storage and an unreachable database, can leave no audit row.
+
+Keep STORAGE-GAP-03 stages for queued receipts and unconfirmed copies. Use the existing table-labelled spill and replay counters. On rollback, preserve outstanding files under `data/spill/audit/tick_conservation_audit/` and drain them with a compatible build.

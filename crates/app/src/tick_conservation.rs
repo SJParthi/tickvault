@@ -399,7 +399,9 @@ async fn run_daily_checks(
     process_start_ist_nanos: i64,
     now_utc_nanos: &impl Fn() -> i64,
 ) {
+    use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
     use tickvault_storage::tick_conservation_audit_persistence::ensure_tick_conservation_audit_table;
+    spawn_audit_spill_drain_once(AuditSpillTable::TickConservationAudit, questdb);
     ensure_tick_conservation_audit_table(questdb).await;
     loop {
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
@@ -541,19 +543,25 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
 }
 
 async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
-    use tickvault_storage::tick_conservation_audit_persistence::TickConservationAuditWriter;
-    let mut writer = TickConservationAuditWriter::new(questdb);
-    let written = writer
-        .append_row(row)
-        .and_then(|()| crate::order_observability::blocking_flush(|| writer.flush()));
-    if let Err(err) = written {
-        error!(
+    use tickvault_storage::tick_conservation_audit_persistence::{
+        AuditReceiptWrite, write_or_queue_tick_conservation_row,
+    };
+    let result = write_or_queue_tick_conservation_row(questdb, row).await;
+    match result {
+        Ok(AuditReceiptWrite::Acknowledged) => {}
+        Ok(AuditReceiptWrite::QueuedForReplay) => warn!(
+            code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+            stage = "tick_conservation_audit_queued",
+            ?row,
+            "tick conservation receipt queued on disk; database delivery unconfirmed"
+        ),
+        Err(err) => error!(
             code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
             stage = "tick_conservation_audit_write",
-            verdict = row.verdict,
+            ?row,
             ?err,
-            "tick_conservation_audit: today's row was not written (the verdict is in this log)"
-        );
+            "tick conservation receipt has no confirmed database acknowledgement or local replay copy"
+        ),
     }
 }
 
