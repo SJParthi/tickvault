@@ -4296,9 +4296,9 @@ mod tests {
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "c3a569fd96398e4c7478be5f56915e2615f2765ad60751c0c7d191a266aec840"
+            "952e667b16bafc3522c8f57cef9dffd73a901633025c2109bdc3f1435c9121d1"
         );
-        assert_eq!(CONSOLE_HTML.len(), 103_037);
+        assert_eq!(CONSOLE_HTML.len(), 103_109);
     }
 
     #[test]

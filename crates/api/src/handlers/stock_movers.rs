@@ -828,12 +828,14 @@ mod oracle {
         reply
     }
 
-    /// The old `fno_stocks::compute_for_list`, with the query injected.
+    /// Per-filter reference calculation, including the dated cash-auction read
+    /// window. The reference selects each security's interval independently.
     fn compute_for_list(
         now_ist: chrono::NaiveDateTime,
         market_open: bool,
         read_at_ist: Option<chrono::NaiveDateTime>,
         list: &FnoUnderlyings,
+        fno: Option<&FnoUnderlyings>,
         query: &dyn Fn(&[u64]) -> Result<Vec<TickRow>, QueryFailure>,
     ) -> FnoStocksResponse {
         let observed_at_epoch_secs = now_ist.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
@@ -879,9 +881,22 @@ mod oracle {
                 );
             }
         };
+        let auction = fno
+            .filter(|f| !f.is_empty())
+            .and_then(|_| cash_auction_window(at, start, end, !open));
         let rows: Vec<_> = rows
             .into_iter()
-            .filter(|r| r.ltp.is_finite() && r.ltp > 0.0 && r.ts >= start && r.ts <= end)
+            .filter(|r| {
+                let bounds = if fno
+                    .and_then(|f| f.name_of(r.security_id, r.segment_code))
+                    .is_some()
+                {
+                    auction.unwrap_or((start, end))
+                } else {
+                    (start, end)
+                };
+                r.ltp.is_finite() && r.ltp > 0.0 && (bounds.0..=bounds.1).contains(&r.ts)
+            })
             .collect();
         let newest = rows
             .iter()
@@ -894,7 +909,11 @@ mod oracle {
             return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
         };
         let age = (at.and_utc().timestamp() - newest.and_utc().timestamp()).max(0);
-        let window_secs = closed_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
+        let measured_window = match auction {
+            Some((s, e)) => Some((s, if open { at } else { e })),
+            None => closed_window,
+        };
+        let window_secs = measured_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
             (e - s)
                 .num_seconds()
                 .clamp(1, fno_stocks::FNO_STOCKS_MAX_WINDOW_SECS)
@@ -974,7 +993,7 @@ mod oracle {
             return finish_empty(if open { "no_data" } else { "closed" });
         }
         let list = FnoUnderlyings { names };
-        let prices = compute_for_list(now_ist, market_open, read_at_ist, &list, query);
+        let prices = compute_for_list(now_ist, market_open, read_at_ist, &list, fno, query);
         finish(prices, filter, membership, fno)
     }
 }
@@ -1230,9 +1249,9 @@ mod tests {
                 Some((&fno.sorted_ids(), lower, upper)),
             );
             assert!(
-                sql.contains("OR security_id IN (2,4)") && sql.contains("security_id IN (1,2,3,4)")
+                sql.contains("OR security_id IN (2,4)") && sql.contains("security_id IN (1,2,3,4)"),
+                "unexpected auction filter for {date} at {now}: {sql}"
             );
-            eprintln!("auction fixture {date} {now}: {sql}");
             let sample = |id, ts| TickRow {
                 security_id: id,
                 segment_code: EXCHANGE_SEGMENT_NSE_EQ,
