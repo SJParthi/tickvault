@@ -60,6 +60,10 @@ use tickvault_app::tick_conservation::{
 };
 use tickvault_common::constants::{MARKET_CLOSE_IST_NANOS, MARKET_OPEN_IST_NANOS};
 
+// Real QuestDB 9.3.5 projection for an already-keyed, fully applied receipt table.
+const RECEIPT_CATALOG: &str =
+    include_str!("../../storage/tests/fixtures/tick_conservation_catalog.json");
+
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const IST_OFFSET_SECS: i64 = 19_800;
 const TWO_HOURS_NANOS: i64 = 2 * 3_600 * NANOS_PER_SEC;
@@ -139,7 +143,9 @@ impl Scenario {
         process_start: NaiveDateTime,
     ) -> Self {
         let srv = FakeQuestDb::start(Arc::new(|q: &str| {
-            if q.contains("count(") {
+            if q.contains("table_columns('tick_conservation_audit')") {
+                (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains("count(") {
                 // Each of the two tables counts 5 rows.
                 (
                     200,
@@ -213,8 +219,8 @@ impl Scenario {
         assert!(
             queries
                 .iter()
-                .any(|q| q.starts_with("CREATE TABLE IF NOT EXISTS tick_conservation_audit")),
-            "{label}: the audit table DDL reached /exec: {queries:?}"
+                .any(|q| q.contains("table_columns('tick_conservation_audit')")),
+            "{label}: the audit table catalog query reached /exec: {queries:?}"
         );
         assert!(
             !requests.iter().any(|r| r.contains("/v2/charts/intraday")),
@@ -298,7 +304,9 @@ async fn assert_wal_lag_retries() {
         ledger.note_row_appended(ist_nanos_of(start));
         let ticks_reads = std::sync::atomic::AtomicUsize::new(0);
         let srv = FakeQuestDb::start(Arc::new(move |q| {
-            if q.contains("from ticks where") {
+            if q.contains("table_columns('tick_conservation_audit')") {
+                (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains("from ticks where") {
                 let read = ticks_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let visible = if catches_up && read > 0 { 2 } else { 0 };
                 (200, format!(r#"{{"dataset":[[{visible}]]}}"#))

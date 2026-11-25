@@ -12,7 +12,8 @@
 //! test oracle (`oracle` module) and a property test proves the two equal.
 //!
 //! Complexity: cold path. Per build O(list rows) to read the lists and one
-//! bounded query; per request O(n log n) in [`select`], n ≤ 2,000 rows.
+//! bounded query. A cached-universe request still scans the input. Ranking
+//! takes O(m + p log p) comparisons for m matches and a page of p ≤ 20 rows.
 use super::fno_stocks::{self, FnoStocksInputs, FnoUnderlyings, QueryFailure, TickRow};
 use crate::response_cache::cached_json_response;
 use crate::state::SharedAppState;
@@ -343,9 +344,8 @@ async fn build_universe(inputs: FnoStocksInputs<'_>) -> MoversUniverse {
         Some(_) if ids.is_empty() => Fetched::NoQuery,
         Some(_) if ids.len() > MAX_UNIVERSE_PRICE_ROWS => Fetched::Failed(QueryFailure::Refused),
         Some((start, window_end, closed)) => {
-            let end = closed.then_some(window_end);
             let bound = ids.len().max(fno_stocks::FNO_STOCKS_MAX_ROWS);
-            let sql = fno_stocks::build_fno_stocks_sql(&ids, start, end, bound + 1);
+            let sql = fno_stocks::build_fno_stocks_sql(&ids, start, window_end, bound + 1);
             let timeout = if closed {
                 inputs.timeout.max(Duration::from_secs(
                     fno_stocks::FNO_STOCKS_CLOSED_QUERY_TIMEOUT_SECS,
@@ -758,7 +758,7 @@ mod oracle {
             let status = if open { "no_data" } else { "closed" };
             return FnoStocksResponse::empty(status, open, total, observed_at_epoch_secs);
         };
-        let age = (at - newest).num_seconds().max(0);
+        let age = (at.and_utc().timestamp() - newest.and_utc().timestamp()).max(0);
         let window_secs = closed_window.map_or(fno_stocks::FNO_STOCKS_WINDOW_SECS, |(s, e)| {
             (e - s)
                 .num_seconds()
@@ -947,6 +947,30 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             other => panic!("expected snapshot, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_historical_stocks_cutoff_keeps_exact_boundary_and_refuses_later_fractions() {
+        let f = Fixture::new(4);
+        let rows = json!({"dataset": [
+            [2,"NSE_EQ",120.0,100.0,1,120.0,"2026-10-30T10:00:00.000000Z"],
+            [4,"NSE_EQ",140.0,100.0,1,140.0,"2026-10-30T10:00:00.000001Z"],
+        ]});
+        let url = http("200 OK", rows.to_string()).await;
+        let filter = Filter {
+            as_of: Some("2026-10-30T10:00".into()),
+            ..Filter::default()
+        };
+        let answer = snapshot(run(&f.0, &url, true, filter).await);
+        let ids: Vec<_> = answer
+            .rows
+            .iter()
+            .map(|row| row.price.security_id)
+            .collect();
+        assert_eq!(ids, [2]);
+        assert_eq!(answer.stocks_priced, 1);
+        assert_eq!(answer.as_of_ist.as_deref(), Some("10:00:00"));
+        assert_eq!(answer.status, SourceStatus::Closed);
     }
 
     #[tokio::test]

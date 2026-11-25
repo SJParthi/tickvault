@@ -1507,3 +1507,17 @@ wrote `.done`, releasing 2026-11-20. The runner, `day_repair_ssm.rs`, the
 workflow and their budget rows were deleted in the next PR, and their paths
 joined `RETIRED_ONE_OFF_PATHS`. The box subcommand `tickvault day-repair`
 stays as the record of what ran; it sends no shell.
+
+## §0.22. 2026-11-25 — timestamped Dhan index quotes in Stocks
+
+The requested Stocks reference view (§0.17) includes a row of index prices.
+The operator may request recent stored quotes for Nifty 50, Nifty Next 50,
+Nifty Bank, India VIX and FinNifty through the existing authenticated SQL
+reader. The query covers 60 seconds of Dhan index ticks and returns up to
+five rows. The page shows the IST tick time, expires old prices, and clears
+prices on lock or entry into a historical view. GIFT Nifty has no verified
+quote source in this read.
+
+With the concurrent disk readout correction, the measured operator-console
+JavaScript is 37,694 UTF-8 bytes and 350 lines
+including script tags. The guard records the byte count for this page.

@@ -412,8 +412,8 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-      - name: cargo audit
-        run: cargo audit --deny yanked
+      - name: Audit workspace and fuzz lockfiles
+        run: cargo audit --deny yanked --file Cargo.lock && cargo audit --deny yanked --file fuzz/Cargo.lock
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening

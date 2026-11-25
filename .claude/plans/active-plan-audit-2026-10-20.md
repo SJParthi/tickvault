@@ -1,5 +1,15 @@
 # Implementation Plan: 2026-10-20 seven-agent code audit fixes
 
+## November 25 follow-up on the Stocks dashboard
+
+Reuse a decoded, validated published Stocks universe in the Lambda for two seconds across filters. Bound the combined wait and fetch by the existing read timeout. Recheck the trading day, session and source timestamp on every hit. Keep historical reads on the box. Check concurrent readers, source expiry, an outage after cache expiry, and recovery. Use the existing captured timestamp, source and elapsed-time log for observations.
+
+Select only the requested page after filtering the eligible universe. Compare replies against full sorting, including tied values, missing prices and empty pages. Bound both ends of the database time window before taking each stock's latest row. Parse fractional timestamps before deciding whether a row belongs to the window. Verify both stock endpoints using the same data.
+
+Display index prices only for verified instruments with a recorded quote time. Present unavailable disk telemetry explicitly and show the configured disk warning thresholds. Preserve the existing authentication boundary, operator controls and paper trading settings. Revert each reader change independently through Git.
+
+For daily receipts, check current QuestDB catalog and WAL state before using an existing table. Keep the journal until successful delivery and retain the schema repair path. Exercise missing tables, changed keys and delayed WAL application against the supported database. Audit the independent fuzz and workspace lockfiles separately.
+
 ## November 24 follow-up on evidence of persistence and performance
 
 The app should record a count match only when QuestDB returns the positive

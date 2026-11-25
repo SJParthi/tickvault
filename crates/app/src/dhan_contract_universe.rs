@@ -563,6 +563,18 @@ pub fn contract_verdict_reasons(selection: &ContractSelection) -> Vec<&'static s
     reasons
 }
 
+/// Local gauges for the last successfully read contract master. If the master is
+/// unreadable the attach records its existing failure counter and keeps the
+/// last observation. A successfully read empty master sets both gauges to zero.
+fn record_contract_spot_coverage(selection: &ContractSelection) {
+    // APPROVED: cast — the selected market universe fits exactly in f64.
+    metrics::gauge!("tv_dhan_contract_underlyings_without_spot")
+        .set(selection.underlyings_without_spot as f64);
+    // APPROVED: cast — same bounded count as the denominator in the attach log.
+    metrics::gauge!("tv_dhan_contract_stock_option_underlyings")
+        .set(selection.stock_option_underlyings as f64);
+}
+
 /// Record the terminal verdict. One increment per reason, once per session.
 pub fn record_contract_verdict(selection: &ContractSelection) {
     for reason in contract_verdict_reasons(selection) {
@@ -2543,6 +2555,7 @@ pub async fn load_contract_universe(
         refused_off_expiry = selection.refused_off_expiry,
         "contract universe resolved"
     );
+    record_contract_spot_coverage(&selection);
     selection
 }
 
@@ -3442,6 +3455,44 @@ mod tests {
              saying otherwise would send the operator to shrink a universe that \
              is not the problem"
         );
+    }
+
+    #[test]
+    fn contract_spot_coverage_gauges_track_each_resolved_selection() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rows = [(1, "RELIANCE"), (2, "OTHER")].map(|(id, symbol)| {
+            contract(
+                id,
+                InstrumentClass::StockOption,
+                "NSE",
+                symbol,
+                20260828,
+                1_000,
+                OptionLeg::Call,
+            )
+        });
+        let mut both_priced = spot("RELIANCE", 1_000);
+        both_priced.extend(spot("OTHER", 1_000));
+        metrics::with_local_recorder(&recorder, || {
+            for (master, prices, missing, total) in [
+                (rows.as_slice(), no_spot(), 2, 2),
+                (rows.as_slice(), spot("RELIANCE", 1_000), 1, 2),
+                (rows.as_slice(), both_priced, 0, 2),
+                (&[][..], no_spot(), 0, 0),
+            ] {
+                let selection = select_contract_universe(master, &prices, TODAY, 25_000);
+                super::record_contract_spot_coverage(&selection);
+                let output = handle.render();
+                for (metric, count) in [
+                    ("tv_dhan_contract_underlyings_without_spot", missing),
+                    ("tv_dhan_contract_stock_option_underlyings", total),
+                ] {
+                    let sample = format!("{metric} {count}");
+                    assert!(output.lines().any(|line| line == sample), "{sample}");
+                }
+            }
+        });
     }
 
     #[test]

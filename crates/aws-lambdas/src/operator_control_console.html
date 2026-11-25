@@ -104,9 +104,10 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
 .stocks-open .tab{border:0;border-radius:0;background:none;color:#aaa;font:400 14px Arial;padding:24px 0}
 .stocks-open .tab.active{color:#00b386;border-bottom:2px solid #00b386;background:none}
 .stocks-open .toast{border-radius:3px;background:#242424;border-color:#444;color:#ddd}
-.market-ticker{height:48px;border-bottom:1px solid #242424;display:flex;align-items:stretch;overflow:hidden;background:#0a0a0a;padding:0 40px}
-.ticker-item{display:flex;align-items:center;gap:14px;min-width:245px;padding:0 24px 0 0;margin-right:24px;border-right:1px solid #252525;font-size:13px;white-space:nowrap}
-.ticker-item b{font-weight:400;color:#c6c6c6}.ticker-item span{color:#727272}.ticker-item small{font-size:10px;color:#666}
+.market-ticker{height:48px;border-bottom:1px solid #242424;display:flex;align-items:stretch;overflow-x:auto;background:#0a0a0a;padding:0 40px}
+.ticker-item{display:flex;align-items:center;gap:14px;min-width:max-content;padding:0 15px 0 0;margin-right:15px;border-right:1px solid #252525;font-size:13px;white-space:nowrap}
+.ticker-controls{display:grid;align-content:center;gap:2px;padding-right:20px;flex-shrink:0}.ticker-controls button{font:inherit;font-size:12px;padding:2px 8px;cursor:pointer}.ticker-controls small,.ticker-item small{color:#aaa;font-size:11px}
+.ticker-item b{font-weight:400;color:#c6c6c6}.ticker-item span{color:#dedede}
 .stocks-layout{display:grid;grid-template-columns:400px minmax(0,1fr);gap:24px;margin:34px 40px 0}
 .stocks-sidebar{min-width:0}.watch-search{position:relative;height:42px}
 .watch-search:before{content:'⌕';position:absolute;left:14px;top:6px;color:#888;font-size:25px}
@@ -229,13 +230,14 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
     </div>
 
     <section data-tab="movers" hidden>
-      <div class="market-ticker" aria-label="Index price availability">
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty 50</b><span>—</span><small>Quote unavailable</small></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Next 50</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>Nifty Bank</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>India VIX</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>FinNifty</b><span>—</span></div>
-        <div class="ticker-item" title="Index quotes are not included in this stock snapshot"><b>GIFT Nifty</b><span>—</span></div>
+      <div class="market-ticker" aria-label="Dhan index quotes">
+        <div class="ticker-controls"><button type="button" id="ticker-refresh">Refresh index quotes</button><small id="ticker-status" role="status">Last 60 seconds · IST</small></div>
+        <div class="ticker-item" data-quote-id="13"><b>Nifty 50</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="38"><b>Nifty Next 50</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="25"><b>Nifty Bank</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="21"><b>India VIX</b><span>—</span><small></small></div>
+        <div class="ticker-item" data-quote-id="27"><b>FinNifty</b><span>—</span><small></small></div>
+        <div class="ticker-item"><b>GIFT Nifty</b><small>No quote source</small></div>
       </div>
       <div class="stocks-layout">
         <aside class="stocks-sidebar" aria-label="Local stock watchlist">
@@ -327,7 +329,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
           <div id="alarms"></div>
           <div class="lbl" style="margin-top:14px">storage — disk space &amp; database size (on the box)</div>
           <div class="shields" id="storage"></div>
-          <div class="muted" style="margin-top:8px">EBS auto-archives partitions &gt;90d to S3, and grows online — so it won't fill. Watch "DB size" climb day-by-day to see your GB/day. (Shows — when the box is stopped.)</div>
+          <div class="muted" style="margin-top:8px">Root disk alarms watch for 20 GiB or less free and usage above 90%. A dash means the host measurement is unavailable.</div>
         </details>
       </div>
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
@@ -523,11 +525,11 @@ function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textC
 
 function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
   TOKEN=v; keySave(v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
-function lock(){ TOKEN=''; moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+function lock(){ TOKEN=''; resetTicker(); moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
 
 function tab(name){ curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   $$('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
-  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers') loadMovers(); }
+  if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers'){expireTicker();loadMovers();} }
 
 async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return null; }
   try{ const r=await fetch(location.href,{method:'POST',
@@ -655,7 +657,7 @@ function dbDownloadCsv(){ if(!dbCsv){ toast('Run a query first'); return; }
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
 
 async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTML='<span class="muted">loading…</span>'; $('alarms').innerHTML='<span class="muted">loading…</span>';
-  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; return; }
+  const j=await call('aws_status'); if(!j){ $('awsstrip').innerHTML='<span class="warn">AWS read failed — retry</span>'; $('alarms').innerHTML=''; $('storage').textContent='Storage readings unavailable.'; return; }
   const cwFail=(j.alarms_firing===null||j.alarms_firing===undefined), al=j.alarms_firing||[];
   const alTxt=cwFail?'?':String(al.length), alCls=cwFail?'warn':(al.length?'bad':'ok');
   $('awsstrip').innerHTML='<span>💵 $'+esc(j.cost_mtd_usd||'—')+' spent this month</span>'+
@@ -663,12 +665,13 @@ async function loadAws(){ $('alarms').dataset.loaded='1'; $('awsstrip').innerHTM
     '<span>💾 disk '+esc(j.disk_pct||'—')+' used</span>';
   if(cwFail){ $('alarms').innerHTML='<span class="warn">CloudWatch read failed — retry.</span>'; }
   else{ $('alarms').innerHTML=al.length? al.map(a=>'<div class="pr"><span class="badge failure">ALARM</span> <span class="t">'+esc(a)+'</span></div>').join('') : '<span class="ok">all clear 🎉</span>'; }
-  const free=parseInt(j.disk_free_gb,10), pct=parseInt(j.disk_pct,10);
-  const freeOk=isNaN(free)?true:free>5; const pctOk=isNaN(pct)?true:pct<85;
+  const size=v=>/^\d+$/.test(v)?Number(v):NaN;
+  const free=size(j.disk_free_gb), used=size(j.disk_used_gb), db=size(j.db_size_gb);
+  const pct=/^(?:100|\d{1,2})%$/.test(j.disk_pct)?parseInt(j.disk_pct,10):NaN;
   $('storage').innerHTML=
-    shield('Disk free', (j.disk_free_gb?j.disk_free_gb+' GB':'—'), freeOk)+
-    shield('Disk used', (j.disk_used_gb?j.disk_used_gb+' GB ('+(j.disk_pct||'')+')':'—'), pctOk)+
-    shield('Database size', (j.db_size_gb?j.db_size_gb+' GB':'—'), true); }
+    (Number.isFinite(free)?shield('Disk free',free+' GiB',free>20):shieldIdle('Disk free'))+
+    (Number.isFinite(pct)?shield('Disk used',(Number.isFinite(used)?used+' GiB · ':'')+pct+'%',pct<=90):shieldIdle('Disk used'))+
+    (Number.isFinite(db)?shield('Database size',db+' GiB',true):shieldIdle('Database size')); }
 
 function fmtNs(n){ if(n==null||n==='') return '—'; n=Number(n); if(n<1000) return n.toFixed(0)+' ns';
   if(n<1e6) return (n/1e3).toFixed(2)+' µs'; if(n<1e9) return (n/1e6).toFixed(2)+' ms'; return (n/1e9).toFixed(2)+' s'; }
@@ -761,6 +764,44 @@ function renderWatch(){
 }
 function moversMessage(key){return $('movers-messages').getAttribute('data-'+key)||'Movers unavailable.';}
 function moversNote(key){$('movers-status').textContent=moversMessage(key);}
+const quoteCells=$$('[data-quote-id]');
+let tickerGeneration=0, tickerClockOrigin=0;
+function resetTicker(){
+  tickerGeneration++;
+  const historical=Boolean($('movers-date').value);
+  $('ticker-refresh').disabled=historical;
+  $('ticker-status').textContent=historical?'Quotes available in current view':'Last 60 seconds · IST';
+  for(const cell of quoteCells){delete cell.dataset.expires;cell.removeAttribute('title');cell.querySelector('span').textContent='—';cell.querySelector('small').textContent='';}
+}
+function expireTicker(){
+  for(const cell of quoteCells)if(cell.dataset.expires && Math.max(performance.now(),Date.now()-tickerClockOrigin)>=Number(cell.dataset.expires)){
+    delete cell.dataset.expires;cell.querySelector('span').textContent='—';cell.querySelector('small').textContent+=' · expired';
+  }
+}
+async function refreshTicker(){
+  const button=$('ticker-refresh'),status=$('ticker-status');
+  if(!TOKEN || button.disabled)return;
+  resetTicker();
+  const generation=tickerGeneration,start=performance.now();
+  tickerClockOrigin=Date.now()-start;button.disabled=true;status.textContent='Reading index quotes…';
+  const query="SELECT security_id, ltp, ts, datediff('s',ts,dateadd('m',330,now())) age_s FROM ticks WHERE feed='dhan' AND segment='IDX_I' AND security_id IN (13,38,25,21,27) AND ts BETWEEN dateadd('m',329,now()) AND dateadd('m',330,now()) LATEST ON ts PARTITION BY security_id LIMIT 5";
+  const reply=sqlResult(await call('sql',{query},AbortSignal.timeout(20000)));
+  if(generation!==tickerGeneration)return;
+  button.disabled=false;
+  if(!reply || reply.columns.join(',')!=='security_id,ltp,ts,age_s'){status.textContent='Quote read unavailable';return;}
+  status.textContent='Last 60 seconds · IST';
+  for(const cell of quoteCells){
+    const row=reply.rows.find(r=>r[0]===cell.dataset.quoteId),stamp=cell.querySelector('small');
+    if(!row){stamp.textContent='No recent tick';continue;}
+    const price=Number(row[1]),age=Number(row[3]),time=tcell(row[2]);
+    if(!Number.isFinite(price)||price<=0||!/^\d+$/.test(row[3])||age>60||time===row[2]){stamp.textContent='Invalid quote';continue;}
+    cell.querySelector('span').textContent=stockNumber(price);stamp.textContent=time.slice(11);cell.title=time;
+    cell.dataset.expires=String(start+(59-age)*1000);
+  }
+  expireTicker();
+}
+$('ticker-refresh').addEventListener('click',refreshTicker);
+$('movers-date').addEventListener('change',resetTicker);
 function moversFilter(){return {fno_only:$('movers-universe').value==='fno',index:$('movers-index').value||null,search:$('movers-search').value.trim(),direction:$('movers-direction').value,offset:moversOffset,sort_by:moversSort,sort_order:moversOrder,as_of:$('movers-date').value?$('movers-date').value+'T'+($('movers-time').value||'15:30'):undefined};}
 function sameMoversFilter(a,b){return a&&['fno_only','index','search','direction','offset','sort_by','sort_order','as_of'].every(k=>a[k]===b[k]);}
 function indexLabel(name){const aliases={'Nifty 50':'Nifty 50','Nifty Bank':'Nifty Bank','Nifty Financial Services':'Fin Nifty','Nifty Next 50':'Nifty Next 50','Nifty Smallcap 50':'Nifty Small Cap 50','Nifty Midcap 50':'Nifty Mid Cap 50','Nifty 100':'NIFTY 100','Nifty 200':'NIFTY 200'};return Object.hasOwn(aliases,name)?aliases[name]:name;}
@@ -812,8 +853,8 @@ $('universe-picker').addEventListener('change',e=>{const value=e.target.value;$(
 $('watch-search').addEventListener('input',renderWatch);$('watch-rows').addEventListener('click',e=>{const remove=e.target.closest('[data-remove]'),open=e.target.closest('[data-watch]');if(remove){stockWatch.delete(remove.dataset.remove);saveWatch();renderMovers();}else if(open){const s=stockWatch.get(open.dataset.watch);if(s){$('movers-search').value=stockSearchPrefix(s.name);changeMovers();}}});
 $('movers-rows').addEventListener('change',e=>{const id=Number(e.target.dataset.watchId),s=moversVisible.find(s=>s.security_id===id&&s.segment==='NSE_EQ');if(s){setWatch(s,e.target.checked);renderMovers();}});
 $('stocks-select-all').addEventListener('change',e=>{for(const s of moversVisible)setWatch(s,e.target.checked);renderMovers();});
-setInterval(()=>{if(curTab==='movers'&&!document.hidden&&!moversBusy)renderMovers();},1000);
-document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
+setInterval(()=>{if(curTab==='movers'&&!document.hidden){expireTicker();if(!moversBusy)renderMovers();}},1000);
+document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){expireTicker();renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
 moversIndices({index_names:[]});renderWatch();
 
 (function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');

@@ -20,6 +20,7 @@ mod tests {
     struct SessionProbe {
         active: Arc<metrics::atomics::AtomicU64>,
         login_polled: Arc<AtomicBool>,
+        authenticated: Arc<AtomicBool>,
         read_entered: Arc<Notify>,
     }
 
@@ -112,6 +113,7 @@ mod tests {
         read: ReadOutcome,
     ) -> Result<(), OrderUpdateConnectionError> {
         let active = metrics::Gauge::from_arc(Arc::clone(&probe.active));
+        let authenticated = Arc::clone(&probe.authenticated);
         let stream = WebSocketStream::from_raw_socket(
             SessionIo { probe, write, read },
             Role::Client,
@@ -129,7 +131,7 @@ mod tests {
                 order_sender: &orders,
                 wal_spill: None,
                 authenticated_signal: None,
-                authenticated_latch: None,
+                authenticated_latch: Some(&authenticated),
                 notifier: None,
                 failures_before_attempt: 0,
                 stability_reached: &mut stable,
@@ -154,8 +156,7 @@ mod tests {
     }
 
     // Regression: 2026-10-31 — dropping a login that cannot finish left active=1.
-    // This tests timeout cancellation, not a production login deadline: main does
-    // not yet impose that deadline. A timeout's inner future is owned and dropped.
+    // The caller may cancel before the connection's own deadline.
     #[tokio::test(start_paused = true)]
     async fn test_regression_order_update_active_gauge_login_timeout() {
         let probe = SessionProbe::default();
@@ -171,6 +172,25 @@ mod tests {
             0.0,
             "timed-out login must clear the active gauge"
         );
+
+        let login = run_session(probe.clone(), WriteOutcome::Pending, ReadOutcome::Pending);
+        tokio::pin!(login);
+        assert!(login.as_mut().now_or_never().is_none());
+        let timer_tick = Duration::from_millis(1);
+        time::advance(DIAL_TIMEOUT - timer_tick).await;
+        assert!(login.as_mut().now_or_never().is_none());
+        assert_eq!(probe.active(), 1.0);
+        time::advance(timer_tick + timer_tick).await;
+        let result = login
+            .now_or_never()
+            .expect("a blocked login must return through the reconnect error path");
+        assert!(matches!(
+            result,
+            Err(OrderUpdateConnectionError::LoginSendTimeout)
+        ));
+        assert_eq!(probe.active(), 0.0);
+        assert!(!probe.authenticated.load(Ordering::SeqCst));
+        assert!(probe.read_entered.notified().now_or_never().is_none());
     }
 
     // Regression: 2026-10-31 — aborting a connected read task bypassed manual resets.

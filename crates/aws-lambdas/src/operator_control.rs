@@ -3116,10 +3116,12 @@ mod tests {
         auth_failures: AuthFailureGuard,
         /// Plan PR MV: the published movers universe object.
         published_universe: Result<Vec<u8>, String>,
+        published_reads: std::sync::atomic::AtomicUsize,
         /// Plan PR MV: how long reading it takes (paused-clock tests).
         published_delay_ms: u64,
         /// Plan PR MV review: viewer heartbeats written.
         heartbeats: std::sync::Mutex<Vec<Vec<u8>>>,
+        clock_after_heartbeat: Option<i64>,
     }
 
     impl Default for MockShell {
@@ -3147,8 +3149,10 @@ mod tests {
                 captured_sync: std::sync::Mutex::new(Vec::new()),
                 auth_failures: AuthFailureGuard::new(),
                 published_universe: Err("absent".to_string()),
+                published_reads: Default::default(),
                 published_delay_ms: 0,
                 heartbeats: std::sync::Mutex::new(Vec::new()),
+                clock_after_heartbeat: None,
             }
         }
     }
@@ -3170,6 +3174,8 @@ mod tests {
             Some(&self.stock_movers_cache)
         }
         async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+            self.published_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.published_delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.published_delay_ms)).await;
             }
@@ -3198,7 +3204,9 @@ mod tests {
             self.wipes_authorized
         }
         fn now_epoch(&self) -> i64 {
-            self.now
+            self.clock_after_heartbeat
+                .filter(|_| !self.heartbeats.lock().unwrap().is_empty())
+                .unwrap_or(self.now)
         }
         fn env(&self, key: &str) -> String {
             self.env.get(key).cloned().unwrap_or_default()
@@ -3518,6 +3526,229 @@ mod tests {
                 "no SSM round trip"
             );
         }
+    }
+
+    fn healthy_box_reply(now: i64, filter: &crate::operator_stock_movers_wire::Filter) -> String {
+        use crate::operator_movers_universe::{MoversUniverse, select, weekday_session_open_at};
+        let universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now, weekday_session_open_at(now))).unwrap();
+        serde_json::to_string(&select(&universe, filter)).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_live_capture_never_regresses_between_sources_until_clock_reset() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let t = shell.now;
+        let f = Filter::default();
+        shell.sync_output = healthy_box_reply(t, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t);
+        shell.now = t + 5;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 5);
+        // Losing S3 cannot resurrect the older cached box reply, or a newly
+        // requested box reply containing the same older payload.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.now = t + 8;
+        shell.published_universe = Err("offline".into());
+        assert_eq!(
+            read(&shell, &f).await.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        shell.sync_output = healthy_box_reply(shell.now, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        shell.published_universe = Ok(published_universe(t + 6, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+
+        // A chosen minute goes directly to the box and may have an older capture.
+        let history = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..f.clone()
+        };
+        shell.sync_output = healthy_box_reply(t, &history);
+        assert_eq!(read(&shell, &history).await.captured_at_epoch_secs, t);
+        // Fresh data on the corrected clock can establish a new ordering interval.
+        shell.now = t - 120;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        let reset = read(&shell, &f).await;
+        assert!(matches!(reset.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reset.captured_at_epoch_secs, t - 120);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_older_inflight_box_capture_cannot_replace_a_newer_published_one() {
+        use crate::operator_movers_universe::{MoversUniverse, UniversePrices};
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let t = MockShell::default().now;
+        let mut u: MoversUniverse = serde_json::from_slice(&published_universe(t, false)).unwrap();
+        // A duplicate outside Nifty forces F&O alone to consult the box.
+        let fno = u.fno.as_mut().unwrap();
+        let mut listing = fno[0].clone();
+        listing.security_id = 3;
+        fno.push(listing);
+        let UniversePrices::Rows { rows } = &mut u.prices else {
+            panic!("fixture prices")
+        };
+        let mut duplicate = rows[0].clone();
+        duplicate.security_id = 3;
+        rows.extend([duplicate.clone(), duplicate]);
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let filter = Filter::default();
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            sync_output: healthy_box_reply(t - 2, &filter),
+            ..box_shell(Ok(serde_json::to_vec(&u).unwrap()))
+        };
+        let index = Filter {
+            fno_only: false,
+            index: Some("Nifty 50".into()),
+            ..Filter::default()
+        };
+        let (older, newer) = tokio::join!(
+            biased;
+            read(&shell, &filter),
+            async {
+                assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+                let reply = read(&shell, &index).await;
+                gate.add_permits(1);
+                reply
+            }
+        );
+        assert!(matches!(newer.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(newer.captured_at_epoch_secs, t);
+        assert_eq!(
+            older.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_newer_success_invalidates_cached_box_error() {
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let filter = Filter::default();
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Error { .. }
+        ));
+        shell.now += 1;
+        // The previous error's stamp is newer than this valid observation.
+        // Error timestamps must never advance the live price watermark.
+        shell.published_universe = Ok(published_universe(shell.now - 3, false));
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Snapshot { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.published_universe = Err("offline".into());
+        shell.sync_output = healthy_box_reply(shell.now, &filter);
+        let reply = read(&shell, &filter).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, shell.now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_recheck_window_after_heartbeat_and_use_box_for_selection_errors() {
+        use crate::operator_movers_universe::{UNIVERSE_IST_OFFSET_SECS, weekday_session_open_at};
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let f = Filter::default();
+        // 29 October 2026 (Thursday), in IST.
+        let midnight = (1_793_252_730 + UNIVERSE_IST_OFFSET_SECS).div_euclid(86_400) * 86_400
+            - UNIVERSE_IST_OFFSET_SECS;
+        for boundary in [
+            midnight,
+            midnight + 9 * 3600,
+            midnight + 15 * 3600 + 40 * 60,
+        ] {
+            let now = boundary + 1;
+            let after = boundary - 1;
+            let mut shell = box_shell(Ok(published_universe(now, weekday_session_open_at(now))));
+            shell.now = now;
+            shell.clock_after_heartbeat = Some(after);
+            shell.sync_output = healthy_box_reply(after, &f);
+            let reply = read(&shell, &f).await;
+            assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+            assert_eq!(reply.captured_at_epoch_secs, after, "boundary {boundary}");
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        }
+
+        let t = MockShell::default().now;
+        let mut universe: crate::operator_movers_universe::MoversUniverse =
+            serde_json::from_slice(&published_universe(t, false)).unwrap();
+        let crate::operator_movers_universe::UniversePrices::Rows { rows } = &mut universe.prices
+        else {
+            panic!("fixture prices");
+        };
+        rows.push(rows[0].clone());
+        let mut shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        shell.sync_output = healthy_box_reply(t - 1, &f);
+        let reply = read(&shell, &f).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, t - 1);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_share_one_object_across_filters_and_refresh_on_expiry() {
+        use crate::operator_stock_movers::from_published;
+        use crate::operator_stock_movers_wire::Filter;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let now = MockShell::default().now;
+        let mut shell = box_shell(Ok(published_universe(now, false)));
+        shell.published_delay_ms = 100;
+        let fno = Filter::default();
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            fno_only: false,
+            ..Filter::default()
+        };
+        let (a, b) = tokio::join!(from_published(&shell, &fno), from_published(&shell, &index));
+        assert!(a.unwrap().valid_at(now, &fno));
+        assert!(b.unwrap().valid_at(now, &index));
+        assert_eq!(shell.published_reads.load(Relaxed), 1);
+
+        shell.published_universe = Err("offline".into());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(from_published(&shell, &index).await, Err("unavailable"));
+        shell.published_universe = Ok(published_universe(now - 20, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            now - 20
+        );
+        shell.now += 1;
+        assert_eq!(from_published(&shell, &fno).await, Err("stale"));
+        assert_eq!(shell.published_reads.load(Relaxed), 4);
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            shell.now
+        );
+        let historical = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..Filter::default()
+        };
+        assert_eq!(from_published(&shell, &historical).await, Err("as_of"));
+        assert_eq!(shell.published_reads.load(Relaxed), 5);
     }
 
     #[tokio::test]
@@ -3973,13 +4204,32 @@ mod tests {
         // for 30 days (`tv_key` with an expiry) instead of per tab; Lock and a
         // 401 forget it; the lock screen text says so. Pinned separately by
         // `console_remembers_the_key_for_thirty_days_only`.
+        // 2026-11-25: timestamped Dhan index quotes and accurate disk-panel wording.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "96119d480539e50a633fb22de3b19842a1cf0c3885481a10e029fa596a97c160"
+            "7c9c475798c777dd12f9edb366b78baf10cdd8606d9f0ebc37504933e4952877"
         );
-        assert_eq!(CONSOLE_HTML.len(), 86_069);
+        assert_eq!(CONSOLE_HTML.len(), 88_877);
+    }
+
+    #[test]
+    fn stocks_index_quote_query_respects_operator_read_policy_and_row_cap() {
+        let query = CONSOLE_HTML
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(r#"const query=""#)?
+                    .strip_suffix(r#"";"#)
+                    .filter(|sql| sql.contains("AS age_s") || sql.contains(" age_s"))
+            })
+            .expect("index quote SQL in the operator Stocks view");
+        assert!(is_safe_sql(query));
+        assert_eq!(cap_sql_rows(query), query);
+        assert!(query.contains("feed='dhan' AND segment='IDX_I'"));
+        assert!(query.contains("ts BETWEEN dateadd('m',329,now()) AND dateadd('m',330,now())"));
+        assert!(query.ends_with("LATEST ON ts PARTITION BY security_id LIMIT 5"));
     }
 
     // ------------------------------------------------ audit L4 source scans

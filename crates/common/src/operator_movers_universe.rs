@@ -18,11 +18,10 @@
 //!
 //! # Complexity
 //!
-//! Cold path, never per tick. [`select`] is O(n log n) in the rows it keeps
-//! (n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]): one pass to build the lookup maps from
-//! the stored lists (O(list rows)), one pass over the price rows, one sort of
-//! the kept rows, one optional sort by the requested column. [`MoversUniverse::valid`]
-//! is O(rows + list rows).
+//! Cold path, never per tick. [`select`] builds lookup maps from the lists
+//! and scans the price rows. It partitions the matching rows at the page
+//! boundaries in linear time, then sorts at most [`SELECTION_LIMIT`] rows.
+//! [`MoversUniverse::valid`] is O(rows + list rows).
 //!
 //! # Honest limits
 //!
@@ -545,17 +544,6 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
             last_trade_ist: hh_mm_ss(row.ts_ist_secs),
         });
     }
-    // O(k log k): change % descending, no change last, then name, then
-    // security id: a total order, so the database order never shows.
-    stocks.sort_by(|a, b| {
-        match (a.change_pct, b.change_pct) {
-            (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        }
-        .then_with(|| a.security_id.cmp(&b.security_id))
-    });
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
         let status = if open {
             SourceStatus::NoData
@@ -582,6 +570,52 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
         window_secs: universe.window_secs,
         stocks,
     }
+}
+
+/// Protocol v2 clients omitting sort fields retain the original percentage,
+/// name and identity ordering. The losers view reversed that entire order.
+fn compare_for_page(
+    filter: &Filter,
+    left: &MemberStock,
+    right: &MemberStock,
+) -> std::cmp::Ordering {
+    if filter.sort_by.is_some() {
+        return filter.compare_rows(left, right);
+    }
+    let (a, b) = (&left.price, &right.price);
+    let order = match (a.change_pct, b.change_pct) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| a.name.cmp(&b.name))
+    .then_with(|| a.security_id.cmp(&b.security_id));
+    if filter.direction == Direction::Losers {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+/// Isolate the requested ranks in linear time and sort just the returned page.
+/// The comparator totally orders validated, unique stock identities.
+fn select_page(mut matches: Vec<MemberStock>, filter: &Filter) -> Vec<MemberStock> {
+    let start = filter.offset;
+    if start >= matches.len() {
+        return Vec::new();
+    }
+    let compare = |a: &MemberStock, b: &MemberStock| compare_for_page(filter, a, b);
+    if start > 0 {
+        matches.select_nth_unstable_by(start - 1, compare);
+    }
+    let after_offset = &mut matches[start..];
+    if after_offset.len() > SELECTION_LIMIT {
+        after_offset.select_nth_unstable_by(SELECTION_LIMIT, compare);
+    }
+    let count = after_offset.len().min(SELECTION_LIMIT);
+    after_offset[..count].sort_unstable_by(compare);
+    matches.into_iter().skip(start).take(count).collect()
 }
 
 fn finish(
@@ -635,17 +669,8 @@ fn finish(
             fno: eligible,
         });
     }
-    if filter.sort_by.is_some() {
-        selected.sort_unstable_by(|left, right| filter.compare_rows(left, right));
-    } else if filter.direction == Direction::Losers {
-        selected.reverse();
-    }
     let matching_total = selected.len();
-    let rows = selected
-        .into_iter()
-        .skip(filter.offset)
-        .take(SELECTION_LIMIT)
-        .collect();
+    let rows = select_page(selected, filter);
     let snapshot = Snapshot {
         filter: filter.clone(),
         status: prices.status,
@@ -693,9 +718,9 @@ fn finish(
 
 /// The filtered, paged movers reply for `filter` from one universe: exactly
 /// what the per-filter API path returned for the same rows, lists and times
-/// (pinned by the API's property test against that path). Pure; O(n log n),
-/// n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]. Never panics; every failure is a typed
-/// reply.
+/// (pinned by the API's property test against that path). Ranking takes O(n)
+/// comparisons plus O(p log p) for the returned page of p ≤ [`SELECTION_LIMIT`].
+/// n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]. Every failure is a typed reply.
 #[must_use]
 pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     let now = universe.observed_at_epoch_secs;
@@ -857,6 +882,104 @@ mod tests {
         assert!(losers.rows.is_empty(), "every change is positive");
         let reply = select(&u, &Filter::default());
         assert!(reply.valid_at(OBSERVED, &Filter::default()));
+    }
+
+    #[test]
+    fn test_movers_pages_match_full_sort_across_ties_missing_values_and_offsets() {
+        // Interleave IDs and repeat names and prices so equal values straddle page boundaries.
+        let rows: Vec<_> = (0..97_u64)
+            .map(|i| {
+                let id = (i * 53) % 97 + 1;
+                let mut price = row(
+                    id,
+                    match i % 3 {
+                        0 => 90.0,
+                        1 => 100.0,
+                        _ => 110.0,
+                    },
+                    5,
+                );
+                if id % 11 == 0 {
+                    price.prev_close = None;
+                }
+                price.volume = (id % 7 != 0).then_some((1_u64 << 53) + id % 4);
+                price
+            })
+            .collect();
+        let mut all = universe(rows.clone());
+        all.fno = Some(
+            rows.iter()
+                .map(|r| ListedStock {
+                    name: format!("SHARE{}", r.security_id % 4),
+                    ..listed(r.security_id)
+                })
+                .collect(),
+        );
+
+        // Project each input onto its wire row independently of the multi-row ranking.
+        let mut one = all.clone();
+        let mut legacy: Vec<_> = rows
+            .into_iter()
+            .map(|r| {
+                one.prices = UniversePrices::Rows { rows: vec![r] };
+                snapshot(select(&one, &Filter::default())).rows.remove(0)
+            })
+            .collect();
+        // Original price-view order: descending percentage, then ascending name and ID.
+        legacy.sort_by(|left, right| {
+            let (a, b) = (&left.price, &right.price);
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap()
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.security_id.cmp(&b.security_id))
+        });
+        let sorts = [
+            SortColumn::Name,
+            SortColumn::Ltp,
+            SortColumn::Change,
+            SortColumn::ChangePct,
+            SortColumn::ValueCr,
+            SortColumn::Volume,
+        ];
+        for direction in [Direction::All, Direction::Gainers, Direction::Losers] {
+            let modes = sorts
+                .into_iter()
+                .flat_map(|c| {
+                    [
+                        (Some(c), Some(SortOrder::Asc)),
+                        (Some(c), Some(SortOrder::Desc)),
+                    ]
+                })
+                .chain(std::iter::once((None, None)));
+            for (sort_by, sort_order) in modes {
+                let mut filter = Filter {
+                    direction,
+                    sort_by,
+                    sort_order,
+                    ..Filter::default()
+                };
+                let mut ordered: Vec<_> = legacy
+                    .iter()
+                    .filter(|r| filter.matches_price(&r.price))
+                    .cloned()
+                    .collect();
+                if sort_by.is_some() {
+                    ordered.sort_unstable_by(|a, b| filter.compare_rows(a, b));
+                } else if direction == Direction::Losers {
+                    ordered.reverse();
+                }
+                for offset in [0, 20, 40, 60, 80, 100, MAX_SOURCE_ROWS - SELECTION_LIMIT] {
+                    filter.offset = offset;
+                    let result = snapshot(select(&all, &filter));
+                    assert_eq!(result.matching_total, ordered.len());
+                    assert_eq!((result.stocks_priced, result.universe_total), (97, 97));
+                    let start = offset.min(ordered.len());
+                    let end = (start + SELECTION_LIMIT).min(ordered.len());
+                    assert_eq!(result.rows, ordered[start..end], "{filter:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -1,21 +1,79 @@
-//! Authenticated filtered reader. At most one bounded cached filter result and
-//! one command in flight per Lambda container. Never filters a truncated page.
+//! Authenticated Stocks reader. Each container retains one published universe
+//! across filter changes and one fallback reply from the private app.
 use crate::operator_control::OpsShell;
 use crate::operator_movers_universe::{
-    MAX_UNIVERSE_BYTES, MoversUniverse, UNIVERSE_MAX_FUTURE_SKEW_SECS,
-    VIEWER_HEARTBEAT_INTERVAL_SECS, ViewerHeartbeat, select,
+    MAX_UNIVERSE_BYTES, MoversUniverse, UNIVERSE_IST_OFFSET_SECS, UNIVERSE_MAX_AGE_SECS,
+    UNIVERSE_MAX_FUTURE_SKEW_SECS, VIEWER_HEARTBEAT_INTERVAL_SECS, ViewerHeartbeat, select,
+    weekday_session_open_at,
 };
 use crate::operator_movers_wire::{BridgeError, MAX_WIRE_BYTES};
-use crate::operator_stock_movers_wire::{Filter, Reply};
+use crate::operator_stock_movers_wire::{Filter, Outcome, Reply};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 const CACHE_SECONDS: u64 = 20;
 const BRIDGE_TIMEOUT_SECS: u64 = 22;
 #[derive(Default)]
 pub struct MoversCache {
-    value: tokio::sync::Mutex<Option<(tokio::time::Instant, Filter, Reply)>>,
+    published: tokio::sync::Mutex<Option<(tokio::time::Instant, Arc<MoversUniverse>)>>,
+    value: tokio::sync::Mutex<Option<BoxCacheEntry>>,
+    live: std::sync::Mutex<LiveHistory>,
     /// Plan PR MV review: UTC second this container last wrote the viewer
     /// heartbeat (0 = never).
     heartbeat_at: AtomicI64,
+}
+
+struct BoxCacheEntry {
+    stored: tokio::time::Instant,
+    filter: Filter,
+    reply: Reply,
+    revision: u64,
+}
+
+#[derive(Default)]
+struct LiveHistory {
+    last_clock: Option<i64>,
+    latest_capture: Option<i64>,
+    revision: u64,
+}
+
+fn same_market_window(a: i64, b: i64) -> bool {
+    let ist_day = |t: i64| {
+        t.saturating_add(UNIVERSE_IST_OFFSET_SECS)
+            .div_euclid(86_400)
+    };
+    ist_day(a) == ist_day(b) && weekday_session_open_at(a) == weekday_session_open_at(b)
+}
+
+impl MoversCache {
+    // Serializes only small in-memory decisions, never an AWS request. A real
+    // clock rollback starts a new ordering interval for this Lambda container.
+    fn live_history(&self, now: i64) -> std::sync::MutexGuard<'_, LiveHistory> {
+        let mut state = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        if state
+            .last_clock
+            .max(state.latest_capture)
+            .is_some_and(|last| {
+                now < last
+                    && (last.saturating_sub(now) > UNIVERSE_MAX_FUTURE_SKEW_SECS
+                        || !same_market_window(last, now))
+            })
+        {
+            state.latest_capture = None;
+            state.revision = state.revision.wrapping_add(1);
+        }
+        state.last_clock = Some(now);
+        state
+    }
+
+    fn accept_live_snapshot(&self, capture: i64, now: i64) -> bool {
+        let mut state = self.live_history(now);
+        if state.latest_capture.is_some_and(|last| capture < last) {
+            return false;
+        }
+        state.latest_capture = Some(capture);
+        state.revision = state.revision.wrapping_add(1);
+        true
+    }
 }
 fn decode(output: &str, now: i64, filter: &Filter) -> Reply {
     if output.is_empty() {
@@ -85,10 +143,46 @@ async fn bounded_capture<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
 }
 /// Bound on reading the published universe before falling back to the box.
 const PUBLISHED_READ_TIMEOUT_MILLIS: u64 = 2_000;
+// The publisher refreshes every five seconds while viewed. Keep the Lambda
+// reuse window as short as the app's two-second universe cache.
+const PUBLISHED_CACHE_SECONDS: u64 = 2;
+
+async fn published_universe<S: OpsShell>(shell: &S) -> Result<Arc<MoversUniverse>, &'static str> {
+    let mut slot = match shell.stock_movers_cache() {
+        Some(cache) => Some(cache.published.lock().await),
+        None => None,
+    };
+    if let Some((stored, universe)) = slot.as_deref().and_then(Option::as_ref)
+        && stored.elapsed().as_secs() < PUBLISHED_CACHE_SECONDS
+        && universe.usable_at(shell.now_epoch()).is_ok()
+    {
+        return Ok(Arc::clone(universe));
+    }
+    if let Some(slot) = slot.as_deref_mut() {
+        *slot = None;
+    }
+    let bytes = shell
+        .movers_universe_object()
+        .await
+        .map_err(|_| "unavailable")?;
+    if bytes.len() > MAX_UNIVERSE_BYTES {
+        return Err("too_large");
+    }
+    let universe: MoversUniverse = serde_json::from_slice(&bytes).map_err(|_| "corrupt")?;
+    universe
+        .usable_at(shell.now_epoch())
+        .map_err(|r| r.as_str())?;
+    let universe = Arc::new(universe);
+    if let Some(slot) = slot.as_deref_mut() {
+        *slot = Some((tokio::time::Instant::now(), Arc::clone(&universe)));
+    }
+    Ok(universe)
+}
 
 /// Plan PR MV (2026-11-06): the reply from the published movers universe, or
 /// why it cannot be used. A chosen minute (`as_of`) always goes to the box.
-/// Cold path: one bounded GetObject, O(bytes) parse, O(n log n) select.
+/// A cache miss reads and decodes the bounded object. Warm requests recheck
+/// its source clock and apply their filter to the same set of stock rows.
 pub(crate) async fn from_published<S: OpsShell>(
     shell: &S,
     filter: &Filter,
@@ -96,23 +190,17 @@ pub(crate) async fn from_published<S: OpsShell>(
     if filter.as_of.is_some() {
         return Err("as_of");
     }
-    let bytes = tokio::time::timeout(
+    let universe = tokio::time::timeout(
         std::time::Duration::from_millis(PUBLISHED_READ_TIMEOUT_MILLIS),
-        shell.movers_universe_object(),
+        published_universe(shell),
     )
     .await
-    .map_err(|_| "timeout")?
-    .map_err(|_| "unavailable")?;
-    if bytes.len() > MAX_UNIVERSE_BYTES {
-        return Err("too_large");
-    }
-    let universe: MoversUniverse = serde_json::from_slice(&bytes).map_err(|_| "corrupt")?;
-    let now = shell.now_epoch();
-    universe
-        .usable_at(now)
-        .map_err(|refusal| refusal.as_str())?;
+    .map_err(|_| "timeout")??;
     let reply = select(&universe, filter);
-    if !reply.valid_at(now, filter) {
+    if matches!(reply.outcome, Outcome::Error { .. }) {
+        return Err("selection_failed");
+    }
+    if !reply.valid_at(shell.now_epoch(), filter) {
         return Err("reply_invalid");
     }
     Ok(reply)
@@ -183,15 +271,29 @@ pub async fn read<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     }
     let started = std::time::Instant::now();
     let (published, ()) = tokio::join!(from_published(shell, filter), note_viewer(shell, filter));
+    let now = shell.now_epoch();
     let fallback = match published {
-        Ok(reply) => {
-            tracing::info!(
-                source = "s3",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "stock movers answered"
-            );
-            return reply;
+        Ok(reply)
+            if now.saturating_sub(reply.captured_at_epoch_secs) <= UNIVERSE_MAX_AGE_SECS
+                && reply.valid_at(now, filter)
+                && same_market_window(reply.captured_at_epoch_secs, now)
+                && matches!(&reply.outcome, Outcome::Snapshot { snapshot } if snapshot.market_open == weekday_session_open_at(now)) =>
+        {
+            if shell
+                .stock_movers_cache()
+                .is_some_and(|cache| !cache.accept_live_snapshot(reply.captured_at_epoch_secs, now))
+            {
+                "older_than_last_snapshot"
+            } else {
+                tracing::info!(
+                    source = "s3",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "stock movers answered"
+                );
+                return reply;
+            }
         }
+        Ok(_) => "expired_during_read",
         Err(reason) => reason,
     };
     let reply = read_from_box(shell, filter).await;
@@ -204,7 +306,7 @@ pub async fn read<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     reply
 }
 
-/// The SSM path, unchanged from before plan PR MV.
+/// The private-app fallback still shares one in-flight command per container.
 async fn read_from_box<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     let Some(cache) = shell.stock_movers_cache() else {
         return bounded_capture(shell, filter).await;
@@ -212,20 +314,58 @@ async fn read_from_box<S: OpsShell>(shell: &S, filter: &Filter) -> Reply {
     let Ok(mut slot) = cache.value.try_lock() else {
         return Reply::error(BridgeError::Busy, shell.now_epoch());
     };
-    if let Some((stored, held, reply)) = slot.as_ref()
-        && held == filter
-        && stored.elapsed().as_secs() < CACHE_SECONDS
-        && reply.valid_at(shell.now_epoch(), filter)
+    let now = shell.now_epoch();
+    if let Some(held) = slot.as_ref()
+        && &held.filter == filter
+        && held.stored.elapsed().as_secs() < CACHE_SECONDS
+        && held.reply.valid_at(now, filter)
+        && (filter.as_of.is_some()
+            || match held.reply.outcome {
+                Outcome::Error { .. } => held.revision == cache.live_history(now).revision,
+                Outcome::Snapshot { .. } => {
+                    same_market_window(held.reply.captured_at_epoch_secs, now)
+                        && cache.accept_live_snapshot(held.reply.captured_at_epoch_secs, now)
+                }
+            })
     {
-        return reply.clone();
+        return held.reply.clone();
     }
+    let revision = if filter.as_of.is_some() {
+        0
+    } else {
+        cache.live_history(now).revision
+    };
     let reply = bounded_capture(shell, filter).await;
-    *slot = Some((tokio::time::Instant::now(), filter.clone(), reply.clone()));
+    let now = shell.now_epoch();
+    if filter.as_of.is_none()
+        && matches!(reply.outcome, Outcome::Snapshot { .. })
+        && (!reply.valid_at(now, filter)
+            || !same_market_window(reply.captured_at_epoch_secs, now)
+            || !cache.accept_live_snapshot(reply.captured_at_epoch_secs, now))
+    {
+        return Reply::error(BridgeError::InvalidResponse, now);
+    }
+    *slot = Some(BoxCacheEntry {
+        stored: tokio::time::Instant::now(),
+        filter: filter.clone(),
+        reply: reply.clone(),
+        revision,
+    });
     reply
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_live_capture_recovers_when_several_clock_steps_exceed_future_skew() {
+        let cache = MoversCache::default();
+        let now = 1_800_000_000;
+        assert!(cache.accept_live_snapshot(now, now));
+        assert!(!cache.accept_live_snapshot(now - 4, now - 4));
+        assert!(cache.accept_live_snapshot(now - 8, now - 8));
+    }
+
     #[test]
     fn test_claim_heartbeat_once_per_interval_and_after_a_clock_step() {
         let last = AtomicI64::new(0);

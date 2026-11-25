@@ -151,7 +151,9 @@ pub fn tick_conservation_audit_ddl_statements() -> Vec<String> {
     statements
 }
 
-/// Returns true when QuestDB acknowledges every schema statement, including DEDUP.
+/// Confirms the current table identity, repairing a missing or legacy schema first.
+/// The SQL catalog check and the later ILP POST are separate database operations.
+/// Out-of-band table replacement must still be coordinated with the writer.
 /// A failed ensure leaves the new receipt on disk until a later ensure succeeds.
 pub async fn ensure_tick_conservation_audit_table(questdb_config: &QuestDbConfig) -> bool {
     let base_url = format!(
@@ -185,7 +187,186 @@ pub(crate) async fn ensure_schema_before_replay(client: &reqwest::Client, write_
     ensure_schema(client, exec.as_str()).await
 }
 
+// The catalog reflects applied WAL transactions. A prior DDL can be committed
+// but temporarily invisible to both tables() and table_columns().
+const CATALOG_APPLY_POLLS: usize = 12;
+const CATALOG_INITIAL_WAIT_MS: u64 = 2;
+const CATALOG_MAX_WAIT_MS: u64 = 32;
+const CATALOG_RESPONSE_LIMIT: usize = 32 * 1024;
+
+static CATALOG_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    // O(1) EXEMPT: build once from the fixed production receipt schema.
+    let names = TICK_CONSERVATION_AUDIT_COLUMNS
+        .iter()
+        .map(|(name, _)| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let limit = TICK_CONSERVATION_AUDIT_COLUMNS.len() + 1;
+    // The extra row detects an unexpected key or designated column. Legacy
+    // non-key columns are deliberately excluded because the retired writer used them.
+    format!(
+        r#"SELECT c."column", c.type, c.designated, c.upsertKey, t.dedup,
+        t.walEnabled, t.partitionBy, t.designatedTimestamp, t.table_txn,
+        w.writerTxn, w.sequencerTxn, w.suspended
+        FROM table_columns('{TICK_CONSERVATION_AUDIT_TABLE}') c CROSS JOIN
+        (SELECT table_name, dedup, walEnabled, partitionBy, designatedTimestamp, table_txn
+         FROM tables() WHERE table_name='{TICK_CONSERVATION_AUDIT_TABLE}') t
+        LEFT JOIN wal_tables() w ON t.table_name=w.name
+        WHERE c.designated OR c.upsertKey OR c."column" IN ({names}) LIMIT {limit}"#
+    )
+});
+
+#[derive(serde::Deserialize)]
+struct CatalogColumn {
+    name: String,
+    kind: String,
+    designated: bool,
+    key: bool,
+    dedup: bool,
+    wal: bool,
+    partition: String,
+    timestamp: Option<String>,
+    table_txn: Option<i64>,
+    writer_txn: Option<i64>,
+    sequencer_txn: Option<i64>,
+    suspended: Option<bool>,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum SchemaState {
+    Ready,
+    NeedsRepair,
+    Applying,
+}
+
+fn catalog_state(rows: &[CatalogColumn]) -> Result<SchemaState> {
+    let first_txn = rows.first().and_then(|first| first.table_txn);
+    for column in rows {
+        if column.wal {
+            anyhow::ensure!(
+                column.suspended == Some(false),
+                "audit WAL suspended or unconfirmed"
+            );
+            let writer = column
+                .writer_txn
+                .context("missing applied WAL transaction")?;
+            let sequencer = column
+                .sequencer_txn
+                .context("missing sequencer transaction")?;
+            // A newly created empty QuestDB 9.3.5 table has no table_txn yet.
+            // Only an initial WAL position on *both* sides establishes that case.
+            let table = column
+                .table_txn
+                .or_else(|| (writer == 0 && sequencer == 0).then_some(0));
+            anyhow::ensure!(
+                table.is_none_or(|txn| txn >= 0) && writer >= 0 && sequencer >= 0,
+                "invalid WAL transaction"
+            );
+            if column.table_txn != first_txn || table != Some(writer) || writer != sequencer {
+                return Ok(SchemaState::Applying);
+            }
+        }
+    }
+    let exact = rows.len() == TICK_CONSERVATION_AUDIT_COLUMNS.len()
+        && TICK_CONSERVATION_AUDIT_COLUMNS.iter().all(|&(name, kind)| {
+            rows.iter().any(|column| {
+                column.name == name
+                    && column.kind == kind
+                    && column.designated == (name == "ts")
+                    && column.key
+                        == DEDUP_KEY_TICK_CONSERVATION_AUDIT
+                            .split(", ")
+                            .any(|key| key == name)
+                    && column.wal
+                    && column.dedup
+                    && column.partition == "DAY"
+                    && column.timestamp.as_deref() == Some("ts")
+            })
+        });
+    Ok(if exact {
+        SchemaState::Ready
+    } else {
+        SchemaState::NeedsRepair
+    })
+}
+
+async fn read_schema(client: &reqwest::Client, base_url: &str) -> Result<SchemaState> {
+    let mut response = client
+        .get(base_url)
+        .query(&[("query", CATALOG_SQL.as_str())])
+        .send()
+        .await?;
+    let status = response.status();
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|n| n <= CATALOG_RESPONSE_LIMIT as u64),
+        "oversize catalog reply"
+    );
+    let mut body = Vec::new();
+    // A chunked response can omit Content-Length. Refuse excess bytes before copying them.
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(
+            chunk.len() <= CATALOG_RESPONSE_LIMIT.saturating_sub(body.len()),
+            "oversize catalog reply"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && value["error"].as_str() == Some("table does not exist [table=tick_conservation_audit]")
+    {
+        return Ok(SchemaState::NeedsRepair);
+    }
+    anyhow::ensure!(
+        status.is_success() && value.get("error").is_none(),
+        "audit catalog request refused ({status})"
+    );
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        dataset: Vec<CatalogColumn>,
+    }
+    let reply: Reply = serde_json::from_value(value)?;
+    catalog_state(&reply.dataset)
+}
+
+async fn settled_schema(client: &reqwest::Client, base_url: &str) -> Result<SchemaState> {
+    let mut wait_ms = CATALOG_INITIAL_WAIT_MS;
+    for poll in 0..=CATALOG_APPLY_POLLS {
+        let state = read_schema(client, base_url).await?;
+        if state != SchemaState::Applying {
+            return Ok(state);
+        }
+        if poll < CATALOG_APPLY_POLLS {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            wait_ms = (wait_ms * 2).min(CATALOG_MAX_WAIT_MS);
+        }
+    }
+    anyhow::bail!("audit WAL catalog has not caught up")
+}
+
 async fn ensure_schema(client: &reqwest::Client, base_url: &str) -> bool {
+    let state = settled_schema(client, base_url).await;
+    let verified = match state {
+        Ok(SchemaState::Ready) => return true,
+        Ok(SchemaState::NeedsRepair) if repair_schema(client, base_url).await => {
+            settled_schema(client, base_url).await
+        }
+        state => state,
+    };
+    if matches!(verified, Ok(SchemaState::Ready)) {
+        return true;
+    }
+    error!(
+        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+        stage = "tick_conservation_ensure_schema",
+        ?verified,
+        "QuestDB catalog did not confirm the daily audit receipt schema"
+    );
+    false
+}
+
+async fn repair_schema(client: &reqwest::Client, base_url: &str) -> bool {
     for ddl in &tick_conservation_audit_ddl_statements() {
         match client
             .get(base_url)
@@ -537,22 +718,92 @@ mod tests {
         assert_eq!(w.pending(), 1);
     }
 
-    // The fixture either acknowledges every DDL or refuses the first. The
-    // disconnected ILP writer exercises the final-flush error after a good schema.
+    const CATALOG_BODY: &str = include_str!("../tests/fixtures/tick_conservation_catalog.json");
+    const CATALOG_REPLY: &str = concat!(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        include_str!("../tests/fixtures/tick_conservation_catalog.json")
+    );
+    const MISSING_TABLE: &str = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n{\"error\":\"table does not exist [table=tick_conservation_audit]\"}";
+
+    #[test]
+    fn catalog_requires_every_receipt_column_and_exact_applied_wal_identity() {
+        let data: serde_json::Value = serde_json::from_str(CATALOG_BODY).unwrap();
+        let rows = &data["dataset"];
+        let state = |v: serde_json::Value| {
+            catalog_state(&serde_json::from_value::<Vec<CatalogColumn>>(v).unwrap())
+        };
+        assert_eq!(state(rows.clone()).unwrap(), SchemaState::Ready);
+        for (index, field, value) in [
+            (0, 2, serde_json::json!(false)),
+            (3, 2, serde_json::json!(true)),
+            (1, 3, serde_json::json!(false)),
+            (4, 3, serde_json::json!(true)),
+            (0, 4, serde_json::json!(false)),
+            (0, 5, serde_json::json!(false)),
+            (0, 6, serde_json::json!("MONTH")),
+            (0, 7, serde_json::json!("another_ts")),
+            (2, 1, serde_json::json!("STRING")),
+            (9, 1, serde_json::json!("INT")),
+            (10, 0, serde_json::json!("unexpected_extra")),
+        ] {
+            let mut changed = rows.clone();
+            changed[index][field] = value;
+            assert_eq!(state(changed).unwrap(), SchemaState::NeedsRepair);
+        }
+        let mut empty = rows.clone();
+        for row in empty.as_array_mut().unwrap() {
+            row[8] = serde_json::Value::Null;
+            row[9] = serde_json::json!(0);
+            row[10] = serde_json::json!(0);
+        }
+        assert_eq!(state(empty.clone()).unwrap(), SchemaState::Ready);
+        empty[0][10] = serde_json::json!(1);
+        assert_eq!(state(empty).unwrap(), SchemaState::Applying);
+        let mut extra = rows.clone();
+        extra.as_array_mut().unwrap().push(rows[0].clone());
+        assert_eq!(state(extra).unwrap(), SchemaState::NeedsRepair);
+        for index in [8, 9, 10] {
+            let mut lagging = rows.clone();
+            lagging[0][index] = serde_json::json!(42);
+            assert_eq!(state(lagging).unwrap(), SchemaState::Applying);
+        }
+        for (field, value) in [
+            (9, serde_json::Value::Null),
+            (10, serde_json::json!(-1)),
+            (11, serde_json::json!(true)),
+        ] {
+            let mut invalid = rows.clone();
+            invalid[0][field] = value;
+            assert!(state(invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_chunked_catalog_never_confirms_a_receipt() {
+        use crate::audit_spill::test_support::status_server;
+        static RESPONSE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            let body = format!("{}{}", CATALOG_BODY, " ".repeat(CATALOG_RESPONSE_LIMIT));
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+        });
+        let (url, server) = status_server(&RESPONSE, 1);
+        let err = read_schema(&crate::http_client::build_probe_client(3).unwrap(), &url)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("oversize catalog reply"), "{err}");
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
     fn schema_server(ready: bool) -> (QuestDbConfig, std::thread::JoinHandle<usize>) {
         use crate::audit_spill::test_support::status_server;
-        let (reply, n) = if ready {
-            (
-                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ddl\":\"OK\"}",
-                tick_conservation_audit_ddl_statements().len(),
-            )
+        let reply = if ready {
+            CATALOG_REPLY
         } else {
-            (
-                "HTTP/1.1 503 Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                1,
-            )
+            "HTTP/1.1 503 Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         };
-        let (url, server) = status_server(reply, n);
+        let (url, server) = status_server(reply, 1);
         (fixture_config(&url), server)
     }
 
@@ -616,7 +867,8 @@ mod tests {
 
     fn reply_to_questdb_request(request: &str) -> &'static str {
         if request.starts_with("GET /exec?") {
-            DDL_ACK
+            assert!(request.contains("table_columns"));
+            CATALOG_REPLY
         } else {
             assert!(request.starts_with("POST /write?"));
             crate::audit_spill::test_support::OK_204
@@ -633,7 +885,7 @@ mod tests {
             if !disk_available {
                 std::fs::write(&spool_dir, b"blocked").expect("obstruct journal");
             }
-            let n = tick_conservation_audit_ddl_statements().len() + 1;
+            let n = 2; // one catalog query and one ILP POST
             let (url, server) = response_server(reply_to_questdb_request, n);
             let config = fixture_config(&url);
             let mut writer = TickConservationAuditWriter::new(&config);
@@ -678,13 +930,15 @@ mod tests {
         let (refused, server) = response_server(
             |request| {
                 assert!(request.starts_with("GET /exec?"));
-                if request.contains("DEDUP+ENABLE") {
+                if request.contains("table_columns") {
+                    MISSING_TABLE
+                } else if request.contains("DEDUP+ENABLE") {
                     "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ddl\":\"OK\",\"error\":\"schema refused\"}"
                 } else {
                     DDL_ACK
                 }
             },
-            ddls + 1,
+            ddls + 2,
         );
         let waiting = drain_audit_spill_dir(
             dir.path(),
@@ -693,19 +947,38 @@ mod tests {
             &client,
         )
         .await;
-        assert_eq!(server.join().expect("DDL server"), ddls);
+        assert_eq!(server.join().expect("DDL server"), ddls + 1);
         assert!(waiting.failed);
         assert_eq!(waiting.files_replayed, 0);
         assert_eq!(std::fs::read(&path).expect("still waiting"), original);
 
-        let (ready, server) = response_server(reply_to_questdb_request, ddls + 1);
+        let (ready, server) = response_server(reply_to_questdb_request, 2);
         let landed =
             drain_audit_spill_dir(dir.path(), table, &format!("{ready}?precision=n"), &client)
                 .await;
-        assert_eq!(server.join().expect("DDL and ILP server"), ddls + 1);
+        assert_eq!(server.join().expect("catalog and ILP server"), 2);
         assert!(!landed.failed);
         assert_eq!(landed.rows_replayed, 1);
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn repair_ddl_acknowledgement_needs_current_schema_readback() {
+        use crate::audit_spill::test_support::response_server;
+        // Empty/shadow catalog results remain unusable after all the DDLs returned OK.
+        let ddl_count = tick_conservation_audit_ddl_statements().len();
+        let (url, server) = response_server(
+            |request| {
+                if request.contains("table_columns") {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"dataset\":[]}"
+                } else {
+                    DDL_ACK
+                }
+            },
+            ddl_count + 2,
+        );
+        assert!(!ensure_tick_conservation_audit_table(&fixture_config(&url)).await);
+        assert_eq!(server.join().unwrap(), ddl_count + 2);
     }
 
     #[tokio::test]

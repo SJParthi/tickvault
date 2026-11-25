@@ -868,11 +868,12 @@ where
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send login message.
+    // The read watchdog starts after login. Bound a stalled login write so the
+    // connection can return to the reconnect loop even with no writable capacity.
     let login_msg = build_order_update_login(client_id, access_token);
-    write
-        .send(Message::Text(login_msg.into()))
+    time::timeout(DIAL_TIMEOUT, write.send(Message::Text(login_msg.into())))
         .await
+        .map_err(|_elapsed| OrderUpdateConnectionError::LoginSendTimeout)?
         .map_err(|err| OrderUpdateConnectionError::Send(err.to_string()))?; // O(1) EXEMPT: cold path, once per connect
 
     debug!("order update WebSocket login sent");
@@ -1744,6 +1745,9 @@ enum OrderUpdateConnectionError {
 
     #[error("failed to send login message: {0}")]
     Send(String),
+
+    #[error("order update login send timed out after {}s", DIAL_TIMEOUT.as_secs())]
+    LoginSendTimeout,
 
     #[error("auth response indicates failure: {0}")]
     AuthFailed(String),
