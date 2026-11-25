@@ -125,6 +125,8 @@ data/instrument-cache/
 *.bak
 mutants.out/
 mutants.out.old/
+/mutants.diff
+/mutation-results.txt
 target/llvm-cov-target/
 .claude/worktrees/
 target2/

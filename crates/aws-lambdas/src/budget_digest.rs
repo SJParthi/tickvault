@@ -28,7 +28,7 @@ use lambda_runtime::Error;
 use serde_json::{Value, json};
 use tracing::info;
 
-/// Rupee display rate (what you actually pay incl GST).
+/// Assumed exchange rate for rupee estimates in operator messages.
 pub const INR_PER_USD: f64 = 85.0;
 /// India GST 18%.
 pub const GST_MULT: f64 = 1.18;
@@ -68,9 +68,15 @@ pub const DIGEST_SUBJECT: &str = "[BUDGET] daily AWS cost";
 /// carries no month stamp).
 pub const FIRST_DAY_CAVEAT: &str = "_Note_: on the 1st and 2nd this figure may still be last month's (AWS refreshes it every 8-12 h)";
 
-/// USD → display rupees (incl GST).
-pub fn inr(usd: f64) -> f64 {
-    usd * INR_PER_USD * GST_MULT
+/// Estimate rupees for a pre-tax service price, including GST (waste alerts).
+pub fn inr(pre_tax_usd: f64) -> f64 {
+    estimated_inr(pre_tax_usd) * GST_MULT
+}
+
+/// Convert the supplied dollars at the display rate. The account budget
+/// includes tax in its actual spend, so its digest needs only this conversion.
+fn estimated_inr(usd: f64) -> f64 {
+    usd * INR_PER_USD
 }
 
 /// Traffic-light emoji — legacy parity: 🟢 <50, 🟡 <80, 🟠 <100, 🔴 ≥100.
@@ -142,15 +148,20 @@ pub fn render_digest(today_utc: NaiveDate, mtd_usd: f64) -> (String, f64) {
 
     let mut lines = vec![
         format!("{emoji} *AWS Cost — tickvault*"),
-        format!("_This month_:  ₹{:.0}   (${:.2})", inr(mtd_usd), mtd_usd),
+        format!(
+            "_This month_:  ₹{:.0}   (${:.2})",
+            estimated_inr(mtd_usd),
+            mtd_usd
+        ),
         // Derived from the EFFECTIVE ceiling for this UTC month.
         format!("_Of ${ceiling:.0} stop-budget_: {pct:.0}%"),
         format!(
             "_Forecast EOM_: ₹{:.0}   (${:.2})",
-            inr(m.forecast_usd),
+            estimated_inr(m.forecast_usd),
             m.forecast_usd
         ),
         format!("_Days left_:   {}", m.days_remaining),
+        format!("Rupee estimates use ₹{INR_PER_USD}/USD. AWS budget totals include tax."),
     ];
     // 2026-10-26 (audit PR L4): days 1 and 2, the same window the guard distrusts.
     if (crate::budget_spend::UNSTAMPED_FIRST_DAY_OF_MONTH
@@ -238,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inr_applies_rate_and_gst() {
+    fn test_inr_for_pre_tax_prices_applies_rate_and_gst() {
         assert!((inr(1.0) - 100.3).abs() < 1e-9); // 85 * 1.18
         assert_eq!(inr(0.0), 0.0);
     }
@@ -289,7 +300,7 @@ mod tests {
         let ceiling = july_ceiling();
         assert!((pct - (10.0 / ceiling) * 100.0).abs() < 1e-9);
         assert!(msg.starts_with("🟢 *AWS Cost — tickvault*"));
-        assert!(msg.contains("_This month_:  ₹1003   ($10.00)"), "{msg}");
+        assert!(msg.contains("_This month_:  ₹850   ($10.00)"), "{msg}");
         // Both halves derived: the ceiling AND the percentage of it, so an
         // authorized budget change never turns into a spurious failure.
         let expected_pct = (10.00_f64 / ceiling * 100.0).round();
@@ -301,6 +312,16 @@ mod tests {
         );
         assert!(msg.contains("_Days left_:   13"), "{msg}");
         assert!(!msg.contains(FIRST_DAY_CAVEAT), "{msg}");
+    }
+
+    #[test]
+    fn test_digest_converts_tax_inclusive_actual_and_forecast_once() {
+        let today = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
+        let (msg, pct) = render_digest(today, 41.537);
+        assert!(msg.contains("_This month_:  ₹3531   ($41.54)"), "{msg}");
+        assert!(msg.contains("_Forecast EOM_: ₹4378   ($51.51)"), "{msg}");
+        assert!(msg.contains("₹85/USD"), "{msg}");
+        assert!((pct - 41.537 / 62.0 * 100.0).abs() < 1e-9);
     }
 
     #[test]
