@@ -12,11 +12,11 @@ When the app accepts 100 updates and the database returns zero, a spill counter 
 | Constructing a labelled database line | p99 1.342 µs before network and storage | Same hosted benchmark |
 | Production Stocks page at 08:10 IST on November 25 | Price Movers, Gainers/Losers, NSE and F&O Stocks rendered. Binary, portal and main reported `9ccd99e`. The instance was stopped. | [Authenticated page capture](stocks.png) |
 
-[Watch the narrated comparison](measurements.mp4) · [English captions](captions.vtt)
+[Download the narrated MP4, captions and full branch table](audit-evidence.zip) · [Read the English captions](captions.vtt)
 
 ## Branch inventory before publication
 
-The [branch inventory](branch-inventory.tsv) covers 925 non-main branch names at 893 distinct tips. Each row records the exact SHA, related PRs and how its changes compare with main. The combined branch contains the dependency head from [PR #2289](https://github.com/SJParthi/tickvault/pull/2289). The Stocks rebuild reached main through [PR #2187](https://github.com/SJParthi/tickvault/pull/2187).
+The [downloadable branch inventory](audit-evidence.zip) is a tab-separated table called `branch-inventory.tsv`. It covers 925 non-main branch names at 893 distinct tips. Each row records the exact SHA, related PRs and how its changes compare with main. The combined branch contains the dependency head from [PR #2289](https://github.com/SJParthi/tickvault/pull/2289). The Stocks rebuild reached main through [PR #2187](https://github.com/SJParthi/tickvault/pull/2187).
 
 The historical `claude/integration` branch would change 64 files in a clean Git merge, including restoring retired Groww and volume-ranking modules and duplicating a Rust import. Review any still-needed changes individually. Main already includes the later feed scan work and the ported WAL acknowledgement logic. [Branch comparison](https://github.com/SJParthi/tickvault/compare/9ccd99e7...82ed11e7) · [WAL decision](https://github.com/SJParthi/tickvault/blob/9ccd99e7/.claude/plans/active-plan-audit-2026-10-20.md#L723-L733)
 
