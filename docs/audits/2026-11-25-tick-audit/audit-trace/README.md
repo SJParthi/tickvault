@@ -41,3 +41,7 @@ An archived margin mapping could assign two conflicting values to the same stock
 | Production completeness | The 17:01 IST recount found 12,150,376 fewer stored rows than the earlier accepted-write count. The cause and the count of unique missing ticks remain unresolved. |
 
 The one-minute narrated film, captions, animation, browser-tested comparison, runtime inventory and test receipts are in the download. The film labels its measured revisions. [Download the comparison and evidence](assurance-followup.zip)
+
+## November 25 merged Stocks release
+
+The narrated comparison, animation and offline table cover the tree merged in ff452b93e. CI recorded 18,736 tests passed and 39 skipped. Coverage reached 84.39% of measured production lines and 94.13% of distinct changed lines. All 106 measured medians met their absolute budgets. Two benchmarks exceeded the allowed slowdown against the previous candidate in a same-runner comparison. The table identifies the operations, units, samples and source revisions. [Download the release comparison](merged-release-comparison.zip) · [CI](https://github.com/SJParthi/tickvault/actions/runs/45634973126) · [Benchmarks](https://github.com/SJParthi/tickvault/actions/runs/45632817244)
