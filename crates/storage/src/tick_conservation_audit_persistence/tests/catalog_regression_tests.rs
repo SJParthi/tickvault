@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Catalog and journal regressions promoted from the November 25 local probes.
 //! The HTTP acknowledgements here are fixtures, not database durability proof.
 
