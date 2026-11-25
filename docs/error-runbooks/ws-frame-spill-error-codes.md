@@ -264,3 +264,13 @@ This rule activates when editing:
 - `crates/storage/src/ws_frame_spill.rs`
 - Any file containing `WS-SPILL-`, `WsSpill0`, `tv_ws_frame_spill_writer_respawn_total`, or
   `tv_ws_frame_spill_write_errors_total`
+
+## Checking how a WAL segment was archived
+
+On Linux, inspect the archived file with `getfattr -n user.tickvault.replay_archive.v1 /path/to/wal/archive/<segment>.wal`. The attribute identifies the last recorded archive decision for that local inode. `applied_watermark` records a range skipped under the persisted watermark. `settled_after_ack` records promotion after the write acknowledgements, durability lag and clean database probes. `direct_confirm` records the path taken when the replay caller had no further sink writes pending. Each value describes an archive decision. Independent database readback is needed to count stored ticks.
+
+Older archives, copies made without extended attributes, and files affected by an interruption between the move and metadata write can lack the attribute. The writer synchronizes the attribute on the archived inode. A power failure can still affect the directory rename under the filesystem’s existing durability rules. Treat a missing decision as unknown. Metadata-write failures increment `tv_wal_replay_archive_provenance_failed_total`. A conflicting segment filename leaves the original captures in place. Compare their contents and backup records before resolving the collision.
+
+When the verified-upload gate is enabled, age, size and disk-floor pruning hash a segment only when selecting it for deletion. A different file with the same name and length stays on disk if its SHA-256 differs from the verified cold object. The writer clears the stale local marker so the ordinary uploader can verify the replacement. Both distinct cold copies can coexist under the canonical and content-derived sidecar keys. If the filesystem refuses to remove the marker, the check will retry at the next eligible prune.
+
+For a verified prune, search the application JSON logs for `wal_verified_prune` and the segment name or raw SHA-256. The event carries the exact bucket, object key, byte length and last archive decision (`unknown` if unavailable). The checked-in CloudWatch agent forwards the machine app log to `/tickvault/prod/app`. Tracing is asynchronous, and logging configuration, delivery and retention govern whether that event can be retrieved. If the segment was uploaded while active, S3 retains its verified bytes and raw SHA-256, and its original object metadata has no subsequent archive decision. Local pruning also removes the inode and upload marker. The prune event does not insert a QuestDB row or create a permanent remote audit receipt.

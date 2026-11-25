@@ -34,7 +34,9 @@
 //! marker's recorded raw length must equal the file's length now. The marker
 //! is keyed by file NAME, so it follows a segment moved between the WAL root,
 //! `replaying/` and `archive/` by rename. Segments are append-only and never
-//! rewritten once sealed, so name plus length is enough without re-hashing.
+//! rewritten once sealed. A restore can nevertheless reuse a name and length.
+//! Only a file selected for deletion is re-hashed against the verified raw
+//! SHA-256. A mismatch clears the readiness marker so the uploader retries.
 //!
 //! # Where it runs
 //!
@@ -452,7 +454,8 @@ fn read_marker(markers_dir: &Path, segment_name: &str) -> Option<UploadMarker> {
 }
 
 /// Whether `segment` has a marker whose recorded raw length equals `len`.
-/// What the WAL prune asks before every delete. Cold path: one small file
+/// Fast candidate check for upload and pruning. The final delete also checks
+/// the raw digest in [`remove_verified_wal`]. Cold path: one small file
 /// read per segment per prune pass.
 #[must_use]
 pub fn marker_matches(markers_dir: &Path, segment: &Path, len: u64) -> bool {
@@ -461,6 +464,51 @@ pub fn marker_matches(markers_dir: &Path, segment: &Path, len: u64) -> bool {
         .and_then(|n| n.to_str())
         .and_then(|name| read_marker(markers_dir, name))
         .is_some_and(|m| m.raw_len == len)
+}
+
+/// At actual WAL deletion, match the candidate's bytes to the digest that was
+/// verified on the cold object. A restored capture can share an older file's
+/// name and length. Clearing its stale readiness marker schedules ordinary
+/// upload verification on the next scan, without deleting the cold object.
+pub(crate) fn remove_verified_wal(markers_dir: &Path, path: &Path) -> std::io::Result<bool> {
+    let Some(marker) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| read_marker(markers_dir, name))
+    else {
+        return Ok(false);
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() != marker.raw_len {
+        return Ok(false);
+    }
+    let mut digest = Sha256Writer::new(std::io::sink());
+    let bytes = std::io::copy(&mut file, &mut digest)?;
+    if bytes != marker.raw_len || hex_encode(&digest.finish().1) != marker.raw_sha256 {
+        remove_marker(markers_dir, path);
+        tracing::warn!(code = ErrorCode::StorageGap04S3ArchiveFailed.code_str(), segment = ?path, "WAL prune retained a segment whose bytes differ from its cold archive; upload verification is due");
+        return Ok(false);
+    }
+    crate::wal_segment_move::remove_hashed_segment(path, &before)?;
+    info!(
+        event = "wal_verified_prune",
+        segment = %path.display(),
+        raw_sha256 = %marker.raw_sha256,
+        raw_len = bytes,
+        bucket = %marker.bucket,
+        object_key = %marker.key,
+        last_archive_decision = crate::wal_segment_move::last_archive_decision(&file),
+        "Removed local WAL segment after verifying its cold copy"
+    );
+    Ok(true)
 }
 
 /// Whole seconds since the epoch of a file's mtime, `0` when unreadable —
@@ -1685,7 +1733,12 @@ pub(crate) fn write_marker_for_test(markers_dir: &Path, segment: &Path, raw_len:
         key: segment_key(name, 0),
         gzip_sha256: String::new(),
         gzip_len: 0,
-        raw_sha256: String::new(),
+        raw_sha256: std::fs::read(segment)
+            .map(|bytes| {
+                use sha2::Digest as _;
+                hex_encode(&sha2::Sha256::digest(&bytes))
+            })
+            .unwrap_or_default(),
         raw_len,
         raw_mtime_secs: 0,
         first_frame_seq: None,
@@ -1930,6 +1983,79 @@ mod tests {
             .read_to_end(&mut back)
             .expect("gunzip"); // APPROVED: test-only
         assert_eq!(back, body);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_prune_log_links_an_early_upload_to_the_later_archive_decision() {
+        let dir = temp_wal_dir("early-upload-prune-event");
+        let path = plant(&dir, SEG, b"closed capture");
+        let store = FakeStore::default();
+        assert_eq!(
+            run_pass_with(&store, &dir, 4, &always, &never_open, SystemTime::now())
+                .await
+                .uploaded,
+            1
+        );
+        let markers = markers_dir(&dir);
+        let verified = read_marker(&markers, SEG).unwrap();
+        let staged = dir.join(crate::ws_frame_spill::REPLAYING_SUBDIR);
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::rename(&path, staged.join(SEG)).unwrap();
+        crate::ws_frame_spill::confirm_replayed(&dir);
+        let archived = dir.join(crate::ws_frame_spill::ARCHIVE_SUBDIR).join(SEG);
+        let log_path = dir.join("probe.jsonl");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || log.try_clone().unwrap())
+            .finish();
+        assert!(
+            tracing::subscriber::with_default(subscriber, || remove_verified_wal(
+                &markers, &archived
+            ))
+            .unwrap()
+        );
+        let line = std::fs::read_to_string(log_path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let fields = &record["fields"];
+        assert_eq!(fields["event"], "wal_verified_prune");
+        assert_eq!(fields["segment"], archived.to_str().unwrap());
+        assert_eq!(fields["last_archive_decision"], "direct_confirm");
+        assert_eq!(fields["raw_sha256"], verified.raw_sha256);
+        assert_eq!(fields["bucket"], verified.bucket);
+        assert_eq!(fields["object_key"], verified.key);
+        assert_eq!(fields["raw_len"], verified.raw_len);
+        assert!(!archived.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_remove_verified_wal_reuploads_a_same_size_replacement_before_deletion() {
+        let dir = temp_wal_dir("same-size-replacement");
+        let old = b"old capture";
+        let new = b"new capture";
+        let path = plant(&dir, SEG, old);
+        let store = FakeStore::default();
+        let markers = markers_dir(&dir);
+        let offered = run_pass_with(&store, &dir, 4, &always, &never_open, SystemTime::now()).await;
+        assert_eq!(offered.uploaded, 1);
+        let original_key = read_marker(&markers, SEG).unwrap().key;
+        plant(&dir, SEG, new);
+        assert!(marker_matches(&markers, &path, new.len() as u64));
+        assert!(!remove_verified_wal(&markers, &path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), new);
+        assert!(!markers.join(SEG).exists());
+        // While verification is pending, later prune attempts cannot delete
+        // the capture or repeat the full file read without a fresh marker.
+        assert!(!remove_verified_wal(&markers, &path).unwrap());
+        let retried = run_pass_with(&store, &dir, 4, &always, &never_open, SystemTime::now()).await;
+        assert_eq!(retried.uploaded_sidecar, 1);
+        assert_ne!(read_marker(&markers, SEG).unwrap().key, original_key);
+        assert!(remove_verified_wal(&markers, &path).unwrap());
+        assert!(!path.exists());
+        assert_eq!(store.objects.lock().unwrap().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

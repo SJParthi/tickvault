@@ -616,6 +616,8 @@ impl TickConservationAuditWriter {
 
 #[cfg(test)]
 mod tests {
+    mod catalog_regression_tests;
+
     use super::*;
 
     const DAY_START: i64 = 1_792_972_800_000_000_000; // 2026-10-26 00:00 IST-epoch

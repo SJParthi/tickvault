@@ -56,6 +56,9 @@ libc = { workspace = true }
 # so `Cargo.lock` gains no new package.
 ahash = { workspace = true }
 
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+rustix = { workspace = true }
+
 [features]
 # PR-C3 (2026-07-14): the `daily_universe_fetcher` feature (Sub-PR #10b-ε
 # of the 2026-05-27 daily-universe expansion) was DELETED —

@@ -144,6 +144,8 @@ sha2 = "=0.11.1"
 # the spill/rescue free-space probe. Same version, no new package; the edge
 # from tickvault-storage is new and is flagged for the owner in that change.
 libc = "=0.2.191"
+# Safe exclusive rename and on-inode replay provenance for archived WAL segments.
+rustix = { version = "=1.1.6", features = ["fs"] }
 notify = "=8.2.2"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
