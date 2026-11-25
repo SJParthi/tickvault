@@ -214,6 +214,7 @@ pub struct StockIndices {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MtfTerms {
     pub observed_at_epoch_secs: i64,
+    #[serde(deserialize_with = "crate::mtf_receipt_json::deserialize_mtf_leverage_map")]
     pub leverage_by_security_id: std::collections::BTreeMap<u64, f64>,
 }
 
@@ -867,6 +868,7 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
                 && t.observed_at_epoch_secs <= cutoff
                 && ist_date_of_epoch(t.observed_at_epoch_secs).as_deref()
                     == Some(universe.trading_date_ist.as_str())
+                && !t.leverage_by_security_id.is_empty()
                 && t.leverage_by_security_id.len() <= MAX_UNIVERSE_LIST_ROWS
         }) else {
             return finish_empty(SourceStatus::NoMtfList, None);
@@ -1003,6 +1005,39 @@ mod tests {
         assert_eq!(s.status, SourceStatus::NoMtfList);
         assert!(!s.universe_available);
         assert!(s.mtf_coverage.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_mtf_leverage_map_preserves_other_prices_and_refuses_ambiguous_security() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(4, 99.0, 0)]);
+        let ordinary = select(&stocks, &Filter::default());
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        for raw in [
+            r#"{"2":0,"2":2.5}"#,
+            r#"{"02":0,"2":2.5}"#,
+            r#"{"2":2.5,"\u0032":0}"#,
+            r#"{"2":2.5,"+2":1,"2":3}"#,
+            r#"{" 2 ":0,"2":2.5}"#,
+        ] {
+            let parse = |body: &str| {
+                serde_json::from_str::<MtfTerms>(&format!(
+                    r#"{{"observed_at_epoch_secs":{},"leverage_by_security_id":{body}}}"#,
+                    OBSERVED
+                ))
+                .unwrap()
+            };
+            stocks.membership.as_mut().unwrap().mtf = Some(parse(raw));
+            let unavailable = snapshot(select(&stocks, &filter));
+            assert_eq!(unavailable.status, SourceStatus::NoMtfList, "{raw}");
+            assert!(unavailable.mtf_coverage.is_none());
+            assert_eq!(select(&stocks, &Filter::default()), ordinary);
+            let normal = format!("{},\"4\":1.0}}", &raw[..raw.len() - 1]);
+            let known = parse(&normal);
+            assert_eq!(known.leverage_by_security_id, [(4, 1.0)].into());
+        }
     }
 
     #[test]

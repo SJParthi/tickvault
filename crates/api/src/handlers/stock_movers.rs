@@ -57,23 +57,127 @@ type CachedUniverse = (Instant, Option<String>, Arc<MoversUniverse>, i64, bool);
 pub(crate) struct MoversCache {
     slot: tokio::sync::Mutex<Option<CachedUniverse>>,
 }
-#[derive(Deserialize)]
 struct MappingArtifact {
-    #[serde(default)]
-    mtf_leverage_by_security_id: Option<serde_json::Value>,
-    #[serde(default)]
-    mtf_observed_at_epoch_secs: Option<serde_json::Value>,
-    #[serde(default)]
-    mtf_source_modified_at_epoch_secs: Option<serde_json::Value>,
-    #[serde(default)]
-    mtf_history: Option<serde_json::Value>,
-    #[serde(default)]
-    mtf_last_refresh_epoch_secs: Option<serde_json::Value>,
     trading_date_ist: String,
     resolved: usize,
     unresolved: usize,
     mappings: Vec<MappingEntry>,
+    mtf: MappingMtfFields,
 }
+
+/// Preserve optional MTF field occurrences until conflicts have been checked.
+/// Ordinary quote and index memberships survive a malformed auxiliary receipt.
+#[derive(Default)]
+struct MappingMtfFields {
+    mtf_leverage_by_security_id: Option<serde_json::Value>,
+    mtf_observed_at_epoch_secs: Option<serde_json::Value>,
+    mtf_source_modified_at_epoch_secs: Option<serde_json::Value>,
+    mtf_history: Option<serde_json::Value>,
+    // The outer option records an occurrence, including a legacy explicit null.
+    mtf_last_refresh_epoch_secs: Option<Option<i64>>,
+    mtf_latest_source_modified_at_epoch_secs: Option<Option<i64>>,
+    ambiguous: bool,
+}
+
+impl<'de> Deserialize<'de> for MappingArtifact {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = MappingArtifact;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("dated stock mapping with optional broker receipt")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                use tickvault_common::mtf_receipt_json::{MtfHistory, MtfLeverage, MtfScalar};
+
+                let (mut date, mut resolved, mut unresolved, mut mappings) =
+                    (None, None, None, None);
+                let mut mtf = MappingMtfFields::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    let (slot, value) = match key.as_str() {
+                        "trading_date_ist" => {
+                            read_required(&mut map, &mut date, "trading_date_ist")?;
+                            continue;
+                        }
+                        "resolved" => {
+                            read_required(&mut map, &mut resolved, "resolved")?;
+                            continue;
+                        }
+                        "unresolved" => {
+                            read_required(&mut map, &mut unresolved, "unresolved")?;
+                            continue;
+                        }
+                        "mappings" => {
+                            read_required(&mut map, &mut mappings, "mappings")?;
+                            continue;
+                        }
+                        "mtf_leverage_by_security_id" => (
+                            &mut mtf.mtf_leverage_by_security_id,
+                            map.next_value::<MtfLeverage>()?.0,
+                        ),
+                        "mtf_history" => (&mut mtf.mtf_history, map.next_value::<MtfHistory>()?.0),
+                        "mtf_observed_at_epoch_secs" => (
+                            &mut mtf.mtf_observed_at_epoch_secs,
+                            map.next_value::<MtfScalar>()?.0,
+                        ),
+                        "mtf_source_modified_at_epoch_secs" => (
+                            &mut mtf.mtf_source_modified_at_epoch_secs,
+                            map.next_value::<MtfScalar>()?.0,
+                        ),
+                        "mtf_last_refresh_epoch_secs"
+                        | "mtf_latest_source_modified_at_epoch_secs" => {
+                            let stamp = map.next_value::<Option<MtfScalar>>()?;
+                            let seconds = stamp.as_ref().and_then(|s| s.0.as_i64());
+                            let slot = if key == "mtf_last_refresh_epoch_secs" {
+                                &mut mtf.mtf_last_refresh_epoch_secs
+                            } else {
+                                &mut mtf.mtf_latest_source_modified_at_epoch_secs
+                            };
+                            mtf.ambiguous |= slot.replace(seconds).is_some()
+                                || (stamp.is_some() && seconds.is_none());
+                            continue;
+                        }
+                        _ => {
+                            // A historical interval's end never belongs to a current receipt.
+                            mtf.ambiguous |= key == "mtf_valid_before_epoch_secs";
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    mtf.ambiguous |= slot.replace(value).is_some();
+                }
+                Ok(MappingArtifact {
+                    trading_date_ist: date
+                        .ok_or_else(|| A::Error::missing_field("trading_date_ist"))?,
+                    resolved: resolved.ok_or_else(|| A::Error::missing_field("resolved"))?,
+                    unresolved: unresolved.ok_or_else(|| A::Error::missing_field("unresolved"))?,
+                    mappings: mappings.ok_or_else(|| A::Error::missing_field("mappings"))?,
+                    mtf,
+                })
+            }
+        }
+        de.deserialize_map(FieldsVisitor)
+    }
+}
+
+fn read_required<'de, A: serde::de::MapAccess<'de>, T: Deserialize<'de>>(
+    map: &mut A,
+    slot: &mut Option<T>,
+    field: &'static str,
+) -> Result<(), A::Error> {
+    if slot.is_some() {
+        return Err(serde::de::Error::duplicate_field(field));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
 /// A previously verified set of terms is usable from observation until the
 /// next refresh first superseded it, even when that refresh found no terms.
 #[derive(Debug)]
@@ -116,8 +220,11 @@ fn parse_mtf_terms(
     })
 }
 
-impl MappingArtifact {
+impl MappingMtfFields {
     fn mtf_versions(&self, date: &str) -> Option<(Option<MtfTerms>, Vec<HistoricalMtfTerms>)> {
+        if self.ambiguous {
+            return None;
+        }
         let observed = self
             .mtf_observed_at_epoch_secs
             .as_ref()
@@ -179,8 +286,7 @@ impl MappingArtifact {
         {
             return None;
         }
-        if let Some(refresh) = &self.mtf_last_refresh_epoch_secs {
-            let refresh = refresh.as_i64()?;
+        if let Some(refresh) = self.mtf_last_refresh_epoch_secs.flatten() {
             // An unknown refresh is only an ordering witness. The marker itself
             // never starts an interval or supplies any security's leverage.
             if ist_date_of_epoch(refresh).as_deref() != Some(date)
@@ -190,6 +296,21 @@ impl MappingArtifact {
                 || history
                     .last()
                     .is_some_and(|h| refresh < h.valid_before_epoch_secs)
+            {
+                return None;
+            }
+        }
+        // This watermark only constrains a receipt. It cannot supply missing terms.
+        if let Some(watermark) = self.mtf_latest_source_modified_at_epoch_secs.flatten() {
+            let refresh = self.mtf_last_refresh_epoch_secs.flatten()?;
+            let verified = if current.is_some() {
+                published
+            } else {
+                prior_publication
+            };
+            if ist_date_of_epoch(watermark).as_deref() != Some(date)
+                || watermark > refresh
+                || verified.is_some_and(|stamp| watermark < stamp)
             {
                 return None;
             }
@@ -236,7 +357,7 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
     if artifact.trading_date_ist != date || artifact.mappings.len() > MAX_MAPPING_ROWS {
         return None;
     }
-    let (mtf, mtf_history) = artifact.mtf_versions(date).unwrap_or_default();
+    let (mtf, mtf_history) = artifact.mtf.mtf_versions(date).unwrap_or_default();
     let equity_rows: Vec<_> = artifact
         .mappings
         .into_iter()
@@ -1442,6 +1563,113 @@ mod tests {
                 },
             ));
             assert_eq!(all.stocks_priced, 1);
+        }
+    }
+
+    #[test]
+    fn test_raw_mtf_field_occurrences_preserve_only_provable_stock_terms() {
+        let now = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut base = serde_json::to_string(&mapping(3)).unwrap();
+        let object_end = base.pop().expect("serialized mapping object");
+        let parse = |optional: &str| {
+            let raw = format!("{base},{optional}{object_end}");
+            let result = parse_memberships(raw.as_bytes(), DATE).expect("ordinary stock mappings");
+            assert_eq!(result.names.len(), 3);
+            result
+        };
+        let current = |map: &str| {
+            format!(
+                r#""mtf_observed_at_epoch_secs":{now},"mtf_source_modified_at_epoch_secs":{now},"mtf_leverage_by_security_id":{map}"#
+            )
+        };
+        for ambiguous in [
+            r#""1":0,"1":2"#,
+            r#""1":2,"1":0"#,
+            r#""1":2,"1":2"#,
+            r#""1":0,"\u0031":2"#,
+            r#""01":0,"1":2"#,
+        ] {
+            let map = format!(r#"{{{ambiguous},"2":1,"3":0}}"#);
+            let valid = parse(&current(&map));
+            let terms = &valid.mtf_at(now).unwrap().leverage_by_security_id;
+            assert_eq!(terms.keys().copied().collect::<Vec<_>>(), [2, 3]);
+            assert_eq!((terms[&2], terms[&3]), (1.0, 0.0));
+            let end = now + 1;
+            let historical = parse(&format!(
+                r#""mtf_history":[{{{},"mtf_valid_before_epoch_secs":{end}}}]"#,
+                current(&map)
+            ));
+            assert_eq!(
+                historical.mtf_at(now).unwrap().leverage_by_security_id,
+                *terms
+            );
+            assert!(historical.mtf_at(end).is_none());
+        }
+        let ordinary = current(r#"{"1":2}"#);
+        for marker in [
+            "mtf_last_refresh_epoch_secs",
+            "mtf_latest_source_modified_at_epoch_secs",
+        ] {
+            let legacy = format!(r#"{ordinary},"{marker}":null"#);
+            assert_eq!(
+                parse(&legacy).mtf_at(now).unwrap().leverage_by_security_id[&1],
+                2.0
+            );
+            for malformed in [r#""unknown""#, "false", "{}", "[]", "1.25"] {
+                assert!(
+                    parse(&format!(r#"{ordinary},"{marker}":{malformed}"#))
+                        .mtf_at(now)
+                        .is_none()
+                );
+            }
+            let repeated = format!(r#"{legacy},"{marker}":null"#);
+            assert!(parse(&repeated).mtf_at(now).is_none());
+        }
+        let cap = now + 1;
+        for inconsistent in [
+            format!(r#"{ordinary},"mtf_observed_at_epoch_secs":{now}"#),
+            format!(r#"{ordinary},"mtf_leverage_by_security_id":{{"1":3}}"#),
+            format!(r#"{ordinary},"mtf_valid_before_epoch_secs":{now}"#),
+            format!(r#"{ordinary},"mtf_history":[],"mtf_history":[]"#),
+            format!(
+                r#"{ordinary},"mtf_last_refresh_epoch_secs":{now},"mtf_latest_source_modified_at_epoch_secs":{cap}"#
+            ),
+            format!(r#"{ordinary},"mtf_latest_source_modified_at_epoch_secs":{now}"#),
+            format!(
+                r#""mtf_history":[{{{ordinary},"mtf_source_modified_at_epoch_secs":{now},"mtf_valid_before_epoch_secs":{cap}}}]"#
+            ),
+            format!(
+                r#""mtf_history":[{{{ordinary},"mtf_valid_before_epoch_secs":{now},"mtf_valid_before_epoch_secs":{cap}}}]"#
+            ),
+        ] {
+            assert!(parse(&inconsistent).mtf_at(now).is_none(), "{inconsistent}");
+        }
+        let extension = format!(r#"{ordinary},"extra":{{"flag":true,"flag":false}},"extra":0"#);
+        assert_eq!(
+            parse(&extension)
+                .mtf_at(now)
+                .unwrap()
+                .leverage_by_security_id[&1],
+            2.0
+        );
+    }
+
+    #[test]
+    fn test_raw_mtf_entry_limit_counts_occurrences_even_for_repeated_keys() {
+        let now = at("2026-10-30 10:00:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let mut ordinary = serde_json::to_string(&mapping(1)).unwrap();
+        let object_end = ordinary.pop().expect("serialized mapping object");
+        let entries = (1..=MAX_MAPPING_ROWS)
+            .map(|id| format!(r#""{id}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (tail, expected_known) in [("", true), (r#","1":0"#, false)] {
+            let raw = format!(
+                r#"{ordinary},"mtf_observed_at_epoch_secs":{now},"mtf_source_modified_at_epoch_secs":{now},"mtf_leverage_by_security_id":{{{entries}{tail}}}{object_end}"#
+            );
+            let memberships = parse_memberships(raw.as_bytes(), DATE).unwrap();
+            assert_eq!(memberships.names.len(), 1);
+            assert_eq!(memberships.mtf_at(now).is_some(), expected_known);
         }
     }
 

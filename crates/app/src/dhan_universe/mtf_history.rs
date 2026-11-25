@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use tickvault_common::mtf_receipt_json::{MtfHistory, MtfLeverage};
 use tickvault_common::operator_movers_universe::{
     MAX_DAILY_MAPPING_BYTES, MAX_MTF_HISTORY_INTERVALS, MAX_UNIVERSE_LIST_ROWS, ist_date_of_epoch,
 };
@@ -31,18 +32,34 @@ pub(super) struct ReceiptState {
 #[derive(Deserialize)]
 struct DatedReceipts {
     trading_date_ist: String,
-    mtf_leverage_by_security_id: Option<serde_json::Value>,
+    mtf_leverage_by_security_id: Option<MtfLeverage>,
     mtf_observed_at_epoch_secs: Option<i64>,
     mtf_source_modified_at_epoch_secs: Option<i64>,
     #[serde(default)]
-    mtf_history: Vec<serde_json::Value>,
+    mtf_history: MtfHistory,
+    #[serde(
+        default,
+        rename = "mtf_valid_before_epoch_secs",
+        deserialize_with = "unexpected_current_end"
+    )]
+    has_current_end: bool,
     mtf_last_refresh_epoch_secs: Option<i64>,
     mtf_latest_source_modified_at_epoch_secs: Option<i64>,
 }
 
+fn unexpected_current_end<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(de).map(|_| true)
+}
+
 impl DatedReceipts {
     fn into_state(self, date: &str) -> Option<ReceiptState> {
-        if self.trading_date_ist != date || self.mtf_history.len() > MAX_MTF_HISTORY_INTERVALS {
+        let serde_json::Value::Array(history) = self.mtf_history.0 else {
+            return None;
+        };
+        if self.trading_date_ist != date
+            || self.has_current_end
+            || history.len() > MAX_MTF_HISTORY_INTERVALS
+        {
             return None;
         }
         let current = match (
@@ -51,15 +68,15 @@ impl DatedReceipts {
             self.mtf_source_modified_at_epoch_secs,
         ) {
             (None, None, None) => None,
-            (Some(map), Some(observed), Some(modified)) => Some(DailyMtfTerms {
+            (Some(MtfLeverage(map)), Some(observed), Some(modified)) => Some(DailyMtfTerms {
                 mtf_leverage_by_security_id: parse_leverage(map)?,
                 mtf_observed_at_epoch_secs: observed,
                 mtf_source_modified_at_epoch_secs: modified,
             }),
             _ => return None,
         };
-        let mut prior = Vec::with_capacity(self.mtf_history.len());
-        for mut entry in self.mtf_history {
+        let mut prior = Vec::with_capacity(history.len());
+        for mut entry in history {
             let end = entry.get("mtf_valid_before_epoch_secs")?.as_i64()?;
             let terms = DailyMtfTerms {
                 mtf_observed_at_epoch_secs: entry.get("mtf_observed_at_epoch_secs")?.as_i64()?,
@@ -253,16 +270,35 @@ impl ReceiptState {
             return Ok(old);
         }
         let current = current.filter(|t| t.valid_on(date) && t.mtf_observed_at_epoch_secs == at);
-        if let Some(seen) = last
-            && at < seen
-        {
-            old.delayed_refresh(at, current.as_ref(), seen);
-            return Ok(old);
-        }
         // The watermark survives eviction and carries no eligibility on its own.
         let last_publication = old
             .mtf_latest_source_modified_at_epoch_secs
             .or_else(|| old.verifiable_source_time());
+        if let Some(seen) = last
+            && at < seen
+        {
+            old.delayed_refresh(at, current.as_ref(), seen);
+            if let Some(delayed) = current {
+                let source = delayed.mtf_source_modified_at_epoch_secs;
+                // A newer publication already existed at `at`. Subsequent
+                // receipts of older publications are rollbacks, even when the
+                // network delivered the newer evidence after those receipts.
+                old.mtf_history.retain(|i| {
+                    i.mtf_valid_before_epoch_secs <= at
+                        || i.terms.mtf_source_modified_at_epoch_secs >= source
+                });
+                if old
+                    .current
+                    .as_ref()
+                    .is_some_and(|t| t.mtf_source_modified_at_epoch_secs < source)
+                {
+                    old.current = None;
+                }
+                old.mtf_latest_source_modified_at_epoch_secs = last_publication.max(Some(source));
+                old.mtf_last_refresh_epoch_secs = Some(seen);
+            }
+            return Ok(old);
+        }
         let mut current = current.filter(|t| {
             last_publication.is_none_or(|last| t.mtf_source_modified_at_epoch_secs >= last)
         });
@@ -339,6 +375,65 @@ mod tests {
         }
     }
     #[test]
+    fn raw_mtf_recovery_never_restores_conflicting_ids_or_duplicate_interval_boundaries() {
+        let date = "2026-11-25";
+        let stamp = 1_795_582_800;
+        let path =
+            std::env::temp_dir().join(format!("tv-mtf-raw-restore-{}.json", std::process::id()));
+        let map = r#""mtf_leverage_by_security_id":{"1":0,"\u0031":2.5,"2":1,"3":0}"#;
+        let current = format!(
+            r#"{map},"mtf_observed_at_epoch_secs":{stamp},"mtf_source_modified_at_epoch_secs":{stamp}"#
+        );
+        let history = format!(
+            r#"{{{current},"mtf_valid_before_epoch_secs":{}}}"#,
+            stamp + 3
+        );
+        let write = |proof: &str| {
+            let raw = format!(r#"{{"trading_date_ist":"{date}",{proof}}}"#);
+            std::fs::write(&path, raw).unwrap();
+        };
+        write(&current);
+        let after = ReceiptState::refresh(&path, date, stamp + 3, None).unwrap();
+        assert!(after.current.is_none());
+        assert_eq!(
+            after.mtf_history[0].terms.mtf_leverage_by_security_id,
+            std::collections::HashMap::from([(2u64, 1.0), (3, 0.0)])
+        );
+        let prior = format!(r#""mtf_history":[{history}]"#);
+        write(&prior);
+        let restored = ReceiptState::read(&path, date).unwrap();
+        assert_eq!(
+            restored.mtf_history[0].terms.mtf_leverage_by_security_id,
+            std::collections::HashMap::from([(2u64, 1.0), (3, 0.0)])
+        );
+        let wrong_end = history.replace(
+            r#""mtf_valid_before_epoch_secs":"#,
+            r#""mtf_valid_before_epoch_secs":0,"mtf_valid_before_epoch_secs":"#,
+        );
+        for bad in [
+            format!(r#""mtf_history":[{wrong_end}]"#),
+            format!("{prior},{prior}"),
+            format!(r#"{current},"mtf_valid_before_epoch_secs":null"#),
+            format!(r#"{current},"mtf_valid_before_epoch_secs":{stamp}"#),
+        ] {
+            write(&bad);
+            let unknown = ReceiptState::read(&path, date).unwrap();
+            assert!(
+                unknown.current.is_none() && unknown.mtf_history.is_empty(),
+                "{bad}"
+            );
+        }
+        write(&format!(
+            r#"{prior},"unknown_extension":1,"unknown_extension":2"#
+        ));
+        assert_eq!(
+            ReceiptState::read(&path, date).unwrap().mtf_history.len(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn corrupt_mtf_history_cannot_be_rewritten_as_verified_eligibility() {
         let date = "2026-11-06";
         let stamp = chrono::DateTime::parse_from_rfc3339("2026-11-06T04:00:00Z")
@@ -368,6 +463,65 @@ mod tests {
         original.as_object_mut().unwrap().remove("mtf_history");
         let legacy = check(original).unwrap();
         assert!(legacy.current.is_some() && legacy.mtf_history.is_empty());
+    }
+
+    #[test]
+    fn delayed_newer_publication_invalidates_later_rollbacks_and_preserves_other_evidence() {
+        let path = std::env::temp_dir().join(format!(
+            "tv-mtf-delayed-revision-{}.json",
+            std::process::id()
+        ));
+        let date = "2026-11-25";
+        let stamp = 1_795_582_800;
+        let refresh = |state: &ReceiptState, offset, publication, leverage| {
+            let mut disk = serde_json::to_value(state).unwrap();
+            disk["trading_date_ist"] = date.into();
+            std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+            let mut observed = terms(stamp + offset, leverage);
+            observed.mtf_source_modified_at_epoch_secs = stamp + publication;
+            let state = ReceiptState::refresh(&path, date, stamp + offset, Some(observed)).unwrap();
+            assert!(state.valid_on(date));
+            state
+        };
+        let first = refresh(&ReceiptState::default(), 0, -5, 1.0);
+        let old = refresh(&first, 4, -3, 1.5);
+        let delayed = refresh(&old, 2, -1, 2.0);
+        assert!(delayed.current.is_none());
+        assert_eq!(delayed.mtf_history.len(), 1);
+        assert_eq!(
+            delayed.mtf_history[0].mtf_valid_before_epoch_secs,
+            stamp + 2
+        );
+        assert_eq!(
+            delayed.mtf_latest_source_modified_at_epoch_secs,
+            Some(stamp - 1)
+        );
+        let still_stale = refresh(&delayed, 5, -3, 1.5);
+        assert!(still_stale.current.is_none());
+        let verified = refresh(&still_stale, 6, -1, 2.0);
+        assert_eq!(
+            verified.current.unwrap().mtf_observed_at_epoch_secs,
+            stamp + 6
+        );
+
+        // If an even newer tail is already present, the affected middle
+        // interval still must be removed while the tail remains provable.
+        let newer_tail = refresh(&old, 8, 1, 3.0);
+        let repaired = refresh(&newer_tail, 2, -1, 2.0);
+        assert_eq!(repaired.mtf_history.len(), 1);
+        assert_eq!(
+            repaired.mtf_history[0].mtf_valid_before_epoch_secs,
+            stamp + 2
+        );
+        assert_eq!(
+            repaired.current.unwrap().mtf_observed_at_epoch_secs,
+            stamp + 8
+        );
+        assert_eq!(
+            repaired.mtf_latest_source_modified_at_epoch_secs,
+            Some(stamp + 1)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
