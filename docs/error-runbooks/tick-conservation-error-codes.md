@@ -87,7 +87,13 @@ timestamp, day and feed. QuestDB uses those keys to collapse repeat submissions.
 
 `STORAGE-GAP-03` at `tick_conservation_audit_queued` means the receipt is
 on disk and database delivery is unconfirmed. At `tick_conservation_audit_write`,
-check the database and spill directory using the logged row identity. The
+check the database and spill directory using the logged row identity. If both
+destinations fail, the daily task keeps the original receipt in memory and
+waits a minute after each failed write before trying again. New attempts stop at
+IST midnight on the audited date. An in-flight write can finish after midnight.
+If both destinations still refuse the receipt, the task logs `tick_conservation_audit_retry_expired` with
+the original fields so the next day can run. A process exit before either
+destination accepts the receipt also ends the in-memory retry. The
 table-labelled spill, replay, refusal and quarantine counters track the outcome.
 The shared audit drain uses `AUDIT-06` and the existing order-audit alarms
 for a stale backlog or permanent refusal. Check the table and source labels

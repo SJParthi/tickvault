@@ -87,7 +87,9 @@ use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsType};
 use tickvault_storage::feed_gap_audit_persistence::FeedGapRow;
-use tickvault_storage::tick_conservation_audit_persistence::TickConservationRow;
+use tickvault_storage::tick_conservation_audit_persistence::{
+    AuditReceiptWrite, TickConservationRow, write_or_queue_tick_conservation_row,
+};
 use tickvault_storage::tick_conservation_ledger::TickConservationLedger;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -423,8 +425,11 @@ async fn run_daily_checks(
             )
             .await;
         }
-        // Sleep to just past the next IST midnight (a multi-day process).
+        // Retry can run to midnight. Begin the new day's scheduling immediately.
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
+        if ist_date_of(now_ist) != today {
+            continue;
+        }
         let to_midnight = NANOS_PER_DAY - now_ist.rem_euclid(NANOS_PER_DAY);
         let secs = u64::try_from(to_midnight / NANOS_PER_SEC).unwrap_or(0) + 5;
         tokio::time::sleep(Duration::from_secs(secs)).await;
@@ -505,7 +510,11 @@ async fn run_one_check(
         process_start_ist_nanos,
     };
     report(&row, inputs);
-    persist(questdb, &row).await;
+    let retry_window = receipt_retry_window(day_ist_nanos, checked_at);
+    persist(&row, retry_window, |receipt| {
+        write_or_queue_tick_conservation_row(questdb, receipt)
+    })
+    .await;
 }
 
 /// Logs the verdict: a coded `error!` on `mismatch` (log only), a `warn!` on
@@ -542,32 +551,161 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
     }
 }
 
-async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
-    use tickvault_storage::tick_conservation_audit_persistence::{
-        AuditReceiptWrite, write_or_queue_tick_conservation_row,
+// A delayed check still gets an immediate write, even if its audited day has ended.
+fn receipt_retry_window(day: i64, checked_at: i64) -> Duration {
+    if day.div_euclid(NANOS_PER_DAY) == checked_at.div_euclid(NANOS_PER_DAY) {
+        Duration::from_nanos((NANOS_PER_DAY - checked_at.rem_euclid(NANOS_PER_DAY)).unsigned_abs())
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Keep the original receipt for another attempt when both durable paths refuse it.
+/// Waiting happens on the daily audit task, outside the feed and dashboard paths.
+async fn persist<'a, F>(
+    row: &'a TickConservationRow,
+    retry_window: Duration,
+    mut write: impl FnMut(&'a TickConservationRow) -> F,
+) where
+    F: std::future::Future<Output = anyhow::Result<AuditReceiptWrite>>,
+{
+    let deadline = tokio::time::Instant::now() + retry_window;
+    let result = match write(row).await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                stage = "tick_conservation_audit_write",
+                ?row,
+                ?err,
+                "daily receipt has no confirmed durable copy; keeping it in memory for retry until IST midnight"
+            );
+            let interval = Duration::from_secs(
+                tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS,
+            );
+            let result = loop {
+                let next_attempt = tokio::time::Instant::now() + interval;
+                tokio::time::sleep_until(next_attempt.min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "tick_conservation_audit_retry_expired",
+                        ?row,
+                        "daily receipt retry window ended with no confirmed database or journal copy"
+                    );
+                    return;
+                }
+                // A write already in flight can have published its journal. Let it
+                // report the outcome even if the audited day ends during the request.
+                match write(row).await {
+                    Ok(result) => break result,
+                    Err(err) => {
+                        tracing::debug!(?err, "daily receipt retry still has no confirmed copy")
+                    }
+                }
+            };
+            info!(
+                ?result,
+                ?row,
+                "daily receipt recovered after a failed write"
+            );
+            result
+        }
     };
-    let result = write_or_queue_tick_conservation_row(questdb, row).await;
-    match result {
-        Ok(AuditReceiptWrite::Acknowledged) => {}
-        Ok(AuditReceiptWrite::QueuedForReplay) => warn!(
+    if result == AuditReceiptWrite::QueuedForReplay {
+        warn!(
             code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
             stage = "tick_conservation_audit_queued",
             ?row,
             "tick conservation receipt queued on disk; database delivery unconfirmed"
-        ),
-        Err(err) => error!(
-            code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-            stage = "tick_conservation_audit_write",
-            ?row,
-            ?err,
-            "tick conservation receipt has no confirmed database acknowledgement or local replay copy"
-        ),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_reoffers_original_receipt_only_while_both_durable_paths_fail() {
+        let row = TickConservationRow {
+            checked_at_ist_nanos: DAY + 100,
+            day_ist_nanos: DAY,
+            feed: Feed::Dhan,
+            verdict: "mismatch",
+            reason: "unexplained_shortfall",
+            accepted_rows: 4,
+            db_tick_rows: 2,
+            not_landed_rows: 0,
+            count_reads: 3,
+            process_start_ist_nanos: DAY,
+        };
+        let interval = tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS;
+        for target in [
+            AuditReceiptWrite::Acknowledged,
+            AuditReceiptWrite::QueuedForReplay,
+        ] {
+            for failures in [0, 2] {
+                let mut calls = 0;
+                let started = tokio::time::Instant::now();
+                persist(&row, Duration::from_secs(3 * interval), |receipt| {
+                    assert!(std::ptr::eq(receipt, &row));
+                    calls += 1;
+                    std::future::ready(if calls <= failures {
+                        Err(anyhow::anyhow!("database and journal unavailable"))
+                    } else {
+                        Ok(target)
+                    })
+                })
+                .await;
+                assert_eq!(calls, failures + 1);
+                assert_eq!(started.elapsed(), Duration::from_secs(failures * interval));
+            }
+        }
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY + 1),
+            Duration::ZERO
+        );
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY - 23),
+            Duration::from_nanos(23)
+        );
+        let calls = std::cell::Cell::new(0);
+        let finished = std::cell::Cell::new(false);
+        persist(&row, Duration::from_secs(interval + 1), |_| async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(anyhow::anyhow!("both refused"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            finished.set(true);
+            Ok(AuditReceiptWrite::QueuedForReplay)
+        })
+        .await;
+        assert!(
+            finished.get(),
+            "an attempt started before midnight finished"
+        );
+        assert_eq!(calls.get(), 2);
+        let mut late_calls = 0;
+        persist(&row, Duration::ZERO, |_| {
+            late_calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("prior-day check")))
+        })
+        .await;
+        assert_eq!(late_calls, 1);
+        let mut calls = 0;
+        let window = Duration::from_secs(2 * interval + 1);
+        let started = tokio::time::Instant::now();
+        persist(&row, window, |receipt| {
+            assert!(std::ptr::eq(receipt, &row));
+            calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("persistent dual failure")))
+        })
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(started.elapsed(), window);
+    }
 
     /// 2026-10-26 00:00 IST, in IST-epoch nanos.
     const DAY: i64 = 1_792_972_800_000_000_000;
