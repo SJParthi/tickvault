@@ -1535,4 +1535,4 @@ The operator latency screen displays receive-buffer readings from the app and
 validates the database response before showing elapsed time. The existing
 read-only SSM commands retain the three bounded HTTP reads. Their measured
 string literals total 27 lines and 1,819 bytes. The reviewed console script
-is 566 lines and 49,015 bytes, including script tags.
+is 581 lines and 49,746 bytes, including script tags.
