@@ -11,6 +11,9 @@ When the app accepts 100 updates and the database returns zero, a spill counter 
 | Warm paper-order placement | p99 0.751 µs inside the app | Same hosted benchmark |
 | Constructing a labelled database line | p99 1.342 µs before network and storage | Same hosted benchmark |
 | Production Stocks page at 08:10 IST on November 25 | Price Movers, Gainers/Losers, NSE and F&O Stocks rendered. Binary, portal and main reported `9ccd99e`. The instance was stopped. | [Authenticated page capture](stocks.png) |
+| Production Stocks after scheduled startup | At 08:32 IST the current F&O universe contained 236 stocks and Nifty 50 contained 50. No stocks were priced yet in the current premarket view. | [Premarket capture](stocks-premarket.png) |
+| Historical Stocks filters served by production | For November 23 all 20 displayed F&O losers were eligible, negative and sorted worst first. All 12 displayed Nifty 50 gainers had that membership and were positive, sorted largest first. The source for the requested 15:29 IST view was 15:14:59. Membership coverage was partial. | [Populated Stocks capture](stocks-history.png) |
+| Production Dhan audit for November 23 | 44,622,479 accepted rows and 44,622,479 stored rows. One read took 788 ms through the operator portal. | Read-only QuestDB query through the authenticated Stocks operator portal |
 
 [Download the narrated MP4, captions and full branch table](audit-evidence.zip) · [Read the English captions](captions.vtt)
 
