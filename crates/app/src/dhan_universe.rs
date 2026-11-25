@@ -30,6 +30,8 @@
 //! way a day cannot pass without a build attempt, which is the property that
 //! actually matters.
 
+mod mtf_history;
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -353,7 +355,7 @@ struct FnoUnderlyingArtifact {
 struct MappingArtifact {
     trading_date_ist: String,
     #[serde(flatten)]
-    mtf: Option<DailyMtfTerms>,
+    mtf: mtf_history::ReceiptState,
     master_rows: usize,
     isin_index_len: usize,
     ambiguous_isins: usize,
@@ -384,7 +386,33 @@ struct MappingArtifact {
     mappings: Vec<MappingEntry>,
 }
 
-#[derive(Debug, serde::Serialize)]
+impl MappingArtifact {
+    /// Fit optional MTF history into the Stocks reader's existing byte ceiling.
+    /// The broad mapping and its capture consumers remain available even if its
+    /// mandatory fields alone exceed what Stocks can accept.
+    fn encode(&mut self, limit: usize) -> serde_json::Result<Vec<u8>> {
+        let intervals = std::mem::take(&mut self.mtf.mtf_history);
+        let mut base = serde_json::to_vec(self)?;
+        if base.len() > limit && self.mtf.current.take().is_some() {
+            // No partially serialized leverage map may certify a security.
+            base = serde_json::to_vec(self)?;
+        }
+        self.mtf.mtf_history = mtf_history::fitting_history(intervals, base.len(), limit)?;
+        if self.mtf.mtf_history.is_empty() {
+            if base.len() < limit {
+                let pretty = serde_json::to_vec_pretty(self)?;
+                if pretty.len() <= limit {
+                    return Ok(pretty);
+                }
+            }
+            Ok(base)
+        } else {
+            serde_json::to_vec(self)
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
 struct DailyMtfTerms {
     // APPROVED: this wire field contains only the master's NSE/E/EQ/EQUITY terms.
     mtf_leverage_by_security_id: HashMap<u64, f64>,
@@ -1242,7 +1270,9 @@ async fn build_once(date: &str, questdb: &QuestDbConfig) -> anyhow::Result<JoinO
     // this fix, and doing it badly would risk the correctness of a daily
     // artifact for a second-order scheduling gain. Recorded rather than
     // silently settled for.
-    tokio::task::block_in_place(|| write_mapping_atomic(date, &master, &index, &outcome, mtf))?;
+    tokio::task::block_in_place(|| {
+        write_mapping_atomic(date, &master, &index, &outcome, observed, mtf)
+    })?;
 
     // No `instrument_lifecycle` / `instrument_lifecycle_audit` write.
     //
@@ -1458,6 +1488,7 @@ fn write_mapping_atomic(
     master: &[tickvault_core::instrument::master_csv::MasterRow],
     index: &tickvault_core::instrument::master_csv::IsinIndex,
     outcome: &JoinOutcome,
+    observed: chrono::DateTime<chrono::Utc>,
     mtf: Option<DailyMtfTerms>,
 ) -> anyhow::Result<()> {
     // Path-traversal guard BEFORE the filename is built (§18 row 4). The date
@@ -1467,6 +1498,20 @@ fn write_mapping_atomic(
         date.len() == 10 && date.bytes().all(|b| b.is_ascii_digit() || b == b'-'),
         "refusing to write a mapping for a malformed date {date:?}"
     );
+    std::fs::create_dir_all(MAPPING_DIR)?;
+    // Concurrent refreshes must merge receipts from the last committed file.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(std::path::Path::new(MAPPING_DIR).join(".dhan-nse-mapping.lock"))?;
+    lock.lock()?;
+    let path = mapping_artifact_path(date);
+    let at = observed
+        .timestamp()
+        .saturating_add(i64::from(observed.timestamp_subsec_nanos() > 0));
+    let mtf = mtf_history::ReceiptState::refresh(&path, date, at, mtf)?;
     let artifact = MappingArtifact {
         trading_date_ist: date.to_string(),
         mtf,
@@ -1514,10 +1559,10 @@ fn write_mapping_atomic(
     artifact.mappings.extend(indices);
     artifact.distinct_instruments = distinct_instrument_count(&artifact.mappings);
     metrics::gauge!(DISTINCT_INSTRUMENTS_GAUGE).set(artifact.distinct_instruments as f64);
-    std::fs::create_dir_all(MAPPING_DIR)?;
-    let path = mapping_artifact_path(date);
+    use tickvault_common::operator_movers_universe::MAX_DAILY_MAPPING_BYTES;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(&artifact)?)?;
+    let bytes = artifact.encode(MAX_DAILY_MAPPING_BYTES)?;
+    std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, &path)?;
     info!(
         path = %path.display(),
@@ -2004,6 +2049,55 @@ mod constituent_bound_tests {
              report a healthy day with almost no membership"
         );
     }
+}
+
+#[cfg(test)]
+/// Feed the real dated writer the same parsed master and constituent join
+/// that it receives from its network inputs, inside the caller's scratch cwd.
+pub(crate) fn write_mtf_mapping_fixture(
+    observed_rfc3339: &str,
+    last_modified: Option<&str>,
+    multiplier: &str,
+) {
+    use tickvault_core::instrument::master_csv::{Constituent, MIN_PLAUSIBLE_MASTER_ROWS};
+    let mut csv =
+        String::from("SECURITY_ID,ISIN,SYMBOL_NAME,EXCH_ID,SEGMENT,SERIES,INSTRUMENT,MTF_LEVERAGE");
+    let mut constituents = Vec::new();
+    for (n, leverage) in ["1.0", multiplier, "0", ""].into_iter().enumerate() {
+        let id = n + 1;
+        csv.push_str(&format!(
+            "\n{id},INE{id:09},S{id},NSE,E,EQ,EQUITY,{leverage}"
+        ));
+        constituents.push(Constituent {
+            index_name: "Nifty 50".into(),
+            symbol: format!("S{id}"),
+            isin: format!("INE{id:09}"),
+        });
+    }
+    for n in 5..=MIN_PLAUSIBLE_MASTER_ROWS {
+        csv.push_str(&format!("\n{n},INE{n:09},S{n},NSE,E,EQ,EQUITY,"));
+    }
+    let detailed = parse_detailed_master(&csv).unwrap();
+    let observed = chrono::DateTime::parse_from_rfc3339(observed_rfc3339)
+        .unwrap()
+        .to_utc();
+    let mtf = DailyMtfTerms::for_date(
+        "2026-11-06",
+        observed,
+        last_modified,
+        detailed.mtf_leverage_by_security_id,
+    );
+    let index = build_isin_index(&detailed.rows);
+    let outcome = join_constituents(&constituents, &index);
+    write_mapping_atomic(
+        "2026-11-06",
+        &detailed.rows,
+        &index,
+        &outcome,
+        observed,
+        mtf,
+    )
+    .unwrap();
 }
 
 #[cfg(test)]

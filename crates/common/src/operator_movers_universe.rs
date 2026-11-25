@@ -45,6 +45,11 @@ use crate::operator_stock_movers_wire::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Maximum bytes of a dated index mapping, including its MTF terms history.
+pub const MAX_DAILY_MAPPING_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum superseded MTF intervals retained alongside the latest terms.
+pub const MAX_MTF_HISTORY_INTERVALS: usize = 32_768;
+
 /// Version of the universe format. A reader refuses any other value.
 pub const UNIVERSE_FORMAT_VERSION: u32 = 1;
 /// Largest universe object a reader accepts, in bytes.

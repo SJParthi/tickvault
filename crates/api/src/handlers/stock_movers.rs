@@ -29,9 +29,10 @@ use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_EQ, INDEX_CONSTITUENCY_SLUGS, IST_UTC_OFFSET_SECONDS_I64,
 };
 use tickvault_common::operator_movers_universe::{
-    ListedStock, MAX_UNIVERSE_PRICE_ROWS, MoversUniverse, MtfTerms, PriceRow, StockIndices,
-    UNIVERSE_DEFAULT_WINDOW_SECS, UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices,
-    select, snapshot_deadline,
+    ListedStock, MAX_DAILY_MAPPING_BYTES, MAX_MTF_HISTORY_INTERVALS, MAX_UNIVERSE_PRICE_ROWS,
+    MoversUniverse, MtfTerms, PriceRow, StockIndices, UNIVERSE_DEFAULT_WINDOW_SECS,
+    UNIVERSE_FORMAT_VERSION, UniverseMembership, UniversePrices, ist_date_of_epoch, select,
+    snapshot_deadline,
 };
 use tickvault_common::operator_movers_wire::{BridgeError, MAX_SOURCE_BYTES, MAX_SOURCE_ROWS};
 use tickvault_common::operator_stock_movers_wire::{
@@ -40,7 +41,6 @@ use tickvault_common::operator_stock_movers_wire::{
 
 /// Existing writer path, pinned against app::dhan_universe by an integration test.
 pub const INDEX_MAPPING_PREFIX: &str = "dhan-nse-mapping-";
-const MAX_MAPPING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MAPPING_ROWS: usize = 32_768;
 const CACHE_TTL_SECONDS: u64 = 2;
 const QUERY_TIMEOUT_SECONDS: u64 = 3;
@@ -65,40 +65,136 @@ struct MappingArtifact {
     mtf_observed_at_epoch_secs: Option<serde_json::Value>,
     #[serde(default)]
     mtf_source_modified_at_epoch_secs: Option<serde_json::Value>,
+    #[serde(default)]
+    mtf_history: Option<serde_json::Value>,
+    #[serde(default)]
+    mtf_last_refresh_epoch_secs: Option<serde_json::Value>,
     trading_date_ist: String,
     resolved: usize,
     unresolved: usize,
     mappings: Vec<MappingEntry>,
 }
+/// A previously verified set of terms is usable from observation until the
+/// next refresh first superseded it, even when that refresh found no terms.
+#[derive(Debug)]
+struct HistoricalMtfTerms {
+    terms: MtfTerms,
+    valid_before_epoch_secs: i64,
+}
+
+fn parse_mtf_terms(
+    date: &str,
+    observed: Option<i64>,
+    modified: Option<i64>,
+    entries: Option<&serde_json::Value>,
+) -> Option<MtfTerms> {
+    let observed = observed?;
+    let modified = modified?;
+    if modified > observed
+        || [observed, modified]
+            .into_iter()
+            .any(|t| ist_date_of_epoch(t).as_deref() != Some(date))
+    {
+        return None;
+    }
+    let entries = entries?.as_object()?;
+    if entries.is_empty() || entries.len() > MAX_MAPPING_ROWS {
+        return None;
+    }
+    let leverage_by_security_id = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            let id: u64 = key.parse().ok()?;
+            let n = value.as_f64()?;
+            (id > 0 && id.to_string() == *key && (n == 0.0 || (n.is_finite() && n >= 1.0)))
+                .then_some((id, n))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    (!leverage_by_security_id.is_empty()).then_some(MtfTerms {
+        observed_at_epoch_secs: observed,
+        leverage_by_security_id,
+    })
+}
+
 impl MappingArtifact {
-    fn mtf_terms(&self, date: &str) -> Option<MtfTerms> {
-        use tickvault_common::operator_movers_universe::ist_date_of_epoch;
-        let observed = self.mtf_observed_at_epoch_secs.as_ref()?.as_i64()?;
-        let modified = self.mtf_source_modified_at_epoch_secs.as_ref()?.as_i64()?;
-        if modified > observed
-            || [observed, modified]
-                .into_iter()
-                .any(|t| ist_date_of_epoch(t).as_deref() != Some(date))
+    fn mtf_versions(&self, date: &str) -> Option<(Option<MtfTerms>, Vec<HistoricalMtfTerms>)> {
+        let observed = self
+            .mtf_observed_at_epoch_secs
+            .as_ref()
+            .and_then(serde_json::Value::as_i64);
+        let published = self
+            .mtf_source_modified_at_epoch_secs
+            .as_ref()
+            .and_then(serde_json::Value::as_i64);
+        let current = parse_mtf_terms(
+            date,
+            observed,
+            published,
+            self.mtf_leverage_by_security_id.as_ref(),
+        );
+        let mut prior_publication = None;
+        let mut history = Vec::<HistoricalMtfTerms>::new();
+        if let Some(value) = &self.mtf_history {
+            let versions = value.as_array()?;
+            if versions.len() > MAX_MTF_HISTORY_INTERVALS {
+                return None;
+            }
+            for v in versions {
+                let publication = v.get("mtf_source_modified_at_epoch_secs")?.as_i64()?;
+                if prior_publication.is_some_and(|previous| publication < previous) {
+                    return None;
+                }
+                prior_publication = Some(publication);
+                let terms = parse_mtf_terms(
+                    date,
+                    v.get("mtf_observed_at_epoch_secs")
+                        .and_then(serde_json::Value::as_i64),
+                    Some(publication),
+                    v.get("mtf_leverage_by_security_id"),
+                )?;
+                let until = v.get("mtf_valid_before_epoch_secs")?.as_i64()?;
+                if until <= terms.observed_at_epoch_secs
+                    || ist_date_of_epoch(until).as_deref() != Some(date)
+                    || history
+                        .last()
+                        .is_some_and(|h| h.valid_before_epoch_secs > terms.observed_at_epoch_secs)
+                {
+                    return None;
+                }
+                history.push(HistoricalMtfTerms {
+                    terms,
+                    valid_before_epoch_secs: until,
+                });
+            }
+        }
+        // Historical cutoffs remain independently provable after a refresh with
+        // missing terms, unless its declared observation overlaps their interval.
+        if history
+            .last()
+            .is_some_and(|last| observed.is_some_and(|t| t < last.valid_before_epoch_secs))
+            || (current.is_some()
+                && published
+                    .zip(prior_publication)
+                    .is_some_and(|(new, old)| new < old))
         {
             return None;
         }
-        let entries = self.mtf_leverage_by_security_id.as_ref()?.as_object()?;
-        if entries.is_empty() || entries.len() > MAX_MAPPING_ROWS {
-            return None;
+        if let Some(refresh) = &self.mtf_last_refresh_epoch_secs {
+            let refresh = refresh.as_i64()?;
+            // An unknown refresh is only an ordering witness. The marker itself
+            // never starts an interval or supplies any security's leverage.
+            if ist_date_of_epoch(refresh).as_deref() != Some(date)
+                || current
+                    .as_ref()
+                    .is_some_and(|t| refresh < t.observed_at_epoch_secs)
+                || history
+                    .last()
+                    .is_some_and(|h| refresh < h.valid_before_epoch_secs)
+            {
+                return None;
+            }
         }
-        let leverage_by_security_id = entries
-            .iter()
-            .filter_map(|(key, value)| {
-                let id: u64 = key.parse().ok()?;
-                let n = value.as_f64()?;
-                (id > 0 && id.to_string() == *key && (n == 0.0 || (n.is_finite() && n >= 1.0)))
-                    .then_some((id, n))
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        (!leverage_by_security_id.is_empty()).then_some(MtfTerms {
-            observed_at_epoch_secs: observed,
-            leverage_by_security_id,
-        })
+        Some((current, history))
     }
 }
 #[derive(Deserialize)]
@@ -111,20 +207,36 @@ struct MappingEntry {
 #[derive(Debug)]
 struct Memberships {
     mtf: Option<MtfTerms>,
+    mtf_history: Vec<HistoricalMtfTerms>,
     names: HashMap<(u64, u8), String>,
     indices: Vec<String>,
     by_stock: HashMap<(u64, u8), Vec<usize>>,
     partial: bool,
 }
+impl Memberships {
+    fn mtf_at(&self, cutoff: i64) -> Option<&MtfTerms> {
+        if let Some(current) = &self.mtf
+            && current.observed_at_epoch_secs <= cutoff
+        {
+            return Some(current);
+        }
+        let next = self
+            .mtf_history
+            .partition_point(|item| item.valid_before_epoch_secs <= cutoff);
+        let prior = self.mtf_history.get(next)?;
+        (prior.terms.observed_at_epoch_secs <= cutoff).then_some(&prior.terms)
+    }
+}
+
 fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
-    if bytes.len() > MAX_MAPPING_BYTES {
+    if bytes.len() > MAX_DAILY_MAPPING_BYTES {
         return None;
     }
     let artifact: MappingArtifact = serde_json::from_slice(bytes).ok()?;
     if artifact.trading_date_ist != date || artifact.mappings.len() > MAX_MAPPING_ROWS {
         return None;
     }
-    let mtf = artifact.mtf_terms(date);
+    let (mtf, mtf_history) = artifact.mtf_versions(date).unwrap_or_default();
     let equity_rows: Vec<_> = artifact
         .mappings
         .into_iter()
@@ -178,6 +290,7 @@ fn parse_memberships(bytes: &[u8], date: &str) -> Option<Memberships> {
             .any(|(name, _)| indices.binary_search_by(|s| s.as_str().cmp(name)).is_err());
     Some(Memberships {
         mtf,
+        mtf_history,
         names,
         indices,
         by_stock,
@@ -192,7 +305,7 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     let path = dir.join(format!("{INDEX_MAPPING_PREFIX}{date}.json"));
     let mut file = std::fs::File::open(&path).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_MAPPING_BYTES as u64 {
+    if !metadata.is_file() || metadata.len() > MAX_DAILY_MAPPING_BYTES as u64 {
         return None;
     }
     let modified = metadata.modified().ok()?;
@@ -201,7 +314,7 @@ fn load_memberships(dir: &Path, date: &str) -> Option<Arc<Memberships>> {
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     (&mut file)
-        .take((MAX_MAPPING_BYTES + 1) as u64)
+        .take((MAX_DAILY_MAPPING_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .ok()?;
     let data = Arc::new(parse_memberships(&bytes, date)?);
@@ -417,17 +530,19 @@ fn assemble_universe(
                 .collect();
             by_stock.sort_unstable_by_key(|s| (s.security_id, s.segment_code));
             UniverseMembership {
-                mtf: m.mtf.as_ref().map(|terms| MtfTerms {
-                    observed_at_epoch_secs: terms.observed_at_epoch_secs,
-                    leverage_by_security_id: m
-                        .names
-                        .keys()
-                        .chain(fno.into_iter().flat_map(|f| f.names.keys()))
-                        .filter_map(|(id, _)| {
-                            terms.leverage_by_security_id.get(id).map(|n| (*id, *n))
-                        })
-                        .collect(),
-                }),
+                mtf: m
+                    .mtf_at(plan.at.and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64)
+                    .map(|terms| MtfTerms {
+                        observed_at_epoch_secs: terms.observed_at_epoch_secs,
+                        leverage_by_security_id: m
+                            .names
+                            .keys()
+                            .chain(fno.into_iter().flat_map(|f| f.names.keys()))
+                            .filter_map(|(id, _)| {
+                                terms.leverage_by_security_id.get(id).map(|n| (*id, *n))
+                            })
+                            .collect(),
+                    }),
                 names: sorted_listed(&m.names),
                 indices: m.indices.clone(),
                 by_stock,
@@ -1317,6 +1432,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mtf_history_uses_the_selected_instant_after_same_day_replacement() {
+        use tickvault_common::operator_stock_movers_wire::MoversCategory;
+        let fixture = Fixture::new(2);
+        let path = fixture.0.join(format!("{INDEX_MAPPING_PREFIX}{DATE}.json"));
+        let open = at("2026-10-30 09:30:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let hour = 3_600;
+        let terms = |observed: i64, multiple: f64| {
+            json!({
+                "mtf_observed_at_epoch_secs": observed,
+                "mtf_source_modified_at_epoch_secs": observed - 1,
+                "mtf_leverage_by_security_id": {"1": 0, "2": multiple}
+            })
+        };
+        let mut disk = mapping(2);
+        let first = terms(open, 1.0);
+        disk.as_object_mut()
+            .unwrap()
+            .extend(first.as_object().unwrap().clone());
+        std::fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let previous_file = load_memberships(&fixture.0, DATE).unwrap();
+        assert!(previous_file.mtf_at(open).is_some());
+
+        let mut interval = first;
+        interval["mtf_valid_before_epoch_secs"] = json!(open + hour / 2);
+        disk["mtf_history"] = json!([interval]);
+        disk.as_object_mut()
+            .unwrap()
+            .extend(terms(open + hour, 3.75).as_object().unwrap().clone());
+        // The real reader keys its parsed cache on the replaced artifact's metadata.
+        let staged = path.with_extension("tmp");
+        std::fs::write(&staged, serde_json::to_vec(&disk).unwrap()).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        let replaced = load_memberships(&fixture.0, DATE).unwrap();
+        assert!(!Arc::ptr_eq(&previous_file, &replaced));
+
+        for (minute, expected) in [
+            ("09:29", None),
+            ("09:30", Some(1.0)),
+            ("09:59", Some(1.0)),
+            ("10:00", None),
+            ("10:29", None),
+            ("10:30", Some(3.75)),
+        ] {
+            let filter = Filter {
+                category: Some(MoversCategory::Mtf),
+                fno_only: false,
+                as_of: Some(format!("{DATE}T{minute}")),
+                ..Filter::default()
+            };
+            let url = http("200 OK", prices(2, "2026-10-30T09:20:00Z")).await;
+            let result = snapshot(run(&fixture.0, &url, false, filter).await);
+            match expected {
+                Some(leverage) => {
+                    assert_eq!(result.rows.len(), 1, "{minute}");
+                    assert_eq!(result.rows[0].mtf_leverage, Some(leverage), "{minute}");
+                }
+                None => {
+                    assert_eq!(result.status, SourceStatus::NoMtfList, "{minute}");
+                    assert!(result.rows.is_empty());
+                }
+            }
+        }
+
+        // An unknown refresh omitted all active terms, but the saved interval still
+        // answers requests before it closed. A gap never inherits earlier leverage.
+        for key in [
+            "mtf_observed_at_epoch_secs",
+            "mtf_source_modified_at_epoch_secs",
+            "mtf_leverage_by_security_id",
+        ] {
+            disk.as_object_mut().unwrap().remove(key);
+        }
+        let frozen = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+        assert_eq!(
+            frozen.mtf_at(open).unwrap().leverage_by_security_id[&2],
+            1.0
+        );
+        assert!(frozen.mtf_at(open + hour / 2).is_none());
+        assert!(frozen.mtf_at(open + hour).is_none());
+    }
+
+    #[test]
+    fn mtf_history_refuses_malformed_overlapping_and_wrong_day_proofs_without_losing_indices() {
+        let begin = at("2026-10-30 09:30:00").and_utc().timestamp() - IST_UTC_OFFSET_SECONDS_I64;
+        let interval = |observed, end| {
+            json!({
+                "mtf_observed_at_epoch_secs": observed,
+                "mtf_source_modified_at_epoch_secs": begin - 60,
+                "mtf_valid_before_epoch_secs": end,
+                "mtf_leverage_by_security_id":{"2":2.5}
+            })
+        };
+        let first = interval(begin, begin + 60);
+        let second = interval(begin + 60, begin + 120);
+        let mut disk = mapping(2);
+        disk["mtf_history"] = json!([first, second]);
+        disk["mtf_observed_at_epoch_secs"] = json!(begin + 120);
+        disk["mtf_source_modified_at_epoch_secs"] = json!(begin);
+        disk["mtf_leverage_by_security_id"] = json!({"2": 4.0});
+        let valid = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+        assert_eq!(
+            valid.mtf_at(begin + 59).unwrap().observed_at_epoch_secs,
+            begin
+        );
+        assert_eq!(
+            valid.mtf_at(begin + 60).unwrap().observed_at_epoch_secs,
+            begin + 60
+        );
+        assert_eq!(
+            valid.mtf_at(begin + 120).unwrap().leverage_by_security_id[&2],
+            4.0
+        );
+
+        let mut rolled_back = second.clone();
+        rolled_back["mtf_source_modified_at_epoch_secs"] = json!(begin - 61);
+        let mut partial = disk.clone();
+        partial
+            .as_object_mut()
+            .unwrap()
+            .remove("mtf_source_modified_at_epoch_secs");
+        let parsed = parse_memberships(&serde_json::to_vec(&partial).unwrap(), DATE).unwrap();
+        assert!(parsed.mtf_at(begin + 119).is_some() && parsed.mtf_at(begin + 120).is_none());
+        partial["mtf_observed_at_epoch_secs"] = json!(begin + 119);
+        let overlap = parse_memberships(&serde_json::to_vec(&partial).unwrap(), DATE).unwrap();
+        assert!(overlap.mtf_at(begin + 119).is_none());
+        let mut rollback = disk.clone();
+        rollback["mtf_source_modified_at_epoch_secs"] = json!(begin - 61);
+        let rollback = parse_memberships(&serde_json::to_vec(&rollback).unwrap(), DATE).unwrap();
+        assert!(rollback.mtf_at(begin).is_none() && rollback.mtf_at(begin + 120).is_none());
+        assert_eq!(rollback.names.len(), 2);
+        for refresh in [json!("unknown"), json!(begin - 86_400), json!(begin + 119)] {
+            disk["mtf_last_refresh_epoch_secs"] = refresh;
+            let m = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+            assert!(m.mtf_at(begin).is_none() && m.mtf_at(begin + 120).is_none());
+            assert_eq!(m.names.len(), 2);
+        }
+        disk["mtf_last_refresh_epoch_secs"] = json!(begin + 120);
+        for bad in [
+            json!("bad"),
+            json!([first, first]),
+            json!([first, rolled_back]),
+            json!([second, first]),
+            json!([interval(begin, begin)]),
+            json!([interval(begin, begin + 86_400)]),
+            json!([interval(begin - 86_400, begin)]),
+            json!([interval(begin, begin + 121)]),
+            json!([interval(begin, begin + 61), second]),
+            json!([{"mtf_valid_before_epoch_secs":begin + 1}]),
+            json!(vec![serde_json::Value::Null; MAX_MTF_HISTORY_INTERVALS + 1]),
+        ] {
+            disk["mtf_history"] = bad;
+            let parsed = parse_memberships(&serde_json::to_vec(&disk).unwrap(), DATE).unwrap();
+            assert!(parsed.mtf_at(begin).is_none() && parsed.mtf_at(begin + 120).is_none());
+            assert_eq!(parsed.names.len(), 2);
+        }
+    }
+
+    #[tokio::test]
     async fn mtf_reader_proves_eligibility_at_or_before_the_selected_ist_minute() {
         use tickvault_common::operator_stock_movers_wire::MoversCategory;
         let f = Fixture::new(6);
@@ -1373,7 +1646,7 @@ mod tests {
         artifact["mtf_source_modified_at_epoch_secs"] = json!(observed - 1800);
         artifact["mtf_leverage_by_security_id"] = json!(terms);
         let bytes = serde_json::to_vec(&artifact).unwrap();
-        assert!(bytes.len() < MAX_MAPPING_BYTES);
+        assert!(bytes.len() < MAX_DAILY_MAPPING_BYTES);
         assert!(parse_memberships(&bytes[..bytes.len() - 1], DATE).is_none());
         let m = parse_memberships(&bytes, DATE).unwrap();
         assert_eq!(
@@ -1721,7 +1994,7 @@ mod tests {
         let mut conflict = value;
         conflict["mappings"][8]["symbol"] = json!("WRONG");
         assert!(parse_memberships(&serde_json::to_vec(&conflict).unwrap(), DATE).is_none());
-        assert!(parse_memberships(&vec![b' '; MAX_MAPPING_BYTES + 1], DATE).is_none());
+        assert!(parse_memberships(&vec![b' '; MAX_DAILY_MAPPING_BYTES + 1], DATE).is_none());
     }
     #[tokio::test]
     async fn index_and_fno_filter_the_universe_before_top_page() {
@@ -2206,6 +2479,7 @@ mod tests {
             .collect();
         let membership = Memberships {
             mtf: None,
+            mtf_history: Vec::new(),
             names: HashMap::new(),
             indices,
             by_stock: (1..=20)
@@ -2620,6 +2894,7 @@ mod select_equivalence {
             .collect();
         Memberships {
             mtf: None,
+            mtf_history: Vec::new(),
             names,
             indices,
             by_stock,

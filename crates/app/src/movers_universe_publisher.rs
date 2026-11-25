@@ -712,6 +712,194 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn daily_mtf_master_reaches_published_stocks_and_replacement_drops_unverified_terms() {
+        use figment::providers::{Format, Toml};
+        use tickvault_common::operator_movers_universe::select;
+        use tickvault_common::operator_movers_wire::SourceStatus;
+        use tickvault_common::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
+        const CHILD: &str = "TV_TEST_MTF_DAILY_PUBLISH_DIR";
+        // The writer and reader use the production relative artifact directory.
+        // A child process gets its own cwd while other Rust tests run in parallel.
+        if let Some(dir) = std::env::var_os(CHILD) {
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                std::path::PathBuf::from(dir)
+            );
+            assert!(
+                std::env::current_dir()
+                    .unwrap()
+                    .starts_with(std::env::temp_dir())
+            );
+        } else {
+            let dir =
+                std::env::temp_dir().join(format!("tv-mtf-daily-publish-{}", std::process::id()));
+            std::fs::create_dir(&dir).unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(std::thread::current().name().unwrap())
+                .env(CHILD, &dir)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+                "child stdout {} stderr {}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config: tickvault_common::config::ApplicationConfig = figment::Figment::new()
+            .merge(Toml::string(include_str!("../../../config/base.toml")))
+            .extract()
+            .unwrap();
+        config.questdb.host = "127.0.0.1".into();
+        config.questdb.http_port = listener.local_addr().unwrap().port();
+        let state = SharedAppState::new(
+            config.questdb,
+            config.dhan,
+            config.instrument,
+            Default::default(),
+        );
+        let db = tokio::spawn(async move {
+            let quote_rows = |axum::extract::Query(args): axum::extract::Query<
+                std::collections::HashMap<String, String>,
+            >| async move {
+                let stamp = args["query"]
+                    .split(" AND ts <= '")
+                    .nth(1)
+                    .unwrap()
+                    .split('\'')
+                    .next()
+                    .unwrap();
+                let rows: Vec<_> = (1..=4)
+                    .map(|id| serde_json::json!([id, "NSE_EQ", 110.0, 100.0, 30, 105.0, stamp]))
+                    .collect();
+                axum::Json(serde_json::json!({"dataset":rows}))
+            };
+            let route = axum::Router::new().route("/exec", axum::routing::get(quote_rows));
+            axum::serve(listener, route).await.unwrap();
+        });
+        let source = Some("Fri, 06 Nov 2026 02:00:00 GMT");
+        let revision = Some("Fri, 06 Nov 2026 08:00:00 GMT");
+        let previous = Some((3.75, epoch_of(9, 30) + 1));
+        let newer = Some((2.5, epoch_of(14, 0)));
+        type ExpectedCutoff = (u32, u32, Option<(f64, i64)>);
+        type Refresh<'a> = (&'a str, Option<&'a str>, &'a str, &'a [ExpectedCutoff]);
+        let checks: &[Refresh<'_>] = &[
+            (
+                "2026-11-06T04:00:00.250Z",
+                source,
+                "3.75",
+                &[(9, 30, None), (10, 0, previous)],
+            ),
+            (
+                "2026-11-06T06:30:00Z",
+                source,
+                "3.75",
+                &[(10, 0, previous), (12, 0, previous)],
+            ),
+            (
+                "2026-11-06T07:30:00Z",
+                None,
+                "3.75",
+                &[(10, 0, previous), (13, 0, None)],
+            ),
+            (
+                "2026-11-06T08:30:00Z",
+                revision,
+                "2.50",
+                &[(10, 0, previous), (13, 30, None), (14, 0, newer)],
+            ),
+            (
+                "2026-11-06T06:45:00Z",
+                source,
+                "5.00",
+                &[
+                    (10, 0, previous),
+                    (12, 15, None),
+                    (12, 30, None),
+                    (13, 30, None),
+                    (14, 0, newer),
+                ],
+            ),
+            (
+                "2026-11-06T09:30:00Z",
+                source,
+                "5.00",
+                &[(14, 30, newer), (15, 0, None)],
+            ),
+        ];
+        for (index, &(observed, header, multiplier, cutoffs)) in checks.iter().enumerate() {
+            crate::dhan_universe::write_mtf_mapping_fixture(observed, header, multiplier);
+            let path = crate::dhan_universe::mapping_artifact_path("2026-11-06");
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            let receipt_count = record
+                .get("mtf_history")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
+            assert_eq!(
+                receipt_count,
+                [0, 0, 1, 1, 1, 2][index],
+                "receipt count at {observed}"
+            );
+            for &(hour, minute, expected) in cutoffs {
+                let clock = clock(hour, minute, false);
+                let store = FakeStore::watching(clock.now_epoch);
+                let run = run_cycle(&store, &mut None, clock, true, || {
+                    build_live_universe(&state, clock)
+                })
+                .await;
+                assert_eq!(run.outcome, PublishOutcome::Ok);
+                let bodies = store.puts.lock().unwrap();
+                assert_eq!(bodies.len(), 1);
+                let u: MoversUniverse = serde_json::from_slice(&bodies[0]).unwrap();
+                let filter = Filter {
+                    fno_only: false,
+                    ..Filter::default()
+                };
+                let daily = select(&u, &filter);
+                assert!(
+                    matches!(daily.outcome,Outcome::Snapshot{snapshot} if snapshot.rows.len()==4)
+                );
+                let filter = Filter {
+                    category: Some(MoversCategory::Mtf),
+                    ..filter
+                };
+                let reply = select(&u, &filter);
+                assert!(reply.valid_at(clock.now_epoch, &filter));
+                let Outcome::Snapshot { snapshot } = reply.outcome else {
+                    panic!("expected Stocks snapshot")
+                };
+                if let Some((leverage, stamp)) = expected {
+                    let coverage = snapshot.mtf_coverage.expect("dated terms");
+                    assert_eq!(
+                        (coverage.selected, coverage.assessed, coverage.eligible),
+                        (4, 3, 2)
+                    );
+                    assert_eq!(coverage.observed_at_epoch_secs, stamp);
+                    assert_eq!(
+                        snapshot
+                            .rows
+                            .iter()
+                            .map(|s| (s.price.security_id, s.mtf_leverage))
+                            .collect::<Vec<_>>(),
+                        [(1, Some(1.0)), (2, Some(leverage))]
+                    );
+                } else {
+                    assert_eq!(snapshot.status, SourceStatus::NoMtfList);
+                    assert!(snapshot.mtf_coverage.is_none() && snapshot.rows.is_empty());
+                }
+            }
+        }
+        db.abort();
+    }
+
     #[test]
     fn test_next_interval_doubles_from_five_seconds_to_a_two_minute_ceiling() {
         let schedule: Vec<u64> = (0..8).map(|n| next_interval(n).as_secs()).collect();
