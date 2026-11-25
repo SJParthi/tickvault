@@ -5,7 +5,7 @@ When the app accepts 100 updates and the database returns zero, a spill counter 
 | What was checked | Result | Where it was measured |
 | --- | --- | --- |
 | Two audit receipts, each sent twice | Two rows remained after restart. All seven checked fields matched. | Production Rust writer, isolated QuestDB 9.3.5 |
-| Changed production Rust lines at revision `16212ad77` | 51 of 51 exercised across three files | Local LLVM instrumentation |
+| Changed production Rust lines at revision `75637a5be` | 61 of 61 exercised across three files | [Local LLVM instrumentation](changed-lines.json). The parser was rebuilt. The dashboard and classifier matched their instrumented sources byte for byte. |
 | Whole-workspace production lines at `9ccd99e7` | 117,496 of 139,557 covered (84.19%) | [Hosted coverage](https://github.com/SJParthi/tickvault/actions/runs/45461479036/job/138686672306) |
 | Time for one frame containing four quotes | p99 1.833 µs standard, 3.757 µs full library, 3.717 µs full custom | 65,536 frames per path on the [hosted benchmark](https://github.com/SJParthi/tickvault/actions/runs/45461485528/job/138684939224) |
 | Warm paper-order placement | p99 0.751 µs inside the app | Same hosted benchmark |
@@ -13,6 +13,12 @@ When the app accepts 100 updates and the database returns zero, a spill counter 
 | Production Stocks page at 08:10 IST on November 25 | Price Movers, Gainers/Losers, NSE and F&O Stocks rendered. Binary, portal and main reported `9ccd99e`. The instance was stopped. | [Authenticated page capture](stocks.png) |
 
 [Watch the narrated comparison](measurements.mp4) · [English captions](captions.vtt)
+
+## Branch inventory before publication
+
+The [branch inventory](branch-inventory.tsv) covers 925 non-main branch names at 893 distinct tips. Each row records the exact SHA, related PRs and how its changes compare with main. The combined branch contains the dependency head from [PR #2289](https://github.com/SJParthi/tickvault/pull/2289). The Stocks rebuild reached main through [PR #2187](https://github.com/SJParthi/tickvault/pull/2187).
+
+The historical `claude/integration` branch would change 64 files in a clean Git merge, including restoring retired Groww and volume-ranking modules and duplicating a Rust import. Review any still-needed changes individually. Main already includes the later feed scan work and the ported WAL acknowledgement logic. [Branch comparison](https://github.com/SJParthi/tickvault/compare/9ccd99e7...82ed11e7) · [WAL decision](https://github.com/SJParthi/tickvault/blob/9ccd99e7/.claude/plans/active-plan-audit-2026-10-20.md#L723-L733)
 
 ## Continue the review in Claude Code
 

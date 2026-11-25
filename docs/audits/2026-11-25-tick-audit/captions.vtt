@@ -25,7 +25,7 @@ The paper order step took zero point seven five one microseconds at the ninety-n
 The step that builds a labelled database line took one point three four two microseconds. Timing a full database round trip or a live broker confirmation needs a separate clock.
 
 00:01:14.917 --> 00:01:27.000
-Imagine highlighting each line you read. Local tests highlighted all fifty-one changed lines of production Rust. Ten were in the count reader, forty in the dashboard, and one in the audit decision.
+Imagine highlighting each line you read. Local tests highlighted all sixty-one changed lines of production Rust. Twenty were in the count reader, forty in the dashboard, and one in the audit decision.
 
 00:01:27.000 --> 00:01:37.917
 Across the whole project, the exact main build reached eighty-four point one nine percent of production lines. Reading a line once leaves room for other inputs to behave differently.
