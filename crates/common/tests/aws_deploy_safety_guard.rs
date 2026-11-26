@@ -67,7 +67,7 @@ impl Fixture {
             .env("REGION", "ap-south-1")
             .env("AWS_REGION_EFF", "ap-south-1")
             .env("IID", "i-owned-fixture")
-            .env("EVENT_NAME", "workflow_dispatch")
+            .env("DEPLOY_ORIGIN", "workflow_dispatch")
             .env("DEPLOY_SHA", SHA)
             .env("BUDGET_MODE", "absent")
             .env("HOLIDAY_MODE", "absent")
@@ -116,6 +116,11 @@ impl Drop for Fixture {
 
 const DATE: &str = r#"
 case "$*" in
+  '+%u %H%M')
+    # A delayed SSM lookup can cross the scheduled EC2 stop.
+    clock=${INITIAL_CLOCK:-"1 1745"}
+    if grep -q '^ssm get-parameter$' "$FIXTURE/calls"; then clock=${AFTER_FENCES_CLOCK:-"$clock"}; fi
+    echo "$clock";;
   '+%u') echo 1;;
   '+%H%M') echo 1745;;
   '-u +%Y-%m') echo 2026-11;;
@@ -330,7 +335,7 @@ fn test_regression_running_or_automatic_off_hours_does_not_claim_a_start() {
         let output = fixture
             .command(&script)
             .env("INITIAL_STATE", if running { "running" } else { "stopped" })
-            .env("EVENT_NAME", "push")
+            .env("DEPLOY_ORIGIN", "push")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -347,6 +352,68 @@ fn test_regression_running_or_automatic_off_hours_does_not_claim_a_start() {
                 .contains("DEPLOY_SKIP_REASON=intentional_stopped"),
             !running
         );
+    }
+}
+
+/// Execute the workflow's actual Ensure step, including both stop-fence reads.
+#[test]
+fn automatic_deploys_obey_the_window_at_the_moment_of_start() {
+    let script = step_run(
+        &workflow(),
+        "- name: Ensure instance running (self-start + wait for SSM online)",
+    );
+    let retry = "automatic_retry";
+    let manual = "workflow_dispatch";
+    for (origin, state, initial_clock, final_clock, should_start, should_defer) in [
+        ("push", "stopped", "4 1630", "4 1630", false, true),
+        ("push", "stopped", "4 1629", "4 1630", false, true),
+        ("push", "stopped", "4 0830", "4 0830", true, false),
+        (retry, "stopped", "4 1815", "4 1815", false, true),
+        (retry, "running", "4 1815", "4 1815", false, false),
+        (retry, "stopped", "4 0829", "4 0829", false, true),
+        (retry, "stopped", "4 0830", "4 0830", true, false),
+        (retry, "stopped", "4 1546", "4 1546", true, false),
+        (retry, "stopped", "4 1629", "4 1630", false, true),
+        (retry, "stopped", "4 1630", "4 1630", false, true),
+        (retry, "stopped", "6 1546", "6 1546", false, true),
+        (manual, "stopped", "4 1815", "4 1815", true, false),
+        (manual, "stopped", "6 1546", "6 1546", true, false),
+    ] {
+        let fixture = Fixture::new();
+        let output = fixture
+            .command(&script)
+            .env("DEPLOY_ORIGIN", origin)
+            .env("INITIAL_STATE", state)
+            .env("INITIAL_CLOCK", initial_clock)
+            .env("AFTER_FENCES_CLOCK", final_clock)
+            .output()
+            .unwrap();
+        let scenario = (origin, state, initial_clock, final_clock);
+        assert!(output.status.success(), "{scenario:?} {output:?}");
+        let calls = fixture.text("calls");
+        let environment = fixture.text("environment");
+        assert_eq!(
+            calls.matches("ec2 start-instances").count(),
+            usize::from(should_start),
+            "{scenario:?}"
+        );
+        assert_eq!(
+            environment.contains("DEPLOY_STARTED_STOPPED_BOX=yes"),
+            should_start,
+            "{scenario:?}"
+        );
+        assert_eq!(
+            environment.contains("DEPLOY_SKIP_REASON=intentional_stopped"),
+            should_defer,
+            "{scenario:?}"
+        );
+        if initial_clock != final_clock {
+            assert_eq!(
+                calls.matches("ssm get-parameter").count(),
+                2,
+                "{scenario:?}"
+            );
+        }
     }
 }
 
