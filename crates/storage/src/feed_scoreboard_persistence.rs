@@ -101,8 +101,11 @@ pub const LAG_FLOOR_MS_DHAN: i64 = 1000;
 /// lock 2026-07-24.
 pub const LAG_FLOOR_MS_TRUEDATA: i64 = 1000;
 
-/// NSE regular session minutes ([09:15, 15:30) IST).
-pub const SCOREBOARD_SESSION_MINUTES: i64 = 375;
+/// Current regular NSE capture window, including its closing auction. Daily
+/// rows use the bounds applicable to their own date.
+pub const SCOREBOARD_SESSION_MINUTES: i64 = (tickvault_common::constants::MARKET_CLOSE_IST_NANOS
+    - tickvault_common::constants::MARKET_OPEN_IST_NANOS)
+    / 60_000_000_000;
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -392,7 +395,7 @@ pub struct FeedScoreboardDailyRow {
     pub restarts_detected: i64,
     /// Session minutes with ≥1 tick from this feed (`-1` = unavailable).
     pub streaming_minutes: i64,
-    /// The session denominator (375 for a regular NSE day).
+    /// Duration of the capture window queried for this date, or -1 if unknown.
     pub session_minutes: i64,
     /// `streaming_minutes / session_minutes * 100` (0.0 when unknown —
     /// paired with `partial_coverage=true` so it can't read as a false 0%).
@@ -975,7 +978,7 @@ mod tests {
             blame_indeterminate: 1,
             restarts_detected: 0,
             streaming_minutes: 373,
-            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            session_minutes: 375,
             uptime_pct: 99.47,
             partial_coverage: false,
             coverage_source: CoverageSource::SqlBackfill,
@@ -1107,7 +1110,7 @@ mod tests {
         // fabricated zero (Rule 11).
         assert_eq!(LAG_FLOOR_MS_DHAN, 1000);
         assert_eq!(SCOREBOARD_UNAVAILABLE_SENTINEL, -1);
-        assert_eq!(SCOREBOARD_SESSION_MINUTES, 375);
+        assert_eq!(SCOREBOARD_SESSION_MINUTES, 385);
     }
 
     #[test]

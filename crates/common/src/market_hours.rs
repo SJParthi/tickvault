@@ -134,6 +134,19 @@ pub fn installed_calendar_session_day(date: chrono::NaiveDate) -> Option<Session
     calendar_session_day(SESSION_CALENDAR.get().map(Arc::as_ref), date)
 }
 
+/// Session information for dates covered by a configured annual holiday
+/// list. A missing calendar year has no authoritative regular-day schedule.
+#[must_use]
+pub fn covered_calendar_session_day(date: chrono::NaiveDate) -> Option<SessionDayInfo> {
+    calendar_session_day(
+        SESSION_CALENDAR
+            .get()
+            .map(Arc::as_ref)
+            .filter(|calendar| calendar.covers_year(date)),
+        date,
+    )
+}
+
 /// What [`installed_calendar_session_day`] reports for one date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDayInfo {

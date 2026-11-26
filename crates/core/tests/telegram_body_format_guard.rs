@@ -136,7 +136,7 @@ fn guard_daily_cards_carry_the_compact_date() {
     // pass one-liner ALWAYS carry the compact verified date.
     let body = scorecard_clean().to_message();
     assert!(
-        first_line(&body).contains("Feed scorecard 3:45 PM \u{b7} 15 Jul"),
+        first_line(&body).contains("Feed scorecard \u{b7} 15 Jul"),
         "scorecard header must carry the compact date: {body}"
     );
     let body = tf_pass().to_message();

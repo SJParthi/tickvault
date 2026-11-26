@@ -1,5 +1,14 @@
 # Dual-Feed Scoreboard — Operator Runbook (month-end verdict + daily triage)
 
+## Reading the daily Dhan capture-minute score
+
+Each minute counts once if QuestDB holds at least one tick from that feed during the configured NSE capture window. On a regular day the window runs from 09:15 IST to 15:40 IST, with the close excluded. It covered 375 minutes before the 3 August 2026 auction change and covers 385 minutes after that change. The numerator and denominator use the same dated window. A day with 375 observed minutes out of 385 scores 97.40%. A full result still leaves individual instrument delivery and exchange-side tick loss unmeasured.
+
+The scorecard uses published Muhurat hours, including for Sunday sessions. On a mixed day it waits until the final session ends plus the configured regular post-close delay. If the annual holiday list or announced session hours are missing, the automatic job has no confirmed trigger. A forced aggregation records unknown minute counts as `-1` and marks the result partial. Under the existing storage contract, a partial row with unknown streaming minutes carries `uptime_pct=0.0`. Exclude such rows from percentage reports.
+
+Historical rows retain their originally recorded values, including any legacy result over 100%. Preserve the original row and use the dated tick records when recalculating it. A SQL backfill of feed minutes cannot reconstruct unobserved instrument coverage.
+
+
 > **⚠ SUPERSEDED IN PURPOSE 2026-07-13 (operator directive — Dhan live WS retired):** the
 > 2026-07-10 month-long Dhan-vs-Groww live comparison is CONCLUDED EARLY by the 2026-07-13
 > retirement directive (verbatim + evidence record: `websocket-connection-scope-lock.md`

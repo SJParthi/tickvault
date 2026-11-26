@@ -2070,23 +2070,25 @@ impl NotificationEvent {
                 // delivered, which is the number an operator actually needs.
                 let (verdict_emoji, verdict_sentence) = if *dhan_feed_off {
                     ("\u{2139}\u{fe0f}", "feed OFF today".to_string())
-                } else if dhan.exclusive_minutes < 0 || *session_minutes == 0 {
+                } else if *session_minutes <= 0
+                    || !(0..=*session_minutes).contains(&dhan.streaming_minutes)
+                {
                     // Unmeasured is NEVER rendered as a clean day.
                     (
                         "\u{26a0}\u{fe0f}",
                         "no coverage figures recorded today".to_string(),
                     )
                 } else {
-                    let covered = dhan.exclusive_minutes;
+                    let covered = dhan.streaming_minutes;
                     let total = *session_minutes;
-                    let emoji = if covered >= total {
+                    let emoji = if covered == total {
                         "\u{2705}"
                     } else {
                         "\u{26a0}\u{fe0f}"
                     };
                     (
                         emoji,
-                        format!("delivered {covered} of {total} session minutes"),
+                        format!("ticks recorded in {covered} of {total} capture minutes"),
                     )
                 };
                 // A caveat day renders the warning emoji up front — the
@@ -2104,7 +2106,7 @@ impl NotificationEvent {
                 let date = render_compact_date_ist(trading_date_ist);
                 let mut lines: Vec<String> = Vec::new();
                 lines.push(format!(
-                    "{emoji} <b>Feed scorecard 3:45 PM \u{b7} {date}</b> \u{2014} \
+                    "{emoji} <b>Feed scorecard \u{b7} {date}</b> \u{2014} \
                      {verdict_sentence}{early}"
                 ));
                 // The `pulls_for` closure is RETIRED 2026-09-17 with the
@@ -6558,18 +6560,19 @@ mod tests {
         // false-OK class this repo has retired repeatedly. The verdict now
         // reports the feed's OWN coverage, and only a full session is green.
         let mut d = score_line("Dhan");
-        d.exclusive_minutes = 375;
+        d.exclusive_minutes = -1;
+        d.streaming_minutes = 375;
         let msg = scorecard(d).to_message();
         assert_eq!(
             msg.lines().next().unwrap_or_default(),
-            "\u{2705} <b>Feed scorecard 3:45 PM \u{b7} 10 Jul</b> \u{2014} \
-             delivered 375 of 375 session minutes",
+            "\u{2705} <b>Feed scorecard \u{b7} 10 Jul</b> \u{2014} \
+             ticks recorded in 375 of 375 capture minutes",
             "a full session is the only green verdict: {msg}"
         );
 
         // A PARTIAL day must not read green.
         let mut d = score_line("Dhan");
-        d.exclusive_minutes = 200;
+        d.streaming_minutes = 200;
         let msg = scorecard(d).to_message();
         let first = msg.lines().next().unwrap_or_default();
         assert!(
@@ -6577,14 +6580,14 @@ mod tests {
             "a partial day must carry the warning emoji: {msg}"
         );
         assert!(
-            first.contains("delivered 200 of 375 session minutes"),
+            first.contains("ticks recorded in 200 of 375 capture minutes"),
             "the verdict must name the real numbers: {msg}"
         );
 
         // UNMEASURED must never render as a clean day, and must never leak
         // the -1 sentinel into operator-facing text.
         let mut d = score_line("Dhan");
-        d.exclusive_minutes = -1;
+        d.streaming_minutes = -1;
         let msg = scorecard(d).to_message();
         let first = msg.lines().next().unwrap_or_default();
         assert!(
@@ -6599,6 +6602,27 @@ mod tests {
             !msg.contains("-1"),
             "the -1 sentinel must never render: {msg}"
         );
+
+        // A mismatched legacy row (385/375) must not turn green or
+        // silently clamp to 100%. Neither can an unknown denominator.
+        for (observed, duration) in [(385, 375), (1, 0), (1, -1)] {
+            let mut d = score_line("Dhan");
+            d.streaming_minutes = observed;
+            let mut ev = scorecard(d);
+            if let NotificationEvent::DualFeedDailyScorecard {
+                session_minutes, ..
+            } = &mut ev
+            {
+                *session_minutes = duration;
+            }
+            let msg = ev.to_message();
+            let first = msg.lines().next().unwrap();
+            assert!(
+                first.contains("no coverage figures recorded today"),
+                "{msg}"
+            );
+            assert!(!first.contains('✅'), "{msg}");
+        }
 
         // A feed switched OFF is an info day, not a failure.
         let mut ev = scorecard(score_line("Dhan"));
