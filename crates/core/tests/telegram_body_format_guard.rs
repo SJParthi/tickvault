@@ -69,6 +69,7 @@ fn sentinel_feed(name: &str) -> FeedScoreLine {
 
 fn scorecard(dhan: FeedScoreLine, partial: bool, dhan_off: bool) -> NotificationEvent {
     NotificationEvent::DualFeedDailyScorecard {
+        prepared_at_ms: Some(36_900_000),
         trading_date_ist: "2026-07-15".to_string(),
         dhan,
         session_minutes: 375,

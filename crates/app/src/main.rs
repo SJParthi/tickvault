@@ -7112,6 +7112,7 @@ fn spawn_feed_scoreboard_tasks(
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
+                        prepared_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).ok(),
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
                         session_minutes: summary.session_minutes,
