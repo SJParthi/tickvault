@@ -1233,21 +1233,24 @@ pub fn form_urlencode(pairs: &[(&str, String)]) -> String {
 /// Deliver the encoded message, including any private-chat button.
 async fn post_telegram_body(
     client: &reqwest::Client,
-    token: &str,
+    url: &str,
     body: String,
-) -> Result<(u16, String), reqwest::Error> {
-    let url = format!("{TELEGRAM_API_BASE}/bot{token}/sendMessage");
+) -> Result<(u16, String), String> {
+    // The Bot API URL contains the token. Strip it from send and body errors
+    // before either can reach the batch result or Lambda logs.
+    let redact_url = |err: reqwest::Error| err.without_url().to_string();
     let resp = client
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .await?;
+        .await
+        .map_err(redact_url)?;
     let status = resp.status().as_u16();
     // legacy: resp.read().decode("utf-8", errors="replace") — reqwest
     // text() is already lossy on invalid UTF-8; a transport error while
     // reading propagates like the legacy exception path.
-    let body_text = resp.text().await?;
+    let body_text = resp.text().await.map_err(redact_url)?;
     Ok((status, body_text))
 }
 
@@ -1406,18 +1409,13 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     //  the Rust fold has no panicking path — ledger.)
 
     let configured_url = std::env::var("OPERATOR_PORTAL_URL").ok();
+    let send_url = format!("{TELEGRAM_API_BASE}/bot{token}/sendMessage");
     let result = send_texts(&texts, records.len(), |delivery| {
-        let client = client.clone();
-        let token = token.clone();
-        let body = delivery.body(&chat_id, configured_url.as_deref());
-        async move {
-            post_telegram_body(&client, &token, body)
-                .await
-                // Token-redaction hardening: the reqwest error Display
-                // embeds the request URL, which contains the bot token —
-                // strip it before the string enters logs / the result.
-                .map_err(|e| e.without_url().to_string())
-        }
+        post_telegram_body(
+            &client,
+            &send_url,
+            delivery.body(&chat_id, configured_url.as_deref()),
+        )
     })
     .await;
 
@@ -1436,6 +1434,9 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod relay_tests;
 
 #[cfg(test)]
 mod tests {
