@@ -529,7 +529,7 @@ fn stage_samples_valid(fig: &StageFigures) -> bool {
 fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
     let tiles = stages.iter().filter_map(|fig| {
         let unit = match fig.stage {
-            Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs",
+            Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs. An accepted frame enters the writer's memory queue. A frame can survive a process crash once the writer flushes it to the operating system.",
             Stage::RingDwell => "live-drained frame, all endpoints. From receipt before the write-ahead log handoff to the drain after dequeue and reservation release. Includes reader work before enqueue. Ring-refused frames have no sample.",
             Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
             Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
@@ -2157,6 +2157,7 @@ mod tests {
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
         assert!(strict.tiles[0].detail.contains("includes refused handoffs"));
+        assert!(strict.tiles[0].detail.contains("writer's memory queue"));
         let dwell = &strict.tiles[1].detail;
         assert!(dwell.contains("before the write-ahead log handoff"));
         assert!(dwell.contains("after dequeue and reservation release"));

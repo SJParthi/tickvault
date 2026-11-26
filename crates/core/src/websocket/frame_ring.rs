@@ -633,6 +633,67 @@ mod tests {
         assert_eq!(&*values.lock().expect("read discarded items"), &[4, 7]);
     }
 
+    #[test]
+    fn upgraded_sender_keeps_its_discard_class_and_diagnostics_keep_the_key_private() {
+        let (plain, rx) = frame_ring::<u8>(2);
+        let discarded = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&discarded);
+        let class_key: usize = 0x5a5a1234;
+        let tagged = plain
+            .clone()
+            .with_discard_handler((class_key, 1), move |item| {
+                recorded.lock().expect("record tagged item").push(*item);
+            });
+        let weak = tagged.downgrade();
+        drop(tagged);
+
+        let upgraded = weak.upgrade().expect("untagged sender still owns the ring");
+        let diagnostic = format!("{upgraded:?}");
+        assert!(diagnostic.contains("DiscardHandler"));
+        assert!(!diagnostic.contains(&class_key.to_string()));
+        plain.try_send(7).expect("untagged frame");
+        upgraded.try_send(8).expect("tagged frame");
+        drop(rx);
+        assert_eq!(*discarded.lock().expect("read tagged items"), [8]);
+    }
+
+    #[test]
+    fn spin_delivers_committed_tail_then_observes_close_with_senders_still_alive() {
+        let (tx, mut rx) = frame_ring(2);
+        rx.set_spin_before_park(FRAME_RING_SPIN_MAX);
+        tx.try_send(91).expect("frame committed before shutdown");
+        rx.close();
+
+        // Exercise the same spin check when shutdown wins between recv's first
+        // empty probe and its spin. Driving this check directly avoids a timing race.
+        assert_eq!(rx.spin_for_next(), Some(Some(91)));
+        assert_eq!(rx.spin_for_next(), Some(None));
+        assert_eq!(tx.try_send(92), Err(FrameRingTrySendError::Closed(92)));
+        let stats = rx.spin_stats();
+        assert_eq!((stats.hits, stats.misses), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_sender_while_an_empty_receiver_registers_cannot_strand_it() {
+        let (tx, mut rx) = frame_ring::<usize>(1);
+        let shared = Arc::clone(&rx.shared);
+        let last_sender = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // Wait until recv has found the ring empty and reached its first
+            // waiter registration. Drop may win before or after the recheck.
+            while shared.registrations.load(Ordering::Relaxed) == 0 {
+                assert!(Instant::now() < deadline, "receiver never began parking");
+                std::thread::yield_now();
+            }
+            drop(tx);
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        last_sender.join().expect("producer completed");
+        assert_eq!(outcome.expect("last sender must wake receiver"), None);
+        assert_eq!(rx.recv().await, None);
+    }
+
     #[tokio::test]
     async fn test_close_sets_receiver_closed_and_preserves_already_committed_items() {
         let (tx, mut rx) = frame_ring(2);

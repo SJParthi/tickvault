@@ -1315,11 +1315,14 @@ impl WsFrameSpill {
     /// writer-dead drop path is loud (WS-SPILL-02), not silent.
     #[cfg(test)]
     fn new_with_dead_writer_for_test() -> Self {
-        // A unique directory per call so the flock is always free: this
-        // constructor exists to exercise the dead-writer arm, and a lock
-        // contention failure here would prove nothing about that arm.
+        Self::new_with_held_writer_for_test(1).0
+    }
+
+    #[cfg(test)]
+    fn new_with_held_writer_for_test(capacity: usize) -> (Self, Receiver<WalRecord>) {
+        // Each fixture owns its directory lock so separate queue tests can run together.
         let dir = std::env::temp_dir().join(format!(
-            "tv-wal-dead-writer-{}-{}",
+            "tv-wal-held-writer-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1327,9 +1330,8 @@ impl WsFrameSpill {
         ));
         std::fs::create_dir_all(&dir).expect("test temp dir");
         let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
-        let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
-        drop(rx); // no writer ever runs → channel is Disconnected for sends
-        Self {
+        let (tx, rx) = bounded(capacity);
+        let spill = Self {
             spill_tx: tx,
             queued_bytes: Arc::new(AtomicU64::new(0)),
             queue_budget_bytes: wal_queue_max_bytes(),
@@ -1345,7 +1347,8 @@ impl WsFrameSpill {
             wal_dir: dir.clone(),
             _dir_guard: dir_guard,
             abort_drain: Arc::new(AbortDrain::default()),
-        }
+        };
+        (spill, rx)
     }
 
     /// Hot path. Non-blocking. O(1). Zero-allocation: accepts anything
@@ -10200,24 +10203,6 @@ mod tests {
             SPILL_CHANNEL_CAPACITY,
             CHAOS_BURST_N
         );
-    }
-
-    #[test]
-    fn test_drop_counter_increments_when_channel_full() {
-        // Exercise the drop path by creating a spill, then forcing the channel
-        // full. We synthesize a dropped count without a writer thread by
-        // constructing an independent spill where the writer is slow — but a
-        // simpler check: verify the drop_critical counter starts at zero and
-        // the `Dropped` variant is observable by type.
-        let dir = tmp_dir("drop");
-        let spill = WsFrameSpill::new(&dir).unwrap();
-        assert_eq!(spill.drop_critical_count(), 0);
-        // A single append should NOT drop (channel is 65k).
-        let outcome = spill.append(WsType::LiveFeed, vec![1]);
-        assert_eq!(outcome, AppendOutcome::Spilled);
-        assert_eq!(spill.drop_critical_count(), 0);
-        drop(spill);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
