@@ -178,15 +178,23 @@ fn catchup_reads_the_calendar_before_the_probe_without_failing_the_job() {
 }
 
 #[test]
-fn a_human_dispatch_of_deploy_aws_still_starts_the_box_at_any_time() {
-    let wf = read(DEPLOY);
+fn scheduled_wrapper_forwards_its_origin_while_manual_dispatch_keeps_its_default() {
+    let wrapper = read(".github/workflows/deploy-aws-after-close.yml");
+    let child = read(DEPLOY);
     assert!(
-        wf.contains(
-            "if [ \"$UP_WINDOW\" = \"yes\" ] || [ \"$EVENT_NAME\" = \"workflow_dispatch\" ]; then SHOULD_BE_UP=yes; fi"
-        ),
-        "{DEPLOY}: a workflow_dispatch must still set SHOULD_BE_UP=yes, so a human \
-         dispatch deploys on a weekend, a holiday or at night"
+        wrapper.contains(
+            "SCHEDULED_RETRY: ${{ github.event_name == 'schedule' && 'true' || 'false' }}"
+        )
     );
+    assert!(wrapper.contains(
+        r#"gh workflow run deploy-aws.yml --ref main -f "scheduled_retry=$SCHEDULED_RETRY""#
+    ));
+    let input = child.split_once("      scheduled_retry:\n").unwrap().1;
+    let input = input.split_once("      confirm_market_hours:").unwrap().0;
+    assert!(input.contains("type: boolean") && input.contains("default: false"));
+    assert!(child.contains(
+        "DEPLOY_ORIGIN: ${{ inputs.scheduled_retry && 'schedule' || github.event_name }}"
+    ));
 }
 
 /// Every `[[trading.nse_holidays]]` and `[[trading.muhurat_trading_dates]]`
