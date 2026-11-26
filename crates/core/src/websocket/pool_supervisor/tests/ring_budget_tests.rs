@@ -232,3 +232,63 @@ fn receiver_drop_refunds_each_class_and_accounts_for_abandoned_wal_and_live_only
     );
     std::fs::remove_dir_all(dir).expect("cleanup");
 }
+
+#[test]
+fn a_closed_receiver_takes_precedence_over_both_budget_limits_before_the_tail_drains() {
+    // With a live receiver the first setup has spare slots but no bytes, and
+    // the second has spare bytes but no slots. Closing retains the queued
+    // frame's reservation until a consumer drains it or drops the receiver.
+    for (case, byte_cap, slot_cap) in [("bytes", 8, 2), ("slots", 16, 1)] {
+        let recorder = InPlaceCounters::default();
+        let dir = wal_dir(&format!("closed-full-{case}"));
+        let spill = std::sync::Arc::new(WsFrameSpill::new(&dir).expect("open WAL"));
+        metrics::with_local_recorder(&recorder, || {
+            let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(2);
+            let budget = std::sync::Arc::new(RingByteBudget::with_slot_cap(byte_cap, slot_cap));
+            let endpoint = DhanEndpointType::MainFeed;
+            let sink = WalRingSink::new(
+                std::sync::Arc::clone(&spill),
+                tx,
+                std::sync::Arc::clone(&budget),
+                WsType::LiveFeed,
+                endpoint,
+                0,
+            );
+            let first = Bytes::from_static(b"original");
+            let deferred = Bytes::from_static(b"deferred");
+            assert_eq!(sink.accept(first.clone()), FrameSinkOutcome::Captured);
+            rx.close();
+
+            assert_eq!(sink.accept(deferred.clone()), FrameSinkOutcome::RingClosed);
+            assert_eq!(spill.shutdown(std::time::Duration::from_secs(5)), 0);
+            assert_eq!(
+                sink.accept(Bytes::from_static(b"no-route")),
+                FrameSinkOutcome::WalDropped
+            );
+            assert_eq!((budget.resident(), budget.slots_resident()), (8, 1));
+
+            let held = rx.try_recv().expect("pre-close frame stays drainable");
+            assert_eq!(held.bytes, first);
+            budget.release(held.bytes.len());
+            drop(rx);
+            assert_eq!((budget.resident(), budget.slots_resident()), (0, 0));
+
+            let counts = recorder.counts.lock().expect("read endpoint counters");
+            for (metric, expected) in [
+                (RING_CLOSED_METRIC, 2),
+                (RING_FULL_METRIC, 0),
+                (RING_BYTES_FULL_METRIC, 0),
+            ] {
+                let key = format!("{metric},endpoint={}", endpoint.as_str());
+                assert_eq!(counts.get(&key).copied().unwrap_or(0), expected, "{case}");
+            }
+            drop(counts);
+            let persisted = tickvault_storage::ws_frame_spill::replay_all(&dir).expect("replay");
+            assert_eq!(persisted.len(), 2);
+            assert_eq!(persisted[0].frame, first.as_ref());
+            assert_eq!(persisted[1].frame, deferred.as_ref());
+            assert_eq!(persisted[0].frame_seq, held.seq);
+        });
+        std::fs::remove_dir_all(dir).expect("clean closed-full WAL");
+    }
+}
