@@ -103,6 +103,7 @@ ORDER BY stage;
 
 How to read it:
 
+- A successful raw-frame WAL offer places the frame in the writer's memory queue. A capture-process crash can lose frames still in that queue or the writer's userspace buffer. Flushing a complete record to the operating system lets the next process replay it. Surviving a host power loss also requires the filesystem to sync it to storage. Use the writer and replay counters alongside the receipt-stage timing when investigating a gap.
 - `p99_ns = 1024` bounds the recorded population at 1,024 ns; it cannot distinguish 999, 1000 or 1001 ns. The strict result is UNKNOWN, not PASS. Historical later buckets demonstrate a miss. This correction closes false assurance; it does not achieve the latency target or alter existing histograms.
 - `samples_over_1024ns` retains its exact historical meaning: above 1,024 ns. It is not a strict 1,000 ns classifier. Zero samples provide no percentile, and zero appended tick rows do not independently prove zero eligible frames.
 - `socket_to_wal` and `ring_dwell` aggregate endpoints; `drain_main_frame` and `receipt_to_fold` cover main-feed frames. All use `feed='dhan'`, which does not separate endpoints. Counts are not comparable as one population. Decode/fold/append are combined in the frame timer; no individual depth/flush/maintenance p99 is established here. The frame arm's size-trigger hand-offs and its 1,024-frame upkeep are timed together in `drain_frame_post`. The five `drain_arm_*` stages below time the individual non-frame arms.
