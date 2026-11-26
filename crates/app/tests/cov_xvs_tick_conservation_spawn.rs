@@ -76,6 +76,9 @@ const SESSION_CLOSE_SECS: i64 = 56_400;
 /// 15:45:00 IST, the daily check.
 const CHECK_SECS: i64 = 56_700;
 
+const DESTINATION_QUERY: &str = "select name, suspended, writerTxn, sequencerTxn";
+const APPLIED_DESTINATIONS: &str = r#"{"columns":[{"name":"name","type":"STRING"},{"name":"suspended","type":"BOOLEAN"},{"name":"writerTxn","type":"LONG"},{"name":"sequencerTxn","type":"LONG"}],"dataset":[["ticks",false,10,10],["tick_quotes",false,20,20]],"count":2}"#;
+
 fn ist(date: (i32, u32, u32), hms: (u32, u32, u32)) -> NaiveDateTime {
     NaiveDate::from_ymd_opt(date.0, date.1, date.2)
         .and_then(|d| d.and_hms_opt(hms.0, hms.1, hms.2))
@@ -145,6 +148,8 @@ impl Scenario {
         let srv = FakeQuestDb::start(Arc::new(|q: &str| {
             if q.contains("table_columns('tick_conservation_audit')") {
                 (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains(DESTINATION_QUERY) {
+                (200, APPLIED_DESTINATIONS.to_owned())
             } else if q.contains("from wal_tables()") {
                 (200, r#"{"dataset":[[1]]}"#.to_owned())
             } else if q.contains("from partition_archive_audit") {
@@ -312,6 +317,8 @@ async fn assert_archive_coverage_verdicts() {
         let srv = FakeQuestDb::start(Arc::new(move |q| {
             if q.contains("table_columns('tick_conservation_audit')") {
                 (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains(DESTINATION_QUERY) {
+                (200, APPLIED_DESTINATIONS.to_owned())
             } else if q.contains("from wal_tables()") {
                 (200, count(applied))
             } else if q.contains("from partition_archive_audit") {
@@ -345,10 +352,18 @@ async fn assert_archive_coverage_verdicts() {
         }
         let queries = s.srv.exec_queries();
         let ix = |key: &str| queries.iter().position(|q| q.contains(key)).unwrap();
+        assert!(ix(DESTINATION_QUERY) < ix("from ticks where"));
         assert!(ix("from ticks where") < ix("from tick_quotes where"));
-        assert!(ix("from tick_quotes where") < ix("from wal_tables()"));
+        let after = queries
+            .iter()
+            .enumerate()
+            .skip(ix("from tick_quotes where") + 1)
+            .find(|(_, q)| q.contains(DESTINATION_QUERY))
+            .unwrap()
+            .0;
+        assert!(after < ix("select count() from wal_tables()"));
         if applied == 1 {
-            assert!(ix("from wal_tables()") < ix("from partition_archive_audit"));
+            assert!(ix("select count() from wal_tables()") < ix("from partition_archive_audit"));
         } else {
             assert!(
                 !queries
@@ -366,6 +381,8 @@ async fn assert_archive_coverage_verdicts() {
             (200, RECEIPT_CATALOG.to_owned())
         } else if q.contains("from ticks where") || q.contains("from tick_quotes where") {
             (200, count(1))
+        } else if q.contains(DESTINATION_QUERY) {
+            (200, APPLIED_DESTINATIONS.to_owned())
         } else if q.contains("from wal_tables()") || q.contains("from partition_archive_audit") {
             // Even a verified archive cannot reduce the observed excess.
             (200, count(1))
@@ -393,6 +410,131 @@ async fn assert_archive_coverage_verdicts() {
     s.finish("hot excess").await;
 }
 
+// Exercise both sides of the sequential hot counts. A healthy WAL on the
+// second poll cannot retroactively certify the preceding SQL result.
+async fn assert_destination_wal_verdicts() {
+    for (day, scenario, accepted, hot, verdict, reason) in [
+        (
+            18,
+            "quote_pending",
+            56,
+            55,
+            "unverified",
+            "destination_wal_unverified",
+        ),
+        (
+            19,
+            "suspended_equal",
+            55,
+            55,
+            "unverified",
+            "destination_wal_unverified",
+        ),
+        (
+            20,
+            "moves_between_reads",
+            56,
+            55,
+            "unverified",
+            "destination_wal_unverified",
+        ),
+        (23, "recovers", 55, 55, "match", "exact"),
+        (24, "suspended_excess", 54, 55, "mismatch", "extra_db_rows"),
+        (25, "missing_hot", 56, -1, "unverified", "count_unreadable"),
+        (
+            26,
+            "admissions_move",
+            54,
+            55,
+            "unverified",
+            "admissions_changed",
+        ),
+        (27, "admissions_settle", 54, 55, "match", "exact"),
+    ] {
+        let date = (2026, 11, day);
+        let start = ist(date, (15, 44, 55));
+        let ledger = tickvault_storage::tick_conservation_ledger::ledger();
+        for _ in 0..accepted {
+            ledger.note_row_appended(ist_nanos_of(start));
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let hot_reads = std::sync::atomic::AtomicUsize::new(0);
+        let srv = FakeQuestDb::start(Arc::new(move |q| {
+            if q.contains("table_columns('tick_conservation_audit')") {
+                (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains(DESTINATION_QUERY) {
+                let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reply = match scenario {
+                    "quote_pending" => APPLIED_DESTINATIONS.replace("20,20", "20,21"),
+                    "suspended_equal" | "suspended_excess" => {
+                        APPLIED_DESTINATIONS.replace("false,10,10", "true,10,10")
+                    }
+                    "moves_between_reads" if call % 2 == 1 => {
+                        APPLIED_DESTINATIONS.replace("10,10", "11,11")
+                    }
+                    "recovers" if call == 0 => APPLIED_DESTINATIONS.replace("10,10", "10,11"),
+                    _ => APPLIED_DESTINATIONS.to_owned(),
+                };
+                (200, reply)
+            } else if q.contains("from wal_tables()") {
+                (200, r#"{"dataset":[[1]]}"#.to_owned())
+            } else if q.contains("from partition_archive_audit") {
+                (200, r#"{"dataset":[[0]]}"#.to_owned())
+            } else if q.contains("from ticks where") {
+                let read = hot_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if scenario == "admissions_move" || (scenario == "admissions_settle" && read == 0) {
+                    ledger.note_row_appended(ist_nanos_of(start));
+                }
+                if scenario == "missing_hot" {
+                    (503, "unavailable".into())
+                } else {
+                    (200, r#"{"dataset":[[55]]}"#.to_owned())
+                }
+            } else if q.contains("from tick_quotes where") {
+                (200, r#"{"dataset":[[0]]}"#.to_owned())
+            } else {
+                (200, r#"{"ddl":"OK"}"#.to_owned())
+            }
+        }));
+        let s =
+            Scenario::start_with_server(weekday_calendar(), start, None, ist(date, (8, 0, 0)), srv);
+        s.until_daily(Duration::from_secs(15 * 60)).await;
+        let rows = s.daily();
+        let [row] = rows.as_slice() else {
+            panic!("{scenario}: {rows:?}")
+        };
+        assert!(
+            row.contains(&format!("verdict={verdict},reason={reason}")),
+            "{scenario}: {row}"
+        );
+        assert!(
+            row.contains(&format!("db_tick_rows={hot}i")),
+            "{scenario}: {row}"
+        );
+        if scenario == "admissions_move" {
+            // The final attempt began at 56, then read 55 hot and ended
+            // at 57. Preserve that attempt's original 56, even on retry exhaustion.
+            assert!(row.contains("accepted_rows=56i"), "{row}");
+        }
+        let expected_reads = if matches!(scenario, "recovers" | "admissions_settle") {
+            2
+        } else {
+            3
+        };
+        assert!(
+            row.contains(&format!("count_reads={expected_reads}i")),
+            "{scenario}: {row}"
+        );
+        let queries = s.srv.exec_queries();
+        let first = |needle: &str| queries.iter().position(|q| q.contains(needle)).unwrap();
+        assert!(
+            first(DESTINATION_QUERY) < first("from ticks where"),
+            "{scenario}"
+        );
+        s.finish(scenario).await;
+    }
+}
+
 async fn assert_wal_lag_retries() {
     // A process-wide rescue tally can cover missing rows even when replay
     // never lands them. Both full-day checks start with an empty database.
@@ -406,6 +548,8 @@ async fn assert_wal_lag_retries() {
         let srv = FakeQuestDb::start(Arc::new(move |q| {
             if q.contains("table_columns('tick_conservation_audit')") {
                 (200, RECEIPT_CATALOG.to_owned())
+            } else if q.contains(DESTINATION_QUERY) {
+                (200, APPLIED_DESTINATIONS.to_owned())
             } else if q.contains("from wal_tables()") {
                 (200, r#"{"dataset":[[1]]}"#.to_owned())
             } else if q.contains("from partition_archive_audit") {
@@ -643,6 +787,7 @@ async fn test_tick_conservation_spawn_tick_conservation_writes_rows_the_clock_ca
 
     assert_wal_lag_retries().await;
     assert_archive_coverage_verdicts().await;
+    assert_destination_wal_verdicts().await;
 
     drop(cwd);
 }

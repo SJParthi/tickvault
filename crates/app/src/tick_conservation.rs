@@ -9,6 +9,10 @@
 //! or daily partition of either destination, its receipt covers every feed.
 //! The persisted database value is then a hot-table observation. A hot excess
 //! is still a mismatch. An equal or smaller count is unverified.
+//! Two WAL snapshots bracket the hot counts. If either table is unavailable,
+//! suspended, behind or advances across the reads, equal/smaller hot counts
+//! remain unverified. If admissions increase during the reads, even a hot
+//! excess stays unverified. Each retry samples a new numerator and new counts.
 //!
 //! - **accepted**: `ticks` rows the Dhan writer appended for today, from the
 //!   in-process ledger (`tickvault_storage::tick_conservation_ledger`, one
@@ -451,6 +455,43 @@ enum ArchiveCoverage {
 const ARCHIVE_AUDIT_APPLIED_SQL: &str = "select count() from wal_tables() \
     where name = 'partition_archive_audit' and suspended = false and writerTxn = sequencerTxn";
 
+const DESTINATION_WAL_SQL: &str = "select name, suspended, writerTxn, sequencerTxn \
+    from wal_tables() where name in ('ticks','tick_quotes')";
+
+/// Each position is meaningful only for its named destination. Missing or
+/// duplicate rows, a suspended writer (even with equal transactions), lag or
+/// an invalid response cannot establish that an acknowledged row is visible.
+fn applied_positions(body: &str) -> Option<[i64; 2]> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    if json.get("error").is_some() || json.get("count").is_some_and(|n| n.as_u64() != Some(2)) {
+        return None;
+    }
+    let (rows, skipped) =
+        tickvault_storage::wal_suspension_watcher::parse_wal_tables_response(&json).ok()?;
+    if skipped != 0 || rows.len() != TICK_COUNT_TABLES.len() {
+        return None;
+    }
+    let mut positions = [None; 2];
+    for row in rows {
+        let slot = TICK_COUNT_TABLES
+            .iter()
+            .position(|&name| name == row.name)?;
+        let applied = row.writer_txn?;
+        if row.suspended
+            || applied < 0
+            || Some(applied) != row.sequencer_txn
+            || positions[slot].replace(applied).is_some()
+        {
+            return None;
+        }
+    }
+    Some([positions[0]?, positions[1]?])
+}
+
+async fn destination_positions(questdb: &QuestDbConfig) -> Option<[i64; 2]> {
+    applied_positions(&read_query(DESTINATION_WAL_SQL, questdb).await?)
+}
+
 fn archive_marker_sql(day: NaiveDate) -> String {
     // The partition name identifies its trading date. The audit timestamp is
     // when it was copied, potentially on a later day. A verified receipt
@@ -479,7 +520,7 @@ async fn archive_coverage(day: NaiveDate, questdb: &QuestDbConfig) -> ArchiveCov
 
 // More cold Dhan rows can only increase the database side. An already
 // observed hot excess remains an independently demonstrated mismatch.
-fn needs_archive_evidence(i: ConservationInputs) -> bool {
+fn needs_storage_evidence(i: ConservationInputs) -> bool {
     i.full_coverage && i.db_rows.is_some_and(|hot| hot <= i.accepted_rows)
 }
 
@@ -489,7 +530,7 @@ fn classify_coverage(
 ) -> (ConservationVerdict, &'static str) {
     // Preserve failed count reads and partial-process coverage. Their raw
     // fields already explain why a whole-day comparison was impossible.
-    if needs_archive_evidence(i) {
+    if needs_storage_evidence(i) {
         match archive {
             ArchiveCoverage::VerifiedPartition => {
                 return (ConservationVerdict::Unverified, "archived_partition");
@@ -514,6 +555,11 @@ async fn read_tick_count(day: NaiveDate, questdb: &QuestDbConfig) -> Option<u64>
 }
 
 async fn read_count(sql: &str, questdb: &QuestDbConfig) -> Option<u64> {
+    let body = read_query(sql, questdb).await?;
+    crate::feed_scoreboard_boot::parse_questdb_count(&body).and_then(|n| u64::try_from(n).ok())
+}
+
+async fn read_query(sql: &str, questdb: &QuestDbConfig) -> Option<String> {
     let client =
         tickvault_storage::http_client::build_probe_client(TICK_COUNT_QUERY_TIMEOUT_SECS).ok()?;
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
@@ -527,8 +573,7 @@ async fn read_count(sql: &str, questdb: &QuestDbConfig) -> Option<u64> {
     if !resp.status().is_success() {
         return None;
     }
-    let body = resp.text().await.ok()?;
-    crate::feed_scoreboard_boot::parse_questdb_count(&body).and_then(|n| u64::try_from(n).ok())
+    resp.text().await.ok()
 }
 
 async fn run_one_check(
@@ -544,18 +589,41 @@ async fn run_one_check(
     let mut reads = 0_u32;
     let (inputs, verdict, reason) = loop {
         reads += 1;
+        let accepted_rows = ledger.accepted_rows_on(ledger_day);
+        let not_landed_rows = ledger.rows_not_landed();
+        let before = if full_coverage {
+            destination_positions(questdb).await
+        } else {
+            None
+        };
         let inputs = ConservationInputs {
-            accepted_rows: ledger.accepted_rows_on(ledger_day),
-            not_landed_rows: ledger.rows_not_landed(),
+            accepted_rows,
+            not_landed_rows,
             db_rows: read_tick_count(day, questdb).await,
             full_coverage,
         };
-        let archive = if needs_archive_evidence(inputs) {
-            archive_coverage(day, questdb).await
+        // Keep the original numerator as evidence. If a later admission
+        // could already be in either count, even a hot excess is ambiguous.
+        let moving_admissions = full_coverage
+            && inputs.db_rows.is_some()
+            && ledger.accepted_rows_on(ledger_day) != accepted_rows;
+        let (verdict, reason) = if moving_admissions {
+            (ConservationVerdict::Unverified, "admissions_changed")
+        } else if needs_storage_evidence(inputs) {
+            // The two counts are separate reads. A later healthy WAL cannot
+            // certify an earlier stale read. Require both positions to be
+            // applied before, and identical after, these reads.
+            if before.is_some() && destination_positions(questdb).await == before {
+                classify_coverage(inputs, archive_coverage(day, questdb).await)
+            } else {
+                (
+                    ConservationVerdict::Unverified,
+                    "destination_wal_unverified",
+                )
+            }
         } else {
-            ArchiveCoverage::Unknown
+            classify(inputs)
         };
-        let (verdict, reason) = classify_coverage(inputs, archive);
         let settled = reason == "archived_partition"
             || matches!(
                 verdict,
@@ -891,6 +959,46 @@ mod tests {
     }
 
     #[test]
+    fn applied_positions_requires_two_distinct_healthy_destinations() {
+        use serde_json::json;
+        let response = |rows: serde_json::Value| {
+            json!({
+            "columns": [{"name":"name"}, {"name":"suspended"}, {"name":"writerTxn"}, {"name":"sequencerTxn"}],
+            "dataset": rows
+        }).to_string()
+        };
+        let tick = json!(["ticks", false, 3, 3]);
+        let quote = json!(["tick_quotes", false, 5, 5]);
+        assert_eq!(
+            applied_positions(&response(json!([quote, tick]))),
+            Some([3, 5])
+        );
+        for rows in [
+            json!([]),
+            json!([tick]),
+            json!([tick, tick]),
+            json!([quote, quote]),
+            json!([tick, quote, quote]),
+            json!([tick, ["other", false, 3, 3]]),
+            json!([tick, ["tick_quotes", true, 5, 5]]),
+            json!([tick, ["tick_quotes", false, 5, 6]]),
+            json!([tick, ["tick_quotes", false, -1, -1]]),
+            json!([quote, ["ticks", false, null, 3]]),
+            json!([null, tick]),
+        ] {
+            assert_eq!(applied_positions(&response(rows)), None);
+        }
+        for raw in [
+            "{}",
+            "not json",
+            r#"{"count":1,"dataset":[]}"#,
+            r#"{"error":"suspended"}"#,
+        ] {
+            assert_eq!(applied_positions(raw), None);
+        }
+    }
+
+    #[test]
     fn archive_marker_uses_partition_date_and_covers_verified_before_drop() {
         let day = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
         let sql = archive_marker_sql(day);
@@ -923,7 +1031,7 @@ mod tests {
             );
         }
         let excess = inputs(100, 0, Some(101));
-        assert!(!needs_archive_evidence(excess));
+        assert!(!needs_storage_evidence(excess));
         for archive in [
             ArchiveCoverage::VerifiedPartition,
             ArchiveCoverage::Unknown,
