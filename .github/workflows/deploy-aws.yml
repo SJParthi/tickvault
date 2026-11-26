@@ -40,8 +40,8 @@ name: deploy-aws
 on:
   workflow_dispatch:
     inputs:
-      scheduled_retry:
-        description: 'Scheduled retry. Respect the EC2 operating window before starting a stopped host.'
+      automatic_retry:
+        description: 'Automatic caller. Respect the EC2 operating window before starting a stopped host.'
         type: boolean
         default: false
       confirm_market_hours:
@@ -713,7 +713,7 @@ jobs:
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
           IID: ${{ env.IID }}
-          DEPLOY_ORIGIN: ${{ inputs.scheduled_retry && 'schedule' || github.event_name }}
+          DEPLOY_ORIGIN: ${{ inputs.automatic_retry && 'automatic_retry' || github.event_name }}
         run: |
           set -uo pipefail
           # Check the clock in the child: the scheduler, build, EC2 transition,
@@ -723,9 +723,9 @@ jobs:
             local DOW HHMM UP_WINDOW=no
             read -r DOW HHMM < <(TZ=Asia/Kolkata date '+%u %H%M') || exit 1
             HHMM=$((10#$HHMM))
-            if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
             # EventBridge can already be stopping the box during the 16:30 minute.
-            if [ "$UP_WINDOW" = yes ] && { [ "$DEPLOY_ORIGIN" != schedule ] || [ "$HHMM" -lt 1630 ]; }; then return 0; fi
+            if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -lt 1630 ]; then UP_WINDOW=yes; fi
+            if [ "$UP_WINDOW" = yes ]; then return 0; fi
             echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
             echo "::notice::Keeping the EC2 instance stopped at $HHMM IST ($DEPLOY_ORIGIN)."
             exit 0
@@ -783,7 +783,7 @@ jobs:
             echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::DEPLOY_FENCE holiday=matching — leaving the holiday-stopped box stopped; no override attempted."; exit 0
           fi
 
-          if [ "$DEPLOY_ORIGIN" = schedule ]; then guard_start_window; fi
+          guard_start_window
           echo "Starting the stopped box for deploy ($DEPLOY_ORIGIN)."
           # Record that THIS run started a stopped box, so the final auto-stop
           # step below can stop it again if we are now OUTSIDE the 08:30-16:30

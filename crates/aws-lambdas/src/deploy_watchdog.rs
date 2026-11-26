@@ -397,7 +397,7 @@ async fn dispatch_deploy(
         token,
         "POST",
         &format!("/repos/{repo}/actions/workflows/{dispatch_workflow}/dispatches"),
-        Some(&json!({"ref": desired_ref})),
+        Some(&json!({"ref": desired_ref, "inputs": {"automatic_retry": true}})),
     )
     .await;
     let ok = status == 201 || status == 204;

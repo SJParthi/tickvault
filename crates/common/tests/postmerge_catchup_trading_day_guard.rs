@@ -40,7 +40,7 @@ const DEPLOY_DAY_LINE: &str = "if [ \"${ist_dow}\" -ge 6 ] || grep -qxF \"date =
 const DEPLOY_SKIP: &str = "if [ \"${wf}\" = \"deploy-aws.yml\" ] && { [ \"${deploy_day}\" = \"no\" ] || [ \"${in_window}\" = \"no\" ]; }; then";
 
 /// The dispatch the skip must come before.
-const DISPATCH: &str = "if gh workflow run \"${wf}\" --ref main; then";
+const DISPATCH: &str = r#"if gh workflow run "${wf}" --ref main "${dispatch_inputs[@]}"; then"#;
 
 /// The window, IST `HHMM`, inclusive. 15:45 = the earliest swap the
 /// market-hours guard allows; 16:05 + ~14.5 min (measured dispatch to done)
@@ -178,22 +178,41 @@ fn catchup_reads_the_calendar_before_the_probe_without_failing_the_job() {
 }
 
 #[test]
-fn scheduled_wrapper_forwards_its_origin_while_manual_dispatch_keeps_its_default() {
+fn automatic_deploy_callers_forward_their_origin_while_manual_dispatch_keeps_its_default() {
     let wrapper = read(".github/workflows/deploy-aws-after-close.yml");
     let child = read(DEPLOY);
+    let catchup = read(CATCHUP);
+    let watchdog = read("crates/aws-lambdas/src/deploy_watchdog.rs");
     assert!(
-        wrapper.contains(
-            "SCHEDULED_RETRY: ${{ github.event_name == 'schedule' && 'true' || 'false' }}"
-        )
+        watchdog
+            .contains(r#"Some(&json!({"ref": desired_ref, "inputs": {"automatic_retry": true}}))"#)
     );
+    assert!(wrapper.contains("AUTOMATIC_RETRY: ${{ (github.event_name == 'schedule' || inputs.automatic_retry) && 'true' || 'false' }}"));
     assert!(wrapper.contains(
-        r#"gh workflow run deploy-aws.yml --ref main -f "scheduled_retry=$SCHEDULED_RETRY""#
+        r#"gh workflow run deploy-aws.yml --ref main -f "automatic_retry=$AUTOMATIC_RETRY""#
     ));
-    let input = child.split_once("      scheduled_retry:\n").unwrap().1;
-    let input = input.split_once("      confirm_market_hours:").unwrap().0;
-    assert!(input.contains("type: boolean") && input.contains("default: false"));
+    let args = find(
+        &catchup,
+        "dispatch_inputs=()",
+        "empty inputs for other workflows",
+    );
+    let app = find(
+        &catchup,
+        r#"if [ "$wf" = deploy-aws.yml ]; then dispatch_inputs=(-f automatic_retry=true); fi"#,
+        "automatic deploy origin",
+    );
+    assert!(args < app && app < find(&catchup, DISPATCH, "catch-up dispatch"));
+    for workflow in [&wrapper, &child] {
+        let input = workflow.split_once("      automatic_retry:\n").unwrap().1;
+        let input: Vec<_> = input
+            .lines()
+            .take_while(|line| line.starts_with("        "))
+            .map(str::trim)
+            .collect();
+        assert!(input.contains(&"type: boolean") && input.contains(&"default: false"));
+    }
     assert!(child.contains(
-        "DEPLOY_ORIGIN: ${{ inputs.scheduled_retry && 'schedule' || github.event_name }}"
+        "DEPLOY_ORIGIN: ${{ inputs.automatic_retry && 'automatic_retry' || github.event_name }}"
     ));
 }
 

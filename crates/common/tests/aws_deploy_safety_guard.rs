@@ -357,36 +357,27 @@ fn test_regression_running_or_automatic_off_hours_does_not_claim_a_start() {
 
 /// Execute the workflow's actual Ensure step, including both stop-fence reads.
 #[test]
-fn scheduled_retry_obeys_the_window_at_the_moment_of_start() {
+fn automatic_deploys_obey_the_window_at_the_moment_of_start() {
     let script = step_run(
         &workflow(),
         "- name: Ensure instance running (self-start + wait for SSM online)",
     );
+    let retry = "automatic_retry";
+    let manual = "workflow_dispatch";
     for (origin, state, initial_clock, final_clock, should_start, should_defer) in [
-        ("schedule", "stopped", "4 1815", "4 1815", false, true),
-        ("schedule", "running", "4 1815", "4 1815", false, false),
-        ("schedule", "stopped", "4 0829", "4 0829", false, true),
-        ("schedule", "stopped", "4 0830", "4 0830", true, false),
-        ("schedule", "stopped", "4 1546", "4 1546", true, false),
-        ("schedule", "stopped", "4 1629", "4 1630", false, true),
-        ("schedule", "stopped", "4 1630", "4 1630", false, true),
-        ("schedule", "stopped", "6 1546", "6 1546", false, true),
-        (
-            "workflow_dispatch",
-            "stopped",
-            "4 1815",
-            "4 1815",
-            true,
-            false,
-        ),
-        (
-            "workflow_dispatch",
-            "stopped",
-            "6 1546",
-            "6 1546",
-            true,
-            false,
-        ),
+        ("push", "stopped", "4 1630", "4 1630", false, true),
+        ("push", "stopped", "4 1629", "4 1630", false, true),
+        ("push", "stopped", "4 0830", "4 0830", true, false),
+        (retry, "stopped", "4 1815", "4 1815", false, true),
+        (retry, "running", "4 1815", "4 1815", false, false),
+        (retry, "stopped", "4 0829", "4 0829", false, true),
+        (retry, "stopped", "4 0830", "4 0830", true, false),
+        (retry, "stopped", "4 1546", "4 1546", true, false),
+        (retry, "stopped", "4 1629", "4 1630", false, true),
+        (retry, "stopped", "4 1630", "4 1630", false, true),
+        (retry, "stopped", "6 1546", "6 1546", false, true),
+        (manual, "stopped", "4 1815", "4 1815", true, false),
+        (manual, "stopped", "6 1546", "6 1546", true, false),
     ] {
         let fixture = Fixture::new();
         let output = fixture

@@ -107,7 +107,12 @@ on:
     - cron: '16 10 * * 1-5'
     - cron: '46 10 * * 1-5'
     - cron: '31 11 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      automatic_retry:
+        description: 'Automatic caller. Respect the EC2 operating window before starting a stopped host.'
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-aws-after-close
@@ -237,10 +242,10 @@ jobs:
       - name: Dispatch deploy-aws.yml on main
         if: steps.check.outputs.dispatch == 'true'
         env:
-          SCHEDULED_RETRY: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          AUTOMATIC_RETRY: ${{ (github.event_name == 'schedule' || inputs.automatic_retry) && 'true' || 'false' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run deploy-aws.yml --ref main -f "scheduled_retry=$SCHEDULED_RETRY"
+          gh workflow run deploy-aws.yml --ref main -f "automatic_retry=$AUTOMATIC_RETRY"
           echo "::notice::deploy-aws dispatched on main — watch Actions tab"
 
       - name: Summary
