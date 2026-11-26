@@ -6005,16 +6005,17 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
     (next_stamp == known).then_some(next)
 }
 
-/// Peak frame age (ms) at the drain in the last completed 60-second window. The
-/// monotonic interval starts at receipt before WAL admission and ends after dequeue
+/// Peak frame age (ms) at the drain over the last completed 60-second window.
+/// Until the first window closes, the gauge shows the maximum observed so far.
+/// Frame age runs from receipt before WAL admission to the sample after dequeue
 /// and reservation release, before the frame's processing timer starts.
 ///
 /// # Why this one and not the vendor lag
 ///
-/// `tv_dhan_ws_lag_ms` measures delay from upstream, while this gauge
-/// measures age inside the process. Reader work before enqueue, backlog
-/// and scheduling delays can each increase it. Compare hand-off times and
-/// ring refusals when investigating a rise.
+/// `tv_dhan_ws_lag_ms` measures the interval from the exchange's last-trade
+/// timestamp to local receipt. This gauge starts at that receipt. Reader work
+/// before enqueue, backlog and scheduling delays can each increase it. Compare
+/// hand-off times and ring refusals when investigating a rise.
 ///
 /// # MAX, not mean, and not a histogram
 ///
@@ -6027,7 +6028,7 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
 ///
 /// # Cost on the hot path
 ///
-/// One `i64` max against a stack local per frame. No allocation, no registry
+/// One relaxed atomic `fetch_max` per frame. No allocation, no registry
 /// lookup, no label — the gauge handle is resolved once and written on the
 /// existing `DRAIN_REPORT_EVERY` path beside `publish_fold_depth`, never per
 /// frame. This is the `DrainCounters` discipline the module already documents.
