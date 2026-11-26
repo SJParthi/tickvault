@@ -24,7 +24,7 @@ in session (09:00–15:40 IST), seven signals:
 | `reader_runtime` | heartbeat | the socket-reader runtime's probe has not woken for 2 s |
 | `frame_drain` | heartbeat | the frame drain has not taken a frame or a 500 ms flush tick for 2 s |
 | `socket_to_wal` | stage | one socket read's WAL + ring hand-off took 2 s |
-| `ring_dwell` | stage | one frame waited 2 s in the ring before the drain took it |
+| `ring_dwell` | stage | 2 s elapsed from the pre-WAL receipt stamp to the drain sample after dequeue and reservation release |
 | `main_runtime_lag` / `reader_runtime_lag` | stage | a probe woke 2 s late |
 | `drain_main_frame` | stage | the drain took 2 s to decode, fold and append ONE main-feed frame (added 2026-10-26, plan item K6; its 1 ms stall budget is dashboard-only) |
 
@@ -110,14 +110,12 @@ wait.
 1. `tv_task_heartbeat_age_seconds{task}`, `tv_hot_path_stage_max_ns{stage}`
    and `tv_task_busy_seconds{task}` on the box's metrics endpoint show which
    step and for how long.
-2. `frame_drain` stalled with `ring_dwell` rising: the drain is busy or
-   blocked. Look for `AGGREGATOR-STALL-01` (a disk wait), a QuestDB stall,
-   or CPU saturation (`top -H`, thread names `tv-worker`, `tv-ws-reader`).
-   The drain's other arms are timed by no stage and show only as
-   `ring_dwell`: the 500 ms flush timer arm, the 30 s silence scan, the
-   idle arm's catch-up seal and seed steps, the catch-up timer and seed
-   arms, the shutdown arm, and each frame's drop after its record (the
-   full list is in `docs/runbooks/hot-path-capacity-proof.md`).
+2. If `frame_drain` stalls and `ring_dwell` rises, compare `socket_to_wal`
+   and the five `drain_arm_*` stages above. The receipt-to-drain interval
+   includes reader work before enqueue, queueing and drain bookkeeping.
+   Check for `AGGREGATOR-STALL-01` (a disk wait), a QuestDB stall or CPU
+   saturation (`top -H`, thread names `tv-worker`, `tv-ws-reader`).
+   Ring-full or ring-closed frames produce no dwell sample.
 3. `main_runtime` / `reader_runtime`: a runtime could not run any task.
    CPU starvation or a synchronous step on a worker; check host CPU and
    steal time.

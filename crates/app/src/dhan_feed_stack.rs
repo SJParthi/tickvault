@@ -6005,24 +6005,16 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
     (next_stamp == known).then_some(next)
 }
 
-/// Gauge: the LONGEST a frame sat in the ring before the drain folded it, in
-/// milliseconds, over the last reporting window.
+/// Peak frame age (ms) at the drain in the last completed 60-second window. The
+/// monotonic interval starts at receipt before WAL admission and ends after dequeue
+/// and reservation release, before the frame's processing timer starts.
 ///
 /// # Why this one and not the vendor lag
 ///
-/// This number was already being computed on every frame — ~5,000 times a
-/// second — and immediately thrown away. `run_frame_drain` derives
-/// `queued_nanos` from the frame's own monotonic receipt stamp solely to
-/// back-date `received_at_nanos`, then drops it. Publishing costs one
-/// comparison per frame and one gauge write per window.
-///
-/// It is the signal that actually predicts the failure the lane is judged on.
-/// `tv_dhan_ws_lag_ms` measures how long DHAN took to deliver — their problem,
-/// unfixable from here, and deliberately excluded from the EMF selector as a
-/// "how much" rather than a "what broke" (see `EMF-METRIC-SELECTOR-NOTES.md`).
-/// Ring dwell measures how far behind OUR OWN drain is, which is the direct
-/// precursor of every loss mechanism the lane has: a drain that stops draining
-/// fills the ring, and a full ring refuses frames.
+/// `tv_dhan_ws_lag_ms` measures delay from upstream, while this gauge
+/// measures age inside the process. Reader work before enqueue, backlog
+/// and scheduling delays can each increase it. Compare hand-off times and
+/// ring refusals when investigating a rise.
 ///
 /// # MAX, not mean, and not a histogram
 ///

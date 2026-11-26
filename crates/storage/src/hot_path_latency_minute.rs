@@ -186,11 +186,10 @@ pub const HOT_PATH_LATENCY_MINUTE_COLUMNS: &[(&str, &str)] = &[
     ("mean_ns", "LONG"),
 ];
 
-/// Whether `samples_over_1024ns` means anything for `stage` (PR DP-6). The
-/// two runtime-lag stages time a 100 ms sleep, ring dwell is a frame waiting
-/// in a queue, and receipt-to-fold spans three steps: each is above 1,024 ns
-/// by construction, so the count was every sample (100%) and read as a
-/// failure. Those write NULL. Pure, O(1).
+/// Selects stages that publish the historical `samples_over_1024ns` count.
+/// The two timer-wake delays and the elapsed receipt-to-drain and receipt-to-fold
+/// stages write NULL by policy. Their actual durations can vary. Versioned
+/// strict counts independently classify measured samples at 1,000 ns.
 #[must_use]
 pub const fn over_1024ns_is_meaningful(stage: Stage) -> bool {
     !matches!(

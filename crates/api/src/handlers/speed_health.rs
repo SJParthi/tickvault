@@ -499,6 +499,7 @@ fn speed_section(
         title: "Operational stall budgets — since process start",
         note: "These colours compare p99 bucket bounds with broad stall budgets, not \
                the strict one-microsecond target. Runtime delays, metrics upkeep and the feed processor's timer and idle runs are diagnostics. \
+               Ring dwell starts before the write-ahead log handoff and overlaps receive time. \
                Receipt-to-fold overlaps earlier frame stages, and later frames' ring dwell \
                and receipt-to-fold include the time an earlier frame spent in work after a \
                frame (drain_frame_post); durations must not be added. \
@@ -529,7 +530,7 @@ fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
     let tiles = stages.iter().filter_map(|fig| {
         let unit = match fig.stage {
             Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs",
-            Stage::RingDwell => "received frame, all endpoints; overlaps receive time",
+            Stage::RingDwell => "live-drained frame, all endpoints. From receipt before the write-ahead log handoff to the drain after dequeue and reservation release. Includes reader work before enqueue. Ring-refused frames have no sample.",
             Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
             Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
             Stage::DrainMainTick => "main-feed tick; the frame's decode/fold/append time over its ticks (per-tick average within each frame)",
@@ -2156,6 +2157,10 @@ mod tests {
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
         assert!(strict.tiles[0].detail.contains("includes refused handoffs"));
+        let dwell = &strict.tiles[1].detail;
+        assert!(dwell.contains("before the write-ahead log handoff"));
+        assert!(dwell.contains("after dequeue and reservation release"));
+        assert!(dwell.contains("Ring-refused frames have no sample"));
         assert!(strict.tiles[3].detail.contains("live main-feed frame"));
         assert!(
             strict.tiles[3]
