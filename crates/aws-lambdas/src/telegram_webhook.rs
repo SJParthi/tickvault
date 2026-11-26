@@ -1230,20 +1230,7 @@ pub fn form_urlencode(pairs: &[(&str, String)]) -> String {
     out
 }
 
-/// POST to the Telegram bot API. Returns (status_code, body_text).
-/// Legacy parity: `_post_to_telegram`. UNPROVEN until deploy — the live
-/// HTTP leg runs only in a real Lambda; the payload construction it
-/// sends is what the unit tests cover. The token/chat-id are NEVER
-/// logged.
-pub async fn post_to_telegram(
-    client: &reqwest::Client,
-    token: &str,
-    chat_id: &str,
-    text: &str,
-) -> Result<(u16, String), reqwest::Error> {
-    post_telegram_body(client, token, telegram_body(chat_id, text, None)).await
-}
-
+/// Deliver the encoded message, including any private-chat button.
 async fn post_telegram_body(
     client: &reqwest::Client,
     token: &str,

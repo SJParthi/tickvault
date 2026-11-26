@@ -445,17 +445,6 @@ pub async fn instance_info<E: Ec2Api>(
     }
 }
 
-/// Legacy `_instance_public_ip` — None on any error / missing IP.
-pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option<String> {
-    match ec2.describe(instance_id).await {
-        Err(exc) => {
-            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances for public IP failed");
-            None
-        }
-        Ok(desc) => desc.and_then(|d| d.public_ip).filter(|ip| !ip.is_empty()),
-    }
-}
-
 /// Why a `StartInstances` call was refused.
 ///
 /// This distinction is load-bearing, not cosmetic. Until 2026-08-10 EVERY start
