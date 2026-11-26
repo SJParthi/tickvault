@@ -8024,6 +8024,22 @@ pub struct CapturedFrame {
     pub bytes: Bytes,
 }
 
+impl CapturedFrame {
+    /// A queued frame was never folded. A WAL append may still fail on its
+    /// writer thread, so keep both replay eligibility and its loss correlation.
+    pub fn note_abandoned(&self, ws_type: WsType) {
+        live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
+        if self.wal_backed {
+            tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(self.seq);
+            let _mark = tickvault_storage::wal_frame_fate::frame_fate().note_shed(
+                self.seq,
+                tickvault_storage::wal_frame_fate::ShedKind::Ring,
+                ws_type,
+            );
+        }
+    }
+}
+
 /// The ring's SECOND bound: total bytes resident, not just frame count.
 ///
 /// A channel bounded only by count is bounded only if the items are a known
@@ -8354,6 +8370,21 @@ impl WalRingSink {
         endpoint: DhanEndpointType,
         connection_index: u8,
     ) -> Self {
+        let refund = std::sync::Arc::clone(&budget);
+        let deferred = metrics::counter!("tv_dhan_feed_shutdown_ring_deferred_total");
+        let lost = metrics::counter!("tv_ticks_lost_total", "source" => "shutdown_ring_unbacked");
+        let ring = ring.with_discard_handler(
+            (std::sync::Arc::as_ptr(&budget) as usize, ws_type.as_u8()),
+            move |frame| {
+                refund.release(frame.bytes.len());
+                frame.note_abandoned(ws_type);
+                if frame.wal_backed {
+                    deferred.increment(1);
+                } else {
+                    lost.increment(1);
+                }
+            },
+        );
         let endpoint_label = endpoint.as_str();
         let sink = Self {
             spill,
@@ -8569,6 +8600,16 @@ impl FrameSink for WalRingSink {
         let len = frame.len();
         match self.budget.try_reserve_detailed(len) {
             RingReserve::Granted => {}
+            RingReserve::SlotsFull | RingReserve::BytesFull if self.ring.receiver_closed() => {
+                self.ring_closed.increment(1);
+                if wal_refused {
+                    live_shed::note(self.endpoint == DhanEndpointType::MainFeed);
+                    return FrameSinkOutcome::WalDropped;
+                }
+                tickvault_storage::wal_applied_watermark::applied_watermark().note_unapplied(seq);
+                self.note_ring_shed(seq);
+                return FrameSinkOutcome::RingClosed;
+            }
             RingReserve::BytesFull => {
                 self.ring_full.increment(1);
                 self.ring_bytes_full.increment(1);
@@ -16173,6 +16214,75 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn receiver_drop_refunds_each_class_and_accounts_for_abandoned_wal_and_live_only_frames() {
+        let recorder = InPlaceCounters::default();
+        let dir = wal_dir("cancel-buffered-mixed");
+        let spill = std::sync::Arc::new(WsFrameSpill::new(&dir).expect("open WAL"));
+        metrics::with_local_recorder(&recorder, || {
+            let (tx, mut rx) = crate::websocket::frame_ring::frame_ring::<CapturedFrame>(6);
+            let weak = tx.downgrade();
+            let sinks = [
+                DhanEndpointType::MainFeed,
+                DhanEndpointType::Depth20,
+                DhanEndpointType::Depth200,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, endpoint)| {
+                let budget = std::sync::Arc::new(RingByteBudget::with_slot_cap(16, 2));
+                let sink = WalRingSink::new(
+                    std::sync::Arc::clone(&spill),
+                    tx.clone(),
+                    std::sync::Arc::clone(&budget),
+                    WsType::LiveFeed,
+                    endpoint,
+                    i as u8,
+                );
+                (sink, budget)
+            })
+            .collect::<Vec<_>>();
+            let frame = Bytes::from_static(b"12345678");
+            assert_eq!(sinks[0].0.accept(frame.clone()), FrameSinkOutcome::Captured);
+            let taken = rx.try_recv().expect("normal dequeue");
+            sinks[0].1.release(taken.bytes.len());
+            for (sink, _) in &sinks {
+                assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::Captured);
+            }
+            assert_eq!(spill.shutdown(std::time::Duration::from_secs(5)), 0);
+            for (sink, budget) in &sinks {
+                assert_eq!(
+                    sink.accept(frame.clone()),
+                    FrameSinkOutcome::CapturedLiveOnly
+                );
+                assert_eq!(budget.slots_resident(), 2);
+            }
+            drop(rx);
+            for (sink, budget) in &sinks {
+                assert_eq!((budget.slots_resident(), budget.resident()), (0, 0));
+                assert_eq!(sink.accept(frame.clone()), FrameSinkOutcome::WalDropped);
+            }
+            assert!(weak.upgrade().is_some());
+        });
+        let counts = recorder.counts.lock().expect("counters");
+        assert_eq!(
+            counts.get("tv_dhan_feed_shutdown_ring_deferred_total"),
+            Some(&3)
+        );
+        assert_eq!(
+            counts.get("tv_ticks_lost_total,source=shutdown_ring_unbacked"),
+            Some(&3)
+        );
+        drop(counts);
+        assert_eq!(
+            tickvault_storage::ws_frame_spill::replay_all(&dir)
+                .expect("replay")
+                .len(),
+            4
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
     #[test]
     fn test_wal_ring_sink_stamps_a_distinct_ascending_seq_per_frame() {
         // Two arrivals of BYTE-IDENTICAL content must still receive distinct

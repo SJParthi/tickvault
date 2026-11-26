@@ -8355,10 +8355,9 @@ async fn run_frame_drain(
     // Plan item J2 (2026-10-26): count what the ring still holds rather than
     // dropping it with the receiver. WAL-backed frames replay on the next
     // boot; frames the WAL refused existed only here and are lost, counted and
-    // coded. Bounded by the ring's capacity, so a socket still delivering
-    // cannot hold the shutdown. The receiver is dropped right after, so a
-    // later frame meets a closed ring at its sender, which counts it
-    // (`ring_full`, and marks a backed one unapplied), instead of dying here.
+    // coded. Closing admissions first leaves a finite backlog, including
+    // any racing push that committed before close.
+    rx.close();
     let ring_residue = shutdown_residue::drain_ring_residue(
         || rx.try_recv(),
         FRAME_RING_CAPACITY,
@@ -8368,6 +8367,7 @@ async fn run_frame_drain(
                 DhanEndpointType::Depth200 => depth200_budget.release(frame.bytes.len()),
                 _ => depth_budget.release(frame.bytes.len()),
             }
+            frame.note_abandoned(WsType::LiveFeed);
             frame.wal_backed
         },
     );
