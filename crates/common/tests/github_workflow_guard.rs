@@ -522,7 +522,7 @@ fn r20_no_workflow_publishes_the_operator_key() {
     );
     must_contain(
         step,
-        r#"--message-attributes '{"TickvaultEntry":{"DataType":"String","StringValue":"operator-portal"}}'"#,
+        r#"PORTAL_ATTRIBUTES: '{"TickvaultEntry":{"DataType":"String","StringValue":"operator-portal"}}'"#,
         "the private Telegram bot button needs the publisher's explicit portal marker",
     );
     must_contain(
@@ -530,21 +530,19 @@ fn r20_no_workflow_publishes_the_operator_key() {
         "tap Open Tickvault",
         "the portal announcement names its private-chat button",
     );
-    must_contain(
-        step,
-        "if ! MESSAGE_ID=$(aws sns publish",
-        "the SNS publish exit status is checked even under set +e",
-    );
-    must_contain(
-        step,
-        "--query MessageId --output text",
-        "success needs an SNS acceptance receipt",
-    );
-    must_contain(
-        step,
-        "no valid MessageId",
-        "an empty or malformed receipt is not announced as a delivery",
-    );
+    let publish = step
+        .find("set -e\n          MESSAGE_ID=$(aws sns publish")
+        .expect("SNS rejection must stop the step");
+    let markup = step
+        .find(r#"--message-attributes "$PORTAL_ATTRIBUTES" --query MessageId --output text)"#)
+        .expect("publish must request the SNS receipt and attach the typed marker");
+    let valid_id = step
+        .find(r#"[[ "$MESSAGE_ID" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]]"#)
+        .expect("missing or malformed receipt must fail");
+    let accepted = step
+        .find("echo \"SNS accepted")
+        .expect("success should name SNS acceptance");
+    assert!(publish < markup && markup < valid_id && valid_id < accepted);
     // Rotation (owner chose "Rotate after fix", 2026-09-27): only the exact
     // word "rotate" overwrites the stored key, and a failed overwrite fails
     // the step instead of reporting success.
