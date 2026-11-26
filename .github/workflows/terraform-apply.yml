@@ -756,17 +756,24 @@ jobs:
           fi
           if [ "$ROTATED" = "yes" ]; then
             SUBJECT="Operator console key replaced"
-            MESSAGE="Your tickvault operator console key was replaced. The old key stops working within a minute. Open ${URL} on each device and paste the new key from AWS Parameter Store (operator control-secret). The key is never sent in a message."
+            MESSAGE="Your Tickvault operator device key was replaced. The old key stops working within a minute. For Stocks, tap Open Tickvault in this private Telegram message. For admin controls or an ordinary browser, open ${URL} and use the new Tickvault operator device key from Parameter Store (operator control-secret). The key is never sent in a message."
           else
             SUBJECT="Operator portal ready"
-            MESSAGE="Your tickvault operator portal is live: ${URL} — open it and paste your device key (AWS Parameter Store, operator control-secret). The key is never sent in a message."
+            MESSAGE="For Stocks, tap Open Tickvault in the latest private Telegram portal announcement. Older messages and ordinary browser links open ${URL}. Use your Tickvault operator device key for browser sign-in or admin controls. The browser can remember it for 30 days. The key is never sent in a message."
           fi
-          aws sns publish --region ${{ env.AWS_REGION }} \
+          if ! MESSAGE_ID=$(aws sns publish --region ${{ env.AWS_REGION }} \
             --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
             --subject "$SUBJECT" \
-            --message "$MESSAGE" >/dev/null
-          echo "✅ Published the portal URL to Telegram (the key is never sent; rotated=${ROTATED})."
-          echo "Operator portal URL: ${URL} (key rotated: ${ROTATED})" >> "$GITHUB_STEP_SUMMARY"
+            --message-attributes '{"TickvaultEntry":{"DataType":"String","StringValue":"operator-portal"}}' \
+            --message "$MESSAGE" --query MessageId --output text); then
+            echo "::error::SNS rejected the operator portal announcement." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ ! "$MESSAGE_ID" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]]; then
+            echo "::error::SNS returned no valid MessageId for the operator portal announcement." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "SNS accepted the operator portal announcement (MessageId ${MESSAGE_ID}, key rotated: ${ROTATED})." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: "Deploy gate: console shell GET / must return 200 within 5s"
         # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a

@@ -96,6 +96,18 @@ data "aws_iam_policy_document" "operator_control_permissions" {
     resources = ["arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/operator/control-secret"]
   }
 
+  # Only the portal's Telegram session exchange reads these existing parameters.
+  # Terraform passes parameter names. Their SecureString values stay out of state.
+  statement {
+    sid     = "ReadTelegramOperatorIdentity"
+    effect  = "Allow"
+    actions = ["ssm:GetParameter"]
+    resources = [
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.telegram_bot_token_ssm_param}",
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.telegram_chat_id_ssm_param}",
+    ]
+  }
+
   # Fine-grained GitHub PAT (scoped to the one repo) for the GitHub tab —
   # view PRs, squash-merge, trigger deploy. Read of the SecureString only.
   statement {
@@ -215,6 +227,8 @@ resource "aws_lambda_function" "operator_control" {
       TV_INSTANCE_ID                = aws_instance.tv_app.id
       OPERATOR_CONTROL_SECRET_PARAM = "/tickvault/${var.environment}/operator/control-secret"
       OPERATOR_GITHUB_TOKEN_PARAM   = "/tickvault/${var.environment}/operator/github-token"
+      TELEGRAM_BOT_TOKEN_SSM_PARAM  = var.telegram_bot_token_ssm_param
+      TELEGRAM_CHAT_ID_SSM_PARAM    = var.telegram_chat_id_ssm_param
       GH_REPO                       = var.operator_github_repo
       GH_DEPLOY_WORKFLOW            = "deploy-aws.yml"
       # B4: base URL of the QuestDB console front (questdb-console.tf). The
@@ -333,5 +347,5 @@ output "operator_control_function_url" {
 
 output "operator_portal_url" {
   value       = var.enable_operator_control_lambda ? aws_apigatewayv2_stage.operator_control[0].invoke_url : null
-  description = "THE operator portal URL (API Gateway → Lambda). Open in a browser; same bearer-key auth inside. This is the link DM'd to Telegram."
+  description = "THE operator portal URL (API Gateway → Lambda). The private Telegram bot opens this address as a Mini App. Other browsers use the operator device key."
 }

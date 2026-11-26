@@ -520,6 +520,31 @@ fn r20_no_workflow_publishes_the_operator_key() {
         "The key is never sent in a message.",
         "portal message tells the operator where the key is instead",
     );
+    must_contain(
+        step,
+        r#"--message-attributes '{"TickvaultEntry":{"DataType":"String","StringValue":"operator-portal"}}'"#,
+        "the private Telegram bot button needs the publisher's explicit portal marker",
+    );
+    must_contain(
+        step,
+        "tap Open Tickvault",
+        "the portal announcement names its private-chat button",
+    );
+    must_contain(
+        step,
+        "if ! MESSAGE_ID=$(aws sns publish",
+        "the SNS publish exit status is checked even under set +e",
+    );
+    must_contain(
+        step,
+        "--query MessageId --output text",
+        "success needs an SNS acceptance receipt",
+    );
+    must_contain(
+        step,
+        "no valid MessageId",
+        "an empty or malformed receipt is not announced as a delivery",
+    );
     // Rotation (owner chose "Rotate after fix", 2026-09-27): only the exact
     // word "rotate" overwrites the stored key, and a failed overwrite fails
     // the step instead of reporting success.
