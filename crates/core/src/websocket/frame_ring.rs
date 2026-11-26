@@ -111,6 +111,7 @@ struct Shared<T> {
 
 struct DiscardHandler<T> {
     key: (usize, u8),
+    // APPROVED: only receiver teardown invokes this type-erased callback. Queued items carry its integer tag.
     handle: Box<dyn Fn(&T) + Send + Sync>,
 }
 
@@ -184,6 +185,7 @@ pub struct FrameRingSpinStats {
 pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<T>) {
     let shared = Arc::new(Shared {
         queue: ConcurrentQueue::bounded(capacity.max(1)),
+        // APPROVED: ring construction only. An empty Vec allocates nothing on rings without a discard handler.
         discard: Mutex::new(Vec::new()),
         notify: Notify::new(),
         senders: AtomicUsize::new(1),
@@ -252,6 +254,7 @@ impl<T> FrameRingSender<T> {
             .unwrap_or_else(|| {
                 handlers.push(DiscardHandler {
                     key,
+                    // APPROVED: allocate once when wiring a new budget/transport pair. Reconnecting senders reuse the existing tag.
                     handle: Box::new(handler),
                 });
                 handlers.len() - 1
@@ -609,6 +612,43 @@ mod tests {
         assert_eq!(rx.try_recv(), Some(1));
         tx.try_send(3).expect("room again");
         assert!(!rx.is_empty());
+    }
+
+    #[test]
+    fn test_with_discard_handler_reuses_the_handler_for_an_existing_class() {
+        let (tx, rx) = frame_ring::<u8>(4);
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&values);
+        let first = tx.clone().with_discard_handler((1, 0), move |item| {
+            recorded.lock().expect("record discarded item").push(*item);
+        });
+        let same = tx.with_discard_handler((1, 0), |_| {
+            panic!("duplicate class installed a new handler")
+        });
+
+        first.try_send(4).expect("first item");
+        same.try_send(7).expect("second item");
+        drop(rx);
+
+        assert_eq!(&*values.lock().expect("read discarded items"), &[4, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_close_sets_receiver_closed_and_preserves_already_committed_items() {
+        let (tx, mut rx) = frame_ring(2);
+        let second = tx.clone();
+        tx.try_send(7).expect("queued before close");
+        second.try_send(8).expect("ring now full");
+        assert!(!tx.receiver_closed());
+
+        rx.close();
+        rx.close();
+
+        assert!(second.receiver_closed());
+        assert_eq!(tx.try_send(9), Err(FrameRingTrySendError::Closed(9)));
+        assert_eq!(rx.recv().await, Some(7));
+        assert_eq!(rx.recv().await, Some(8));
+        assert_eq!(rx.recv().await, None);
     }
 
     #[test]
