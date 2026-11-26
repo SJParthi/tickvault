@@ -135,11 +135,9 @@ resource "aws_lambda_function" "start_watchdog" {
     variables = {
       EC2_INSTANCE_ID  = aws_instance.tv_app.id
       ALERTS_TOPIC_ARN = aws_sns_topic.tv_alerts.arn
-      # App port for the Feed Control page link in the 08:30 IST start ping
-      # (config/base.toml [api] port). The ping reads the instance's live
-      # public IP via the existing ec2:DescribeInstances grant — no new IAM.
-      DASHBOARD_PORT = "3001"
-      LOG_LEVEL      = "INFO"
+      # The morning notification opens the same portal as deployment announcements.
+      OPERATOR_PORTAL_URL = var.enable_operator_control_lambda ? aws_apigatewayv2_stage.operator_control[0].invoke_url : ""
+      LOG_LEVEL           = "INFO"
       # Curfew keep-alive override param (ISO timestamp; operator/portal sets
       # it to run the box out of hours without the curfew guard stopping it).
       KEEP_ALIVE_PARAM = "/tickvault/${var.environment}/keep-alive-until"

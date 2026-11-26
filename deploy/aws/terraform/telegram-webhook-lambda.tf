@@ -126,6 +126,7 @@ resource "aws_lambda_function" "telegram_webhook" {
     variables = {
       TELEGRAM_BOT_TOKEN_SSM_PARAM = var.telegram_bot_token_ssm_param
       TELEGRAM_CHAT_ID_SSM_PARAM   = var.telegram_chat_id_ssm_param
+      OPERATOR_PORTAL_URL          = var.enable_operator_control_lambda ? aws_apigatewayv2_stage.operator_control[0].invoke_url : ""
       LOG_LEVEL                    = "INFO"
     }
   }

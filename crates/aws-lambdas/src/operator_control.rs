@@ -26,6 +26,8 @@
 //! hot-path (zero-alloc / O(1)) constraints apply, but the charter lints on
 //! lib.rs do.
 
+mod telegram_session;
+
 use std::sync::LazyLock;
 
 use aws_lc_rs::constant_time::verify_slices_are_equal;
@@ -1517,6 +1519,10 @@ pub trait OpsShell {
             .unwrap_or_default(),
         }
     }
+    /// Server-side Telegram bot token and configured private operator chat ID.
+    async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+        None
+    }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
@@ -1769,7 +1775,25 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             &json!({"error": "control secret unreadable on the server — try again shortly"}),
         );
     }
-    if !authorized(&headers, &secret) {
+    let admin = authorized(&headers, &secret);
+    let now = shell.now_epoch();
+    let session_expiry = if admin {
+        None
+    } else {
+        telegram_session::signed_expiry(&headers, &secret)
+    };
+    if session_expiry.is_some_and(|exp| exp <= now) {
+        return resp(401, &json!({"error":"Telegram session expired"}));
+    }
+    let scoped = session_expiry.is_some_and(|exp| telegram_session::active(exp, now));
+    if !admin && !scoped {
+        if headers.get("authorization").is_none()
+            && let Some(raw) = telegram_session::exchange_input(event)
+            && let Some(response) = telegram_session::exchange(&raw, &secret, now, shell).await
+        {
+            return response;
+        }
+
         // An unreadable secret was answered 503 above, so every refusal here
         // is a wrong key and counts against the source.
         {
@@ -1801,7 +1825,10 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         }
         return resp(401, &json!({"error": "unauthorized"}));
     }
-    guard.record_success(&source);
+    // A lower-privilege session cannot reset the full operator key failure budget.
+    if admin {
+        guard.record_success(&source);
+    }
 
     // legacy: `raw = event.get("body") or "{}"`; dict passthrough, else
     // json.loads (fail → 400). Ledger deviation: a parsed NON-OBJECT payload
@@ -1818,6 +1845,22 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     };
 
     let action = payload_str(&payload, "action").to_string();
+    if scoped
+        && (!telegram_session::explicit_post(event) || !telegram_session::read_allowed(&action))
+    {
+        return resp(
+            403,
+            &json!({"error":"this read-only session cannot perform that action"}),
+        );
+    }
+    // Launch proofs belong only on the unauthenticated exchange. An
+    // authenticated request must never forward one to an operation.
+    if payload.get("init_data").is_some() {
+        return resp(
+            400,
+            &json!({"error":"launch data is accepted only during Telegram sign-in"}),
+        );
+    }
     let force = truthy(payload.get("force").unwrap_or(&Value::Bool(false)));
 
     // HARD gate first: data-destructive actions have NO force escape inside
@@ -2552,6 +2595,19 @@ impl OpsShell for AwsShell {
         &self.auth_failures
     }
 
+    async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+        let bot_param = std::env::var("TELEGRAM_BOT_TOKEN_SSM_PARAM").ok()?;
+        let chat_param = std::env::var("TELEGRAM_CHAT_ID_SSM_PARAM").ok()?;
+        let (bot, chat) = tokio::join!(
+            self.cached_param(&bot_param),
+            self.cached_param(&chat_param)
+        );
+        if bot.is_empty() || chat.is_empty() {
+            return None;
+        }
+        Some((bot, chat))
+    }
+
     async fn control_secret(&self) -> String {
         self.cached_param(&self.secret_param).await
     }
@@ -3217,6 +3273,12 @@ mod tests {
         fn auth_failures(&self) -> &AuthFailureGuard {
             &self.auth_failures
         }
+        async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+            Some((
+                self.env.get("test-bot")?.clone(),
+                self.env.get("test-chat")?.clone(),
+            ))
+        }
         async fn control_secret(&self) -> String {
             self.secret.clone()
         }
@@ -3326,6 +3388,8 @@ mod tests {
             "unknown".to_string()
         }
     }
+
+    include!("operator_control/telegram_route_tests.rs");
 
     // ------------------------------------------------------- event helpers
     fn get_event() -> Value {
@@ -4292,13 +4356,14 @@ mod tests {
         // 401 forget it; the lock screen text says so. Pinned separately by
         // `console_remembers_the_key_for_thirty_days_only`.
         // 2026-11-25: timestamped Dhan index quotes and accurate disk-panel wording.
+        // 2026-11-26: private Telegram Mini App launch and in-memory viewer session.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "938119626a2337a77b6bdc19e169e0053f86ae2cbcab92b62c2b8275b4a3befb"
+            "d7b36d5aa4c9d6e22d7a944f11e249a3cb119ae13eee19b8e94943597ef4257d"
         );
-        assert_eq!(CONSOLE_HTML.len(), 103_091);
+        assert_eq!(CONSOLE_HTML.len(), 106_755);
     }
 
     #[test]
@@ -4403,24 +4468,35 @@ mod tests {
             "localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token');"
         ));
         let lock_fn = CONSOLE_HTML
-            .lines()
-            .find(|l| l.starts_with("function lock()"))
-            .expect("lock() present");
-        assert!(lock_fn.contains("localStorage.removeItem('tv_key')"));
-        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock();"));
+            .split_once("function lock(message){")
+            .expect("lock function")
+            .1
+            .split_once("function viewerExpired()")
+            .expect("end of lock")
+            .0;
+        assert!(
+            lock_fn.contains("if(!viewer)")
+                && lock_fn.contains("localStorage.removeItem('tv_key')")
+        );
+        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock(viewerExpires?"));
         assert_eq!(CONSOLE_HTML.matches("localStorage.setItem").count(), 1);
-        // A key arriving in the address is stripped from it after reading.
-        let reader = CONSOLE_HTML
-            .lines()
-            .position(|l| l.contains("location.hash.match(/key="))
-            .expect("address-key reader present");
-        let block: String = CONSOLE_HTML
-            .lines()
-            .skip(reader)
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(block.contains("history.replaceState(null,'',location.pathname)"));
+        let launch = CONSOLE_HTML
+            .split_once("function takeLaunch(){")
+            .expect("launch parser")
+            .1
+            .split_once("async function startPortal()")
+            .expect("end of launch parser")
+            .0;
+        assert!(launch.contains("new URLSearchParams(location.hash.slice(1))"));
+        assert!(launch.contains("fragment.get('key')||query.get('key')"));
+        assert!(
+            launch
+                .find("history.replaceState(null,'',location.pathname)")
+                .expect("scrub URL")
+                < launch
+                    .find("return {initData,legacyKey}")
+                    .expect("return parsed launch")
+        );
     }
 
     // ------------------------------------------------ audit M4 auth guard
@@ -4716,7 +4792,10 @@ mod tests {
         // A #key=... link must auto-unlock + strip the fragment from the URL.
         assert!(CONSOLE_HTML.contains("location.hash"));
         assert!(CONSOLE_HTML.contains("replaceState"));
-        assert!(CONSOLE_HTML.contains("TOKEN=k; keySave(TOKEN);"));
+        assert!(
+            CONSOLE_HTML
+                .contains("if(launch.legacyKey){ TOKEN=launch.legacyKey; keySave(TOKEN); }")
+        );
     }
 
     #[test]

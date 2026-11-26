@@ -14,7 +14,7 @@
 //!
 //! # What this is instead
 //!
-//! Storage is a `crossbeam_channel::bounded` array: every slot is allocated
+//! Storage is a closeable `ConcurrentQueue::bounded` array: every slot is allocated
 //! once, when the ring is built, and `try_send` / `try_recv` never allocate.
 //! A `tokio::sync::Notify` wakes the drain. The drain cannot poll on a timer:
 //! its first `select!` arm must wake within microseconds of a frame.
@@ -58,11 +58,11 @@
 //! `notify_one` takes the `Notify`'s waiter lock only while the drain is
 //! parked. Construction: O(capacity), once at boot.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{TryRecvError, TrySendError};
+use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use tokio::sync::Notify;
 
 /// The longest spin [`FrameRingReceiver::set_spin_before_park`] accepts.
@@ -87,7 +87,10 @@ const FRAME_RING_SPIN_CHECKS_PER_CLOCK_READ: u32 = 32;
 
 /// State shared by every handle of one ring.
 #[derive(Debug)]
-struct Shared {
+struct Shared<T> {
+    queue: ConcurrentQueue<(usize, T)>,
+    // Resolved once per class when a sink is wired. Only cancellation reads the callbacks.
+    discard: Mutex<Vec<DiscardHandler<T>>>,
     /// Wakes the consumer.
     notify: Notify,
     /// Live STRONG senders. Weak senders are not counted.
@@ -106,6 +109,18 @@ struct Shared {
     registrations: AtomicUsize,
 }
 
+struct DiscardHandler<T> {
+    key: (usize, u8),
+    // APPROVED: only receiver teardown invokes this type-erased callback. Queued items carry its integer tag.
+    handle: Box<dyn Fn(&T) + Send + Sync>,
+}
+
+impl<T> std::fmt::Debug for DiscardHandler<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscardHandler").finish_non_exhaustive()
+    }
+}
+
 /// Why [`FrameRingSender::try_send`] refused an item. The item is handed back.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FrameRingTrySendError<T> {
@@ -118,22 +133,21 @@ pub enum FrameRingTrySendError<T> {
 /// Producer handle. Cloning adds a strong sender.
 #[derive(Debug)]
 pub struct FrameRingSender<T> {
-    tx: crossbeam_channel::Sender<T>,
-    shared: Arc<Shared>,
+    discard_tag: usize,
+    shared: Arc<Shared<T>>,
 }
 
 /// A sender that does not keep the ring open. See [`Self::upgrade`].
 #[derive(Debug, Clone)]
 pub struct FrameRingWeakSender<T> {
-    tx: crossbeam_channel::Sender<T>,
-    shared: Arc<Shared>,
+    discard_tag: usize,
+    shared: Arc<Shared<T>>,
 }
 
 /// The single consumer.
 #[derive(Debug)]
 pub struct FrameRingReceiver<T> {
-    rx: crossbeam_channel::Receiver<T>,
-    shared: Arc<Shared>,
+    shared: Arc<Shared<T>>,
     /// How long `recv` keeps checking an empty ring before it sleeps. Zero
     /// (the default) sleeps at once, the behaviour before this field.
     spin_before_park: Duration,
@@ -166,12 +180,13 @@ pub struct FrameRingSpinStats {
 ///
 /// # Panics
 ///
-/// Never: a `capacity` of 0 is raised to 1, because a zero-capacity crossbeam
-/// channel is a rendezvous channel and would refuse every `try_send`.
+/// A capacity of zero is raised to one, preserving a non-rendezvous ring.
 #[must_use]
 pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<T>) {
-    let (tx, rx) = crossbeam_channel::bounded(capacity.max(1));
     let shared = Arc::new(Shared {
+        queue: ConcurrentQueue::bounded(capacity.max(1)),
+        // APPROVED: ring construction only. An empty Vec allocates nothing on rings without a discard handler.
+        discard: Mutex::new(Vec::new()),
         notify: Notify::new(),
         senders: AtomicUsize::new(1),
         busy_polling: AtomicBool::new(false),
@@ -182,11 +197,10 @@ pub fn frame_ring<T>(capacity: usize) -> (FrameRingSender<T>, FrameRingReceiver<
     });
     (
         FrameRingSender {
-            tx,
+            discard_tag: 0,
             shared: Arc::clone(&shared),
         },
         FrameRingReceiver {
-            rx,
             shared,
             spin_before_park: Duration::ZERO,
             spin_stats: FrameRingSpinStats::default(),
@@ -205,7 +219,7 @@ impl<T> FrameRingSender<T> {
     /// [`FrameRingTrySendError::Closed`] when the receiver is gone. Either way
     /// the item comes back.
     pub fn try_send(&self, item: T) -> Result<(), FrameRingTrySendError<T>> {
-        match self.tx.try_send(item) {
+        match self.shared.queue.push((self.discard_tag, item)) {
             Ok(()) => {
                 // SeqCst, not Relaxed: paired with the consumer's SeqCst clear
                 // in `set_busy_polling(false)` (see there). A plain load on
@@ -217,9 +231,41 @@ impl<T> FrameRingSender<T> {
                 }
                 Ok(())
             }
-            Err(TrySendError::Full(item)) => Err(FrameRingTrySendError::Full(item)),
-            Err(TrySendError::Disconnected(item)) => Err(FrameRingTrySendError::Closed(item)),
+            Err(PushError::Full((_, item))) => Err(FrameRingTrySendError::Full(item)),
+            Err(PushError::Closed((_, item))) => Err(FrameRingTrySendError::Closed(item)),
         }
+    }
+
+    /// Associates this sender's queued items with a cold-path refund. The
+    /// handler holds the key's budget alive, so its address cannot be reused.
+    pub(crate) fn with_discard_handler(
+        mut self,
+        key: (usize, u8),
+        handler: impl Fn(&T) + Send + Sync + 'static,
+    ) -> Self {
+        let mut handlers = self
+            .shared
+            .discard
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let index = handlers
+            .iter()
+            .position(|h| h.key == key)
+            .unwrap_or_else(|| {
+                handlers.push(DiscardHandler {
+                    key,
+                    // APPROVED: allocate once when wiring a new budget/transport pair. Reconnecting senders reuse the existing tag.
+                    handle: Box::new(handler),
+                });
+                handlers.len() - 1
+            });
+        self.discard_tag = index + 1;
+        drop(handlers);
+        self
+    }
+
+    pub(crate) fn receiver_closed(&self) -> bool {
+        self.shared.queue.is_closed()
     }
 
     /// A handle that does not keep the ring open.
@@ -227,7 +273,7 @@ impl<T> FrameRingSender<T> {
     pub fn downgrade(&self) -> FrameRingWeakSender<T> {
         FrameRingWeakSender {
             // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
-            tx: self.tx.clone(),
+            discard_tag: self.discard_tag,
             shared: Arc::clone(&self.shared),
         }
     }
@@ -238,7 +284,7 @@ impl<T> Clone for FrameRingSender<T> {
         self.shared.senders.fetch_add(1, Ordering::Relaxed);
         Self {
             // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
-            tx: self.tx.clone(),
+            discard_tag: self.discard_tag,
             shared: Arc::clone(&self.shared),
         }
     }
@@ -248,6 +294,7 @@ impl<T> Drop for FrameRingSender<T> {
     fn drop(&mut self) {
         // The last strong sender wakes the consumer so it can see the close.
         if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.queue.close();
             self.shared.notify.notify_one();
         }
     }
@@ -272,7 +319,7 @@ impl<T> FrameRingWeakSender<T> {
                 Ok(_) => {
                     return Some(FrameRingSender {
                         // APPROVED: an Arc count bump on a handle clone, once per socket dial, never per frame.
-                        tx: self.tx.clone(),
+                        discard_tag: self.discard_tag,
                         shared: Arc::clone(&self.shared),
                     });
                 }
@@ -282,7 +329,35 @@ impl<T> FrameRingWeakSender<T> {
     }
 }
 
+impl<T> Drop for FrameRingReceiver<T> {
+    fn drop(&mut self) {
+        self.close();
+        let handlers = std::mem::take(
+            &mut *self
+                .shared
+                .discard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        while let Ok((tag, item)) = self.shared.queue.pop() {
+            if tag != 0 {
+                (handlers[tag - 1].handle)(&item);
+            }
+        }
+    }
+}
+
 impl<T> FrameRingReceiver<T> {
+    /// Stops admissions before draining the final backlog. In-flight pushes
+    /// either preceded the close and are drainable, or return their item.
+    pub fn close(&self) {
+        self.shared.queue.close();
+    }
+
+    fn pop_value(&self) -> Result<T, PopError> {
+        self.shared.queue.pop().map(|(_, item)| item)
+    }
+
     /// The next item, waiting for one. `None` once every strong sender is gone
     /// and the ring is empty. Cancellation-safe; charges the cooperative budget.
     pub async fn recv(&mut self) -> Option<T> {
@@ -303,15 +378,15 @@ impl<T> FrameRingReceiver<T> {
             // running. Registration is only needed before SLEEPING, so it now
             // happens only once the queue looks empty, and the queue is
             // checked again after it (below), which is what keeps every wake.
-            match self.rx.try_recv() {
+            match self.pop_value() {
                 Ok(item) => {
                     if quick_wake {
                         self.spin_armed = true;
                     }
                     return Some(item);
                 }
-                Err(TryRecvError::Disconnected) => return None,
-                Err(TryRecvError::Empty) => {}
+                Err(PopError::Closed) => return None,
+                Err(PopError::Empty) => {}
             }
             // A wake that found nothing (a stale `Notify` permit) re-arms
             // nothing.
@@ -352,14 +427,14 @@ impl<T> FrameRingReceiver<T> {
             #[cfg(test)]
             self.shared.registrations.fetch_add(1, Ordering::Relaxed);
             notified.as_mut().enable();
-            match self.rx.try_recv() {
+            match self.pop_value() {
                 Ok(item) => return Some(item),
-                Err(TryRecvError::Disconnected) => return None,
-                Err(TryRecvError::Empty) => {}
+                Err(PopError::Closed) => return None,
+                Err(PopError::Empty) => {}
             }
             if self.shared.senders.load(Ordering::Acquire) == 0 {
                 // Closed: deliver anything pushed just before the last drop.
-                return self.rx.try_recv().ok();
+                return self.pop_value().ok();
             }
             if self.spin_before_park.is_zero() {
                 notified.await;
@@ -383,11 +458,12 @@ impl<T> FrameRingReceiver<T> {
     ///
     /// # Why clearing it strands no frame
     ///
-    /// A producer pushes (crossbeam's tail compare-and-swap, `SeqCst`), then
+    /// A producer pushes (the array's tail compare-and-swap, `SeqCst`), then
     /// loads this flag (`SeqCst`). Clearing it is a `SeqCst` store, and the
     /// consumer's next `try_recv` declares the ring empty only after a `SeqCst`
-    /// fence and a tail load (crossbeam-channel 0.5.17, `array.rs`
-    /// `start_recv`, pinned). If a producer still read the flag as set, its
+    /// fence and a tail load (`concurrent-queue` 2.5.0, `bounded.rs::pop`).
+    /// The one-slot specialization checks its state with a SeqCst CAS. If a
+    /// producer still read the flag as set, its
     /// load comes before the clear in the single total order of `SeqCst`
     /// operations, so its tail update comes before that fence, and the tail
     /// load sees the frame: the consumer takes it instead of sleeping. A
@@ -431,13 +507,13 @@ impl<T> FrameRingReceiver<T> {
         let deadline = started + self.spin_before_park;
         loop {
             for _ in 0..FRAME_RING_SPIN_CHECKS_PER_CLOCK_READ {
-                match self.rx.try_recv() {
+                match self.pop_value() {
                     Ok(item) => {
                         self.note_spin(started, Instant::now(), true);
                         return Some(Some(item));
                     }
-                    Err(TryRecvError::Disconnected) => return Some(None),
-                    Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                    Err(PopError::Closed) => return Some(None),
+                    Err(PopError::Empty) => std::hint::spin_loop(),
                 }
             }
             let now = Instant::now();
@@ -491,19 +567,19 @@ impl<T> FrameRingReceiver<T> {
 
     /// The next item if one is queued now. O(1).
     pub fn try_recv(&mut self) -> Option<T> {
-        self.rx.try_recv().ok()
+        self.pop_value().ok()
     }
 
     /// Items queued now.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rx.len()
+        self.shared.queue.len()
     }
 
     /// Whether nothing is queued now.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rx.is_empty()
+        self.shared.queue.is_empty()
     }
 }
 
@@ -536,6 +612,88 @@ mod tests {
         assert_eq!(rx.try_recv(), Some(1));
         tx.try_send(3).expect("room again");
         assert!(!rx.is_empty());
+    }
+
+    #[test]
+    fn test_with_discard_handler_reuses_the_handler_for_an_existing_class() {
+        let (tx, rx) = frame_ring::<u8>(4);
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&values);
+        let first = tx.clone().with_discard_handler((1, 0), move |item| {
+            recorded.lock().expect("record discarded item").push(*item);
+        });
+        let same = tx.with_discard_handler((1, 0), |_| {
+            panic!("duplicate class installed a new handler")
+        });
+
+        first.try_send(4).expect("first item");
+        same.try_send(7).expect("second item");
+        drop(rx);
+
+        assert_eq!(&*values.lock().expect("read discarded items"), &[4, 7]);
+    }
+
+    #[tokio::test]
+    async fn test_close_sets_receiver_closed_and_preserves_already_committed_items() {
+        let (tx, mut rx) = frame_ring(2);
+        let second = tx.clone();
+        tx.try_send(7).expect("queued before close");
+        second.try_send(8).expect("ring now full");
+        assert!(!tx.receiver_closed());
+
+        rx.close();
+        rx.close();
+
+        assert!(second.receiver_closed());
+        assert_eq!(tx.try_send(9), Err(FrameRingTrySendError::Closed(9)));
+        assert_eq!(rx.recv().await, Some(7));
+        assert_eq!(rx.recv().await, Some(8));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[test]
+    fn receiver_drop_refunds_only_pending_committed_writes_in_a_close_race() {
+        use std::collections::BTreeSet;
+        use std::sync::Barrier;
+        for capacity in [1, 17, 1024] {
+            let (tx, mut rx) = frame_ring::<usize>(capacity);
+            let refunded = Arc::new(Mutex::new(BTreeSet::new()));
+            let seen = Arc::clone(&refunded);
+            let tx = tx.with_discard_handler((1, 0), move |id| {
+                assert!(seen.lock().expect("refunds").insert(*id));
+            });
+            let weak = tx.downgrade();
+            tx.try_send(0).expect("first item");
+            assert_eq!(rx.try_recv(), Some(0));
+            tx.try_send(1).expect("buffered");
+            let gate = Barrier::new(5);
+            let committed = std::thread::scope(|scope| {
+                let mut writers = Vec::new();
+                for writer in 0..4 {
+                    let tx = tx.clone();
+                    let gate = &gate;
+                    writers.push(scope.spawn(move || {
+                        gate.wait();
+                        (0..128)
+                            .map(|i| 2 + writer * 128 + i)
+                            .filter(|id| tx.try_send(*id).is_ok())
+                            .collect::<Vec<_>>()
+                    }));
+                }
+                gate.wait();
+                drop(rx);
+                let mut committed = BTreeSet::from([1]);
+                for writer in writers {
+                    committed.extend(writer.join().expect("writer"));
+                }
+                committed
+            });
+            assert_eq!(*refunded.lock().expect("refunds"), committed);
+            assert_eq!(
+                weak.upgrade().expect("strong sender").try_send(999),
+                Err(FrameRingTrySendError::Closed(999))
+            );
+        }
     }
 
     #[test]

@@ -1536,3 +1536,16 @@ validates the database response before showing elapsed time. The existing
 read-only SSM commands retain the three bounded HTTP reads. Their measured
 string literals total 27 lines and 1,819 bytes. The reviewed console script
 is 581 lines and 49,746 bytes, including script tags.
+
+## §0.24. 2026-11-26 — Private Telegram entry to Stocks and Status
+
+The Open Tickvault button in the private bot chat starts a read-only portal
+session. The browser removes the Telegram launch parameters from the address
+bar before requesting a session from the same origin. Rust authenticates
+the signed launch and authorizes the two read actions. The browser keeps the
+returned credential in memory until its expiry or until the viewer leaves.
+Opening the ordinary portal URL still supports the existing device key.
+
+The browser code for session expiry, navigation and access to Stocks and
+Status brings the existing operator console script to 661 lines and 53,057
+bytes, including its script tags. The page has 21 inline event handlers.

@@ -294,10 +294,10 @@ pub struct TapLink {
 ///
 /// # Why no tick is stranded
 ///
-/// The tap pushes (crossbeam's tail compare-and-swap, `SeqCst`), then loads
+/// The tap pushes (a `SeqCst` compare-and-swap), then loads
 /// `parked` (`SeqCst`). The thread stores `parked = true` (`SeqCst`), then
-/// checks its rings (crossbeam-channel 0.5.17 `is_empty`: two `SeqCst`
-/// loads) and parks only when both are empty. In the single total order of
+/// checks its rings (`concurrent-queue` 2.5.0 `is_empty`: two `SeqCst`
+/// loads in the bounded array, one in the single-slot queue) and parks only when both are empty. In the single total order of
 /// `SeqCst` operations either the tap's load comes after the thread's store
 /// (it sees the flag and unparks), or its push comes before the thread's
 /// check (the thread sees the tick and does not park). An unpark that lands
