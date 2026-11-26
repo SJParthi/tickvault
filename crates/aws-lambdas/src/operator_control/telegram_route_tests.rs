@@ -283,3 +283,139 @@ async fn telegram_exchange_binds_explicit_post_envelope_and_cannot_upgrade_a_ses
         429
     );
 }
+
+#[tokio::test]
+async fn telegram_exchange_requires_signed_private_chat_to_match_the_signed_user() {
+    // Independent WebAppData signatures for each chat. A rejection therefore
+    // tests chat authorization even when the signature itself is valid.
+    let cases = [
+        (
+            r#"{"id":1234,"type":"private"}"#,
+            "a2738d8ab5699b535a6fc15b6e139aeb24534e730bc68fdb7572595f59caeb5e",
+            200,
+        ),
+        (
+            r#"{"id":4321,"type":"private"}"#,
+            "9f45c4fe0c127cc4fcdda4eb05feb23a76dba1a236fbdde999e1a57dc7af8e42",
+            401,
+        ),
+        (
+            r#"{"id":1234,"type":"group"}"#,
+            "e535fa1a33aeae139f7453f6da846853c3473b6426042213b790be98b8853d1d",
+            401,
+        ),
+        (
+            "{}",
+            "5615d583486a21109c78d44d7f7f2e88e1c3fa46942448cb5d081a47bd35758e",
+            401,
+        ),
+    ];
+    for (chat, signature, expected) in cases {
+        let raw = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("chat", chat),
+                ("user", r#"{"id":1234}"#),
+                ("hash", signature),
+                ("chat_type", "private"),
+                ("auth_date", "1700000000"),
+            ])
+            .finish();
+        let reply = route(&exchange_event(&raw), &telegram_mock()).await;
+        assert_eq!(status_of(&reply), expected);
+        assert_eq!(
+            body_of(&reply)["session_token"].is_string(),
+            expected == 200
+        );
+    }
+}
+
+#[tokio::test]
+async fn telegram_exchange_rejects_malformed_bodies_and_respects_the_wire_limit() {
+    let mut event = exchange_event(TG_LAUNCH);
+    let wire = event["body"].as_str().unwrap();
+    let padded = format!("{wire:16384}");
+    event["body"] = json!(padded);
+    assert_eq!(status_of(&route(&event, &telegram_mock()).await), 200);
+    for body in [
+        json!(format!("{padded} ")),
+        json!(false),
+        json!([]),
+        json!("{}["),
+        Value::Null,
+    ] {
+        event["body"] = body;
+        let reply = route(&event, &telegram_mock()).await;
+        assert_eq!(status_of(&reply), 401);
+        assert!(body_of(&reply)["session_token"].is_null());
+    }
+    // The exchange itself rejects an invalid raw size before asking for the
+    // credentials; only testing the route would exercise its outer body guard.
+    let mut unavailable = telegram_mock();
+    unavailable.env.remove("test-bot");
+    for raw in ["", &"x".repeat(8193)] {
+        assert!(
+            telegram_session::exchange(raw, AUTH_SECRET, TG_TIME, &unavailable)
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn telegram_noncanonical_or_nonpositive_signed_expirations_are_invalid_credentials() {
+    // Each MAC is valid for the exact expiry text and the fixture control key.
+    for (expiry, signature) in [
+        ("0", "cTEu5eUpn5NufbegEZEyyjJ77p2FlFm6kx_Yp9TxP7A"),
+        ("-1", "23j3BZaOHybbFgGbTjvyyVPRrcdEf-hulDdWjFVgsUI"),
+        ("01700043200", "qp0G2M17xsvWDv90fxHdLuJNVhlOLvL-kGDicsKRrlg"),
+    ] {
+        let headers =
+            json!({"authorization": format!("Bearer tv-tg-read-v1.{expiry}.{signature}")});
+        assert!(telegram_session::signed_expiry(&headers, AUTH_SECRET).is_none());
+    }
+}
+
+#[test]
+fn telegram_real_shell_reads_both_secure_parameters_and_fails_closed_if_either_is_missing() {
+    use crate::test_support::{
+        EnvVarGuard, Fleet, aws_env_guards, env_lock, recorded, start_fleet,
+    };
+    let _lock = env_lock();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut fleet = Fleet::default();
+            fleet
+                .ssm
+                .insert("/local/bot".into(), "test-bot-value".into());
+            fleet.ssm.insert("/local/chat".into(), "1234".into());
+            let (endpoint, requests) = start_fleet(fleet).await;
+            let _aws = aws_env_guards(&endpoint);
+            let _bot = EnvVarGuard::set("TELEGRAM_BOT_TOKEN_SSM_PARAM", Some("/local/bot"));
+            let _chat = EnvVarGuard::set("TELEGRAM_CHAT_ID_SSM_PARAM", Some("/local/chat"));
+            let shell = AwsShell::new().await;
+            {
+                let _absent = EnvVarGuard::set("TELEGRAM_CHAT_ID_SSM_PARAM", None);
+                assert_eq!(shell.telegram_identity_parameters().await, None);
+                assert!(recorded(&requests).is_empty());
+            }
+            let expected = Some(("test-bot-value".to_owned(), "1234".to_owned()));
+            assert_eq!(shell.telegram_identity_parameters().await, expected);
+            assert_eq!(shell.telegram_identity_parameters().await, expected);
+            let mut names = Vec::new();
+            for request in recorded(&requests) {
+                assert_eq!(request.target, "AmazonSSM.GetParameter");
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                assert_eq!(body["WithDecryption"], true);
+                names.push(body["Name"].as_str().unwrap().to_owned());
+            }
+            names.sort();
+            assert_eq!(names, ["/local/bot", "/local/chat"]);
+            for key in ["TELEGRAM_BOT_TOKEN_SSM_PARAM", "TELEGRAM_CHAT_ID_SSM_PARAM"] {
+                let _missing = EnvVarGuard::set(key, Some("/local/missing"));
+                assert_eq!(shell.telegram_identity_parameters().await, None);
+            }
+        });
+}
