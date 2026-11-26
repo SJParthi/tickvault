@@ -53,6 +53,9 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
+mod capture_minutes;
+
+use capture_minutes::CaptureMinutes;
 use tickvault_common::feed_blame::{
     EPISODE_KIND_DISCONNECT, EPISODE_KIND_NEVER_STREAMED_RESTART,
     EPISODE_KIND_OFF_HOURS_DISCONNECT, EPISODE_KIND_PROCESS_DEATH, EPISODE_KIND_STALL_RESTART,
@@ -64,8 +67,8 @@ use tickvault_storage::feed_episode_audit_persistence::{
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_UNAVAILABLE_SENTINEL,
+    ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
 };
 
 // ---- `SPOT_1M_REST_TABLE` is RETIRED 2026-09-17 ----
@@ -238,6 +241,13 @@ pub fn decide_scoreboard_start(
         return ScoreboardStart::RunCatchUp;
     }
     ScoreboardStart::SleepThenRun(u64::from(trigger_secs_of_day_ist - now_secs_of_day_ist))
+}
+
+/// Earliest final scorecard time for the given IST date, using the same
+/// dated windows as the tick query. Absent calendar or hours give no trigger.
+#[must_use]
+pub fn scoreboard_trigger_for_date(date: chrono::NaiveDate, regular_trigger: u32) -> Option<u32> {
+    CaptureMinutes::for_date(date).and_then(|window| window.trigger(regular_trigger))
 }
 
 /// `true` when `secs_of_day` is inside the market-hours window the
@@ -1002,8 +1012,8 @@ pub fn build_feed_instruments_count_sql(feed: &str, target_ist_day: u64) -> Stri
     )
 }
 
-/// Distinct session minutes ([09:15, 15:30) IST) a feed delivered any tick
-/// in. ≤375 rows; the minute values are opaque keys compared in Rust.
+/// Minutes in the regular capture window used by the process-death reconciler.
+/// The daily score selects its own dated session bounds in `CaptureMinutes`.
 /// Micros literals.
 #[must_use]
 pub fn build_feed_session_minutes_sql(feed: &str, target_ist_day: u64) -> String {
@@ -2884,6 +2894,7 @@ async fn run_feed_scoreboard_attempt(
     runtime_enabled_now: Option<(bool, bool)>,
     ctx: &mut ScoreboardAttempt,
 ) -> ScoreboardAttemptEnd {
+    let capture = CaptureMinutes::for_day(target_ist_day);
     let retry_until_deadline = is_same_day_run;
     let final_attempt = ctx.final_attempt;
     // Every QuestDB read or write failure below returns `Retry` at once when
@@ -3080,13 +3091,18 @@ async fn run_feed_scoreboard_attempt(
                     // feed and must never defeat feed_off. The predicates
                     // carry the same filter internally; this outer gate
                     // covers the `any_up` fold.
+                    let second = secs_of_day_ist_from_nanos(ev.ts_ist_nanos);
+                    let before_open = capture.as_ref().is_some_and(|day| day.before_open(second));
                     if is_market_data_ws_type(&ev.ws_type) && is_up_kind(&ev.event_kind) {
                         ups.any_up.insert(ev.feed.clone());
                         if !parked.contains(&idx) {
-                            if is_session_up_row(ev) {
+                            if capture
+                                .as_ref()
+                                .is_some_and(|day| day.market_data_up(second))
+                            {
                                 ups.session_up.insert(ev.feed.clone());
                             }
-                            if is_pre_session_up_row(ev) {
+                            if before_open {
                                 let e = ups
                                     .pre_session_toggles
                                     .entry(ev.feed.clone())
@@ -3095,7 +3111,7 @@ async fn run_feed_scoreboard_attempt(
                             }
                         }
                     }
-                    if is_pre_session_feed_disable_row(ev) {
+                    if before_open && ev.source == FEED_DISABLE_SOURCE {
                         let e = ups
                             .pre_session_toggles
                             .entry(ev.feed.clone())
@@ -3294,6 +3310,9 @@ async fn run_feed_scoreboard_attempt(
 
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
+    let session_minutes = capture
+        .as_ref()
+        .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, CaptureMinutes::duration);
     let mut feed_numbers: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
@@ -3312,15 +3331,18 @@ async fn run_feed_scoreboard_attempt(
         {
             n.instruments = count;
         }
-        // Distinct session minutes (≤375 opaque keys).
-        let minutes_sql = build_feed_session_minutes_sql(label, target_ist_day);
-        let set = exec_query(&client, questdb, &minutes_sql)
-            .await
-            .and_then(|body| parse_minute_set(&body));
-        if let Some(ref s) = set {
-            n.streaming_minutes = i64::try_from(s.len()).unwrap_or(i64::MAX);
+        if let Some(window) = &capture {
+            let sql = window.sql(label);
+            if let Some(body) = exec_query(&client, questdb, &sql).await
+                && let Some(measured) = window.observed(&body)
+            {
+                n.streaming_minutes = measured;
+            }
+        } else {
+            // A missing schedule cannot be repaired by retrying QuestDB.
+            sources_complete = false;
         }
-        if n.ticks < 0 || n.instruments < 0 || set.is_none() {
+        if n.ticks < 0 || n.instruments < 0 || (capture.is_some() && n.streaming_minutes < 0) {
             // A count read failed (an empty day still answers 0). Before the
             // final attempt this is retried, never written as -1 sentinels.
             if !final_attempt {
@@ -3402,20 +3424,21 @@ async fn run_feed_scoreboard_attempt(
                 secondary_on
             }
         });
-        let inferred = up_signals.as_ref().is_some_and(|ups| {
-            let (disable_ts, up_ts) = ups
-                .pre_session_toggles
-                .get(label)
-                .copied()
-                .unwrap_or((None, None));
-            is_feed_off_day(
-                ups.session_up.contains(label),
-                ups.any_up.contains(label),
-                pre_session_disable_is_state_at_open(disable_ts, up_ts),
-                ticks,
-                enabled_now,
-            )
-        });
+        let inferred = capture.is_some()
+            && up_signals.as_ref().is_some_and(|ups| {
+                let (disable_ts, up_ts) = ups
+                    .pre_session_toggles
+                    .get(label)
+                    .copied()
+                    .unwrap_or((None, None));
+                is_feed_off_day(
+                    ups.session_up.contains(label),
+                    ups.any_up.contains(label),
+                    pre_session_disable_is_state_at_open(disable_ts, up_ts),
+                    ticks,
+                    enabled_now,
+                )
+            });
         let kept = existing_daily.as_ref().is_some_and(|m| {
             should_keep_feed_off_outcome(m.get(label).map(String::as_str), inferred, ticks)
         });
@@ -3695,11 +3718,11 @@ async fn run_feed_scoreboard_attempt(
             .get(label)
             .copied()
             .unwrap_or_else(FeedDayNumbers::unavailable);
-        let uptime_pct = if n.streaming_minutes >= 0 {
+        let uptime_pct = if n.streaming_minutes >= 0 && session_minutes > 0 {
             #[allow(clippy::cast_precision_loss)]
             // APPROVED: display-only percentage over bounded minute counts.
             {
-                (n.streaming_minutes as f64 / SCOREBOARD_SESSION_MINUTES as f64) * 100.0
+                (n.streaming_minutes as f64 / session_minutes as f64) * 100.0
             }
         } else {
             // Unknown — 0.0 paired with partial_coverage=true (never a
@@ -3745,7 +3768,7 @@ async fn run_feed_scoreboard_attempt(
             blame_indeterminate: n.blame_indeterminate,
             restarts_detected: n.restarts,
             streaming_minutes: n.streaming_minutes,
-            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            session_minutes,
             uptime_pct,
             partial_coverage: row_partial,
             // Scoreboard PR-D: per-feed source truth — 'in_memory' when
@@ -3863,7 +3886,7 @@ async fn run_feed_scoreboard_attempt(
         result: Ok(ScoreboardSummary {
             trading_date_ist: trading_date_label,
             dhan,
-            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            session_minutes,
             partial_coverage,
             degraded,
             early_run: forced_early_run,

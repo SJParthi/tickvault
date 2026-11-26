@@ -120,3 +120,66 @@ fn a_refused_frame_releases_its_byte_reservation() {
          would make the budget shrink monotonically until nothing is accepted"
     );
 }
+
+/// Hold the connected writer between reads and observe which bound rejects
+/// further frames. The accepted frame stays in the queue while refusals occur.
+fn stalled_writer_refusals(record_capacity: usize, byte_budget: u64) -> (u64, u64) {
+    let (mut spill, reader) = WsFrameSpill::new_with_held_writer_for_test(record_capacity);
+    spill.queue_budget_bytes = byte_budget;
+    let record_full = Arc::new(metrics::atomics::AtomicU64::new(0));
+    let bytes_full = Arc::new(metrics::atomics::AtomicU64::new(0));
+    let idx = ws_type_index(WsType::LiveFeed);
+    spill.drop_counters.ticks_lost_channel_full[idx] =
+        metrics::Counter::from_arc(Arc::clone(&record_full));
+    spill.drop_counters.ticks_lost_bytes_full[idx] =
+        metrics::Counter::from_arc(Arc::clone(&bytes_full));
+
+    let payload = Bytes::from_static(b"12345678");
+    for (cycle, first_id) in [10, 20].into_iter().enumerate() {
+        assert_eq!(
+            spill.append_with_seq(WsType::LiveFeed, payload.clone(), first_id),
+            AppendOutcome::Spilled
+        );
+        for refused_id in first_id + 1..=first_id + 3 {
+            assert_eq!(
+                spill.append_with_seq(WsType::LiveFeed, payload.clone(), refused_id),
+                AppendOutcome::Dropped
+            );
+            assert_eq!(
+                spill.queued_bytes.load(Ordering::Relaxed),
+                payload.len() as u64
+            );
+            assert_eq!(spill.queued_records(), 1);
+        }
+        assert_eq!(spill.drop_critical_count(), 3 * (cycle as u64 + 1));
+        let stored = reader.try_recv().expect("first frame remains readable");
+        assert_eq!(stored.frame_seq, first_id);
+        assert_eq!(stored.frame, payload);
+        // Release the held reader's byte reservation as the writer does on dequeue.
+        assert_eq!(
+            spill
+                .queued_bytes
+                .fetch_sub(stored.frame.len() as u64, Ordering::Relaxed),
+            payload.len() as u64
+        );
+        assert!(reader.is_empty());
+    }
+    let directory = spill.wal_dir.clone();
+    drop(spill);
+    std::fs::remove_dir_all(directory).unwrap();
+    (
+        record_full.load(Ordering::Relaxed),
+        bytes_full.load(Ordering::Relaxed),
+    )
+}
+
+#[test]
+fn test_drop_counter_increments_when_channel_full() {
+    // A second 8-byte frame fits the byte budget. The single record slot is full.
+    assert_eq!(stalled_writer_refusals(1, 16), (6, 0));
+}
+
+#[test]
+fn the_byte_limit_refuses_while_a_record_slot_is_free() {
+    assert_eq!(stalled_writer_refusals(2, 8), (0, 6));
+}

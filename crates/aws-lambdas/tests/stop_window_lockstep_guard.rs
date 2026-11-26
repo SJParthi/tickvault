@@ -348,11 +348,16 @@ fn deploy_workflow_encodes_the_same_evening_edge() {
     );
 
     for (lineno, line) in &live {
+        // A stopped host cannot be woken once EventBridge's stop begins.
+        // The separate finalizer still avoids stopping an already-running host at the edge.
+        let comparator = if line.contains("UP_WINDOW=yes") {
+            "-lt"
+        } else {
+            "-le"
+        };
         assert!(
-            line.contains(&format!("-le {expected}")),
-            "deploy-aws.yml:{lineno} compares against the wrong evening edge — the window \
-             closes at {STOP_IST_HOUR}:{STOP_IST_MINUTE:02} IST, so this must read \
-             `-le {expected}`. Line: {}",
+            line.contains(&format!("{comparator} {expected}")),
+            "deploy-aws.yml:{lineno} must use {comparator} {expected} at the {STOP_IST_HOUR}:{STOP_IST_MINUTE:02} IST stop: {}",
             line.trim()
         );
     }

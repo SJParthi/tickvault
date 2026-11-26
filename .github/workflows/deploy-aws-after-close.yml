@@ -37,10 +37,9 @@
 #     market hours stayed undeployed all day. Two staggered retries give three
 #     independent chances. Each firing is idempotent via the sha check below,
 #     so on a normal day the retries exit clean with no restart. The 11:31 UTC
-#     slot is past the 16:30 IST box auto-stop — safe: the dispatched
-#     deploy-aws run self-starts a stopped box (workflow_dispatch ⇒
-#     SHOULD_BE_UP=yes in its "Ensure instance running" step) and its final
-#     never-cross step stops the box again once the deploy finishes.
+#     slot is past the 16:30 IST box auto-stop. It can deploy if the box is
+#     still running. A scheduled retry cannot wake a stopped box after the
+#     stop time, even if the runner or compilation was delayed.
 #     2026-10-20: EXCEPT on a holiday-stop day. When the holiday gate stopped
 #     the box today (`/tickvault/<env>/holiday-stop-date` = today's IST date),
 #     deploy-aws skips green (`DEPLOY_SKIP_REASON=holiday_stop`) instead of
@@ -74,8 +73,8 @@
 #     deploy-aws run exists for the HEAD; a HUMAN evening merge already has a
 #     green off-hours skip run, which postmerge-catchup deliberately counts
 #     as covered). ⚠️ latest-main-at-08:30-sharp is no longer promised.
-#   - Box failed to auto-start at 08:30 → deploy-aws runs dispatched OUTSIDE
-#     the prep window still self-start the box; inside the window the
+#   - Box failed to auto-start at 08:30 → outside the prep window a scheduled
+#     deploy can self-start during weekday uptime; inside the prep window the
 #     EventBridge start + deploy-watchdog own it.
 #   - NSE holiday: cron fires; deploy-aws's own market-hours guard is a no-op
 #     outside trading hours, so the deploy runs harmlessly on holiday windows.
@@ -108,7 +107,12 @@ on:
     - cron: '16 10 * * 1-5'
     - cron: '46 10 * * 1-5'
     - cron: '31 11 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      automatic_retry:
+        description: 'Automatic caller. Respect the EC2 operating window before starting a stopped host.'
+        type: boolean
+        default: false
 
 concurrency:
   group: deploy-aws-after-close
@@ -238,9 +242,10 @@ jobs:
       - name: Dispatch deploy-aws.yml on main
         if: steps.check.outputs.dispatch == 'true'
         env:
+          AUTOMATIC_RETRY: ${{ (github.event_name == 'schedule' || inputs.automatic_retry) && 'true' || 'false' }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh workflow run deploy-aws.yml --ref main
+          gh workflow run deploy-aws.yml --ref main -f "automatic_retry=$AUTOMATIC_RETRY"
           echo "::notice::deploy-aws dispatched on main — watch Actions tab"
 
       - name: Summary

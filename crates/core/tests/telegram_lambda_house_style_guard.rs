@@ -83,8 +83,8 @@ fn guard_house_line_ist_12h_and_fold_records_present() {
     // The fold output is what reaches Telegram (single choke point):
     // `handle` routes the SNS records through fold_records.
     assert!(
-        prod.contains("fold_records(&records, now, cache)"),
-        "handle must route records through fold_records"
+        prod.contains("fold_for_delivery(&records, now, cache)"),
+        "handle must use the same message fold that preserves typed portal announcements"
     );
 }
 
@@ -251,7 +251,7 @@ fn guard_never_drop_delivery_boundary_and_fail_open_render() {
     // Malformed SNS records fold to the generic safe line — never a
     // crash, never raw JSON, never a dropped batch.
     assert!(
-        prod.contains("plain_texts.push(GENERIC_SAFE_LINE.to_string())"),
+        prod.contains("plain_texts.push(Delivery::plain(GENERIC_SAFE_LINE.to_string()))"),
         "fold_records lost the malformed-record generic-safe-line fail-open arm"
     );
     // handle: every folded text is iterated straight into the Telegram

@@ -1,4 +1,4 @@
-//! Real-time proof that nothing on the live path is waiting (2026-10-02).
+//! Frame timing and task-liveness measurements on the live path (2026-10-02).
 //!
 //! Three instruments, all Prometheus-only, plus one phone page (below):
 //!
@@ -155,7 +155,8 @@ pub enum Stage {
     /// Socket read task: frame in hand → WAL hand-off and ring hand-off done
     /// (`WalRingSink::accept`).
     SocketToWal = 0,
-    /// Frame waiting in the ring: ring hand-off → drain picks it up.
+    /// Elapsed from the sink's pre-WAL receipt stamp to the drain's sample
+    /// after dequeue and reservation release. Overlaps the reader hand-off.
     RingDwell = 1,
     /// How late a 100 ms sleep on the MAIN tokio runtime woke.
     MainRuntimeLag = 2,
@@ -167,20 +168,18 @@ pub enum Stage {
     DrainMainFrame = 4,
     /// One main-feed frame, end to end inside this process: the read task's
     /// receipt instant → the drain finished folding it (plan item DT0,
-    /// 2026-10-29). It spans `socket_to_wal`, `ring_dwell` and
-    /// `drain_main_frame`, so a frame that took the LIVE path and took over
-    /// 1 ms to reach RAM shows here once, whichever step held it. Recorded
+    /// 2026-10-29). This single elapsed-time measurement includes ring dwell
+    /// and main-frame processing and overlaps the reader hand-off. Recorded
     /// once per main-feed frame by [`record_receipt_to_fold_nanos`], which
     /// also fills the finer quarter-octave histogram below. Never paged.
     ///
-    /// Not every tick: a frame the ring refused (frame-count or byte budget
-    /// full, or the drain gone) is kept only in the WAL and reaches the fold
-    /// later through refold or catch-up, the slowest path a tick can take,
-    /// and records nothing here. Those frames are counted on
+    /// Ring refusals yield no sample here. A frame admitted only to the WAL
+    /// can be offered again during recovery. A frame refused by both paths
+    /// has no archived copy from this attempt. Ring refusals are counted on
     /// `tv_dhan_ws_ring_full_total` and `tv_dhan_ws_ring_closed_total`
     /// (`endpoint="main_feed"`); read them beside this stage. In a window
-    /// where either rose the tail is partly unmeasured, so this stage's
-    /// p99.9 reads low for that window.
+    /// where either rose, this stage's p99.9 covers only frames that took
+    /// the live path. Recovery latency requires a separate measurement.
     ReceiptToFold = 5,
     /// One run of the Prometheus exporter's upkeep (it drains every
     /// histogram), which runs every 5 s on the MAIN tokio runtime, the one
@@ -326,9 +325,9 @@ const STAGE_COUNT: usize = ALL_STAGES.len();
 
 /// The stall page (`HOT-PATH-STALL-01`) reads only the first this-many
 /// stages. `receipt_to_fold` and `metrics_upkeep` (DT0, 2026-10-29) are
-/// measurement only: `receipt_to_fold` is the sum of three paged stages, so
-/// paging on it could page where none of them reached 2 s, and no dated
-/// noise-lock row authorizes a new page.
+/// measurement only. The receipt-to-fold timer spans overlapping stage
+/// intervals. Its elapsed time can exceed 2 s while each paged stage stays
+/// below 2 s. The noise lock authorizes only the existing page signals.
 const PAGED_STAGE_COUNT: usize = 5;
 
 const _: () = assert!(PAGED_STAGE_COUNT <= STAGE_COUNT);

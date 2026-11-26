@@ -6005,24 +6005,17 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
     (next_stamp == known).then_some(next)
 }
 
-/// Gauge: the LONGEST a frame sat in the ring before the drain folded it, in
-/// milliseconds, over the last reporting window.
+/// Peak frame age (ms) at the drain over the last completed 60-second window.
+/// Until the first window closes, the gauge shows the maximum observed so far.
+/// Frame age runs from receipt before WAL admission to the sample after dequeue
+/// and reservation release, before the frame's processing timer starts.
 ///
 /// # Why this one and not the vendor lag
 ///
-/// This number was already being computed on every frame — ~5,000 times a
-/// second — and immediately thrown away. `run_frame_drain` derives
-/// `queued_nanos` from the frame's own monotonic receipt stamp solely to
-/// back-date `received_at_nanos`, then drops it. Publishing costs one
-/// comparison per frame and one gauge write per window.
-///
-/// It is the signal that actually predicts the failure the lane is judged on.
-/// `tv_dhan_ws_lag_ms` measures how long DHAN took to deliver — their problem,
-/// unfixable from here, and deliberately excluded from the EMF selector as a
-/// "how much" rather than a "what broke" (see `EMF-METRIC-SELECTOR-NOTES.md`).
-/// Ring dwell measures how far behind OUR OWN drain is, which is the direct
-/// precursor of every loss mechanism the lane has: a drain that stops draining
-/// fills the ring, and a full ring refuses frames.
+/// `tv_dhan_ws_lag_ms` measures the interval from the exchange's last-trade
+/// timestamp to local receipt. This gauge starts at that receipt. Reader work
+/// before enqueue, backlog and scheduling delays can each increase it. Compare
+/// hand-off times and ring refusals when investigating a rise.
 ///
 /// # MAX, not mean, and not a histogram
 ///
@@ -6035,7 +6028,7 @@ pub fn unknown_packet_skip(frame: &[u8], offset: usize) -> Option<usize> {
 ///
 /// # Cost on the hot path
 ///
-/// One `i64` max against a stack local per frame. No allocation, no registry
+/// One relaxed atomic `fetch_max` per frame. No allocation, no registry
 /// lookup, no label — the gauge handle is resolved once and written on the
 /// existing `DRAIN_REPORT_EVERY` path beside `publish_fold_depth`, never per
 /// frame. This is the `DrainCounters` discipline the module already documents.
@@ -8362,10 +8355,9 @@ async fn run_frame_drain(
     // Plan item J2 (2026-10-26): count what the ring still holds rather than
     // dropping it with the receiver. WAL-backed frames replay on the next
     // boot; frames the WAL refused existed only here and are lost, counted and
-    // coded. Bounded by the ring's capacity, so a socket still delivering
-    // cannot hold the shutdown. The receiver is dropped right after, so a
-    // later frame meets a closed ring at its sender, which counts it
-    // (`ring_full`, and marks a backed one unapplied), instead of dying here.
+    // coded. Closing admissions first leaves a finite backlog, including
+    // any racing push that committed before close.
+    rx.close();
     let ring_residue = shutdown_residue::drain_ring_residue(
         || rx.try_recv(),
         FRAME_RING_CAPACITY,
@@ -8375,6 +8367,7 @@ async fn run_frame_drain(
                 DhanEndpointType::Depth200 => depth200_budget.release(frame.bytes.len()),
                 _ => depth_budget.release(frame.bytes.len()),
             }
+            frame.note_abandoned(WsType::LiveFeed);
             frame.wal_backed
         },
     );

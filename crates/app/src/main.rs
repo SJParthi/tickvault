@@ -6686,7 +6686,7 @@ fn spawn_feed_scoreboard_tasks(
         PROCESS_DEATH_RECONCILE_DELAY_SECS, ScoreboardStart, day_already_scored_complete,
         decide_scoreboard_start, parse_scoreboard_date_override, reconcile_process_death_episodes,
         run_feed_scoreboard, sanitize_scoreboard_trigger, scoreboard_trigger_after_auto_stop,
-        validate_scoreboard_backfill_date,
+        scoreboard_trigger_for_date, validate_scoreboard_backfill_date,
     };
     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
 
@@ -6842,25 +6842,14 @@ fn spawn_feed_scoreboard_tasks(
             .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
             .max(0) as u64
             / 86_400;
-        // Semantic backfill-date validation (round-2 hostile review
-        // 2026-07-10): a well-shaped NON-TRADING or FUTURE date used to run
-        // the full aggregation against legitimately-empty sources and write
-        // two fabricated all-zero rows stamped outcome='complete'. The
-        // TARGET date must be a past-or-today TRADING day; refusal pages
-        // Aborted, matching the malformed-date arm.
-        //
-        // Round 3 (2026-07-10): the SAME semantic gate applies to the
-        // no-DATE forced arm — `TICKVAULT_SCOREBOARD_NOW=1` alone on a
-        // Saturday/holiday targeted the non-trading TODAY and (after
-        // 15:45) fabricated two all-zero rows stamped outcome='complete'.
-        // The natural weekend mistake is re-running Friday's card and
-        // forgetting the DATE var; refusal pages Aborted with the fix.
+        // Validate both dated and undated forced runs. A future date or a
+        // day without a session could otherwise produce a complete row of zeros.
         if refusal.is_none() && force_now && date_override.is_none() {
             let today_label = today_ist.format("%Y-%m-%d").to_string();
             if let Err(why) = validate_scoreboard_backfill_date(
                 boot_day,
                 boot_day,
-                sb_calendar.is_trading_day(today_ist),
+                sb_calendar.is_session_day(today_ist),
             ) {
                 error!(
                     code = tickvault_common::error_code::ErrorCode::Scoreboard01AggregationDegraded
@@ -6883,7 +6872,7 @@ fn spawn_feed_scoreboard_tasks(
             && let Some((target_day, label)) = &date_override
         {
             let target_is_trading = chrono::NaiveDate::parse_from_str(label, "%Y-%m-%d")
-                .map(|d| sb_calendar.is_trading_day(d))
+                .map(|d| sb_calendar.is_session_day(d))
                 .unwrap_or(false);
             if let Err(why) =
                 validate_scoreboard_backfill_date(*target_day, boot_day, target_is_trading)
@@ -6900,9 +6889,13 @@ fn spawn_feed_scoreboard_tasks(
                 refusal = Some(format!("TICKVAULT_SCOREBOARD_DATE {label} {why}"));
             }
         }
-        let is_trading_day = sb_calendar.is_trading_day(today_ist);
-        let decision =
-            decide_scoreboard_start(boot_secs_of_day, is_trading_day, force_now, sb_trigger);
+        let dated_trigger = scoreboard_trigger_for_date(today_ist, sb_trigger);
+        let decision = decide_scoreboard_start(
+            boot_secs_of_day,
+            dated_trigger.is_some(),
+            force_now,
+            dated_trigger.unwrap_or(sb_trigger),
+        );
         // A refused run logs/sleeps NOTHING here (the refusal paths are all
         // forced runs — RunNow, never SleepThenRun — but the "running
         // on-demand NOW" line would mislead); it still awaits + classifies
@@ -6910,7 +6903,9 @@ fn spawn_feed_scoreboard_tasks(
         if refusal.is_none() {
             match decision {
                 ScoreboardStart::SkipNonTradingDay => {
-                    info!("feed_scoreboard: skipping the daily aggregation (non-trading day)");
+                    info!(
+                        "feed_scoreboard: skipping the daily aggregation (no dated capture window)"
+                    );
                 }
                 ScoreboardStart::RunCatchUp => {
                     info!(
@@ -7014,8 +7009,9 @@ fn spawn_feed_scoreboard_tasks(
         // of the session — the row is stamped partial and the card says so
         // (hostile review 2026-07-10: never a mid-day row masquerading as
         // a complete end-of-day row).
-        let forced_early_run =
-            force_now && target_ist_day == today_day && run_secs_of_day < sb_trigger;
+        let forced_early_run = force_now
+            && target_ist_day == today_day
+            && dated_trigger.is_none_or(|trigger| run_secs_of_day < trigger);
         // Round-4 LOW rerun latch: a post-trigger same-day boot whose day
         // ALREADY carries complete rows for BOTH feeds (the post-close
         // deploy-restart shape) skips the redundant re-run + duplicate
@@ -7105,6 +7101,7 @@ fn spawn_feed_scoreboard_tasks(
             Ok(Ok(Some(summary))) => {
                 if sb_telegram_enabled {
                     sb_notifier.notify(NotificationEvent::DualFeedDailyScorecard {
+                        prepared_at_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).ok(),
                         trading_date_ist: summary.trading_date_ist.clone(),
                         dhan: to_line("Dhan", &summary.dhan),
                         session_minutes: summary.session_minutes,

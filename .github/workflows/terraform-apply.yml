@@ -702,6 +702,8 @@ jobs:
         # rotation fails the step loudly; it never reports success.
         env:
           ROTATE_CONSOLE_KEY: ${{ github.event.inputs.rotate_console_key }}
+          ALERTS_TOPIC_ARN: arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts
+          PORTAL_ATTRIBUTES: '{"TickvaultEntry":{"DataType":"String","StringValue":"operator-portal"}}'
         run: |
           set +e
           URL=$(terraform -chdir=${{ env.TF_DIR }} output -raw operator_portal_url 2>/dev/null)
@@ -756,17 +758,19 @@ jobs:
           fi
           if [ "$ROTATED" = "yes" ]; then
             SUBJECT="Operator console key replaced"
-            MESSAGE="Your tickvault operator console key was replaced. The old key stops working within a minute. Open ${URL} on each device and paste the new key from AWS Parameter Store (operator control-secret). The key is never sent in a message."
+            MESSAGE="Your Tickvault operator device key was replaced. The old key stops working within a minute. For Stocks, tap Open Tickvault in this private Telegram message. For admin controls or an ordinary browser, open ${URL} and use the new Tickvault operator device key from Parameter Store (operator control-secret). The key is never sent in a message."
           else
             SUBJECT="Operator portal ready"
-            MESSAGE="Your tickvault operator portal is live: ${URL} — open it and paste your device key (AWS Parameter Store, operator control-secret). The key is never sent in a message."
+            MESSAGE="For Stocks, tap Open Tickvault in the latest private Telegram portal announcement. Older messages and ordinary browser links open ${URL}. Use your Tickvault operator device key for browser sign-in or admin controls. The browser can remember it for 30 days. The key is never sent in a message."
           fi
-          aws sns publish --region ${{ env.AWS_REGION }} \
-            --topic-arn "arn:aws:sns:${{ env.AWS_REGION }}:${{ steps.aws_account.outputs.account_id }}:tv-prod-alerts" \
-            --subject "$SUBJECT" \
-            --message "$MESSAGE" >/dev/null
-          echo "✅ Published the portal URL to Telegram (the key is never sent; rotated=${ROTATED})."
-          echo "Operator portal URL: ${URL} (key rotated: ${ROTATED})" >> "$GITHUB_STEP_SUMMARY"
+          # Rotation above inspects SSM exit codes explicitly. From here on both a failed
+          # Publish and a missing/malformed SNS receipt must fail the step before success.
+          set -e
+          MESSAGE_ID=$(aws sns publish --region "$AWS_REGION" --topic-arn "$ALERTS_TOPIC_ARN" \
+            --subject "$SUBJECT" --message "$MESSAGE" \
+            --message-attributes "$PORTAL_ATTRIBUTES" --query MessageId --output text)
+          [[ "$MESSAGE_ID" =~ ^[[:xdigit:]]{8}(-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12}$ ]]
+          echo "SNS accepted the operator portal announcement (MessageId ${MESSAGE_ID}, key rotated: ${ROTATED})." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: "Deploy gate: console shell GET / must return 200 within 5s"
         # Console smoke gate (B4 r3 shell-hang fix, 2026-07-06; simplified to a

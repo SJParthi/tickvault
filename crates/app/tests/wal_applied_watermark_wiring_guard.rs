@@ -91,11 +91,15 @@ fn every_ring_full_shed_marks_the_frame_unapplied() {
     let body = &src[accept..];
     let body_end = body.find("\n    }\n").map_or(body.len(), |i| i + 6);
     let body = &body[..body_end];
-    let sheds = body.matches("FrameSinkOutcome::RingFull").count();
+    let full = body.matches("FrameSinkOutcome::RingFull").count();
+    // A closed, saturated ring returns before try_send. The later physical
+    // send-failure arm shares one mark between its full/closed outcomes.
+    let closed_early = body.matches("return FrameSinkOutcome::RingClosed;").count();
+    let sheds = full + closed_early;
     let marks = body.matches(".note_unapplied(seq)").count();
     assert!(
-        sheds >= 3,
-        "expected the three RingFull arms, found {sheds}"
+        full >= 3 && closed_early == 1,
+        "expected three full-capable arms and one early closed return"
     );
     assert_eq!(
         marks, sheds,

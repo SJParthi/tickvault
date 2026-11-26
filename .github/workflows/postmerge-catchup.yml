@@ -134,7 +134,6 @@ jobs:
             echo "::warning::could not resolve main HEAD (transient API failure?) — skipping this catch-up pass; the next scheduled firing retries."
             exit 0
           fi
-          echo "main HEAD = ${head_sha}"
           # Exported for the SSM-mirror step below. Written only AFTER the
           # 40-lowercase-hex validation above, so the mirror can never receive
           # an error string or a truncated sha.
@@ -201,8 +200,8 @@ jobs:
           # Outside the window nothing is dispatched, so NO run exists for the
           # SHA and the next in-window firing (the weekday crons above), or
           # deploy-aws-after-close's 15:46 / 16:16 IST crons, deploy it. The
-          # fix lives HERE, not in deploy-aws.yml, so a human dispatch of
-          # deploy-aws.yml still deploys at any time on any day, unchanged.
+          # dispatch marks the child as automatic so a delayed build also
+          # respects the stop. Direct operator dispatch keeps its override.
           # ci.yml, bench.yml and terraform-apply.yml start no box and are
           # still backfilled at every firing. Pinned by
           # crates/common/tests/postmerge_catchup_trading_day_guard.rs.
@@ -248,7 +247,6 @@ jobs:
                              or . == ".github/workflows/terraform-apply.yml") ]
                   | length' 2>/dev/null || echo "")
           [[ "${tf_touched}" =~ ^[0-9]+$ ]] || tf_touched=0
-          echo "terraform-filtered files in HEAD commit: ${tf_touched}"
 
           for wf in ci.yml bench.yml deploy-aws.yml terraform-apply.yml; do
             if [ "${wf}" = "terraform-apply.yml" ] && [ "${tf_touched}" -eq 0 ]; then
@@ -282,7 +280,9 @@ jobs:
               # A transient dispatch failure must not abort the REMAINING
               # lanes (hostile review 2026-07-14, MEDIUM) — the next 30-min
               # firing retries any lane still uncovered.
-              if gh workflow run "${wf}" --ref main; then
+              dispatch_inputs=()
+              if [ "$wf" = deploy-aws.yml ]; then dispatch_inputs=(-f automatic_retry=true); fi
+              if gh workflow run "${wf}" --ref main "${dispatch_inputs[@]}"; then
                 dispatched=$((dispatched + 1))
               else
                 echo "::error::dispatch of ${wf} failed — the next 30-min firing retries"
@@ -294,7 +294,7 @@ jobs:
 
           # 2026-11-07: one printf (was a 6-line block) pays for the
           # trading-day check above; the run-line budget only shrinks.
-          printf '## Post-merge catch-up\n\n- main HEAD: `%s`\n- IST %s deploy day: %s\n- catch-up runs dispatched: %s\n' "${head_sha}" "${ist_day}" "${deploy_day}" "${dispatched}" >> "$GITHUB_STEP_SUMMARY"
+          printf '## Post-merge catch-up\n\n- main HEAD: `%s`\n- IST %s deploy day: %s\n- Terraform-filtered files in HEAD: %s\n- catch-up runs dispatched: %s\n' "${head_sha}" "${ist_day}" "${deploy_day}" "${tf_touched}" "${dispatched}" >> "$GITHUB_STEP_SUMMARY"
 
       # 2026-09-02 — MIRROR main HEAD into SSM for the deploy-watchdog.
       #

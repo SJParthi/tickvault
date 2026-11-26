@@ -797,8 +797,8 @@ const JS_VOLUME_BUDGET: &[(&str, usize)] = &[
     // 301 → 275 the same day: the speed-and-health panel compacted the script.
     ("crates/api/src/handlers/dashboard_page.rs", 275),
     ("crates/api/src/handlers/feeds_page.rs", 226),
-    // Public portal Top Movers, user-requested 2026-10-31; scope/measurement in §0.16.
-    ("crates/aws-lambdas/src/operator_control_console.html", 581),
+    // Stocks and Telegram read-only entry, measured in rust-only-forever-lock §0.24.
+    ("crates/aws-lambdas/src/operator_control_console.html", 661),
 ];
 
 /// Inline event-handler attributes (`onclick=`, `onerror=`, …) per file.
@@ -1251,10 +1251,10 @@ const JS_BYTE_BUDGET: &[(&str, usize)] = &[
     // still under the 34,714 §0.18 approved.
     // 34,696 → 35,000 on 2026-11-17: the key is remembered in this browser for
     // 30 days (owner card "Remember 30 days"), rust-only-forever-lock §0.20.
-    // Stocks watchlists, verified opening prices and socket readouts (§0.23, 2026-11-25).
+    // Telegram read-only entry and session expiry (§0.24, 2026-11-26).
     (
         "crates/aws-lambdas/src/operator_control_console.html",
-        49_746,
+        53_057,
     ),
 ];
 

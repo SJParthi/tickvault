@@ -251,7 +251,7 @@ mod tests {
         let returns = production
             .matches("return FrameSinkOutcome::WalDropped;")
             .count();
-        assert_eq!(returns, 3, "the three WAL-and-ring refusal arms");
+        assert_eq!(returns, 4, "the four WAL-and-ring refusal arms");
         let counted = production
             .lines()
             .zip(production.lines().skip(1))

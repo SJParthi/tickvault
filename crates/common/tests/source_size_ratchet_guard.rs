@@ -41,7 +41,9 @@ const PINS: &[(&str, usize)] = &[
     ("crates/app/src/main.rs", 6_958),
     // 2026-10-26 (PR K): lowered 26,621 -> 25,984 after the frame-silence
     // evidence tests moved to `pool_supervisor/frame_silence_evidence_tests.rs`.
-    ("crates/core/src/websocket/pool_supervisor.rs", 25_984),
+    // The ring budget tests moved to their own module. The supervisor is
+    // 122 lines shorter than before the receiver-close repair.
+    ("crates/core/src/websocket/pool_supervisor.rs", 25_862),
     ("crates/storage/src/ws_frame_spill.rs", 13_467),
     ("crates/trading/src/candles/multi_tf_aggregator.rs", 12_755),
 ];

@@ -30,10 +30,8 @@
 //! - An abandoned thread is detached, not stopped. If it finishes its write
 //!   before the process exits, rows counted lost here did land (errs toward
 //!   loss, never toward a false all-clear).
-//! - Frames a socket still delivers after the residue count are dropped with
-//!   the receiver; the window is the few instructions between the last
-//!   `try_recv` and the drop. The sockets are stopped before the drain is
-//!   signalled, so in practice nothing arrives there.
+//! - Closing the frame ring rejects subsequent admissions. Previously
+//!   accepted frames still depend on WAL write/flush or their live fold.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;

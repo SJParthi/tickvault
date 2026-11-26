@@ -1663,6 +1663,7 @@ mod tests {
 
     #[test]
     fn test_outcome_exits_one_below_a_production_floor_and_on_an_unreadable_thresholds_file() {
+        let temp_file = fixture_writer("production_floor");
         let source = temp_file("crates/app/src/lib.rs", FIXTURE_LIB);
         let json = FIXTURE.replace("/w/crates/app/src/lib.rs", &source.to_string_lossy());
         let good = temp_file("good_prod.json", &json);
@@ -1699,6 +1700,7 @@ mod tests {
     // key count as one crate, and the run fails.
     #[test]
     fn test_regression_a_duplicate_production_floor_fails_the_run() {
+        let temp_file = fixture_writer("duplicate_floor");
         let source = temp_file("crates/app/src/lib.rs", FIXTURE_LIB);
         let json = FIXTURE.replace("/w/crates/app/src/lib.rs", &source.to_string_lossy());
         let good = temp_file("dup_prod.json", &json);
@@ -1861,20 +1863,24 @@ mod tests {
         assert!(!is_directory_owner(Path::new("/w/src/tool.rs")));
     }
 
-    /// Writes `text` at `<temp>/coverage_prod_report_unit_<pid>/<relative>`.
-    fn temp_file(relative: &str, text: &str) -> PathBuf {
-        let path = std::env::temp_dir()
+    /// Parallel tests each need their own writable copy of `crates/app/src/lib.rs`.
+    fn fixture_writer(case: &str) -> impl Fn(&str, &str) -> PathBuf {
+        let root = std::env::temp_dir()
             .join(format!("coverage_prod_report_unit_{}", std::process::id()))
-            .join(relative);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("temp dir"); // APPROVED: test
+            .join(case);
+        move |relative, text| {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("temp dir"); // APPROVED: test
+            }
+            std::fs::write(&path, text).expect("temp file"); // APPROVED: test
+            path
         }
-        std::fs::write(&path, text).expect("temp file"); // APPROVED: test
-        path
     }
 
     #[test]
     fn test_outcome_reports_parse_errors_empty_exports_and_success() {
+        let temp_file = fixture_writer("outcome_report");
         let malformed = temp_file("malformed.json", "{\"data\":[");
         let (text, code) = outcome(&["x".into(), malformed.to_string_lossy().into_owned()]);
         assert_eq!(code, 1);

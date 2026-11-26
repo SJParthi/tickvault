@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>tickvault — operator portal</title>
 <style>
@@ -207,6 +208,7 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
 .direction-toggle button[aria-pressed="false"]::before{content:'';position:absolute;left:calc(50% - 18px);top:0;width:40px;height:100%;z-index:3;cursor:pointer}
 .stocks-open .direction-toggle button:active{transform:none}
 
+.telegram-viewer [data-operator-only]{display:none!important}
 </style>
 </head>
 <body>
@@ -219,9 +221,8 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
   <div class="card lock" id="lock">
     <div class="ic">🔐</div>
     <div class="lbl" style="margin-top:8px">device key</div>
-    <p class="muted" style="max-width:460px;margin:6px auto 14px">This portal only works on a device that holds your
-      secret key — your laptop and your phone. Anyone else who opens this link sees this screen and can do nothing.
-      Paste your key once; this browser remembers it for 30 days (Lock forgets it at once).</p>
+    <p id="login-status" class="muted" role="status">In your private Tickvault bot chat, tap Open Tickvault for read-only Stocks and Status.</p>
+    <p class="muted">For operator controls, enter your device key. This browser remembers it on this site for 30 days. Lock forgets it.</p>
     <input id="tok" type="password" placeholder="paste your operator key" autocomplete="off">
     <div class="row" style="margin-top:12px"><button class="b-blu" onclick="unlock()">🔓 Unlock this device</button></div>
   </div>
@@ -230,12 +231,13 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
     <div class="tabs">
       <div class="tab active" data-t="overview" onclick="tab('overview')">📊 Overview</div>
       <button type="button" class="tab" data-t="movers" id="movers-tab">Markets</button>
-      <div class="tab" data-t="data" onclick="tab('data')">📈 Data</div>
-      <div class="tab" data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
+      <div class="tab" data-operator-only data-t="data" onclick="tab('data')">📈 Data</div>
+      <div class="tab" data-operator-only data-t="admin" onclick="tab('admin')">🛠️ Admin</div>
+      <button id="viewer-exit" class="b-ghost mini" type="button" hidden>Leave read-only view</button>
     </div>
 
     <section data-tab="movers" hidden>
-      <div class="market-ticker" aria-label="Dhan index quotes">
+      <div class="market-ticker" data-operator-only aria-label="Dhan index quotes">
         <div class="ticker-controls"><button type="button" id="ticker-refresh">Refresh index quotes</button><small id="ticker-status" role="status">Last 60 seconds · IST</small></div>
         <div class="ticker-item" data-quote-id="13"><b>Nifty 50</b><span>—</span><small></small></div>
         <div class="ticker-item" data-quote-id="38"><b>Nifty Next 50</b><span>—</span><small></small></div>
@@ -322,16 +324,16 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
         </div>
         <div class="row" style="margin-top:14px">
           <button class="b-blu" id="refbtn" onclick="loadOverview()">🔄 Refresh now</button>
-          <button class="b-go" id="instbtn" onclick="instAct()" hidden>▶ Start instance</button>
+          <button class="b-go" data-operator-only id="instbtn" onclick="instAct()" hidden>▶ Start instance</button>
         </div>
         <div style="display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap">
           <label class="switch"><input type="checkbox" id="auto" checked onchange="autotoggle()"> auto-refresh (8s)</label>
-          <label class="switch"><input type="checkbox" id="force_inst"> force (override market-hours guard)</label>
+          <label class="switch" data-operator-only><input type="checkbox" id="force_inst"> force (override market-hours guard)</label>
           <span class="muted" id="updated"></span>
         </div>
-        <div class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:40 PM IST Mon–Fri unless force is ticked.</div>
+        <div data-operator-only class="muted" style="margin-top:8px">One button, context-aware: ▶ Start when the box is stopped, ■ Stop when it is running. Stop is blocked 9:15 AM–3:40 PM IST Mon–Fri unless force is ticked.</div>
       </div>
-      <div class="card">
+      <div class="card" data-operator-only>
         <details class="fold" id="awsdetails">
           <summary><div class="lbl" style="margin-bottom:6px">aws — tap to expand alarms + storage</div>
             <div class="strip" id="awsstrip"><span class="muted">not loaded yet</span></div></summary>
@@ -345,13 +347,13 @@ body.stocks-open{padding:0;background:#000;color:#ccc;font-family:Arial,Helvetic
       <div class="card"><div class="lbl">guarantees — live proof read from the box</div>
         <div class="banner" id="stoppedbanner" hidden>⏸ Box stopped (auto-stops 16:30 IST, auto-starts 08:30 Mon–Fri) — guarantees resume on start.</div>
         <div class="shields" id="shields"></div></div>
-      <div class="card"><div class="lbl">feeds — per-broker official-candle pulls (toggle on/off)</div>
+      <div class="card" data-operator-only><div class="lbl">feeds — per-broker official-candle pulls (toggle on/off)</div>
         <div class="row" style="margin-bottom:10px"><button class="b-blu" onclick="loadFeeds()">🔄 Load feeds</button></div>
         <div id="feeds"><span class="muted">not loaded yet</span></div>
         <div class="muted" id="feedsmsg" style="margin-top:8px"></div>
         <div class="muted" style="margin-top:6px">Every feed the app reports appears here automatically (a future feed #3 needs zero portal changes). Turning a feed OFF asks for confirmation; disabling Dhan during live trading is refused by the app itself. The pull line below each feed comes from today's fetch log: how many minute-pulls succeeded / failed / were rate-limited, and how fast the successful pulls landed in the last hour.</div>
       </div>
-      <div class="card"><div class="lbl">latency — live feed, and how fast each official minute candle arrives</div>
+      <div class="card" data-operator-only><div class="lbl">latency — live feed, and how fast each official minute candle arrives</div>
         <div class="row" style="margin-bottom:12px"><button class="b-blu" onclick="loadLatency()">⚡ Measure now</button></div>
         <div class="lbl" style="margin-top:4px">live websocket — exchange stamp → arrived here, per socket</div>
         <div id="latws" style="overflow:auto"></div>
@@ -528,30 +530,63 @@ const dismissedRead=Symbol('dismissed read');
 function keyLoad(){ try{ const o=JSON.parse(localStorage.getItem('tv_key')||'{}'); if(o.e>Date.now()&&typeof o.k==='string') return o.k; localStorage.removeItem('tv_key'); }catch(e){} return ''; }
 function keySave(v){ try{ localStorage.setItem('tv_key',JSON.stringify({k:v,e:Date.now()+2592e6})); }catch(e){} }
 let TOKEN=keyLoad(); try{ localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token'); }catch(e){}
+const portalEndpoint=location.origin+location.pathname;
+const telegramPrompt='Tap Open Tickvault again in your private Tickvault bot chat.';
+let authVersion=0, viewerExpires=0, viewerTimeout, initialTab='movers';
 let timer=null, lastTicks=0, curTab='overview';
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
 function esc(s){ return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
 function setLive(on){ $('livedot').classList.toggle('on',on); $('livetxt').textContent=on?'Connected':'Offline'; }
 
-function unlock(){ const v=($('tok').value||'').trim(); if(!v){ toast('Paste your key first'); return; }
-  TOKEN=v; keySave(v); $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
-function lock(){ TOKEN=''; moversRequest?.controller.abort(dismissedRead); resetTicker(); clearWatchSearch(); moversGeneration++; moversReply=null; renderMovers(); try{ localStorage.removeItem('tv_key'); }catch(e){} $('tok').value=''; stopAuto(); $('app').hidden=true; $('lock').hidden=false; setLive(false); toast('Locked — key forgotten on this device'); }
+function showSession(){
+  document.body.classList.toggle('telegram-viewer',Boolean(viewerExpires));
+  $('viewer-exit').hidden=!viewerExpires;
+  $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab(initialTab);
+}
 
-function tab(name){ if(curTab==='movers'&&name!==curTab)clearWatchSearch(); curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
+function unlock(){
+  const v=($('tok').value||'').trim();
+  if(!v){ toast('Paste your key first'); return; }
+  authVersion++; clearTimeout(viewerTimeout); viewerExpires=0;
+  TOKEN=v; keySave(v); showSession();
+}
+
+function lock(message){
+  const viewer=Boolean(viewerExpires);
+  authVersion++; clearTimeout(viewerTimeout); viewerExpires=0; TOKEN=''; stopAuto();
+  moversRequest?.controller.abort(dismissedRead); resetTicker(); clearWatchSearch();
+  moversGeneration++; moversReply=null; renderMovers();
+  if(!viewer){ try{ localStorage.removeItem('tv_key'); }catch(e){} }
+  $('tok').value=''; $('viewer-exit').hidden=true; $('app').hidden=true; $('lock').hidden=false;
+  document.body.classList.remove('telegram-viewer','stocks-open'); setLive(false);
+  $('login-status').textContent=message||(viewer?telegramPrompt:'Device locked. Enter your operator key or use the private Telegram button.');
+}
+
+function viewerExpired(){
+  if(!viewerExpires||Date.now()<viewerExpires)return false;
+  lock('Your read-only session expired. '+telegramPrompt); return true;
+}
+
+function tab(name){ if(viewerExpires&&name!=='movers'&&name!=='overview')return;
+  if(curTab==='movers'&&name!==curTab)clearWatchSearch(); curTab=name; document.body.classList.toggle('stocks-open',name==='movers'); $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.t===name));
   $$('section[data-tab]').forEach(s=>s.hidden=s.dataset.tab!==name);
   if(name==='data' && !$('dbtables').dataset.loaded) loadDbTables(); if(name==='movers'){expireTicker();loadMovers();} }
 
-async function call(action, extra, signal){ if(!TOKEN){ toast('Locked'); return null; }
-  try{ const r=await fetch(location.href,{method:'POST',
+async function call(action, extra, signal){
+  if(viewerExpired()||!TOKEN)return null;
+  if(viewerExpires&&action!=='view'&&action!=='stock-movers')return null;
+  const version=authVersion;
+  try{ const r=await fetch(portalEndpoint,{method:'POST',redirect:'error',credentials:'omit',cache:'no-store',
       headers:{'authorization':'Bearer '+TOKEN,'content-type':'application/json'},
       body:JSON.stringify(Object.assign({action},extra||{})),signal});
     const j=await r.json().catch(()=>({}));
-    if(r.status===401){ lock(); toast('Wrong or old key — paste the current one'); return null; }
+    if(version!==authVersion||viewerExpired())return null;
+    if(r.status===401){ lock(viewerExpires?'Read-only session ended. '+telegramPrompt:'Wrong or old key — paste the current one'); return null; }
     if(r.status===409){ toast(j.error||'Blocked during market hours'); return null; }
     if(!r.ok){ toast(j.error||('Error '+r.status)); return null; }
     return j;
-  }catch(e){ if(signal?.reason===dismissedRead)return null; toast('Network error'); setLive(false); return null; } }
+  }catch(e){ if(version!==authVersion||signal?.reason===dismissedRead)return null; toast('Network error'); setLive(false); return null; } }
 
 function countUp(el,target){ target=parseInt(String(target).replace(/[^0-9]/g,''),10)||0; const from=lastTicks||0; lastTicks=target;
   const t0=performance.now(),dur=900; function step(t){ const k=Math.min(1,(t-t0)/dur);
@@ -595,8 +630,10 @@ async function loadOverview(){ $('refbtn').innerHTML='<span class="spin">🔄</s
   else { dkTxt=dkRaw+' — schema drift (expected 5)'; dkCls='warn'; }
   $('shields').innerHTML=shield('Dedup key columns',dkTxt,keysOk,dkCls);
   }
-  if(!$('feeds').dataset.loaded) loadFeeds();
-  if(!$('alarms').dataset.loaded) loadAws();
+  if(!viewerExpires){
+    if(!$('feeds').dataset.loaded) loadFeeds();
+    if(!$('alarms').dataset.loaded) loadAws();
+  }
   $('updated').textContent='updated '+new Date().toLocaleTimeString(); }
 
 let instState='';
@@ -1095,13 +1132,58 @@ $('stocks-select-all').addEventListener('change',e=>{
   if(changed)watchChanged();else renderMovers();
 });
 setInterval(()=>{if(curTab==='movers'&&!document.hidden){expireTicker();if(!moversBusy||(moversReply?.result==='snapshot'&&moversExpired()))renderMovers();}},1000);
-document.addEventListener('visibilitychange',()=>{if(curTab==='movers'&&!document.hidden){expireTicker();renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
+document.addEventListener('visibilitychange',()=>{if(viewerExpired())return;if(curTab==='movers'&&!document.hidden){expireTicker();renderMovers();if(TOKEN&&!moversBusy&&$('auto').checked&&performance.now()-moversLastAttempt>=30000)loadMovers();}});
 moversIndices({index_names:[]});renderWatch();
 
-(function(){ var k=(location.hash.match(/key=([^&]+)/)||[])[1] || new URLSearchParams(location.search).get('key');
-  if(k){ try{ k=decodeURIComponent(k); }catch(e){} TOKEN=k; keySave(TOKEN);
-    try{ history.replaceState(null,'',location.pathname); }catch(e){} } })();
-if(TOKEN){ $('tok').value=TOKEN; $('lock').hidden=true; $('app').hidden=false; startAuto(); loadOverview(); tab('movers'); }
+function takeLaunch(){
+  const fragment=new URLSearchParams(location.hash.slice(1)), query=new URLSearchParams(location.search);
+  const target=query.get('tab')||fragment.get('tgWebAppStartParam')||location.hash.slice(1)||location.pathname.split('/').pop();
+  initialTab=target==='status'||target==='overview'?'overview':'movers';
+  const initData=fragment.get('tgWebAppData');
+  const legacyKey=fragment.get('key')||query.get('key');
+  if(initData!==null||legacyKey||[...query.keys(),...fragment.keys()].some(k=>k.startsWith('tgWebApp'))){
+    history.replaceState(null,'',location.pathname);
+  }
+  return {initData,legacyKey};
+}
+
+async function startPortal(){
+  let launch;
+  try{ launch=takeLaunch(); }catch(e){
+    TOKEN=''; $('login-status').textContent='Unable to open a private session. '+telegramPrompt; return;
+  }
+  if(launch.initData===null){
+    if(launch.legacyKey){ TOKEN=launch.legacyKey; keySave(TOKEN); }
+    if(TOKEN){ $('tok').value=TOKEN; showSession(); }
+    return;
+  }
+
+  // An explicit Telegram launch uses its own read-only credential, including
+  // when this browser separately remembers a full operator key.
+  TOKEN='';
+  const version=++authVersion;
+  $('login-status').textContent='Checking your Telegram session…';
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),15000);
+  try{
+    const response=await fetch(portalEndpoint,{method:'POST',credentials:'omit',redirect:'error',cache:'no-store',
+      headers:{'content-type':'application/json'},body:JSON.stringify({action:'telegram-session',init_data:launch.initData}),
+      signal:controller.signal});
+    if(!response.ok)throw new Error();
+    const session=await response.json();
+    if(version!==authVersion)return;
+    const expiry=session.expires_at*1000;
+    if(typeof session.session_token!=='string'||!session.session_token||!Number.isSafeInteger(session.expires_at)||
+       !Number.isSafeInteger(expiry)||expiry<=Date.now())throw new Error();
+    TOKEN=session.session_token; viewerExpires=expiry;
+    viewerTimeout=setTimeout(viewerExpired,Math.min(viewerExpires-Date.now(),2147483647));
+    showSession();
+  }catch(e){
+    if(version===authVersion)$('login-status').textContent='Telegram could not open a read-only session. '+telegramPrompt;
+  }finally{ clearTimeout(timeout); }
+}
+$('viewer-exit').addEventListener('click',()=>lock());
+startPortal();
 </script>
 </body>
 </html>

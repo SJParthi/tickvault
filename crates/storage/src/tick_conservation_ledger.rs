@@ -12,6 +12,8 @@
 //!   designated `ts` (the same day the database count filters on). A row the
 //!   session-window gate refused, or one that failed to append, is never
 //!   counted, because it was never offered to QuestDB.
+//!   Each ring slot retains its newest day. A replay for an older day that
+//!   shares the slot can still write its row without replacing the newer count.
 //! - **Rows that left the buffer without reaching QuestDB**, over the process
 //!   lifetime: rescued to the tick spill file, rescued and failed, or handed to
 //!   the WAL replay. These are the rows the database legitimately does not
@@ -112,7 +114,11 @@ impl TickConservationLedger {
     pub fn note_row_appended(&self, ts_ist_nanos: i64) {
         let day = Self::ist_day_of(ts_ist_nanos);
         let slot = self.slot_for(day);
-        if slot.day.load(Ordering::Acquire) != day {
+        let retained_day = slot.day.load(Ordering::Acquire);
+        if retained_day != day {
+            if day < retained_day {
+                return;
+            }
             slot.rows.store(0, Ordering::Relaxed);
             slot.day.store(day, Ordering::Release);
         }
@@ -208,6 +214,26 @@ mod tests {
         assert_eq!(l.accepted_rows_on(later), 1);
         // The old day is gone, never reported as the new day's count.
         assert_eq!(l.accepted_rows_on(DAY), 0);
+    }
+
+    #[test]
+    fn late_replay_preserves_newer_accepted_rows_in_the_same_slot() {
+        let l = TickConservationLedger::new();
+        let span = LEDGER_DAY_SLOTS as i64;
+        l.note_row_appended(ts_on(DAY));
+        l.note_row_appended(ts_on(DAY));
+        for days_ago in [span, span * 2] {
+            l.note_row_appended(ts_on(DAY - days_ago));
+            assert_eq!(l.accepted_rows_on(DAY), 2);
+            assert_eq!(l.accepted_rows_on(DAY - days_ago), 0);
+        }
+        // An out-of-order day in another retained slot can still be counted.
+        let recent_day = DAY - span + 1;
+        l.note_row_appended(ts_on(recent_day));
+        l.note_row_appended(ts_on(DAY));
+        assert_eq!(l.accepted_rows_on(recent_day), 1);
+        assert_eq!(l.accepted_rows_on(DAY), 3);
+        assert_eq!(l.rows_not_landed(), 0);
     }
 
     #[test]
