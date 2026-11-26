@@ -841,11 +841,21 @@ fn conservation_result(
         {
             ("row counts agree", Light::Green)
         }
+        ("unverified", "archived_partition") => {
+            ("archive verified, full count unknown", Light::Amber)
+        }
+        ("unverified", "archive_coverage_unknown") => ("archive status unknown", Light::Amber),
+        ("unverified", "destination_wal_unverified") => {
+            ("database write progress unconfirmed", Light::Amber)
+        }
+        ("unverified", "admissions_changed") => {
+            ("new writes arrived during the count", Light::Amber)
+        }
         ("match" | "unverified", _) => ("count agreement unverified", Light::Amber),
         ("partial", _) => ("partial session counts", Light::Amber),
-        ("mismatch", "extra_db_rows") => ("extra database rows", Light::Red),
+        ("mismatch", "extra_db_rows") => ("more live rows than accepted writes", Light::Red),
         ("mismatch", "unexplained_shortfall") => {
-            ("fewer stored rows than accepted writes", Light::Red)
+            ("fewer live rows than accepted writes", Light::Red)
         }
         ("mismatch", _) => ("row counts differ", Light::Red),
         _ => ("unknown result", Light::Grey),
@@ -918,7 +928,7 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
                     let number = |value: Option<i64>| value.map_or_else(|| "unknown".to_string(), format_signed);
                     Tile::new(format!("{day} · {}", short_text(feed)), value, status)
                         .with_detail(format!(
-                            "accepted writes {} · in the database {} · spill, failure or deferral counter {} · difference {} · reason {} · checked {} · count reads {}",
+                            "accepted writes {} · rows in live trade and quote tables {} · spill, failure or deferral counter {} · difference {} · reason {} · checked {} · count reads {}",
                             number(accepted),
                             number(database),
                             number(count("not_landed_rows")),
@@ -941,7 +951,7 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
     };
     Section {
         title: "Daily tick counts",
-        note: "At 15:45 the app compares writes accepted by its buffer with stored trades and quotes. Replaying the same key can count a write twice while the database keeps one row. Identifying a missing tick requires comparing capture keys."
+        note: "The daily check compares writes accepted by the buffer with rows visible in the live trade and quote tables. Rows held only in the archive fall outside this count. Replaying one key can produce two accepted writes and one row. Checking individual ticks requires comparing capture keys."
             .to_string(),
         tiles,
     }
@@ -2403,7 +2413,11 @@ garbage line without a number x
                 .contains("checked unknown · count reads unknown")
         );
         assert_eq!(section.tiles[2].status, Light::Amber);
-        assert!(section.tiles[2].detail.contains("in the database unknown"));
+        assert!(
+            section.tiles[2]
+                .detail
+                .contains("rows in live trade and quote tables unknown")
+        );
         assert!(section.tiles[2].detail.contains("difference unknown"));
         assert!(section.tiles[2].detail.contains("reason db unreadable"));
 
@@ -2457,12 +2471,12 @@ garbage line without a number x
         for (row, label, status) in [
             (
                 serde_json::json!(["mismatch", "unexplained_shortfall", 4, 2, 2]),
-                "fewer stored rows than accepted writes",
+                "fewer live rows than accepted writes",
                 Light::Red,
             ),
             (
                 serde_json::json!(["mismatch", "extra_db_rows", 100, 101, -1]),
-                "extra database rows",
+                "more live rows than accepted writes",
                 Light::Red,
             ),
             (
@@ -2482,6 +2496,43 @@ garbage line without a number x
             ),
         ] {
             assert_eq!(render(row), (label.into(), status));
+        }
+    }
+
+    #[test]
+    fn test_conservation_section_explains_uncertain_reads_even_when_counts_agree() {
+        let columns = [
+            "verdict",
+            "reason",
+            "accepted_rows",
+            "db_tick_rows",
+            "shortfall",
+        ];
+        for (reason, expected) in [
+            ("archived_partition", "archive verified, full count unknown"),
+            ("archive_coverage_unknown", "archive status unknown"),
+            (
+                "destination_wal_unverified",
+                "database write progress unconfirmed",
+            ),
+            ("admissions_changed", "new writes arrived during the count"),
+            ("future_reason", "count agreement unverified"),
+        ] {
+            let row = vec![
+                json_str("unverified"),
+                json_str(reason),
+                12.into(),
+                12.into(),
+                0.into(),
+            ];
+            let section = conservation_section(&rows(&columns, vec![row]), IST_0930_25);
+            let tile = &section.tiles[1];
+            assert_eq!((tile.value.as_str(), tile.status), (expected, Light::Amber));
+            assert!(
+                tile.detail
+                    .contains("rows in live trade and quote tables 12")
+            );
+            assert!(tile.detail.contains(&reason.replace('_', " ")));
         }
     }
 
@@ -2900,7 +2951,7 @@ garbage line without a number x
         if request_line.contains("tick_conservation_audit") {
             return (
                 "application/json",
-                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","unexplained_shortfall",100,90,0,10]]}"#,
+                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","unexplained_shortfall",100,90,0,10],["2026-10-28T00:00:00.000000Z","dhan","unverified","archived_partition",5,2,0,3]]}"#,
             );
         }
         if request_line.contains("feed_gap_audit") {
@@ -2972,9 +3023,11 @@ garbage line without a number x
         let parsed: Value = serde_json::from_slice(&body).expect("json");
         let text = parsed.to_string();
         assert!(
-            text.contains("fewer stored rows than accepted writes"),
+            text.contains("fewer live rows than accepted writes"),
             "conservation row read: {text}"
         );
+        assert!(text.contains("archive verified, full count unknown"));
+        assert!(text.contains("rows in live trade and quote tables 2 ·"));
         assert!(text.contains("1.0 GB"), "metrics page read: {text}");
         assert!(
             text.contains("not yet available"),
