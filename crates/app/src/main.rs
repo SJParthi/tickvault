@@ -6842,19 +6842,8 @@ fn spawn_feed_scoreboard_tasks(
             .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
             .max(0) as u64
             / 86_400;
-        // Semantic backfill-date validation (round-2 hostile review
-        // 2026-07-10): a well-shaped NON-TRADING or FUTURE date used to run
-        // the full aggregation against legitimately-empty sources and write
-        // two fabricated all-zero rows stamped outcome='complete'. The
-        // TARGET date must be a past-or-today TRADING day; refusal pages
-        // Aborted, matching the malformed-date arm.
-        //
-        // Round 3 (2026-07-10): the SAME semantic gate applies to the
-        // no-DATE forced arm — `TICKVAULT_SCOREBOARD_NOW=1` alone on a
-        // Saturday/holiday targeted the non-trading TODAY and (after
-        // 15:45) fabricated two all-zero rows stamped outcome='complete'.
-        // The natural weekend mistake is re-running Friday's card and
-        // forgetting the DATE var; refusal pages Aborted with the fix.
+        // Validate both dated and undated forced runs. A future date or a
+        // day without a session could otherwise produce a complete row of zeros.
         if refusal.is_none() && force_now && date_override.is_none() {
             let today_label = today_ist.format("%Y-%m-%d").to_string();
             if let Err(why) = validate_scoreboard_backfill_date(
