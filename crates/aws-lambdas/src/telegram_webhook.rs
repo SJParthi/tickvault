@@ -2335,6 +2335,21 @@ mod tests {
     // ---- PlainTextTransport (legacy: 5 tests) ----
 
     #[test]
+    fn test_portal_web_app_url_preserves_stage_and_rejects_credential_fields() {
+        let stage = "https://portal.example.org/prod/";
+        assert_eq!(portal_web_app_url(Some(stage)).unwrap().as_str(), stage);
+        for invalid in [
+            None,
+            Some("http://portal.example.org/prod/"),
+            Some("https://operator:x@portal.example.org/"),
+            Some("https://portal.example.org/?key=x"),
+            Some("https://portal.example.org/#key=x"),
+        ] {
+            assert!(portal_web_app_url(invalid).is_none(), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn portal_button_uses_only_its_configured_https_url_and_a_private_chat() {
         let portal = "https://example.execute-api.ap-south-1.amazonaws.com/";
         let button = operator_button("123456789", Some(portal)).expect("private user button");

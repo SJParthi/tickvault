@@ -1,5 +1,5 @@
-// Test-only. Independently generated with Python's urllib.parse.urlencode and
-// hmac over sorted decoded pairs. The optional signature participates in HMAC.
+// Known-answer fixtures generated independently of the verifier. The HMAC
+// covers the sorted decoded fields, including the optional signature.
 const TG_TIME: i64 = 1_700_000_000;
 const TG_LAUNCH: &str = "query_id=abc%2B%2F%3D&user=%7B%22id%22%3A1234%2C%22first_name%22%3A%22A+%26+B%22%7D&auth_date=1700000000&signature=example_-&hash=3d8a3cf0093da70a058c893250d4bbe925a496fd547793ed7974bd9da68e2892";
 const TG_OTHER: &str = "query_id=abc%2B%2F%3D&user=%7B%22id%22%3A9999%2C%22first_name%22%3A%22A+%26+B%22%7D&auth_date=1700000000&signature=example_-&hash=162da7591b7ee9f28b4eb0d3e03d5d6f42b7b97fd17cadfb1c4fa936ae938e78";
