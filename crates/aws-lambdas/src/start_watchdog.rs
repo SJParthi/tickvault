@@ -1430,7 +1430,23 @@ impl SnsApi for SdkSns {
                 .map_err(|e| e.to_string())?;
             request = request.message_attributes(crate::telegram_webhook::PORTAL_MARKER, marker);
         }
-        request.send().await.map(|_| ()).map_err(|e| e.to_string())
+        let output = request.send().await.map_err(|e| e.to_string())?;
+        if subject == crate::telegram_webhook::START_NOTICE_SUBJECT {
+            if let Some(id) = crate::logging::sns_message_id(output.message_id()) {
+                info!(
+                    sns_message_id = id,
+                    operator_entry_tagged = with_portal_entry,
+                    "SNS accepted morning start notice"
+                );
+            } else {
+                // SNS accepted the request. Retrying just for a receipt could send a duplicate.
+                warn!(
+                    operator_entry_tagged = with_portal_entry,
+                    "SNS accepted morning start notice without a usable MessageId"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3662,6 +3678,76 @@ mod sdk_loopback_tests {
                 .form_value("MessageAttributes.entry.1.Name")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_morning_sns_logs_only_the_accepted_message_receipt() {
+        use crate::telegram_webhook::START_NOTICE_SUBJECT;
+        use crate::test_support::{Captured, LoopbackResponse, start_loopback_aws};
+
+        let id = "b5b1cc77-914a-57c5-a0ba-2515c6a30e93";
+        for (wire_id, status, subject, tagged) in [
+            (Some(id), 200, START_NOTICE_SUBJECT, true),
+            (Some(id), 200, START_NOTICE_SUBJECT, false),
+            (None, 200, START_NOTICE_SUBJECT, true),
+            (
+                Some("private-unexpected-text"),
+                200,
+                START_NOTICE_SUBJECT,
+                true,
+            ),
+            (Some(id), 403, START_NOTICE_SUBJECT, true),
+            (Some(id), 200, "another notice", false),
+        ] {
+            let (endpoint, requests) = start_loopback_aws(move |_| {
+                if status == 403 {
+                    return LoopbackResponse::xml(status, "<ErrorResponse><Error><Code>AccessDenied</Code></Error></ErrorResponse>");
+                }
+                let element = wire_id.map_or_else(String::new, |value| format!("<MessageId>{value}</MessageId>"));
+                LoopbackResponse::xml(status, format!("<PublishResponse><PublishResult>{element}</PublishResult><ResponseMetadata><RequestId>different-request-id</RequestId></ResponseMetadata></PublishResponse>"))
+            }).await;
+            let sdk = SdkSns {
+                client: aws_sdk_sns::Client::new(&loopback_sdk_config(&endpoint).await),
+            };
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter("tickvault_aws_lambdas::start_watchdog=info")
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let result = sdk
+                .publish(
+                    "arn:aws:sns:ap-south-1:1:tv",
+                    subject,
+                    "private notice body",
+                    tagged,
+                )
+                .await;
+            assert_eq!(result.is_ok(), status == 200);
+            assert_eq!(operations(&requests), vec!["Publish"]);
+            let log = captured.text();
+            assert!(
+                !log.contains("private")
+                    && !log.contains("different-request-id")
+                    && !log.contains("arn:")
+            );
+            if status != 200 || subject != START_NOTICE_SUBJECT {
+                assert!(log.is_empty());
+            } else {
+                assert_eq!(log.lines().count(), 1);
+                let event: Value = serde_json::from_str(&log).expect("one JSON log event");
+                assert_eq!(event["fields"]["operator_entry_tagged"], tagged);
+                if wire_id == Some(id) {
+                    assert_eq!(event["level"], "INFO");
+                    assert_eq!(event["fields"]["sns_message_id"], id);
+                } else {
+                    assert_eq!(event["level"], "WARN");
+                    assert!(event["fields"].get("sns_message_id").is_none());
+                }
+            }
+        }
     }
 
     #[tokio::test]

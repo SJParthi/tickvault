@@ -22,6 +22,17 @@ pub fn level_directive(raw: Option<&str>) -> &'static str {
     }
 }
 
+/// Only canonical SNS UUIDs may enter receipts. Never log unexpected provider text.
+pub(crate) fn sns_message_id(raw: Option<&str>) -> Option<&str> {
+    raw.filter(|id| {
+        id.len() == 36
+            && id.bytes().enumerate().all(|(pos, byte)| match pos {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+    })
+}
+
 /// Install the process-global JSON subscriber. Safe to call more than once
 /// (warm Lambda re-invokes, tests) — a second call is a no-op.
 pub fn init_lambda_tracing() {
@@ -56,6 +67,22 @@ mod tests {
         assert_eq!(level_directive(None), "info");
         assert_eq!(level_directive(Some("")), "info");
         assert_eq!(level_directive(Some("garbage")), "info");
+    }
+
+    #[test]
+    fn sns_message_id_preserves_only_the_bounded_uuid_shape() {
+        let id = "B5B1CC77-914A-57C5-A0BA-2515C6A30E93";
+        assert_eq!(sns_message_id(Some(id)), Some(id));
+        for invalid in [
+            None,
+            Some(""),
+            Some("B5B1CC77914A57C5A0BA2515C6A30E93"),
+            Some("B5B1CC77_914A-57C5-A0BA-2515C6A30E93"),
+            Some("B5B1CC77-914A-57C5-A0BA-2515C6A30E9Z"),
+            Some("B5B1CC77-914A-57C5-A0BA-2515C6A30E93\n"),
+        ] {
+            assert_eq!(sns_message_id(invalid), None);
+        }
     }
 
     #[test]
