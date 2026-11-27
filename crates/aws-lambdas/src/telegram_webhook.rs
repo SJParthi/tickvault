@@ -985,27 +985,104 @@ pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -
 }
 
 #[derive(Clone)]
+enum OperatorNotice {
+    Portal,
+    MorningNotice { sns_message_id: Option<String> },
+}
+
+#[derive(Clone)]
 struct Delivery {
     text: String,
-    operator_entry: bool,
+    operator_notice: Option<OperatorNotice>,
+    button_requested: bool,
 }
 
 impl Delivery {
     fn plain(text: String) -> Self {
         Self {
             text,
-            operator_entry: false,
+            operator_notice: None,
+            button_requested: false,
         }
     }
 
-    fn body(&self, chat_id: &str, configured_url: Option<&str>) -> String {
-        let markup = if self.operator_entry {
+    fn prepare(&self, chat_id: &str, configured_url: Option<&str>) -> (String, bool) {
+        let markup = if self.button_requested {
             operator_button(chat_id, configured_url)
         } else {
             None
         };
-        telegram_body(chat_id, &self.text, markup.as_deref())
+        (
+            telegram_body(chat_id, &self.text, markup.as_deref()),
+            markup.is_some(),
+        )
     }
+
+    async fn post(
+        self,
+        client: &reqwest::Client,
+        url: &str,
+        chat_id: &str,
+        configured_url: Option<&str>,
+    ) -> Result<(u16, String), String> {
+        let (request, button_attached) = self.prepare(chat_id, configured_url);
+        let reply = post_telegram_body(client, url, request).await;
+        if let Some(OperatorNotice::MorningNotice { sns_message_id }) = &self.operator_notice {
+            record_morning_relay_result(sns_message_id.as_deref(), button_attached, &reply);
+        }
+        let (status, mut response) = reply?;
+        if self.operator_notice.is_some() && status >= 400 {
+            // An error body can echo private request data into the batch's failure log.
+            response = "operator notice response body omitted".to_string();
+        }
+        Ok((status, response))
+    }
+}
+
+fn record_morning_relay_result(
+    sns_message_id: Option<&str>,
+    button_attached: bool,
+    reply: &Result<(u16, String), String>,
+) {
+    let relay_outcome = match reply {
+        Err(_) => "transport_error",
+        Ok(_) if !button_attached => "private_button_omitted",
+        Ok(_) if sns_message_id.is_none() => "sns_message_id_unavailable",
+        Ok((status, body)) if !telegram_accepted_message(*status, body) => {
+            "bot_response_unconfirmed"
+        }
+        Ok(_) => {
+            info!(
+                sns_message_id,
+                relay_outcome = "telegram_accepted",
+                "Telegram accepted the private morning start notice"
+            );
+            return;
+        }
+    };
+    let http_status = reply.as_ref().ok().map(|(status, _)| *status);
+    warn!(
+        sns_message_id,
+        relay_outcome,
+        button_attached,
+        http_status,
+        "Private morning start notice receipt incomplete"
+    );
+}
+
+fn telegram_accepted_message(status: u16, response: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct SentMessage {
+        message_id: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct SendMessageResponse {
+        ok: bool,
+        result: SentMessage,
+    }
+    (200..300).contains(&status)
+        && serde_json::from_str::<SendMessageResponse>(response)
+            .is_ok_and(|reply| reply.ok && reply.result.message_id > 0)
 }
 
 fn fold_for_delivery(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -> Vec<Delivery> {
@@ -1060,24 +1137,31 @@ fn fold_for_delivery(records: &[Value], now_epoch: f64, cache: &mut AlertCache) 
             last_by_name.insert(name, alarm);
         } else {
             let subject = sns_obj.and_then(|s| s.get("Subject"));
-            // Only the typed deployment announcement gets a button. Carry its identity
-            // through the fold so arbitrary alert text can never supply a URL.
+            // The subject identifies sensitive notices, including a notice sent without
+            // a marker. Only an explicit, valid marker may request an operator button.
+            let operator_notice = match subject.and_then(Value::as_str) {
+                Some(START_NOTICE_SUBJECT) => Some(OperatorNotice::MorningNotice {
+                    sns_message_id: crate::logging::sns_message_id(
+                        sns_obj.and_then(|sns| sns.get("MessageId")?.as_str()),
+                    )
+                    .map(str::to_owned),
+                }),
+                Some("Operator portal ready" | "Operator console key replaced") => {
+                    Some(OperatorNotice::Portal)
+                }
+                _ => None,
+            };
             let marker = sns_obj
                 .and_then(|s| s.get("MessageAttributes"))
                 .and_then(|attrs| attrs.get(PORTAL_MARKER));
-            let operator_entry = matches!(
-                subject.and_then(Value::as_str),
-                Some(
-                    "Operator portal ready"
-                        | "Operator console key replaced"
-                        | START_NOTICE_SUBJECT
-                )
-            ) && marker.is_some_and(|attr| {
-                attr["Type"] == "String" && attr["Value"] == PORTAL_MARKER_VALUE
-            });
+            let button_requested = operator_notice.is_some()
+                && marker.is_some_and(|attr| {
+                    attr["Type"] == "String" && attr["Value"] == PORTAL_MARKER_VALUE
+                });
             plain_texts.push(Delivery {
                 text: format_plain_sns(subject, message),
-                operator_entry,
+                operator_notice,
+                button_requested,
             });
         }
     }
@@ -1411,11 +1495,7 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     let configured_url = std::env::var("OPERATOR_PORTAL_URL").ok();
     let send_url = format!("{TELEGRAM_API_BASE}/bot{token}/sendMessage");
     let result = send_texts(&texts, records.len(), |delivery| {
-        post_telegram_body(
-            &client,
-            &send_url,
-            delivery.body(&chat_id, configured_url.as_deref()),
-        )
+        delivery.post(&client, &send_url, &chat_id, configured_url.as_deref())
     })
     .await;
 
@@ -2409,13 +2489,13 @@ mod tests {
         assert_eq!(
             deliveries
                 .iter()
-                .map(|d| d.operator_entry)
+                .map(|d| d.button_requested)
                 .collect::<Vec<_>>(),
             [false, false, true, false, true, false, true, false]
         );
         let canonical = "https://portal.example.org/";
         for delivery in &deliveries {
-            let form = delivery.body("123", Some(canonical));
+            let (form, _) = delivery.prepare("123", Some(canonical));
             // Decode the exact form that the HTTP client sends to Telegram.
             let decoded = reqwest::Url::parse(&format!("https://example.org/?{form}")).unwrap();
             let fields: HashMap<_, _> = decoded.query_pairs().collect();
@@ -2424,18 +2504,18 @@ mod tests {
             assert_eq!(fields["disable_web_page_preview"], "true");
             match fields.get("reply_markup") {
                 Some(value) => {
-                    assert!(delivery.operator_entry);
+                    assert!(delivery.button_requested);
                     assert_eq!(fields.len(), 4);
                     let markup: Value = serde_json::from_str(value).unwrap();
                     assert_eq!(markup["inline_keyboard"][0][0]["web_app"]["url"], canonical);
                 }
                 None => {
-                    assert!(!delivery.operator_entry);
+                    assert!(!delivery.button_requested);
                     assert_eq!(fields.len(), 3);
                 }
             }
             assert_eq!(
-                delivery.body("-123", Some(canonical)),
+                delivery.prepare("-123", Some(canonical)).0,
                 telegram_body("-123", &delivery.text, None)
             );
         }
