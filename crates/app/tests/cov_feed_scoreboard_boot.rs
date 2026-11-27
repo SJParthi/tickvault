@@ -1886,3 +1886,28 @@ async fn same_day_socket_audit_counters_control_stored_outcome() {
     }
     assert!(discrepancies.is_empty(), "{discrepancies:?}");
 }
+
+#[test]
+fn daily_event_kind_only_promotes_legacy_dhan_pool_rows_with_gap_evidence() {
+    let cases = [
+        ("dhan", "main_feed", 0, 0, "connected"),
+        ("dhan", "main_feed", 1, 0, "reconnected"),
+        ("dhan", "main_feed", 0, 1, "reconnected"),
+        ("dhan", "depth_20", 0, 2, "reconnected"),
+        ("dhan", "depth_200", 2, 0, "reconnected"),
+        ("dhan", "main_feed", -1, -1, "connected"),
+        ("dhan", "order_update", 1, 2, "connected"),
+        ("groww", "main_feed", 1, 2, "connected"),
+    ];
+    for (feed, pool, seconds, attempts, expected) in cases {
+        let body = serde_json::json!({"dataset": [
+            [0, feed, pool, 3, "connected", "subscription_ack", -1, seconds, true, attempts]
+        ]});
+        let rows = parse_ws_events(&body.to_string()).expect("valid daily event dataset");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].event_kind, expected,
+            "{feed}/{pool} {seconds}/{attempts}"
+        );
+    }
+}
