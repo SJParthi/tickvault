@@ -1673,9 +1673,10 @@ pub fn collect_correlation_evidence(
 /// `episode_ts_nanos`. Pure, O(list).
 #[must_use]
 pub fn has_overlap(ts_list: &[i64], episode_ts_nanos: i64, window_secs: i64) -> bool {
-    let Ok(window_nanos) = u64::try_from(window_secs.saturating_mul(NANOS_PER_SEC)) else {
+    let Ok(seconds) = u64::try_from(window_secs) else {
         return false;
     };
+    let window_nanos = seconds.saturating_mul(1_000_000_000);
     ts_list
         .iter()
         .any(|&t| t.abs_diff(episode_ts_nanos) <= window_nanos)
@@ -4462,8 +4463,11 @@ mod tests {
     fn has_overlap_handles_extreme_timestamps_and_negative_windows() {
         for (ts, episode) in [(i64::MAX, i64::MIN), (i64::MIN, i64::MAX), (i64::MIN, 0)] {
             assert!(!has_overlap(&[ts], episode, 1));
-            assert!(!has_overlap(&[ts], episode, i64::MAX));
+            assert!(has_overlap(&[ts], episode, i64::MAX));
         }
+        // The widest possible distance is 18,446,744,073.709551615 seconds.
+        assert!(!has_overlap(&[i64::MIN], i64::MAX, 18_446_744_073));
+        assert!(has_overlap(&[i64::MIN], i64::MAX, 18_446_744_074));
         assert!(has_overlap(&[i64::MIN], i64::MIN, 0));
         assert!(!has_overlap(&[i64::MAX], i64::MAX, -1));
         assert!(has_overlap(&[i64::MAX], i64::MAX - NANOS_PER_SEC, 1));
