@@ -4357,13 +4357,14 @@ mod tests {
         // `console_remembers_the_key_for_thirty_days_only`.
         // 2026-11-25: timestamped Dhan index quotes and accurate disk-panel wording.
         // 2026-11-26: private Telegram Mini App launch and in-memory viewer session.
+        // 2026-11-27: distinguish the requested historical cutoff from the current market.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "d7b36d5aa4c9d6e22d7a944f11e249a3cb119ae13eee19b8e94943597ef4257d"
+            "9bb9a70e130df0c93aea6743449881b3b4b009f91e4dc40dfe3b48abce1ae97a"
         );
-        assert_eq!(CONSOLE_HTML.len(), 106_755);
+        assert_eq!(CONSOLE_HTML.len(), 107_071);
     }
 
     #[test]
@@ -4396,6 +4397,28 @@ mod tests {
         );
         assert!(
             CONSOLE_HTML.contains("moversObserved-reply.captured_at_epoch_secs)+2+moversElapsed()")
+        );
+    }
+
+    #[test]
+    fn stocks_historical_views_keep_cutoff_age_separate_from_live_freshness() {
+        let render = CONSOLE_HTML
+            .split_once("function renderMovers(){")
+            .and_then(|(_, rest)| rest.split_once("function validMtfPage("))
+            .expect("Stocks renderer")
+            .0;
+        // v2 uses Closed for both historical prices and a genuinely closed market.
+        // The verified response filter identifies which clock the read used.
+        assert!(render.contains("asOf=s.filter.as_of"));
+        assert!(render.contains("age=asOf||s.data_age_secs===null?s.data_age_secs:Math.ceil("));
+        assert!(render.contains(":'unknown'):s.status,asOf)"));
+        assert!(render.contains("asOf?'tick age at read cutoff ':'conservative tick age '"));
+        assert!(CONSOLE_HTML.contains("asOf&&key==='closed'?'historical':key"));
+        assert!(CONSOLE_HTML.contains(r#"data-historical="Historical lookup of stored prices.""#));
+        assert!(CONSOLE_HTML.contains("moversMessage(snapshot.status,snapshot.filter.as_of)"));
+        // Never admit an inconsistent historical Live/Stale reply to the current watchlist.
+        assert!(
+            CONSOLE_HTML.contains("!(filter.as_of&&['live','stale'].includes(r.snapshot.status))")
         );
     }
 
