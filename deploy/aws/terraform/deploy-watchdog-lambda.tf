@@ -146,11 +146,8 @@ resource "aws_lambda_function" "deploy_watchdog" {
       # /tickvault/prod/... path (prod is the only real env) — the two must
       # stay in lockstep; a staging env would need the workflow parameterized.
       BINARY_SHA_PARAM = "/tickvault/${var.environment}/deploy/binary-git-sha"
-      # 2026-09-02: the main-HEAD mirror the watchdog falls back to when
-      # /tickvault/<env>/operator/github-token is absent. Same lockstep note as
-      # above -- postmerge-catchup.yml writes the hardcoded /tickvault/prod/
-      # path. GitHub stays the PREFERRED source, so adding a token later
-      # upgrades the check with no further change.
+      # The watchdog falls back to the deploy-relevant mirror when it cannot
+      # read main from GitHub. postmerge-catchup.yml writes the prod path.
       DESIRED_SHA_PARAM = "/tickvault/${var.environment}/deploy/desired-git-sha"
       # 2026-10-20: no redeploy dispatch while this marker is today's IST date
       # (the holiday gate stopped the box on purpose).
@@ -426,7 +423,7 @@ resource "aws_cloudwatch_log_metric_filter" "deploy_provenance_blind" {
 
 resource "aws_cloudwatch_metric_alarm" "deploy_provenance_blind" {
   alarm_name          = "tv-${var.environment}-deploy-provenance-blind"
-  alarm_description   = "The deploy watchdog RAN but could not compare the running binary against main — every fire in the last 24h skipped, so tv-${var.environment}-binary-sha-stale is reading OK on no data and CANNOT tell you the box is on old code. Usual cause: /tickvault/${var.environment}/operator/github-token is missing or unreadable, so main HEAD cannot be fetched. Check the Lambda log for which sha was unknown (binary_sha_known / desired_sha_known). Runbook: .claude/rules/project/deploy-provenance.md"
+  alarm_description   = "The deploy watchdog skipped at least three binary/target mismatch samples in 24 hours. Check binary_sha_known and desired_sha_known in its logs. For an unknown binary, check the deployed SHA in SSM. For an unknown target, check GitHub main and the deploy-relevant SSM mirror. Public GitHub reads work without a dispatch credential. See .claude/rules/project/deploy-provenance.md"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 1
   datapoints_to_alarm = 1

@@ -551,6 +551,20 @@ fn rich_responses(dropped_metric: u64) -> Responses {
             807,
             true,
         ),
+        // Earlier Dhan writers labelled the subscribe acknowledgement "connected"
+        // even when it closed a measured gap on that slot (Nov 27 live audit).
+        serde_json::json!([
+            ts_micros(hms(11, 0)) + 1_359_101,
+            "dhan",
+            "main_feed",
+            1,
+            "connected",
+            "main_feed",
+            -1,
+            1,
+            true,
+            0
+        ]),
         ws_row(
             hms(16, 0),
             "dhan",
@@ -727,7 +741,10 @@ async fn test_feed_scoreboard_run_rich_day_keeps_degraded_lag_coverage_and_feed_
     assert_eq!(d.instruments, 50);
     assert_eq!(d.streaming_minutes, 3);
     assert_eq!(summary.session_minutes, 375);
-    assert_eq!(d.reconnects, 1, "one market-data reconnect");
+    assert_eq!(
+        d.reconnects, 2,
+        "explicit and historical market-data reconnects"
+    );
     // 10:00 (kept existing verdict) + 11:00 on main_feed; the order-update
     // drop is not a headline disconnect.
     assert_eq!(d.disconnects_market, 2);

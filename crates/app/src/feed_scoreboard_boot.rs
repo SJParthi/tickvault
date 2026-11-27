@@ -414,7 +414,7 @@ pub fn build_ws_events_day_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select cast(ts as long), feed, ws_type, connection_index, event_kind, \
-         source, dhan_code, down_secs, market_hours \
+         source, dhan_code, down_secs, market_hours, attempts \
          from ws_event_audit where ts >= {start} and ts < {end} order by ts"
     )
 }
@@ -883,23 +883,56 @@ pub const PARKED_WAKE_PAIR_WINDOW_NANOS: i64 = 10 * NANOS_PER_SEC;
 /// by a `feed_disabled` marker for the SAME
 /// (feed, ws_type, connection_index) is a parked wake, not evidence the
 /// feed was up — the fold excludes it from BOTH up signals (session-window
-/// and pre-session state-at-open). O(n·m) over one day's audit rows
-/// (≤ hundreds; cold path, one run/day). Pure.
+/// and pre-session state-at-open). Marker indexing and wake lookups are
+/// expected linear work in the number of rows, independent of arrival order.
 #[must_use]
 pub fn parked_wake_indices(rows: &[WsAuditEventLite]) -> HashSet<usize> {
-    rows.iter()
+    let mut wakes = rows
+        .iter()
         .enumerate()
-        .filter(|(_, wake)| wake.event_kind == "sleep_resumed")
+        .filter(|(_, row)| row.event_kind == "sleep_resumed")
+        .peekable();
+    if wakes.peek().is_none() {
+        return HashSet::new();
+    }
+
+    // A wake's inclusive window spans at most two consecutive buckets.
+    // In its own bucket only the latest marker matters; in the next bucket
+    // only the earliest matters. This also handles equal-time rows in either order.
+    let mut marker_bounds = HashMap::new();
+    for marker in rows.iter().filter(|row| row.source == FEED_DISABLE_SOURCE) {
+        let ts = marker.ts_ist_nanos;
+        let bucket = ts.div_euclid(PARKED_WAKE_PAIR_WINDOW_NANOS);
+        let socket = (
+            marker.feed.as_str(),
+            marker.ws_type.as_str(),
+            marker.connection_index,
+        );
+        let (first, last) = marker_bounds.entry((socket, bucket)).or_insert((ts, ts));
+        *first = (*first).min(ts);
+        *last = (*last).max(ts);
+    }
+    if marker_bounds.is_empty() {
+        return HashSet::new();
+    }
+
+    wakes
         .filter(|(_, wake)| {
-            rows.iter().any(|m| {
-                m.source == FEED_DISABLE_SOURCE
-                    && m.feed == wake.feed
-                    && m.ws_type == wake.ws_type
-                    && m.connection_index == wake.connection_index
-                    && m.ts_ist_nanos >= wake.ts_ist_nanos
-                    && m.ts_ist_nanos.saturating_sub(wake.ts_ist_nanos)
-                        <= PARKED_WAKE_PAIR_WINDOW_NANOS
-            })
+            let ts = wake.ts_ist_nanos;
+            let bucket = ts.div_euclid(PARKED_WAKE_PAIR_WINDOW_NANOS);
+            let socket = (
+                wake.feed.as_str(),
+                wake.ws_type.as_str(),
+                wake.connection_index,
+            );
+            marker_bounds
+                .get(&(socket, bucket))
+                .is_some_and(|&(_, last)| last >= ts)
+                || marker_bounds
+                    .get(&(socket, bucket + 1))
+                    .is_some_and(|&(first, _)| {
+                        first <= ts.saturating_add(PARKED_WAKE_PAIR_WINDOW_NANOS)
+                    })
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -1065,15 +1098,26 @@ pub fn parse_ws_events(body: &str) -> Option<Vec<WsAuditEventLite>> {
         let Some(ts_micros) = cols[0].as_i64() else {
             continue;
         };
+        let feed = cols[1].as_str().unwrap_or("");
+        let ws_type = cols[2].as_str().unwrap_or("");
+        let down_secs = cols[7].as_i64().unwrap_or(0);
+        let attempts = cols.get(9).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let kind = crate::ws_connection_rollup::daily_event_kind(
+            feed,
+            ws_type,
+            cols[4].as_str().unwrap_or(""),
+            down_secs,
+            attempts,
+        );
         out.push(WsAuditEventLite {
             ts_ist_nanos: ts_micros.saturating_mul(1_000),
-            feed: cols[1].as_str().unwrap_or("").to_string(),
-            ws_type: cols[2].as_str().unwrap_or("").to_string(),
+            feed: feed.to_string(),
+            ws_type: ws_type.to_string(),
             connection_index: cols[3].as_i64().unwrap_or(0),
-            event_kind: cols[4].as_str().unwrap_or("").to_string(),
+            event_kind: kind.to_string(),
             source: cols[5].as_str().unwrap_or("").to_string(),
             dhan_code: cols[6].as_i64().unwrap_or(-1),
-            down_secs: cols[7].as_i64().unwrap_or(0),
+            down_secs,
             market_hours: cols[8].as_bool().unwrap_or(false),
         });
     }
@@ -1629,10 +1673,12 @@ pub fn collect_correlation_evidence(
 /// `episode_ts_nanos`. Pure, O(list).
 #[must_use]
 pub fn has_overlap(ts_list: &[i64], episode_ts_nanos: i64, window_secs: i64) -> bool {
-    let window_nanos = window_secs.saturating_mul(NANOS_PER_SEC);
+    let Ok(window_nanos) = u64::try_from(window_secs.saturating_mul(NANOS_PER_SEC)) else {
+        return false;
+    };
     ts_list
         .iter()
-        .any(|&t| (t - episode_ts_nanos).abs() <= window_nanos)
+        .any(|&t| t.abs_diff(episode_ts_nanos) <= window_nanos)
 }
 
 /// The ONLY codes the correlation scan retains. Filtering at PARSE time
@@ -4299,14 +4345,16 @@ mod tests {
             [1784000000000000, "dhan", "main_feed", 0, "disconnected", "Dhan or network", -1, 0, true],
             [1784000060000000, "dhan", "main_feed", 0, "reconnected", "n/a", -1, 60, true],
             ["bad row"],
-            [1784000120000000, "groww", "groww_bridge", 0, "connected", "groww_subscribed", -1, 0, false]
+            [1784000120000000, "groww", "groww_bridge", 0, "connected", "groww_subscribed", -1, 0, false],
+            [1784000180000000, "dhan", "main_feed", 3, "connected", "main_feed", -1, 0, true, 1]
         ]}"#;
         let rows = parse_ws_events(body).expect("parse");
-        assert_eq!(rows.len(), 3, "malformed rows skipped, never panic");
+        assert_eq!(rows.len(), 4, "malformed rows skipped, never panic");
         assert_eq!(rows[0].event_kind, "disconnected");
         assert_eq!(rows[0].ts_ist_nanos, 1_784_000_000_000_000 * 1_000);
         assert_eq!(rows[1].down_secs, 60);
         assert_eq!(rows[2].feed, "groww");
+        assert_eq!(rows[3].event_kind, "reconnected");
         // Unparsable body → None (caller records sentinels).
         assert_eq!(parse_ws_events("not json"), None);
     }
@@ -4408,6 +4456,18 @@ mod tests {
             });
             assert!(emitted, "stage {stage} is no longer a RESILIENCE-01 line");
         }
+    }
+
+    #[test]
+    fn has_overlap_handles_extreme_timestamps_and_negative_windows() {
+        for (ts, episode) in [(i64::MAX, i64::MIN), (i64::MIN, i64::MAX), (i64::MIN, 0)] {
+            assert!(!has_overlap(&[ts], episode, 1));
+            assert!(!has_overlap(&[ts], episode, i64::MAX));
+        }
+        assert!(has_overlap(&[i64::MIN], i64::MIN, 0));
+        assert!(!has_overlap(&[i64::MAX], i64::MAX, -1));
+        assert!(has_overlap(&[i64::MAX], i64::MAX - NANOS_PER_SEC, 1));
+        assert!(!has_overlap(&[i64::MIN], i64::MIN + NANOS_PER_SEC + 1, 1));
     }
 
     #[test]
@@ -6300,6 +6360,85 @@ mod tests {
             false,
         );
         assert!(!is_pre_session_up_row(&down), "down kinds never count");
+    }
+
+    #[test]
+    fn parked_wake_indices_match_inclusive_signed_time_window() {
+        let width = PARKED_WAKE_PAIR_WINDOW_NANOS;
+        let times = [
+            i64::MIN,
+            i64::MIN + width,
+            -width - 1,
+            -width,
+            -1,
+            0,
+            1,
+            width - 1,
+            width,
+            width + 1,
+            i64::MAX - width,
+            i64::MAX,
+        ];
+        for wake_ts in times {
+            for marker_ts in times {
+                let wake = ev(
+                    wake_ts,
+                    "dhan",
+                    "main_feed",
+                    "sleep_resumed",
+                    "ws",
+                    -1,
+                    true,
+                );
+                let marker = ev(
+                    marker_ts,
+                    "dhan",
+                    "main_feed",
+                    "sleep_entered",
+                    FEED_DISABLE_SOURCE,
+                    -1,
+                    true,
+                );
+                let distance = i128::from(marker_ts) - i128::from(wake_ts);
+                let expected = if (0..=i128::from(width)).contains(&distance) {
+                    HashSet::from([1, 2])
+                } else {
+                    HashSet::new()
+                };
+                assert_eq!(
+                    parked_wake_indices(&[marker, wake.clone(), wake]),
+                    expected,
+                    "wake {wake_ts}, marker {marker_ts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parked_wake_indices_use_both_marker_extrema_in_unsorted_buckets() {
+        let width = PARKED_WAKE_PAIR_WINDOW_NANOS;
+        let marker = |ts| {
+            ev(
+                ts,
+                "dhan",
+                "main_feed",
+                "sleep_entered",
+                FEED_DISABLE_SOURCE,
+                -1,
+                true,
+            )
+        };
+        let wake = |ts| ev(ts, "dhan", "main_feed", "sleep_resumed", "ws", -1, true);
+        let rows = [
+            marker(width + 8),
+            wake(width + 6),
+            marker(width + 3),
+            wake(4),
+            wake(2),
+            wake(width + 9),
+            marker(width + 3),
+        ];
+        assert_eq!(parked_wake_indices(&rows), HashSet::from([1, 3]));
     }
 
     #[test]
