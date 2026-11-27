@@ -86,6 +86,13 @@ persisted in `feed_episode_audit` with their `ws_type` for forensics but
 are EXCLUDED from the Dhan-vs-Groww comparison (a dead-token day once put
 39+ order-update drops on Dhan's card while its market feed was perfect).
 
+For Dhan pool sockets, a successful subscription acknowledgement that closes
+an observed gap is recorded as `reconnected`, including subsecond recoveries.
+Both daily rollups also recognize older `connected` rows with positive
+downtime or failed attempts. A legacy `connected` row with zero in both
+fields counts as a connect. Use its matching closed `feed_gap_audit` record,
+when available, to verify a historical subsecond recovery.
+
 
 `ws_connection_daily` — DEDUP
 `(ts, trading_date_ist, feed, ws_type, connection_index)`; `ts` is the

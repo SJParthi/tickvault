@@ -279,7 +279,7 @@ impl GapTracker {
                 }
                 GapStep::default()
             }
-            WsEventKind::Connected => match slot.take() {
+            WsEventKind::Connected | WsEventKind::Reconnected => match slot.take() {
                 Some(gap) => {
                     let row = gap_row(event.connection_index, gap, now_ist_nanos, false);
                     GapStep {
@@ -656,7 +656,7 @@ fn lifecycle_row(
     now_ist_nanos: i64,
     step: GapStep,
 ) -> tickvault_common::ws_event_types::WsEventAuditRow {
-    use tickvault_common::ws_event_types::WsEventAuditRow;
+    use tickvault_common::ws_event_types::{WsEventAuditRow, WsEventKind};
 
     let nanos_per_day: i64 = 86_400 * 1_000_000_000;
     WsEventAuditRow {
@@ -674,7 +674,13 @@ fn lifecycle_row(
         // ONE socket's event and must not imply a fleet-wide reading it
         // cannot have.
         pool_size: pool_size_of(event.endpoint),
-        event_kind: event.kind,
+        // A subscribe acknowledgement closes this slot's open gap even if
+        // downtime rounds to zero and the first redial succeeded.
+        event_kind: if step.closed.is_some() {
+            WsEventKind::Reconnected
+        } else {
+            event.kind
+        },
         source: event.endpoint.as_str().to_string(),
         reason: event.reason.to_string(),
         // The Dhan close code when the socket was closed with one; -1 otherwise.
@@ -682,7 +688,7 @@ fn lifecycle_row(
             tickvault_common::ws_event_types::WS_EVENT_NO_DHAN_CODE,
             i64::from,
         ),
-        // On the CONNECTED row that ends a gap: how long the slot was dark and
+        // On the recovery row that ends a gap: how long the slot was dark and
         // how many dials failed inside it. 0 on every other row.
         down_secs: step.down_secs,
         attempts: step.attempts,
@@ -1370,7 +1376,7 @@ mod lifecycle_row_tests {
 
 /// 2026-10-02: reconnect gaps are durably recorded. A disconnect opens a gap
 /// per connection slot, the next connect closes it into one `feed_gap_audit`
-/// row and stamps `down_secs` / `attempts` on the `ws_event_audit` CONNECTED
+/// row and stamps `down_secs` / `attempts` on the `ws_event_audit` recovery
 /// row, and a shutdown closes every gap still open at that instant.
 #[cfg(test)]
 mod feed_gap_tests {
@@ -1540,7 +1546,48 @@ mod feed_gap_tests {
         assert_eq!(open_row.dhan_code, WS_EVENT_NO_DHAN_CODE);
         assert_eq!(open_row.down_secs, 90, "no longer hard-coded to 0");
         assert_eq!(open_row.attempts, 0);
-        assert_eq!(open_row.event_kind, WsEventKind::Connected);
+        assert_eq!(open_row.event_kind, WsEventKind::Reconnected);
+    }
+
+    #[test]
+    fn a_gap_closes_once_even_when_downtime_rounds_to_zero() {
+        let mut gaps = GapTracker::new();
+        let initial = connected(3);
+        assert_eq!(
+            lifecycle_row(initial, T0, gaps.on_event(&initial, T0)).event_kind,
+            WsEventKind::Connected
+        );
+        let _ = gaps.on_event(&close_805(3), T0 + SEC);
+        let other = connected(2);
+        assert_eq!(
+            lifecycle_row(other, T0 + SEC, gaps.on_event(&other, T0 + SEC)).event_kind,
+            WsEventKind::Connected
+        );
+        let recovered_at = T0 + SEC + SEC / 2;
+        let recovered = lifecycle_row(initial, recovered_at, gaps.on_event(&initial, recovered_at));
+        assert_eq!(recovered.event_kind, WsEventKind::Reconnected);
+        assert_eq!((recovered.down_secs, recovered.attempts), (0, 0));
+        assert_eq!(
+            lifecycle_row(
+                initial,
+                recovered_at + SEC,
+                gaps.on_event(&initial, recovered_at + SEC)
+            )
+            .event_kind,
+            WsEventKind::Connected
+        );
+        let _ = gaps.on_event(&close_805(3), recovered_at + 2 * SEC);
+        let explicit = WsLifecycleEvent {
+            kind: WsEventKind::Reconnected,
+            ..initial
+        };
+        let at = recovered_at + 3 * SEC;
+        let row = lifecycle_row(explicit, at, gaps.on_event(&explicit, at));
+        assert_eq!(
+            (row.event_kind, row.down_secs),
+            (WsEventKind::Reconnected, 1)
+        );
+        assert_eq!(gaps.on_event(&initial, at + SEC), GapStep::default());
     }
 }
 

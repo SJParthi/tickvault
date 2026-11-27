@@ -551,6 +551,20 @@ fn rich_responses(dropped_metric: u64) -> Responses {
             807,
             true,
         ),
+        // Earlier Dhan writers labelled the subscribe acknowledgement "connected"
+        // even when it closed a measured gap on that slot (Nov 27 live audit).
+        serde_json::json!([
+            ts_micros(hms(11, 0)) + 1_359_101,
+            "dhan",
+            "main_feed",
+            1,
+            "connected",
+            "main_feed",
+            -1,
+            1,
+            true,
+            0
+        ]),
         ws_row(
             hms(16, 0),
             "dhan",
@@ -727,7 +741,10 @@ async fn test_feed_scoreboard_run_rich_day_keeps_degraded_lag_coverage_and_feed_
     assert_eq!(d.instruments, 50);
     assert_eq!(d.streaming_minutes, 3);
     assert_eq!(summary.session_minutes, 375);
-    assert_eq!(d.reconnects, 1, "one market-data reconnect");
+    assert_eq!(
+        d.reconnects, 2,
+        "explicit and historical market-data reconnects"
+    );
     // 10:00 (kept existing verdict) + 11:00 on main_feed; the order-update
     // drop is not a headline disconnect.
     assert_eq!(d.disconnects_market, 2);
@@ -1868,4 +1885,29 @@ async fn same_day_socket_audit_counters_control_stored_outcome() {
         }
     }
     assert!(discrepancies.is_empty(), "{discrepancies:?}");
+}
+
+#[test]
+fn daily_event_kind_only_promotes_legacy_dhan_pool_rows_with_gap_evidence() {
+    let cases = [
+        ("dhan", "main_feed", 0, 0, "connected"),
+        ("dhan", "main_feed", 1, 0, "reconnected"),
+        ("dhan", "main_feed", 0, 1, "reconnected"),
+        ("dhan", "depth_20", 0, 2, "reconnected"),
+        ("dhan", "depth_200", 2, 0, "reconnected"),
+        ("dhan", "main_feed", -1, -1, "connected"),
+        ("dhan", "order_update", 1, 2, "connected"),
+        ("groww", "main_feed", 1, 2, "connected"),
+    ];
+    for (feed, pool, seconds, attempts, expected) in cases {
+        let body = serde_json::json!({"dataset": [
+            [0, feed, pool, 3, "connected", "subscription_ack", -1, seconds, true, attempts]
+        ]});
+        let rows = parse_ws_events(&body.to_string()).expect("valid daily event dataset");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].event_kind, expected,
+            "{feed}/{pool} {seconds}/{attempts}"
+        );
+    }
 }

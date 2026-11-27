@@ -757,11 +757,22 @@ fn deploy_chain_does_not_restart_a_box_the_holiday_gate_stopped() {
     // pass even with the production read deleted (2026-10-20 review fix).
     let watchdog = read("crates/aws-lambdas/src/deploy_watchdog.rs");
     let handle = deploy_watchdog_handle_body(&watchdog);
+    let marker = handle
+        .find("crate::start_watchdog::holiday_stop_is_today(")
+        .expect("the deploy-watchdog must read today's holiday marker");
+    let hold = handle
+        .find("if let Some(reason) = dispatch_hold_reason(holiday_stop, &token)")
+        .expect("the actual marker and credential must decide whether dispatch is held");
+    let dispatch = handle
+        .find("let dispatched = dispatch_deploy(")
+        .expect("locate the real dispatch in the handler");
+    assert!(marker < hold && hold < dispatch);
+    let held = &handle[hold..dispatch];
     assert!(
-        handle.contains("crate::start_watchdog::holiday_stop_is_today(")
-            && handle.contains("\"skipped\": \"holiday_stop\""),
-        "the deploy-watchdog's `handle` must reuse the start-watchdog's marker \
-         read and skip the dispatch on a holiday-stop day"
+        held.contains("return Ok(json!({")
+            && held.contains("\"dispatched\": false")
+            && held.contains("\"skipped\": reason"),
+        "a held request must return its reason before dispatch"
     );
     let tf = squish(&code_only(&read(
         "deploy/aws/terraform/deploy-watchdog-lambda.tf",
