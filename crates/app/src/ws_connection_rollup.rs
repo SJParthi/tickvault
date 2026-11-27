@@ -183,11 +183,32 @@ pub const EVENT_KIND_RECONNECTED: &str = "reconnected";
 /// makes a never-opened connection visible instead of absent.
 pub const EVENT_KIND_DIAL_STARTED: &str = "dial_started";
 
+/// Older Dhan pool writers kept the transport label `connected` when an
+/// acknowledgement closed an observed gap. Only those gap-closing rows
+/// carried downtime or failed attempts. Zero/zero is ambiguous on old rows.
+pub(crate) fn daily_event_kind<'a>(
+    feed: &str,
+    ws_type: &str,
+    kind: &'a str,
+    down_secs: i64,
+    attempts: i64,
+) -> &'a str {
+    if kind == EVENT_KIND_CONNECTED
+        && feed == "dhan"
+        && matches!(ws_type, "main_feed" | "depth_20" | "depth_200")
+        && (down_secs > 0 || attempts > 0)
+    {
+        EVENT_KIND_RECONNECTED
+    } else {
+        kind
+    }
+}
+
 /// The day's `ws_event_audit` rows, reduced to what the rollup folds.
 ///
 /// A SEPARATE builder from `feed_scoreboard_boot::build_ws_events_day_sql`
 /// deliberately: that shape is pinned by its own tests and read by the
-/// classifier, and widening it to carry `pool_size` / `attempts` would put
+/// classifier, and widening it to carry `pool_size` would put
 /// this table's needs inside a query the blame path depends on. Two small
 /// queries over the same bounded day cost less than one coupled one.
 ///
@@ -235,9 +256,15 @@ pub fn fold_ws_event_rows(
             continue;
         };
         let pool_size = cols[3].as_i64().unwrap_or(0);
-        let kind = cols[4].as_str().unwrap_or("");
         let down_secs = cols[5].as_i64().unwrap_or(0);
         let attempts = cols[6].as_i64().unwrap_or(0);
+        let kind = daily_event_kind(
+            &feed,
+            &ws_type,
+            cols[4].as_str().unwrap_or(""),
+            down_secs,
+            attempts,
+        );
 
         let entry = out
             .entry((feed.clone(), ws_type.clone(), conn_idx))
@@ -1116,6 +1143,36 @@ mod tests {
         );
         assert_eq!(rows[0].total_attempts, 4);
         assert_eq!(rows[0].max_attempts, 3, "worst single ladder, not the last");
+    }
+
+    #[test]
+    fn legacy_dhan_recoveries_keep_their_connection_and_gap_measurements() {
+        let body = ws_body(
+            r#"["dhan","main_feed",3,5,"connected",0,0],
+               ["dhan","main_feed",3,5,"disconnected",0,0],
+               ["dhan","main_feed",3,5,"connected",1,0],
+               ["dhan","main_feed",3,5,"connected",0,2],
+               ["dhan","main_feed",3,5,"reconnected",0,0],
+               ["dhan","main_feed",4,5,"connected",0,0],
+               ["dhan","depth_20",3,5,"connected",2,0],
+               ["dhan","depth_200",3,5,"connected",0,1],
+               ["dhan","order_update",3,1,"connected",0,1],
+               ["truedata","truedata_feed",3,5,"connected",1,0]"#,
+        );
+        let mut out = BTreeMap::new();
+        fold_ws_event_rows(&mut out, &body).expect("parse");
+        let row = |feed: &str, pool: &str, index| &out[&(feed.to_owned(), pool.to_owned(), index)];
+        let main = row("dhan", "main_feed", 3);
+        assert_eq!(
+            (main.connects, main.reconnects, main.disconnect_events),
+            (1, 3, 1)
+        );
+        assert_eq!((main.total_down_secs, main.total_attempts), (1, 2));
+        assert_eq!(row("dhan", "main_feed", 4).reconnects, 0);
+        assert_eq!(row("dhan", "depth_20", 3).reconnects, 1);
+        assert_eq!(row("dhan", "depth_200", 3).reconnects, 1);
+        assert_eq!(row("dhan", "order_update", 3).connects, 1);
+        assert_eq!(row("truedata", "truedata_feed", 3).connects, 1);
     }
 
     #[test]
