@@ -3708,7 +3708,7 @@ aws events enable-rule --name tv-prod-daily-start\n"
     // estimate; neither may change a stop decision.
     mod budget_freshness {
         use super::*;
-        use std::sync::{Arc, Mutex};
+        use crate::test_support::Captured;
 
         /// Budgets fake that also reports a `LastUpdatedTime`.
         struct FakeStampedBudgets {
@@ -3740,28 +3740,6 @@ aws events enable-rule --name tv-prod-daily-start\n"
         /// Tuesday 17 Nov 2026 10:00 IST: in the up-window.
         fn tue_17_nov() -> DateTime<Utc> {
             utc(2026, 11, 17, 4, 30)
-        }
-
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .map_err(|_| std::io::Error::other("poisoned"))?
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Captured {
-            fn text(&self) -> String {
-                String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
-            }
         }
 
         async fn run_in_window_capturing(budgets: &FakeStampedBudgets) -> (Value, String) {
