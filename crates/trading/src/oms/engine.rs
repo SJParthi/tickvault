@@ -31,7 +31,7 @@ use tickvault_common::types::ExchangeSegment;
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
 use super::error_taxonomy::{self, DhanErrorClass, OrderEndpoint, OrderErrorPolicy};
-use super::exit_rules;
+use super::exit_rules::{self, refuse_retail_algo_disallowed};
 use super::idempotency::CorrelationTracker;
 use super::order_readiness::{OrderReadinessState, ReadinessRefusal, evaluate_order_readiness};
 use super::placement_telemetry::{self, PaperTradeRecord, PlacementLatency};
@@ -3726,7 +3726,7 @@ fn verdict_label(verdict: &ExecutionVerdict) -> &'static str {
 
 /// Validates the leg-modify payload before any gate is spent.
 ///
-/// MARKET entry modifies keep price 0.0 (mirror of the place rule / U1);
+/// The entry must be a LIMIT (Cluster H2b: MARKET refused) with a price;
 /// every price is finite; ENTRY quantity positive; trailing >= 0 finite.
 fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsError> {
     fn positive_finite(label: &str, value: f64) -> Result<(), OmsError> {
@@ -3761,10 +3761,12 @@ fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsE
             stop_loss_price,
             trailing_jump,
         } => {
-            if !matches!(order_type, OrderType::Limit | OrderType::Market) {
+            // Cluster H2b: MARKET / STOP_LOSS_MARKET refused first.
+            refuse_retail_algo_disallowed(*order_type, None)?;
+            if *order_type != OrderType::Limit {
                 return Err(OmsError::RiskRejected {
                     reason: format!(
-                        "super order entry leg must be LIMIT or MARKET, got {}",
+                        "super order entry leg must be LIMIT, got {}",
                         order_type.as_str()
                     ),
                 });
@@ -3774,17 +3776,7 @@ fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsE
                     reason: format!("super order modify quantity must be positive, got {quantity}"),
                 });
             }
-            if *order_type == OrderType::Market {
-                if *price != 0.0 {
-                    return Err(OmsError::RiskRejected {
-                        reason: format!(
-                            "MARKET super order modify must have price=0.0, got {price}"
-                        ),
-                    });
-                }
-            } else {
-                positive_finite("price", *price)?;
-            }
+            positive_finite("price", *price)?;
             positive_finite("targetPrice", *target_price)?;
             positive_finite("stopLossPrice", *stop_loss_price)?;
             trailing_ok(*trailing_jump)
@@ -3907,28 +3899,14 @@ fn build_forever_request(
 
 /// Validates order fields before submission to avoid wasting Dhan rate limits.
 ///
-/// - MARKET orders must have price = 0.0 (Dhan rejects non-zero → DH-905)
-/// - STOP_LOSS / STOP_LOSS_MARKET orders require triggerPrice > 0.0
+/// - Cluster H2b: MARKET, STOP_LOSS_MARKET and IOC are refused
+///   ([`refuse_retail_algo_disallowed`]), so every accepted order is a priced
+///   LIMIT or STOP_LOSS with DAY validity
+/// - LIMIT / STOP_LOSS price must be finite and > 0
+/// - STOP_LOSS triggerPrice must be finite and > 0
 fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
-    use tickvault_common::order_types::OrderType;
-
-    // MARKET orders: price must be 0 (Dhan API spec)
-    if request.order_type == OrderType::Market && request.price != 0.0 {
-        return Err(OmsError::RiskRejected {
-            reason: format!("MARKET order must have price=0.0, got {}", request.price),
-        });
-    }
-
-    // SL/SLM orders: triggerPrice is mandatory
-    if matches!(
-        request.order_type,
-        OrderType::StopLoss | OrderType::StopLossMarket
-    ) && request.trigger_price == 0.0
-    {
-        return Err(OmsError::RiskRejected {
-            reason: "STOP_LOSS/STOP_LOSS_MARKET orders require triggerPrice > 0".to_owned(),
-        });
-    }
+    refuse_retail_algo_disallowed(request.order_type, Some(request.validity))?;
+    validate_priced_order(request.order_type, request.price, request.trigger_price)?;
 
     // I-P0-03: Reject orders for expired derivative contracts.
     // Stale universe → expired contract order → CRITICAL risk.
@@ -3947,26 +3925,38 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
 
 /// Validates modify-order fields before submission to avoid wasting Dhan rate limits.
 ///
-/// Same rules as place: MARKET→price=0, SL→triggerPrice>0.
+/// Same rules as place: MARKET / STOP_LOSS_MARKET / IOC refused (Cluster
+/// H2b), LIMIT / STOP_LOSS price finite and > 0, STOP_LOSS trigger finite
+/// and > 0.
 fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> {
-    use tickvault_common::order_types::OrderType;
+    refuse_retail_algo_disallowed(request.order_type, Some(request.validity))?;
+    validate_priced_order(request.order_type, request.price, request.trigger_price)
+}
 
-    if request.order_type == OrderType::Market && request.price != 0.0 {
+/// Cluster H2b: the price rules of an order that passed
+/// [`refuse_retail_algo_disallowed`] (so a LIMIT or a STOP_LOSS): its price
+/// must be finite and > 0, and a STOP_LOSS trigger finite and > 0. Before
+/// H2b a LIMIT priced 0 or NaN reached the wire; each caller checked it.
+fn validate_priced_order(
+    order_type: OrderType,
+    price: f64,
+    trigger_price: f64,
+) -> Result<(), OmsError> {
+    if !(price.is_finite() && price > 0.0) {
         return Err(OmsError::RiskRejected {
-            reason: format!("MARKET order must have price=0.0, got {}", request.price),
+            reason: format!(
+                "{} order price must be positive and finite, got {price}",
+                order_type.as_str()
+            ),
         });
     }
-
-    if matches!(
-        request.order_type,
-        OrderType::StopLoss | OrderType::StopLossMarket
-    ) && request.trigger_price == 0.0
-    {
+    if order_type == OrderType::StopLoss && !(trigger_price.is_finite() && trigger_price > 0.0) {
         return Err(OmsError::RiskRejected {
-            reason: "STOP_LOSS/STOP_LOSS_MARKET orders require triggerPrice > 0".to_owned(),
+            reason: format!(
+                "STOP_LOSS orders require a positive, finite triggerPrice, got {trigger_price}"
+            ),
         });
     }
-
     Ok(())
 }
 
@@ -4933,11 +4923,11 @@ mod tests {
             security_id: 52432,
             exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Market,
+            order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 50,
-            price: 0.0,
+            price: 100.0,
             trigger_price: 0.0,
             lot_size: 25,
             expiry_date: None,
@@ -5117,7 +5107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_market_order_zero_price_accepted() {
+    async fn test_market_order_refused_before_any_slot() {
         let api_client = OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
@@ -5145,7 +5135,13 @@ mod tests {
         };
 
         let result = oms.place_order(request).await;
-        assert!(result.is_ok(), "MARKET order with price=0 must be accepted");
+        // Cluster H2b: MARKET is refused before the budget, the rate slot
+        // and the dry-run branch, so nothing is placed.
+        assert!(
+            matches!(&result, Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")),
+            "MARKET order must be refused, got {result:?}"
+        );
+        assert_eq!(oms.total_placed(), 0, "a refused order places nothing");
     }
 
     // -----------------------------------------------------------------------
@@ -5385,7 +5381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_order_fields_market_order_valid() {
+    fn test_validate_order_fields_market_order_refused() {
         let request = PlaceOrderRequest {
             security_id: 52432,
             exchange_segment: ExchangeSegment::NseFno,
@@ -5399,7 +5395,10 @@ mod tests {
             lot_size: 25,
             expiry_date: None,
         };
-        assert!(validate_order_fields(&request).is_ok());
+        assert!(matches!(
+            validate_order_fields(&request),
+            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
+        ));
     }
 
     #[test]
@@ -5478,7 +5477,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_order_fields_slm_with_trigger() {
+    fn test_validate_order_fields_slm_with_trigger_refused() {
         let request = PlaceOrderRequest {
             security_id: 52432,
             exchange_segment: ExchangeSegment::NseFno,
@@ -5492,7 +5491,186 @@ mod tests {
             lot_size: 25,
             expiry_date: None,
         };
-        assert!(validate_order_fields(&request).is_ok());
+        assert!(matches!(
+            validate_order_fields(&request),
+            Err(OmsError::RiskRejected { reason }) if reason.contains("STOP_LOSS_MARKET") && reason.contains("not allowed")
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster H2b: IOC refused, LIMIT / STOP_LOSS priced
+    // -----------------------------------------------------------------------
+
+    fn h2b_request(
+        order_type: OrderType,
+        validity: OrderValidity,
+        price: f64,
+        trigger: f64,
+    ) -> PlaceOrderRequest {
+        PlaceOrderRequest {
+            security_id: 52432,
+            exchange_segment: ExchangeSegment::NseFno,
+            transaction_type: TransactionType::Buy,
+            order_type,
+            product_type: ProductType::Intraday,
+            validity,
+            quantity: 50,
+            price,
+            trigger_price: trigger,
+            lot_size: 25,
+            expiry_date: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_order_fields_refuses_ioc_validity() {
+        for order_type in [OrderType::Limit, OrderType::StopLoss] {
+            let request = h2b_request(order_type, OrderValidity::Ioc, 250.0, 249.0);
+            assert!(
+                matches!(
+                    validate_order_fields(&request),
+                    Err(OmsError::RiskRejected { reason }) if reason.contains("IOC") && reason.contains("not allowed")
+                ),
+                "{order_type:?} with IOC must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_order_fields_limit_needs_a_positive_finite_price() {
+        for price in [0.0, -0.05, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for order_type in [OrderType::Limit, OrderType::StopLoss] {
+                let request = h2b_request(order_type, OrderValidity::Day, price, 249.0);
+                assert!(
+                    matches!(
+                        validate_order_fields(&request),
+                        Err(OmsError::RiskRejected { .. })
+                    ),
+                    "{order_type:?} at price {price} must be refused"
+                );
+            }
+        }
+        assert!(
+            validate_order_fields(&h2b_request(
+                OrderType::Limit,
+                OrderValidity::Day,
+                0.05,
+                0.0
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_order_fields_stop_loss_needs_a_positive_finite_trigger() {
+        for trigger in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let request = h2b_request(OrderType::StopLoss, OrderValidity::Day, 250.0, trigger);
+            assert!(
+                matches!(
+                    validate_order_fields(&request),
+                    Err(OmsError::RiskRejected { .. })
+                ),
+                "STOP_LOSS with trigger {trigger} must be refused"
+            );
+        }
+        assert!(
+            validate_order_fields(&h2b_request(
+                OrderType::StopLoss,
+                OrderValidity::Day,
+                250.0,
+                249.0
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_modify_fields_refuses_ioc_and_unpriced_limit() {
+        let modify = |order_type, validity, price| ModifyOrderRequest {
+            order_type,
+            quantity: 50,
+            price,
+            trigger_price: 249.0,
+            validity,
+            disclosed_quantity: 0,
+        };
+        assert!(
+            validate_modify_fields(&modify(OrderType::Limit, OrderValidity::Ioc, 250.0)).is_err()
+        );
+        assert!(
+            validate_modify_fields(&modify(OrderType::Limit, OrderValidity::Day, 0.0)).is_err()
+        );
+        assert!(
+            validate_modify_fields(&modify(OrderType::StopLossMarket, OrderValidity::Day, 0.0))
+                .is_err()
+        );
+        assert!(
+            validate_modify_fields(&modify(OrderType::Limit, OrderValidity::Day, 250.0)).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_modify_super_fields_refuses_market_entry() {
+        for (order_type, price) in [(OrderType::Market, 0.0), (OrderType::StopLossMarket, 101.0)] {
+            let modify = ModifySuperOrderLeg::Entry {
+                order_type,
+                quantity: 75,
+                price,
+                target_price: 111.0,
+                stop_loss_price: 96.0,
+                trailing_jump: 0.0,
+            };
+            assert!(
+                matches!(
+                    validate_modify_super_fields(&modify),
+                    Err(OmsError::RiskRejected { .. })
+                ),
+                "{order_type:?} super entry modify must be refused"
+            );
+        }
+    }
+
+    /// Cluster H2b: an IOC order is refused before the budget, the rate slot
+    /// and the dry-run branch, so the paper book stays empty.
+    #[tokio::test]
+    async fn test_place_order_ioc_refused_before_any_slot() {
+        let api_client = OrderApiClient::new(
+            reqwest::Client::new(),
+            "https://api.dhan.co/v2".to_owned(),
+            "100".to_owned(),
+        );
+        let mut oms = OrderManagementSystem::new(
+            api_client,
+            OrderRateLimiter::new(10),
+            Box::new(TestTokenProvider),
+            "100".to_owned(),
+        );
+        let result = oms
+            .place_order(h2b_request(
+                OrderType::Limit,
+                OrderValidity::Ioc,
+                250.0,
+                0.0,
+            ))
+            .await;
+        assert!(
+            matches!(result, Err(OmsError::RiskRejected { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(oms.total_placed(), 0);
+        // The refusal spent no rate slot: ten DAY orders still go through.
+        for _ in 0..10 {
+            let placed = oms
+                .place_order(h2b_request(
+                    OrderType::Limit,
+                    OrderValidity::Day,
+                    250.0,
+                    0.0,
+                ))
+                .await;
+            assert!(placed.is_ok(), "got {placed:?}");
+        }
+        assert_eq!(oms.total_placed(), 10);
     }
 
     // -----------------------------------------------------------------------
@@ -5585,7 +5763,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_modify_fields_market_valid() {
+    fn test_validate_modify_fields_market_refused() {
         let request = ModifyOrderRequest {
             order_type: OrderType::Market,
             quantity: 50,
@@ -5594,7 +5772,10 @@ mod tests {
             validity: OrderValidity::Day,
             disclosed_quantity: 0,
         };
-        assert!(validate_modify_fields(&request).is_ok());
+        assert!(matches!(
+            validate_modify_fields(&request),
+            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
+        ));
     }
 
     #[test]
@@ -6154,7 +6335,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_slm_order_valid_trigger_accepted() {
+    async fn test_slm_order_refused_before_any_slot() {
         let api_client = OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
@@ -6183,9 +6364,10 @@ mod tests {
 
         let result = oms.place_order(request).await;
         assert!(
-            result.is_ok(),
-            "SLM order with valid trigger must be accepted"
+            matches!(&result, Err(OmsError::RiskRejected { reason }) if reason.contains("STOP_LOSS_MARKET") && reason.contains("not allowed")),
+            "STOP_LOSS_MARKET order must be refused, got {result:?}"
         );
+        assert_eq!(oms.total_placed(), 0, "a refused order places nothing");
     }
 
     // -----------------------------------------------------------------------
