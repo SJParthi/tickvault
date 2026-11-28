@@ -95,6 +95,9 @@ use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::auth::token_manager::TokenHandle;
 use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_trading::brutex_host::engine::Side;
+use tickvault_trading::brutex_host::order_price::{DEFAULT_BAND_BPS, marketable_limit};
+use tickvault_trading::brutex_host::worst_fill::rupees_to_paise;
 use tickvault_trading::oms::engine::{OmsAlert, OmsAlertSink};
 use tickvault_trading::oms::{
     FillEvent, ManagedOrder, OrderApiClient, OrderManagementSystem, OrderRateLimiter,
@@ -637,6 +640,51 @@ fn segment_code_to_chars(segment_code: u8) -> (&'static str, &'static str) {
         Some(Seg::BseEquity) => ("BSE", "E"),
         Some(Seg::IdxI) => ("NSE", "I"),
         _ => ("", ""),
+    }
+}
+
+/// Tick for the paper self-test's index LIMIT prices: 5 paise (0.05 rupees,
+/// the NSE F&O price step). Index marks reach the self-test only in dry run
+/// (an index is not an orderable instrument), so this only shapes a paper
+/// price; it is never sent to an exchange.
+const SELF_TEST_TICK_PAISE: i64 = 5;
+
+/// Cluster H3 (2026-11-28): the paper self-test's LIMIT price for `side`,
+/// built from `reference` rupees with the house marketable-limit rule (the
+/// live paper chain's own builder): a BUY up to `DEFAULT_BAND_BPS` (10%)
+/// above the reference, a SELL down to 10% below it, on the tick grid. So a
+/// paper LIMIT that honours its price still fills when the index moves
+/// against it within the self-test's 180 s window. `None` when no such price
+/// exists (reference not finite, not positive, or out of range).
+fn self_test_limit_price(side: Side, reference: f64) -> Option<f64> {
+    let reference_paise = rupees_to_paise(reference).ok()?;
+    let limit = marketable_limit(
+        side,
+        reference_paise,
+        DEFAULT_BAND_BPS,
+        SELF_TEST_TICK_PAISE,
+        1,
+        None,
+        None,
+    )
+    .ok()?;
+    // Paise to rupees: exact for any price below 2^53 paise.
+    Some(limit.price_paise as f64 / 100.0)
+}
+
+/// Cluster H3 (2026-11-28): whether a paper LIMIT order may fill at `mark`.
+/// A BUY fills only at a mark at or below its limit, a SELL only at or above
+/// it, as on the exchange; until then the order rests and is retried on the
+/// next mark. Before H3 every paper order filled at any mark. Other order
+/// types (STOP_LOSS, and the MARKET/SLM the OMS now refuses) keep the old
+/// behaviour.
+fn paper_limit_reached(order: &ManagedOrder, mark: f64) -> bool {
+    if order.order_type != OrderType::Limit {
+        return true;
+    }
+    match order.transaction_type {
+        TransactionType::Buy => mark <= order.price,
+        TransactionType::Sell => mark >= order.price,
     }
 }
 
@@ -1843,9 +1891,13 @@ async fn process_mark(
     // Until then the index was bare-sid and `segment_matches_first_seen`
     // closed that path; the key now closes it by construction.
     if paper_fill && oms.is_dry_run() && has_pending_paper {
-        // Cold branch by construction (only reached when THIS instrument has
-        // a pending paper order); the id Vec clone is bounded by its pending
-        // count (1-2 in practice — self-test legs).
+        // Only reached when THIS instrument has a pending paper order; the id
+        // Vec clone is bounded by its pending count (1-2 in practice —
+        // self-test legs). Since Cluster H3 a LIMIT the mark has not reached
+        // stays pending, so this clone repeats on every mark for that
+        // instrument until the order fills or is cancelled (the self-test's
+        // 180 s timeout cancels its own legs): O(pending) per mark, per-order
+        // runtime task only, never the frame drain.
         let pending: Vec<String> = book
             .pending_paper
             .get(&(mark.security_id, mark_segment))
@@ -1892,9 +1944,18 @@ async fn fill_paper_order(
         );
         return;
     }
-    let Some(order) = oms.order(order_id).cloned() else {
+    let Some(order_ref) = oms.order(order_id) else {
         return;
     };
+    // Cluster H3: a LIMIT whose price the mark has not reached rests (no
+    // fill); it is retried on the next mark. Not a deferral (the mark is
+    // fine), counted on its own. Checked on the borrowed order, so a resting
+    // order costs no copy per mark.
+    if mark.is_finite() && mark > 0.0 && !paper_limit_reached(order_ref, mark) {
+        metrics::counter!("tv_paper_fills_resting_total").increment(1);
+        return;
+    }
+    let order = order_ref.clone();
     let Some(synthetic) = synthesize_paper_fill(&order, mark, segment_code) else {
         // F20: zero/absent/non-finite mark — defer, retry on the next mark.
         metrics::counter!("tv_paper_fills_deferred_total").increment(1);
@@ -2194,10 +2255,14 @@ async fn drive_self_test_timers(
 /// Mark-arm half: the first usable mark picks the sid and places the entry
 /// paper order (qty 1 unit, lot_size 1 → 1 lot).
 ///
-/// Cluster H2 (2026-11-28, self-trader rule fit): a LIMIT order at the mark
-/// that picked the sid, never MARKET. The caller has already checked the
-/// mark is finite and > 0. Index marks reach this path only in dry run, so
-/// no tick rounding is needed.
+/// Cluster H2 (2026-11-28, self-trader rule fit): a LIMIT order, never MARKET.
+/// Cluster H3: priced up to 10% above the mark that picked the sid
+/// ([`self_test_limit_price`]), the same marketable band as the close. The
+/// entry fills on the mark that placed it (process_mark fills pending orders
+/// with that same mark, and the price is at or above it), so the band only
+/// keeps the two legs priced by one rule; the close is the leg it protects. The caller has
+/// already checked the mark is finite and > 0; a mark the price builder
+/// refuses places nothing (the 180 s timeout then skips the day).
 async fn start_self_test_entry(
     oms: &mut OrderManagementSystem,
     self_test: &mut SelfTestState,
@@ -2205,6 +2270,13 @@ async fn start_self_test_entry(
     _segment_code: u8,
     mark_price: f64,
 ) {
+    let Some(entry_price) = self_test_limit_price(Side::Buy, mark_price) else {
+        warn!(
+            security_id = sid,
+            mark_price, "paper self-test entry not placed: no LIMIT price for this mark"
+        );
+        return;
+    };
     let request = PlaceOrderRequest {
         security_id: sid,
         exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
@@ -2213,7 +2285,7 @@ async fn start_self_test_entry(
         product_type: ProductType::Intraday,
         validity: OrderValidity::Day,
         quantity: 1,
-        price: mark_price,
+        price: entry_price,
         trigger_price: 0.0,
         lot_size: 1,
         expiry_date: None,
@@ -2237,12 +2309,17 @@ async fn start_self_test_entry(
     }
 }
 
-/// The self-test close leg's LIMIT price: the entry order's average fill
-/// price, kept only when finite and > 0 (Cluster H2). `None` means no order
-/// may be sent.
+/// The self-test close leg's LIMIT price: built from the entry order's
+/// average fill price (Cluster H2), down to 10% below it (Cluster H3,
+/// [`self_test_limit_price`]) so the SELL still fills if the index falls
+/// before the next mark. `None` (unknown entry, a fill price not finite and
+/// > 0, or no price on the grid) means no order may be sent.
 fn self_test_close_price(oms: &OrderManagementSystem, entry_order_id: &str) -> Option<f64> {
-    let price = oms.order(entry_order_id)?.avg_traded_price;
-    (price.is_finite() && price > 0.0).then_some(price)
+    let fill = oms.order(entry_order_id)?.avg_traded_price;
+    if !(fill.is_finite() && fill > 0.0) {
+        return None;
+    }
+    self_test_limit_price(Side::Sell, fill)
 }
 
 /// Fill-path half: advance the state machine when one of OUR self-test
@@ -2722,7 +2799,7 @@ mod tests {
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 100.0,
+                price: 500.0, // marketable at the 500 mark (Cluster H3: a LIMIT fills only at its price)
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,
@@ -3309,8 +3386,9 @@ mod tests {
         );
     }
 
-    /// Cluster H2: the self-test sends LIMIT orders only — the entry at the
-    /// mark that picked the sid, the close at the entry's fill price.
+    /// Cluster H2/H3: the self-test sends LIMIT orders only — the entry up to
+    /// 10% above the mark that picked the sid, the close down to 10% below the
+    /// entry's fill price (marketable band, 0.05 grid).
     #[tokio::test]
     async fn test_selftest_entry_and_close_are_limit_orders() {
         let ctx = make_ctx();
@@ -3344,9 +3422,16 @@ mod tests {
         assert_eq!(orders.len(), 2, "entry + close");
         for order in orders.values() {
             assert_eq!(order.order_type, OrderType::Limit, "no MARKET order");
+            // Cluster H3: 10% band on the 0.05 grid — BUY 23146.45 × 1.1 =
+            // 25461.095 rounded down, SELL × 0.9 = 20831.805 rounded up.
+            let expected = match order.transaction_type {
+                TransactionType::Buy => 25461.05,
+                TransactionType::Sell => 20831.85,
+            };
             assert!(
-                (order.price - 23146.45).abs() < f64::EPSILON,
-                "LIMIT at the mark / entry fill price, got {}",
+                (order.price - expected).abs() < 1e-9,
+                "{:?} LIMIT expected {expected}, got {}",
+                order.transaction_type,
                 order.price
             );
         }
@@ -3354,8 +3439,160 @@ mod tests {
         assert!(sides.contains(&TransactionType::Buy) && sides.contains(&TransactionType::Sell));
     }
 
-    /// Cluster H2: the close price is the entry's fill price only when it is
-    /// finite and > 0; an unknown or unfilled entry gives `None` (no close).
+    /// Cluster H3: a paper LIMIT fills only once the mark reaches its price —
+    /// a BUY at or below, a SELL at or above; other types fill at any mark.
+    #[test]
+    fn test_paper_limit_reached_buy_and_sell() {
+        let mut buy = make_paper_order("PAPER-1", TransactionType::Buy);
+        buy.order_type = OrderType::Limit;
+        buy.price = 100.0;
+        assert!(paper_limit_reached(&buy, 100.0), "at the limit");
+        assert!(paper_limit_reached(&buy, 99.95), "below the limit");
+        assert!(
+            !paper_limit_reached(&buy, 100.05),
+            "above a BUY limit rests"
+        );
+        let mut sell = make_paper_order("PAPER-2", TransactionType::Sell);
+        sell.order_type = OrderType::Limit;
+        sell.price = 100.0;
+        assert!(paper_limit_reached(&sell, 100.0));
+        assert!(paper_limit_reached(&sell, 100.05));
+        assert!(
+            !paper_limit_reached(&sell, 99.95),
+            "below a SELL limit rests"
+        );
+        let mut stop = make_paper_order("PAPER-3", TransactionType::Buy);
+        stop.order_type = OrderType::StopLoss;
+        stop.price = 100.0;
+        assert!(
+            paper_limit_reached(&stop, 150.0),
+            "non-LIMIT types keep the old rule"
+        );
+    }
+
+    #[test]
+    fn test_self_test_limit_price_band_on_the_grid() {
+        assert_eq!(self_test_limit_price(Side::Buy, 100.0), Some(110.0));
+        assert_eq!(self_test_limit_price(Side::Sell, 100.0), Some(90.0));
+        for reference in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                self_test_limit_price(Side::Buy, reference),
+                None,
+                "{reference}"
+            );
+            assert_eq!(
+                self_test_limit_price(Side::Sell, reference),
+                None,
+                "{reference}"
+            );
+        }
+    }
+
+    /// Cluster H3: a paper BUY LIMIT rests while the mark is above its price
+    /// and fills (at the mark) once the mark comes down to it.
+    #[tokio::test]
+    async fn test_paper_limit_buy_rests_until_the_mark_reaches_it() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        let order_id = place_paper(&mut oms, 13, TransactionType::Buy).await; // LIMIT at 100
+        book.rebuild_pending_paper(&oms);
+        let mark = |price| MarkUpdate {
+            security_id: 13,
+            segment_code: 0,
+            price,
+        };
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(101.0),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            oms.order(&order_id).map(|o| o.traded_qty),
+            Some(0),
+            "rests above its limit"
+        );
+        assert!(
+            book.has_pending_paper(13, ExchangeSegment::IdxI),
+            "still pending"
+        );
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(99.5),
+            true,
+            None,
+        )
+        .await;
+        let order = oms.order(&order_id).expect("order");
+        assert_eq!(order.traded_qty, 1, "fills once the mark reaches the limit");
+        assert!((order.avg_traded_price - 99.5).abs() < 1e-9, "at the mark");
+    }
+
+    /// Cluster H3: the self-test still passes when the index falls between
+    /// the entry fill and the close (the close SELL is priced 10% below).
+    #[tokio::test]
+    async fn test_selftest_passes_when_the_index_falls_before_the_close() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        let mark = |price| MarkUpdate {
+            security_id: 13,
+            segment_code: 0,
+            price,
+        };
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(100.0),
+            true,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            self_test.phase,
+            SelfTestPhase::AwaitingCloseFill { .. }
+        ));
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            mark(95.0),
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            self_test.phase,
+            SelfTestPhase::Idle,
+            "the close filled on a 5% fall"
+        );
+        assert_eq!(risk.net_lots_for(13), 0, "flat");
+    }
+
+    /// Cluster H2/H3: the close price is built from the entry's fill price
+    /// (down to 10% below it) only when that fill price is finite and > 0; an
+    /// unknown or unfilled entry gives `None` (no close).
     #[tokio::test]
     async fn test_self_test_close_price_needs_a_usable_fill_price() {
         let mut oms = make_oms();
@@ -3370,6 +3607,11 @@ mod tests {
             None,
             "an unfilled order has no fill price"
         );
+        // Filled at 100: the close is the SELL band, 10% below, on the grid.
+        let order = oms.order(&unfilled).cloned().expect("order");
+        let fill = synthesize_paper_fill(&order, 100.0, 0).expect("fill");
+        oms.handle_order_update(&fill).expect("paper fill applies");
+        assert_eq!(self_test_close_price(&oms, &unfilled), Some(90.0));
     }
 
     #[test]
@@ -3761,7 +4003,7 @@ mod tests {
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 75,
-                price: 100.0,
+                price: 400.0, // marketable at the 400 mark (Cluster H3)
                 trigger_price: 0.0,
                 lot_size: 75,
                 expiry_date: None,
