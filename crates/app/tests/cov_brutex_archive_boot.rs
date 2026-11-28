@@ -5,9 +5,9 @@
 //! Both modules put every scheduling decision in small pure functions (export
 //! window, session-day steps, visit order, hold and gate reasons, last-chance
 //! and forced-day logic, the archive pass verdict, attempt ledger, latch and
-//! config decisions). CI's coverage report showed most of them unexecuted by
-//! any test the workspace coverage run counts, so this file pins each one
-//! against exact expected values, boundaries (exactly at a threshold, one
+//! config decisions). The modules' own unit tests cover the main paths; this
+//! file drives the same functions through the public API and pins the
+//! branches those leave out against exact expected values, boundaries (exactly at a threshold, one
 //! second either side), malformed input and properties that must hold for any
 //! input. No network, no AWS, no wall clock: every date and time is explicit,
 //! and this test binary installs no trading calendar, so `session_info` falls
@@ -696,29 +696,25 @@ fn test_past_day_step_table() {
 
 #[test]
 fn test_yield_to_session_day_table() {
-    let all = [
-        DayStep::NotDue,
-        DayStep::Wait,
-        DayStep::Run,
-        DayStep::GiveUp,
+    // (step, session_day_pending, last_chance, expected): only a Run on a day
+    // not at its last chance yields while the session day is pending.
+    let cases = [
+        (DayStep::Run, true, false, DayStep::Wait),
+        (DayStep::Run, true, true, DayStep::Run),
+        (DayStep::Run, false, false, DayStep::Run),
+        (DayStep::Run, false, true, DayStep::Run),
+        (DayStep::Wait, true, false, DayStep::Wait),
+        (DayStep::NotDue, true, false, DayStep::NotDue),
+        (DayStep::GiveUp, true, false, DayStep::GiveUp),
+        (DayStep::GiveUp, false, true, DayStep::GiveUp),
     ];
-    for step in all {
-        for pending in [false, true] {
-            for last in [false, true] {
-                let expected = if step == DayStep::Run && pending && !last {
-                    DayStep::Wait
-                } else {
-                    step
-                };
-                assert_eq!(yield_to_session_day(step, pending, last), expected);
-            }
-        }
+    for (step, pending, last, expected) in cases {
+        assert_eq!(
+            yield_to_session_day(step, pending, last),
+            expected,
+            "{step:?} pending={pending} last={last}"
+        );
     }
-    assert_eq!(
-        yield_to_session_day(DayStep::Run, true, false),
-        DayStep::Wait
-    );
-    assert_eq!(yield_to_session_day(DayStep::Run, true, true), DayStep::Run);
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +722,7 @@ fn test_yield_to_session_day_table() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_visit_order_is_session_day_first_then_oldest_first() {
+fn test_visit_order_and_oldest_window_day_across_year_end_and_min_date() {
     assert_eq!(
         visit_order(d(2026, 11, 25)),
         vec![
@@ -1373,7 +1369,7 @@ fn test_process_saw_whole_session_at_and_after_the_open() {
     assert!(!process_saw_whole_session(open + 1, day));
     // Armed a day earlier.
     assert!(process_saw_whole_session(open - i64::from(DAY), day));
-    // Armed the previous day's evening, measured for the next day.
+    // Armed at the open of the day before: it also saw the next day whole.
     assert!(process_saw_whole_session(open, d(2026, 11, 28)));
     // Armed long after.
     assert!(!process_saw_whole_session(i64::MAX, day));

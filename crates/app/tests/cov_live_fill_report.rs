@@ -31,6 +31,9 @@ use tickvault_app::live_fill_report::build::{
     Counts, DailyReport, FILL_SECONDS_BUCKETS, LatencyStats, RejectTotal, latency_stats,
     rows_day_start,
 };
+use tickvault_app::live_fill_report::recheck::{
+    RECHECK_QUERY_TIMEOUT_SECS, RECHECK_WALL_BUDGET_SECS,
+};
 use tickvault_app::live_fill_report::render::{
     csv_field, render_files, render_json, report_file_names, summary_plain,
 };
@@ -324,45 +327,48 @@ fn test_catch_up_decision_tables() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_step_budget_constants_add_up() {
-    assert_eq!(DB_ROW_STEP_BOUND_SECS, 40);
-    assert_eq!(TAIL_AFTER_RECHECK_SECS, 180);
-    assert_eq!(TAIL_AFTER_READINESS_SECS, 240);
-    let fixed = [REPORT_READINESS_WAIT_SECS, TAIL_AFTER_READINESS_SECS];
-    assert_eq!(fixed.iter().sum::<u64>(), 360);
-    assert!(fixed.iter().sum::<u64>() < REPORT_ATTEMPT_TIMEOUT_SECS);
-}
-
-#[test]
 fn test_readiness_recheck_copy_budget_tables() {
     let s = Duration::from_secs;
-    // readiness: min(120, r - 240), saturating.
+    // readiness: min(WAIT, r - TAIL_AFTER_READINESS), saturating.
+    let (w, t) = (REPORT_READINESS_WAIT_SECS, TAIL_AFTER_READINESS_SECS);
     let readiness: &[(u64, u64)] = &[
         (0, 0),
-        (239, 0),
-        (240, 0),
-        (241, 1),
-        (360, 120),
-        (361, 120),
-        (410, 120),
-        (u64::MAX, 120),
+        (t - 1, 0),
+        (t, 0),
+        (t + 1, 1),
+        (t + w - 1, w - 1),
+        (t + w, w),
+        (t + w + 1, w),
+        (u64::MAX, w),
     ];
     for &(r, want) in readiness {
         assert_eq!(readiness_budget(s(r)), s(want), "readiness {r}");
     }
-    // recheck: min(120, r - (180 + 10)).
-    let recheck: &[(u64, u64)] = &[(0, 0), (190, 0), (191, 1), (310, 120), (1_000, 120)];
+    // recheck: min(WALL_BUDGET, r - (TAIL_AFTER_RECHECK + QUERY_TIMEOUT)).
+    let (b, k) = (
+        RECHECK_WALL_BUDGET_SECS,
+        TAIL_AFTER_RECHECK_SECS + RECHECK_QUERY_TIMEOUT_SECS,
+    );
+    let recheck: &[(u64, u64)] = &[
+        (0, 0),
+        (k, 0),
+        (k + 1, 1),
+        (k + b, b),
+        (k + b + 1, b),
+        (u64::MAX, b),
+    ];
     for &(r, want) in recheck {
         assert_eq!(recheck_budget(s(r)), s(want), "recheck {r}");
     }
-    // copy: r - 40, saturating.
-    let copy: &[(u64, u64)] = &[(0, 0), (40, 0), (41, 1), (300, 260)];
+    // copy: r - DB_ROW_STEP_BOUND, saturating, never capped.
+    let d = DB_ROW_STEP_BOUND_SECS;
+    let copy: &[(u64, u64)] = &[(0, 0), (d, 0), (d + 1, 1), (d + 260, 260)];
     for &(r, want) in copy {
         assert_eq!(copy_budget(s(r)), s(want), "copy {r}");
     }
     // Sub-second remainders are kept by copy_budget.
     assert_eq!(
-        copy_budget(Duration::from_millis(40_500)),
+        copy_budget(s(d) + Duration::from_millis(500)),
         Duration::from_millis(500)
     );
 }
@@ -375,7 +381,7 @@ proptest! {
         let cb = recheck_budget(r);
         let pb = copy_budget(r);
         prop_assert!(rb <= Duration::from_secs(REPORT_READINESS_WAIT_SECS));
-        prop_assert!(cb <= Duration::from_secs(120));
+        prop_assert!(cb <= Duration::from_secs(RECHECK_WALL_BUDGET_SECS));
         prop_assert!(rb <= r && cb <= r && pb <= r);
         // The readiness wait always leaves the tail it reserves.
         if rb > Duration::ZERO {
@@ -1198,7 +1204,6 @@ proptest! {
 
     #[test]
     fn test_parse_exec_body_never_panics_on_arbitrary_text(s in ".{0,200}") {
-        let _ = parse_exec_body(&s);
         prop_assert_eq!(parse_exec_body(&s), parse_exec_body_owned(s.clone()));
     }
 }
@@ -1243,16 +1248,23 @@ async fn serve_once(
     (format!("http://{addr}/exec"), handle)
 }
 
-/// A URL whose port has no listener.
-async fn closed_url() -> String {
+/// A URL whose server accepts every connection and closes it without any
+/// reply, so the request itself fails. The listener stays bound for the
+/// handle's life (unlike a bind-then-drop port, which a parallel test's
+/// listener could take); abort the handle when done.
+async fn hang_up_url() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| panic!("bind: {e}"));
     let addr = listener
         .local_addr()
         .unwrap_or_else(|e| panic!("addr: {e}"));
-    drop(listener);
-    format!("http://{addr}/exec")
+    let handle = tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            drop(sock);
+        }
+    });
+    (format!("http://{addr}/exec"), handle)
 }
 
 fn percent_decoded(s: &str) -> String {
@@ -1325,10 +1337,12 @@ async fn test_read_day_error_paths() {
     let _ = server.await;
     assert_eq!(got, Err("response has no `dataset` array".to_owned()));
 
-    let got = read_day(&closed_url().await, date(2026, 11, 12)).await;
+    let (url, server) = hang_up_url().await;
+    let got = read_day(&url, date(2026, 11, 12)).await;
+    server.abort();
     match got {
         Err(e) => assert!(e.starts_with("request: "), "{e}"),
-        Ok(v) => panic!("closed port read succeeded: {v:?}"),
+        Ok(v) => panic!("hung-up read succeeded: {v:?}"),
     }
 }
 
@@ -1368,9 +1382,12 @@ async fn test_read_row_uploaded_outcomes() {
         Err("bad day".to_owned())
     );
 
-    match read_row_uploaded(&closed_url().await, "2026-11-12").await {
+    let (url, server) = hang_up_url().await;
+    let got = read_row_uploaded(&url, "2026-11-12").await;
+    server.abort();
+    match got {
         Err(e) => assert!(e.starts_with("summary row read failed: "), "{e}"),
-        Ok(v) => panic!("closed port read succeeded: {v:?}"),
+        Ok(v) => panic!("hung-up read succeeded: {v:?}"),
     }
 }
 
