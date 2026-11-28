@@ -1,14 +1,32 @@
-//! SEBI-mandated order rate limiter using the governor crate (GCRA algorithm).
+//! SEBI-mandated order rate limiter: a strict sliding 1-second window beside a
+//! GCRA (governor crate).
 //!
 //! Enforces the maximum orders-per-second limit mandated by SEBI regulation.
-//! Uses Generic Cell Rate Algorithm for smooth rate limiting.
 //!
 //! # SEBI Rule
 //! Maximum 10 orders per second. Violation = regulatory risk.
 //! If rate limit hit: reject immediately, do NOT retry.
+//!
+//! # Why a window AND a GCRA (2026-11-28, plan Cluster H1)
+//!
+//! `Quota::per_second(n)` is a GCRA with burst `n` that refills one cell every
+//! `1/n` s. After an idle second it admits `n` at once and then one more every
+//! `1/n` s, so up to `2n − 1` orders can fall inside one second (19 for 10).
+//! The self-trader rule is "at most 10 orders per second", and how NSE counts a
+//! second (rolling or calendar) is not documented, so a [`SlidingWindow`] of the
+//! last `n` admission instants now refuses an order when all `n` fall within the
+//! last second (closed window). No 1-second window, rolling or calendar, can
+//! then admit more than `n`. The GCRA stays as the smoother behind it.
+//!
+//! The window is checked first and recorded only after the GCRA also admits, so
+//! a refusal by either spends nothing in the other. O(1) time and space: a fixed
+//! array of [`WINDOW_SLOTS`] instants, no allocation. Above `WINDOW_SLOTS`
+//! (tests and benches only; config validation caps production at 10) the window
+//! is off and the GCRA alone applies.
 
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::InMemoryState, state::NotKeyed};
 use tickvault_common::error_code::ErrorCode;
@@ -17,21 +35,105 @@ use tracing::warn;
 use super::types::OmsError;
 
 // ---------------------------------------------------------------------------
+// SlidingWindow — at most N admissions in any closed 1-second window
+// ---------------------------------------------------------------------------
+
+/// Largest per-second limit the strict window tracks. Production is capped at
+/// `SEBI_MAX_ORDERS_PER_SECOND` (10) by config validation; tests and benches
+/// pass larger values (up to `u32::MAX`) to mean "never refuse", and for those
+/// the window is off.
+pub const WINDOW_SLOTS: usize = 64;
+
+/// Length of the strict window, in seconds: the "per second" of SEBI's
+/// orders-per-second limit.
+const ORDER_RATE_WINDOW_SECS: u64 = 1;
+
+/// Length of the strict window.
+const WINDOW: Duration = Duration::from_secs(ORDER_RATE_WINDOW_SECS);
+
+/// The last `limit` admission instants, in a fixed ring. O(1) per check, no
+/// allocation, `WINDOW_SLOTS` instants of space whatever the order count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlidingWindow {
+    /// Admission instants as nanoseconds since `anchor`; only the first
+    /// `limit` slots are used.
+    slots: [u64; WINDOW_SLOTS],
+    /// How many slots hold an admission (saturates at `limit`).
+    filled: usize,
+    /// Index of the oldest admission once the ring is full; the next write.
+    next: usize,
+    /// Per-second limit, `1..=WINDOW_SLOTS`.
+    limit: usize,
+}
+
+impl SlidingWindow {
+    const fn new(limit: usize) -> Self {
+        Self {
+            slots: [0; WINDOW_SLOTS],
+            filled: 0,
+            next: 0,
+            limit,
+        }
+    }
+
+    /// Whether one more admission at `now_nanos` keeps every closed 1-second
+    /// window at or under `limit`. Refuses when the ring is full and the
+    /// oldest of the last `limit` admissions is at most 1 s before `now`
+    /// (an equal or earlier `now` counts as inside the window: errs toward
+    /// refusal).
+    fn would_admit(&self, now_nanos: u64) -> bool {
+        if self.filled < self.limit {
+            return true;
+        }
+        let oldest = self.slots[self.next];
+        // u128 so a WINDOW of any size cannot overflow the comparison.
+        let window_nanos = WINDOW.as_nanos();
+        u128::from(now_nanos.saturating_sub(oldest)) > window_nanos
+    }
+
+    /// Records an admission at `now_nanos`, overwriting the oldest once full.
+    fn record(&mut self, now_nanos: u64) {
+        self.slots[self.next] = now_nanos;
+        // A compare instead of `% limit`: no division per admission.
+        self.next += 1;
+        if self.next == self.limit {
+            self.next = 0;
+        }
+        if self.filled < self.limit {
+            self.filled += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OrderRateLimiter
 // ---------------------------------------------------------------------------
 
-/// GCRA-based rate limiter for order submission.
+/// Order-submission rate limiter: a strict sliding 1-second window (when the
+/// limit is at most [`WINDOW_SLOTS`]) checked before a GCRA.
 ///
-/// Wraps `governor::RateLimiter` with SEBI-compliant configuration.
 /// Cold path — checked before each order submission (~1-100/day).
 pub struct OrderRateLimiter {
     limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
+    /// The strict window, `None` above `WINDOW_SLOTS` (tests and benches).
+    /// A `Mutex` because `check` takes `&self`; uncontended in production
+    /// (the OMS is single-owner), so one lock and unlock per order. The
+    /// poisoned-lock arm in `admit_with` is reachable only in tests: the
+    /// release profile sets `panic = "abort"`.
+    window: Option<Mutex<SlidingWindow>>,
+    /// Monotonic origin for the window's nanosecond instants.
+    anchor: Instant,
     /// `tv_rate_limiter_allowed_total`, resolved once on the first admitted
     /// order instead of a registry lookup per order (about 40 ns each with
     /// the production recorder, measured 2026-10-30). Resolved at first USE,
     /// not at construction, so it binds to the recorder installed at boot
     /// even if this limiter was built before it.
     allowed_total: OnceLock<metrics::Counter>,
+    /// `tv_rate_limiter_denied_total`, cached the same way. Until 2026-11-28
+    /// it was looked up per refusal, which allocated 32 B per refused order
+    /// with the production recorder (found by the DHAT window added with the
+    /// strict 1-second window; no gate exercised the refusal path before).
+    denied_total: OnceLock<metrics::Counter>,
 }
 
 impl OrderRateLimiter {
@@ -49,10 +151,15 @@ impl OrderRateLimiter {
             .expect("max_orders_per_second must be > 0 (validated at config load)");
 
         let quota = Quota::per_second(max_burst);
+        let limit = max_burst.get() as usize;
+        let window = (limit <= WINDOW_SLOTS).then(|| Mutex::new(SlidingWindow::new(limit)));
 
         Self {
             limiter: RateLimiter::direct(quota),
+            window,
+            anchor: Instant::now(),
             allowed_total: OnceLock::new(),
+            denied_total: OnceLock::new(),
         }
     }
 
@@ -65,18 +172,49 @@ impl OrderRateLimiter {
     /// `OmsError::RateLimited` if the SEBI rate limit would be exceeded.
     /// Caller must NOT retry — SEBI violation risk.
     pub fn check(&self) -> Result<(), OmsError> {
-        match self.limiter.check() {
-            Ok(()) => {
-                self.allowed_total
-                    .get_or_init(|| metrics::counter!("tv_rate_limiter_allowed_total"))
-                    .increment(1);
-                Ok(())
-            }
-            Err(_) => {
-                metrics::counter!("tv_rate_limiter_denied_total").increment(1);
-                warn!("order rate limit hit — SEBI max orders/sec exceeded, rejecting");
-                Err(OmsError::RateLimited)
-            }
+        let admitted = match &self.window {
+            None => self.limiter.check().is_ok(),
+            // u64 nanoseconds since construction: about 584 years.
+            Some(window) => self.admit_with(window, || {
+                u64::try_from(self.anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            }),
+        };
+        self.report(admitted)
+    }
+
+    /// The window-then-GCRA decision. `now_nanos` is read after the lock is
+    /// taken, so the instants in the ring rise in lock order. The window is
+    /// asked first and written only after the GCRA also admits: a refusal by
+    /// either spends nothing in the other. Tests pass a fixed clock.
+    fn admit_with(&self, window: &Mutex<SlidingWindow>, now_nanos: impl FnOnce() -> u64) -> bool {
+        // A poisoned lock means a panic while holding it; the ring is plain
+        // data, so keep using it rather than panic here.
+        let mut ring = match window.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = now_nanos();
+        if ring.would_admit(now) && self.limiter.check().is_ok() {
+            ring.record(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Counts and returns the decision.
+    fn report(&self, admitted: bool) -> Result<(), OmsError> {
+        if admitted {
+            self.allowed_total
+                .get_or_init(|| metrics::counter!("tv_rate_limiter_allowed_total"))
+                .increment(1);
+            Ok(())
+        } else {
+            self.denied_total
+                .get_or_init(|| metrics::counter!("tv_rate_limiter_denied_total"))
+                .increment(1);
+            warn!("order rate limit hit — SEBI max orders/sec exceeded, rejecting");
+            Err(OmsError::RateLimited)
         }
     }
 }
@@ -629,5 +767,255 @@ mod tests {
             from_new.try_consume(0).is_err(),
             "and `new()` must bind at exactly the same place"
         );
+    }
+
+    // -- 2026-11-28 (Cluster H1): the strict sliding 1-second window ---------
+
+    const MS: u64 = 1_000_000;
+    const SEC: u64 = 1_000 * MS;
+
+    /// Runs `attempts` (nanosecond instants, in call order) through a window
+    /// of `limit` and returns the admitted instants.
+    fn admitted_by_window(limit: usize, attempts: &[u64]) -> Vec<u64> {
+        let mut window = SlidingWindow::new(limit);
+        let mut admitted = Vec::new();
+        for &now in attempts {
+            if window.would_admit(now) {
+                window.record(now);
+                admitted.push(now);
+            }
+        }
+        admitted
+    }
+
+    /// Largest number of `times` inside any closed window `[t, t + 1 s]`.
+    fn max_in_any_closed_second(times: &[u64]) -> usize {
+        let mut sorted = times.to_vec();
+        sorted.sort_unstable();
+        let mut best = 0;
+        for (i, &start) in sorted.iter().enumerate() {
+            let end = start.saturating_add(SEC);
+            let count = sorted[i..].iter().take_while(|&&t| t <= end).count();
+            best = best.max(count);
+        }
+        best
+    }
+
+    #[test]
+    fn test_window_never_admits_more_than_n_in_any_closed_second() {
+        // The shape the GCRA let through: a full burst after an idle second,
+        // then steady attempts. One attempt every 50 ms for 1.5 s.
+        let attempts: Vec<u64> = (0..=30).map(|i| i * 50 * MS).collect();
+        let admitted = admitted_by_window(10, &attempts);
+        // 0..450 ms admitted (10), then nothing until more than 1 s after
+        // 0 ms: 1,050 ms is the next, then 1,100 .. 1,500 as each old one ages out.
+        let expected: Vec<u64> = (0..10)
+            .map(|i| i * 50 * MS)
+            .chain((21..=30).map(|i| i * 50 * MS))
+            .collect();
+        assert_eq!(admitted, expected);
+        assert_eq!(max_in_any_closed_second(&admitted), 10);
+    }
+
+    #[test]
+    fn test_window_exact_one_second_boundary_is_refused_one_nano_later_admitted() {
+        let mut window = SlidingWindow::new(2);
+        for now in [0, 10 * MS] {
+            assert!(window.would_admit(now));
+            window.record(now);
+        }
+        // Exactly 1 s after the oldest: the closed window [0, 1 s] would hold 3.
+        assert!(!window.would_admit(SEC));
+        assert!(window.would_admit(SEC + 1));
+    }
+
+    #[test]
+    fn test_window_backward_or_equal_instant_is_conservative() {
+        let mut window = SlidingWindow::new(3);
+        for now in [5 * SEC, 5 * SEC + MS, 5 * SEC + 2 * MS] {
+            window.record(now);
+        }
+        assert!(
+            !window.would_admit(5 * SEC),
+            "an equal instant stays inside the window"
+        );
+        assert!(
+            !window.would_admit(SEC),
+            "an earlier instant stays inside the window"
+        );
+        assert!(!window.would_admit(0), "and so does zero");
+    }
+
+    #[test]
+    fn test_window_limit_one_admits_one_per_closed_second() {
+        let attempts: Vec<u64> = (0..=40).map(|i| i * 100 * MS).collect();
+        let admitted = admitted_by_window(1, &attempts);
+        assert_eq!(admitted, vec![0, 1_100 * MS, 2_200 * MS, 3_300 * MS]);
+    }
+
+    #[test]
+    fn test_window_off_above_slot_cap() {
+        assert!(OrderRateLimiter::new(1).window.is_some());
+        assert!(OrderRateLimiter::new(10).window.is_some());
+        let at_cap = u32::try_from(WINDOW_SLOTS).unwrap_or(u32::MAX);
+        assert!(OrderRateLimiter::new(at_cap).window.is_some());
+        assert!(OrderRateLimiter::new(at_cap + 1).window.is_none());
+        let unlimited = OrderRateLimiter::new(u32::MAX);
+        assert!(unlimited.window.is_none());
+        for _ in 0..1_000 {
+            assert!(unlimited.check().is_ok(), "u32::MAX means never refuse");
+        }
+    }
+
+    #[test]
+    fn test_production_limit_has_the_window() {
+        let limit = tickvault_common::constants::SEBI_MAX_ORDERS_PER_SECOND;
+        assert!(
+            usize::try_from(limit).unwrap_or(usize::MAX) <= WINDOW_SLOTS,
+            "the SEBI cap must sit inside the strict window"
+        );
+        assert!(OrderRateLimiter::new(limit).window.is_some());
+    }
+
+    #[test]
+    fn test_check_refuses_the_eleventh_within_one_second_and_counts_it() {
+        let limiter = OrderRateLimiter::new(10);
+        for _ in 0..10 {
+            assert!(limiter.check().is_ok());
+        }
+        assert!(matches!(limiter.check(), Err(OmsError::RateLimited)));
+    }
+
+    /// A copy of the ring, to prove a refusal left it untouched.
+    fn ring_of(limiter: &OrderRateLimiter) -> SlidingWindow {
+        match limiter.window.as_ref() {
+            Some(window) => match window.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            },
+            None => SlidingWindow::new(1),
+        }
+    }
+
+    /// Runs one decision at a fixed window instant, with the real GCRA.
+    fn admit_at(limiter: &OrderRateLimiter, now: u64) -> bool {
+        match limiter.window.as_ref() {
+            Some(window) => limiter.admit_with(window, || now),
+            None => false,
+        }
+    }
+
+    #[test]
+    fn test_window_refusal_spends_no_gcra_cell() {
+        // Limit 2: GCRA burst 2, refilling one cell every 500 ms of REAL time.
+        let limiter = OrderRateLimiter::new(2);
+        assert!(admit_at(&limiter, 0));
+        assert!(admit_at(&limiter, MS));
+        // Let the real-time GCRA refill both cells.
+        std::thread::sleep(Duration::from_millis(1_100));
+        // The window (fixed clock, still inside the second) refuses ...
+        let before = ring_of(&limiter);
+        assert!(!admit_at(&limiter, 2 * MS));
+        assert_eq!(
+            ring_of(&limiter),
+            before,
+            "a refusal must not touch the ring"
+        );
+        // ... and the GCRA still holds both cells: two admissions in a row
+        // once the window has room. Had the refusal asked the GCRA first, one
+        // cell would be gone and the second admission below would fail.
+        assert!(admit_at(&limiter, 2 * SEC));
+        assert!(admit_at(&limiter, 2 * SEC + MS));
+    }
+
+    #[test]
+    fn test_gcra_refusal_records_nothing_in_the_window() {
+        // Window instants 2 s apart, so the window always has room; the GCRA
+        // (burst 3, real time) is what refuses the fourth.
+        let limiter = OrderRateLimiter::new(3);
+        for i in 0..3 {
+            assert!(admit_at(&limiter, i * 2 * SEC));
+        }
+        let before = ring_of(&limiter);
+        assert!(
+            !admit_at(&limiter, 6 * SEC),
+            "the GCRA refuses inside its burst"
+        );
+        assert_eq!(
+            ring_of(&limiter),
+            before,
+            "a GCRA refusal must not be recorded"
+        );
+    }
+
+    #[test]
+    fn test_window_survives_a_poisoned_lock() {
+        let limiter = std::sync::Arc::new(OrderRateLimiter::new(2));
+        let clone = std::sync::Arc::clone(&limiter);
+        let joined = std::thread::spawn(move || {
+            if let Some(window) = clone.window.as_ref() {
+                let _guard = window.lock();
+                panic!("poison the window lock");
+            }
+        })
+        .join();
+        assert!(joined.is_err(), "the helper thread panicked as intended");
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_ok());
+        assert!(limiter.check().is_err());
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Whatever the timing (bursts, gaps, repeated and backward instants),
+        /// no closed 1-second window ever holds more than `limit` admissions.
+        #[test]
+        fn proptest_window_never_exceeds_n_in_any_closed_second(
+            limit in 1usize..=WINDOW_SLOTS,
+            // Mostly bursts (gaps under 5 ms) so even a 64-order limit fills
+            // its ring inside one second, mixed with long gaps.
+            steps in proptest::collection::vec(
+                (
+                    proptest::prop_oneof![3 => 0u64..5 * MS, 1 => 0u64..400 * MS],
+                    proptest::bool::weighted(0.05),
+                ),
+                1..400,
+            ),
+        ) {
+            let mut now: u64 = 10 * SEC;
+            let mut attempts = Vec::with_capacity(steps.len());
+            for (gap, step_back) in steps {
+                now = if step_back { now.saturating_sub(gap) } else { now.saturating_add(gap) };
+                attempts.push(now);
+            }
+            let admitted = admitted_by_window(limit, &attempts);
+            proptest::prop_assert!(max_in_any_closed_second(&admitted) <= limit);
+        }
+
+        /// The window never refuses while fewer than `limit` admissions sit
+        /// inside the last second: it is strict, not starved.
+        #[test]
+        fn proptest_window_admits_whenever_room_remains(
+            limit in 1usize..=16,
+            gaps in proptest::collection::vec(
+                proptest::prop_oneof![3 => 0u64..5 * MS, 1 => 0u64..300 * MS],
+                1..200,
+            ),
+        ) {
+            let mut window = SlidingWindow::new(limit);
+            let mut admitted: Vec<u64> = Vec::new();
+            let mut now: u64 = 0;
+            for gap in gaps {
+                now += gap;
+                let inside = admitted.iter().filter(|&&t| now - t <= SEC).count();
+                let would = window.would_admit(now);
+                proptest::prop_assert_eq!(would, inside < limit);
+                if would {
+                    window.record(now);
+                    admitted.push(now);
+                }
+            }
+        }
     }
 }

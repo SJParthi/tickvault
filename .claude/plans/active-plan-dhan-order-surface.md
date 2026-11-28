@@ -549,3 +549,26 @@ are in the book and the audit).
 Failure modes: none new; a refused order is refused exactly as before.
 Rollback: revert the PR; no data or config change.
 Observability: unchanged series (pinned by the parity test).
+
+## Cluster H — self-trader rule fit: strict 10/sec cap, no MARKET/IOC (branch claude/brave-noether-tr1cog, 2026-11-28)
+
+Owner (Parthiban), Sat 28 Nov 2026, after the read-only self-trader rules audit
+(SEBI retail algo framework 4 Feb 2025, NSE/INVG/69255, NSE notice 20 Nov 2026):
+"go ahead with 1 and 2 dude" — item 1 the strict per-second cap, item 2 refuse
+MARKET and IOC orders. Two serial PRs (H1 first). `dry_run`, the exit-order
+lockout, the indicator and strategy trees are untouched. Matrices: by
+cross-reference, as for the clusters above.
+
+- [x] H1 — strict sliding 1-second window beside the GCRA in `OrderRateLimiter`: refuse when the last N admissions all fall within 1 s (closed window), so no 1-second window ever admits more than N (was up to 2N−1 with burst N + refill). Window checked before the GCRA, recorded only after both admit (a refusal spends nothing). Fixed array of `WINDOW_SLOTS` (64), O(1) time and space, no allocation; above 64 (tests and benches only, config caps production at 10) the window is off and the GCRA alone applies.
+  - Files: crates/trading/src/oms/rate_limiter.rs, crates/app/src/order_runtime_live_fill.rs (burst test now asserts the 10-per-second contract), crates/app/benches/order_path.rs (windowed admit bench), crates/app/tests/dhat_order_path_recorder.rs (windowed allocation window)
+  - Tests: test_window_never_admits_more_than_n_in_any_closed_second, test_window_exact_one_second_boundary_is_refused_one_nano_later_admitted, test_window_backward_or_equal_instant_is_conservative, test_window_limit_one_admits_one_per_closed_second, test_window_off_above_slot_cap, test_production_limit_has_the_window, test_window_refusal_spends_no_gcra_cell, test_gcra_refusal_records_nothing_in_the_window, test_window_survives_a_poisoned_lock, proptest_window_never_exceeds_n_in_any_closed_second, proptest_window_admits_whenever_room_remains, test_regression_exit_burst_makes_one_refused_attempt_per_round, dhat_order_path_with_the_production_recorder
+- [ ] H2 — refuse MARKET, STOP_LOSS_MARKET and IOC in `validate_order_fields` and `validate_modify_fields` (fail-closed `OmsError::RiskRejected`, before the dry-run branch), and switch every production builder that sends them to a LIMIT order (paper self-test from its held mark; dormant exit closes and pipeline entries via the marketable-limit price). Super/forever/conditional validators narrowed to LIMIT + DAY.
+  - Files: crates/trading/src/oms/engine.rs, crates/trading/src/oms/exit_rules.rs, crates/trading/src/oms/conditional.rs, crates/app/src/order_runtime.rs, crates/app/src/exit_execution.rs, crates/app/src/trading_pipeline.rs
+  - Tests: listed in the H2 PR (design follows H1's merge)
+
+Design (H1): the vendor/SEBI figure is "10 orders per second"; how NSE counts a second (rolling or calendar) is Unknown, so the window is closed and rolling, which is at least as strict as either. The GCRA keeps its smoothing.
+Edge cases: equal or backward instants (monotonic clock; `saturating_sub` reads them as inside the window, so it refuses: errs toward refusal); a poisoned lock (recovered with `into_inner`, never panics); N above 64 (window off, documented); exactly 1 s after the oldest admission (refused; 1 s + 1 ns admitted).
+Failure modes: a refused order is refused exactly as before (`OmsError::RateLimited`, same counters); more refusals only for bursts that the old limiter let past 10 in one second.
+Rollback: revert the PR; no data or config change.
+Observability: unchanged series (`tv_rate_limiter_allowed_total`, `tv_rate_limiter_denied_total`). The denied counter is now cached like the allowed one: the refusal path allocated 32 B per refused order with the production recorder (pre-existing, found by the new DHAT window, fixed here).
+Limits (H1, stated, not fixed): the window counts orders when they leave the OMS, not when Dhan receives them, so uneven network delay can still put 11 inside one of Dhan's seconds (a margin, e.g. a cap of 9, is an owner decision); the window is per process and starts empty after a restart; a sliced or super/OCO exit order spends one slot for several exchange orders (exit layer locked off); the order-status probe `verify_order_execution` spends a slot like an order (as it did under the GCRA).
