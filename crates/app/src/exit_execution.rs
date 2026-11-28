@@ -86,34 +86,6 @@ fn sanitize_oms_error(err: &OmsError) -> String {
     capture_rest_error_body(&err.to_string())
 }
 
-/// Cluster H2 (2026-11-28, self-trader rule fit): the close order's LIMIT
-/// price, kept only when finite and > 0. `None` means no close may be sent;
-/// there is no MARKET fallback.
-fn usable_close_price(close_price: Option<f64>) -> Option<f64> {
-    close_price.filter(|price| price.is_finite() && *price > 0.0)
-}
-
-/// Counts a close refused for want of a usable LIMIT price and, when
-/// `log_here`, logs it coded `EXIT-ORDER-01` (log-sink-only: no Telegram, no
-/// alarm; the exit layer is locked off and the trading pipeline has no
-/// production caller). The CloseAll path passes `false`: it returns
-/// `RiskRejected`, which the dispatcher already logs as `EXIT-ORDER-01`, so
-/// one refusal is logged once, not twice.
-fn report_close_refused(security_id: u64, net_lots: i32, path: &'static str, log_here: bool) {
-    metrics::counter!("tv_exit_close_refused_total", "reason" => "no_close_price").increment(1);
-    if !log_here {
-        return;
-    }
-    error!(
-        code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
-        security_id,
-        net_lots,
-        path,
-        "EXIT-ORDER-01: close refused — no usable LIMIT price; the position stays open \
-         (MARKET orders are never sent)"
-    );
-}
-
 /// H1 (2026-07-14 hostile review): the elapsed seconds handed to a verify
 /// probe for `attempt` (1-indexed).
 ///
@@ -187,7 +159,6 @@ pub async fn dispatch_exit_command(
             security_id,
             exchange_segment,
             freeze_limit,
-            close_price,
         } => {
             close_all_for_security(
                 oms,
@@ -195,7 +166,6 @@ pub async fn dispatch_exit_command(
                 security_id,
                 exchange_segment,
                 freeze_limit,
-                close_price,
                 cfg,
             )
             .await
@@ -297,7 +267,6 @@ pub async fn execute_exit_for_security(
     cfg: &ExitOrdersConfig,
     order_side: &OrderSideObserver,
     exchange_segment_code: u8,
-    close_price: Option<f64>,
 ) {
     // I-P1-11 (audit M7, 2026-10-04): the position to close is the composite
     // `(security_id, segment)`. An unknown segment code refuses the exit
@@ -313,7 +282,6 @@ pub async fn execute_exit_for_security(
             security_id,
             exchange_segment,
             freeze_limit: cfg.default_freeze_limit_qty,
-            close_price,
         };
         if let Err(err) = dispatch_exit_command(oms, risk_engine, cmd, cfg).await {
             // Already EXIT-ORDER-01-coded inside the dispatcher; this is
@@ -373,35 +341,21 @@ pub async fn execute_exit_for_security(
             TransactionType::Buy
         };
         let close_qty = i64::from(net_lots.unsigned_abs());
-        // Cluster H2: a LIMIT close at the caller's price, never MARKET.
-        let Some(limit_price) = usable_close_price(close_price) else {
-            report_close_refused(security_id, net_lots, "legacy", true);
-            observe_order_side(
-                order_side,
-                OrderSideMsg::PlaceFailed {
-                    correlation_id: String::new(),
-                    security_id,
-                    detail: "exit close refused: no usable LIMIT price".to_string(),
-                },
-            );
-            return;
-        };
         info!(
             security_id,
             net_lots,
             close_type = ?close_type,
-            limit_price,
-            "EXIT signal → placing LIMIT closing order for open position"
+            "EXIT signal → placing closing order for open position"
         );
         let close_request = PlaceOrderRequest {
             security_id,
             exchange_segment,
             transaction_type: close_type,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: close_qty,
-            price: limit_price,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -423,7 +377,7 @@ pub async fn execute_exit_for_security(
                         exchange_segment: exchange_segment.as_str(),
                         transaction_type: if net_lots > 0 { "SELL" } else { "BUY" },
                         quantity: close_qty,
-                        price: limit_price,
+                        price: 0.0,
                     },
                 );
             }
@@ -463,7 +417,6 @@ async fn close_all_for_security(
     security_id: u64,
     exchange_segment: ExchangeSegment,
     freeze_limit: i64,
-    close_price: Option<f64>,
     cfg: &ExitOrdersConfig,
 ) -> Result<(), OmsError> {
     // Step 1: cancel actives for this security — super-order-aware.
@@ -505,35 +458,22 @@ async fn close_all_for_security(
         TransactionType::Buy
     };
     let close_qty = i64::from(net_lots.unsigned_abs());
-    // Cluster H2: a LIMIT close at the caller's price, never MARKET. No
-    // usable price → no close; the dispatcher logs the returned refusal
-    // (coded EXIT-ORDER-01), so this path only counts it.
-    let Some(limit_price) = usable_close_price(close_price) else {
-        report_close_refused(security_id, net_lots, "close_all", false);
-        return Err(OmsError::RiskRejected {
-            reason: format!(
-                "close refused for security {security_id}: no usable LIMIT price \
-                 (MARKET orders are never sent)"
-            ),
-        });
-    };
     info!(
         security_id,
         net_lots,
         close_type = ?close_type,
         freeze_limit,
-        limit_price,
-        "CloseAll → placing LIMIT closing order(s) for open position"
+        "CloseAll → placing closing order(s) for open position"
     );
     let close_request = PlaceOrderRequest {
         security_id,
         exchange_segment,
         transaction_type: close_type,
-        order_type: OrderType::Limit,
+        order_type: OrderType::Market,
         product_type: ProductType::Intraday,
         validity: OrderValidity::Day,
         quantity: close_qty,
-        price: limit_price,
+        price: 0.0,
         trigger_price: 0.0,
         lot_size: 1,
         expiry_date: None,
@@ -805,7 +745,6 @@ mod tests {
                 security_id: 13,
                 exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: 1800,
-                close_price: Some(100.0),
             },
             ExitCommand::PlaceBracket(bracket_request(49081)),
             ExitCommand::TightenStop {
@@ -850,11 +789,11 @@ mod tests {
             security_id: 13,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -865,7 +804,6 @@ mod tests {
             security_id: 13,
             exchange_segment: ExchangeSegment::NseFno,
             freeze_limit: cfg.default_freeze_limit_qty,
-            close_price: Some(100.0),
         };
         dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg)
             .await
@@ -878,138 +816,6 @@ mod tests {
             !oms.active_orders().iter().any(|o| o.order_id == pending_id),
             "CloseAll must cancel the pre-existing active order"
         );
-    }
-
-    /// Cluster H2: every CloseAll slice is a LIMIT order at the caller's
-    /// price, never MARKET.
-    #[tokio::test]
-    async fn test_close_all_places_limit_slices_at_the_close_price() {
-        let mut oms = make_dry_run_oms();
-        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 5, 100.0, 1);
-        let cfg = enabled_cfg(2);
-        let cmd = ExitCommand::CloseAll {
-            security_id: 13,
-            exchange_segment: ExchangeSegment::NseFno,
-            freeze_limit: cfg.default_freeze_limit_qty,
-            close_price: Some(97.35),
-        };
-        dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg)
-            .await
-            .expect("CloseAll must succeed in dry-run");
-        assert_eq!(oms.total_placed(), 3, "5 lots at freeze 2 = 3 slices");
-        for order in oms.all_orders().values() {
-            assert_eq!(order.order_type, OrderType::Limit, "no MARKET close");
-            assert!((order.price - 97.35).abs() < f64::EPSILON);
-        }
-    }
-
-    /// Cluster H2: with no usable LIMIT price the CloseAll still cancels
-    /// the actives, places NO close (never a MARKET fallback) and returns
-    /// `RiskRejected`.
-    #[tokio::test]
-    async fn test_close_all_without_a_usable_price_places_no_close() {
-        for close_price in [
-            None,
-            Some(0.0),
-            Some(-1.0),
-            Some(f64::NAN),
-            Some(f64::INFINITY),
-        ] {
-            let mut oms = make_dry_run_oms();
-            let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-            risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 5, 100.0, 1);
-            let cfg = enabled_cfg(2);
-            let pending = PlaceOrderRequest {
-                security_id: 13,
-                exchange_segment: ExchangeSegment::NseFno,
-                transaction_type: TransactionType::Buy,
-                order_type: OrderType::Limit,
-                product_type: ProductType::Intraday,
-                validity: OrderValidity::Day,
-                quantity: 1,
-                price: 100.0,
-                trigger_price: 0.0,
-                lot_size: 1,
-                expiry_date: None,
-            };
-            let pending_id = oms.place_order(pending).await.expect("paper place");
-            let cmd = ExitCommand::CloseAll {
-                security_id: 13,
-                exchange_segment: ExchangeSegment::NseFno,
-                freeze_limit: cfg.default_freeze_limit_qty,
-                close_price,
-            };
-            let result = dispatch_exit_command(&mut oms, &mut risk, cmd, &cfg).await;
-            assert!(
-                matches!(result, Err(OmsError::RiskRejected { .. })),
-                "close_price {close_price:?} must refuse the close, got {result:?}"
-            );
-            assert_eq!(
-                oms.total_placed(),
-                1,
-                "only the pre-existing order ({close_price:?})"
-            );
-            assert!(
-                !oms.active_orders().iter().any(|o| o.order_id == pending_id),
-                "actives are still cancelled ({close_price:?})"
-            );
-        }
-    }
-
-    /// Cluster H2: the legacy (disabled-layer) exit with no usable price
-    /// cancels the actives and places no close.
-    #[tokio::test]
-    async fn test_legacy_exit_without_a_usable_price_places_no_close() {
-        for close_price in [None, Some(0.0), Some(f64::NAN)] {
-            let mut oms = make_dry_run_oms();
-            let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-            risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 3, 100.0, 1);
-            execute_exit_for_security(
-                &mut oms,
-                &mut risk,
-                13,
-                &ExitOrdersConfig::default(),
-                &None,
-                ExchangeSegment::NseFno.binary_code(),
-                close_price,
-            )
-            .await;
-            assert_eq!(oms.total_placed(), 0, "no close for {close_price:?}");
-        }
-    }
-
-    /// Cluster H2: the legacy close is a LIMIT at the caller's price.
-    #[tokio::test]
-    async fn test_legacy_exit_close_is_limit_at_the_close_price() {
-        let mut oms = make_dry_run_oms();
-        let mut risk = RiskEngine::new(2.0, 100, 1_000_000.0);
-        risk.record_fill_in_segment(13, ExchangeSegment::NseFno, 3, 100.0, 1);
-        execute_exit_for_security(
-            &mut oms,
-            &mut risk,
-            13,
-            &ExitOrdersConfig::default(),
-            &None,
-            ExchangeSegment::NseFno.binary_code(),
-            Some(101.5),
-        )
-        .await;
-        assert_eq!(oms.total_placed(), 1);
-        let order = oms.all_orders().values().next().expect("one close");
-        assert_eq!(order.order_type, OrderType::Limit);
-        assert!((order.price - 101.5).abs() < f64::EPSILON);
-        assert_eq!(order.transaction_type, TransactionType::Sell);
-    }
-
-    #[test]
-    fn test_usable_close_price_keeps_only_finite_positive() {
-        assert_eq!(usable_close_price(Some(0.05)), Some(0.05));
-        assert_eq!(usable_close_price(None), None);
-        assert_eq!(usable_close_price(Some(0.0)), None);
-        assert_eq!(usable_close_price(Some(-0.05)), None);
-        assert_eq!(usable_close_price(Some(f64::NAN)), None);
-        assert_eq!(usable_close_price(Some(f64::NEG_INFINITY)), None);
     }
 
     /// Per-variant dispatch smoke: PlaceBracket → TightenStop →
@@ -1100,11 +906,11 @@ mod tests {
             security_id: 13,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -1183,11 +989,11 @@ mod tests {
             security_id: 13,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -1201,7 +1007,6 @@ mod tests {
             &cfg,
             &None,
             ExchangeSegment::NseFno.binary_code(),
-            Some(100.0),
         )
         .await;
 
@@ -1229,7 +1034,6 @@ mod tests {
             &cfg,
             &None,
             ExchangeSegment::NseFno.binary_code(),
-            Some(100.0),
         )
         .await;
         assert_eq!(oms.total_placed(), 0, "flat + no actives = no orders");
@@ -1252,7 +1056,6 @@ mod tests {
             &cfg,
             &None,
             ExchangeSegment::NseFno.binary_code(),
-            Some(100.0),
         )
         .await;
         assert_eq!(
@@ -1283,7 +1086,7 @@ mod tests {
             };
 
             let idx = ExchangeSegment::IdxI.binary_code();
-            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, idx, Some(100.0)).await;
+            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, idx).await;
             assert_eq!(
                 oms.total_placed(),
                 0,
@@ -1291,7 +1094,7 @@ mod tests {
             );
 
             let fno = ExchangeSegment::NseFno.binary_code();
-            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, fno, Some(100.0)).await;
+            execute_exit_for_security(&mut oms, &mut risk, 13, &cfg, &None, fno).await;
             assert_eq!(oms.total_placed(), 1, "enabled={enabled}");
             assert!(
                 oms.all_orders()
@@ -1314,11 +1117,11 @@ mod tests {
             security_id: 13,
             exchange_segment: ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -1332,7 +1135,6 @@ mod tests {
             &ExitOrdersConfig::default(),
             &None,
             6,
-            Some(100.0),
         )
         .await;
         assert_eq!(oms.total_placed(), 1, "no close order was placed");
@@ -1380,11 +1182,11 @@ mod tests {
                 security_id: 13,
                 exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
-                order_type: OrderType::Limit,
+                order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 100.0,
+                price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,
@@ -1422,7 +1224,6 @@ mod tests {
                 security_id: 13,
                 exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: cfg.default_freeze_limit_qty,
-                close_price: Some(100.0),
             },
             &cfg,
         )
@@ -1484,7 +1285,6 @@ mod tests {
                 security_id: 13,
                 exchange_segment: ExchangeSegment::NseFno,
                 freeze_limit: 1,
-                close_price: Some(100.0),
             }),
             command_label(&ExitCommand::PlaceBracket(bracket_request(13))),
             command_label(&ExitCommand::TightenStop {

@@ -1946,10 +1946,10 @@ impl OrderManagementSystem {
     /// the exchange-resident exit vehicle.
     ///
     /// Step 0 wires `exit_rules::validate_super_order_request` (finite
-    /// prices, LIMIT-only entry since Cluster H2b refuses MARKET, lot
-    /// multiple, trailing bound, I-P0-03 expiry gate) +
-    /// `validate_super_order_prices` (relative ordering of the LIMIT entry
-    /// against its target and stop loss) + the freeze
+    /// prices, LIMIT/MARKET-only entry, lot multiple, trailing bound,
+    /// I-P0-03 expiry gate) + `validate_super_order_prices` (relative
+    /// ordering — LIMIT entries only: a MARKET entry carries price 0.0 per
+    /// live-probe U1, so ordering against 0.0 is meaningless) + the freeze
     /// refusal (quantity > freeze_limit ⇒ typed `RiskRejected`; NO
     /// sliced-super endpoint exists — Verified V10, never auto-slice).
     ///
@@ -1973,8 +1973,7 @@ impl OrderManagementSystem {
         let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
 
         // Step 0b: relative price ordering (BUY target > entry etc.).
-        // Step 0a admits only LIMIT entries (Cluster H2b refuses MARKET), so
-        // this guard always holds; kept as a defensive check.
+        // LIMIT entries only — MARKET entries carry price 0.0 (U1).
         if request.order_type == OrderType::Limit {
             validate_super_order_prices(
                 request.transaction_type.as_str(),
@@ -3727,7 +3726,7 @@ fn verdict_label(verdict: &ExecutionVerdict) -> &'static str {
 
 /// Validates the leg-modify payload before any gate is spent.
 ///
-/// The entry must be a LIMIT (Cluster H2b: MARKET refused) with a price;
+/// MARKET entry modifies keep price 0.0 (mirror of the place rule / U1);
 /// every price is finite; ENTRY quantity positive; trailing >= 0 finite.
 fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsError> {
     fn positive_finite(label: &str, value: f64) -> Result<(), OmsError> {
@@ -3762,12 +3761,12 @@ fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsE
             stop_loss_price,
             trailing_jump,
         } => {
-            // Cluster H2b: MARKET / STOP_LOSS_MARKET refused first.
+            // Cluster H2b: STOP_LOSS_MARKET refused first (MARKET allowed, H4a).
             refuse_retail_algo_disallowed(*order_type, None)?;
-            if *order_type != OrderType::Limit {
+            if !matches!(order_type, OrderType::Limit | OrderType::Market) {
                 return Err(OmsError::RiskRejected {
                     reason: format!(
-                        "super order entry leg must be LIMIT, got {}",
+                        "super order entry leg must be LIMIT or MARKET, got {}",
                         order_type.as_str()
                     ),
                 });
@@ -3777,7 +3776,17 @@ fn validate_modify_super_fields(modify: &ModifySuperOrderLeg) -> Result<(), OmsE
                     reason: format!("super order modify quantity must be positive, got {quantity}"),
                 });
             }
-            positive_finite("price", *price)?;
+            if *order_type == OrderType::Market {
+                if *price != 0.0 {
+                    return Err(OmsError::RiskRejected {
+                        reason: format!(
+                            "MARKET super order modify must have price=0.0, got {price}"
+                        ),
+                    });
+                }
+            } else {
+                positive_finite("price", *price)?;
+            }
             positive_finite("targetPrice", *target_price)?;
             positive_finite("stopLossPrice", *stop_loss_price)?;
             trailing_ok(*trailing_jump)
@@ -3900,9 +3909,9 @@ fn build_forever_request(
 
 /// Validates order fields before submission to avoid wasting Dhan rate limits.
 ///
-/// - Cluster H2b: MARKET, STOP_LOSS_MARKET and IOC are refused
-///   ([`refuse_retail_algo_disallowed`]), so every accepted order is a priced
-///   LIMIT or STOP_LOSS with DAY validity
+/// - Cluster H2b: STOP_LOSS_MARKET and IOC are refused
+///   ([`refuse_retail_algo_disallowed`]); MARKET is allowed (H4a, Dhan converts it)
+/// - MARKET price must be 0.0 (Dhan rejects non-zero, DH-905)
 /// - LIMIT / STOP_LOSS price must be finite and > 0
 /// - STOP_LOSS triggerPrice must be finite and > 0
 fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
@@ -3926,23 +3935,33 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
 
 /// Validates modify-order fields before submission to avoid wasting Dhan rate limits.
 ///
-/// Same rules as place: MARKET / STOP_LOSS_MARKET / IOC refused (Cluster
-/// H2b), LIMIT / STOP_LOSS price finite and > 0, STOP_LOSS trigger finite
-/// and > 0.
+/// Same rules as place: STOP_LOSS_MARKET / IOC refused (Cluster H2b), MARKET
+/// price 0.0, LIMIT / STOP_LOSS price finite and > 0, STOP_LOSS trigger
+/// finite and > 0.
 fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> {
     refuse_retail_algo_disallowed(request.order_type, Some(request.validity))?;
     validate_priced_order(request.order_type, request.price, request.trigger_price)
 }
 
-/// Cluster H2b: the price rules of an order that passed
-/// [`refuse_retail_algo_disallowed`] (so a LIMIT or a STOP_LOSS): its price
-/// must be finite and > 0, and a STOP_LOSS trigger finite and > 0. Before
-/// H2b a LIMIT priced 0 or NaN reached the wire; each caller checked it.
+/// Cluster H2b / H4a: the price rules of an order that passed
+/// [`refuse_retail_algo_disallowed`] (a MARKET, LIMIT or STOP_LOSS): a MARKET
+/// carries price 0.0 (Dhan prices it with market protection); a LIMIT or
+/// STOP_LOSS price must be finite and > 0, and a STOP_LOSS trigger finite and
+/// > 0. Before H2b a LIMIT priced 0 or NaN reached the wire; each caller
+/// checked it.
 fn validate_priced_order(
     order_type: OrderType,
     price: f64,
     trigger_price: f64,
 ) -> Result<(), OmsError> {
+    if order_type == OrderType::Market {
+        if price != 0.0 {
+            return Err(OmsError::RiskRejected {
+                reason: format!("MARKET order must have price=0.0, got {price}"),
+            });
+        }
+        return Ok(());
+    }
     if !(price.is_finite() && price > 0.0) {
         return Err(OmsError::RiskRejected {
             reason: format!(
@@ -5108,7 +5127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_market_order_refused_before_any_slot() {
+    async fn test_market_order_zero_price_accepted() {
         let api_client = OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
@@ -5136,13 +5155,12 @@ mod tests {
         };
 
         let result = oms.place_order(request).await;
-        // Cluster H2b: MARKET is refused before the budget, the rate slot
-        // and the dry-run branch, so nothing is placed.
+        // H4a (owner 2026-11-28): MARKET orders are sent; Dhan converts them.
         assert!(
-            matches!(&result, Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")),
-            "MARKET order must be refused, got {result:?}"
+            result.is_ok(),
+            "MARKET order with price=0 must be accepted, got {result:?}"
         );
-        assert_eq!(oms.total_placed(), 0, "a refused order places nothing");
+        assert_eq!(oms.total_placed(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -5382,7 +5400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_order_fields_market_order_refused() {
+    fn test_validate_order_fields_market_order_valid() {
         let request = PlaceOrderRequest {
             security_id: 52432,
             exchange_segment: ExchangeSegment::NseFno,
@@ -5396,10 +5414,7 @@ mod tests {
             lot_size: 25,
             expiry_date: None,
         };
-        assert!(matches!(
-            validate_order_fields(&request),
-            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
-        ));
+        assert!(validate_order_fields(&request).is_ok());
     }
 
     #[test]
@@ -5611,12 +5626,23 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_modify_super_fields_refuses_market_entry() {
-        for (order_type, price) in [(OrderType::Market, 0.0), (OrderType::StopLossMarket, 101.0)] {
+    fn test_validate_modify_super_fields_market_entry_and_slm() {
+        // H4a: a MARKET entry modify at price 0 is accepted, a priced one refused.
+        let entry = |order_type, price| ModifySuperOrderLeg::Entry {
+            order_type,
+            quantity: 75,
+            price,
+            target_price: 111.0,
+            stop_loss_price: 96.0,
+            trailing_jump: 0.0,
+        };
+        assert!(validate_modify_super_fields(&entry(OrderType::Market, 0.0)).is_ok());
+        assert!(validate_modify_super_fields(&entry(OrderType::Market, 101.0)).is_err());
+        {
             let modify = ModifySuperOrderLeg::Entry {
-                order_type,
+                order_type: OrderType::StopLossMarket,
                 quantity: 75,
-                price,
+                price: 101.0,
                 target_price: 111.0,
                 stop_loss_price: 96.0,
                 trailing_jump: 0.0,
@@ -5626,7 +5652,7 @@ mod tests {
                     validate_modify_super_fields(&modify),
                     Err(OmsError::RiskRejected { reason }) if reason.contains("not allowed")
                 ),
-                "{order_type:?} super entry modify must be refused by the H2b refusal"
+                "STOP_LOSS_MARKET super entry modify must be refused by the H2b refusal"
             );
         }
     }
@@ -5783,7 +5809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_modify_fields_market_refused() {
+    fn test_validate_modify_fields_market_valid() {
         let request = ModifyOrderRequest {
             order_type: OrderType::Market,
             quantity: 50,
@@ -5792,10 +5818,7 @@ mod tests {
             validity: OrderValidity::Day,
             disclosed_quantity: 0,
         };
-        assert!(matches!(
-            validate_modify_fields(&request),
-            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
-        ));
+        assert!(validate_modify_fields(&request).is_ok());
     }
 
     #[test]
