@@ -409,11 +409,11 @@ jobs:
           cargo install --locked --version 0.22.2 cargo-audit
           cargo install --locked --version 0.19.9 cargo-deny
 
-      - name: cargo deny check
-        run: cargo deny check
+      - name: Test dependency scanner and check dependency policy
+        run: cargo test --locked --manifest-path scripts/dep-freshness/Cargo.toml && cargo deny check
 
-      - name: Audit workspace and fuzz lockfiles
-        run: cargo audit --deny yanked --file Cargo.lock && cargo audit --deny yanked --file fuzz/Cargo.lock
+      - name: Audit all tracked Cargo lockfiles
+        run: git ls-files -z -- '*Cargo.lock' | xargs -0 -n1 cargo audit --deny yanked --file
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening

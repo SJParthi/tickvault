@@ -3508,17 +3508,32 @@ fn all_locked_graphs() -> Vec<(String, Vec<String>)> {
             let lock = std::fs::read_to_string(root.join(&p))
                 .unwrap_or_else(|e| panic!("rust_only_guard: cannot read {p}: {e}"));
             let names = locked_package_names(&lock);
-            // Anti-vacuity, PER FILE: a parser that returns nothing makes every
-            // assertion downstream trivially true, which is exactly how a guard
-            // reports green while enforcing nothing. Every real lockfile in this
-            // repository resolves hundreds of packages.
-            assert!(
-                names.len() > 100,
-                "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from \
-                 {p}. The lockfile format changed or the read failed, and this \
-                 guard is enforcing nothing.",
-                names.len()
-            );
+            // A small tooling workspace can have a complete graph well below 100.
+            // Check each package table against the names used by both runtime guards.
+            let manifest: toml::Table = lock.parse().expect("parse Cargo.lock as TOML");
+            let packages = manifest
+                .get("package")
+                .and_then(toml::Value::as_array)
+                .filter(|rows| !rows.is_empty())
+                .expect("nonempty Cargo.lock package list");
+            let declared: Vec<_> = packages
+                .iter()
+                .map(|item| {
+                    item.get("version")
+                        .and_then(toml::Value::as_str)
+                        .expect("locked package version");
+                    item.get("name")
+                        .and_then(toml::Value::as_str)
+                        .expect("locked package name")
+                })
+                .collect();
+            assert_eq!(names, declared, "incomplete inventory of {p}");
+            if matches!(p.as_str(), "Cargo.lock" | "fuzz/Cargo.lock") {
+                assert!(
+                    names.len() > 100,
+                    "unexpectedly small workspace graph in {p}"
+                );
+            }
             (p, names)
         })
         .collect()

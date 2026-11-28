@@ -12,7 +12,7 @@
 #     Never auto-merged — semver minor bumps can technically
 #     change behavior and need explicit test verification.
 #
-#   - UNKNOWN: logs and continues (network issue, not a failure).
+#   - UNKNOWN: fails the scan and withholds all patch proposals.
 #
 # The two issue jobs use the `gh` CLI (ported off actions/github-script,
 # 2026-10-12, deep audit RUST-8); the label-based dedup is unchanged.
@@ -48,6 +48,7 @@ jobs:
       minor_count: ${{ steps.scan.outputs.minor_count }}
       major_count: ${{ steps.scan.outputs.major_count }}
       report: ${{ steps.scan.outputs.report }}
+      patch_plan: ${{ steps.scan.outputs.patch_plan }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,9 +69,10 @@ jobs:
       - name: Run dep freshness scanner
         id: scan
         run: |
-          chmod +x .claude/hooks/dep-freshness-scanner.sh
-          bash .claude/hooks/dep-freshness-scanner.sh > /tmp/report.txt 2>&1 || true
-          cat /tmp/report.txt
+          set -euo pipefail
+          cargo test --locked --manifest-path scripts/dep-freshness/Cargo.toml
+          bash .claude/hooks/dep-freshness-scanner.sh --write-plan /tmp/patches.json | tee /tmp/report.txt
+          echo "patch_plan=$(base64 -w0 /tmp/patches.json)" >> "$GITHUB_OUTPUT"
 
           PATCH=$(grep -oE '^PATCH drift \([0-9]+' /tmp/report.txt | grep -oE '[0-9]+' || echo 0)
           MINOR=$(grep -oE '^MINOR drift \([0-9]+' /tmp/report.txt | grep -oE '[0-9]+' || echo 0)
@@ -99,43 +101,28 @@ jobs:
         with:
           toolchain: 1.95.0
 
-      - name: Run scanner to identify patch drifts
-        id: identify
+      - name: Apply scanned patch proposals and refresh the lockfile
+        env:
+          PATCH_PLAN: ${{ needs.scan.outputs.patch_plan }}
+          REPORT_B64: ${{ needs.scan.outputs.report }}
         run: |
-          chmod +x .claude/hooks/dep-freshness-scanner.sh
-          bash .claude/hooks/dep-freshness-scanner.sh > /tmp/report.txt 2>&1
-          # Extract lines in the PATCH section
-          awk '/^PATCH drift/{p=1;next} /^MINOR drift/{p=0} /^MAJOR drift/{p=0} /^UNKNOWN/{p=0} p && /pinned=/{print}' /tmp/report.txt > /tmp/patches.txt
-          cat /tmp/patches.txt
-
-      - name: Apply patch bumps to Cargo.toml
-        run: |
-          while IFS= read -r LINE; do
-            NAME=$(echo "$LINE" | sed -nE 's/^ *([a-z][a-zA-Z0-9_-]*): pinned=.*/\1/p')
-            PINNED=$(echo "$LINE" | grep -oE 'pinned=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
-            LATEST=$(echo "$LINE" | grep -oE 'latest=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
-            if [ -n "$NAME" ] && [ -n "$PINNED" ] && [ -n "$LATEST" ]; then
-              echo "Bumping $NAME: $PINNED -> $LATEST"
-              # Use sed to replace the exact version string. Handles both
-              #   name = "1.2.3"
-              # and
-              #   name = { version = "1.2.3", ... }
-              sed -i -E \
-                "s|^(${NAME} = (\\{ version = )?)\"${PINNED}\"|\\1\"${LATEST}\"|" \
-                Cargo.toml
-            fi
-          done < /tmp/patches.txt
-
-      - name: Verify Cargo.toml still parses
-        run: cargo metadata --format-version 1 --no-deps > /dev/null
+          set -euo pipefail
+          printf '%s' "$PATCH_PLAN" | base64 -d > /tmp/patches.json
+          bash .claude/hooks/dep-freshness-scanner.sh --apply-plan /tmp/patches.json
+          cargo update --workspace
+          {
+            printf 'Automated patch updates from the nightly workspace scan.\n\n```\n'
+            printf '%s' "$REPORT_B64" | base64 -d
+            printf '\n```\n'
+          } > /tmp/patch-pr.md
 
       - name: Run workspace check
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       - name: Run scoped test suites
         run: |
-          cargo test -p tickvault-common --lib
-          cargo test -p tickvault-storage --lib
+          cargo test --locked -p tickvault-common --lib
+          cargo test --locked -p tickvault-storage --lib
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
@@ -149,25 +136,7 @@ jobs:
           branch: auto/patch-bump-${{ github.run_id }}
           delete-branch: true
           title: "chore(deps): auto-bump ${{ needs.scan.outputs.patch_count }} patch versions"
-          body: |
-            Automatic PR from `dep-freshness-nightly` (Phase 7, Option A).
-
-            ### Scanner report
-
-            ```
-            $(base64 -d <<< '${{ needs.scan.outputs.report }}')
-            ```
-
-            ### Safety
-
-            All bumps are PATCH level (same major.minor). `cargo check`
-            and scoped lib tests pass. The 12 pre-push gates run on
-            the merge queue.
-
-            ### Auto-merge policy
-
-            This PR auto-merges if all status checks pass. If you need to
-            block it, add the `do-not-merge` label.
+          body-path: /tmp/patch-pr.md
           labels: |
             deps
             auto/patch-bump
