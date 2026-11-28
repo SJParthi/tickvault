@@ -82,16 +82,6 @@ fn ist_secs_of_day(now_utc_secs: i64) -> u32 {
     // rem_euclid(86_400) is always in [0, 86_399] — the cast is lossless.
     now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
-
-/// Cluster H2 (2026-11-28, self-trader rule fit): the LIMIT price for a
-/// pipeline order, the tick's last traded price. A traded price is on the
-/// exchange tick by construction. Converted with `f32_to_f64_clean` (no
-/// IEEE 754 widening artifact) and kept only when finite and > 0; `None`
-/// means no order is sent (there is no MARKET fallback).
-fn pipeline_limit_price(tick: &ParsedTick) -> Option<f64> {
-    let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
-    (price.is_finite() && price > 0.0).then_some(price)
-}
 use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
@@ -135,6 +125,16 @@ fn order_side_send(handle: &OrderSideHandle, msg: OrderSideMsg) {
 // ---------------------------------------------------------------------------
 
 use crate::oms_wiring::TokenHandleBridge;
+
+/// Cluster H2 (2026-11-28, self-trader rule fit): the LIMIT price for a
+/// pipeline order, the tick's last traded price. A traded price is on the
+/// exchange tick by construction. Converted with `f32_to_f64_clean` (no
+/// IEEE 754 widening artifact) and kept only when finite and > 0; `None`
+/// means no order is sent (there is no MARKET fallback).
+fn pipeline_limit_price(tick: &ParsedTick) -> Option<f64> {
+    let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
+    (price.is_finite() && price > 0.0).then_some(price)
+}
 
 // ---------------------------------------------------------------------------
 // TokenProvider bridge — EXTRACTED to `crate::oms_wiring::TokenHandleBridge`
@@ -524,7 +524,7 @@ async fn run_trading_pipeline(
                                             // (a traded price, so on the exchange tick), never MARKET.
                                             let Some(limit_price) = pipeline_limit_price(&tick) else {
                                                 metrics::counter!("tv_pipeline_entry_refused_total", "reason" => "no_price").increment(1);
-                                                debug!(security_id = tick.security_id, "entry refused — no usable LIMIT price");
+                                                warn!(security_id = tick.security_id, "entry refused — no usable LIMIT price (MARKET orders are never sent)");
                                                 continue;
                                             };
                                             let request = PlaceOrderRequest {
@@ -617,7 +617,7 @@ async fn run_trading_pipeline(
                                             // (a traded price, so on the exchange tick), never MARKET.
                                             let Some(limit_price) = pipeline_limit_price(&tick) else {
                                                 metrics::counter!("tv_pipeline_entry_refused_total", "reason" => "no_price").increment(1);
-                                                debug!(security_id = tick.security_id, "entry refused — no usable LIMIT price");
+                                                warn!(security_id = tick.security_id, "entry refused — no usable LIMIT price (MARKET orders are never sent)");
                                                 continue;
                                             };
                                             let request = PlaceOrderRequest {
