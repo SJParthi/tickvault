@@ -53,6 +53,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
+#[path = "../../../common/src/source_header.rs"]
+mod source_header;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -125,22 +127,39 @@ fn count_ext(files: &[String], exts: &[&str]) -> usize {
         .count()
 }
 
-/// Count tracked files whose FIRST TWO BYTES are `#!`, whatever they are named.
-///
-/// Deliberately reads the file rather than matching an extension list. The
-/// enumerate-one-more-extension approach has been wrong repeatedly in this
-/// repository, always in the same direction: a class nobody listed is
-/// invisible, and invisibility reads as green. `tools/deploy` with a `#!`
-/// first line is a script; `tools/deploy.txt` without one is not.
+/// Read only the header unless a leading comment could introduce a Rust attribute.
+fn has_interpreter_header(mut reader: impl std::io::BufRead) -> std::io::Result<bool> {
+    let mut marker = [0; 2];
+    match reader.read_exact(&mut marker) {
+        Ok(()) if marker == *b"#!" => {}
+        Ok(()) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let mut header = Vec::new();
+    reader.read_until(b'\n', &mut header)?;
+    let first_line = String::from_utf8_lossy(&header);
+    let directive = source_header::trim_header_whitespace(&first_line);
+    if directive.is_empty() || directive.starts_with('\0') {
+        return Ok(false);
+    }
+    if directive.starts_with("//") || directive.starts_with("/*") {
+        reader.read_to_end(&mut header)?;
+        return Ok(!source_header::rust_inner_attribute_follows(
+            &String::from_utf8_lossy(&header),
+        ));
+    }
+    Ok(!source_header::rust_inner_attribute_follows(&first_line))
+}
+
+/// Count first-line interpreter directives independently of the filename or executable bit.
 fn count_shebangs(files: &[String]) -> usize {
-    use std::io::Read as _;
     files
         .iter()
-        .filter(|f| {
-            std::fs::File::open(f).is_ok_and(|mut fh| {
-                let mut head = [0u8; 2];
-                fh.read_exact(&mut head).is_ok() && &head == b"#!"
-            })
+        .filter(|path| {
+            std::fs::File::open(path)
+                .and_then(|file| has_interpreter_header(std::io::BufReader::new(file)))
+                .unwrap_or(false)
         })
         .count()
 }
@@ -1123,12 +1142,7 @@ fn main() {
     let shell = count_ext(&files, &[".sh", ".bash", ".zsh"]);
     let rust = count_ext(&files, &[".rs"]);
 
-    // Extension-less `#!` executables. Counted SEPARATELY from `.sh` because
-    // the extension ban and the shebang check catch different things, and the
-    // 2026-08-14 audit found exactly this hole: `tools/deploy` with a `#!`
-    // first line is neither extension-banned nor invocation-scanned, so a
-    // one-rename evasion was invisible. Asking about the FILE rather than its
-    // NAME is the fix; this row makes the answer visible.
+    // Includes extensionless Git hooks and provisioning templates.
     let shebangs = count_shebangs(&files);
 
     // Third-party GitHub Actions. Each `uses:` is someone else's runtime —
@@ -1162,10 +1176,10 @@ fn main() {
             "CI/hook glue. NOT Rust. git invokes hooks as shell",
         ),
         Row::new(
-            "`#!` executables (any name)",
+            "Files declaring an interpreter",
             Verdict::Bounded,
             format!("{shebangs} files"),
-            "asks the FILE, not its name -- closes the rename evasion",
+            "first-line interpreter directive, including extensionless scripts and templates",
         ),
         Row::new(
             "Rust spawn literals",
@@ -2195,4 +2209,43 @@ fn main() {
         std::process::exit(1);
     }
     println!("\n  Every guaranteed row holds.");
+}
+
+#[cfg(test)]
+mod shebang_tests {
+    use super::has_interpreter_header;
+
+    #[test]
+    fn counts_interpreter_tokens_regardless_of_script_name_or_body() {
+        for sample in [
+            &b"#!/bin/sh"[..],
+            b"#! \t/usr/bin/env -S bash -eu\r\n",
+            b"#!./interpreter -q\n",
+            b"#!/bin/bash\n\xff",
+            b"#!//bin/sh\nrun\n",
+        ] {
+            assert!(has_interpreter_header(sample).unwrap(), "{sample:?}");
+        }
+    }
+
+    #[test]
+    fn rust_attributes_empty_markers_and_later_lines_are_not_interpreters() {
+        for sample in [
+            &b""[..],
+            b"#",
+            b"#!",
+            b"#! \t\r\n/bin/sh",
+            b" #!/bin/sh",
+            b"first line\n#!/bin/sh",
+            b"#![cfg(test)]",
+            b"#! \t [allow(dead_code)]",
+            b"#!/* outer /* inner */ */\n[allow(dead_code)]",
+            b"#!// ordinary comment\n[cfg(test)]",
+            "#!\u{0085}/* ordinary\ncomment */[cfg(test)]".as_bytes(),
+            "#!\u{200e}\n".as_bytes(),
+            b"#!\0/bin/sh",
+        ] {
+            assert!(!has_interpreter_header(sample).unwrap(), "{sample:?}");
+        }
+    }
 }
