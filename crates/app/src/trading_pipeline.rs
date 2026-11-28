@@ -126,16 +126,6 @@ fn order_side_send(handle: &OrderSideHandle, msg: OrderSideMsg) {
 
 use crate::oms_wiring::TokenHandleBridge;
 
-/// Cluster H2 (2026-11-28, self-trader rule fit): the LIMIT price for a
-/// pipeline order, the tick's last traded price. A traded price is on the
-/// exchange tick by construction. Converted with `f32_to_f64_clean` (no
-/// IEEE 754 widening artifact) and kept only when finite and > 0; `None`
-/// means no order is sent (there is no MARKET fallback).
-fn pipeline_limit_price(tick: &ParsedTick) -> Option<f64> {
-    let price = tickvault_common::price_precision::f32_to_f64_clean(tick.last_traded_price);
-    (price.is_finite() && price > 0.0).then_some(price)
-}
-
 // ---------------------------------------------------------------------------
 // TokenProvider bridge — EXTRACTED to `crate::oms_wiring::TokenHandleBridge`
 // (order-runtime dry-run PR, 2026-07-14) so this pipeline and the dhan-off
@@ -520,22 +510,15 @@ async fn run_trading_pipeline(
                                             ) else {
                                                 continue;
                                             };
-                                            // Cluster H2: a LIMIT at the tick's last traded price
-                                            // (a traded price, so on the exchange tick), never MARKET.
-                                            let Some(limit_price) = pipeline_limit_price(&tick) else {
-                                                metrics::counter!("tv_pipeline_entry_refused_total", "reason" => "no_price").increment(1);
-                                                warn!(security_id = tick.security_id, "entry refused — no usable LIMIT price (MARKET orders are never sent)");
-                                                continue;
-                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
                                                 exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Buy,
-                                                order_type: OrderType::Limit,
+                                                order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
                                                 validity: OrderValidity::Day,
                                                 quantity: 1,
-                                                price: limit_price,
+                                                price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
                                             expiry_date: None,
@@ -560,7 +543,7 @@ async fn run_trading_pipeline(
                                                             ),
                                                         transaction_type: "BUY",
                                                         quantity: 1,
-                                                        price: limit_price,
+                                                        price: 0.0,
                                                     });
                                                 }
                                                 Err(err) => {
@@ -613,22 +596,15 @@ async fn run_trading_pipeline(
                                             ) else {
                                                 continue;
                                             };
-                                            // Cluster H2: a LIMIT at the tick's last traded price
-                                            // (a traded price, so on the exchange tick), never MARKET.
-                                            let Some(limit_price) = pipeline_limit_price(&tick) else {
-                                                metrics::counter!("tv_pipeline_entry_refused_total", "reason" => "no_price").increment(1);
-                                                warn!(security_id = tick.security_id, "entry refused — no usable LIMIT price (MARKET orders are never sent)");
-                                                continue;
-                                            };
                                             let request = PlaceOrderRequest {
                                                 security_id: tick.security_id,
                                                 exchange_segment: order_segment,
                                                 transaction_type: TransactionType::Sell,
-                                                order_type: OrderType::Limit,
+                                                order_type: OrderType::Market,
                                                 product_type: ProductType::Intraday,
                                                 validity: OrderValidity::Day,
                                                 quantity: 1,
-                                                price: limit_price,
+                                                price: 0.0,
                                                 trigger_price: 0.0,
                                                 lot_size: 1,
                                             expiry_date: None,
@@ -653,7 +629,7 @@ async fn run_trading_pipeline(
                                                             ),
                                                         transaction_type: "SELL",
                                                         quantity: 1,
-                                                        price: limit_price,
+                                                        price: 0.0,
                                                     });
                                                 }
                                                 Err(err) => {
@@ -716,7 +692,6 @@ async fn run_trading_pipeline(
                                         &config.exit_orders,
                                         &order_side,
                                         tick.exchange_segment_code,
-                                        pipeline_limit_price(&tick),
                                     )
                                     .await;
                                 }
@@ -1964,19 +1939,17 @@ threshold = 25.0
         // Simulates what the pipeline does on EnterLong: builds a PlaceOrderRequest
         let tick = ParsedTick {
             security_id: 52432,
-            last_traded_price: 21004.95,
             ..ParsedTick::default()
         };
-        let limit_price = pipeline_limit_price(&tick).expect("a positive LTP is a usable price");
         let request = PlaceOrderRequest {
             security_id: tick.security_id,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: limit_price,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -1984,29 +1957,9 @@ threshold = 25.0
 
         assert_eq!(request.security_id, 52432);
         assert_eq!(request.transaction_type, TransactionType::Buy);
-        assert_eq!(request.order_type, OrderType::Limit);
+        assert_eq!(request.order_type, OrderType::Market);
         assert_eq!(request.product_type, ProductType::Intraday);
-        // f32_to_f64_clean: 21004.95, not the widened 21004.94921875.
-        assert_eq!(
-            request.price, 21004.95,
-            "LIMIT at the clean last traded price"
-        );
-    }
-
-    /// Cluster H2: the pipeline's LIMIT price is the clean LTP, refused
-    /// (None, so no order) when not finite and > 0.
-    #[test]
-    fn test_pipeline_limit_price_refuses_unusable_ltp() {
-        let tick_at = |ltp: f32| ParsedTick {
-            last_traded_price: ltp,
-            ..ParsedTick::default()
-        };
-        assert_eq!(pipeline_limit_price(&tick_at(10.2)), Some(10.2));
-        assert_eq!(pipeline_limit_price(&tick_at(0.05)), Some(0.05));
-        assert_eq!(pipeline_limit_price(&tick_at(0.0)), None);
-        assert_eq!(pipeline_limit_price(&tick_at(-1.0)), None);
-        assert_eq!(pipeline_limit_price(&tick_at(f32::NAN)), None);
-        assert_eq!(pipeline_limit_price(&tick_at(f32::INFINITY)), None);
+        assert_eq!(request.price, 0.0, "market orders must have price=0");
     }
 
     #[test]
@@ -2019,11 +1972,11 @@ threshold = 25.0
             security_id: tick.security_id,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Sell,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -2062,11 +2015,11 @@ threshold = 25.0
             security_id: 52432,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -2129,11 +2082,11 @@ threshold = 25.0
                 } else {
                     TransactionType::Sell
                 },
-                order_type: OrderType::Limit,
+                order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 100.0,
+                price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,
@@ -3498,11 +3451,11 @@ threshold = 70.0
             security_id: 52432,
             exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
             transaction_type: TransactionType::Buy,
-            order_type: OrderType::Limit,
+            order_type: OrderType::Market,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 100.0,
+            price: 0.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -3642,11 +3595,11 @@ threshold = 30.0
                 security_id: sec_id,
                 exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 transaction_type: TransactionType::Buy,
-                order_type: OrderType::Limit,
+                order_type: OrderType::Market,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 100.0,
+                price: 0.0,
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,

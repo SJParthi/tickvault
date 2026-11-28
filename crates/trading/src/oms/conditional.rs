@@ -333,10 +333,9 @@ pub enum ConditionalBuildError {
     /// Comparing value NaN or infinite.
     #[error("comparing value must be finite")]
     NonFiniteComparingValue,
-    /// Cluster H2b (2026-11-28, self-trader rule fit): MARKET and
-    /// STOP_LOSS_MARKET legs are refused; every leg is a priced LIMIT or
-    /// STOP_LOSS.
-    #[error("order type {order_type} not allowed: send LIMIT or STOP_LOSS with a price")]
+    /// Cluster H2b (2026-11-28, self-trader rule fit): STOP_LOSS_MARKET legs
+    /// are refused (MARKET legs are allowed again, H4a).
+    #[error("order type {order_type} not allowed: send MARKET, LIMIT or STOP_LOSS")]
     OrderTypeNotAllowed {
         /// Wire form of the refused order type.
         order_type: &'static str,
@@ -474,9 +473,9 @@ fn validate_common_leg(
     disclosed_quantity: i64,
 ) -> Result<(), ConditionalBuildError> {
     validate_security_id(security_id)?;
-    // Cluster H2b: MARKET / STOP_LOSS_MARKET legs and IOC validity are
-    // refused before any other leg check.
-    if matches!(order_type, OrderType::Market | OrderType::StopLossMarket) {
+    // Cluster H2b: STOP_LOSS_MARKET legs and IOC validity are refused before
+    // any other leg check (MARKET legs allowed again, H4a).
+    if order_type == OrderType::StopLossMarket {
         return Err(ConditionalBuildError::OrderTypeNotAllowed {
             order_type: order_type.as_str(),
         });
@@ -522,7 +521,7 @@ fn validate_common_leg(
     // Price/trigger coupling by order type (docs/dhan-ref/07-orders.md rules
     // 10/11 applied to this family):
     //   LIMIT:            price > 0, trigger == 0
-    //   MARKET:           refused (Cluster H2b)
+    //   MARKET:           price == 0, trigger == 0 (allowed again, H4a)
     //   STOP_LOSS:        price > 0, trigger > 0
     //   STOP_LOSS_MARKET: refused (Cluster H2b)
     match order_type {
@@ -554,8 +553,22 @@ fn validate_common_leg(
                 });
             }
         }
+        OrderType::Market => {
+            if price_paise != 0 {
+                return Err(ConditionalBuildError::BadPrice {
+                    order_type: order_type_wire,
+                    reason: "MARKET requires price == 0",
+                });
+            }
+            if trigger_price_paise != 0 {
+                return Err(ConditionalBuildError::BadTriggerPrice {
+                    order_type: order_type_wire,
+                    reason: "MARKET requires trigger price == 0",
+                });
+            }
+        }
         // Refused at the top of this function (Cluster H2b).
-        OrderType::Market | OrderType::StopLossMarket => {}
+        OrderType::StopLossMarket => {}
     }
 
     // Disclosed quantity: 0, OR strictly more than 30% of quantity AND at
@@ -1182,17 +1195,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_trigger_order_price_boundary_market_refused_limit_zero_rejected() {
-        // Cluster H2b: MARKET is refused whatever its price.
+    fn test_build_trigger_order_price_boundary_zero_market_ok_limit_zero_rejected() {
+        // MARKET with price 0 + trigger 0 is legal (allowed again, H4a).
         let mut market = limit_leg_spec();
         market.order_type = OrderType::Market;
         market.price_paise = 0;
-        assert!(matches!(
-            build_trigger_order(&market),
-            Err(ConditionalBuildError::OrderTypeNotAllowed {
-                order_type: "MARKET"
-            })
-        ));
+        assert!(build_trigger_order(&market).is_ok());
 
         // LIMIT with price 0 refused.
         let mut limit_zero = limit_leg_spec();
@@ -1202,12 +1210,12 @@ mod tests {
             Err(ConditionalBuildError::BadPrice { .. })
         ));
 
-        // MARKET with a price refused (as MARKET, Cluster H2b).
+        // MARKET with a price refused.
         let mut market_priced = limit_leg_spec();
         market_priced.order_type = OrderType::Market;
         assert!(matches!(
             build_trigger_order(&market_priced),
-            Err(ConditionalBuildError::OrderTypeNotAllowed { .. })
+            Err(ConditionalBuildError::BadPrice { .. })
         ));
 
         // Negative paise refused.
@@ -1840,9 +1848,16 @@ mod tests {
         stop_loss_unpriced.trigger_price_paise = 24_900;
         refuse_price(&stop_loss_unpriced);
 
-        // Cluster H2b: MARKET and STOP_LOSS_MARKET legs are refused as order
-        // types, before any price or trigger arm, whatever their prices.
-        for order_type in [OrderType::Market, OrderType::StopLossMarket] {
+        // MARKET with a stray trigger (MARKET allowed again, H4a).
+        let mut market_triggered = limit_leg_spec();
+        market_triggered.order_type = OrderType::Market;
+        market_triggered.price_paise = 0;
+        market_triggered.trigger_price_paise = 100;
+        refuse_trigger(&market_triggered);
+
+        // Cluster H2b: STOP_LOSS_MARKET legs are refused as an order type,
+        // before any price or trigger arm, whatever their prices.
+        for order_type in [OrderType::StopLossMarket] {
             for (price_paise, trigger_price_paise) in
                 [(0, 0), (24_900, 0), (0, 24_900), (24_900, 100)]
             {
