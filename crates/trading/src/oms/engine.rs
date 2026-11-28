@@ -1946,10 +1946,10 @@ impl OrderManagementSystem {
     /// the exchange-resident exit vehicle.
     ///
     /// Step 0 wires `exit_rules::validate_super_order_request` (finite
-    /// prices, LIMIT/MARKET-only entry, lot multiple, trailing bound,
-    /// I-P0-03 expiry gate) + `validate_super_order_prices` (relative
-    /// ordering — LIMIT entries only: a MARKET entry carries price 0.0 per
-    /// live-probe U1, so ordering against 0.0 is meaningless) + the freeze
+    /// prices, LIMIT-only entry since Cluster H2b refuses MARKET, lot
+    /// multiple, trailing bound, I-P0-03 expiry gate) +
+    /// `validate_super_order_prices` (relative ordering of the LIMIT entry
+    /// against its target and stop loss) + the freeze
     /// refusal (quantity > freeze_limit ⇒ typed `RiskRejected`; NO
     /// sliced-super endpoint exists — Verified V10, never auto-slice).
     ///
@@ -1973,7 +1973,8 @@ impl OrderManagementSystem {
         let order_segment = wire_order_segment(EXCHANGE_SEGMENT_NSE_FNO, request.security_id)?;
 
         // Step 0b: relative price ordering (BUY target > entry etc.).
-        // LIMIT entries only — MARKET entries carry price 0.0 (U1).
+        // Step 0a admits only LIMIT entries (Cluster H2b refuses MARKET), so
+        // this guard always holds; kept as a defensive check.
         if request.order_type == OrderType::Limit {
             validate_super_order_prices(
                 request.transaction_type.as_str(),
@@ -5623,11 +5624,30 @@ mod tests {
             assert!(
                 matches!(
                     validate_modify_super_fields(&modify),
-                    Err(OmsError::RiskRejected { .. })
+                    Err(OmsError::RiskRejected { reason }) if reason.contains("not allowed")
                 ),
-                "{order_type:?} super entry modify must be refused"
+                "{order_type:?} super entry modify must be refused by the H2b refusal"
             );
         }
+    }
+
+    /// A priced STOP_LOSS_MARKET modify (price and trigger both set) passes
+    /// `validate_priced_order`, so only the H2b refusal stops it.
+    #[test]
+    fn test_validate_modify_fields_refuses_priced_stop_loss_market() {
+        let request = ModifyOrderRequest {
+            order_type: OrderType::StopLossMarket,
+            quantity: 50,
+            price: 250.0,
+            trigger_price: 249.0,
+            validity: OrderValidity::Day,
+            disclosed_quantity: 0,
+        };
+        assert!(matches!(
+            validate_modify_fields(&request),
+            Err(OmsError::RiskRejected { reason })
+                if reason.contains("STOP_LOSS_MARKET") && reason.contains("not allowed")
+        ));
     }
 
     /// Cluster H2b: an IOC order is refused before the budget, the rate slot
