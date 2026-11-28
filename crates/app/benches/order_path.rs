@@ -150,12 +150,25 @@ fn bench_oms_gates(c: &mut Criterion) {
         b.iter(|| black_box(parse_order_status(black_box("PART_TRADED"))));
     });
 
-    // Per-second GCRA, admit arm (quota large enough never to refuse).
+    // Per-second GCRA, admit arm (quota large enough never to refuse; above
+    // `WINDOW_SLOTS` the strict 1-second window is off, so GCRA only).
     let limiter = OrderRateLimiter::new(u32::MAX);
     c.bench_function("order_path/rate_limiter_admit", |b| {
         b.iter(|| black_box(limiter.check().is_ok()));
     });
-    // Refusal arm (one-per-second quota, spent once before timing).
+    // The production admit (limit 10): lock, clock read, window check, GCRA,
+    // record, unlock (Cluster H1, 2026-11-28). A fresh limiter per iteration,
+    // built outside the timing, so every timed call admits.
+    c.bench_function("order_path/rate_limiter_admit_windowed", |b| {
+        b.iter_batched(
+            || OrderRateLimiter::new(10),
+            |fresh| black_box(fresh.check().is_ok()),
+            BatchSize::SmallInput,
+        );
+    });
+    // Refusal arm (limit 1, spent once before timing). Since Cluster H1 the
+    // strict window refuses first, so this times the window refusal (lock,
+    // clock read, compare); the GCRA is not reached.
     let spent = OrderRateLimiter::new(1);
     let _ = spent.check();
     c.bench_function("order_path/rate_limiter_refused", |b| {
