@@ -1,5 +1,5 @@
 #!/bin/bash
-# Scan crates.io workspace pins. --json preserves the machine-readable report.
+# Scan crates.io over HTTPS. --offline-index DIR reads a local sparse-index snapshot.
 # --fail-on-minor returns 1 for minor/major drift. Incomplete scans return 2.
 set -eu
 tool_root=$(cd "$(dirname "$0")/../.." && pwd)

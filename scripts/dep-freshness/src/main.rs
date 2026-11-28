@@ -1,3 +1,4 @@
+use reqwest::{StatusCode, blocking::Client};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -5,9 +6,10 @@ use std::{
     env,
     error::Error,
     fmt, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::ExitCode,
+    time::Duration,
 };
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, TableLike, Value};
@@ -151,32 +153,70 @@ fn latest(package: &str, response: &str) -> Result<Version> {
     best.ok_or_else(|| "registry supplied no stable, non-yanked release".into())
 }
 
-fn registry(package: &str) -> Result<String> {
-    let name = package.to_ascii_lowercase(); // pin() validated the ASCII name.
-    let key = match name.len() {
+const INDEX_ORIGIN: &str = "https://index.crates.io";
+const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+const ATTEMPTS: usize = 3;
+
+fn index_key(package: &str) -> String {
+    // pin() validates the ASCII crate name before invoking the reader.
+    let name = package.to_ascii_lowercase();
+    match name.len() {
         1 => format!("1/{name}"),
         2 => format!("2/{name}"),
         3 => format!("3/{}/{name}", &name[..1]),
         _ => format!("{}/{}/{name}", &name[..2], &name[2..4]),
-    };
-    let url = format!("https://index.crates.io/{key}");
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--retry",
-            "2",
-            "--max-time",
-            "30",
-            &url,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err("registry request failed".into());
     }
-    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn read_index(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INDEX_BYTES {
+        return Err("registry record exceeds size limit".into());
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+fn get_record(client: &Client, url: &str, retry_delay: Duration) -> Result<String> {
+    for attempt in 1..=ATTEMPTS {
+        let response = client.get(url).send();
+        match response {
+            Ok(response) if response.status() == StatusCode::OK => {
+                if response
+                    .headers()
+                    .contains_key(reqwest::header::CONTENT_RANGE)
+                {
+                    return Err("registry returned a partial record".into());
+                }
+                return read_index(response);
+            }
+            Ok(response) => {
+                let status = response.status();
+                if attempt == ATTEMPTS
+                    || !(status.is_server_error()
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status == StatusCode::REQUEST_TIMEOUT)
+                {
+                    return Err(format!("registry returned HTTP {status}").into());
+                }
+            }
+            Err(error) if attempt < ATTEMPTS && (error.is_timeout() || error.is_connect()) => {}
+            Err(error) => return Err(error.without_url().into()),
+        }
+        std::thread::sleep(retry_delay * attempt as u32);
+    }
+    Err("registry retry limit reached".into())
+}
+
+fn https_client() -> Result<Client> {
+    Ok(Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .user_agent("tickvault-dep-freshness/0.1")
+        .build()?)
 }
 
 fn scan(doc: &DocumentMut, mut fetch: impl FnMut(&str) -> Result<String>) -> Result<Report> {
@@ -280,10 +320,16 @@ fn run() -> Result<u8> {
     let mut fail_minor = false;
     let mut plan_out = None;
     let mut plan_in = None;
+    let mut offline_index = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json = true,
+            "--offline-index" => {
+                offline_index = Some(PathBuf::from(
+                    args.next().ok_or("missing sparse index directory")?,
+                ))
+            }
             "--fail-on-minor" => fail_minor = true,
             "--write-plan" => {
                 plan_out = Some(PathBuf::from(
@@ -299,7 +345,7 @@ fn run() -> Result<u8> {
     let path = Path::new("Cargo.toml");
     let mut doc = fs::read_to_string(path)?.parse::<DocumentMut>()?;
     if let Some(input) = plan_in {
-        if json || fail_minor || plan_out.is_some() {
+        if json || fail_minor || plan_out.is_some() || offline_index.is_some() {
             return Err("apply-plan cannot also scan".into());
         }
         let changes: Vec<Change> = serde_json::from_slice(&fs::read(input)?)?;
@@ -308,7 +354,24 @@ fn run() -> Result<u8> {
         println!("Applied {} patch proposals", changes.len());
         return Ok(0);
     }
-    let report = scan(&doc, registry)?;
+    let report = if let Some(dir) = offline_index {
+        let dir = dir.canonicalize()?;
+        if !dir.is_dir() {
+            return Err("offline index must be a directory".into());
+        }
+        scan(&doc, |package| {
+            read_index(fs::File::open(dir.join(index_key(package)))?)
+        })?
+    } else {
+        let client = https_client()?;
+        scan(&doc, |package| {
+            get_record(
+                &client,
+                &format!("{INDEX_ORIGIN}/{}", index_key(package)),
+                Duration::from_millis(250),
+            )
+        })?
+    };
     report.print(json)?;
     if !report.unknown.is_empty() {
         return Ok(2);
@@ -436,5 +499,130 @@ mod tests {
         ] {
             assert!(apply(&mut original.parse().unwrap(), &proposed).is_err());
         }
+    }
+    #[test]
+    fn sparse_keys_and_secure_production_transport() {
+        for (name, key) in [
+            ("A", "1/a"),
+            ("AB", "2/ab"),
+            ("Syn", "3/s/syn"),
+            ("Proc_Macro", "pr/oc/proc_macro"),
+        ] {
+            assert_eq!(index_key(name), key);
+        }
+        let error = https_client()
+            .unwrap()
+            .get("http://127.0.0.1:9/test")
+            .send()
+            .unwrap_err();
+        assert!(error.is_builder(), "production client must reject HTTP");
+        assert_eq!(INDEX_ORIGIN, "https://index.crates.io");
+    }
+
+    fn local_request(responses: &[Option<&'static str>], timeout: Duration) -> Result<String> {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::time::Instant;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/3/a/abc", listener.local_addr()?);
+        listener.set_nonblocking(true)?;
+        let replies = responses.to_vec();
+        let worker = std::thread::spawn(move || {
+            let mut withheld = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            for response in replies {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break s,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(e) => panic!("expected request did not arrive: {e}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut buf = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if buf.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                match response {
+                    Some(response) => stream.write_all(response.as_bytes()).unwrap(),
+                    None => withheld.push(stream),
+                }
+            }
+            // Keep unanswered requests open past the client timeout.
+            if !withheld.is_empty() {
+                std::thread::sleep(timeout * 2);
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(timeout)
+            .build()?;
+        let result = get_record(&client, &url, Duration::ZERO);
+        worker.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn http_success_retry_refusal_and_timeout_have_distinct_results() {
+        let timeout = Duration::from_secs(1);
+        let overloaded = Some(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let success = Some("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        assert_eq!(
+            local_request(&[overloaded, success], timeout).unwrap(),
+            "ok"
+        );
+        assert!(
+            local_request(&[overloaded; ATTEMPTS], timeout)
+                .unwrap_err()
+                .to_string()
+                .contains("503")
+        );
+        for (status, response) in [
+            (
+                "206",
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                "partial record",
+                "HTTP/1.1 200 OK\r\nContent-Range: bytes 0-0/12\r\nContent-Length: 1\r\nConnection: close\r\n\r\na",
+            ),
+            (
+                "404",
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                "302",
+                "HTTP/1.1 302 Found\r\nLocation: /another-host\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+        ] {
+            assert!(
+                local_request(&[Some(response)], timeout)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(status)
+            );
+        }
+        assert!(local_request(&[None; ATTEMPTS], Duration::from_millis(150)).is_err());
+    }
+
+    #[test]
+    fn malformed_or_oversized_records_fail_closed() {
+        assert!(read_index(&[0xff_u8][..]).is_err());
+        assert!(read_index(std::io::repeat(b'a').take(MAX_INDEX_BYTES + 1)).is_err());
     }
 }
