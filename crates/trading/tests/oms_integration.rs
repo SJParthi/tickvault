@@ -72,11 +72,11 @@ fn make_market_order_request() -> PlaceOrderRequest {
         security_id: 52432,
         exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
         transaction_type: TransactionType::Buy,
-        order_type: OrderType::Market,
+        order_type: OrderType::Limit,
         product_type: ProductType::Intraday,
         validity: OrderValidity::Day,
         quantity: 50,
-        price: 0.0,
+        price: 100.0,
         trigger_price: 0.0,
         lot_size: 25,
         expiry_date: None,
@@ -551,7 +551,7 @@ async fn test_market_order_with_price_rejected() {
         product_type: ProductType::Intraday,
         validity: OrderValidity::Day,
         quantity: 50,
-        price: 245.50, // MARKET orders must have price=0
+        price: 245.50, // Cluster H2b: MARKET is refused whatever its price
         trigger_price: 0.0,
         lot_size: 25,
         expiry_date: None,
