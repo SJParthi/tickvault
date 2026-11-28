@@ -93,11 +93,17 @@ fn usable_close_price(close_price: Option<f64>) -> Option<f64> {
     close_price.filter(|price| price.is_finite() && *price > 0.0)
 }
 
-/// Counts and logs a close refused for want of a usable LIMIT price. Coded
-/// `EXIT-ORDER-01`, log-sink-only (no Telegram, no alarm: the exit layer is
-/// locked off and the trading pipeline has no production caller).
-fn report_close_refused(security_id: u64, net_lots: i32, path: &'static str) {
+/// Counts a close refused for want of a usable LIMIT price and, when
+/// `log_here`, logs it coded `EXIT-ORDER-01` (log-sink-only: no Telegram, no
+/// alarm; the exit layer is locked off and the trading pipeline has no
+/// production caller). The CloseAll path passes `false`: it returns
+/// `RiskRejected`, which the dispatcher already logs as `EXIT-ORDER-01`, so
+/// one refusal is logged once, not twice.
+fn report_close_refused(security_id: u64, net_lots: i32, path: &'static str, log_here: bool) {
     metrics::counter!("tv_exit_close_refused_total", "reason" => "no_close_price").increment(1);
+    if !log_here {
+        return;
+    }
     error!(
         code = ErrorCode::ExitOrder01ExecutionDegraded.code_str(),
         security_id,
@@ -369,7 +375,7 @@ pub async fn execute_exit_for_security(
         let close_qty = i64::from(net_lots.unsigned_abs());
         // Cluster H2: a LIMIT close at the caller's price, never MARKET.
         let Some(limit_price) = usable_close_price(close_price) else {
-            report_close_refused(security_id, net_lots, "legacy");
+            report_close_refused(security_id, net_lots, "legacy", true);
             observe_order_side(
                 order_side,
                 OrderSideMsg::PlaceFailed {
@@ -500,9 +506,10 @@ async fn close_all_for_security(
     };
     let close_qty = i64::from(net_lots.unsigned_abs());
     // Cluster H2: a LIMIT close at the caller's price, never MARKET. No
-    // usable price → no close (the dispatcher codes the refusal).
+    // usable price → no close; the dispatcher logs the returned refusal
+    // (coded EXIT-ORDER-01), so this path only counts it.
     let Some(limit_price) = usable_close_price(close_price) else {
-        report_close_refused(security_id, net_lots, "close_all");
+        report_close_refused(security_id, net_lots, "close_all", false);
         return Err(OmsError::RiskRejected {
             reason: format!(
                 "close refused for security {security_id}: no usable LIMIT price \
