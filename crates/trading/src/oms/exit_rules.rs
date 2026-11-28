@@ -592,7 +592,7 @@ mod tests {
         r.price = 0.0;
         assert!(matches!(
             validate_super_order_request(&r),
-            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET")
+            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
         ));
     }
 
@@ -1389,8 +1389,11 @@ mod tests {
             let mut r = forever_req();
             r.order_type = order_type;
             assert!(
-                matches!(validate_forever_oco(&r), Err(OmsError::RiskRejected { .. })),
-                "{order_type:?} must be refused"
+                matches!(
+                    validate_forever_oco(&r),
+                    Err(OmsError::RiskRejected { reason }) if reason.contains("not allowed")
+                ),
+                "{order_type:?} must be refused by the H2b refusal, not a later check"
             );
         }
         // Before H2b forever/OCO never checked validity, so IOC got through.
@@ -1412,7 +1415,7 @@ mod tests {
         r.order_type = OrderType::StopLossMarket;
         assert!(matches!(
             validate_super_order_request(&r),
-            Err(OmsError::RiskRejected { reason }) if reason.contains("STOP_LOSS_MARKET")
+            Err(OmsError::RiskRejected { reason }) if reason.contains("STOP_LOSS_MARKET") && reason.contains("not allowed")
         ));
     }
 }
