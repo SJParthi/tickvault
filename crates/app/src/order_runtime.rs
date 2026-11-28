@@ -1891,9 +1891,13 @@ async fn process_mark(
     // Until then the index was bare-sid and `segment_matches_first_seen`
     // closed that path; the key now closes it by construction.
     if paper_fill && oms.is_dry_run() && has_pending_paper {
-        // Cold branch by construction (only reached when THIS instrument has
-        // a pending paper order); the id Vec clone is bounded by its pending
-        // count (1-2 in practice — self-test legs).
+        // Only reached when THIS instrument has a pending paper order; the id
+        // Vec clone is bounded by its pending count (1-2 in practice —
+        // self-test legs). Since Cluster H3 a LIMIT the mark has not reached
+        // stays pending, so this clone repeats on every mark for that
+        // instrument until the order fills or is cancelled (the self-test's
+        // 180 s timeout cancels its own legs): O(pending) per mark, per-order
+        // runtime task only, never the frame drain.
         let pending: Vec<String> = book
             .pending_paper
             .get(&(mark.security_id, mark_segment))
@@ -1940,16 +1944,18 @@ async fn fill_paper_order(
         );
         return;
     }
-    let Some(order) = oms.order(order_id).cloned() else {
+    let Some(order_ref) = oms.order(order_id) else {
         return;
     };
     // Cluster H3: a LIMIT whose price the mark has not reached rests (no
     // fill); it is retried on the next mark. Not a deferral (the mark is
-    // fine), counted on its own.
-    if mark.is_finite() && mark > 0.0 && !paper_limit_reached(&order, mark) {
+    // fine), counted on its own. Checked on the borrowed order, so a resting
+    // order costs no copy per mark.
+    if mark.is_finite() && mark > 0.0 && !paper_limit_reached(order_ref, mark) {
         metrics::counter!("tv_paper_fills_resting_total").increment(1);
         return;
     }
+    let order = order_ref.clone();
     let Some(synthetic) = synthesize_paper_fill(&order, mark, segment_code) else {
         // F20: zero/absent/non-finite mark — defer, retry on the next mark.
         metrics::counter!("tv_paper_fills_deferred_total").increment(1);
@@ -2251,8 +2257,10 @@ async fn drive_self_test_timers(
 ///
 /// Cluster H2 (2026-11-28, self-trader rule fit): a LIMIT order, never MARKET.
 /// Cluster H3: priced up to 10% above the mark that picked the sid
-/// ([`self_test_limit_price`]), so it still fills if the index rises before
-/// the next mark now that a paper LIMIT honours its price. The caller has
+/// ([`self_test_limit_price`]), the same marketable band as the close. The
+/// entry fills on the mark that placed it (process_mark fills pending orders
+/// with that same mark, and the price is at or above it), so the band only
+/// keeps the two legs priced by one rule; the close is the leg it protects. The caller has
 /// already checked the mark is finite and > 0; a mark the price builder
 /// refuses places nothing (the 180 s timeout then skips the day).
 async fn start_self_test_entry(
@@ -3378,8 +3386,9 @@ mod tests {
         );
     }
 
-    /// Cluster H2: the self-test sends LIMIT orders only — the entry at the
-    /// mark that picked the sid, the close at the entry's fill price.
+    /// Cluster H2/H3: the self-test sends LIMIT orders only — the entry up to
+    /// 10% above the mark that picked the sid, the close down to 10% below the
+    /// entry's fill price (marketable band, 0.05 grid).
     #[tokio::test]
     async fn test_selftest_entry_and_close_are_limit_orders() {
         let ctx = make_ctx();
@@ -3581,8 +3590,9 @@ mod tests {
         assert_eq!(risk.net_lots_for(13), 0, "flat");
     }
 
-    /// Cluster H2: the close price is the entry's fill price only when it is
-    /// finite and > 0; an unknown or unfilled entry gives `None` (no close).
+    /// Cluster H2/H3: the close price is built from the entry's fill price
+    /// (down to 10% below it) only when that fill price is finite and > 0; an
+    /// unknown or unfilled entry gives `None` (no close).
     #[tokio::test]
     async fn test_self_test_close_price_needs_a_usable_fill_price() {
         let mut oms = make_oms();
@@ -3597,6 +3607,11 @@ mod tests {
             None,
             "an unfilled order has no fill price"
         );
+        // Filled at 100: the close is the SELL band, 10% below, on the grid.
+        let order = oms.order(&unfilled).cloned().expect("order");
+        let fill = synthesize_paper_fill(&order, 100.0, 0).expect("fill");
+        oms.handle_order_update(&fill).expect("paper fill applies");
+        assert_eq!(self_test_close_price(&oms, &unfilled), Some(90.0));
     }
 
     #[test]
