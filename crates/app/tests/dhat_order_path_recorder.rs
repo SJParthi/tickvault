@@ -194,6 +194,31 @@ fn dhat_order_path_with_the_production_recorder() {
     );
     assert_within("the OMS gates", bytes, blocks, BUDGET_BYTES, BUDGET_BLOCKS);
 
+    // The production limit (10) runs the strict 1-second window (Cluster H1,
+    // 2026-11-28): lock, clock read, window check, record. Limiters are built
+    // before the window; each takes 10 admissions then refusals, so both arms
+    // of the window run inside it (and on a phantom retry, refusals only).
+    let windowed: Vec<OrderRateLimiter> = (0..1_000).map(|_| OrderRateLimiter::new(10)).collect();
+    let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+        || {},
+        || {
+            for limiter in &windowed {
+                for _ in 0..12 {
+                    std::hint::black_box(limiter.check().is_ok());
+                }
+            }
+        },
+    );
+    assert_within(
+        "OrderRateLimiter::check with the strict window",
+        bytes,
+        blocks,
+        BUDGET_BYTES,
+        BUDGET_BLOCKS,
+    );
+
     let (bytes, blocks) = dhat_support::measure_with_phantom_retry(
         BUDGET_BYTES,
         BUDGET_BLOCKS,

@@ -1482,8 +1482,11 @@ mod tests {
     /// per waiting exit; every position still ends flat and in order.
     #[tokio::test]
     async fn test_regression_exit_burst_makes_one_refused_attempt_per_round() {
-        // Exercise the case that failed under load: two tokens can refill while
-        // 30 commands are being delivered. Every run checks the entire queue.
+        // Exercise the case that failed under load: a pause long enough for the
+        // old GCRA to refill two tokens while 30 commands are being delivered.
+        // Since 2026-11-28 (Cluster H1) the strict 1-second window holds the
+        // cap at 10 until a second after the first admission, so the pause
+        // admits nothing more. Every run checks the entire queue.
         check_exit_burst(true).await;
         // Also require the original ten-admitted, twenty-queued scenario.
         // Only elapsed time can disqualify that additional timing assertion.
@@ -1530,10 +1533,19 @@ mod tests {
                 within_one_refill = start.elapsed() < std::time::Duration::from_millis(100);
             }
         }
+        // Measured after the last delivery: every admission happened before
+        // this instant, and the first no earlier than `start`.
+        let within_one_second = start.elapsed() < std::time::Duration::from_secs(1);
         let admitted = usize::try_from(oms.total_placed()).expect("fits");
         assert!((10..=sids.len()).contains(&admitted));
-        if pause_after_ten {
-            assert!(admitted >= 12, "two tokens refilled after the first ten");
+        if within_one_second {
+            // The self-trader rule: at most 10 orders in any one second. The
+            // old GCRA refilled during the 220 ms pause and let 12 or more
+            // through here; the strict window must not.
+            assert_eq!(
+                admitted, 10,
+                "no more than 10 exits may pass inside one second, pause or not"
+            );
         }
         if within_one_refill {
             assert_eq!(admitted, 10);
