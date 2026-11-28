@@ -470,7 +470,7 @@ impl OrderManagementSystem {
                     security_id: 0,
                     exchange_segment: ExchangeSegment::IdxI,
                     transaction_type: TransactionType::Buy,
-                    order_type: OrderType::Market,
+                    order_type: OrderType::Limit,
                     product_type: ProductType::Intraday,
                     validity: OrderValidity::Day,
                     quantity: 0,

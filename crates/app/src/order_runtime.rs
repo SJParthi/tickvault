@@ -640,6 +640,18 @@ fn segment_code_to_chars(segment_code: u8) -> (&'static str, &'static str) {
     }
 }
 
+/// The order-type label the vendor's order-update feed uses ("LMT", "MKT",
+/// "SL", "SLM"), stamped on a synthetic paper fill so it names the order it
+/// fills. Before Cluster H2 every paper fill was stamped "MKT".
+fn paper_order_type_label(order_type: OrderType) -> &'static str {
+    match order_type {
+        OrderType::Limit => "LMT",
+        OrderType::Market => "MKT",
+        OrderType::StopLoss => "SL",
+        OrderType::StopLossMarket => "SLM",
+    }
+}
+
 /// Builds the synthetic TRADED update for a pending paper order at `mark`.
 ///
 /// Returns `None` unless the mark is finite and > 0 (F20 — NEVER fabricate
@@ -662,7 +674,8 @@ fn synthesize_paper_fill(order: &ManagedOrder, mark: f64, segment_code: u8) -> O
         exch_order_no: String::new(),
         product: "I".to_string(),
         txn_type: txn.to_string(),
-        order_type: "MKT".to_string(),
+        // The order's own type, as the vendor's order-update feed labels it.
+        order_type: paper_order_type_label(order.order_type).to_string(),
         validity: "DAY".to_string(),
         quantity: order.quantity,
         traded_qty: order.quantity,
@@ -1792,7 +1805,7 @@ async fn process_mark(
         if ctx.safety.blocked_on(today).is_some() {
             self_test.skip_with(today, SKIP_OUTCOME_FEED_TIME, SKIP_TEXT_FEED_TIME);
         } else {
-            start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code).await;
+            start_self_test_entry(oms, self_test, mark.security_id, mark.segment_code, price).await;
             // HP-2: the entry placement changed the pending set.
             book.rebuild_pending_paper(oms);
         }
@@ -2180,21 +2193,27 @@ async fn drive_self_test_timers(
 
 /// Mark-arm half: the first usable mark picks the sid and places the entry
 /// paper order (qty 1 unit, lot_size 1 → 1 lot).
+///
+/// Cluster H2 (2026-11-28, self-trader rule fit): a LIMIT order at the mark
+/// that picked the sid, never MARKET. The caller has already checked the
+/// mark is finite and > 0. Index marks reach this path only in dry run, so
+/// no tick rounding is needed.
 async fn start_self_test_entry(
     oms: &mut OrderManagementSystem,
     self_test: &mut SelfTestState,
     sid: u64,
     _segment_code: u8,
+    mark_price: f64,
 ) {
     let request = PlaceOrderRequest {
         security_id: sid,
         exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
         transaction_type: TransactionType::Buy,
-        order_type: OrderType::Market,
+        order_type: OrderType::Limit,
         product_type: ProductType::Intraday,
         validity: OrderValidity::Day,
         quantity: 1,
-        price: 0.0,
+        price: mark_price,
         trigger_price: 0.0,
         lot_size: 1,
         expiry_date: None,
@@ -2216,6 +2235,14 @@ async fn start_self_test_entry(
             // OMS/fill chain, not the pre-trade gate).
         }
     }
+}
+
+/// The self-test close leg's LIMIT price: the entry order's average fill
+/// price, kept only when finite and > 0 (Cluster H2). `None` means no order
+/// may be sent.
+fn self_test_close_price(oms: &OrderManagementSystem, entry_order_id: &str) -> Option<f64> {
+    let price = oms.order(entry_order_id)?.avg_traded_price;
+    (price.is_finite() && price > 0.0).then_some(price)
 }
 
 /// Fill-path half: advance the state machine when one of OUR self-test
@@ -2243,16 +2270,24 @@ async fn advance_self_test_on_fill(
                 self_test.fail(today, "paper_fill_disabled_mid_cycle");
                 return;
             }
+            // Cluster H2: the close is a LIMIT at the entry's fill price,
+            // never MARKET. With no usable fill price nothing is sent (no
+            // price 0, no guess): the position is reported dangling, loudly.
+            let Some(close_price) = self_test_close_price(oms, order_id) else {
+                report_dangling_self_test_position(risk, sid, "close_price_unknown");
+                self_test.fail(today, "close_price_unknown");
+                return;
+            };
             // Place the close (opposite side, same 1-lot size).
             let request = PlaceOrderRequest {
                 security_id: sid,
                 exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Sell,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 0.0,
+                price: close_price,
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,
@@ -2406,11 +2441,11 @@ mod tests {
             security_id: sid,
             exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
-            order_type: OrderType::Market,
+            order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 0.0,
+            price: 100.0,
             trigger_price: 0.0,
             lot_size: 1,
             expiry_date: None,
@@ -2683,11 +2718,11 @@ mod tests {
                 security_id: 27,
                 exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Buy,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 1,
-                price: 0.0,
+                price: 100.0,
                 trigger_price: 0.0,
                 lot_size: 1,
                 expiry_date: None,
@@ -2775,11 +2810,11 @@ mod tests {
             security_id: 13,
             exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
             transaction_type: side,
-            order_type: OrderType::Market,
+            order_type: OrderType::Limit,
             product_type: ProductType::Intraday,
             validity: OrderValidity::Day,
             quantity: 1,
-            price: 0.0,
+            price: 100.0,
             trigger_price: 0.0,
             status: tickvault_common::order_types::OrderStatus::Confirmed,
             traded_qty: 0,
@@ -3274,6 +3309,84 @@ mod tests {
         );
     }
 
+    /// Cluster H2: the self-test sends LIMIT orders only — the entry at the
+    /// mark that picked the sid, the close at the entry's fill price.
+    #[tokio::test]
+    async fn test_selftest_entry_and_close_are_limit_orders() {
+        let ctx = make_ctx();
+        let mut oms = make_oms();
+        let mut risk = make_risk();
+        let mut book = BookState::new();
+        let mut self_test = SelfTestState::new();
+        self_test.phase = SelfTestPhase::AwaitingMark;
+        self_test.started_at = std::time::Instant::now();
+        process_mark(
+            &mut oms,
+            &mut risk,
+            &mut book,
+            &mut self_test,
+            &ctx,
+            MarkUpdate {
+                security_id: 13,
+                segment_code: 0,
+                price: 23146.45,
+            },
+            true,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(self_test.phase, SelfTestPhase::AwaitingCloseFill { .. }),
+            "got {:?}",
+            self_test.phase
+        );
+        let orders = oms.all_orders();
+        assert_eq!(orders.len(), 2, "entry + close");
+        for order in orders.values() {
+            assert_eq!(order.order_type, OrderType::Limit, "no MARKET order");
+            assert!(
+                (order.price - 23146.45).abs() < f64::EPSILON,
+                "LIMIT at the mark / entry fill price, got {}",
+                order.price
+            );
+        }
+        let sides: Vec<TransactionType> = orders.values().map(|o| o.transaction_type).collect();
+        assert!(sides.contains(&TransactionType::Buy) && sides.contains(&TransactionType::Sell));
+    }
+
+    /// Cluster H2: the close price is the entry's fill price only when it is
+    /// finite and > 0; an unknown or unfilled entry gives `None` (no close).
+    #[tokio::test]
+    async fn test_self_test_close_price_needs_a_usable_fill_price() {
+        let mut oms = make_oms();
+        assert_eq!(
+            self_test_close_price(&oms, "PAPER-404"),
+            None,
+            "unknown order"
+        );
+        let unfilled = place_paper(&mut oms, 13, TransactionType::Buy).await;
+        assert_eq!(
+            self_test_close_price(&oms, &unfilled),
+            None,
+            "an unfilled order has no fill price"
+        );
+    }
+
+    #[test]
+    fn test_paper_order_type_label_names_every_order_type() {
+        assert_eq!(paper_order_type_label(OrderType::Limit), "LMT");
+        assert_eq!(paper_order_type_label(OrderType::Market), "MKT");
+        assert_eq!(paper_order_type_label(OrderType::StopLoss), "SL");
+        assert_eq!(paper_order_type_label(OrderType::StopLossMarket), "SLM");
+        let fill =
+            synthesize_paper_fill(&make_paper_order("PAPER-1", TransactionType::Buy), 101.0, 0)
+                .expect("a positive mark fills");
+        assert_eq!(
+            fill.order_type, "LMT",
+            "the paper fill names the order's own type"
+        );
+    }
+
     /// E4: the self-test sid pick ignores NON-index marks (a far-month
     /// future with minutes of legitimate silence would false-FAIL the day).
     #[tokio::test]
@@ -3644,11 +3757,11 @@ mod tests {
                 security_id: 13,
                 exchange_segment: tickvault_common::types::ExchangeSegment::IdxI,
                 transaction_type: TransactionType::Buy,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit,
                 product_type: ProductType::Intraday,
                 validity: OrderValidity::Day,
                 quantity: 75,
-                price: 0.0,
+                price: 100.0,
                 trigger_price: 0.0,
                 lot_size: 75,
                 expiry_date: None,

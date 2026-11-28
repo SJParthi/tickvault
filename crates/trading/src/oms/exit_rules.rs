@@ -60,6 +60,13 @@ pub enum ExitCommand {
         exchange_segment: tickvault_common::types::ExchangeSegment,
         /// Exchange freeze quantity for the close order(s).
         freeze_limit: i64,
+        /// LIMIT price for the close order(s), already on the exchange tick
+        /// (Cluster H2, 2026-11-28: no MARKET order is ever sent). `None`, or
+        /// a value that is not finite and > 0, refuses the close: actives are
+        /// still cancelled, no close is placed, and the dispatcher returns
+        /// `OmsError::RiskRejected`. The position then stays open rather than
+        /// closing at a guessed price.
+        close_price: Option<f64>,
     },
     /// Entry-time 3-leg bracket (constructed at the entry decision by the
     /// future entry-side (Cluster A) work).
@@ -1236,6 +1243,7 @@ mod tests {
                 security_id: 13,
                 exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 freeze_limit: 1800,
+                close_price: Some(100.0),
             },
             ExitCommand::PlaceBracket(super_req()),
             ExitCommand::TightenStop {
