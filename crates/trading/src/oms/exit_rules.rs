@@ -60,13 +60,6 @@ pub enum ExitCommand {
         exchange_segment: tickvault_common::types::ExchangeSegment,
         /// Exchange freeze quantity for the close order(s).
         freeze_limit: i64,
-        /// LIMIT price for the close order(s), already on the exchange tick
-        /// (Cluster H2, 2026-11-28: no MARKET order is ever sent). `None`, or
-        /// a value that is not finite and > 0, refuses the close: actives are
-        /// still cancelled, no close is placed, and the dispatcher returns
-        /// `OmsError::RiskRejected`. The position then stays open rather than
-        /// closing at a guessed price.
-        close_price: Option<f64>,
     },
     /// Entry-time 3-leg bracket (constructed at the entry decision by the
     /// future entry-side (Cluster A) work).
@@ -92,13 +85,17 @@ pub enum ExitCommand {
     },
 }
 
-/// Cluster H2b (2026-11-28, self-trader rule fit): refuses an order type or
-/// validity this system never sends — MARKET, STOP_LOSS_MARKET and IOC.
+/// Cluster H2b / H4a (2026-11-28, self-trader rule fit): refuses an order type
+/// or validity this system never sends — STOP_LOSS_MARKET and IOC.
 ///
-/// Under the SEBI retail-algo framework and Dhan's market price protection a
-/// MARKET order is converted to a LIMIT the system did not price, and an IOC
-/// order can lapse silently, so every order the OMS accepts is a priced
-/// LIMIT or STOP_LOSS with DAY validity. Called first by every OMS validator
+/// MARKET orders ARE allowed (H4a, owner decision 2026-11-28, card "Send
+/// MARKET, Dhan converts": "always it should be market order"). Dhan converts
+/// an API MARKET order into a LIMIT with Market Price Protection before it
+/// reaches the exchange (Dhan support: "Market Orders placed via APIs are
+/// automatically converted into Limit Orders with Market Price Protection
+/// (MPP) applied"), and the order tracker follows every order until it
+/// executes. An IOC order can lapse silently and STOP_LOSS_MARKET was not
+/// part of that decision, so both stay refused. Called first by every OMS validator
 /// (place, modify, super place and modify, forever/OCO), before the dry-run
 /// branch and before any budget or rate slot is spent. `validity` is `None`
 /// where the request carries none (super orders).
@@ -113,15 +110,11 @@ pub(crate) fn refuse_retail_algo_disallowed(
     validity: Option<OrderValidity>,
 ) -> Result<(), OmsError> {
     let refusal: Option<(&'static str, &'static str)> = match order_type {
-        OrderType::Market => Some((
-            "market",
-            "MARKET orders are not allowed (SEBI retail-algo rules; send a LIMIT order)",
-        )),
         OrderType::StopLossMarket => Some((
             "stop_loss_market",
             "STOP_LOSS_MARKET orders are not allowed (send STOP_LOSS with a limit price)",
         )),
-        OrderType::Limit | OrderType::StopLoss => match validity {
+        OrderType::Market | OrderType::Limit | OrderType::StopLoss => match validity {
             Some(OrderValidity::Ioc) => Some(("ioc", "IOC validity is not allowed (send DAY)")),
             Some(OrderValidity::Day) | None => None,
         },
@@ -130,7 +123,6 @@ pub(crate) fn refuse_retail_algo_disallowed(
         return Ok(());
     };
     match kind {
-        "market" => metrics::counter!("tv_oms_order_refused_total", "kind" => "market"),
         "stop_loss_market" => {
             metrics::counter!("tv_oms_order_refused_total", "kind" => "stop_loss_market")
         }
@@ -154,9 +146,9 @@ pub(crate) fn refuse_retail_algo_disallowed(
 /// Rules (Ruling 3 / §3.2 of the 2026-07-14 design):
 /// - price / target / stop-loss / trailing must be FINITE (NaN/∞ slip
 ///   through the engine's ordering validator — Verified);
-/// - entry `order_type` must be LIMIT (Cluster H2b: MARKET refused by
-///   [`refuse_retail_algo_disallowed`]; super orders also reject SL/SLM —
-///   portal 04:51);
+/// - entry `order_type` ∈ {LIMIT, MARKET} (super orders reject SL/SLM —
+///   portal 04:51; MARKET allowed again by H4a, Dhan converts it);
+/// - MARKET ⇒ `price == 0.0` (mirror of the plain-order rule; probe U1);
 /// - `quantity > 0` and a lot multiple when `lot_size > 1`;
 /// - `trailing_jump >= 0.0` and, when non-zero, strictly below
 ///   `|price - stop_loss_price|` (Assumed A6 sanity bound);
@@ -181,12 +173,18 @@ pub fn validate_super_order_request(r: &PlaceSuperOrderRequest) -> Result<(), Om
         }
     }
 
-    if r.order_type != OrderType::Limit {
+    if !matches!(r.order_type, OrderType::Limit | OrderType::Market) {
         return Err(OmsError::RiskRejected {
             reason: format!(
-                "super order entry leg must be LIMIT, got {}",
+                "super order entry leg must be LIMIT or MARKET, got {}",
                 r.order_type.as_str()
             ),
+        });
+    }
+
+    if r.order_type == OrderType::Market && r.price != 0.0 {
+        return Err(OmsError::RiskRejected {
+            reason: format!("MARKET super order must have price=0.0, got {}", r.price),
         });
     }
 
@@ -237,7 +235,7 @@ pub fn validate_super_order_request(r: &PlaceSuperOrderRequest) -> Result<(), Om
 ///
 /// Rules (07b §1): `product_type` ∈ {CNC, MTF} ONLY (Forever orders are
 /// structurally NOT the intraday F&O exit vehicle — wired for completeness);
-/// `order_type` LIMIT only (Cluster H2b: MARKET and IOC refused); price + trigger positive AND finite;
+/// `order_type` ∈ {LIMIT, MARKET} (IOC refused, Cluster H2b); price + trigger positive AND finite;
 /// `quantity > 0`; when the OCO leg is present, all three of its fields
 /// positive/finite; I-P0-03 expiry gate.
 pub fn validate_forever_oco(r: &PlaceForeverOcoRequest) -> Result<(), OmsError> {
@@ -253,10 +251,10 @@ pub fn validate_forever_oco(r: &PlaceForeverOcoRequest) -> Result<(), OmsError> 
         });
     }
 
-    if r.order_type != OrderType::Limit {
+    if !matches!(r.order_type, OrderType::Limit | OrderType::Market) {
         return Err(OmsError::RiskRejected {
             reason: format!(
-                "forever/OCO order type must be LIMIT, got {}",
+                "forever/OCO order type must be LIMIT or MARKET, got {}",
                 r.order_type.as_str()
             ),
         });
@@ -585,15 +583,12 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_super_order_request_refuses_market_with_zero_price() {
-        // Cluster H2b: MARKET is refused whatever its price.
+    fn test_validate_super_order_request_accepts_market_with_zero_price() {
+        // H4a: a MARKET super entry at price 0 is accepted again.
         let mut r = super_req();
         r.order_type = OrderType::Market;
         r.price = 0.0;
-        assert!(matches!(
-            validate_super_order_request(&r),
-            Err(OmsError::RiskRejected { reason }) if reason.contains("MARKET") && reason.contains("not allowed")
-        ));
+        assert!(validate_super_order_request(&r).is_ok());
     }
 
     #[test]
@@ -1304,7 +1299,6 @@ mod tests {
                 security_id: 13,
                 exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
                 freeze_limit: 1800,
-                close_price: Some(100.0),
             },
             ExitCommand::PlaceBracket(super_req()),
             ExitCommand::TightenStop {
@@ -1332,7 +1326,8 @@ mod tests {
     // --- Cluster H2b: refuse MARKET, STOP_LOSS_MARKET and IOC ---
 
     /// Every order type × every validity (and "no validity"): refused
-    /// exactly when MARKET, STOP_LOSS_MARKET, or IOC on a LIMIT/STOP_LOSS.
+    /// exactly when STOP_LOSS_MARKET, or IOC on any other type. MARKET is
+    /// allowed (H4a, owner 2026-11-28).
     /// The full product is 4 × 3 = 12 cases, so it is enumerated, not sampled.
     #[test]
     fn test_refuse_retail_algo_disallowed_every_type_and_validity() {
@@ -1347,8 +1342,7 @@ mod tests {
         for order_type in order_types {
             for validity in validities {
                 let expect_refused =
-                    matches!(order_type, OrderType::Market | OrderType::StopLossMarket)
-                        || validity == Some(OrderValidity::Ioc);
+                    order_type == OrderType::StopLossMarket || validity == Some(OrderValidity::Ioc);
                 let result = refuse_retail_algo_disallowed(order_type, validity);
                 assert_eq!(
                     result.is_err(),
@@ -1364,8 +1358,8 @@ mod tests {
                 }
             }
         }
-        // MARKET ×3 + SLM ×3 + IOC on LIMIT and STOP_LOSS = 8.
-        assert_eq!(refused, 8, "the refusal set must not silently shrink");
+        // SLM ×3 + IOC on MARKET, LIMIT and STOP_LOSS = 6.
+        assert_eq!(refused, 6, "the refusal set must not silently shrink");
     }
 
     #[test]
@@ -1375,7 +1369,11 @@ mod tests {
                 Err(OmsError::RiskRejected { reason }) => reason,
                 other => panic!("expected a refusal, got {other:?}"),
             };
-        assert!(reason(OrderType::Market, None).contains("MARKET"));
+        assert!(
+            refuse_retail_algo_disallowed(OrderType::Market, Some(OrderValidity::Day)).is_ok(),
+            "a DAY MARKET is allowed (H4a)"
+        );
+        assert!(reason(OrderType::Market, Some(OrderValidity::Ioc)).contains("IOC"));
         assert!(
             reason(OrderType::StopLossMarket, Some(OrderValidity::Day))
                 .contains("STOP_LOSS_MARKET")
@@ -1384,16 +1382,22 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_forever_oco_refuses_market_slm_and_ioc() {
-        for order_type in [OrderType::Market, OrderType::StopLossMarket] {
+    fn test_validate_forever_oco_refuses_slm_and_ioc_accepts_market() {
+        let mut market = forever_req();
+        market.order_type = OrderType::Market;
+        assert!(
+            validate_forever_oco(&market).is_ok(),
+            "MARKET allowed (H4a)"
+        );
+        {
             let mut r = forever_req();
-            r.order_type = order_type;
+            r.order_type = OrderType::StopLossMarket;
             assert!(
                 matches!(
                     validate_forever_oco(&r),
                     Err(OmsError::RiskRejected { reason }) if reason.contains("not allowed")
                 ),
-                "{order_type:?} must be refused by the H2b refusal, not a later check"
+                "STOP_LOSS_MARKET must be refused by the H2b refusal, not a later check"
             );
         }
         // Before H2b forever/OCO never checked validity, so IOC got through.
