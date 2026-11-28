@@ -40,6 +40,10 @@ name: deploy-aws
 on:
   workflow_dispatch:
     inputs:
+      automatic_retry:
+        description: 'Automatic caller. Respect the EC2 operating window before starting a stopped host.'
+        type: boolean
+        default: false
       confirm_market_hours:
         description: 'Deploying during market hours? Choose "yes" to override the guard.'
         required: false
@@ -667,13 +671,13 @@ jobs:
         # cases, two behaviours:
         #
         #   A. The box SHOULD be up now (08:30-16:30 IST Mon-Fri, OR this run is
-        #      a manual/after-close workflow_dispatch). If it's stopped, the
+        #      a direct dispatch or a manually requested wrapper run). If it's stopped, the
         #      08:30 EventBridge start silently failed (see scripts/aws-autopilot.sh
         #      EventBridge diagnostic). SELF-HEAL: start it here + wait for the
         #      SSM agent to report Online, then proceed with the deploy. This is
         #      the fix for the 2026-06-02 "box never auto-started" incident.
         #
-        #   B. The box is intentionally stopped (overnight / weekend push,
+        #   B. The box is intentionally stopped (overnight / weekend push or scheduled retry,
         #      outside the up-window). Do NOT start it (would bill ~₹2/hr off-
         #      schedule, breaching the budget lock). Skip the deploy: set
         #      DEPLOY_SKIP_REASON so EVERY downstream step (S3 upload, SSM swap,
@@ -709,23 +713,23 @@ jobs:
         env:
           REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
           IID: ${{ env.IID }}
-          EVENT_NAME: ${{ github.event_name }}
+          DEPLOY_ORIGIN: ${{ inputs.automatic_retry && 'automatic_retry' || github.event_name }}
         run: |
           set -uo pipefail
-          # Up-window = 08:30-16:30 IST Mon-Fri (the EventBridge schedule window;
-          # back to 16:30 on 2026-10-22 per operator Quote 37 (17:30 from Quote 14), recorded in
-          # daily-universe-scope-expansion-2026-05-27.md. That quote moved FOUR
-          # coupled sites in lockstep; this workflow was a FIFTH nobody listed,
-          # and it kept the old 16:30 until 2026-08-27).
-          DOW=$(TZ='Asia/Kolkata' date +%u)            # 1=Mon..7=Sun
-          HHMM=$(TZ='Asia/Kolkata' date +%H%M); HHMM=$((10#$HHMM))
-          UP_WINDOW=no
-          if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -le 1630 ]; then UP_WINDOW=yes; fi
-          # A manual run or the after-close cron dispatch (workflow_dispatch)
-          # always intends the box up — self-start regardless of clock.
-          SHOULD_BE_UP=no
-          if [ "$UP_WINDOW" = "yes" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then SHOULD_BE_UP=yes; fi
-          echo "IST dow=$DOW time=$HHMM up_window=$UP_WINDOW event=$EVENT_NAME should_be_up=$SHOULD_BE_UP"
+          # Check the clock in the child: the scheduler, build, EC2 transition,
+          # or SSM fence reads can carry a retry past the scheduled stop.
+          guard_start_window() {
+            if [ "$DEPLOY_ORIGIN" = workflow_dispatch ]; then return 0; fi
+            local DOW HHMM UP_WINDOW=no
+            read -r DOW HHMM < <(TZ=Asia/Kolkata date '+%u %H%M') || exit 1
+            HHMM=$((10#$HHMM))
+            # EventBridge can already be stopping the box during the 16:30 minute.
+            if [ "$DOW" -le 5 ] && [ "$HHMM" -ge 830 ] && [ "$HHMM" -lt 1630 ]; then UP_WINDOW=yes; fi
+            if [ "$UP_WINDOW" = yes ]; then return 0; fi
+            echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
+            echo "::notice::Keeping the EC2 instance stopped at $HHMM IST ($DEPLOY_ORIGIN)."
+            exit 0
+          }
 
           state() {
             aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
@@ -743,16 +747,7 @@ jobs:
           if [ "$ST" = "running" ]; then echo "instance already running — proceeding with deploy"; exit 0; fi
           if [ "$ST" != "stopped" ]; then echo "::error::instance in unexpected state '$ST' — not safe to deploy"; exit 1; fi
 
-          if [ "$SHOULD_BE_UP" != "yes" ]; then
-            echo "DEPLOY_SKIP_REASON=intentional_stopped" >> "$GITHUB_ENV"
-            echo "::notice::Box is intentionally stopped (outside 08:30-16:30 IST Mon-Fri up-window) and this is an auto push — skipping deploy without paging. REDEPLOY COVER: if no deploy-aws run exists for this SHA (a bot merge, whose push run GitHub suppresses) postmerge-catchup dispatches one only on an ordinary IST trading day (never a weekend, holiday or Muhurat date) between 15:45 and 16:05 IST, when the box is already up by schedule, so the catch-up never starts the box (2026-11-07). If THIS skipped run already covers the SHA (a human merge) the cover is the deploy-watchdog at 08:50 IST Mon-Fri, which dispatches after-close by workflow_dispatch and so bypasses the prep-window gate, with the post-close crons at 15:46 / 16:16 / 17:01 IST as backstop. It is NOT the 08:45 IST cron -- that slot sits inside the 08:15-09:15 IST prep window and is always suppressed. A manual dispatch deploys immediately, any hour, any day."
-            # Exit ZERO: an intentional skip is a deliberate no-op, not a deploy
-            # failure. DEPLOY_SKIP_REASON is now set, so every downstream step
-            # below is gated `if: env.DEPLOY_SKIP_REASON == ''` and cleanly no-ops
-            # (no SSM against a down box, no false success/failure Telegram). The
-            # run is GREEN. A real failure (box up + error) never reaches here.
-            exit 0
-          fi
+          guard_start_window
 
           # Audit PR30 (2026-09-27): a budget stop stays stopped for the UTC
           # billing month. The latch is read before the start, for every
@@ -777,9 +772,9 @@ jobs:
           # 2026-10-20: the holiday gate (holiday_gate.rs) stamps today's IST
           # date into this marker before it stops the box on a weekday NSE
           # holiday. Every dispatcher (deploy-watchdog, deploy-aws-after-close,
-          # postmerge-catchup) runs this workflow by workflow_dispatch, which
-          # sets SHOULD_BE_UP=yes, so without this check a holiday redeploy
-          # would start the box the gate just stopped. The same strict reader
+          # postmerge-catchup) runs this workflow by workflow_dispatch.
+          # Without the marker, a daytime retry or explicit dispatch could
+          # wake the box the holiday gate just stopped. The same strict reader
           # validates this date and refuses an unknown result before starting.
           # GitHub role already reads this parameter (oidc.tf). A valid matching
           # marker is a green no-op; unreadable/invalid is a loud refusal.
@@ -788,7 +783,8 @@ jobs:
             echo "DEPLOY_SKIP_REASON=holiday_stop" >> "$GITHUB_ENV"; echo "::notice::DEPLOY_FENCE holiday=matching — leaving the holiday-stopped box stopped; no override attempted."; exit 0
           fi
 
-          echo "box stopped but SHOULD be up — starting it (EventBridge start likely failed)"
+          guard_start_window
+          echo "Starting the stopped box for deploy ($DEPLOY_ORIGIN)."
           # Record that THIS run started a stopped box, so the final auto-stop
           # step below can stop it again if we are now OUTSIDE the 08:30-16:30
           # IST Mon-Fri up-window (e.g. an after-close workflow_dispatch deploy).

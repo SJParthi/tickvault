@@ -64,7 +64,8 @@
 //!   while it runs the blocking closure and idles in the blocking pool
 //!   (about 10 s), so its wait as a blocking thread counts too. The series
 //!   answers "did the main runtime's threads wait for a CPU", not "how long
-//!   did the drain task wait"; the task-level queueing is `ring_dwell`.
+//!   did the drain task wait". `ring_dwell` measures frame age at the drain
+//!   and includes work on the socket reader before the frame is queued.
 //! * On macOS, or wherever `/proc` cannot be read, nothing is published and
 //!   nothing is logged: an absent series means "not measured here", never 0.
 //!

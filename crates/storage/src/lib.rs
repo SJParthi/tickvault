@@ -416,6 +416,7 @@ pub(crate) mod wal_clock_step;
 // WAL replay settle step (2026-10-13, DA-13c): an acked replay batch is archived
 // only after the durability lag and two clean QuestDB probes.
 pub mod wal_replay_settle;
+mod wal_segment_move;
 // Bounded WAL unapplied ranges (2026-10-20, plan item PR W): the backlog guard,
 // the boot fold and an inherited overflow become at most 32 ranges in a sidecar,
 // so the WAL stops growing behind an unbounded overflow bit.

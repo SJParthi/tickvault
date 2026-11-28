@@ -1507,3 +1507,45 @@ wrote `.done`, releasing 2026-11-20. The runner, `day_repair_ssm.rs`, the
 workflow and their budget rows were deleted in the next PR, and their paths
 joined `RETIRED_ONE_OFF_PATHS`. The box subcommand `tickvault day-repair`
 stays as the record of what ran; it sends no shell.
+
+## §0.22. 2026-11-25 — timestamped Dhan index quotes in Stocks
+
+The requested Stocks reference view (§0.17) includes a row of index prices.
+The operator may request recent stored quotes for Nifty 50, Nifty Next 50,
+Nifty Bank, India VIX and FinNifty through the existing authenticated SQL
+reader. The query covers 60 seconds of Dhan index ticks and returns up to
+five rows. The page shows the IST tick time, expires old prices, and clears
+prices on lock or entry into a historical view. GIFT Nifty has no verified
+quote source in this read.
+
+With the concurrent disk readout correction, the measured operator-console
+JavaScript is 37,694 UTF-8 bytes and 350 lines
+including script tags. The guard records the byte count for this page.
+
+## §0.23. 2026-11-25 — Stocks selections and measured connection health
+
+The requested Stocks view adds six watchlist slots, symbol lookup on explicit
+submit, and selectors for intraday movers and open-at-high or open-at-low stocks. The page
+uses the existing authenticated Stocks action. Rust compares intraday prices with
+the previous close and evaluates opening extremes from the same exchange tick.
+The MTF view reads the dated leverage multiple in Dhan’s daily instrument
+master. Saved watchlist selections stay in the browser tab.
+
+The operator latency screen displays receive-buffer readings from the app and
+validates the database response before showing elapsed time. The existing
+read-only SSM commands retain the three bounded HTTP reads. Their measured
+string literals total 27 lines and 1,819 bytes. The reviewed console script
+is 581 lines and 49,746 bytes, including script tags.
+
+## §0.24. 2026-11-26 — Private Telegram entry to Stocks and Status
+
+The Open Tickvault button in the private bot chat starts a read-only portal
+session. The browser removes the Telegram launch parameters from the address
+bar before requesting a session from the same origin. Rust authenticates
+the signed launch and authorizes the two read actions. The browser keeps the
+returned credential in memory until its expiry or until the viewer leaves.
+Opening the ordinary portal URL still supports the existing device key.
+
+The browser code for session expiry, navigation and access to Stocks and
+Status brings the existing operator console script to 661 lines and 53,057
+bytes, including its script tags. The page has 21 inline event handlers.

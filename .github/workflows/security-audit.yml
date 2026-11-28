@@ -47,5 +47,5 @@ jobs:
       - name: Supply chain check (CVEs + licenses + bans + sources)
         run: cargo deny check
 
-      - name: Check for yanked crates
-        run: cargo audit --deny yanked
+      - name: Audit all tracked Cargo lockfiles
+        run: git ls-files -z -- '*Cargo.lock' | xargs -0 -n1 cargo audit --deny yanked --file

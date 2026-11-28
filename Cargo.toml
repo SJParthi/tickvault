@@ -42,6 +42,8 @@ futures-util = "=0.3.34"
 # ---- Section 3: Data Pipeline ----
 papaya = "=0.2.5"
 crossbeam-channel = "=0.5.17"
+# The frame ring closes admission atomically before its final drain.
+concurrent-queue = "=2.5.0"
 # ringbuf removed 2026-06-10 (operator-approved dead-pin cleanup): zero
 # consumers — hot-path ring buffers use rtrb + crossbeam-channel.
 # Wave 6 Sub-PR #1 (2026-05-10): per-cell mutex for the multi-TF
@@ -120,7 +122,7 @@ rkyv = { version = "=0.8.18", features = ["std", "bytecheck"] }
 csv = "=1.4.0"
 thiserror = "=2.0.21"
 anyhow = "=1.0.104"
-bytes = "=1.12.1"
+bytes = "=1.12.2"
 sha2 = "=0.11.1"
 
 # ---- Section 12: System & Resilience ----
@@ -144,6 +146,8 @@ sha2 = "=0.11.1"
 # the spill/rescue free-space probe. Same version, no new package; the edge
 # from tickvault-storage is new and is flagged for the owner in that change.
 libc = "=0.2.191"
+# Safe exclusive rename and on-inode replay provenance for archived WAL segments.
+rustix = { version = "=1.1.6", features = ["fs"] }
 notify = "=8.2.2"
 # signal-hook-tokio removed in S11 — dead dep with zero references across
 # crates/ and fuzz/. signal-hook itself is kept because crates/app/Cargo.toml
@@ -154,7 +158,7 @@ arrayvec = "=0.7.8"
 
 # ---- Section 14: Security & Secrets ----
 secrecy = { version = "=0.10.3", features = ["serde"] }
-zeroize = { version = "=1.9.1", features = ["derive"] }
+zeroize = { version = "=1.9.2", features = ["derive"] }
 
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
@@ -234,7 +238,7 @@ flate2 = "=1.1.11"
 # resolved in Cargo.lock (transitive via criterion/proptest and others);
 # this promotes it to a direct pin — the aws-lc-rs / flate2 promotion
 # precedent above. Flagged in the PR body for operator visibility.
-regex = "=1.13.1"
+regex = "=1.13.2"
 
 # ---- Section 11d: QuestDB-console Lambda pair (rust-only phase 2b-3) ----
 # 2026-07-18: the qdb-console-proxy / qdb-console-front handler.py ports
@@ -253,7 +257,7 @@ form_urlencoded = "=1.2.3"
 # ---- Section 16: CLI ----
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "=1.29.2", features = ["v4", "serde"] }
+uuid = { version = "=1.29.3", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 

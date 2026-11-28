@@ -62,6 +62,7 @@ pub mod pool_budget;
 pub mod hot_thread_placement;
 pub mod pool_supervisor;
 pub mod reader_runtime;
+pub mod receive_buffer;
 pub mod reconnect_ladder;
 // 2026-10-20: the frame-silence gate stays shut all day on an NSE holiday or
 // weekend (569 holiday redials on 2026-10-20 measured the gap).

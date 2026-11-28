@@ -36,6 +36,31 @@ use tickvault_storage::feed_scoreboard_persistence::CoverageSource;
 fn setup_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        use tickvault_common::config::TradingConfig;
+        use tickvault_common::trading_calendar::TradingCalendar;
+        let cfg: TradingConfig = serde_json::from_value(serde_json::json!({
+            "market_open_time": "09:15:00", "market_close_time": "15:40:00",
+            "order_cutoff_time": "15:14:00", "data_collection_start": "09:00:00",
+            "data_collection_end": "16:00:00", "timezone": "Asia/Kolkata",
+            "max_orders_per_second": 10,
+            "nse_holidays": [
+                {"date": "2024-12-25", "name": "Christmas"},
+                {"date": "2026-12-25", "name": "Christmas"}
+            ],
+            "muhurat_trading_dates": [
+                {"date": "2026-11-08", "name": "Diwali", "session_start_ist": "14:05", "session_end_ist": "15:40"},
+                {"date": "2026-11-22", "name": "Sunday evening", "session_start_ist": "18:00", "session_end_ist": "19:00"},
+                {"date": "2026-11-11", "name": "Test evening", "session_start_ist": "18:00", "session_end_ist": "19:00"},
+                {"date": "2026-11-15", "name": "Unpublished hours", "session_start_ist": "", "session_end_ist": ""}
+            ]
+        }))
+        .unwrap();
+        let calendar = TradingCalendar::from_config(&cfg).unwrap();
+        assert!(
+            tickvault_common::market_hours::set_market_calendar_for_session(std::sync::Arc::new(
+                calendar
+            ))
+        );
         let existing = std::env::var("NO_PROXY").unwrap_or_default();
         let no_proxy = if existing.is_empty() {
             "127.0.0.1,localhost".to_string()
@@ -526,6 +551,20 @@ fn rich_responses(dropped_metric: u64) -> Responses {
             807,
             true,
         ),
+        // Earlier Dhan writers labelled the subscribe acknowledgement "connected"
+        // even when it closed a measured gap on that slot (Nov 27 live audit).
+        serde_json::json!([
+            ts_micros(hms(11, 0)) + 1_359_101,
+            "dhan",
+            "main_feed",
+            1,
+            "connected",
+            "main_feed",
+            -1,
+            1,
+            true,
+            0
+        ]),
         ws_row(
             hms(16, 0),
             "dhan",
@@ -638,7 +677,7 @@ fn rich_responses(dropped_metric: u64) -> Responses {
     let minutes = dataset(vec![
         serde_json::json!(["2024-10-04T09:15:00.000000Z"]),
         serde_json::json!(["2024-10-04T09:16:00.000000Z"]),
-        serde_json::json!(["2024-10-04T15:39:00.000000Z"]),
+        serde_json::json!(["2024-10-04T15:29:00.000000Z"]),
     ]);
     Responses {
         ws: ok(&ws),
@@ -654,7 +693,13 @@ fn rich_responses(dropped_metric: u64) -> Responses {
         other_minutes: ok(EMPTY),
         metrics: ok(&format!(
             "# TYPE tv_ws_event_audit_dropped_total counter\n\
-             tv_ws_event_audit_dropped_total{{ws_type=\"main_feed\"}} {dropped_metric}\n"
+             tv_ws_event_audit_dropped_total{{reason=\"subscription_change\"}} {dropped_metric}\n\
+             tv_ws_event_audit_dropped_total{{reason=\"live_feed_lifecycle\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"live_feed_forward\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"full\"}} 0\n\
+             tv_ws_event_audit_dropped_total{{reason=\"closed\"}} 0\n\
+             tv_ws_event_audit_write_errors_total{{stage=\"append\"}} 0\n\
+             tv_ws_event_audit_write_errors_total{{stage=\"flush\"}} 0\n"
         )),
         write_status: 204,
         default: ok(EMPTY),
@@ -695,7 +740,11 @@ async fn test_feed_scoreboard_run_rich_day_keeps_degraded_lag_coverage_and_feed_
     assert_eq!(d.ticks, 1234);
     assert_eq!(d.instruments, 50);
     assert_eq!(d.streaming_minutes, 3);
-    assert_eq!(d.reconnects, 1, "one market-data reconnect");
+    assert_eq!(summary.session_minutes, 375);
+    assert_eq!(
+        d.reconnects, 2,
+        "explicit and historical market-data reconnects"
+    );
     // 10:00 (kept existing verdict) + 11:00 on main_feed; the order-update
     // drop is not a headline disconnect.
     assert_eq!(d.disconnects_market, 2);
@@ -730,6 +779,170 @@ async fn test_feed_scoreboard_run_rich_day_keeps_degraded_lag_coverage_and_feed_
     // The suppressed 10:00 row is not rewritten; the 11:00 one is.
     assert!(writes.contains("dhan_code=807i"), "{writes}");
     assert!(!writes.contains("dhan_code=805i"), "{writes}");
+}
+
+#[test]
+fn test_scoreboard_trigger_for_date_uses_the_final_dated_session() {
+    use tickvault_app::feed_scoreboard_boot::{
+        ScoreboardStart, decide_scoreboard_start, scoreboard_trigger_for_date,
+    };
+    setup_env();
+    let regular = 15 * 3600 + 45 * 60;
+    let at = |date: &str| {
+        scoreboard_trigger_for_date(
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            regular,
+        )
+    };
+    assert_eq!(at("2026-11-26"), Some(regular));
+    assert_eq!(at("2026-11-08"), Some(regular)); // Official Sunday session
+    let evening = at("2026-11-11").unwrap();
+    assert_eq!(evening, 19 * 3600 + 5 * 60);
+    assert_eq!(
+        decide_scoreboard_start(regular, true, false, evening),
+        ScoreboardStart::SleepThenRun(u64::from(evening - regular))
+    );
+    assert_eq!(at("2026-11-15"), None); // session announced, hours missing
+    assert_eq!(at("2026-12-25"), None); // published regular holiday
+    assert_eq!(at("2027-01-05"), None); // calendar expired
+}
+
+#[tokio::test]
+async fn test_special_evening_reconnect_does_not_hide_a_measured_zero() {
+    setup_env();
+    let (day, label) =
+        tickvault_app::feed_scoreboard_boot::parse_scoreboard_date_override("2026-11-22").unwrap();
+    let epoch = i64::try_from(day).unwrap() * 86_400;
+    let mut r = rich_responses(0);
+    r.daily = ok(EMPTY);
+    r.ws = ok(&dataset(vec![
+        serde_json::json!([
+            (epoch + hms(8, 30)) * 1_000_000,
+            "dhan",
+            "main_feed",
+            0,
+            "sleep_entered",
+            "feed_disabled",
+            -1,
+            0,
+            false
+        ]),
+        serde_json::json!([
+            (epoch + hms(18, 1)) * 1_000_000,
+            "dhan",
+            "main_feed",
+            0,
+            "connected",
+            "broker",
+            -1,
+            0,
+            true
+        ]),
+    ]));
+    r.dhan_ticks = ok(r#"{"dataset":[[0]]}"#);
+    r.dhan_minutes = ok(EMPTY);
+    let server = FakeQuestDb::start(r);
+    let summary = run_feed_scoreboard(
+        &server.questdb(),
+        server.port,
+        day,
+        label,
+        false,
+        false,
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!summary.dhan_feed_off);
+    assert_eq!(summary.dhan.streaming_minutes, 0);
+    assert_eq!(summary.session_minutes, 60);
+}
+
+#[tokio::test]
+async fn test_scoreboard_full_auction_day_persists_the_same_measured_window() {
+    setup_env();
+    let (day, label) =
+        tickvault_app::feed_scoreboard_boot::parse_scoreboard_date_override("2026-11-26").unwrap();
+    let mut r = rich_responses(0);
+    let minutes = (9 * 60 + 15..15 * 60 + 40)
+        .map(|minute| {
+            serde_json::json!([format!(
+                "2026-11-26T{:02}:{:02}:00.000000Z",
+                minute / 60,
+                minute % 60
+            )])
+        })
+        .collect();
+    r.dhan_minutes = ok(&dataset(minutes));
+    r.daily = ok(EMPTY);
+    let server = FakeQuestDb::start(r);
+    let summary = run_feed_scoreboard(
+        &server.questdb(),
+        server.port,
+        day,
+        label,
+        false,
+        false,
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.dhan.streaming_minutes, 385);
+    assert_eq!(summary.session_minutes, 385);
+    assert_eq!(summary.dhan.covered_instrument_minutes, -1);
+    assert_eq!(summary.dhan.unique_win_minutes, -1);
+    let writes = server.writes();
+    let dhan = writes
+        .iter()
+        .flat_map(|write| write.lines())
+        .find(|line| line.starts_with("feed_scoreboard_daily,") && line.contains("feed=dhan"))
+        .unwrap();
+    assert!(dhan.contains("streaming_minutes=385i"), "{dhan}");
+    assert!(dhan.contains("session_minutes=385i"), "{dhan}");
+    let uptime = dhan
+        .split_once("uptime_pct=")
+        .unwrap()
+        .1
+        .split([',', ' '])
+        .next()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert_eq!(uptime, 100.0);
+    assert!(dhan.contains("coverage_source=sql_backfill"), "{dhan}");
+}
+
+#[tokio::test]
+async fn test_covered_calendar_session_day_missing_circular_keeps_sql_coverage_unknown() {
+    setup_env();
+    // The fake calendar has 2024 and 2026 circulars only. 1 July
+    // 2025 is a weekday in the gap.
+    let (day, label) =
+        tickvault_app::feed_scoreboard_boot::parse_scoreboard_date_override("2025-07-01").unwrap();
+    let server = FakeQuestDb::start(rich_responses(0));
+    let summary = run_feed_scoreboard(
+        &server.questdb(),
+        server.port,
+        day,
+        label,
+        false,
+        false,
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(summary.partial_coverage);
+    assert_eq!(summary.session_minutes, -1);
+    assert_eq!(summary.dhan.streaming_minutes, -1);
 }
 
 #[tokio::test]
@@ -1452,4 +1665,249 @@ fn test_feed_scoreboard_synthesize_out_of_order_rows_pick_last_pre_and_earliest_
     assert_eq!(deaths[0].gap_upper_bound_secs, hms(11, 5) - hms(10, 0));
     assert!(deaths[0].market_hours);
     assert!(!deaths[0].post_close_restart);
+}
+
+#[tokio::test]
+async fn same_day_socket_audit_counters_control_stored_outcome() {
+    setup_env();
+    let drops = "tv_ws_event_audit_dropped_total";
+    let append = r#"tv_ws_event_audit_write_errors_total{stage="append"}"#;
+    let flush = r#"tv_ws_event_audit_write_errors_total{stage="flush"}"#;
+    // None omits the series from the scrape, matching an exporter with
+    // incomplete evidence. Values are strings so malformed samples survive.
+    let expected_reasons = [
+        "subscription_change",
+        "live_feed_lifecycle",
+        "live_feed_forward",
+        "full",
+        "closed",
+    ];
+    let scrape = |d: Option<&str>, a: Option<&str>, f: Option<&str>| {
+        let mut lines = Vec::new();
+        if let Some(raw) = d {
+            for reason in expected_reasons {
+                lines.push(format!("{drops}{{reason=\"{reason}\"}} {raw}"));
+            }
+        }
+        for (metric, value) in [(append, a), (flush, f)] {
+            if let Some(raw) = value {
+                lines.push(format!("{metric} {raw}"));
+            }
+        }
+        ok(&lines.join("\n"))
+    };
+    let writer_zeros = format!("{append} 0\n{flush} 0");
+    let zero = Some("0");
+    let pos = Some("3");
+    let bad = Some("NaN");
+    let cases = [
+        ("all zero", scrape(zero, zero, zero), true, "complete"),
+        ("producer drops", scrape(pos, zero, zero), true, "degraded"),
+        (
+            "fractional drops",
+            scrape(Some("0.5"), zero, zero),
+            true,
+            "partial",
+        ),
+        (
+            "zero plus invalid",
+            scrape(
+                Some(&format!("0\n{drops}{{reason=\"closed\"}} NaN")),
+                zero,
+                zero,
+            ),
+            true,
+            "partial",
+        ),
+        (
+            "positive plus invalid",
+            scrape(
+                Some(&format!("2\n{drops}{{reason=\"closed\"}} NaN")),
+                zero,
+                zero,
+            ),
+            true,
+            "degraded",
+        ),
+        ("HTTP 503", status(503), true, "partial"),
+        ("missing drops", scrape(None, zero, zero), true, "partial"),
+        ("invalid drops", scrape(bad, zero, zero), true, "partial"),
+        (
+            "missing writer counters",
+            scrape(zero, None, None),
+            true,
+            "partial",
+        ),
+        ("missing append", scrape(zero, None, zero), true, "partial"),
+        ("missing flush", scrape(zero, zero, None), true, "partial"),
+        ("invalid append", scrape(zero, bad, zero), true, "partial"),
+        (
+            "invalid flush",
+            scrape(zero, zero, Some("-1")),
+            true,
+            "partial",
+        ),
+        ("append rejected", scrape(zero, pos, zero), true, "degraded"),
+        (
+            "flush failed with unknown delivery",
+            scrape(zero, zero, pos),
+            true,
+            "partial",
+        ),
+        (
+            "append rejected with missing drops",
+            scrape(None, pos, pos),
+            true,
+            "degraded",
+        ),
+        (
+            "drops with missing writer counters",
+            scrape(pos, None, None),
+            true,
+            "degraded",
+        ),
+        (
+            "past day ignores failed scrape",
+            status(503),
+            false,
+            "complete",
+        ),
+        (
+            "past day ignores today's writer failures",
+            scrape(zero, pos, pos),
+            false,
+            "complete",
+        ),
+    ];
+    let mut cases = cases.to_vec();
+    for missing in expected_reasons {
+        let body = expected_reasons
+            .iter()
+            .filter(|&&r| r != missing)
+            .map(|r| format!("{drops}{{reason=\"{r}\"}} 0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cases.push((
+            missing,
+            ok(&format!("{body}\n{writer_zeros}")),
+            true,
+            "partial",
+        ));
+    }
+    cases.extend([
+        (
+            "one seed present",
+            ok(&format!("{drops}{{reason=\"full\"}} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "bare zero",
+            ok(&format!("{drops} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "bare positive",
+            ok(&format!("{drops} 1\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "unknown reason zero",
+            ok(&format!("{drops}{{reason=\"other\"}} 0\n{writer_zeros}")),
+            true,
+            "partial",
+        ),
+        (
+            "subset with positive",
+            ok(&format!("{drops}{{reason=\"full\"}} 2\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "unknown reason positive",
+            ok(&format!("{drops}{{reason=\"new\"}} 2\n{writer_zeros}")),
+            true,
+            "degraded",
+        ),
+        (
+            "zero-like noninteger",
+            scrape(Some("1e-400"), zero, zero),
+            true,
+            "partial",
+        ),
+    ]);
+    let mut discrepancies = Vec::new();
+    for (case, metrics, same_day, expected) in cases {
+        let mut r = rich_responses(0);
+        r.daily = ok(EMPTY);
+        r.boot = ok(EMPTY);
+        r.ws = ok(EMPTY);
+        r.metrics = metrics;
+        let server = FakeQuestDb::start(r);
+        let summary = run_feed_scoreboard(
+            &server.questdb(),
+            server.port,
+            DAY,
+            "2024-10-04".to_string(),
+            false,
+            false,
+            same_day,
+            0,
+            &[],
+            Some((true, false)),
+        )
+        .await
+        .expect("measurable day");
+        let writes = server.writes();
+        let row = writes
+            .iter()
+            .flat_map(|body| body.lines())
+            .find(|line| line.starts_with("feed_scoreboard_daily,") && line.contains("feed=dhan,"))
+            .expect("daily Dhan audit row");
+        let actual = row
+            .split_once("outcome=")
+            .expect("outcome tag")
+            .1
+            .split([',', ' '])
+            .next()
+            .expect("tag value");
+        println!(
+            "{case}: stored={actual}, expected={expected}, partial={} degraded={}",
+            summary.partial_coverage, summary.degraded
+        );
+        if actual != expected
+            || summary.partial_coverage != (expected == "partial")
+            || summary.degraded != (expected == "degraded")
+        {
+            discrepancies.push((case, actual.to_owned(), expected));
+        }
+    }
+    assert!(discrepancies.is_empty(), "{discrepancies:?}");
+}
+
+#[test]
+fn daily_event_kind_only_promotes_legacy_dhan_pool_rows_with_gap_evidence() {
+    let cases = [
+        ("dhan", "main_feed", 0, 0, "connected"),
+        ("dhan", "main_feed", 1, 0, "reconnected"),
+        ("dhan", "main_feed", 0, 1, "reconnected"),
+        ("dhan", "depth_20", 0, 2, "reconnected"),
+        ("dhan", "depth_200", 2, 0, "reconnected"),
+        ("dhan", "main_feed", -1, -1, "connected"),
+        ("dhan", "order_update", 1, 2, "connected"),
+        ("groww", "main_feed", 1, 2, "connected"),
+    ];
+    for (feed, pool, seconds, attempts, expected) in cases {
+        let body = serde_json::json!({"dataset": [
+            [0, feed, pool, 3, "connected", "subscription_ack", -1, seconds, true, attempts]
+        ]});
+        let rows = parse_ws_events(&body.to_string()).expect("valid daily event dataset");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].event_kind, expected,
+            "{feed}/{pool} {seconds}/{attempts}"
+        );
+    }
 }

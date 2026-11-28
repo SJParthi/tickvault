@@ -18,8 +18,11 @@
 //!
 //! Only a bounded GitHub comparison of two exact commit IDs can establish
 //! that the recorded binary is an ancestor of the target and authorize a
-//! deployment request. Equality needs no network comparison. A newer binary,
-//! divergent history, missing credentials, or unavailable comparison never
+//! deployment request. Public repositories permit read-only observations without
+//! credentials. A verified lag with no dispatch credential is reported and
+//! leaves recovery to the normal guarded GitHub workflow. Equality needs no
+//! network comparison. A newer binary, divergent history, missing dispatch
+//! credentials, or an unavailable comparison never
 //! dispatches and never produces an "old build" notification. Unknown and
 //! divergent outcomes remain explicit in structured logs and result JSON.
 //!
@@ -68,6 +71,8 @@ use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
 mod ancestry;
+#[cfg(test)]
+mod public_read_tests;
 use ancestry::{
     BuildComparison, BuildRelation, classify_comparison, comparison_path, validated_full_sha,
 };
@@ -144,16 +149,14 @@ pub fn binary_mismatch_value(binary_sha: Option<&str>, desired_sha: Option<&str>
 
 /// Pick main HEAD from the GitHub answer, falling back to the SSM mirror.
 ///
-/// Why a fallback exists at all: `desired_sha` needs
-/// `/tickvault/<env>/operator/github-token`, and on 2026-09-02 that parameter
-/// did not exist -- so the deploy-provenance comparison had been dead for its
+/// On 2026-09-02 the GitHub reader required an operator token that did not
+/// exist, so the deploy-provenance comparison had been dead for its
 /// whole life while `tv-<env>-binary-sha-stale` read OK, because
 /// treat_missing_data = notBreaching turns a producer that declines to produce
 /// into a healthy-looking alarm. The mirror removes the credential from the
 /// critical path without removing the check.
 ///
-/// The GitHub answer stays PREFERRED, so placing a token later upgrades this
-/// automatically with no further change. "unknown" is rejected as a value
+/// A GitHub answer is preferred regardless of authentication. "unknown" is rejected as a value
 /// because that is the literal the portal writes for an unresolved sha, and
 /// comparing it would manufacture a mismatch out of an absence.
 ///
@@ -247,6 +250,16 @@ async fn cached_param(ssm: &aws_sdk_ssm::Client, name: &str) -> String {
             }
             value
         }
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|err| err.is_parameter_not_found()) =>
+        {
+            info!(
+                param = name,
+                "optional GitHub dispatch credential is absent"
+            );
+            String::new()
+        }
         Err(e) => {
             // The param NAME is safe to log; the value never is.
             error!(code = "LAMBDA-AWS-01", param = name, error = %e, "ssm get_parameter failed");
@@ -290,34 +303,40 @@ async fn read_github_response(mut response: reqwest::Response) -> (u16, Value) {
     (status, parsed)
 }
 
-/// Minimal GitHub REST call. Returns (status, json) — legacy `_gh` parity:
-/// no token -> (0, {"error": "github token not configured"}); transport
-/// failure -> (0, {"error": "github request failed"}); unparsable body on
-/// an HTTP response -> {"error": "github http error"}.
+/// Construct an anonymous GET or an authenticated GET/dispatch on the fixed
+/// GitHub API origin. A missing credential cannot produce a dispatch request.
+fn github_request(
+    client: &reqwest::Client,
+    token: &str,
+    path: &str,
+    dispatch_body: Option<&Value>,
+) -> Option<reqwest::RequestBuilder> {
+    let url = format!("{GITHUB_API_BASE}{path}");
+    let mut request = match dispatch_body {
+        None => client.get(url),
+        Some(_) if token.is_empty() => return None,
+        Some(body) => client.post(url).json(body),
+    };
+    if !token.is_empty() {
+        request = request.bearer_auth(token);
+    }
+    Some(
+        request
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .header("user-agent", "tickvault-deploy-watchdog"),
+    )
+}
+
 async fn gh(
     client: &reqwest::Client,
     token: &str,
-    method: &str,
     path: &str,
-    body: Option<&Value>,
+    dispatch_body: Option<&Value>,
 ) -> (u16, Value) {
-    if token.is_empty() {
+    let Some(req) = github_request(client, token, path, dispatch_body) else {
         return (0, json!({"error": "github token not configured"}));
-    }
-    let url = format!("{GITHUB_API_BASE}{path}");
-    let mut req = if method == "POST" {
-        client.post(&url)
-    } else {
-        client.get(&url)
     };
-    req = req
-        .header("authorization", format!("Bearer {token}"))
-        .header("accept", "application/vnd.github+json")
-        .header("x-github-api-version", "2022-11-28")
-        .header("user-agent", "tickvault-deploy-watchdog");
-    if let Some(b) = body {
-        req = req.header("content-type", "application/json").json(b);
-    }
     match req.send().await {
         Ok(resp) => read_github_response(resp).await,
         // Token-redaction hardening: never log the raw reqwest error here
@@ -336,7 +355,6 @@ async fn desired_sha(
     let (status, body) = gh(
         client,
         token,
-        "GET",
         &format!("/repos/{repo}/commits/{desired_ref}"),
         None,
     )
@@ -360,7 +378,7 @@ async fn deployed_sha(
     let path = format!(
         "/repos/{repo}/actions/workflows/{deploy_workflow}/runs?branch={desired_ref}&status=success&per_page=1"
     );
-    let (status, body) = gh(client, token, "GET", &path, None).await;
+    let (status, body) = gh(client, token, &path, None).await;
     if status == 200 {
         if let Some(first) = body
             .get("workflow_runs")
@@ -383,6 +401,17 @@ async fn deployed_sha(
     None
 }
 
+/// These holds apply only after the binary has been proven behind.
+fn dispatch_hold_reason(holiday_stop: bool, token: &str) -> Option<&'static str> {
+    if holiday_stop {
+        Some("holiday_stop")
+    } else if token.is_empty() {
+        Some("missing_dispatch_credential")
+    } else {
+        None
+    }
+}
+
 /// Trigger the (idempotent, market-hours-guarded) auto-deploy workflow.
 /// Legacy `_dispatch_deploy` — ok iff GitHub answers 201/204.
 async fn dispatch_deploy(
@@ -395,9 +424,8 @@ async fn dispatch_deploy(
     let (status, _) = gh(
         client,
         token,
-        "POST",
         &format!("/repos/{repo}/actions/workflows/{dispatch_workflow}/dispatches"),
-        Some(&json!({"ref": desired_ref})),
+        Some(&json!({"ref": desired_ref, "inputs": {"automatic_retry": true}})),
     )
     .await;
     let ok = status == 201 || status == 204;
@@ -437,8 +465,8 @@ async fn read_sha_param(ssm: &aws_sdk_ssm::Client, param: &str) -> Option<String
     }
 }
 
-/// Compare immutable commits; a missing token or comparison failure is
-/// uncertainty, including when the target came from an SSM mirror.
+/// Compare immutable commits, including a target from an SSM mirror. A denied
+/// or unavailable read leaves ancestry unknown.
 async fn verify_build_comparison(
     client: &reqwest::Client,
     token: &str,
@@ -456,7 +484,7 @@ async fn verify_build_comparison(
     let Some(path) = comparison_path(repo, binary, desired) else {
         return BuildComparison::unknown("invalid_repository", None);
     };
-    let (status, body) = gh(client, token, "GET", &path, None).await;
+    let (status, body) = gh(client, token, &path, None).await;
     classify_comparison(binary, desired, status, &body)
 }
 
@@ -481,7 +509,7 @@ async fn publish_binary_mismatch_metric(
         // one when the alarm treats no-data as health.
         //
         // Root cause on that day: `/tickvault/<env>/operator/github-token`
-        // does not exist, so `desired_sha` cannot ask GitHub for main HEAD.
+        // did not exist, and the former reader required it for main HEAD.
         // The binary sha itself was fine — written by deploy-aws.yml the day
         // before — so only the COMPARISON was dead.
         //
@@ -661,8 +689,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let desired_from_github = desired_sha(&http, &token, &gh_repo, &gh_desired_ref).await;
     // Only reach for the mirror when GitHub could not answer -- an SSM read
     // per fire is cheap, but a read nobody needs is still a read, and keeping
-    // GitHub on the fast path means the behaviour is unchanged the day a
-    // token is placed.
+    // GitHub on the fast path observes main directly on a public repository.
     let desired_from_mirror = if desired_from_github.is_none() {
         read_sha_param(&ssm, &desired_sha_param).await
     } else {
@@ -717,7 +744,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
         verification_reason = comparison.reason,
         comparison_http_status = ?comparison.http_status,
         github_stale,
-        dispatch_permitted = binary_stale,
+        dispatch_credential_available = !token.is_empty(),
         "deploy-watchdog verdict"
     );
 
@@ -753,18 +780,16 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
     let holiday_marker = crate::start_watchdog::SdkSsm {
         client: ssm.clone(),
     };
-    if crate::start_watchdog::holiday_stop_is_today(
+    let holiday_stop = crate::start_watchdog::holiday_stop_is_today(
         &holiday_marker,
         &holiday_stop_param,
         chrono::Utc::now(),
     )
-    .await
-    {
+    .await;
+    if let Some(reason) = dispatch_hold_reason(holiday_stop, &token) {
         info!(
             window,
-            github_stale,
-            binary_stale,
-            "stale deploy, but the holiday-stop marker is today: the holiday gate stopped the box on purpose — not dispatching a redeploy"
+            github_stale, binary_stale, reason, "verified build lag: watchdog dispatch held"
         );
         return Ok(json!({
             "window": window,
@@ -776,7 +801,7 @@ pub async fn handle(event: Value) -> Result<Value, lambda_runtime::Error> {
             "comparison_http_status": comparison.http_status,
             "desired_source": desired_source,
             "dispatched": false,
-            "skipped": "holiday_stop",
+            "skipped": reason,
         }));
     }
 
@@ -947,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn github_wins_when_it_answers_so_a_token_upgrades_this_automatically() {
+    fn github_wins_when_it_answers() {
         let (sha, src) = resolve_desired_sha(Some("aaaa1111"), Some("bbbb2222"));
         assert_eq!(sha, Some("aaaa1111"));
         assert_eq!(src, "github", "the mirror must never shadow a live answer");
@@ -955,8 +980,7 @@ mod tests {
 
     #[test]
     fn the_mirror_answers_when_github_cannot() {
-        // The 2026-09-02 shape: /tickvault/prod/operator/github-token does not
-        // exist, so desired_sha() returns None and the comparison was dead.
+        // The mirror remains available when a GitHub read fails.
         let (sha, src) = resolve_desired_sha(None, Some("bbbb2222"));
         assert_eq!(sha, Some("bbbb2222"));
         assert_eq!(src, "ssm-mirror");
@@ -1022,7 +1046,7 @@ mod tests {
             .find("crate::start_watchdog::holiday_stop_is_today(")
             .expect("handle must read the holiday-stop marker");
         let skip = body
-            .find("\"skipped\": \"holiday_stop\"")
+            .find("if let Some(reason) = dispatch_hold_reason(holiday_stop, &token)")
             .expect("handle must report the holiday-stop skip");
         let dispatch = body
             .find("dispatch_deploy(")
@@ -1155,9 +1179,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_token_cannot_dispatch_from_a_mirror_mismatch() {
-        // If this short-circuit regresses, an explicit loopback-only proxy
-        // prevents the fixture from reaching GitHub or ambient proxy services.
+    async fn unavailable_public_comparison_cannot_authorize_a_mirror_mismatch() {
+        // The denied loopback proxy keeps this failure fixture offline.
         let http = reqwest::Client::builder()
             .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
             .timeout(Duration::from_secs(1))

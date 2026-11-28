@@ -91,12 +91,12 @@ fn ist() -> FixedOffset {
 }
 
 /// Environment wiring — legacy parity: module-level `os.environ.get` reads
-/// with the same defaults ("" / "" / "3001" / the two SSM param paths).
+/// with an optional canonical portal URL for the start notification.
 #[derive(Debug, Clone)]
 pub struct WatchdogEnv {
     pub instance_id: String,
     pub alerts_topic_arn: String,
-    pub dashboard_port: String,
+    pub operator_portal_url: Option<reqwest::Url>,
     pub keep_alive_param: String,
     pub holiday_stop_param: String,
     /// The budget-stop latch (`budget_stop_latch`): the month a budget stop
@@ -119,7 +119,9 @@ impl WatchdogEnv {
         Self {
             instance_id: std::env::var("EC2_INSTANCE_ID").unwrap_or_default(),
             alerts_topic_arn: std::env::var("ALERTS_TOPIC_ARN").unwrap_or_default(),
-            dashboard_port: std::env::var("DASHBOARD_PORT").unwrap_or_else(|_| "3001".to_string()),
+            operator_portal_url: crate::telegram_webhook::portal_web_app_url(
+                std::env::var("OPERATOR_PORTAL_URL").ok().as_deref(),
+            ),
             keep_alive_param: std::env::var("KEEP_ALIVE_PARAM")
                 .unwrap_or_else(|_| DEFAULT_KEEP_ALIVE_PARAM.to_string()),
             holiday_stop_param: std::env::var("HOLIDAY_STOP_PARAM")
@@ -164,7 +166,13 @@ pub trait SsmApi {
 /// propagates out of the handler exactly like the raised boto3 error would.
 #[allow(async_fn_in_trait)] // APPROVED: handler is generic over the trait (no dyn); futures awaited inline.
 pub trait SnsApi {
-    async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String>;
+    async fn publish(
+        &self,
+        topic_arn: &str,
+        subject: &str,
+        message: &str,
+        with_portal_entry: bool,
+    ) -> Result<(), String>;
 }
 
 /// Legacy `_is_within_operating_hours`: 08:00-17:00 IST on a Monday-Friday.
@@ -437,17 +445,6 @@ pub async fn instance_info<E: Ec2Api>(
     }
 }
 
-/// Legacy `_instance_public_ip` — None on any error / missing IP.
-pub async fn instance_public_ip<E: Ec2Api>(ec2: &E, instance_id: &str) -> Option<String> {
-    match ec2.describe(instance_id).await {
-        Err(exc) => {
-            error!(code = "LAMBDA-AWS-01", error = %exc, "describe_instances for public IP failed");
-            None
-        }
-        Ok(desc) => desc.and_then(|d| d.public_ip).filter(|ip| !ip.is_empty()),
-    }
-}
-
 /// Why a `StartInstances` call was refused.
 ///
 /// This distinction is load-bearing, not cosmetic. Until 2026-08-10 EVERY start
@@ -630,7 +627,10 @@ async fn publish<N: SnsApi>(
         warn!(subject, "ALERTS_TOPIC_ARN unset — cannot publish");
         return Ok(());
     }
-    sns.publish(&env.alerts_topic_arn, subject, message).await
+    let with_portal_entry = subject == crate::telegram_webhook::START_NOTICE_SUBJECT
+        && env.operator_portal_url.is_some();
+    sns.publish(&env.alerts_topic_arn, subject, message, with_portal_entry)
+        .await
 }
 
 /// A box launched this long before the Muhurat box window opened is not one
@@ -838,23 +838,20 @@ The app should report live in ~3 minutes. \
 If you do NOT get a 'tickvault started' message by 8:40 AM, the \
 8:45 AM watchdog will check and start the box itself if needed."
             .to_string();
-        // Append a tappable Feed Control link (IP changes each start — EIP
-        // detached); if it isn't ready yet, degrade gracefully — the
-        // start-triggered message must always send.
-        match instance_public_ip(ec2, &env.instance_id).await {
-            Some(public_ip) => {
-                info!(public_ip = %public_ip, "ping — resolved public IP for dashboard link");
-                message.push_str(&format!(
-                    "\n📊 Dashboard: http://{public_ip}:{}/feeds",
-                    env.dashboard_port
-                ));
-            }
-            None => {
-                info!("ping — public IP not ready; sending without dashboard link");
-                message.push_str("\n📊 Dashboard link not ready yet — try again in a minute.");
-            }
+        if env.alerts_topic_arn.is_empty() {
+            warn!("ALERTS_TOPIC_ARN unset — start notification skipped");
+            return Ok(json!({"mode": "ping", "published": false, "skipped": "no_alerts_topic"}));
         }
-        publish(sns, env, "Instance start triggered", &message).await?;
+        if let Some(portal) = &env.operator_portal_url {
+            message.push_str(&format!("\nFor Stocks, tap Open Tickvault in this private Telegram message. For a browser, open {portal} and use your Tickvault operator device key."));
+        }
+        publish(
+            sns,
+            env,
+            crate::telegram_webhook::START_NOTICE_SUBJECT,
+            &message,
+        )
+        .await?;
         return Ok(json!({"mode": "ping", "published": true}));
     }
 
@@ -1412,16 +1409,44 @@ pub struct SdkSns {
 }
 
 impl SnsApi for SdkSns {
-    async fn publish(&self, topic_arn: &str, subject: &str, message: &str) -> Result<(), String> {
-        self.client
+    async fn publish(
+        &self,
+        topic_arn: &str,
+        subject: &str,
+        message: &str,
+        with_portal_entry: bool,
+    ) -> Result<(), String> {
+        let mut request = self
+            .client
             .publish()
             .topic_arn(topic_arn)
             .subject(subject)
-            .message(message)
-            .send()
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .message(message);
+        if with_portal_entry {
+            let marker = aws_sdk_sns::types::MessageAttributeValue::builder()
+                .data_type("String")
+                .string_value(crate::telegram_webhook::PORTAL_MARKER_VALUE)
+                .build()
+                .map_err(|e| e.to_string())?;
+            request = request.message_attributes(crate::telegram_webhook::PORTAL_MARKER, marker);
+        }
+        let output = request.send().await.map_err(|e| e.to_string())?;
+        if subject == crate::telegram_webhook::START_NOTICE_SUBJECT {
+            if let Some(id) = crate::logging::sns_message_id(output.message_id()) {
+                info!(
+                    sns_message_id = id,
+                    operator_entry_tagged = with_portal_entry,
+                    "SNS accepted morning start notice"
+                );
+            } else {
+                // SNS accepted the request. Retrying just for a receipt could send a duplicate.
+                warn!(
+                    operator_entry_tagged = with_portal_entry,
+                    "SNS accepted morning start notice without a usable MessageId"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1473,6 +1498,7 @@ mod tests {
     }
 
     struct Published {
+        with_portal_entry: bool,
         topic: String,
         subject: String,
         message: String,
@@ -1489,8 +1515,10 @@ mod tests {
             topic_arn: &str,
             subject: &str,
             message: &str,
+            with_portal_entry: bool,
         ) -> Result<(), String> {
             self.published.borrow_mut().push(Published {
+                with_portal_entry,
                 topic: topic_arn.to_string(),
                 subject: subject.to_string(),
                 message: message.to_string(),
@@ -1633,7 +1661,9 @@ mod tests {
         WatchdogEnv {
             instance_id: "i-0test".to_string(),
             alerts_topic_arn: "arn:aws:sns:ap-south-1:1:tv-prod-alerts".to_string(),
-            dashboard_port: "3001".to_string(),
+            operator_portal_url: crate::telegram_webhook::portal_web_app_url(Some(
+                "https://portal.example.org/",
+            )),
             keep_alive_param: DEFAULT_KEEP_ALIVE_PARAM.to_string(),
             holiday_stop_param: DEFAULT_HOLIDAY_STOP_PARAM.to_string(),
             budget_stop_param: crate::budget_stop_latch::DEFAULT_BUDGET_STOP_PARAM.to_string(),
@@ -1733,70 +1763,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ping_includes_dashboard_link() {
-        // The operator's 08:30 start ping must carry a tappable Feed Control
-        // link (http://<public_ip>:3001/feeds) built from the live public IP.
+    async fn start_notice_uses_the_canonical_portal_without_needing_a_public_ip() {
         let sns = FakeSns::default();
-        let ec2 = FakeEc2::new(Some("running")).ip("13.200.1.2");
-        run(
+        let out = run(
             json!({"mode": "ping"}),
-            &ec2,
+            &FakeEc2::new(None),
             &FakeSsm::raising(),
             &sns,
             in_window_now(),
         )
         .await;
+        assert_eq!(out["published"], true);
         let published = sns.published.borrow();
-        let msg = &published[0].message;
-        assert!(msg.contains("/feeds"));
-        assert!(msg.contains("3001"));
-        assert!(msg.contains("http://13.200.1.2:3001/feeds"));
-        // The original start-triggered text must remain intact.
-        assert!(msg.to_lowercase().contains("start triggered"));
+        assert_eq!(published.len(), 1);
+        let start = &published[0];
+        assert_eq!(start.subject, crate::telegram_webhook::START_NOTICE_SUBJECT);
+        assert!(start.with_portal_entry);
+        assert!(start.message.contains("https://portal.example.org/"));
+        assert!(start.message.contains("tap Open Tickvault"));
+        assert!(!start.message.contains("http://"));
     }
 
     #[tokio::test]
-    async fn test_ping_missing_public_ip_degrades_gracefully() {
-        // No public IP yet -> the start message STILL sends, with no link and
-        // a clear 'not ready' line — never a silent omission, never a crash.
+    async fn start_notice_without_a_portal_still_sends_without_any_link_or_button() {
+        let mut env = test_env();
+        env.operator_portal_url = None;
         let sns = FakeSns::default();
-        let ec2 = FakeEc2::new(Some("pending")); // box up but no IP yet
-        let out = run(
-            json!({"mode": "ping"}),
+        let ec2 = FakeEc2::new(Some("running")).ip("203.0.113.1");
+        let out = run_watchdog(
+            &json!({"mode":"ping"}),
+            &env,
             &ec2,
             &FakeSsm::raising(),
             &sns,
             in_window_now(),
         )
-        .await;
-        assert_eq!(out["published"], json!(true));
+        .await
+        .unwrap();
+        assert_eq!(out["published"], true);
         let published = sns.published.borrow();
-        let msg = &published[0].message;
-        assert!(!msg.contains("http://"));
-        assert!(!msg.contains("3001/feeds"));
-        assert!(msg.contains("not ready yet"));
-        assert!(msg.contains("8:30")); // start signal preserved
+        let start = &published[0];
+        assert!(start.message.contains("8:30 AM IST"));
+        assert!(!start.message.contains("http"));
+        assert!(!start.with_portal_entry);
     }
 
     #[tokio::test]
-    async fn test_ping_describe_error_degrades_gracefully() {
-        // describe_instances raising must not crash the ping — it still
-        // sends the start message without a dashboard link.
+    async fn start_notice_with_no_topic_reports_that_it_was_not_published() {
+        let mut env = test_env();
+        env.alerts_topic_arn.clear();
         let sns = FakeSns::default();
-        let ec2 = FakeEc2::new(None); // describe raises
-        let out = run(
-            json!({"mode": "ping"}),
-            &ec2,
+        let out = run_watchdog(
+            &json!({"mode":"ping"}),
+            &env,
+            &FakeEc2::new(None),
             &FakeSsm::raising(),
             &sns,
             in_window_now(),
         )
-        .await;
-        assert_eq!(out["published"], json!(true));
-        let published = sns.published.borrow();
-        let msg = &published[0].message;
-        assert!(!msg.contains("http://"));
-        assert!(msg.contains("not ready yet"));
+        .await
+        .unwrap();
+        assert_eq!(out["published"], false);
+        assert!(sns.published.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -3627,9 +3655,14 @@ mod sdk_loopback_tests {
     #[tokio::test]
     async fn test_sdk_sns_publish_sends_topic_subject_and_message() {
         let (_, _, sns, requests) = adapters(Fleet::default()).await;
-        sns.publish("arn:aws:sns:ap-south-1:1:tv", "subject line", "body text")
-            .await
-            .expect("publish succeeds");
+        sns.publish(
+            "arn:aws:sns:ap-south-1:1:tv",
+            "subject line",
+            "body text",
+            false,
+        )
+        .await
+        .expect("publish succeeds");
         let seen = recorded(&requests);
         assert_eq!(
             seen[0].form_value("TopicArn").as_deref(),
@@ -3640,6 +3673,81 @@ mod sdk_loopback_tests {
             Some("subject line")
         );
         assert_eq!(seen[0].form_value("Message").as_deref(), Some("body text"));
+        assert!(
+            seen[0]
+                .form_value("MessageAttributes.entry.1.Name")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sdk_morning_sns_logs_only_the_accepted_message_receipt() {
+        use crate::telegram_webhook::START_NOTICE_SUBJECT;
+        use crate::test_support::{Captured, LoopbackResponse, start_loopback_aws};
+
+        let id = "b5b1cc77-914a-57c5-a0ba-2515c6a30e93";
+        for (wire_id, status, subject, tagged) in [
+            (Some(id), 200, START_NOTICE_SUBJECT, true),
+            (Some(id), 200, START_NOTICE_SUBJECT, false),
+            (None, 200, START_NOTICE_SUBJECT, true),
+            (
+                Some("private-unexpected-text"),
+                200,
+                START_NOTICE_SUBJECT,
+                true,
+            ),
+            (Some(id), 403, START_NOTICE_SUBJECT, true),
+            (Some(id), 200, "another notice", false),
+        ] {
+            let (endpoint, requests) = start_loopback_aws(move |_| {
+                if status == 403 {
+                    return LoopbackResponse::xml(status, "<ErrorResponse><Error><Code>AccessDenied</Code></Error></ErrorResponse>");
+                }
+                let element = wire_id.map_or_else(String::new, |value| format!("<MessageId>{value}</MessageId>"));
+                LoopbackResponse::xml(status, format!("<PublishResponse><PublishResult>{element}</PublishResult><ResponseMetadata><RequestId>different-request-id</RequestId></ResponseMetadata></PublishResponse>"))
+            }).await;
+            let sdk = SdkSns {
+                client: aws_sdk_sns::Client::new(&loopback_sdk_config(&endpoint).await),
+            };
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter("tickvault_aws_lambdas::start_watchdog=info")
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let result = sdk
+                .publish(
+                    "arn:aws:sns:ap-south-1:1:tv",
+                    subject,
+                    "private notice body",
+                    tagged,
+                )
+                .await;
+            assert_eq!(result.is_ok(), status == 200);
+            assert_eq!(operations(&requests), vec!["Publish"]);
+            let log = captured.text();
+            assert!(
+                !log.contains("private")
+                    && !log.contains("different-request-id")
+                    && !log.contains("arn:")
+            );
+            if status != 200 || subject != START_NOTICE_SUBJECT {
+                assert!(log.is_empty());
+            } else {
+                assert_eq!(log.lines().count(), 1);
+                let event: Value = serde_json::from_str(&log).expect("one JSON log event");
+                assert_eq!(event["fields"]["operator_entry_tagged"], tagged);
+                if wire_id == Some(id) {
+                    assert_eq!(event["level"], "INFO");
+                    assert_eq!(event["fields"]["sns_message_id"], id);
+                } else {
+                    assert_eq!(event["level"], "WARN");
+                    assert!(event["fields"].get("sns_message_id").is_none());
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3649,7 +3757,7 @@ mod sdk_loopback_tests {
             ..Fleet::default()
         })
         .await;
-        assert!(sns.publish("arn:x", "s", "m").await.is_err());
+        assert!(sns.publish("arn:x", "s", "m", false).await.is_err());
     }
 
     #[test]
@@ -3658,7 +3766,7 @@ mod sdk_loopback_tests {
         let keys = [
             "EC2_INSTANCE_ID",
             "ALERTS_TOPIC_ARN",
-            "DASHBOARD_PORT",
+            "OPERATOR_PORTAL_URL",
             "KEEP_ALIVE_PARAM",
             "HOLIDAY_STOP_PARAM",
             "BUDGET_STOP_PARAM",
@@ -3670,7 +3778,7 @@ mod sdk_loopback_tests {
             let env = WatchdogEnv::from_process_env();
             assert_eq!(env.instance_id, "");
             assert_eq!(env.alerts_topic_arn, "");
-            assert_eq!(env.dashboard_port, "3001");
+            assert!(env.operator_portal_url.is_none());
             assert_eq!(env.keep_alive_param, DEFAULT_KEEP_ALIVE_PARAM);
             assert_eq!(env.holiday_stop_param, DEFAULT_HOLIDAY_STOP_PARAM);
             assert_eq!(
@@ -3690,7 +3798,10 @@ mod sdk_loopback_tests {
         let env = WatchdogEnv::from_process_env();
         assert_eq!(env.instance_id, "v-EC2_INSTANCE_ID");
         assert_eq!(env.alerts_topic_arn, "v-ALERTS_TOPIC_ARN");
-        assert_eq!(env.dashboard_port, "v-DASHBOARD_PORT");
+        assert!(
+            env.operator_portal_url.is_none(),
+            "unusable operator URL must fail closed"
+        );
         assert_eq!(env.keep_alive_param, "v-KEEP_ALIVE_PARAM");
         assert_eq!(env.holiday_stop_param, "v-HOLIDAY_STOP_PARAM");
         assert_eq!(env.budget_stop_param, "v-BUDGET_STOP_PARAM");
@@ -3702,7 +3813,7 @@ mod sdk_loopback_tests {
     }
 
     #[test]
-    fn test_handle_ping_describes_the_instance_and_publishes_the_dashboard_link() {
+    fn test_handle_ping_publishes_the_tagged_portal_in_the_sns_request() {
         let _lock = env_lock();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3714,7 +3825,8 @@ mod sdk_loopback_tests {
                 let _id = EnvVarGuard::set("EC2_INSTANCE_ID", Some("i-0loopback"));
                 let _topic =
                     EnvVarGuard::set("ALERTS_TOPIC_ARN", Some("arn:aws:sns:ap-south-1:1:tv"));
-                let _port = EnvVarGuard::set("DASHBOARD_PORT", Some("3001"));
+                let _portal =
+                    EnvVarGuard::set("OPERATOR_PORTAL_URL", Some("https://portal.example.org/"));
 
                 let out = handle(json!({"mode": "ping"}))
                     .await
@@ -3729,15 +3841,33 @@ mod sdk_loopback_tests {
                     return;
                 }
                 let ops = operations(&requests);
-                assert!(ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
+                assert!(!ops.iter().any(|o| o == "DescribeInstances"), "{ops:?}");
                 let publish = recorded(&requests)
                     .into_iter()
                     .find(|r| r.query_action().as_deref() == Some("Publish"))
                     .expect("the ping publishes");
                 let message = publish.form_value("Message").unwrap_or_default();
                 assert!(
-                    message.contains("http://203.0.113.7:3001/feeds"),
+                    message.contains("https://portal.example.org/"),
                     "the start message carries the dashboard link: {message}"
+                );
+                assert_eq!(
+                    publish
+                        .form_value("MessageAttributes.entry.1.Name")
+                        .as_deref(),
+                    Some("TickvaultEntry")
+                );
+                assert_eq!(
+                    publish
+                        .form_value("MessageAttributes.entry.1.Value.DataType")
+                        .as_deref(),
+                    Some("String")
+                );
+                assert_eq!(
+                    publish
+                        .form_value("MessageAttributes.entry.1.Value.StringValue")
+                        .as_deref(),
+                    Some("operator-portal")
                 );
             });
     }

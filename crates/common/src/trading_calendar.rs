@@ -33,6 +33,8 @@ pub struct HolidayInfo {
 pub struct TradingCalendar {
     /// All NSE holidays loaded from config.
     holidays: HashSet<NaiveDate>,
+    /// Years represented by the configured annual NSE holiday lists.
+    holiday_years: HashSet<i32>,
     /// Holiday name lookup for display/persistence.
     holiday_names: HashMap<NaiveDate, String>,
     /// Muhurat Trading dates (special evening sessions on otherwise closed days).
@@ -115,6 +117,7 @@ impl TradingCalendar {
         }
 
         Ok(Self {
+            holiday_years: holidays.iter().map(Datelike::year).collect(),
             holidays,
             holiday_names,
             muhurat_dates,
@@ -139,6 +142,12 @@ impl TradingCalendar {
             return false;
         }
         !self.holidays.contains(&date)
+    }
+
+    /// Whether this year's NSE holiday list is configured. The absence of a
+    /// particular holiday only implies an open weekday within a covered year.
+    pub(crate) fn covers_year(&self, date: NaiveDate) -> bool {
+        self.holiday_years.contains(&date.year())
     }
 
     /// Returns `true` if today (IST) is a regular NSE trading day.
@@ -1526,6 +1535,25 @@ mod tests {
         // through 2026-12-31 (NOT the newest holiday date 2026-10-20).
         let calendar = TradingCalendar::from_config(&make_test_config()).unwrap();
         assert_eq!(calendar.coverage_end_date(), Some(ymd(2026, 12, 31)));
+    }
+
+    #[test]
+    fn test_covers_year_requires_a_configured_circular_for_that_year() {
+        let mut config = make_test_config();
+        config.nse_holidays.push(NseHolidayEntry {
+            date: "2028-01-26".into(),
+            name: "Republic Day".into(),
+        });
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        for (year, covered) in [
+            (2025, false),
+            (2026, true),
+            (2027, false),
+            (2028, true),
+            (2029, false),
+        ] {
+            assert_eq!(cal.covers_year(ymd(year, 11, 1)), covered);
+        }
     }
 
     #[test]

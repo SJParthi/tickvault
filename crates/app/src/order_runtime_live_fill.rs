@@ -1482,6 +1482,20 @@ mod tests {
     /// per waiting exit; every position still ends flat and in order.
     #[tokio::test]
     async fn test_regression_exit_burst_makes_one_refused_attempt_per_round() {
+        // Exercise the case that failed under load: two tokens can refill while
+        // 30 commands are being delivered. Every run checks the entire queue.
+        check_exit_burst(true).await;
+        // Also require the original ten-admitted, twenty-queued scenario.
+        // Only elapsed time can disqualify that additional timing assertion.
+        for _ in 0..8 {
+            if check_exit_burst(false).await {
+                return;
+            }
+        }
+        panic!("could not deliver the first eleven exits within one 100 ms refill interval");
+    }
+
+    async fn check_exit_burst(pause_after_ten: bool) -> bool {
         let (tx, mut rx) = mpsc::channel(4_096);
         let ctx = ctx(tx);
         let mut oms = oms();
@@ -1490,22 +1504,18 @@ mod tests {
         let mut book = BookState::new();
         let seg = ExchangeSegment::NseEquity;
         let sids: Vec<u64> = (7_000..7_030).collect();
-        for batch in sids.chunks(10) {
-            for &sid in batch {
-                handle_live_fill_cmd(
-                    &mut oms,
-                    &mut risk,
-                    &mut book,
-                    &ctx,
-                    PaperCmd::Execute(Box::new(execution_for(sid, Side::Buy, false))),
-                )
-                .await;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1_100));
-        }
-        while rx.try_recv().is_ok() {}
-        oms.set_alert_sink(Box::new(alerts.clone()));
         for &sid in &sids {
+            risk.record_fill_in_segment(sid, seg, 1, 100.0, 1);
+            assert_eq!(risk.net_lots_for_in_segment(sid, seg), 1, "sid {sid} open");
+        }
+        assert!(oms.is_dry_run());
+        oms.set_alert_sink(Box::new(alerts.clone()));
+        let mut within_one_refill = false;
+        let start = std::time::Instant::now();
+        for (index, &sid) in sids.iter().enumerate() {
+            if index == 10 && pause_after_ten {
+                tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+            }
             let mut x = execution_for(sid, Side::Sell, true);
             x.base.security_id = i64::try_from(sid).expect("fits");
             handle_live_fill_cmd(
@@ -1516,18 +1526,45 @@ mod tests {
                 PaperCmd::Execute(Box::new(x)),
             )
             .await;
+            if index == 10 {
+                within_one_refill = start.elapsed() < std::time::Duration::from_millis(100);
+            }
+        }
+        let admitted = usize::try_from(oms.total_placed()).expect("fits");
+        assert!((10..=sids.len()).contains(&admitted));
+        if pause_after_ten {
+            assert!(admitted >= 12, "two tokens refilled after the first ten");
+        }
+        if within_one_refill {
+            assert_eq!(admitted, 10);
+            assert_eq!(book.live_fill_exit_retry.len(), 20);
         }
         assert_eq!(
             alerts.0.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "one refused attempt for the burst, the rest wait untouched"
+            u64::from(admitted < sids.len()),
+            "only the first refused exit raises an alert"
         );
-        assert_eq!(book.live_fill_exit_retry.len(), 20);
-        assert_eq!(book.live_fill_exit_retry[1].attempts, 0);
+        assert_eq!(book.live_fill_exit_retry.len(), sids.len() - admitted);
+        for (index, &sid) in sids.iter().enumerate() {
+            if index < admitted {
+                assert_eq!(risk.net_lots_for_in_segment(sid, seg), 0, "sid {sid} flat");
+            } else {
+                assert_eq!(risk.net_lots_for_in_segment(sid, seg), 1, "sid {sid} open");
+                let queued = &book.live_fill_exit_retry[index - admitted];
+                assert_eq!(queued.x.security_id, sid);
+                assert_eq!(queued.attempts, u32::from(index == admitted));
+            }
+        }
         let mut rounds = 0u64;
         while !book.live_fill_exit_retry.is_empty() && rounds < 6 {
-            std::thread::sleep(std::time::Duration::from_millis(1_100));
+            tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+            let before = alerts.0.load(std::sync::atomic::Ordering::Relaxed);
             retry_live_fill_exits(&mut oms, &mut risk, &mut book, &ctx).await;
+            let after = alerts.0.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after - before,
+                u64::from(!book.live_fill_exit_retry.is_empty())
+            );
             rounds += 1;
         }
         for &sid in &sids {
@@ -1551,6 +1588,7 @@ mod tests {
             .map(|s| i64::try_from(*s).expect("fits"))
             .collect();
         assert_eq!(order, want);
+        within_one_refill
     }
 
     /// Audit 2026-11-14 (finding 1): long 100, the exit was refused by the

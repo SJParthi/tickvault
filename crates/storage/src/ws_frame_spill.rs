@@ -124,6 +124,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::wal_segment_move::{ArchiveDecision, archive_segment, move_segment};
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use tickvault_common::error_code::ErrorCode;
@@ -1314,11 +1315,14 @@ impl WsFrameSpill {
     /// writer-dead drop path is loud (WS-SPILL-02), not silent.
     #[cfg(test)]
     fn new_with_dead_writer_for_test() -> Self {
-        // A unique directory per call so the flock is always free: this
-        // constructor exists to exercise the dead-writer arm, and a lock
-        // contention failure here would prove nothing about that arm.
+        Self::new_with_held_writer_for_test(1).0
+    }
+
+    #[cfg(test)]
+    fn new_with_held_writer_for_test(capacity: usize) -> (Self, Receiver<WalRecord>) {
+        // Each fixture owns its directory lock so separate queue tests can run together.
         let dir = std::env::temp_dir().join(format!(
-            "tv-wal-dead-writer-{}-{}",
+            "tv-wal-held-writer-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1326,9 +1330,8 @@ impl WsFrameSpill {
         ));
         std::fs::create_dir_all(&dir).expect("test temp dir");
         let dir_guard = lock_wal_dir(&dir).expect("fresh temp dir is never contended");
-        let (tx, rx) = bounded::<WalRecord>(SPILL_CHANNEL_CAPACITY);
-        drop(rx); // no writer ever runs → channel is Disconnected for sends
-        Self {
+        let (tx, rx) = bounded(capacity);
+        let spill = Self {
             spill_tx: tx,
             queued_bytes: Arc::new(AtomicU64::new(0)),
             queue_budget_bytes: wal_queue_max_bytes(),
@@ -1344,7 +1347,8 @@ impl WsFrameSpill {
             wal_dir: dir.clone(),
             _dir_guard: dir_guard,
             abort_drain: Arc::new(AbortDrain::default()),
-        }
+        };
+        (spill, rx)
     }
 
     /// Hot path. Non-blocking. O(1). Zero-allocation: accepts anything
@@ -4385,13 +4389,9 @@ pub const WAL_REPLAY_RSS_STOP_PCT: u64 = 60;
 /// Counter: segments `replay_all` deferred to the next boot for the budget.
 pub const WAL_REPLAY_DEFERRED_COUNTER: &str = "tv_wal_replay_deferred_segments_total";
 
-/// Counter: DEFERRED segments `replay_all` could not restore out of the replay
-/// staging area back to the live directory.
-///
-/// Non-zero means captured frames are sitting where the confirm step archives
-/// them unread -- the single path by which WAL recovery can lose data. It is
-/// incremented unconditionally (by zero on a clean boot) so the series exists
-/// before the first real occurrence.
+/// Counts skipped or deferred staged segments that could not return to the
+/// live directory. Replay holds the failed pass for a later retry. The first
+/// clean boot publishes zero so the series exists before its first failure.
 pub const WAL_REPLAY_RESTORE_FAILED_COUNTER: &str = "tv_wal_replay_restore_failed_total";
 
 /// Neither of the two counters below is EMF-selected, and that is deliberate
@@ -4722,6 +4722,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // bare live dir) instead of by capture time, breaking cross-source FIFO.
     segments.sort_by(|a, b| a.file_name().cmp(&b.file_name())); // O(1) EXEMPT: boot replay — this sort IS the FIFO-order invariant
 
+    crate::wal_segment_move::check_replay_names(&segments)?;
+
     // APPLIED-WATERMARK SKIP (2026-09-05). Every segment whose entire sequence
     // range is below the watermark and overlaps no unapplied bucket is moved
     // STRAIGHT to `archive/`, unread. The bytes never leave the disk, the
@@ -4915,8 +4917,8 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // A rename that fails leaves the segment a `*.wal`; the next pass skips
     // it again, so nothing applied is ever re-read by accident of this.
     // O(1) EXEMPT: begin — one rename per skipped segment, boot replay cold path
-    // Restores that fail, here and for DEFERRED segments below: both leave a
-    // segment in `replaying/`, where the confirm archives it unread.
+    // Either failed restore holds the pass: confirming by glob would archive
+    // the unread segment that remains in `replaying/`.
     let mut restore_failures = 0usize;
     for (path, next_kept) in &pending_skips {
         if *next_kept > consumed {
@@ -4926,19 +4928,17 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             // never see the gap it leaves (review, 2026-09-29).
             if path.parent() == Some(replaying_dir.as_path())
                 && let Some(name) = path.file_name()
-                && let Err(err) = std::fs::rename(path, wal_dir.join(name))
+                && let Err(err) = move_segment(path, &wal_dir.join(name))
             {
-                // Coded and counted like the deferred restore below (review
-                // round 7): archived unread, it hides the gap it leaves.
+                // Withhold confirm even for a skipped segment past the stop;
+                // the next pass still needs to see its gap.
                 restore_failures = restore_failures.saturating_add(1);
                 error!(
                     code = ErrorCode::WsSpill02FrameDropped.code_str(),
                     segment = ?path,
                     error = %err,
                     "WAL replay could not return a SKIPPED staged segment to the live \
-                     directory. The confirm step will archive it, and the next pass will \
-                     not see the gap it leaves, so bars across that gap may be rebuilt \
-                     from part of their ticks."
+                     directory. Refusing this pass so its gap remains visible on retry."
                 );
             }
             continue;
@@ -4948,7 +4948,11 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         };
         drop(std::fs::create_dir_all(&archive_dir));
         let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        match std::fs::rename(path, archive_dir.join(name)) {
+        match archive_segment(
+            path,
+            &archive_dir.join(name),
+            ArchiveDecision::AppliedWatermark,
+        ) {
             Ok(()) => {
                 skipped_segments = skipped_segments.saturating_add(1);
                 skipped_bytes = skipped_bytes.saturating_add(bytes);
@@ -4993,11 +4997,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // segments this boot actually read, which is exactly what that function
     // assumes. It needs no signature change and no manifest file.
     //
-    // A failed restore is LOUD, never silent: the segment stays in
-    // `replaying/` and would be archived unread, so it is the one residual
-    // and it gets a coded error plus a counter rather than a shrug. Both
-    // renames are within one filesystem between sibling directories, so a
-    // failure here means the staging renames below are failing too.
+    // A failed restore leaves an unread segment in the directory a boot confirm
+    // would glob. Refuse the entire pass before it can stage or return frames.
+    // A later pass re-lists both directories, including any successful restores.
     // K2: a leftover this pass could not READ goes back the same way, so the
     // confirm cannot archive it unread.
     // O(1) EXEMPT: begin — boot replay restore, cold path, one pass over the segment list
@@ -5014,17 +5016,15 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
             continue;
         };
         // O(1) EXEMPT: boot replay restore, cold path, bounded by deferred count
-        if let Err(err) = std::fs::rename(path, wal_dir.join(name)) {
+        if let Err(err) = move_segment(path, &wal_dir.join(name)) {
             restore_failures = restore_failures.saturating_add(1);
             error!(
                 code = ErrorCode::WsSpill02FrameDropped.code_str(),
                 segment = ?path,
                 error = %err,
                 "WAL replay could not restore a DEFERRED staged segment to the \
-                 live directory. It is still in the replay staging area, where \
-                 the confirm step archives everything it finds -- so these \
-                 captured frames may be archived without ever being replayed. \
-                 This is the one path by which recovery can lose data."
+                 live directory. Refusing this pass so its captured frames stay \
+                 available for retry."
             );
         }
     }
@@ -5034,6 +5034,12 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
     // first occurrence is the only one you get.
     // APPROVED: cast -- restore_failures is O(segments) <= u64 always.
     metrics::counter!(WAL_REPLAY_RESTORE_FAILED_COUNTER).increment(restore_failures as u64);
+
+    if restore_failures != 0 {
+        anyhow::bail!(
+            "WAL replay: {restore_failures} staged segment(s) could not be restored; holding the pass for retry"
+        );
+    }
 
     let deferred = segments.len().saturating_sub(consumed);
     if deferred > 0 {
@@ -5118,9 +5124,9 @@ pub fn replay_all_with_report_guarded<P: AsRef<Path>, R: Fn() -> Option<u64>>(
         if let Some(name) = seg.file_name() {
             let dst = replaying_dir.join(name);
             // A leftover that was re-read from `replaying/` renames onto
-            // itself / is overwritten by identical bytes — safe.
+            // itself; keep its original capture in place.
             if seg != &dst {
-                let staged = std::fs::rename(seg, &dst); // O(1) EXEMPT: boot replay staging move, cold path
+                let staged = move_segment(seg, &dst); // O(1) EXEMPT: boot replay staging move, cold path
                 if let Err(err) = staged {
                     note_stage_failure("replay_stage_rename", seg, &err);
                 }
@@ -5534,7 +5540,7 @@ pub fn confirm_replayed<P: AsRef<Path>>(wal_dir: P) {
         if let Some(name) = seg.file_name() {
             let dst = archive_dir.join(name);
             // O(1) EXEMPT: boot-time confirm step, cold path
-            match std::fs::rename(seg, &dst) {
+            match archive_segment(seg, &dst, ArchiveDecision::DirectConfirm) {
                 Ok(()) => confirmed += 1,
                 Err(err) => {
                     // Stays in `replaying/` → re-replayed next boot (DEDUP-safe).
@@ -5749,6 +5755,18 @@ impl UploadGate<'_> {
             Self::NotRequired => true,
             Self::Required { markers_dir } => len
                 .is_some_and(|len| crate::raw_frame_upload::marker_matches(markers_dir, path, len)),
+        }
+    }
+
+    /// The inexpensive scan checks candidate length. Only a selected delete
+    /// reads and verifies the exact raw bytes against the recorded S3 digest.
+    fn remove(&self, path: &Path) -> std::io::Result<bool> {
+        match self {
+            // O(1) EXEMPT: periodic retention worker unlinks one selected WAL file, off the feed path.
+            Self::NotRequired => std::fs::remove_file(path).map(|()| true),
+            Self::Required { markers_dir } => {
+                crate::raw_frame_upload::remove_verified_wal(markers_dir, path)
+            }
         }
     }
 
@@ -6252,53 +6270,51 @@ fn prune_wal_dir_at(
         let aged = mtime
             .and_then(|mt| now.duration_since(mt).ok())
             .is_some_and(|age| age > cutoff);
-        match segment_prune_decision(aged, state, false, uploaded) {
+        let uploaded = if segment_prune_decision(aged, state, false, uploaded)
+            == SegmentPruneDecision::DeleteAged
+        {
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-            SegmentPruneDecision::DeleteAged => match std::fs::remove_file(&path) {
-                Ok(()) => {
+            match upload.remove(&path) {
+                Ok(true) => {
                     outcome.deleted += 1;
                     upload.forget(&path);
+                    continue;
                 }
+                Ok(false) => false,
                 Err(err) => {
                     outcome.failed += 1;
-                    warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "WAL archive prune: remove_file failed — retried next pass"
-                    );
-                }
-            },
-            SegmentPruneDecision::Keep
-            | SegmentPruneDecision::DeleteForBytes
-            | SegmentPruneDecision::RefuseForBytes { .. }
-            | SegmentPruneDecision::RefuseNotUploaded => {
-                outcome.kept += 1;
-                if aged && state == SegmentAppliedState::Applied {
-                    // Past the window and applied, kept only because no
-                    // verified S3 copy is recorded yet (item 45e-1).
-                    outcome.age_kept_not_uploaded += 1;
-                } else if aged {
-                    // Past the window, kept only because the watermark has
-                    // not passed it (item 44d).
-                    outcome.age_kept_unapplied += 1;
-                }
-                // Survivor of the age pass — a candidate for the byte
-                // ceiling below. mtime is the sort key so the ceiling
-                // deletes genuinely oldest-first. Unreadable metadata is
-                // kept but never a byte candidate (no length to account).
-                if let Some(meta) = meta {
-                    survivors.push(PruneSurvivor {
-                        mtime: mtime.unwrap_or(std::time::UNIX_EPOCH),
-                        len: meta.len(),
-                        path,
-                        aged,
-                        state,
-                        first_seq,
-                        last_seq,
-                        uploaded,
-                    });
+                    warn!(path = %path.display(), error = %err, "WAL archive prune: deletion failed; retried next pass");
+                    continue;
                 }
             }
+        } else {
+            uploaded
+        };
+        outcome.kept += 1;
+        if aged && state == SegmentAppliedState::Applied {
+            // Past the window and applied, kept only because no
+            // verified S3 copy is recorded yet (item 45e-1).
+            outcome.age_kept_not_uploaded += 1;
+        } else if aged {
+            // Past the window, kept only because the watermark has
+            // not passed it (item 44d).
+            outcome.age_kept_unapplied += 1;
+        }
+        // Survivor of the age pass — a candidate for the byte
+        // ceiling below. mtime is the sort key so the ceiling
+        // deletes genuinely oldest-first. Unreadable metadata is
+        // kept but never a byte candidate (no length to account).
+        if let Some(meta) = meta {
+            survivors.push(PruneSurvivor {
+                mtime: mtime.unwrap_or(std::time::UNIX_EPOCH),
+                len: meta.len(),
+                path,
+                aged,
+                state,
+                first_seq,
+                last_seq,
+                uploaded,
+            });
         }
     }
 
@@ -6357,8 +6373,9 @@ fn prune_wal_dir_at(
                 SegmentPruneDecision::Keep => continue,
             }
             // O(1) EXEMPT: periodic cold archive prune, never the per-frame append
-            match std::fs::remove_file(&s.path) {
-                Ok(()) => {
+            match upload.remove(&s.path) {
+                Ok(false) => note_not_uploaded_refusal(&mut outcome, s),
+                Ok(true) => {
                     upload.forget(&s.path);
                     outcome.size_deleted += 1;
                     outcome.size_deleted_bytes = outcome.size_deleted_bytes.saturating_add(s.len);
@@ -6442,8 +6459,9 @@ fn prune_wal_dir_at(
                 continue;
             }
             // O(1) EXEMPT: periodic cold WAL prune under the disk floor, never the per-frame append
-            match std::fs::remove_file(&s.path) {
-                Ok(()) => {
+            match upload.remove(&s.path) {
+                Ok(false) => note_not_uploaded_refusal(&mut outcome, s),
+                Ok(true) => {
                     upload.forget(&s.path);
                     remaining = remaining.saturating_sub(s.len);
                     outcome.size_deleted += 1;
@@ -10271,24 +10289,6 @@ mod tests {
             SPILL_CHANNEL_CAPACITY,
             CHAOS_BURST_N
         );
-    }
-
-    #[test]
-    fn test_drop_counter_increments_when_channel_full() {
-        // Exercise the drop path by creating a spill, then forcing the channel
-        // full. We synthesize a dropped count without a writer thread by
-        // constructing an independent spill where the writer is slow — but a
-        // simpler check: verify the drop_critical counter starts at zero and
-        // the `Dropped` variant is observable by type.
-        let dir = tmp_dir("drop");
-        let spill = WsFrameSpill::new(&dir).unwrap();
-        assert_eq!(spill.drop_critical_count(), 0);
-        // A single append should NOT drop (channel is 65k).
-        let outcome = spill.append(WsType::LiveFeed, vec![1]);
-        assert_eq!(outcome, AppendOutcome::Spilled);
-        assert_eq!(spill.drop_critical_count(), 0);
-        drop(spill);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

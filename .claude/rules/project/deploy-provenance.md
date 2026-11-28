@@ -78,6 +78,16 @@ terraform outputs: portal_git_sha + binary_git_sha_ssm_param
   it no longer turns a Friday ALARM into a false Saturday "recovered".)*
 - The watchdog **skips** publishing when either SHA is unknown — no false
   signal on uncertainty (mirrors the `is_stale` no-false-OK contract).
+- When the deploy-provenance-blind alarm fires, check `binary_sha_known` and
+  `desired_sha_known` in the watchdog logs. For an unknown binary check the
+  last verified swap and `/tickvault/<env>/deploy/binary-git-sha`. For an
+  unknown target check the GitHub main read and `/tickvault/<env>/deploy/desired-git-sha`,
+  the fallback for the latest deploy-relevant commit. Public GitHub reads
+  work without credentials. Private repositories require a token for reads.
+- A verified lag with `skipped=missing_dispatch_credential` means the AWS
+  watchdog observed an older binary and held its dispatch. Inspect the
+  ordinary guarded GitHub after-close workflow and its on-box verification
+  to determine whether it deployed. That workflow uses GitHub's own identity.
 - The portal GET can never fail or hang on provenance: all three lookups
   are individually fail-soft to `unknown`; the GitHub call is 3s-bounded +
   60s cached.

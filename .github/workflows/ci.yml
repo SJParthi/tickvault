@@ -318,7 +318,7 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          shared-key: ci-test-${{ matrix.crate }}
+          shared-key: ci-test-${{ matrix.crate }}${{ matrix.crate == 'app' && '-no-debug-info' || '' }}
           cache-on-failure: true
 
       - name: Install cargo-nextest
@@ -356,6 +356,9 @@ jobs:
         # round-trip tests at the container above and make a missing or
         # unreachable QuestDB a failure, not a skip. Empty elsewhere.
         env:
+          # App tests exhausted runner disk linking with full symbols (#2289).
+          # Other crates keep Cargo's default level 2. Assertions stay enabled.
+          CARGO_PROFILE_TEST_DEBUG: ${{ matrix.crate == 'app' && '0' || '2' }}
           TV_QDB_REAL_HTTP: ${{ matrix.crate == 'storage' && '127.0.0.1:9000' || '' }}
           TV_QDB_REAL_REQUIRED: ${{ matrix.crate == 'storage' && '1' || '' }}
         run: cargo nextest run -p tickvault-${{ matrix.crate }} ${{ matrix.features }} --no-fail-fast --profile ci
@@ -420,11 +423,11 @@ jobs:
           cargo install --locked --version 0.22.2 cargo-audit
           cargo install --locked --version 0.19.9 cargo-deny
 
-      - name: cargo deny check
-        run: cargo deny check
+      - name: Test dependency scanner and check dependency policy
+        run: cargo test --locked --manifest-path scripts/dep-freshness/Cargo.toml && cargo deny check
 
-      - name: cargo audit
-        run: cargo audit --deny yanked
+      - name: Audit all tracked Cargo lockfiles
+        run: git ls-files -z -- '*Cargo.lock' | xargs -0 -n1 cargo audit --deny yanked --file
 
   # -------------------------------------------------------------------------
   # Coverage & Perf — runs on PRs AND on push-to-main (merge-gate hardening

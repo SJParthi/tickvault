@@ -1,0 +1,37 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:08.417
+Imagine one hundred price updates arrive. The app counts one hundred. The database shows zero. Can we tick the box that says all arrived?
+
+00:00:08.417 --> 00:00:18.250
+The old audit could say yes because another counter showed one hundred. The fix marks the gap as unverified and checks again. When both counts reach one hundred, they agree.
+
+00:00:18.250 --> 00:00:25.833
+We sent two audit receipts to a real test database, then sent the same two again. After a restart we counted two rows.
+
+00:00:25.833 --> 00:00:34.667
+All seven fields we checked matched the original values. This tells us what survived in the test. A live feed needs its own record of which updates arrived.
+
+00:00:34.667 --> 00:00:45.750
+Picture a frame as an envelope holding four price updates. We timed sixty-five thousand five hundred thirty-six envelopes on each of three paths. The line marks one microsecond.
+
+00:00:45.750 --> 00:00:55.750
+At the ninety-ninth percentile, all three paths crossed the line. The standard path took about one point eight microseconds. Both full paths took more than three point seven.
+
+00:00:55.750 --> 00:01:04.583
+The paper order step took zero point seven five one microseconds at the ninety-ninth percentile. It ran inside the app with the order book ready.
+
+00:01:04.583 --> 00:01:14.917
+The step that builds a labelled database line took one point three four two microseconds. Timing a full database round trip or a live broker confirmation needs a separate clock.
+
+00:01:14.917 --> 00:01:27.000
+Imagine highlighting each line you read. Local tests highlighted all sixty-one changed lines of production Rust. Twenty were in the count reader, forty in the dashboard, and one in the audit decision.
+
+00:01:27.000 --> 00:01:37.917
+Across the whole project, the exact main build reached eighty-four point one nine percent of production lines. Reading a line once leaves room for other inputs to behave differently.
+
+00:01:37.917 --> 00:01:49.000
+Before the market opened, the running server found two hundred thirty-six eligible futures and options stocks, and fifty Nifty Fifty members. Neither filter had a priced row yet.
+
+00:01:49.000 --> 00:02:07.583
+A saved November twenty-third snapshot showed twenty of the one hundred sixty-one futures and options losers. The Nifty Fifty filter returned twelve gainers. The database audit for that day showed all forty-four million, six hundred twenty-two thousand, four hundred seventy-nine accepted Dhan rows in its stored count.

@@ -26,6 +26,8 @@
 //! hot-path (zero-alloc / O(1)) constraints apply, but the charter lints on
 //! lib.rs do.
 
+mod telegram_session;
+
 use std::sync::LazyLock;
 
 use aws_lc_rs::constant_time::verify_slices_are_equal;
@@ -912,7 +914,10 @@ pub fn avg_ns(sum_v: &str, count_v: &str) -> Option<f64> {
 fn sec_to_ms(s: &str) -> String {
     s.trim()
         .parse::<f64>()
-        .map(|f| format!("{:.1}", f * 1000.0))
+        .ok()
+        .map(|seconds| seconds * 1000.0)
+        .filter(|milliseconds| milliseconds.is_finite())
+        .map(|milliseconds| format!("{milliseconds:.1}"))
         .unwrap_or_default()
 }
 
@@ -967,6 +972,8 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
         instruments: Option<f64>,
         frames: Option<f64>,
         tick_age_secs: Option<f64>,
+        never_received: bool,
+        receive_buffer_bytes: Option<u32>,
     }
     let mut per_conn: BTreeMap<u32, Conn> = BTreeMap::new();
 
@@ -996,10 +1003,17 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
             entry.instruments = Some(value);
         } else if line.starts_with("tv_dhan_ws_conn_frames") {
             entry.frames = Some(value);
+        } else if line.starts_with("tv_dhan_ws_receive_buffer_bytes{") {
+            // Linux SO_RCVBUF returns a positive signed integer, or the
+            // emitter reports -1 when the socket cannot be sampled.
+            entry.receive_buffer_bytes =
+                (value >= 1.0 && value <= f64::from(i32::MAX) && value.fract() == 0.0)
+                    .then_some(value as u32);
         } else if line.starts_with("tv_dhan_ws_conn_tick_age_secs") {
             // The drain publishes -1 for "never delivered"; that is an
             // absence, not a negative age, and must not render as a number.
-            entry.tick_age_secs = (value >= 0.0).then_some(value);
+            entry.never_received = value == -1.0;
+            entry.tick_age_secs = (value.is_finite() && value >= 0.0).then_some(value);
         }
     }
 
@@ -1009,7 +1023,11 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
         // zero-count histogram with nothing else is a series the exporter
         // pre-registered, not a socket that exists.
         .filter(|(_, c)| {
-            c.count > 0.0 || c.instruments.is_some() || c.frames.is_some() || c.endpoint.is_some()
+            c.count > 0.0
+                || c.instruments.is_some()
+                || c.frames.is_some()
+                || c.endpoint.is_some()
+                || c.receive_buffer_bytes.is_some()
         })
         .map(|(slot, c)| {
             // Sort by numeric bound; `+Inf` sorts last by construction.
@@ -1062,6 +1080,8 @@ fn parse_ws_lag_rows(raw: &[String]) -> Vec<Value> {
                 "instruments": c.instruments,
                 "frames": c.frames,
                 "tick_age_secs": c.tick_age_secs,
+                "never_received": c.never_received,
+                "receive_buffer_bytes": c.receive_buffer_bytes,
                 "samples": count,
                 "p50_ms": quantile(0.50),
                 "p99_ms": quantile(0.99),
@@ -1112,6 +1132,14 @@ pub fn parse_latency(stdout: &str) -> Value {
             fields.insert(k.trim().to_string(), v.trim().to_string());
         }
     }
+    let questdb_ms = fields
+        .get("QDB_PROBE")
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .filter(|reply| reply.get("error").is_none() && reply["dataset"] == json!([[1]]))
+        .and_then(|_| fields.get("QDB"))
+        .filter(|seconds| seconds.parse::<f64>().is_ok_and(|value| value >= 0.0))
+        .map(|seconds| sec_to_ms(seconds))
+        .unwrap_or_default();
     let order_avg = avg_ns(
         metrics
             .get("tv_order_placement_duration_ns_sum")
@@ -1131,7 +1159,7 @@ pub fn parse_latency(stdout: &str) -> Value {
         // ticks (feed off, box stopped, or /metrics unreachable) — the page
         // says that rather than showing a comforting zero.
         "ws_latency": parse_ws_lag_rows(&ws_raw),
-        "questdb_ms": sec_to_ms(fields.get("QDB").map_or("", String::as_str)),
+        "questdb_ms": questdb_ms,
         "clock_skew_ms": sec_to_ms(fields.get("SKEW").map_or("", String::as_str)),
         "order_place_avg_ns": order_avg.map(round1),
     })
@@ -1491,6 +1519,10 @@ pub trait OpsShell {
             .unwrap_or_default(),
         }
     }
+    /// Server-side Telegram bot token and configured private operator chat ID.
+    async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+        None
+    }
     /// legacy `_control_secret()` — SSM SecureString, 60s-cached.
     async fn control_secret(&self) -> String;
     /// legacy `_is_market_hours(datetime.datetime.utcnow())`.
@@ -1743,7 +1775,25 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
             &json!({"error": "control secret unreadable on the server — try again shortly"}),
         );
     }
-    if !authorized(&headers, &secret) {
+    let admin = authorized(&headers, &secret);
+    let now = shell.now_epoch();
+    let session_expiry = if admin {
+        None
+    } else {
+        telegram_session::signed_expiry(&headers, &secret)
+    };
+    if session_expiry.is_some_and(|exp| exp <= now) {
+        return resp(401, &json!({"error":"Telegram session expired"}));
+    }
+    let scoped = session_expiry.is_some_and(|exp| telegram_session::active(exp, now));
+    if !admin && !scoped {
+        if headers.get("authorization").is_none()
+            && let Some(raw) = telegram_session::exchange_input(event)
+            && let Some(response) = telegram_session::exchange(&raw, &secret, now, shell).await
+        {
+            return response;
+        }
+
         // An unreadable secret was answered 503 above, so every refusal here
         // is a wrong key and counts against the source.
         {
@@ -1775,7 +1825,10 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
         }
         return resp(401, &json!({"error": "unauthorized"}));
     }
-    guard.record_success(&source);
+    // A lower-privilege session cannot reset the full operator key failure budget.
+    if admin {
+        guard.record_success(&source);
+    }
 
     // legacy: `raw = event.get("body") or "{}"`; dict passthrough, else
     // json.loads (fail → 400). Ledger deviation: a parsed NON-OBJECT payload
@@ -1792,6 +1845,22 @@ pub async fn route<S: OpsShell>(event: &Value, shell: &S) -> Value {
     };
 
     let action = payload_str(&payload, "action").to_string();
+    if scoped
+        && (!telegram_session::explicit_post(event) || !telegram_session::read_allowed(&action))
+    {
+        return resp(
+            403,
+            &json!({"error":"this read-only session cannot perform that action"}),
+        );
+    }
+    // Launch proofs belong only on the unauthenticated exchange. An
+    // authenticated request must never forward one to an operation.
+    if payload.get("init_data").is_some() {
+        return resp(
+            400,
+            &json!({"error":"launch data is accepted only during Telegram sign-in"}),
+        );
+    }
     let force = truthy(payload.get("force").unwrap_or(&Value::Bool(false)));
 
     // HARD gate first: data-destructive actions have NO force escape inside
@@ -2526,6 +2595,19 @@ impl OpsShell for AwsShell {
         &self.auth_failures
     }
 
+    async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+        let bot_param = std::env::var("TELEGRAM_BOT_TOKEN_SSM_PARAM").ok()?;
+        let chat_param = std::env::var("TELEGRAM_CHAT_ID_SSM_PARAM").ok()?;
+        let (bot, chat) = tokio::join!(
+            self.cached_param(&bot_param),
+            self.cached_param(&chat_param)
+        );
+        if bot.is_empty() || chat.is_empty() {
+            return None;
+        }
+        Some((bot, chat))
+    }
+
     async fn control_secret(&self) -> String {
         self.cached_param(&self.secret_param).await
     }
@@ -3116,10 +3198,12 @@ mod tests {
         auth_failures: AuthFailureGuard,
         /// Plan PR MV: the published movers universe object.
         published_universe: Result<Vec<u8>, String>,
+        published_reads: std::sync::atomic::AtomicUsize,
         /// Plan PR MV: how long reading it takes (paused-clock tests).
         published_delay_ms: u64,
         /// Plan PR MV review: viewer heartbeats written.
         heartbeats: std::sync::Mutex<Vec<Vec<u8>>>,
+        clock_after_heartbeat: Option<i64>,
     }
 
     impl Default for MockShell {
@@ -3147,8 +3231,10 @@ mod tests {
                 captured_sync: std::sync::Mutex::new(Vec::new()),
                 auth_failures: AuthFailureGuard::new(),
                 published_universe: Err("absent".to_string()),
+                published_reads: Default::default(),
                 published_delay_ms: 0,
                 heartbeats: std::sync::Mutex::new(Vec::new()),
+                clock_after_heartbeat: None,
             }
         }
     }
@@ -3170,6 +3256,8 @@ mod tests {
             Some(&self.stock_movers_cache)
         }
         async fn movers_universe_object(&self) -> Result<bytes::Bytes, String> {
+            self.published_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.published_delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.published_delay_ms)).await;
             }
@@ -3185,6 +3273,12 @@ mod tests {
         fn auth_failures(&self) -> &AuthFailureGuard {
             &self.auth_failures
         }
+        async fn telegram_identity_parameters(&self) -> Option<(String, String)> {
+            Some((
+                self.env.get("test-bot")?.clone(),
+                self.env.get("test-chat")?.clone(),
+            ))
+        }
         async fn control_secret(&self) -> String {
             self.secret.clone()
         }
@@ -3198,7 +3292,9 @@ mod tests {
             self.wipes_authorized
         }
         fn now_epoch(&self) -> i64 {
-            self.now
+            self.clock_after_heartbeat
+                .filter(|_| !self.heartbeats.lock().unwrap().is_empty())
+                .unwrap_or(self.now)
         }
         fn env(&self, key: &str) -> String {
             self.env.get(key).cloned().unwrap_or_default()
@@ -3292,6 +3388,8 @@ mod tests {
             "unknown".to_string()
         }
     }
+
+    include!("operator_control/telegram_route_tests.rs");
 
     // ------------------------------------------------------- event helpers
     fn get_event() -> Value {
@@ -3464,6 +3562,9 @@ mod tests {
             window_secs: UNIVERSE_DEFAULT_WINDOW_SECS,
             prices: UniversePrices::Rows {
                 rows: vec![PriceRow {
+                    session_open: None,
+                    session_high: None,
+                    session_low: None,
                     security_id: 2,
                     segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
                     ltp: 110.0,
@@ -3474,6 +3575,7 @@ mod tests {
             },
             fno: Some(vec![listed.clone()]),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: vec![listed],
                 indices: vec!["Nifty 50".into()],
                 by_stock: vec![StockIndices {
@@ -3499,6 +3601,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mtf_reads_a_valid_published_daily_list_without_an_extra_ssm_call() {
+        use crate::operator_movers_universe::{MoversUniverse, MtfTerms};
+        let now = MockShell::default().now;
+        let mut universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now - 3, false)).unwrap();
+        universe.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: now - 4,
+            leverage_by_security_id: [(2, 1.0)].into(),
+        });
+        let shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        let response = post(
+            &shell,
+            json!({"action":"stock-movers","filter":{"category":"mtf"}}),
+        )
+        .await;
+        let movers = &body_of(&response)["movers"];
+        assert_eq!(movers["snapshot"]["rows"][0]["mtf_leverage"], 1.0);
+        assert_eq!(movers["snapshot"]["mtf_coverage"]["assessed"], 1);
+        assert!(shell.captured_sync.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_stock_movers_answer_from_a_fresh_published_universe_without_ssm() {
         let now = MockShell::default().now;
         for filter in [
@@ -3518,6 +3642,264 @@ mod tests {
                 "no SSM round trip"
             );
         }
+    }
+
+    fn healthy_box_reply(now: i64, filter: &crate::operator_stock_movers_wire::Filter) -> String {
+        use crate::operator_movers_universe::{MoversUniverse, select, weekday_session_open_at};
+        let universe: MoversUniverse =
+            serde_json::from_slice(&published_universe(now, weekday_session_open_at(now))).unwrap();
+        serde_json::to_string(&select(&universe, filter)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stock_categories_refuse_an_older_box_reply_that_ignores_the_requested_category() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, MoversCategory, Outcome};
+        for as_of in [None, Some("2026-11-03T15:29".to_owned())] {
+            let daily = Filter {
+                as_of,
+                ..Filter::default()
+            };
+            let mut shell = box_shell(Err("no published artifact".into()));
+            shell.sync_output = healthy_box_reply(shell.now, &daily);
+            for category in [
+                MoversCategory::Intraday,
+                MoversCategory::ExtremeOpenings,
+                MoversCategory::Mtf,
+            ] {
+                let request = Filter {
+                    category: Some(category),
+                    ..daily.clone()
+                };
+                assert_eq!(
+                    read(&shell, &request).await.outcome,
+                    Outcome::Error {
+                        code: BridgeError::InvalidResponse
+                    }
+                );
+            }
+            assert!(matches!(
+                read(&shell, &daily).await.outcome,
+                Outcome::Snapshot { .. }
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_live_capture_never_regresses_between_sources_until_clock_reset() {
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let t = shell.now;
+        let f = Filter::default();
+        shell.sync_output = healthy_box_reply(t, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t);
+        shell.now = t + 5;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 5);
+        // Losing S3 cannot resurrect the older cached box reply, or a newly
+        // requested box reply containing the same older payload.
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.now = t + 8;
+        shell.published_universe = Err("offline".into());
+        assert_eq!(
+            read(&shell, &f).await.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+        shell.sync_output = healthy_box_reply(shell.now, &f);
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        shell.published_universe = Ok(published_universe(t + 6, false));
+        assert_eq!(read(&shell, &f).await.captured_at_epoch_secs, t + 8);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 3);
+
+        // A chosen minute goes directly to the box and may have an older capture.
+        let history = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..f.clone()
+        };
+        shell.sync_output = healthy_box_reply(t, &history);
+        assert_eq!(read(&shell, &history).await.captured_at_epoch_secs, t);
+        // Fresh data on the corrected clock can establish a new ordering interval.
+        shell.now = t - 120;
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        let reset = read(&shell, &f).await;
+        assert!(matches!(reset.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reset.captured_at_epoch_secs, t - 120);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_older_inflight_box_capture_cannot_replace_a_newer_published_one() {
+        use crate::operator_movers_universe::{MoversUniverse, UniversePrices};
+        use crate::operator_movers_wire::BridgeError;
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let t = MockShell::default().now;
+        let mut u: MoversUniverse = serde_json::from_slice(&published_universe(t, false)).unwrap();
+        // A duplicate outside Nifty forces F&O alone to consult the box.
+        let fno = u.fno.as_mut().unwrap();
+        let mut listing = fno[0].clone();
+        listing.security_id = 3;
+        fno.push(listing);
+        let UniversePrices::Rows { rows } = &mut u.prices else {
+            panic!("fixture prices")
+        };
+        let mut duplicate = rows[0].clone();
+        duplicate.security_id = 3;
+        rows.extend([duplicate.clone(), duplicate]);
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let filter = Filter::default();
+        let shell = MockShell {
+            movers_gate: Some(gate.clone()),
+            sync_output: healthy_box_reply(t - 2, &filter),
+            ..box_shell(Ok(serde_json::to_vec(&u).unwrap()))
+        };
+        let index = Filter {
+            fno_only: false,
+            index: Some("Nifty 50".into()),
+            ..Filter::default()
+        };
+        let (older, newer) = tokio::join!(
+            biased;
+            read(&shell, &filter),
+            async {
+                assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+                let reply = read(&shell, &index).await;
+                gate.add_permits(1);
+                reply
+            }
+        );
+        assert!(matches!(newer.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(newer.captured_at_epoch_secs, t);
+        assert_eq!(
+            older.outcome,
+            Outcome::Error {
+                code: BridgeError::InvalidResponse
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_newer_success_invalidates_cached_box_error() {
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let mut shell = box_shell(Err("offline".into()));
+        let filter = Filter::default();
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Error { .. }
+        ));
+        shell.now += 1;
+        // The previous error's stamp is newer than this valid observation.
+        // Error timestamps must never advance the live price watermark.
+        shell.published_universe = Ok(published_universe(shell.now - 3, false));
+        assert!(matches!(
+            read(&shell, &filter).await.outcome,
+            Outcome::Snapshot { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        shell.published_universe = Err("offline".into());
+        shell.sync_output = healthy_box_reply(shell.now, &filter);
+        let reply = read(&shell, &filter).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, shell.now);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_recheck_window_after_heartbeat_and_use_box_for_selection_errors() {
+        use crate::operator_movers_universe::{UNIVERSE_IST_OFFSET_SECS, weekday_session_open_at};
+        use crate::operator_stock_movers::read;
+        use crate::operator_stock_movers_wire::{Filter, Outcome};
+        let f = Filter::default();
+        // 29 October 2026 (Thursday), in IST.
+        let midnight = (1_793_252_730 + UNIVERSE_IST_OFFSET_SECS).div_euclid(86_400) * 86_400
+            - UNIVERSE_IST_OFFSET_SECS;
+        for boundary in [
+            midnight,
+            midnight + 9 * 3600,
+            midnight + 15 * 3600 + 40 * 60,
+        ] {
+            let now = boundary + 1;
+            let after = boundary - 1;
+            let mut shell = box_shell(Ok(published_universe(now, weekday_session_open_at(now))));
+            shell.now = now;
+            shell.clock_after_heartbeat = Some(after);
+            shell.sync_output = healthy_box_reply(after, &f);
+            let reply = read(&shell, &f).await;
+            assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+            assert_eq!(reply.captured_at_epoch_secs, after, "boundary {boundary}");
+            assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+        }
+
+        let t = MockShell::default().now;
+        let mut universe: crate::operator_movers_universe::MoversUniverse =
+            serde_json::from_slice(&published_universe(t, false)).unwrap();
+        let crate::operator_movers_universe::UniversePrices::Rows { rows } = &mut universe.prices
+        else {
+            panic!("fixture prices");
+        };
+        rows.push(rows[0].clone());
+        let mut shell = box_shell(Ok(serde_json::to_vec(&universe).unwrap()));
+        shell.sync_output = healthy_box_reply(t - 1, &f);
+        let reply = read(&shell, &f).await;
+        assert!(matches!(reply.outcome, Outcome::Snapshot { .. }));
+        assert_eq!(reply.captured_at_epoch_secs, t - 1);
+        assert_eq!(shell.captured_sync.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stock_movers_share_one_object_across_filters_and_refresh_on_expiry() {
+        use crate::operator_stock_movers::from_published;
+        use crate::operator_stock_movers_wire::Filter;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let now = MockShell::default().now;
+        let mut shell = box_shell(Ok(published_universe(now, false)));
+        shell.published_delay_ms = 100;
+        let fno = Filter::default();
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            fno_only: false,
+            ..Filter::default()
+        };
+        let (a, b) = tokio::join!(from_published(&shell, &fno), from_published(&shell, &index));
+        assert!(a.unwrap().valid_at(now, &fno));
+        assert!(b.unwrap().valid_at(now, &index));
+        assert_eq!(shell.published_reads.load(Relaxed), 1);
+
+        shell.published_universe = Err("offline".into());
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(from_published(&shell, &index).await, Err("unavailable"));
+        shell.published_universe = Ok(published_universe(now - 20, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            now - 20
+        );
+        shell.now += 1;
+        assert_eq!(from_published(&shell, &fno).await, Err("stale"));
+        assert_eq!(shell.published_reads.load(Relaxed), 4);
+        shell.published_universe = Ok(published_universe(shell.now, false));
+        assert_eq!(
+            from_published(&shell, &fno)
+                .await
+                .unwrap()
+                .captured_at_epoch_secs,
+            shell.now
+        );
+        let historical = Filter {
+            as_of: Some("2026-11-03T15:29".into()),
+            ..Filter::default()
+        };
+        assert_eq!(from_published(&shell, &historical).await, Err("as_of"));
+        assert_eq!(shell.published_reads.load(Relaxed), 5);
     }
 
     #[tokio::test]
@@ -3973,13 +4355,89 @@ mod tests {
         // for 30 days (`tv_key` with an expiry) instead of per tab; Lock and a
         // 401 forget it; the lock screen text says so. Pinned separately by
         // `console_remembers_the_key_for_thirty_days_only`.
+        // 2026-11-25: timestamped Dhan index quotes and accurate disk-panel wording.
+        // 2026-11-26: private Telegram Mini App launch and in-memory viewer session.
+        // 2026-11-27: distinguish the requested historical cutoff from the current market.
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CONSOLE_HTML.as_bytes());
         let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "96119d480539e50a633fb22de3b19842a1cf0c3885481a10e029fa596a97c160"
+            "9bb9a70e130df0c93aea6743449881b3b4b009f91e4dc40dfe3b48abce1ae97a"
         );
-        assert_eq!(CONSOLE_HTML.len(), 86_069);
+        assert_eq!(CONSOLE_HTML.len(), 107_071);
+    }
+
+    #[test]
+    fn stocks_freshness_counts_elapsed_time_across_browser_sleep() {
+        // The monotonic clock may stop during sleep. A wall-clock rollback must
+        // never make a snapshot younger, including while a refresh is pending.
+        let elapsed = CONSOLE_HTML
+            .split_once("function moversElapsed(){")
+            .and_then(|(_, body)| body.split_once('}'))
+            .expect("Stocks elapsed-time helper")
+            .0;
+        for clock in [
+            "moversElapsedHigh=Math.max(moversElapsedHigh,",
+            "(performance.now()-moversStart)/1000",
+            "(Date.now()-moversWall)/1000",
+        ] {
+            assert!(
+                elapsed.contains(clock),
+                "missing elapsed-time guard {clock}"
+            );
+        }
+        assert!(
+            CONSOLE_HTML.contains(
+                "moversStart=moversLastAttempt;moversWall=wallStart;moversElapsedHigh=0;"
+            )
+        );
+        assert!(
+            CONSOLE_HTML
+                .contains("moversObserved+2+moversElapsed()>=moversReply.valid_until_epoch_secs")
+        );
+        assert!(
+            CONSOLE_HTML.contains("moversObserved-reply.captured_at_epoch_secs)+2+moversElapsed()")
+        );
+    }
+
+    #[test]
+    fn stocks_historical_views_keep_cutoff_age_separate_from_live_freshness() {
+        let render = CONSOLE_HTML
+            .split_once("function renderMovers(){")
+            .and_then(|(_, rest)| rest.split_once("function validMtfPage("))
+            .expect("Stocks renderer")
+            .0;
+        // v2 uses Closed for both historical prices and a genuinely closed market.
+        // The verified response filter identifies which clock the read used.
+        assert!(render.contains("asOf=s.filter.as_of"));
+        assert!(render.contains("age=asOf||s.data_age_secs===null?s.data_age_secs:Math.ceil("));
+        assert!(render.contains(":'unknown'):s.status,asOf)"));
+        assert!(render.contains("asOf?'tick age at read cutoff ':'conservative tick age '"));
+        assert!(CONSOLE_HTML.contains("asOf&&key==='closed'?'historical':key"));
+        assert!(CONSOLE_HTML.contains(r#"data-historical="Historical lookup of stored prices.""#));
+        assert!(CONSOLE_HTML.contains("moversMessage(snapshot.status,snapshot.filter.as_of)"));
+        // Never admit an inconsistent historical Live/Stale reply to the current watchlist.
+        assert!(
+            CONSOLE_HTML.contains("!(filter.as_of&&['live','stale'].includes(r.snapshot.status))")
+        );
+    }
+
+    #[test]
+    fn stocks_index_quote_query_respects_operator_read_policy_and_row_cap() {
+        let query = CONSOLE_HTML
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix(r#"const query=""#)?
+                    .strip_suffix(r#"";"#)
+                    .filter(|sql| sql.contains("AS age_s") || sql.contains(" age_s"))
+            })
+            .expect("index quote SQL in the operator Stocks view");
+        assert!(is_safe_sql(query));
+        assert_eq!(cap_sql_rows(query), query);
+        assert!(query.contains("feed='dhan' AND segment='IDX_I'"));
+        assert!(query.contains("ts BETWEEN dateadd('m',329,now()) AND dateadd('m',330,now())"));
+        assert!(query.ends_with("LATEST ON ts PARTITION BY security_id LIMIT 5"));
     }
 
     // ------------------------------------------------ audit L4 source scans
@@ -4033,24 +4491,35 @@ mod tests {
             "localStorage.removeItem('tv_token'); sessionStorage.removeItem('tv_token');"
         ));
         let lock_fn = CONSOLE_HTML
-            .lines()
-            .find(|l| l.starts_with("function lock()"))
-            .expect("lock() present");
-        assert!(lock_fn.contains("localStorage.removeItem('tv_key')"));
-        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock();"));
+            .split_once("function lock(message){")
+            .expect("lock function")
+            .1
+            .split_once("function viewerExpired()")
+            .expect("end of lock")
+            .0;
+        assert!(
+            lock_fn.contains("if(!viewer)")
+                && lock_fn.contains("localStorage.removeItem('tv_key')")
+        );
+        assert!(CONSOLE_HTML.contains("if(r.status===401){ lock(viewerExpires?"));
         assert_eq!(CONSOLE_HTML.matches("localStorage.setItem").count(), 1);
-        // A key arriving in the address is stripped from it after reading.
-        let reader = CONSOLE_HTML
-            .lines()
-            .position(|l| l.contains("location.hash.match(/key="))
-            .expect("address-key reader present");
-        let block: String = CONSOLE_HTML
-            .lines()
-            .skip(reader)
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(block.contains("history.replaceState(null,'',location.pathname)"));
+        let launch = CONSOLE_HTML
+            .split_once("function takeLaunch(){")
+            .expect("launch parser")
+            .1
+            .split_once("async function startPortal()")
+            .expect("end of launch parser")
+            .0;
+        assert!(launch.contains("new URLSearchParams(location.hash.slice(1))"));
+        assert!(launch.contains("fragment.get('key')||query.get('key')"));
+        assert!(
+            launch
+                .find("history.replaceState(null,'',location.pathname)")
+                .expect("scrub URL")
+                < launch
+                    .find("return {initData,legacyKey}")
+                    .expect("return parsed launch")
+        );
     }
 
     // ------------------------------------------------ audit M4 auth guard
@@ -4346,7 +4815,10 @@ mod tests {
         // A #key=... link must auto-unlock + strip the fragment from the URL.
         assert!(CONSOLE_HTML.contains("location.hash"));
         assert!(CONSOLE_HTML.contains("replaceState"));
-        assert!(CONSOLE_HTML.contains("TOKEN=k; keySave(TOKEN);"));
+        assert!(
+            CONSOLE_HTML
+                .contains("if(launch.legacyKey){ TOKEN=launch.legacyKey; keySave(TOKEN); }")
+        );
     }
 
     #[test]
@@ -4726,6 +5198,7 @@ mod tests {
             "tv_order_placement_duration_ns_sum 5000\n",
             "tv_order_placement_duration_ns_count 10\n",
             "METRICS_END\n",
+            "QDB_PROBE={\"dataset\":[[1]]}\n",
             "QDB=0.0021\n",
             "SKEW=0.000123\n",
             "RESTLAT_ROW=\"dhan\",\"chain_1m\",374,1300.0,2100.0\n",
@@ -4738,6 +5211,52 @@ mod tests {
             out.get("rest_latency").is_none(),
             "a stale RESTLAT_ROW= line must not resurrect the retired field"
         );
+    }
+
+    #[test]
+    fn latency_requires_a_completed_query_with_the_expected_result() {
+        for probe in [
+            "",
+            "invalid",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[0]]}"#,
+            r#"{"dataset":[[1]],"error":"unavailable"}"#,
+        ] {
+            let output = parse_latency(&format!("QDB_PROBE={probe}\nQDB=0.001\n"));
+            assert_eq!(output["questdb_ms"], "", "{probe}");
+        }
+        for invalid in ["-0.1", "NaN", "inf", "1e308"] {
+            let output = parse_latency(&format!(
+                "QDB_PROBE={{\"dataset\":[[1]]}}\nQDB={invalid}\nSKEW=NaN"
+            ));
+            assert_eq!(output["questdb_ms"], "", "{invalid}");
+            assert_eq!(output["clock_skew_ms"], "");
+        }
+    }
+
+    #[test]
+    fn receive_buffer_bytes_require_a_current_positive_kernel_reading() {
+        let lines = [
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="0"} 1048576"#,
+            r#"tv_dhan_ws_conn_frames{connection="1"} 0"#,
+            r#"tv_dhan_ws_conn_tick_age_secs{connection="1"} -1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="1"} -1"#,
+            r#"tv_dhan_ws_conn_frames{connection="2"} 1"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="3"} NaN"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="4"} 0"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="5"} 12.5"#,
+            r#"tv_dhan_ws_receive_buffer_bytes{connection="6"} 2147483648"#,
+        ];
+        let raw = lines.map(str::to_owned);
+        let rows = parse_ws_lag_rows(&raw);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["receive_buffer_bytes"], 1048576);
+        assert_eq!(rows[0]["never_received"], false);
+        assert!(rows[0]["frames"].is_null());
+        assert!(rows[1]["receive_buffer_bytes"].is_null());
+        assert_eq!(rows[1]["never_received"], true);
+        assert!(rows[2]["receive_buffer_bytes"].is_null());
     }
 
     #[test]

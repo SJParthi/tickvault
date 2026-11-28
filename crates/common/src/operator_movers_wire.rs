@@ -17,6 +17,9 @@ pub struct Stock {
     pub name: String,
     pub ltp: f64,
     pub prev_close: Option<f64>,
+    /// The move requested by this view. The v1 protocol and default v2 Price
+    /// Movers always compare LTP to the previous close. An explicit v2
+    /// Extreme Openings category compares LTP to the session open.
     pub change: Option<f64>,
     pub change_pct: Option<f64>,
     pub volume: Option<u64>,
@@ -48,6 +51,7 @@ pub enum SourceStatus {
     Closed,
     NoFnoList,
     NoIndexList,
+    NoMtfList,
     NoData,
     Unreachable,
     QueryFailed,

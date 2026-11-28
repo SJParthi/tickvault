@@ -472,3 +472,167 @@ fn test_b1_a_segment_that_reads_again_leaves_the_book() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn failed_deferred_restore_holds_every_unconfirmed_segment_for_retry() {
+    let dir = tmp_dir("replay-restore-obstructed");
+    let staging = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    let pre_staged = write_wm_segment(&staging, 10, 1, WalEndpoint::MainFeed);
+    let live = write_wm_segment(&dir, 15, 1, WalEndpoint::MainFeed);
+    let restored = write_wm_segment(&staging, 20, 1, WalEndpoint::MainFeed);
+    let blocked = write_wm_segment(&staging, 30, 1, WalEndpoint::MainFeed);
+    let obstruction = dir.join(blocked.file_name().unwrap());
+    std::fs::create_dir(&obstruction).unwrap();
+
+    // Only the first segment fits. Returning the third succeeds; returning
+    // the fourth fails because a directory occupies its live destination.
+    let failed = replay_all_with_report_guarded(&dir, 1, || None, None, WAL_REPLAY_RSS_STOP_PCT);
+    assert!(
+        failed
+            .expect_err("failed restore must hold the pass")
+            .to_string()
+            .contains("could not be restored")
+    );
+    assert!(pre_staged.is_file() && live.is_file() && blocked.is_file());
+    assert!(!restored.exists() && dir.join(restored.file_name().unwrap()).is_file());
+    assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+
+    std::fs::remove_dir(&obstruction).unwrap();
+    let retry =
+        replay_all_with_report_guarded(&dir, usize::MAX, || None, None, WAL_REPLAY_RSS_STOP_PCT)
+            .expect("both restored and still-staged segments must be offered again");
+    let sequences: Vec<_> = retry.frames.iter().map(|frame| frame.frame_seq).collect();
+    assert_eq!(sequences, [wm_seq(10), wm_seq(15), wm_seq(20), wm_seq(30)]);
+    confirm_replayed(&dir);
+    assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 4);
+    assert!(wal_segments_in(&staging).is_empty() && wal_segments_in(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_replay_names_preserves_both_conflicting_captures_until_resolved() {
+    let dir = tmp_dir("replay-name-conflict");
+    let staging = dir.join(REPLAYING_SUBDIR);
+    std::fs::create_dir_all(&staging).unwrap();
+    let first = write_wm_segment(&dir, 10, 1, WalEndpoint::MainFeed);
+    let second = write_wm_segment(&staging, 20, 1, WalEndpoint::MainFeed);
+    let conflict = staging.join(first.file_name().unwrap());
+    std::fs::rename(&second, &conflict).unwrap();
+    let before = (
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&conflict).unwrap(),
+    );
+    assert_ne!(before.0, before.1);
+    assert!(
+        k2_replay(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting segment names")
+    );
+    assert_eq!(
+        (
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&conflict).unwrap()
+        ),
+        before
+    );
+    assert!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).is_empty());
+    std::fs::rename(&conflict, &second).unwrap();
+    let retry = k2_replay(&dir).unwrap();
+    assert_eq!(
+        retry
+            .frames
+            .iter()
+            .map(|frame| frame.frame_seq)
+            .collect::<Vec<_>>(),
+        [wm_seq(10), wm_seq(20)]
+    );
+    confirm_replayed(&dir);
+    assert_eq!(wal_segments_in(&dir.join(ARCHIVE_SUBDIR)).len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn same_size_wal_replacement_survives_age_byte_and_disk_floor_prunes() {
+    for (tag, aged, floor) in [
+        ("age", true, false),
+        ("bytes", false, false),
+        ("floor", false, true),
+    ] {
+        let dir = tmp_dir(&format!("restore-prune-{tag}"));
+        let now = SystemTime::now();
+        let candidate = write_wm_segment(&dir, 0, 3, WalEndpoint::MainFeed);
+        write_wm_segment(&dir, 1_000, 3, WalEndpoint::MainFeed);
+        let applied = all_applied_through(wm_seq(5_000));
+        let deferred = floor.then(|| deferred_at(wm_seq(100)));
+        let len = len_of(&candidate);
+        mark_uploaded(&dir, &candidate, len);
+        let replaced = (0..3)
+            .flat_map(|i| {
+                encode_v4_record(
+                    WsType::LiveFeed,
+                    wm_seq(i),
+                    7,
+                    WalEndpoint::MainFeed,
+                    &[0x38; 32],
+                )
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&candidate, &replaced).unwrap();
+        assert_eq!(len_of(&candidate), len);
+        if aged {
+            backdate(&candidate, now, 400_000);
+        }
+        let markers = crate::raw_frame_upload::markers_dir(&dir);
+        let prune = || {
+            prune_active_segments_deferred_at(
+                &dir,
+                172_800,
+                if aged { u64::MAX } else { 0 },
+                now,
+                Some(&applied),
+                deferred.as_ref(),
+                floor,
+                UploadGate::Required {
+                    markers_dir: &markers,
+                },
+            )
+        };
+        let held = prune();
+        assert_eq!(
+            held.age_kept_not_uploaded + held.size_refused_not_uploaded,
+            1,
+            "{tag}"
+        );
+        assert_eq!(held.deleted + held.size_deleted, 0, "{tag}");
+        assert_eq!(std::fs::read(&candidate).unwrap(), replaced, "{tag}");
+        assert!(
+            !markers.join(candidate.file_name().unwrap()).exists(),
+            "{tag}"
+        );
+        mark_uploaded(&dir, &candidate, len);
+        let matched = prune();
+        assert_eq!(matched.deleted + matched.size_deleted, 1, "{tag}");
+        assert!(!candidate.exists(), "{tag}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn previously_applied_archive_records_the_watermark_decision() {
+    let dir = tmp_dir("archived-watermark-decision");
+    write_wm_segment(&dir, 0, 5, WalEndpoint::MainFeed);
+    write_wm_segment(&dir, 1000, 5, WalEndpoint::MainFeed);
+    write_wm_watermark(&dir, &all_applied_through(wm_seq(5000)));
+    let batch = replay_unguarded(&dir);
+    assert_eq!(batch.skipped_segments, 1);
+    for archived in wal_segments_in(&dir.join(ARCHIVE_SUBDIR)) {
+        let mut value = [0u8; 32];
+        let n = rustix::fs::getxattr(archived, "user.tickvault.replay_archive.v1", &mut value[..])
+            .unwrap();
+        assert_eq!(&value[..n], b"applied_watermark");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

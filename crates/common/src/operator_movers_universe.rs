@@ -18,11 +18,10 @@
 //!
 //! # Complexity
 //!
-//! Cold path, never per tick. [`select`] is O(n log n) in the rows it keeps
-//! (n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]): one pass to build the lookup maps from
-//! the stored lists (O(list rows)), one pass over the price rows, one sort of
-//! the kept rows, one optional sort by the requested column. [`MoversUniverse::valid`]
-//! is O(rows + list rows).
+//! Cold path, never per tick. [`select`] builds lookup maps from the lists
+//! and scans the price rows. It partitions the matching rows at the page
+//! boundaries in linear time, then sorts at most [`SELECTION_LIMIT`] rows.
+//! [`MoversUniverse::valid`] is O(rows + list rows).
 //!
 //! # Honest limits
 //!
@@ -41,10 +40,15 @@ use crate::operator_movers_wire::{
 };
 use crate::operator_stock_movers_wire::{
     Direction, FILTERED_PROTOCOL_VERSION, Filter, MAX_INDEX_NAME_BYTES, MAX_INDEX_NAMES,
-    MemberStock, MembershipStatus, Outcome, Reply, Snapshot,
+    MemberStock, MembershipStatus, MoversCategory, MtfCoverage, Outcome, Reply, Snapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// Maximum bytes of a dated index mapping, including its MTF terms history.
+pub const MAX_DAILY_MAPPING_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum superseded MTF intervals retained alongside the latest terms.
+pub const MAX_MTF_HISTORY_INTERVALS: usize = 32_768;
 
 /// Version of the universe format. A reader refuses any other value.
 pub const UNIVERSE_FORMAT_VERSION: u32 = 1;
@@ -63,6 +67,8 @@ pub const UNIVERSE_NSE_EQ_SEGMENT: &str = "NSE_EQ";
 pub const UNIVERSE_IST_OFFSET_SECS: i64 = 19_800;
 /// 09:00 IST, seconds of day. Pinned to `constants::TICK_PERSIST_START_SECS_OF_DAY_IST`.
 pub const UNIVERSE_SESSION_START_SECS_OF_DAY_IST: i64 = 32_400;
+/// 09:15 IST, the regular cash-market open. Pinned to `MARKET_OPEN_IST_NANOS`.
+pub const UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST: i64 = 33_300;
 /// 15:40 IST, seconds of day. Pinned to `constants::TICK_PERSIST_END_SECS_OF_DAY_IST`.
 pub const UNIVERSE_SESSION_END_SECS_OF_DAY_IST: i64 = 56_400;
 /// Newest row at most this old reads `live` (the API's `FNO_STOCKS_LIVE_MAX_AGE_SECS`).
@@ -203,10 +209,21 @@ pub struct StockIndices {
     pub indices: Vec<usize>,
 }
 
+/// Observed daily broker terms keyed by NSE cash security ID. An explicit
+/// zero is distinguishable from an instrument with no usable master entry.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MtfTerms {
+    pub observed_at_epoch_secs: i64,
+    #[serde(deserialize_with = "crate::mtf_receipt_json::deserialize_mtf_leverage_map")]
+    pub leverage_by_security_id: std::collections::BTreeMap<u64, f64>,
+}
+
 /// The day's index-membership mapping, as the API read it.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct UniverseMembership {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtf: Option<MtfTerms>,
     pub names: Vec<ListedStock>,
     /// Index labels, strictly ascending.
     pub indices: Vec<String>,
@@ -224,6 +241,13 @@ pub struct PriceRow {
     pub ltp: f64,
     /// Previous session's close, only when finite and positive.
     pub prev_close: Option<f64>,
+    /// Exchange-reported opening price of this session. Earlier universes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_open: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_low: Option<f64>,
     /// Day's cumulative volume as stored (zero kept; the view drops it).
     pub volume: Option<u64>,
     /// Exchange time of the row, IST seconds since the epoch (naive IST).
@@ -334,6 +358,10 @@ impl MoversUniverse {
                         r.ltp.is_finite()
                             && r.ltp > 0.0
                             && r.prev_close.is_none_or(|p| p.is_finite() && p > 0.0)
+                            && [r.session_open, r.session_high, r.session_low]
+                                .into_iter()
+                                .flatten()
+                                .all(|p| p.is_finite() && p > 0.0)
                     })
             }
             _ => true,
@@ -449,6 +477,7 @@ struct MembershipView<'a> {
     indices: &'a [String],
     by_stock: HashMap<Key, &'a [usize]>,
     partial: bool,
+    mtf: Option<&'a MtfTerms>,
 }
 
 impl<'a> MembershipView<'a> {
@@ -462,11 +491,13 @@ impl<'a> MembershipView<'a> {
                 .map(|s| ((s.security_id, s.segment_code), s.indices.as_slice()))
                 .collect(),
             partial: m.partial,
+            mtf: m.mtf.as_ref(),
         }
     }
 }
 
 struct PricedStock {
+    qualifies: bool,
     security_id: u64,
     name: String,
     ltp: f64,
@@ -506,7 +537,7 @@ impl PriceView {
 }
 
 /// The price engine over the selected names (the API's `compute_for_list`).
-fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceView {
+fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>, filter: &Filter) -> PriceView {
     let total = names.len();
     let open = universe.market_open;
     let now = universe.observed_at_epoch_secs;
@@ -522,6 +553,15 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
         }
         UniversePrices::Rows { rows } => rows,
     };
+    let at = universe.read_at_ist_secs;
+    let session_start = at
+        .saturating_sub(at.rem_euclid(SECONDS_PER_DAY))
+        .saturating_add(UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST);
+    let session_end = if open {
+        at.saturating_add(UNIVERSE_MAX_FUTURE_SKEW_SECS)
+    } else {
+        at
+    };
     let mut newest: Option<i64> = None;
     let mut stocks = Vec::with_capacity(rows.len().min(total));
     for row in rows {
@@ -531,10 +571,40 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
         if !row.ltp.is_finite() || row.ltp <= 0.0 {
             continue;
         }
-        newest = Some(newest.map_or(row.ts_ist_secs, |n| n.max(row.ts_ist_secs)));
         let prev_close = row.prev_close.filter(|p| p.is_finite() && *p > 0.0);
-        let (change, change_pct) = change_against(row.ltp, prev_close);
+        let (change, change_pct, qualifies) =
+            if filter.category == Some(MoversCategory::ExtremeOpenings) {
+                // Compare the high and low reported on this quote at its timestamp.
+                // A pre-open or out-of-session quote can carry another day's OHLC.
+                if !(session_start..=session_end).contains(&row.ts_ist_secs) {
+                    continue;
+                }
+                let (Some(open), Some(high), Some(low)) =
+                    (row.session_open, row.session_high, row.session_low)
+                else {
+                    continue;
+                };
+                let range = low..=high;
+                if !range.contains(&open) || !range.contains(&row.ltp) {
+                    continue;
+                }
+                let (change, pct) = change_against(row.ltp, Some(open));
+                if !pct.is_some_and(f64::is_finite) {
+                    continue;
+                }
+                let qualifies = match filter.direction {
+                    Direction::Gainers => open == low,
+                    Direction::Losers => open == high,
+                    Direction::All => open == low || open == high,
+                };
+                (change, pct, qualifies)
+            } else {
+                let (change, pct) = change_against(row.ltp, prev_close);
+                (change, pct, true)
+            };
+        newest = Some(newest.map_or(row.ts_ist_secs, |n| n.max(row.ts_ist_secs)));
         stocks.push(PricedStock {
+            qualifies,
             security_id: row.security_id,
             name: (*name).to_string(),
             ltp: row.ltp,
@@ -545,17 +615,6 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
             last_trade_ist: hh_mm_ss(row.ts_ist_secs),
         });
     }
-    // O(k log k): change % descending, no change last, then name, then
-    // security id: a total order, so the database order never shows.
-    stocks.sort_by(|a, b| {
-        match (a.change_pct, b.change_pct) {
-            (Some(x), Some(y)) => y.total_cmp(&x).then_with(|| a.name.cmp(&b.name)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
-        }
-        .then_with(|| a.security_id.cmp(&b.security_id))
-    });
     let Some(newest) = newest.filter(|_| !stocks.is_empty()) else {
         let status = if open {
             SourceStatus::NoData
@@ -584,11 +643,58 @@ fn price_view(universe: &MoversUniverse, names: &HashMap<Key, &str>) -> PriceVie
     }
 }
 
+/// Protocol v2 clients omitting sort fields retain the original percentage,
+/// name and identity ordering. The losers view reversed that entire order.
+fn compare_for_page(
+    filter: &Filter,
+    left: &MemberStock,
+    right: &MemberStock,
+) -> std::cmp::Ordering {
+    if filter.sort_by.is_some() {
+        return filter.compare_rows(left, right);
+    }
+    let (a, b) = (&left.price, &right.price);
+    let order = match (a.change_pct, b.change_pct) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+    .then_with(|| a.name.cmp(&b.name))
+    .then_with(|| a.security_id.cmp(&b.security_id));
+    if filter.direction == Direction::Losers {
+        order.reverse()
+    } else {
+        order
+    }
+}
+
+/// Isolate the requested ranks in linear time and sort just the returned page.
+/// The comparator totally orders validated, unique stock identities.
+fn select_page(mut matches: Vec<MemberStock>, filter: &Filter) -> Vec<MemberStock> {
+    let start = filter.offset;
+    if start >= matches.len() {
+        return Vec::new();
+    }
+    let compare = |a: &MemberStock, b: &MemberStock| compare_for_page(filter, a, b);
+    if start > 0 {
+        matches.select_nth_unstable_by(start - 1, compare);
+    }
+    let after_offset = &mut matches[start..];
+    if after_offset.len() > SELECTION_LIMIT {
+        after_offset.select_nth_unstable_by(SELECTION_LIMIT, compare);
+    }
+    let count = after_offset.len().min(SELECTION_LIMIT);
+    after_offset[..count].sort_unstable_by(compare);
+    matches.into_iter().skip(start).take(count).collect()
+}
+
 fn finish(
     prices: PriceView,
     filter: &Filter,
     membership: Option<&MembershipView<'_>>,
     fno: Option<&HashMap<Key, &str>>,
+    mtf_coverage: Option<MtfCoverage>,
 ) -> Reply {
     let observed = prices.observed;
     let index_names = membership.map_or_else(Vec::new, |m| m.indices.to_vec());
@@ -617,7 +723,7 @@ fn finish(
         if !price.valid() || !ids.insert(price.security_id) {
             return Reply::error(BridgeError::InvalidResponse, observed);
         }
-        if !filter.matches_price(&price) {
+        if !row.qualifies || !filter.matches_price(&price) {
             continue;
         }
         let key = (price.security_id, UNIVERSE_NSE_EQ_SEGMENT_CODE);
@@ -627,7 +733,15 @@ fn finish(
             .unwrap_or_default();
         let eligible = fno.map(|f| f.contains_key(&key));
         let volume_text = price.volume.map(|volume| volume.to_string());
+        let mtf_leverage = mtf_coverage.and_then(|_| {
+            membership?
+                .mtf?
+                .leverage_by_security_id
+                .get(&price.security_id)
+                .copied()
+        });
         selected.push(MemberStock {
+            mtf_leverage,
             price,
             company_name: None,
             volume_text,
@@ -635,31 +749,25 @@ fn finish(
             fno: eligible,
         });
     }
-    if filter.sort_by.is_some() {
-        selected.sort_unstable_by(|left, right| filter.compare_rows(left, right));
-    } else if filter.direction == Direction::Losers {
-        selected.reverse();
-    }
     let matching_total = selected.len();
-    let rows = selected
-        .into_iter()
-        .skip(filter.offset)
-        .take(SELECTION_LIMIT)
-        .collect();
+    let rows = select_page(selected, filter);
     let snapshot = Snapshot {
+        mtf_coverage,
         filter: filter.clone(),
         status: prices.status,
         market_open: prices.market_open,
         as_of_ist: prices.as_of_ist,
         data_age_secs: prices.data_age_secs,
-        universe_available: (if filter.fno_only {
-            fno.is_some()
-        } else {
-            membership.is_some()
-        }) && filter
-            .index
-            .as_ref()
-            .is_none_or(|name| membership.is_some_and(|m| m.indices.binary_search(name).is_ok())),
+        universe_available: (filter.category != Some(MoversCategory::Mtf)
+            || mtf_coverage.is_some())
+            && (if filter.fno_only {
+                fno.is_some()
+            } else {
+                membership.is_some()
+            })
+            && filter.index.as_ref().is_none_or(|name| {
+                membership.is_some_and(|m| m.indices.binary_search(name).is_ok())
+            }),
         universe_total: prices.total,
         stocks_priced: prices.stocks_priced,
         matching_total,
@@ -693,9 +801,9 @@ fn finish(
 
 /// The filtered, paged movers reply for `filter` from one universe: exactly
 /// what the per-filter API path returned for the same rows, lists and times
-/// (pinned by the API's property test against that path). Pure; O(n log n),
-/// n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]. Never panics; every failure is a typed
-/// reply.
+/// (pinned by the API's property test against that path). Ranking takes O(n)
+/// comparisons plus O(p log p) for the returned page of p ≤ [`SELECTION_LIMIT`].
+/// n ≤ [`MAX_UNIVERSE_PRICE_ROWS`]. Every failure is a typed reply.
 #[must_use]
 pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     let now = universe.observed_at_epoch_secs;
@@ -705,19 +813,20 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     let closed_or = |status| {
         if open { status } else { SourceStatus::Closed }
     };
-    let finish_empty = |status| {
+    let finish_empty = |status, coverage| {
         finish(
             PriceView::empty(status, open, 0, now),
             filter,
             membership.as_ref(),
             fno.as_ref(),
+            coverage,
         )
     };
     if filter.fno_only && fno.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoFnoList));
+        return finish_empty(closed_or(SourceStatus::NoFnoList), None);
     }
     if (!filter.fno_only || filter.index.is_some()) && membership.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     }
     let names = if filter.fno_only {
         fno.as_ref()
@@ -725,16 +834,16 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
         membership.as_ref().map(|m| &m.names)
     };
     let Some(names) = names else {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     };
     let selected_index = filter
         .index
         .as_ref()
         .and_then(|name| membership.as_ref()?.indices.binary_search(name).ok());
     if filter.index.is_some() && selected_index.is_none() {
-        return finish_empty(closed_or(SourceStatus::NoIndexList));
+        return finish_empty(closed_or(SourceStatus::NoIndexList), None);
     }
-    let names: HashMap<Key, &str> = names
+    let mut names: HashMap<Key, &str> = names
         .iter()
         .filter(|(key, _)| {
             selected_index.is_none_or(|index| {
@@ -749,14 +858,46 @@ pub fn select(universe: &MoversUniverse, filter: &Filter) -> Reply {
     if names.len() > MAX_SOURCE_ROWS {
         return Reply::error(BridgeError::ResponseTooLarge, now);
     }
+    let mut mtf_coverage = None;
+    if filter.category == Some(MoversCategory::Mtf) {
+        let cutoff = universe
+            .read_at_ist_secs
+            .saturating_sub(UNIVERSE_IST_OFFSET_SECS);
+        let Some(terms) = membership.as_ref().and_then(|m| m.mtf).filter(|t| {
+            t.observed_at_epoch_secs > 0
+                && t.observed_at_epoch_secs <= cutoff
+                && ist_date_of_epoch(t.observed_at_epoch_secs).as_deref()
+                    == Some(universe.trading_date_ist.as_str())
+                && !t.leverage_by_security_id.is_empty()
+                && t.leverage_by_security_id.len() <= MAX_UNIVERSE_LIST_ROWS
+        }) else {
+            return finish_empty(SourceStatus::NoMtfList, None);
+        };
+        let selected = names.len();
+        let mut assessed = 0;
+        names.retain(|&(id, _), _| match terms.leverage_by_security_id.get(&id) {
+            Some(&n) if n == 0.0 || (n.is_finite() && n >= 1.0) => {
+                assessed += 1;
+                n >= 1.0
+            }
+            _ => false,
+        });
+        mtf_coverage = Some(MtfCoverage {
+            selected,
+            assessed,
+            eligible: names.len(),
+            observed_at_epoch_secs: terms.observed_at_epoch_secs,
+        });
+    }
     if names.is_empty() {
-        return finish_empty(closed_or(SourceStatus::NoData));
+        return finish_empty(closed_or(SourceStatus::NoData), mtf_coverage);
     }
     finish(
-        price_view(universe, &names),
+        price_view(universe, &names, filter),
         filter,
         membership.as_ref(),
         fno.as_ref(),
+        mtf_coverage,
     )
 }
 
@@ -787,6 +928,7 @@ mod tests {
             prices: UniversePrices::Rows { rows },
             fno: Some((1..=4).map(|id| listed(id * 2)).collect()),
             membership: Some(UniverseMembership {
+                mtf: None,
                 names: (1..=8).map(listed).collect(),
                 indices: vec!["Nifty 50".into(), "Nifty Bank".into()],
                 by_stock: (1..=8)
@@ -805,6 +947,9 @@ mod tests {
             security_id: id,
             segment_code: UNIVERSE_NSE_EQ_SEGMENT_CODE,
             ltp,
+            session_open: None,
+            session_high: None,
+            session_low: None,
             prev_close: Some(100.0),
             volume: Some(1_000 + id),
             ts_ist_secs: ist(OBSERVED) - age,
@@ -815,6 +960,288 @@ mod tests {
             Outcome::Snapshot { snapshot } => *snapshot,
             Outcome::Error { code } => panic!("expected snapshot, got {code:?}"),
         }
+    }
+
+    #[test]
+    fn mtf_counts_known_zeros_unknowns_and_unpriced_eligible_stocks() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(6, 110.0, 4), row(8, 125.0, 3)]);
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED - 10,
+            leverage_by_security_id: [(2, 1.0), (4, 3.75), (6, 0.0)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let reply = select(&stocks, &filter);
+        assert!(reply.valid_at(OBSERVED, &filter));
+        let s = snapshot(reply);
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 3, 2));
+        assert_eq!(
+            (s.universe_total, s.stocks_priced, s.matching_total),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (s.rows[0].price.security_id, s.rows[0].mtf_leverage),
+            (2, Some(1.0))
+        );
+        for (leverage, valid) in [(1.0, true), (0.0, false), (0.9, false)] {
+            let mut changed = s.clone();
+            changed.rows[0].mtf_leverage = Some(leverage);
+            assert_eq!(changed.valid(), valid);
+        }
+        let mut changed = s.clone();
+        changed.rows[0].mtf_leverage = None;
+        assert!(!changed.valid());
+        let mut changed = s;
+        changed.mtf_coverage.as_mut().unwrap().eligible = 4;
+        assert!(!changed.valid());
+
+        let daily = select(&stocks, &Filter::default());
+        stocks.membership.as_mut().unwrap().mtf = None;
+        assert_eq!(daily, select(&stocks, &Filter::default()));
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::NoMtfList);
+        assert!(!s.universe_available);
+        assert!(s.mtf_coverage.is_none());
+    }
+
+    #[test]
+    fn test_deserialize_mtf_leverage_map_preserves_other_prices_and_refuses_ambiguous_security() {
+        let mut stocks = universe(vec![row(2, 95.0, 5), row(4, 99.0, 0)]);
+        let ordinary = select(&stocks, &Filter::default());
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        for raw in [
+            r#"{"2":0,"2":2.5}"#,
+            r#"{"02":0,"2":2.5}"#,
+            r#"{"2":2.5,"\u0032":0}"#,
+            r#"{"2":2.5,"+2":1,"2":3}"#,
+            r#"{" 2 ":0,"2":2.5}"#,
+        ] {
+            let parse = |body: &str| {
+                serde_json::from_str::<MtfTerms>(&format!(
+                    r#"{{"observed_at_epoch_secs":{},"leverage_by_security_id":{body}}}"#,
+                    OBSERVED
+                ))
+                .unwrap()
+            };
+            stocks.membership.as_mut().unwrap().mtf = Some(parse(raw));
+            let unavailable = snapshot(select(&stocks, &filter));
+            assert_eq!(unavailable.status, SourceStatus::NoMtfList, "{raw}");
+            assert!(unavailable.mtf_coverage.is_none());
+            assert_eq!(select(&stocks, &Filter::default()), ordinary);
+            let normal = format!("{},\"4\":1.0}}", &raw[..raw.len() - 1]);
+            let known = parse(&normal);
+            assert_eq!(known.leverage_by_security_id, [(4, 1.0)].into());
+        }
+    }
+
+    #[test]
+    fn mtf_rejects_future_wrong_day_and_cross_cutoff_wire_terms() {
+        let mut stocks = universe(vec![row(2, 101.0, 0)]);
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            as_of: Some(
+                chrono::DateTime::from_timestamp(ist(OBSERVED), 0)
+                    .unwrap()
+                    .format("%Y-%m-%dT%H:%M")
+                    .to_string(),
+            ),
+            ..Filter::default()
+        };
+        stocks.market_open = false;
+        stocks.read_at_ist_secs = ist(OBSERVED) - 30;
+        for stamp in [OBSERVED, OBSERVED - 86_400, 0] {
+            stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+                observed_at_epoch_secs: stamp,
+                leverage_by_security_id: [(2, 1.0)].into(),
+            });
+            let answer = select(&stocks, &filter);
+            assert!(answer.valid_at(OBSERVED, &filter));
+            assert_eq!(snapshot(answer).status, SourceStatus::NoMtfList);
+        }
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .observed_at_epoch_secs = OBSERVED - 30;
+        let answer = select(&stocks, &filter);
+        assert!(answer.valid_at(OBSERVED, &filter));
+        for stamp in [OBSERVED - 29, OBSERVED - 86_400] {
+            let mut changed = answer.clone();
+            let Outcome::Snapshot { snapshot } = &mut changed.outcome else {
+                panic!("snapshot")
+            };
+            snapshot
+                .mtf_coverage
+                .as_mut()
+                .unwrap()
+                .observed_at_epoch_secs = stamp;
+            assert!(!changed.valid_at(OBSERVED, &filter));
+        }
+    }
+
+    #[test]
+    fn mtf_all_known_ineligible_survives_price_failure_and_invalid_values_stay_unknown() {
+        let mut stocks = universe(vec![]);
+        stocks.prices = UniversePrices::Unreachable;
+        stocks.membership.as_mut().unwrap().mtf = Some(MtfTerms {
+            observed_at_epoch_secs: OBSERVED,
+            leverage_by_security_id: [(2, 0.0), (4, -1.0), (6, f64::NAN), (8, 0.5)].into(),
+        });
+        let filter = Filter {
+            category: Some(MoversCategory::Mtf),
+            ..Filter::default()
+        };
+        let s = snapshot(select(&stocks, &filter));
+        let c = s.mtf_coverage.unwrap();
+        assert_eq!((c.selected, c.assessed, c.eligible), (4, 1, 0));
+        assert!(s.universe_available);
+        assert_eq!(s.status, SourceStatus::NoData);
+        stocks
+            .membership
+            .as_mut()
+            .unwrap()
+            .mtf
+            .as_mut()
+            .unwrap()
+            .leverage_by_security_id
+            .insert(4, 2.0);
+        let s = snapshot(select(&stocks, &filter));
+        assert_eq!(s.status, SourceStatus::Unreachable);
+        assert_eq!(s.universe_total, 1);
+    }
+
+    #[test]
+    fn extreme_openings_match_the_reported_day_extreme_and_keep_zero_recovery() {
+        let quote = |id, ltp, open, high, low| PriceRow {
+            session_open: Some(open),
+            session_high: Some(high),
+            session_low: Some(low),
+            ..row(id, ltp, 1)
+        };
+        let mut stocks = universe(vec![
+            quote(2, 99.0, 90.0, 110.0, 90.0),
+            quote(4, 110.0, 125.0, 125.0, 100.0),
+            quote(6, 100.0, 100.0, 100.0, 100.0),
+            quote(8, 130.0, 110.0, 140.0, 105.0),
+        ]);
+        for (direction, expected) in [
+            (Direction::Gainers, vec![(2, 10.0), (6, 0.0)]),
+            (Direction::Losers, vec![(4, -12.0), (6, 0.0)]),
+        ] {
+            let filter = Filter {
+                category: Some(MoversCategory::ExtremeOpenings),
+                direction,
+                ..Filter::default()
+            };
+            let reply = select(&stocks, &filter);
+            assert!(reply.valid_at(OBSERVED, &filter));
+            let s = snapshot(reply);
+            assert_eq!((s.stocks_priced, s.matching_total), (4, 2));
+            assert_eq!(
+                s.rows
+                    .iter()
+                    .map(|r| (r.price.security_id, r.price.change_pct.unwrap()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        // A subsequent low below the open removes a stock from Open = Low.
+        let UniversePrices::Rows { rows } = &mut stocks.prices else {
+            unreachable!()
+        };
+        rows[0].session_low = Some(89.0);
+        let low = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            direction: Direction::Gainers,
+            ..Filter::default()
+        };
+        assert_eq!(snapshot(select(&stocks, &low)).matching_total, 1);
+        // Intraday and Price Movers share the daily previous-close measure.
+        let intraday = Filter {
+            category: Some(MoversCategory::Intraday),
+            ..Filter::default()
+        };
+        let daily = snapshot(select(&stocks, &Filter::default()));
+        assert_eq!(snapshot(select(&stocks, &intraday)).rows, daily.rows);
+    }
+
+    #[test]
+    fn old_missing_or_inconsistent_session_ranges_and_out_of_session_ticks_are_unavailable() {
+        let legacy:PriceRow=serde_json::from_value(serde_json::json!({"security_id":2,"segment_code":1,"ltp":100.0,"prev_close":90.0,"volume":10,"ts_ist_secs":ist(OBSERVED)})).unwrap();
+        let full = PriceRow {
+            session_open: Some(100.0),
+            session_high: Some(110.0),
+            session_low: Some(100.0),
+            ..row(4, 100.0, 0)
+        };
+        let midnight = ist(OBSERVED).div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY;
+        let samples = [
+            legacy,
+            PriceRow {
+                session_low: None,
+                ..full.clone()
+            },
+            PriceRow {
+                session_low: Some(101.0),
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: midnight + UNIVERSE_CASH_OPEN_SECS_OF_DAY_IST - 1,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) - SECONDS_PER_DAY,
+                ..full.clone()
+            },
+            PriceRow {
+                ts_ist_secs: ist(OBSERVED) + UNIVERSE_MAX_FUTURE_SKEW_SECS + 1,
+                ..full
+            },
+        ];
+        let filter = Filter {
+            category: Some(MoversCategory::ExtremeOpenings),
+            ..Filter::default()
+        };
+        assert_eq!(
+            Filter::from_hex(&filter.to_hex().unwrap()),
+            Some(filter.clone())
+        );
+        for sample in samples {
+            let s = snapshot(select(&universe(vec![sample]), &filter));
+            assert_eq!(
+                (s.status, s.stocks_priced, s.matching_total),
+                (SourceStatus::NoData, 0, 0)
+            );
+        }
+        let mut u = universe(vec![]);
+        u.prices = UniversePrices::QueryFailed;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::QueryFailed
+        );
+        u.prices = UniversePrices::Unreachable;
+        assert_eq!(
+            snapshot(select(&u, &filter)).status,
+            SourceStatus::Unreachable
+        );
+        u.membership = None;
+        let index = Filter {
+            index: Some("Nifty 50".into()),
+            ..filter
+        };
+        assert_eq!(
+            snapshot(select(&u, &index)).status,
+            SourceStatus::NoIndexList
+        );
     }
 
     #[test]
@@ -857,6 +1284,104 @@ mod tests {
         assert!(losers.rows.is_empty(), "every change is positive");
         let reply = select(&u, &Filter::default());
         assert!(reply.valid_at(OBSERVED, &Filter::default()));
+    }
+
+    #[test]
+    fn test_movers_pages_match_full_sort_across_ties_missing_values_and_offsets() {
+        // Interleave IDs and repeat names and prices so equal values straddle page boundaries.
+        let rows: Vec<_> = (0..97_u64)
+            .map(|i| {
+                let id = (i * 53) % 97 + 1;
+                let mut price = row(
+                    id,
+                    match i % 3 {
+                        0 => 90.0,
+                        1 => 100.0,
+                        _ => 110.0,
+                    },
+                    5,
+                );
+                if id % 11 == 0 {
+                    price.prev_close = None;
+                }
+                price.volume = (id % 7 != 0).then_some((1_u64 << 53) + id % 4);
+                price
+            })
+            .collect();
+        let mut all = universe(rows.clone());
+        all.fno = Some(
+            rows.iter()
+                .map(|r| ListedStock {
+                    name: format!("SHARE{}", r.security_id % 4),
+                    ..listed(r.security_id)
+                })
+                .collect(),
+        );
+
+        // Project each input onto its wire row independently of the multi-row ranking.
+        let mut one = all.clone();
+        let mut legacy: Vec<_> = rows
+            .into_iter()
+            .map(|r| {
+                one.prices = UniversePrices::Rows { rows: vec![r] };
+                snapshot(select(&one, &Filter::default())).rows.remove(0)
+            })
+            .collect();
+        // Original price-view order: descending percentage, then ascending name and ID.
+        legacy.sort_by(|left, right| {
+            let (a, b) = (&left.price, &right.price);
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap()
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.security_id.cmp(&b.security_id))
+        });
+        let sorts = [
+            SortColumn::Name,
+            SortColumn::Ltp,
+            SortColumn::Change,
+            SortColumn::ChangePct,
+            SortColumn::ValueCr,
+            SortColumn::Volume,
+        ];
+        for direction in [Direction::All, Direction::Gainers, Direction::Losers] {
+            let modes = sorts
+                .into_iter()
+                .flat_map(|c| {
+                    [
+                        (Some(c), Some(SortOrder::Asc)),
+                        (Some(c), Some(SortOrder::Desc)),
+                    ]
+                })
+                .chain(std::iter::once((None, None)));
+            for (sort_by, sort_order) in modes {
+                let mut filter = Filter {
+                    direction,
+                    sort_by,
+                    sort_order,
+                    ..Filter::default()
+                };
+                let mut ordered: Vec<_> = legacy
+                    .iter()
+                    .filter(|r| filter.matches_price(&r.price))
+                    .cloned()
+                    .collect();
+                if sort_by.is_some() {
+                    ordered.sort_unstable_by(|a, b| filter.compare_rows(a, b));
+                } else if direction == Direction::Losers {
+                    ordered.reverse();
+                }
+                for offset in [0, 20, 40, 60, 80, 100, MAX_SOURCE_ROWS - SELECTION_LIMIT] {
+                    filter.offset = offset;
+                    let result = snapshot(select(&all, &filter));
+                    assert_eq!(result.matching_total, ordered.len());
+                    assert_eq!((result.stocks_priced, result.universe_total), (97, 97));
+                    let start = offset.min(ordered.len());
+                    let end = (start + SELECTION_LIMIT).min(ordered.len());
+                    assert_eq!(result.rows, ordered[start..end], "{filter:?}");
+                }
+            }
+        }
     }
 
     #[test]

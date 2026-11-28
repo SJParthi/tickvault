@@ -51,6 +51,9 @@
 //! they shrink these allowlists — BY DESIGN. The fix is always mechanical:
 //! delete the corresponding entries below in the same PR as the deletion.
 
+#[path = "../src/source_header.rs"]
+mod source_header;
+use source_header::rust_inner_attribute_follows;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -526,68 +529,6 @@ fn interpreter_shebang_line<'a>(path: &str, content: &'a str) -> Option<&'a str>
         return None;
     }
     Some(rest.lines().next().unwrap_or_default())
-}
-
-/// Rust's shebang/attribute boundary uses Pattern_White_Space and non-doc
-/// comments. The scan is O(header bytes), with no allocation or recursion.
-fn rust_inner_attribute_follows(mut rest: &str) -> bool {
-    loop {
-        rest = rest.trim_start_matches(|ch| {
-            matches!(
-                ch,
-                '\u{0009}'
-                    ..='\u{000d}'
-                        | ' '
-                        | '\u{0085}'
-                        | '\u{200e}'
-                        | '\u{200f}'
-                        | '\u{2028}'
-                        | '\u{2029}'
-            )
-        });
-        if rest.starts_with('[') {
-            return true;
-        }
-        if rest.starts_with("//") {
-            if rest.starts_with("//!") || (rest.starts_with("///") && !rest.starts_with("////")) {
-                return false;
-            }
-            let Some(newline) = rest.find('\n') else {
-                return false;
-            };
-            rest = &rest[newline + 1..];
-            continue;
-        }
-        if !rest.starts_with("/*")
-            || rest.starts_with("/*!")
-            || (rest.starts_with("/**") && !rest.starts_with("/***") && !rest.starts_with("/**/"))
-        {
-            return false;
-        }
-        let bytes = rest.as_bytes();
-        let mut cursor = 2;
-        let mut depth = 1usize;
-        while cursor + 1 < bytes.len() {
-            match &bytes[cursor..cursor + 2] {
-                b"/*" => {
-                    depth += 1;
-                    cursor += 2;
-                }
-                b"*/" => {
-                    depth -= 1;
-                    cursor += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => cursor += 1,
-            }
-        }
-        if depth != 0 {
-            return false;
-        }
-        rest = &rest[cursor..];
-    }
 }
 
 /// The runtime a shebang line names, if any — `#!/usr/bin/env node` -> `node`,
@@ -3579,17 +3520,32 @@ fn all_locked_graphs() -> Vec<(String, Vec<String>)> {
             let lock = std::fs::read_to_string(root.join(&p))
                 .unwrap_or_else(|e| panic!("rust_only_guard: cannot read {p}: {e}"));
             let names = locked_package_names(&lock);
-            // Anti-vacuity, PER FILE: a parser that returns nothing makes every
-            // assertion downstream trivially true, which is exactly how a guard
-            // reports green while enforcing nothing. Every real lockfile in this
-            // repository resolves hundreds of packages.
-            assert!(
-                names.len() > 100,
-                "RUST-ONLY GUARD IS BLIND: parsed only {} package name(s) from \
-                 {p}. The lockfile format changed or the read failed, and this \
-                 guard is enforcing nothing.",
-                names.len()
-            );
+            // A small tooling workspace can have a complete graph well below 100.
+            // Check each package table against the names used by both runtime guards.
+            let manifest: toml::Table = lock.parse().expect("parse Cargo.lock as TOML");
+            let packages = manifest
+                .get("package")
+                .and_then(toml::Value::as_array)
+                .filter(|rows| !rows.is_empty())
+                .expect("nonempty Cargo.lock package list");
+            let declared: Vec<_> = packages
+                .iter()
+                .map(|item| {
+                    item.get("version")
+                        .and_then(toml::Value::as_str)
+                        .expect("locked package version");
+                    item.get("name")
+                        .and_then(toml::Value::as_str)
+                        .expect("locked package name")
+                })
+                .collect();
+            assert_eq!(names, declared, "incomplete inventory of {p}");
+            if matches!(p.as_str(), "Cargo.lock" | "fuzz/Cargo.lock") {
+                assert!(
+                    names.len() > 100,
+                    "unexpectedly small workspace graph in {p}"
+                );
+            }
             (p, names)
         })
         .collect()

@@ -53,6 +53,9 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
+mod capture_minutes;
+
+use capture_minutes::CaptureMinutes;
 use tickvault_common::feed_blame::{
     EPISODE_KIND_DISCONNECT, EPISODE_KIND_NEVER_STREAMED_RESTART,
     EPISODE_KIND_OFF_HOURS_DISCONNECT, EPISODE_KIND_PROCESS_DEATH, EPISODE_KIND_STALL_RESTART,
@@ -64,8 +67,8 @@ use tickvault_storage::feed_episode_audit_persistence::{
 };
 use tickvault_storage::feed_scoreboard_persistence::{
     CoverageSource, FeedScoreboardDailyRow, FeedScoreboardWriter, LAG_FLOOR_MS_DHAN,
-    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_SESSION_MINUTES,
-    SCOREBOARD_UNAVAILABLE_SENTINEL, ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
+    LAG_FLOOR_MS_TRUEDATA, SCOREBOARD_DDL_MAX_ATTEMPTS, SCOREBOARD_UNAVAILABLE_SENTINEL,
+    ScoreboardOutcome, ensure_feed_scoreboard_tables_with,
 };
 
 // ---- `SPOT_1M_REST_TABLE` is RETIRED 2026-09-17 ----
@@ -83,13 +86,37 @@ use tickvault_storage::feed_scoreboard_persistence::{
 // still covers `rest_spot_1m` under `DAY_PARTITIONED_TABLES`. What is gone
 // is the last thing that READ it from this process.
 
-/// Parses the QuestDB `/exec` count response (`{"dataset":[[N]]}`). Pure.
-/// Relocated 2026-07-18 from the retired `tick_conservation_boot` module
-/// (dead-WS sweep follow-up) — this module is the sole surviving consumer.
+/// Reads the single nonnegative LONG returned by a QuestDB count query.
+/// The optional envelope `count` is the number of result rows, even when
+/// the aggregate itself is zero. Older responses omit column metadata or
+/// its type. When supplied, the column must describe the requested count.
 #[must_use]
 pub fn parse_questdb_count(body: &str) -> Option<i64> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    v.get("dataset")?.get(0)?.get(0)?.as_i64()
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    if response.get("error").is_some()
+        || response.get("count").is_some_and(|n| n.as_u64() != Some(1))
+    {
+        return None;
+    }
+    if let Some(columns) = response.get("columns") {
+        let [column] = columns.as_array()?.as_slice() else {
+            return None;
+        };
+        if !matches!(column.get("name")?.as_str()?, "count" | "count()")
+            || column
+                .get("type")
+                .is_some_and(|ty| ty.as_str() != Some("LONG"))
+        {
+            return None;
+        }
+    }
+    let [row] = response.get("dataset")?.as_array()?.as_slice() else {
+        return None;
+    };
+    let [value] = row.as_array()?.as_slice() else {
+        return None;
+    };
+    value.as_i64().filter(|n| *n >= 0)
 }
 
 /// IST seconds-of-day of the DETERMINISTIC daily-row timestamp (15:45:00).
@@ -214,6 +241,13 @@ pub fn decide_scoreboard_start(
         return ScoreboardStart::RunCatchUp;
     }
     ScoreboardStart::SleepThenRun(u64::from(trigger_secs_of_day_ist - now_secs_of_day_ist))
+}
+
+/// Earliest final scorecard time for the given IST date, using the same
+/// dated windows as the tick query. Absent calendar or hours give no trigger.
+#[must_use]
+pub fn scoreboard_trigger_for_date(date: chrono::NaiveDate, regular_trigger: u32) -> Option<u32> {
+    CaptureMinutes::for_date(date).and_then(|window| window.trigger(regular_trigger))
 }
 
 /// `true` when `secs_of_day` is inside the market-hours window the
@@ -380,7 +414,7 @@ pub fn build_ws_events_day_sql(target_ist_day: u64) -> String {
     let (start, end) = day_bounds_micros(target_ist_day);
     format!(
         "select cast(ts as long), feed, ws_type, connection_index, event_kind, \
-         source, dhan_code, down_secs, market_hours \
+         source, dhan_code, down_secs, market_hours, attempts \
          from ws_event_audit where ts >= {start} and ts < {end} order by ts"
     )
 }
@@ -849,23 +883,56 @@ pub const PARKED_WAKE_PAIR_WINDOW_NANOS: i64 = 10 * NANOS_PER_SEC;
 /// by a `feed_disabled` marker for the SAME
 /// (feed, ws_type, connection_index) is a parked wake, not evidence the
 /// feed was up — the fold excludes it from BOTH up signals (session-window
-/// and pre-session state-at-open). O(n·m) over one day's audit rows
-/// (≤ hundreds; cold path, one run/day). Pure.
+/// and pre-session state-at-open). Marker indexing and wake lookups are
+/// expected linear work in the number of rows, independent of arrival order.
 #[must_use]
 pub fn parked_wake_indices(rows: &[WsAuditEventLite]) -> HashSet<usize> {
-    rows.iter()
+    let mut wakes = rows
+        .iter()
         .enumerate()
-        .filter(|(_, wake)| wake.event_kind == "sleep_resumed")
+        .filter(|(_, row)| row.event_kind == "sleep_resumed")
+        .peekable();
+    if wakes.peek().is_none() {
+        return HashSet::new();
+    }
+
+    // A wake's inclusive window spans at most two consecutive buckets.
+    // In its own bucket only the latest marker matters; in the next bucket
+    // only the earliest matters. This also handles equal-time rows in either order.
+    let mut marker_bounds = HashMap::new();
+    for marker in rows.iter().filter(|row| row.source == FEED_DISABLE_SOURCE) {
+        let ts = marker.ts_ist_nanos;
+        let bucket = ts.div_euclid(PARKED_WAKE_PAIR_WINDOW_NANOS);
+        let socket = (
+            marker.feed.as_str(),
+            marker.ws_type.as_str(),
+            marker.connection_index,
+        );
+        let (first, last) = marker_bounds.entry((socket, bucket)).or_insert((ts, ts));
+        *first = (*first).min(ts);
+        *last = (*last).max(ts);
+    }
+    if marker_bounds.is_empty() {
+        return HashSet::new();
+    }
+
+    wakes
         .filter(|(_, wake)| {
-            rows.iter().any(|m| {
-                m.source == FEED_DISABLE_SOURCE
-                    && m.feed == wake.feed
-                    && m.ws_type == wake.ws_type
-                    && m.connection_index == wake.connection_index
-                    && m.ts_ist_nanos >= wake.ts_ist_nanos
-                    && m.ts_ist_nanos.saturating_sub(wake.ts_ist_nanos)
-                        <= PARKED_WAKE_PAIR_WINDOW_NANOS
-            })
+            let ts = wake.ts_ist_nanos;
+            let bucket = ts.div_euclid(PARKED_WAKE_PAIR_WINDOW_NANOS);
+            let socket = (
+                wake.feed.as_str(),
+                wake.ws_type.as_str(),
+                wake.connection_index,
+            );
+            marker_bounds
+                .get(&(socket, bucket))
+                .is_some_and(|&(_, last)| last >= ts)
+                || marker_bounds
+                    .get(&(socket, bucket + 1))
+                    .is_some_and(|&(first, _)| {
+                        first <= ts.saturating_add(PARKED_WAKE_PAIR_WINDOW_NANOS)
+                    })
         })
         .map(|(idx, _)| idx)
         .collect()
@@ -978,8 +1045,8 @@ pub fn build_feed_instruments_count_sql(feed: &str, target_ist_day: u64) -> Stri
     )
 }
 
-/// Distinct session minutes ([09:15, 15:30) IST) a feed delivered any tick
-/// in. ≤375 rows; the minute values are opaque keys compared in Rust.
+/// Minutes in the regular capture window used by the process-death reconciler.
+/// The daily score selects its own dated session bounds in `CaptureMinutes`.
 /// Micros literals.
 #[must_use]
 pub fn build_feed_session_minutes_sql(feed: &str, target_ist_day: u64) -> String {
@@ -1031,15 +1098,26 @@ pub fn parse_ws_events(body: &str) -> Option<Vec<WsAuditEventLite>> {
         let Some(ts_micros) = cols[0].as_i64() else {
             continue;
         };
+        let feed = cols[1].as_str().unwrap_or("");
+        let ws_type = cols[2].as_str().unwrap_or("");
+        let down_secs = cols[7].as_i64().unwrap_or(0);
+        let attempts = cols.get(9).and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let kind = crate::ws_connection_rollup::daily_event_kind(
+            feed,
+            ws_type,
+            cols[4].as_str().unwrap_or(""),
+            down_secs,
+            attempts,
+        );
         out.push(WsAuditEventLite {
             ts_ist_nanos: ts_micros.saturating_mul(1_000),
-            feed: cols[1].as_str().unwrap_or("").to_string(),
-            ws_type: cols[2].as_str().unwrap_or("").to_string(),
+            feed: feed.to_string(),
+            ws_type: ws_type.to_string(),
             connection_index: cols[3].as_i64().unwrap_or(0),
-            event_kind: cols[4].as_str().unwrap_or("").to_string(),
+            event_kind: kind.to_string(),
             source: cols[5].as_str().unwrap_or("").to_string(),
             dhan_code: cols[6].as_i64().unwrap_or(-1),
-            down_secs: cols[7].as_i64().unwrap_or(0),
+            down_secs,
             market_hours: cols[8].as_bool().unwrap_or(false),
         });
     }
@@ -1353,6 +1431,86 @@ pub fn should_suppress_episode_overwrite(
     existing_run_partial == Some(false) && new_run_partial
 }
 
+/// Drop reasons registered on startup and required to prove a measured zero.
+pub const WS_AUDIT_DROP_REASONS: [&str; 5] = [
+    "subscription_change",
+    "live_feed_lifecycle",
+    "live_feed_forward",
+    "full",
+    "closed",
+];
+
+#[derive(Default)]
+struct AuditCounterSample {
+    count: u64,
+    seen: bool,
+    invalid: bool,
+}
+
+impl AuditCounterSample {
+    fn observe(&mut self, raw: Option<&str>) {
+        // The local Rust exporter renders integer counter values in base ten.
+        // Accept its exact format so a small positive fraction cannot round to zero.
+        match raw.and_then(|v| v.parse::<u64>().ok()) {
+            Some(n) => {
+                self.count = self.count.saturating_add(n);
+                self.seen = true;
+            }
+            None => self.invalid = true,
+        }
+    }
+
+    fn reading(&self) -> Option<u64> {
+        (self.count > 0 || (self.seen && !self.invalid)).then_some(self.count)
+    }
+}
+
+/// Read the seven boot-seeded series in one pass. A positive count proves a
+/// lower bound even if the exporter omitted or damaged another series.
+fn socket_audit_counters(body: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut drops = AuditCounterSample::default();
+    let mut append = AuditCounterSample::default();
+    let mut flush = AuditCounterSample::default();
+    let mut seen_reasons = [false; WS_AUDIT_DROP_REASONS.len()];
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(metric) = fields.next() else {
+            continue;
+        };
+        match metric {
+            r#"tv_ws_event_audit_write_errors_total{stage="append"}"# => {
+                append.observe(fields.next())
+            }
+            r#"tv_ws_event_audit_write_errors_total{stage="flush"}"# => {
+                flush.observe(fields.next())
+            }
+            _ => {
+                let Some(labels) = metric.strip_prefix("tv_ws_event_audit_dropped_total") else {
+                    continue;
+                };
+                if !labels.is_empty() && !labels.starts_with('{') {
+                    continue;
+                }
+                let reason = labels
+                    .strip_prefix(r#"{reason=""#)
+                    .and_then(|s| s.strip_suffix(r#""}"#));
+                if let Some(index) = WS_AUDIT_DROP_REASONS
+                    .iter()
+                    .position(|&expected| Some(expected) == reason)
+                {
+                    seen_reasons[index] = true;
+                } else {
+                    // An unlabelled or unknown zero cannot certify the seeded reasons.
+                    drops.invalid = true;
+                }
+                drops.observe(fields.next());
+            }
+        }
+    }
+    drops.invalid |= seen_reasons.contains(&false);
+    (drops.reading(), append.reading(), flush.reading())
+}
+
 /// Sum EVERY series of a counter across its label sets (the bare name AND
 /// `name{labels}` lines) from a Prometheus exposition body. Pure. `None`
 /// when the metric is entirely absent (never silently zero).
@@ -1515,10 +1673,13 @@ pub fn collect_correlation_evidence(
 /// `episode_ts_nanos`. Pure, O(list).
 #[must_use]
 pub fn has_overlap(ts_list: &[i64], episode_ts_nanos: i64, window_secs: i64) -> bool {
-    let window_nanos = window_secs.saturating_mul(NANOS_PER_SEC);
+    let Ok(seconds) = u64::try_from(window_secs) else {
+        return false;
+    };
+    let window_nanos = seconds.saturating_mul(1_000_000_000);
     ts_list
         .iter()
-        .any(|&t| (t - episode_ts_nanos).abs() <= window_nanos)
+        .any(|&t| t.abs_diff(episode_ts_nanos) <= window_nanos)
 }
 
 /// The ONLY codes the correlation scan retains. Filtering at PARSE time
@@ -2780,6 +2941,7 @@ async fn run_feed_scoreboard_attempt(
     runtime_enabled_now: Option<(bool, bool)>,
     ctx: &mut ScoreboardAttempt,
 ) -> ScoreboardAttemptEnd {
+    let capture = CaptureMinutes::for_day(target_ist_day);
     let retry_until_deadline = is_same_day_run;
     let final_attempt = ctx.final_attempt;
     // Every QuestDB read or write failure below returns `Retry` at once when
@@ -2976,13 +3138,18 @@ async fn run_feed_scoreboard_attempt(
                     // feed and must never defeat feed_off. The predicates
                     // carry the same filter internally; this outer gate
                     // covers the `any_up` fold.
+                    let second = secs_of_day_ist_from_nanos(ev.ts_ist_nanos);
+                    let before_open = capture.as_ref().is_some_and(|day| day.before_open(second));
                     if is_market_data_ws_type(&ev.ws_type) && is_up_kind(&ev.event_kind) {
                         ups.any_up.insert(ev.feed.clone());
                         if !parked.contains(&idx) {
-                            if is_session_up_row(ev) {
+                            if capture
+                                .as_ref()
+                                .is_some_and(|day| day.market_data_up(second))
+                            {
                                 ups.session_up.insert(ev.feed.clone());
                             }
-                            if is_pre_session_up_row(ev) {
+                            if before_open {
                                 let e = ups
                                     .pre_session_toggles
                                     .entry(ev.feed.clone())
@@ -2991,7 +3158,7 @@ async fn run_feed_scoreboard_attempt(
                             }
                         }
                     }
-                    if is_pre_session_feed_disable_row(ev) {
+                    if before_open && ev.source == FEED_DISABLE_SOURCE {
                         let e = ups
                             .pre_session_toggles
                             .entry(ev.feed.clone())
@@ -3190,6 +3357,9 @@ async fn run_feed_scoreboard_attempt(
 
     // 4. Per-feed tick / instrument / minute coverage (SQL over the day's
     //    ticks partition — flagged O(day-rows), server-side, cold).
+    let session_minutes = capture
+        .as_ref()
+        .map_or(SCOREBOARD_UNAVAILABLE_SENTINEL, CaptureMinutes::duration);
     let mut feed_numbers: BTreeMap<&'static str, FeedDayNumbers> = BTreeMap::new();
     for feed in tickvault_common::feed::Feed::ALL {
         let label = feed.as_str();
@@ -3208,15 +3378,18 @@ async fn run_feed_scoreboard_attempt(
         {
             n.instruments = count;
         }
-        // Distinct session minutes (≤375 opaque keys).
-        let minutes_sql = build_feed_session_minutes_sql(label, target_ist_day);
-        let set = exec_query(&client, questdb, &minutes_sql)
-            .await
-            .and_then(|body| parse_minute_set(&body));
-        if let Some(ref s) = set {
-            n.streaming_minutes = i64::try_from(s.len()).unwrap_or(i64::MAX);
+        if let Some(window) = &capture {
+            let sql = window.sql(label);
+            if let Some(body) = exec_query(&client, questdb, &sql).await
+                && let Some(measured) = window.observed(&body)
+            {
+                n.streaming_minutes = measured;
+            }
+        } else {
+            // A missing schedule cannot be repaired by retrying QuestDB.
+            sources_complete = false;
         }
-        if n.ticks < 0 || n.instruments < 0 || set.is_none() {
+        if n.ticks < 0 || n.instruments < 0 || (capture.is_some() && n.streaming_minutes < 0) {
             // A count read failed (an empty day still answers 0). Before the
             // final attempt this is retried, never written as -1 sentinels.
             if !final_attempt {
@@ -3298,20 +3471,21 @@ async fn run_feed_scoreboard_attempt(
                 secondary_on
             }
         });
-        let inferred = up_signals.as_ref().is_some_and(|ups| {
-            let (disable_ts, up_ts) = ups
-                .pre_session_toggles
-                .get(label)
-                .copied()
-                .unwrap_or((None, None));
-            is_feed_off_day(
-                ups.session_up.contains(label),
-                ups.any_up.contains(label),
-                pre_session_disable_is_state_at_open(disable_ts, up_ts),
-                ticks,
-                enabled_now,
-            )
-        });
+        let inferred = capture.is_some()
+            && up_signals.as_ref().is_some_and(|ups| {
+                let (disable_ts, up_ts) = ups
+                    .pre_session_toggles
+                    .get(label)
+                    .copied()
+                    .unwrap_or((None, None));
+                is_feed_off_day(
+                    ups.session_up.contains(label),
+                    ups.any_up.contains(label),
+                    pre_session_disable_is_state_at_open(disable_ts, up_ts),
+                    ticks,
+                    enabled_now,
+                )
+            });
         let kept = existing_daily.as_ref().is_some_and(|m| {
             should_keep_feed_off_outcome(m.get(label).map(String::as_str), inferred, ticks)
         });
@@ -3479,19 +3653,34 @@ async fn run_feed_scoreboard_attempt(
     let mut degraded = false;
     if is_same_day_run {
         let metrics_url = format!("http://127.0.0.1:{metrics_port}/metrics");
-        if let Ok(resp) = client.get(&metrics_url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.text().await
-            && let Some(dropped) = parse_prom_counter_sum(&body, "tv_ws_event_audit_dropped_total")
-            && dropped > 0
-        {
+        let body = match client.get(metrics_url).send().await {
+            Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+            _ => None,
+        };
+        // Both single-label writer series are seeded at boot. Rejected appends
+        // lose the event; failed flush attempts may recover on a later retry.
+        let (dropped, append_errors, flush_errors) = body
+            .as_deref()
+            .map_or((None, None, None), socket_audit_counters);
+        if dropped.is_some_and(|n| n > 0) || append_errors.is_some_and(|n| n > 0) {
             degraded = true;
             scoreboard_finding!(
                 ctx,
                 stage = "audit_drop_crosscheck",
-                dropped,
-                "SCOREBOARD-01: ws_event_audit dropped rows this session — the \
-                 day's episode counts are a floor, not a truth (outcome=degraded)"
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: ws_event_audit rejected rows this session; the day's episode counts are a lower bound"
+            );
+        } else if (dropped, append_errors, flush_errors) != (Some(0), Some(0), Some(0)) {
+            sources_complete = false;
+            scoreboard_finding!(
+                ctx,
+                stage = "audit_drop_crosscheck",
+                ?dropped,
+                ?append_errors,
+                ?flush_errors,
+                "SCOREBOARD-01: today's socket audit counters are incomplete or include a failed flush whose delivery is unverified"
             );
         }
     }
@@ -3576,11 +3765,11 @@ async fn run_feed_scoreboard_attempt(
             .get(label)
             .copied()
             .unwrap_or_else(FeedDayNumbers::unavailable);
-        let uptime_pct = if n.streaming_minutes >= 0 {
+        let uptime_pct = if n.streaming_minutes >= 0 && session_minutes > 0 {
             #[allow(clippy::cast_precision_loss)]
             // APPROVED: display-only percentage over bounded minute counts.
             {
-                (n.streaming_minutes as f64 / SCOREBOARD_SESSION_MINUTES as f64) * 100.0
+                (n.streaming_minutes as f64 / session_minutes as f64) * 100.0
             }
         } else {
             // Unknown — 0.0 paired with partial_coverage=true (never a
@@ -3626,7 +3815,7 @@ async fn run_feed_scoreboard_attempt(
             blame_indeterminate: n.blame_indeterminate,
             restarts_detected: n.restarts,
             streaming_minutes: n.streaming_minutes,
-            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            session_minutes,
             uptime_pct,
             partial_coverage: row_partial,
             // Scoreboard PR-D: per-feed source truth — 'in_memory' when
@@ -3744,7 +3933,7 @@ async fn run_feed_scoreboard_attempt(
         result: Ok(ScoreboardSummary {
             trading_date_ist: trading_date_label,
             dhan,
-            session_minutes: SCOREBOARD_SESSION_MINUTES,
+            session_minutes,
             partial_coverage,
             degraded,
             early_run: forced_early_run,
@@ -3768,14 +3957,63 @@ mod tests {
 
     #[test]
     fn test_parse_questdb_count() {
-        // Relocated 2026-07-18 with the fn from the retired
-        // tick_conservation_boot module.
         assert_eq!(
-            parse_questdb_count(r#"{"dataset":[[42]],"count":1}"#),
+            parse_questdb_count(
+                r#"{"columns":[{"name":"count","type":"LONG"}],"dataset":[[42]],"count":1}"#
+            ),
             Some(42)
         );
-        assert_eq!(parse_questdb_count(r#"{"dataset":[]}"#), None);
-        assert_eq!(parse_questdb_count("not json"), None);
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[0]],"count":1}"#),
+            Some(0)
+        );
+        assert_eq!(
+            parse_questdb_count(r#"{"dataset":[[9223372036854775807]]}"#),
+            Some(i64::MAX)
+        );
+        // Older responses can name the aggregate without describing its type.
+        for columns in [
+            r#"[{"name":"count"}]"#,
+            r#"[{"name":"count()","type":"LONG"}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), Some(42), "{response}");
+        }
+        for columns in [
+            "null",
+            "{}",
+            "[]",
+            "[null]",
+            r#"[{"name":"count"},{"name":"count"}]"#,
+            r#"[{"type":"LONG"}]"#,
+            r#"[{"name":null}]"#,
+            r#"[{"name":"temperature","type":"LONG"}]"#,
+            r#"[{"name":"temperature","type":"INT"}]"#,
+            r#"[{"name":"count","type":"INT"}]"#,
+            r#"[{"name":"count","type":null}]"#,
+        ] {
+            let response = format!(r#"{{"columns":{columns},"dataset":[[42]]}}"#);
+            assert_eq!(parse_questdb_count(&response), None, "{response}");
+        }
+        for invalid in [
+            "not json",
+            "{}",
+            r#"{"dataset":[]}"#,
+            r#"{"dataset":[[]]}"#,
+            r#"{"dataset":[[42],[0]]}"#,
+            r#"{"dataset":[[42,0]]}"#,
+            r#"{"dataset":[[null]]}"#,
+            r#"{"dataset":[[-1]]}"#,
+            r#"{"dataset":[[42.0]]}"#,
+            r#"{"dataset":[["42"]]}"#,
+            r#"{"dataset":[[9223372036854775808]]}"#,
+            r#"{"dataset":[[42]],"count":0}"#,
+            r#"{"dataset":[[42]],"count":null}"#,
+            r#"{"dataset":[[42]],"error":"unavailable"}"#,
+            r#"{"error":null,"dataset":[[42]]}"#,
+        ] {
+            assert_eq!(parse_questdb_count(invalid), None, "{invalid}");
+        }
     }
 
     const DAY: u64 = 20_644; // an arbitrary IST day number
@@ -4108,14 +4346,16 @@ mod tests {
             [1784000000000000, "dhan", "main_feed", 0, "disconnected", "Dhan or network", -1, 0, true],
             [1784000060000000, "dhan", "main_feed", 0, "reconnected", "n/a", -1, 60, true],
             ["bad row"],
-            [1784000120000000, "groww", "groww_bridge", 0, "connected", "groww_subscribed", -1, 0, false]
+            [1784000120000000, "groww", "groww_bridge", 0, "connected", "groww_subscribed", -1, 0, false],
+            [1784000180000000, "dhan", "main_feed", 3, "connected", "main_feed", -1, 0, true, 1]
         ]}"#;
         let rows = parse_ws_events(body).expect("parse");
-        assert_eq!(rows.len(), 3, "malformed rows skipped, never panic");
+        assert_eq!(rows.len(), 4, "malformed rows skipped, never panic");
         assert_eq!(rows[0].event_kind, "disconnected");
         assert_eq!(rows[0].ts_ist_nanos, 1_784_000_000_000_000 * 1_000);
         assert_eq!(rows[1].down_secs, 60);
         assert_eq!(rows[2].feed, "groww");
+        assert_eq!(rows[3].event_kind, "reconnected");
         // Unparsable body → None (caller records sentinels).
         assert_eq!(parse_ws_events("not json"), None);
     }
@@ -4217,6 +4457,21 @@ mod tests {
             });
             assert!(emitted, "stage {stage} is no longer a RESILIENCE-01 line");
         }
+    }
+
+    #[test]
+    fn has_overlap_handles_extreme_timestamps_and_negative_windows() {
+        for (ts, episode) in [(i64::MAX, i64::MIN), (i64::MIN, i64::MAX), (i64::MIN, 0)] {
+            assert!(!has_overlap(&[ts], episode, 1));
+            assert!(has_overlap(&[ts], episode, i64::MAX));
+        }
+        // The widest possible distance is 18,446,744,073.709551615 seconds.
+        assert!(!has_overlap(&[i64::MIN], i64::MAX, 18_446_744_073));
+        assert!(has_overlap(&[i64::MIN], i64::MAX, 18_446_744_074));
+        assert!(has_overlap(&[i64::MIN], i64::MIN, 0));
+        assert!(!has_overlap(&[i64::MAX], i64::MAX, -1));
+        assert!(has_overlap(&[i64::MAX], i64::MAX - NANOS_PER_SEC, 1));
+        assert!(!has_overlap(&[i64::MIN], i64::MIN + NANOS_PER_SEC + 1, 1));
     }
 
     #[test]
@@ -6109,6 +6364,85 @@ mod tests {
             false,
         );
         assert!(!is_pre_session_up_row(&down), "down kinds never count");
+    }
+
+    #[test]
+    fn parked_wake_indices_match_inclusive_signed_time_window() {
+        let width = PARKED_WAKE_PAIR_WINDOW_NANOS;
+        let times = [
+            i64::MIN,
+            i64::MIN + width,
+            -width - 1,
+            -width,
+            -1,
+            0,
+            1,
+            width - 1,
+            width,
+            width + 1,
+            i64::MAX - width,
+            i64::MAX,
+        ];
+        for wake_ts in times {
+            for marker_ts in times {
+                let wake = ev(
+                    wake_ts,
+                    "dhan",
+                    "main_feed",
+                    "sleep_resumed",
+                    "ws",
+                    -1,
+                    true,
+                );
+                let marker = ev(
+                    marker_ts,
+                    "dhan",
+                    "main_feed",
+                    "sleep_entered",
+                    FEED_DISABLE_SOURCE,
+                    -1,
+                    true,
+                );
+                let distance = i128::from(marker_ts) - i128::from(wake_ts);
+                let expected = if (0..=i128::from(width)).contains(&distance) {
+                    HashSet::from([1, 2])
+                } else {
+                    HashSet::new()
+                };
+                assert_eq!(
+                    parked_wake_indices(&[marker, wake.clone(), wake]),
+                    expected,
+                    "wake {wake_ts}, marker {marker_ts}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parked_wake_indices_use_both_marker_extrema_in_unsorted_buckets() {
+        let width = PARKED_WAKE_PAIR_WINDOW_NANOS;
+        let marker = |ts| {
+            ev(
+                ts,
+                "dhan",
+                "main_feed",
+                "sleep_entered",
+                FEED_DISABLE_SOURCE,
+                -1,
+                true,
+            )
+        };
+        let wake = |ts| ev(ts, "dhan", "main_feed", "sleep_resumed", "ws", -1, true);
+        let rows = [
+            marker(width + 8),
+            wake(width + 6),
+            marker(width + 3),
+            wake(4),
+            wake(2),
+            wake(width + 9),
+            marker(width + 3),
+        ];
+        assert_eq!(parked_wake_indices(&rows), HashSet::from([1, 3]));
     }
 
     #[test]

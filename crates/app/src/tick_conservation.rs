@@ -5,7 +5,14 @@
 //!
 //! At [`TICK_CONSERVATION_CHECK_SECS_OF_DAY_IST`] (15:45 IST, five minutes
 //! after `TICK_PERSIST_END_SECS_OF_DAY_IST` closes the `ticks` window) it
-//! compares:
+//! compares the following quantities. Once the archiver verifies an hourly
+//! or daily partition of either destination, its receipt covers every feed.
+//! The persisted database value is then a hot-table observation. A hot excess
+//! is still a mismatch. An equal or smaller count is unverified.
+//! Two WAL snapshots bracket the hot counts. If either table is unavailable,
+//! suspended, behind or advances across the reads, equal/smaller hot counts
+//! remain unverified. If admissions increase during the reads, even a hot
+//! excess stays unverified. Each retry samples a new numerator and new counts.
 //!
 //! - **accepted**: `ticks` rows the Dhan writer appended for today, from the
 //!   in-process ledger (`tickvault_storage::tick_conservation_ledger`, one
@@ -22,13 +29,13 @@
 //!
 //! | verdict | when |
 //! |---|---|
-//! | `unverified` | the count could not be read (error, timeout, bad body), or nothing was accepted and nothing is stored (a zero baseline proves nothing) |
+//! | `unverified` | a count or the archive state is unreadable, a partition was verified for archive, both counts are zero, or counted losses can explain a shortfall |
 //! | `partial` | this process started after 09:00 IST today (or on another day): it only knows its own rows, so no mismatch is claimed |
-//! | `match` | `accepted == database`, or the shortfall is within the rows counted as not landed |
+//! | `match` | the full-day accepted and database counts are equal and positive |
 //! | `mismatch` | the database holds MORE rows than accepted, or the shortfall exceeds every counted loss |
 //!
-//! An `unverified` or `mismatch` read is retried up to
-//! [`TICK_CONSERVATION_MAX_READS`] times, [`TICK_CONSERVATION_READ_SPACING_SECS`]
+//! An `unverified` (except `no_rows` or a verified archive) or `mismatch` read is retried, up to
+//! [`TICK_CONSERVATION_MAX_READS`] reads in total, [`TICK_CONSERVATION_READ_SPACING_SECS`]
 //! apart, because an acknowledged row is only countable once QuestDB has
 //! applied its WAL. A final `mismatch` logs one coded `error!`
 //! (`TICK-CONSERVE-01`), log only: no CloudWatch filter, no EMF name, no
@@ -56,8 +63,9 @@
 //! ## Honest limits
 //!
 //! - The not-landed total is per process and can include `feed_aux_packets`
-//!   rows that shared a rescued batch, so it is a tolerance, not an exact
-//!   term; a real loss smaller than the counted spills reads as `match`.
+//!   rows that shared a rescued batch. It cannot establish which of this
+//!   day's missing rows were rescued. Even an exact count compares totals,
+//!   not row identities.
 //! - Rows the boot WAL replay of a mid-day restart re-appends would be counted
 //!   twice against a database that already holds them; that process is
 //!   `partial` by construction, which is why `partial` never claims a
@@ -86,7 +94,9 @@ use tickvault_common::feed::Feed;
 use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::ws_event_types::{WS_EVENT_NO_DHAN_CODE, WsType};
 use tickvault_storage::feed_gap_audit_persistence::FeedGapRow;
-use tickvault_storage::tick_conservation_audit_persistence::TickConservationRow;
+use tickvault_storage::tick_conservation_audit_persistence::{
+    AuditReceiptWrite, TickConservationRow, write_or_queue_tick_conservation_row,
+};
 use tickvault_storage::tick_conservation_ledger::TickConservationLedger;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -124,11 +134,11 @@ const _: () = assert!(TICK_CONSERVATION_CHECK_SECS_OF_DAY_IST < 16 * 3600);
 /// The outcome of one daily check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConservationVerdict {
-    /// Every accepted row is stored or counted as not landed.
+    /// The positive accepted and database counts are equal.
     Match,
     /// Rows are unaccounted for, or the database holds extra rows.
     Mismatch,
-    /// The database count was not read, or there was nothing to compare.
+    /// An unreadable count, empty baseline or possibly accounted-for shortfall.
     Unverified,
     /// This process did not cover the whole day; it never claims a mismatch.
     Partial,
@@ -179,7 +189,7 @@ pub const fn classify(i: ConservationInputs) -> (ConservationVerdict, &'static s
     if shortfall == 0 {
         (ConservationVerdict::Match, "exact")
     } else if shortfall <= i.not_landed_rows {
-        (ConservationVerdict::Match, "within_counted_losses")
+        (ConservationVerdict::Unverified, "within_counted_losses")
     } else {
         (ConservationVerdict::Mismatch, "unexplained_shortfall")
     }
@@ -398,7 +408,9 @@ async fn run_daily_checks(
     process_start_ist_nanos: i64,
     now_utc_nanos: &impl Fn() -> i64,
 ) {
+    use tickvault_storage::audit_spill::{AuditSpillTable, spawn_audit_spill_drain_once};
     use tickvault_storage::tick_conservation_audit_persistence::ensure_tick_conservation_audit_table;
+    spawn_audit_spill_drain_once(AuditSpillTable::TickConservationAudit, questdb);
     ensure_tick_conservation_audit_table(questdb).await;
     loop {
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
@@ -420,12 +432,116 @@ async fn run_daily_checks(
             )
             .await;
         }
-        // Sleep to just past the next IST midnight (a multi-day process).
+        // Retry can run to midnight. Begin the new day's scheduling immediately.
         let now_ist = now_utc_nanos().saturating_add(IST_UTC_OFFSET_NANOS);
+        if ist_date_of(now_ist) != today {
+            continue;
+        }
         let to_midnight = NANOS_PER_DAY - now_ist.rem_euclid(NANOS_PER_DAY);
         let secs = u64::try_from(to_midnight / NANOS_PER_SEC).unwrap_or(0) + 5;
         tokio::time::sleep(Duration::from_secs(secs)).await;
     }
+}
+
+/// Archived partition metadata combines all feeds. Retain the observed hot
+/// count, but make no full-day comparison when the Dhan share is unknown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchiveCoverage {
+    HotOnly,
+    VerifiedPartition,
+    Unknown,
+}
+
+const ARCHIVE_AUDIT_APPLIED_SQL: &str = "select count() from wal_tables() \
+    where name = 'partition_archive_audit' and suspended = false and writerTxn = sequencerTxn";
+
+const DESTINATION_WAL_SQL: &str = "select name, suspended, writerTxn, sequencerTxn \
+    from wal_tables() where name in ('ticks','tick_quotes')";
+
+/// Each position is meaningful only for its named destination. Missing or
+/// duplicate rows, a suspended writer (even with equal transactions), lag or
+/// an invalid response cannot establish that an acknowledged row is visible.
+fn applied_positions(body: &str) -> Option<[i64; 2]> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    if json.get("error").is_some() || json.get("count").is_some_and(|n| n.as_u64() != Some(2)) {
+        return None;
+    }
+    let (rows, skipped) =
+        tickvault_storage::wal_suspension_watcher::parse_wal_tables_response(&json).ok()?;
+    if skipped != 0 || rows.len() != TICK_COUNT_TABLES.len() {
+        return None;
+    }
+    let mut positions = [None; 2];
+    for row in rows {
+        let slot = TICK_COUNT_TABLES
+            .iter()
+            .position(|&name| name == row.name)?;
+        let applied = row.writer_txn?;
+        if row.suspended
+            || applied < 0
+            || Some(applied) != row.sequencer_txn
+            || positions[slot].replace(applied).is_some()
+        {
+            return None;
+        }
+    }
+    Some([positions[0]?, positions[1]?])
+}
+
+async fn destination_positions(questdb: &QuestDbConfig) -> Option<[i64; 2]> {
+    applied_positions(&read_query(DESTINATION_WAL_SQL, questdb).await?)
+}
+
+fn archive_marker_sql(day: NaiveDate) -> String {
+    // The partition name identifies its trading date. The audit timestamp is
+    // when it was copied, potentially on a later day. A verified receipt
+    // precedes DROP even if the subsequent dropped receipt fails to land.
+    format!(
+        "select count() from (select partition_name from partition_archive_audit \
+        where ts >= '{day}T00:00:00.000000Z' and table_name in ('ticks','tick_quotes') \
+        and partition_name like '{day}%' and outcome in ('verified','dropped') limit 1)"
+    )
+}
+
+/// Called AFTER the hot counts. For a partition removed before those reads,
+/// the archiver had already flushed its verified receipt before DROP. First
+/// establish that such receipts are query-visible, then look them up. A
+/// subsequent unrelated drop cannot invalidate a previously read hot count.
+async fn archive_coverage(day: NaiveDate, questdb: &QuestDbConfig) -> ArchiveCoverage {
+    if read_count(ARCHIVE_AUDIT_APPLIED_SQL, questdb).await != Some(1) {
+        return ArchiveCoverage::Unknown;
+    }
+    match read_count(&archive_marker_sql(day), questdb).await {
+        Some(0) => ArchiveCoverage::HotOnly,
+        Some(1) => ArchiveCoverage::VerifiedPartition,
+        _ => ArchiveCoverage::Unknown,
+    }
+}
+
+// More cold Dhan rows can only increase the database side. An already
+// observed hot excess remains an independently demonstrated mismatch.
+fn needs_storage_evidence(i: ConservationInputs) -> bool {
+    i.full_coverage && i.db_rows.is_some_and(|hot| hot <= i.accepted_rows)
+}
+
+fn classify_coverage(
+    i: ConservationInputs,
+    archive: ArchiveCoverage,
+) -> (ConservationVerdict, &'static str) {
+    // Preserve failed count reads and partial-process coverage. Their raw
+    // fields already explain why a whole-day comparison was impossible.
+    if needs_storage_evidence(i) {
+        match archive {
+            ArchiveCoverage::VerifiedPartition => {
+                return (ConservationVerdict::Unverified, "archived_partition");
+            }
+            ArchiveCoverage::Unknown => {
+                return (ConservationVerdict::Unverified, "archive_coverage_unknown");
+            }
+            ArchiveCoverage::HotOnly => {}
+        }
+    }
+    classify(i)
 }
 
 /// The day's rows across [`TICK_COUNT_TABLES`]. `None` when any one count
@@ -433,19 +549,23 @@ async fn run_daily_checks(
 async fn read_tick_count(day: NaiveDate, questdb: &QuestDbConfig) -> Option<u64> {
     let mut total = 0_u64;
     for table in TICK_COUNT_TABLES {
-        total = total.checked_add(read_table_count(table, day, questdb).await?)?;
+        total = total.checked_add(read_count(&tick_count_sql(table, day), questdb).await?)?;
     }
     Some(total)
 }
 
-async fn read_table_count(table: &str, day: NaiveDate, questdb: &QuestDbConfig) -> Option<u64> {
+async fn read_count(sql: &str, questdb: &QuestDbConfig) -> Option<u64> {
+    let body = read_query(sql, questdb).await?;
+    crate::feed_scoreboard_boot::parse_questdb_count(&body).and_then(|n| u64::try_from(n).ok())
+}
+
+async fn read_query(sql: &str, questdb: &QuestDbConfig) -> Option<String> {
     let client =
         tickvault_storage::http_client::build_probe_client(TICK_COUNT_QUERY_TIMEOUT_SECS).ok()?;
     let url = format!("http://{}:{}/exec", questdb.host, questdb.http_port);
-    let sql = tick_count_sql(table, day);
     let resp = tokio::time::timeout(
         Duration::from_secs(TICK_COUNT_QUERY_TIMEOUT_SECS),
-        client.get(&url).query(&[("query", sql.as_str())]).send(),
+        client.get(&url).query(&[("query", sql)]).send(),
     )
     .await
     .ok()?
@@ -453,8 +573,7 @@ async fn read_table_count(table: &str, day: NaiveDate, questdb: &QuestDbConfig) 
     if !resp.status().is_success() {
         return None;
     }
-    let body = resp.text().await.ok()?;
-    crate::feed_scoreboard_boot::parse_questdb_count(&body).and_then(|n| u64::try_from(n).ok())
+    resp.text().await.ok()
 }
 
 async fn run_one_check(
@@ -470,17 +589,47 @@ async fn run_one_check(
     let mut reads = 0_u32;
     let (inputs, verdict, reason) = loop {
         reads += 1;
+        let accepted_rows = ledger.accepted_rows_on(ledger_day);
+        let not_landed_rows = ledger.rows_not_landed();
+        let before = if full_coverage {
+            destination_positions(questdb).await
+        } else {
+            None
+        };
         let inputs = ConservationInputs {
-            accepted_rows: ledger.accepted_rows_on(ledger_day),
-            not_landed_rows: ledger.rows_not_landed(),
+            accepted_rows,
+            not_landed_rows,
             db_rows: read_tick_count(day, questdb).await,
             full_coverage,
         };
-        let (verdict, reason) = classify(inputs);
-        let settled = matches!(
-            verdict,
-            ConservationVerdict::Match | ConservationVerdict::Partial
-        ) || reason == "no_rows";
+        // Keep the original numerator as evidence. If a later admission
+        // could already be in either count, even a hot excess is ambiguous.
+        let moving_admissions = full_coverage
+            && inputs.db_rows.is_some()
+            && ledger.accepted_rows_on(ledger_day) != accepted_rows;
+        let (verdict, reason) = if moving_admissions {
+            (ConservationVerdict::Unverified, "admissions_changed")
+        } else if needs_storage_evidence(inputs) {
+            // The two counts are separate reads. A later healthy WAL cannot
+            // certify an earlier stale read. Require both positions to be
+            // applied before, and identical after, these reads.
+            if before.is_some() && destination_positions(questdb).await == before {
+                classify_coverage(inputs, archive_coverage(day, questdb).await)
+            } else {
+                (
+                    ConservationVerdict::Unverified,
+                    "destination_wal_unverified",
+                )
+            }
+        } else {
+            classify(inputs)
+        };
+        let settled = reason == "archived_partition"
+            || matches!(
+                verdict,
+                ConservationVerdict::Match | ConservationVerdict::Partial
+            )
+            || reason == "no_rows";
         if settled || reads >= TICK_CONSERVATION_MAX_READS {
             break (inputs, verdict, reason);
         }
@@ -502,7 +651,11 @@ async fn run_one_check(
         process_start_ist_nanos,
     };
     report(&row, inputs);
-    persist(questdb, &row).await;
+    let retry_window = receipt_retry_window(day_ist_nanos, checked_at);
+    persist(&row, retry_window, |receipt| {
+        write_or_queue_tick_conservation_row(questdb, receipt)
+    })
+    .await;
 }
 
 /// Logs the verdict: a coded `error!` on `mismatch` (log only), a `warn!` on
@@ -517,15 +670,16 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
             not_landed_rows = inputs.not_landed_rows,
             shortfall = row.shortfall(),
             count_reads = row.count_reads,
-            "TICK-CONSERVE-01: today's ticks rows do not reconcile with the rows this \
-             process accepted, after every counted spill, failure and WAL deferral"
+            "TICK-CONSERVE-01: accepted buffer writes and stored trade and quote rows differ. \
+             Compare capture keys to distinguish repeated writes from missing rows"
         ),
         "unverified" => warn!(
             reason = row.reason,
             accepted_rows = inputs.accepted_rows,
+            db_tick_rows = row.db_tick_rows,
+            not_landed_rows = inputs.not_landed_rows,
             count_reads = row.count_reads,
-            "tick conservation: today's check is unverified (the database count was not \
-             read, or there was nothing to compare)"
+            "tick conservation: today's accepted and stored counts could not be confirmed"
         ),
         _ => info!(
             verdict = row.verdict,
@@ -538,19 +692,73 @@ fn report(row: &TickConservationRow, inputs: ConservationInputs) {
     }
 }
 
-async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
-    use tickvault_storage::tick_conservation_audit_persistence::TickConservationAuditWriter;
-    let mut writer = TickConservationAuditWriter::new(questdb);
-    let written = writer
-        .append_row(row)
-        .and_then(|()| crate::order_observability::blocking_flush(|| writer.flush()));
-    if let Err(err) = written {
-        error!(
+// A delayed check still gets an immediate write, even if its audited day has ended.
+fn receipt_retry_window(day: i64, checked_at: i64) -> Duration {
+    if day.div_euclid(NANOS_PER_DAY) == checked_at.div_euclid(NANOS_PER_DAY) {
+        Duration::from_nanos((NANOS_PER_DAY - checked_at.rem_euclid(NANOS_PER_DAY)).unsigned_abs())
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Keep the original receipt for another attempt when both durable paths refuse it.
+/// Waiting happens on the daily audit task, outside the feed and dashboard paths.
+async fn persist<'a, F>(
+    row: &'a TickConservationRow,
+    retry_window: Duration,
+    mut write: impl FnMut(&'a TickConservationRow) -> F,
+) where
+    F: std::future::Future<Output = anyhow::Result<AuditReceiptWrite>>,
+{
+    let deadline = tokio::time::Instant::now() + retry_window;
+    let result = match write(row).await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(
+                code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                stage = "tick_conservation_audit_write",
+                ?row,
+                ?err,
+                "daily receipt has no confirmed durable copy; keeping it in memory for retry until IST midnight"
+            );
+            let interval = Duration::from_secs(
+                tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS,
+            );
+            let result = loop {
+                let next_attempt = tokio::time::Instant::now() + interval;
+                tokio::time::sleep_until(next_attempt.min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    error!(
+                        code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
+                        stage = "tick_conservation_audit_retry_expired",
+                        ?row,
+                        "daily receipt retry window ended with no confirmed database or journal copy"
+                    );
+                    return;
+                }
+                // A write already in flight can have published its journal. Let it
+                // report the outcome even if the audited day ends during the request.
+                match write(row).await {
+                    Ok(result) => break result,
+                    Err(err) => {
+                        tracing::debug!(?err, "daily receipt retry still has no confirmed copy")
+                    }
+                }
+            };
+            info!(
+                ?result,
+                ?row,
+                "daily receipt recovered after a failed write"
+            );
+            result
+        }
+    };
+    if result == AuditReceiptWrite::QueuedForReplay {
+        warn!(
             code = ErrorCode::StorageGap03AuditWriteFailed.code_str(),
-            stage = "tick_conservation_audit_write",
-            verdict = row.verdict,
-            ?err,
-            "tick_conservation_audit: today's row was not written (the verdict is in this log)"
+            stage = "tick_conservation_audit_queued",
+            ?row,
+            "tick conservation receipt queued on disk; database delivery unconfirmed"
         );
     }
 }
@@ -558,6 +766,87 @@ async fn persist(questdb: &QuestDbConfig, row: &TickConservationRow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_persist_reoffers_original_receipt_only_while_both_durable_paths_fail() {
+        let row = TickConservationRow {
+            checked_at_ist_nanos: DAY + 100,
+            day_ist_nanos: DAY,
+            feed: Feed::Dhan,
+            verdict: "mismatch",
+            reason: "unexplained_shortfall",
+            accepted_rows: 4,
+            db_tick_rows: 2,
+            not_landed_rows: 0,
+            count_reads: 3,
+            process_start_ist_nanos: DAY,
+        };
+        let interval = tickvault_storage::audit_spill::AUDIT_SPILL_DRAIN_INTERVAL_SECS;
+        for target in [
+            AuditReceiptWrite::Acknowledged,
+            AuditReceiptWrite::QueuedForReplay,
+        ] {
+            for failures in [0, 2] {
+                let mut calls = 0;
+                let started = tokio::time::Instant::now();
+                persist(&row, Duration::from_secs(3 * interval), |receipt| {
+                    assert!(std::ptr::eq(receipt, &row));
+                    calls += 1;
+                    std::future::ready(if calls <= failures {
+                        Err(anyhow::anyhow!("database and journal unavailable"))
+                    } else {
+                        Ok(target)
+                    })
+                })
+                .await;
+                assert_eq!(calls, failures + 1);
+                assert_eq!(started.elapsed(), Duration::from_secs(failures * interval));
+            }
+        }
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY + 1),
+            Duration::ZERO
+        );
+        assert_eq!(
+            receipt_retry_window(DAY, DAY + NANOS_PER_DAY - 23),
+            Duration::from_nanos(23)
+        );
+        let calls = std::cell::Cell::new(0);
+        let finished = std::cell::Cell::new(false);
+        persist(&row, Duration::from_secs(interval + 1), |_| async {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                return Err(anyhow::anyhow!("both refused"));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            finished.set(true);
+            Ok(AuditReceiptWrite::QueuedForReplay)
+        })
+        .await;
+        assert!(
+            finished.get(),
+            "an attempt started before midnight finished"
+        );
+        assert_eq!(calls.get(), 2);
+        let mut late_calls = 0;
+        persist(&row, Duration::ZERO, |_| {
+            late_calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("prior-day check")))
+        })
+        .await;
+        assert_eq!(late_calls, 1);
+        let mut calls = 0;
+        let window = Duration::from_secs(2 * interval + 1);
+        let started = tokio::time::Instant::now();
+        persist(&row, window, |receipt| {
+            assert!(std::ptr::eq(receipt, &row));
+            calls += 1;
+            std::future::ready(Err(anyhow::anyhow!("persistent dual failure")))
+        })
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(started.elapsed(), window);
+    }
 
     /// 2026-10-26 00:00 IST, in IST-epoch nanos.
     const DAY: i64 = 1_792_972_800_000_000_000;
@@ -670,15 +959,117 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_shortfall_within_counted_losses_is_match() {
+    fn applied_positions_requires_two_distinct_healthy_destinations() {
+        use serde_json::json;
+        let response = |rows: serde_json::Value| {
+            json!({
+            "columns": [{"name":"name"}, {"name":"suspended"}, {"name":"writerTxn"}, {"name":"sequencerTxn"}],
+            "dataset": rows
+        }).to_string()
+        };
+        let tick = json!(["ticks", false, 3, 3]);
+        let quote = json!(["tick_quotes", false, 5, 5]);
         assert_eq!(
-            classify(inputs(1_000, 40, Some(960))),
-            (ConservationVerdict::Match, "within_counted_losses")
+            applied_positions(&response(json!([quote, tick]))),
+            Some([3, 5])
         );
-        // Boundary: shortfall == not landed.
+        for rows in [
+            json!([]),
+            json!([tick]),
+            json!([tick, tick]),
+            json!([quote, quote]),
+            json!([tick, quote, quote]),
+            json!([tick, ["other", false, 3, 3]]),
+            json!([tick, ["tick_quotes", true, 5, 5]]),
+            json!([tick, ["tick_quotes", false, 5, 6]]),
+            json!([tick, ["tick_quotes", false, -1, -1]]),
+            json!([quote, ["ticks", false, null, 3]]),
+            json!([null, tick]),
+        ] {
+            assert_eq!(applied_positions(&response(rows)), None);
+        }
+        for raw in [
+            "{}",
+            "not json",
+            r#"{"count":1,"dataset":[]}"#,
+            r#"{"error":"suspended"}"#,
+        ] {
+            assert_eq!(applied_positions(raw), None);
+        }
+    }
+
+    #[test]
+    fn archive_marker_uses_partition_date_and_covers_verified_before_drop() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let sql = archive_marker_sql(day);
+        assert!(sql.contains("table_name in ('ticks','tick_quotes')"));
+        assert!(sql.contains("partition_name like '2026-11-26%'"));
+        assert!(sql.contains("outcome in ('verified','dropped') limit 1"));
+        // The audit time can be later than the partition day. A cap at
+        // midnight or ts in '<day>' would hide next-day archive receipts.
+        assert!(sql.contains("ts >= '2026-11-26T00:00:00.000000Z'"));
+        assert!(!sql.contains("ts <") && !sql.contains("ts in"));
+    }
+
+    #[test]
+    fn archive_state_changes_the_verdict_without_changing_the_hot_count() {
+        for hot in [0, 98, 100] {
+            let sample = inputs(100, 0, Some(hot));
+            for (evidence, reason) in [
+                (ArchiveCoverage::VerifiedPartition, "archived_partition"),
+                (ArchiveCoverage::Unknown, "archive_coverage_unknown"),
+            ] {
+                assert_eq!(
+                    classify_coverage(sample, evidence),
+                    (ConservationVerdict::Unverified, reason)
+                );
+                assert_eq!(sample.db_rows, Some(hot));
+            }
+            assert_eq!(
+                classify_coverage(sample, ArchiveCoverage::HotOnly),
+                classify(sample)
+            );
+        }
+        let excess = inputs(100, 0, Some(101));
+        assert!(!needs_storage_evidence(excess));
+        for archive in [
+            ArchiveCoverage::VerifiedPartition,
+            ArchiveCoverage::Unknown,
+            ArchiveCoverage::HotOnly,
+        ] {
+            assert_eq!(
+                classify_coverage(excess, archive),
+                (ConservationVerdict::Mismatch, "extra_db_rows")
+            );
+        }
+        let partial = ConservationInputs {
+            full_coverage: false,
+            ..inputs(100, 0, Some(12))
+        };
+        for evidence in [
+            ArchiveCoverage::VerifiedPartition,
+            ArchiveCoverage::Unknown,
+            ArchiveCoverage::HotOnly,
+        ] {
+            assert_eq!(classify_coverage(partial, evidence), classify(partial));
+            assert_eq!(
+                classify_coverage(inputs(100, 0, None), evidence),
+                (ConservationVerdict::Unverified, "count_unreadable")
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_shortfall_within_counted_losses_is_unverified() {
+        for (accepted, not_landed, db) in [(1_000, 40, 960), (1_000, 40, 999), (100, 100, 0)] {
+            assert_eq!(
+                classify(inputs(accepted, not_landed, Some(db))),
+                (ConservationVerdict::Unverified, "within_counted_losses")
+            );
+        }
         assert_eq!(
-            classify(inputs(1_000, 40, Some(960))).0,
-            ConservationVerdict::Match
+            classify(inputs(1_000, 40, Some(1_000))),
+            (ConservationVerdict::Match, "exact")
         );
     }
 
@@ -738,7 +1129,7 @@ mod tests {
     fn test_classify_extremes_do_not_overflow() {
         assert_eq!(
             classify(inputs(u64::MAX, u64::MAX, Some(0))).0,
-            ConservationVerdict::Match
+            ConservationVerdict::Unverified
         );
         assert_eq!(
             classify(inputs(u64::MAX, 0, Some(0))).0,

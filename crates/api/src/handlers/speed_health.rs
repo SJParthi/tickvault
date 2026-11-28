@@ -18,7 +18,7 @@
 //! | Database catch-up queue, feed sockets delivering data now | read in process: the WAL watcher's last apply-lag and stopped-table reading (`ingest_shed::wal_apply_lag_max`, `wal_suspended_tables`), used only while under 150 s old, and each socket's last-frame stamp (`pool_supervisor::snapshot_frame_activity`, the feed's own "delivered in the last 10 s" evidence) |
 //! | Worst step in the last 75 s, bytes kept on disk until confirmed, reconnects, candle overflow | the app's own metrics page (`[observability]` address), read once per refresh |
 //! | Ticks per minute | QuestDB `ticks` and `tick_quotes`, the last 15 full minutes |
-//! | Every tick accounted for | QuestDB `tick_conservation_audit`, the last 14 days |
+//! | Daily tick counts | QuestDB `tick_conservation_audit`, the last 14 days |
 //! | Connection gaps closed today | QuestDB `feed_gap_audit`, since IST midnight (a gap is written when it closes) |
 //! | Per-minute speed record | QuestDB `hot_path_latency_minute` when that table exists; "not yet available" when it does not |
 //!
@@ -499,6 +499,7 @@ fn speed_section(
         title: "Operational stall budgets — since process start",
         note: "These colours compare p99 bucket bounds with broad stall budgets, not \
                the strict one-microsecond target. Runtime delays, metrics upkeep and the feed processor's timer and idle runs are diagnostics. \
+               Ring dwell starts before the write-ahead log handoff and overlaps receive time. \
                Receipt-to-fold overlaps earlier frame stages, and later frames' ring dwell \
                and receipt-to-fold include the time an earlier frame spent in work after a \
                frame (drain_frame_post); durations must not be added. \
@@ -528,8 +529,8 @@ fn stage_samples_valid(fig: &StageFigures) -> bool {
 fn strict_target_section(stages: &[StageFigures; ALL_STAGES.len()]) -> Section {
     let tiles = stages.iter().filter_map(|fig| {
         let unit = match fig.stage {
-            Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs",
-            Stage::RingDwell => "received frame, all endpoints; overlaps receive time",
+            Stage::SocketToWal => "received frame, all endpoints; includes refused handoffs. An accepted frame enters the writer's memory queue. A frame can survive a process crash once the writer flushes it to the operating system.",
+            Stage::RingDwell => "live-drained frame, all endpoints. From receipt before the write-ahead log handoff to the drain after dequeue and reservation release. Includes reader work before enqueue. Ring-refused frames have no sample.",
             Stage::DrainMainFrame => "main-feed frame; decode/fold/append combined",
             Stage::ReceiptToFold => "live main-feed frame; overlaps earlier stages; ring-refused frames excluded",
             Stage::DrainMainTick => "main-feed tick; the frame's decode/fold/append time over its ticks (per-tick average within each frame)",
@@ -624,7 +625,7 @@ pub(crate) fn tick_window(ist_now: i64) -> (i64, i64) {
 pub(crate) fn conservation_sql(ist_now: i64) -> String {
     format!(
         "SELECT trading_date_ist, feed, verdict, reason, accepted_rows, db_tick_rows, \
-         not_landed_rows, shortfall FROM tick_conservation_audit WHERE ts >= '{}' \
+         not_landed_rows, shortfall, ts, count_reads FROM tick_conservation_audit WHERE ts >= '{}' \
          ORDER BY ts DESC LIMIT {CONSERVATION_ROWS}",
         ist_literal(ist_now - CONSERVATION_LOOKBACK_DAYS * SECS_PER_DAY),
     )
@@ -822,31 +823,50 @@ fn ticks_section(inputs: &Inputs) -> Section {
     }
 }
 
-/// The verdict for one daily tick-accounting row.
-pub(crate) fn conservation_light(verdict: &str) -> Light {
-    match verdict {
-        "match" => Light::Green,
-        "partial" | "unverified" => Light::Amber,
-        "mismatch" => Light::Red,
-        _ => Light::Grey,
-    }
-}
-
-/// Plain-English word for a stored verdict.
-pub(crate) fn conservation_word(verdict: &str) -> &'static str {
-    match verdict {
-        "match" => "every tick counted",
-        "partial" => "partly checked (app restarted mid-day)",
-        "unverified" => "could not be checked",
-        "mismatch" => "ticks missing",
-        _ => "unknown result",
+/// Historical writers stored covered shortfalls as `match`; the audit reason
+/// and the two row counts distinguish those records from exact count parity.
+fn conservation_result(
+    verdict: &str,
+    reason: &str,
+    accepted: Option<i64>,
+    database: Option<i64>,
+    shortfall: Option<i64>,
+) -> (&'static str, Light) {
+    match (verdict, reason) {
+        ("match" | "unverified", "within_counted_losses") => {
+            ("database shortfall still unverified", Light::Amber)
+        }
+        ("match", "exact")
+            if accepted.is_some_and(|n| n > 0) && accepted == database && shortfall == Some(0) =>
+        {
+            ("row counts agree", Light::Green)
+        }
+        ("unverified", "archived_partition") => {
+            ("archive verified, full count unknown", Light::Amber)
+        }
+        ("unverified", "archive_coverage_unknown") => ("archive status unknown", Light::Amber),
+        ("unverified", "destination_wal_unverified") => {
+            ("database write progress unconfirmed", Light::Amber)
+        }
+        ("unverified", "admissions_changed") => {
+            ("new writes arrived during the count", Light::Amber)
+        }
+        ("match" | "unverified", _) => ("count agreement unverified", Light::Amber),
+        ("partial", _) => ("partial session counts", Light::Amber),
+        ("mismatch", "extra_db_rows") => ("more live rows than accepted writes", Light::Red),
+        ("mismatch", "unexplained_shortfall") => {
+            ("fewer live rows than accepted writes", Light::Red)
+        }
+        ("mismatch", _) => ("row counts differ", Light::Red),
+        _ => ("unknown result", Light::Grey),
     }
 }
 
 /// How old the newest daily tick check is. Green within
 /// [`CONSERVATION_STALE_DAYS`] days, amber older (a check went missing, so the
-/// older green rows below it say nothing about the last trading days), grey
-/// when its day cannot be read. `rows` come newest first.
+/// older green rows below it say nothing about the last trading days), amber
+/// on a future trading day, and grey when its day cannot be read. `rows`
+/// come newest first.
 pub(crate) fn conservation_freshness_tile(
     columns: &[String],
     rows: &[Vec<Value>],
@@ -861,9 +881,13 @@ pub(crate) fn conservation_freshness_tile(
     match newest {
         None => Tile::new(LABEL, "unknown day", Light::Grey),
         Some(day) => {
-            let age_days = (ist_day_at(ist_now, 0) - ist_day_at(day, 0)).div_euclid(SECS_PER_DAY);
+            let age_days = ist_now.div_euclid(SECS_PER_DAY) - day.div_euclid(SECS_PER_DAY);
             let value = match age_days {
-                d if d <= 0 => "today".to_string(),
+                ..0 => {
+                    return Tile::new(LABEL, "future trading date", Light::Amber)
+                        .with_detail("check the recorded trading date and the system clock");
+                }
+                0 => "today".to_string(),
                 1 => "1 day ago".to_string(),
                 d => format!("{d} days ago"),
             };
@@ -889,32 +913,30 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
                         .and_then(Value::as_str)
                         .map_or("unknown day", |d| d.get(..10).unwrap_or(d));
                     let feed = cell("feed").and_then(Value::as_str).unwrap_or("unknown");
-                    let number = |name: &str| {
-                        cell(name)
-                            .and_then(Value::as_i64)
-                            .map_or_else(|| "unknown".to_string(), format_signed)
-                    };
-                    let db = match cell("db_tick_rows").and_then(Value::as_i64) {
-                        Some(n) if n >= 0 => format_signed(n),
-                        _ => "unknown".to_string(),
-                    };
-                    Tile::new(
-                format!("{day} · {}", short_text(feed)),
-                conservation_word(verdict),
-                conservation_light(verdict),
-            )
-            .with_detail(format!(
-                "received {} · in the database {db} · not landed {} · short by {} · reason {}",
-                number("accepted_rows"),
-                number("not_landed_rows"),
-                number("shortfall"),
-                short_text(
-                    &cell("reason")
+                    let reason = cell("reason").and_then(Value::as_str).unwrap_or("unknown");
+                    let count = |name| cell(name).and_then(Value::as_i64).filter(|n| *n >= 0);
+                    let accepted = count("accepted_rows");
+                    let database = count("db_tick_rows");
+                    // The writer uses zero as a placeholder for an unreadable count.
+                    let shortfall = database.and_then(|_| cell("shortfall")?.as_i64());
+                    let (value, status) = conservation_result(verdict, reason, accepted, database, shortfall);
+                    // This table stores IST wall time in its designated timestamp.
+                    let checked = cell("ts")
                         .and_then(Value::as_str)
-                        .unwrap_or("none")
-                        .replace('_', " ")
-                ),
-            ))
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map_or_else(|| "unknown".to_string(), |ts| ts.format("%Y-%m-%d %H:%M:%S%.6f IST").to_string());
+                    let number = |value: Option<i64>| value.map_or_else(|| "unknown".to_string(), format_signed);
+                    Tile::new(format!("{day} · {}", short_text(feed)), value, status)
+                        .with_detail(format!(
+                            "accepted writes {} · rows in live trade and quote tables {} · spill, failure or deferral counter {} · difference {} · reason {} · checked {} · count reads {}",
+                            number(accepted),
+                            number(database),
+                            number(count("not_landed_rows")),
+                            number(shortfall),
+                            short_text(&reason.replace('_', " ")),
+                            checked,
+                            number(count("count_reads")),
+                        ))
                 }))
                 .collect()
         }
@@ -928,8 +950,8 @@ fn conservation_section(outcome: &QueryOutcome, ist_now: i64) -> Section {
         ],
     };
     Section {
-        title: "Every tick accounted for",
-        note: "The 15:45 daily check: ticks the app received against ticks in the database."
+        title: "Daily tick counts",
+        note: "The daily check compares writes accepted by the buffer with rows visible in the live trade and quote tables. Rows held only in the archive fall outside this count. Replaying one key can produce two accepted writes and one row. Checking individual ticks requires comparing capture keys."
             .to_string(),
         tiles,
     }
@@ -2145,6 +2167,11 @@ mod tests {
         );
         assert!(strict.tiles.iter().all(|tile| tile.status == Light::Grey));
         assert!(strict.tiles[0].detail.contains("includes refused handoffs"));
+        assert!(strict.tiles[0].detail.contains("writer's memory queue"));
+        let dwell = &strict.tiles[1].detail;
+        assert!(dwell.contains("before the write-ahead log handoff"));
+        assert!(dwell.contains("after dequeue and reservation release"));
+        assert!(dwell.contains("Ring-refused frames have no sample"));
         assert!(strict.tiles[3].detail.contains("live main-feed frame"));
         assert!(
             strict.tiles[3]
@@ -2304,8 +2331,7 @@ garbage line without a number x
     }
 
     #[test]
-    fn test_apply_lag_light_pinned_bytes_light_reconnects_light_conservation_light_conservation_word()
-     {
+    fn test_apply_lag_light_pinned_bytes_light_reconnects_light() {
         assert_eq!(apply_lag_light(0), Light::Green);
         assert_eq!(apply_lag_light(10), Light::Green);
         assert_eq!(apply_lag_light(11), Light::Amber);
@@ -2321,13 +2347,6 @@ garbage line without a number x
         assert_eq!(reconnects_light(0.0), Light::Green);
         assert_eq!(reconnects_light(5.0), Light::Amber);
         assert_eq!(reconnects_light(6.0), Light::Red);
-        assert_eq!(conservation_light("match"), Light::Green);
-        assert_eq!(conservation_light("partial"), Light::Amber);
-        assert_eq!(conservation_light("unverified"), Light::Amber);
-        assert_eq!(conservation_light("mismatch"), Light::Red);
-        assert_eq!(conservation_light(""), Light::Grey);
-        assert_eq!(conservation_word("mismatch"), "ticks missing");
-        assert_eq!(conservation_word("weird"), "unknown result");
     }
 
     #[test]
@@ -2342,17 +2361,21 @@ garbage line without a number x
                 "db_tick_rows",
                 "not_landed_rows",
                 "shortfall",
+                "ts",
+                "count_reads",
             ],
             vec![
                 vec![
                     json_str("2026-10-29T00:00:00.000000Z"),
                     json_str("dhan"),
                     json_str("match"),
-                    json_str("counted"),
+                    json_str("exact"),
                     Value::from(64_349_753),
                     Value::from(64_349_753),
                     Value::from(0),
                     Value::from(0),
+                    json_str("2026-10-29T15:49:02.891119Z"),
+                    Value::from(3),
                 ],
                 vec![
                     json_str("2026-10-28T00:00:00.000000Z"),
@@ -2372,12 +2395,30 @@ garbage line without a number x
         assert_eq!(section.tiles[0].value, "1 day ago");
         assert_eq!(section.tiles[0].status, Light::Green);
         assert_eq!(section.tiles[1].label, "2026-10-29 · dhan");
-        assert_eq!(section.tiles[1].value, "every tick counted");
+        assert_eq!(section.tiles[1].value, "row counts agree");
         assert_eq!(section.tiles[1].status, Light::Green);
-        assert!(section.tiles[1].detail.contains("received 64,349,753"));
+        assert!(
+            section.tiles[1]
+                .detail
+                .contains("accepted writes 64,349,753")
+        );
+        assert!(
+            section.tiles[1]
+                .detail
+                .contains("checked 2026-10-29 15:49:02.891119 IST · count reads 3")
+        );
+        assert!(
+            section.tiles[2]
+                .detail
+                .contains("checked unknown · count reads unknown")
+        );
         assert_eq!(section.tiles[2].status, Light::Amber);
-        assert!(section.tiles[2].detail.contains("in the database unknown"));
-        assert!(section.tiles[2].detail.contains("short by -3"));
+        assert!(
+            section.tiles[2]
+                .detail
+                .contains("rows in live trade and quote tables unknown")
+        );
+        assert!(section.tiles[2].detail.contains("difference unknown"));
         assert!(section.tiles[2].detail.contains("reason db unreadable"));
 
         // The same rows read eight days later: old greens, so the freshness
@@ -2391,6 +2432,108 @@ garbage line without a number x
         assert_eq!(none.tiles[0].status, Light::Grey);
         let down = conservation_section(&QueryOutcome::Unreachable, IST_0930_25);
         assert_eq!(down.tiles[0].status, Light::Grey);
+    }
+
+    #[test]
+    fn test_conservation_result_renders_historical_and_current_audits_from_stored_fields() {
+        let columns = [
+            "verdict",
+            "reason",
+            "accepted_rows",
+            "db_tick_rows",
+            "shortfall",
+        ];
+        let render = |sample: Value| {
+            let row = sample.as_array().expect("audit row").clone();
+            let section = conservation_section(&rows(&columns, vec![row]), IST_0930_25);
+            let result = &section.tiles[1];
+            (result.value.clone(), result.status)
+        };
+        for verdict in ["match", "unverified"] {
+            let row = serde_json::json!([verdict, "within_counted_losses", 100, 0, 100]);
+            assert_eq!(
+                render(row),
+                ("database shortfall still unverified".into(), Light::Amber)
+            );
+        }
+        for row in [
+            serde_json::json!(["match", "exact", 100, 99, 0]),
+            serde_json::json!(["match", "exact", 100, 100, 1]),
+            serde_json::json!(["match", "exact", null, null, null]),
+            serde_json::json!(["match", "exact", 0, 0, 0]),
+            serde_json::json!(["match", null, 99, 99, 0]),
+        ] {
+            assert_eq!(
+                render(row),
+                ("count agreement unverified".into(), Light::Amber)
+            );
+        }
+        for (row, label, status) in [
+            (
+                serde_json::json!(["mismatch", "unexplained_shortfall", 4, 2, 2]),
+                "fewer live rows than accepted writes",
+                Light::Red,
+            ),
+            (
+                serde_json::json!(["mismatch", "extra_db_rows", 100, 101, -1]),
+                "more live rows than accepted writes",
+                Light::Red,
+            ),
+            (
+                serde_json::json!(["mismatch", null, 100, null, null]),
+                "row counts differ",
+                Light::Red,
+            ),
+            (
+                serde_json::json!(["partial", "process_started_mid_day", 1, 2, -1]),
+                "partial session counts",
+                Light::Amber,
+            ),
+            (
+                serde_json::json!([null, null, null, null, null]),
+                "unknown result",
+                Light::Grey,
+            ),
+        ] {
+            assert_eq!(render(row), (label.into(), status));
+        }
+    }
+
+    #[test]
+    fn test_conservation_section_explains_uncertain_reads_even_when_counts_agree() {
+        let columns = [
+            "verdict",
+            "reason",
+            "accepted_rows",
+            "db_tick_rows",
+            "shortfall",
+        ];
+        for (reason, expected) in [
+            ("archived_partition", "archive verified, full count unknown"),
+            ("archive_coverage_unknown", "archive status unknown"),
+            (
+                "destination_wal_unverified",
+                "database write progress unconfirmed",
+            ),
+            ("admissions_changed", "new writes arrived during the count"),
+            ("future_reason", "count agreement unverified"),
+        ] {
+            let row = vec![
+                json_str("unverified"),
+                json_str(reason),
+                12.into(),
+                12.into(),
+                0.into(),
+            ];
+            let section = conservation_section(&rows(&columns, vec![row]), IST_0930_25);
+            let tile = &section.tiles[1];
+            assert_eq!((tile.value.as_str(), tile.status), (expected, Light::Amber));
+            assert!(
+                tile.detail
+                    .contains("rows in live trade and quote tables 12")
+            );
+            assert!(tile.detail.contains(&reason.replace('_', " ")));
+        }
     }
 
     #[test]
@@ -2551,6 +2694,23 @@ garbage line without a number x
         assert_eq!(
             (four.value.as_str(), four.status),
             ("4 days ago", Light::Green)
+        );
+    }
+
+    #[test]
+    fn test_conservation_freshness_tile_flags_future_date_at_midnight() {
+        let columns = vec!["trading_date_ist".to_string()];
+        let rows = vec![vec![json_str("2026-10-31T00:00:00.000000Z")]];
+        let midnight = parse_ts_secs("2026-10-31T00:00:00.000000Z").expect("fixture timestamp");
+        let future = conservation_freshness_tile(&columns, &rows, midnight - 1);
+        assert_eq!(
+            (future.value.as_str(), future.status),
+            ("future trading date", Light::Amber)
+        );
+        let today = conservation_freshness_tile(&columns, &rows, midnight);
+        assert_eq!(
+            (today.value.as_str(), today.status),
+            ("today", Light::Green)
         );
     }
 
@@ -2791,7 +2951,7 @@ garbage line without a number x
         if request_line.contains("tick_conservation_audit") {
             return (
                 "application/json",
-                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","short",100,90,0,10]]}"#,
+                r#"{"columns":[{"name":"trading_date_ist"},{"name":"feed"},{"name":"verdict"},{"name":"reason"},{"name":"accepted_rows"},{"name":"db_tick_rows"},{"name":"not_landed_rows"},{"name":"shortfall"}],"dataset":[["2026-10-29T00:00:00.000000Z","dhan","mismatch","unexplained_shortfall",100,90,0,10],["2026-10-28T00:00:00.000000Z","dhan","unverified","archived_partition",5,2,0,3]]}"#,
             );
         }
         if request_line.contains("feed_gap_audit") {
@@ -2863,9 +3023,11 @@ garbage line without a number x
         let parsed: Value = serde_json::from_slice(&body).expect("json");
         let text = parsed.to_string();
         assert!(
-            text.contains("ticks missing"),
+            text.contains("fewer live rows than accepted writes"),
             "conservation row read: {text}"
         );
+        assert!(text.contains("archive verified, full count unknown"));
+        assert!(text.contains("rows in live trade and quote tables 2 ·"));
         assert!(text.contains("1.0 GB"), "metrics page read: {text}");
         assert!(
             text.contains("not yet available"),

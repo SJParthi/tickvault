@@ -61,6 +61,9 @@ pub mod waste_check;
 pub mod operator_stock_movers_wire;
 // Plan PR MV (2026-11-06): the movers universe + pure selection, shared
 // source with tickvault-common (no common dependency in the Lambda).
+#[path = "../../common/src/mtf_receipt_json.rs"]
+pub mod mtf_receipt_json;
+
 #[path = "../../common/src/operator_movers_universe.rs"]
 pub mod operator_movers_universe;
 

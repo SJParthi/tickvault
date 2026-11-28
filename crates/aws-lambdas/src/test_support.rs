@@ -19,6 +19,30 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// In-memory writer for tests that check structured Lambda receipts.
+#[derive(Clone, Default)]
+pub(crate) struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    // TEST-EXEMPT: test-only writer read by the watchdog and relay receipt assertions.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
+    }
+}
+
 /// One HTTP request as the loopback server saw it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LoopbackRequest {

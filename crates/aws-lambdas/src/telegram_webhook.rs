@@ -19,6 +19,7 @@
 //! Environment variables (set by Terraform — unchanged from the legacy runtime):
 //!   TELEGRAM_BOT_TOKEN_SSM_PARAM  — SSM path holding the bot token
 //!   TELEGRAM_CHAT_ID_SSM_PARAM    — SSM path holding the chat ID
+//!   OPERATOR_PORTAL_URL           — canonical HTTPS portal used by the private Mini App button
 //!   LOG_LEVEL                     — INFO (default) / DEBUG / WARNING
 //!
 //! Parity ledger (every deliberate deviation from the legacy original):
@@ -977,8 +978,116 @@ pub fn repeat_alarm_line(alarm: &Value, streak: u32) -> String {
 /// - A malformed record folds to a safe generic line — never a crash,
 ///   never raw JSON.
 pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -> Vec<String> {
+    fold_for_delivery(records, now_epoch, cache)
+        .into_iter()
+        .map(|delivery| delivery.text)
+        .collect()
+}
+
+#[derive(Clone)]
+enum OperatorNotice {
+    Portal,
+    MorningNotice { sns_message_id: Option<String> },
+}
+
+#[derive(Clone)]
+struct Delivery {
+    text: String,
+    operator_notice: Option<OperatorNotice>,
+    button_requested: bool,
+}
+
+impl Delivery {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            operator_notice: None,
+            button_requested: false,
+        }
+    }
+
+    fn prepare(&self, chat_id: &str, configured_url: Option<&str>) -> (String, bool) {
+        let markup = if self.button_requested {
+            operator_button(chat_id, configured_url)
+        } else {
+            None
+        };
+        (
+            telegram_body(chat_id, &self.text, markup.as_deref()),
+            markup.is_some(),
+        )
+    }
+
+    async fn post(
+        self,
+        client: &reqwest::Client,
+        url: &str,
+        chat_id: &str,
+        configured_url: Option<&str>,
+    ) -> Result<(u16, String), String> {
+        let (request, button_attached) = self.prepare(chat_id, configured_url);
+        let reply = post_telegram_body(client, url, request).await;
+        if let Some(OperatorNotice::MorningNotice { sns_message_id }) = &self.operator_notice {
+            record_morning_relay_result(sns_message_id.as_deref(), button_attached, &reply);
+        }
+        let (status, mut response) = reply?;
+        if self.operator_notice.is_some() && status >= 400 {
+            // An error body can echo private request data into the batch's failure log.
+            response = "operator notice response body omitted".to_string();
+        }
+        Ok((status, response))
+    }
+}
+
+fn record_morning_relay_result(
+    sns_message_id: Option<&str>,
+    button_attached: bool,
+    reply: &Result<(u16, String), String>,
+) {
+    let relay_outcome = match reply {
+        Err(_) => "transport_error",
+        Ok(_) if !button_attached => "private_button_omitted",
+        Ok(_) if sns_message_id.is_none() => "sns_message_id_unavailable",
+        Ok((status, body)) if !telegram_accepted_message(*status, body) => {
+            "bot_response_unconfirmed"
+        }
+        Ok(_) => {
+            info!(
+                sns_message_id,
+                relay_outcome = "telegram_accepted",
+                "Telegram accepted the private morning start notice"
+            );
+            return;
+        }
+    };
+    let http_status = reply.as_ref().ok().map(|(status, _)| *status);
+    warn!(
+        sns_message_id,
+        relay_outcome,
+        button_attached,
+        http_status,
+        "Private morning start notice receipt incomplete"
+    );
+}
+
+fn telegram_accepted_message(status: u16, response: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct SentMessage {
+        message_id: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct SendMessageResponse {
+        ok: bool,
+        result: SentMessage,
+    }
+    (200..300).contains(&status)
+        && serde_json::from_str::<SendMessageResponse>(response)
+            .is_ok_and(|reply| reply.ok && reply.result.message_id > 0)
+}
+
+fn fold_for_delivery(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -> Vec<Delivery> {
     let now = now_epoch;
-    let mut plain_texts: Vec<String> = Vec::new();
+    let mut plain_texts = Vec::new();
     // Per alarm name (first-appearance order): the LAST record wins,
     // remembering whether an ALARM was seen anywhere in the batch.
     let mut name_order: Vec<String> = Vec::new();
@@ -996,13 +1105,13 @@ pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -
                 Some(Value::Object(sns)) => Some(sns),
                 Some(_) => {
                     warn!("Malformed SNS record — sending safe generic line");
-                    plain_texts.push(GENERIC_SAFE_LINE.to_string());
+                    plain_texts.push(Delivery::plain(GENERIC_SAFE_LINE.to_string()));
                     continue;
                 }
             },
             _ => {
                 warn!("Malformed SNS record — sending safe generic line");
-                plain_texts.push(GENERIC_SAFE_LINE.to_string());
+                plain_texts.push(Delivery::plain(GENERIC_SAFE_LINE.to_string()));
                 continue;
             }
         };
@@ -1028,7 +1137,32 @@ pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -
             last_by_name.insert(name, alarm);
         } else {
             let subject = sns_obj.and_then(|s| s.get("Subject"));
-            plain_texts.push(format_plain_sns(subject, message));
+            // The subject identifies sensitive notices, including a notice sent without
+            // a marker. Only an explicit, valid marker may request an operator button.
+            let operator_notice = match subject.and_then(Value::as_str) {
+                Some(START_NOTICE_SUBJECT) => Some(OperatorNotice::MorningNotice {
+                    sns_message_id: crate::logging::sns_message_id(
+                        sns_obj.and_then(|sns| sns.get("MessageId")?.as_str()),
+                    )
+                    .map(str::to_owned),
+                }),
+                Some("Operator portal ready" | "Operator console key replaced") => {
+                    Some(OperatorNotice::Portal)
+                }
+                _ => None,
+            };
+            let marker = sns_obj
+                .and_then(|s| s.get("MessageAttributes"))
+                .and_then(|attrs| attrs.get(PORTAL_MARKER));
+            let button_requested = operator_notice.is_some()
+                && marker.is_some_and(|attr| {
+                    attr["Type"] == "String" && attr["Value"] == PORTAL_MARKER_VALUE
+                });
+            plain_texts.push(Delivery {
+                text: format_plain_sns(subject, message),
+                operator_notice,
+                button_requested,
+            });
         }
     }
 
@@ -1092,8 +1226,10 @@ pub fn fold_records(records: &[Value], now_epoch: f64, cache: &mut AlertCache) -
         out.push(recovered_line(&lone_ok_phrases, &ist_time));
     }
 
-    out.extend(plain_texts);
-    out
+    out.into_iter()
+        .map(Delivery::plain)
+        .chain(plain_texts)
+        .collect()
 }
 
 /// The exact Telegram sendMessage form pairs. Plain-text mode is
@@ -1108,6 +1244,44 @@ pub fn telegram_form_pairs(chat_id: &str, text: &str) -> [(&'static str, String)
         ("text", text.to_string()),
         ("disable_web_page_preview", "true".to_string()),
     ]
+}
+
+pub(crate) const PORTAL_MARKER: &str = "TickvaultEntry";
+pub(crate) const PORTAL_MARKER_VALUE: &str = "operator-portal";
+pub(crate) const START_NOTICE_SUBJECT: &str = "Instance start triggered";
+
+pub(crate) fn portal_web_app_url(configured_url: Option<&str>) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(configured_url?).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url)
+}
+
+/// Telegram permits inline Web Apps in a private user/bot chat over HTTPS.
+fn operator_button(chat_id: &str, configured_url: Option<&str>) -> Option<String> {
+    if !chat_id.bytes().all(|c| c.is_ascii_digit()) || chat_id.parse::<i64>().ok()? <= 0 {
+        return None;
+    }
+    let url = portal_web_app_url(configured_url)?;
+    Some(
+        json!({"inline_keyboard": [[{"text":"Open Tickvault","web_app":{"url":url.as_str()}}]]})
+            .to_string(),
+    )
+}
+
+fn telegram_body(chat_id: &str, text: &str, reply_markup: Option<&str>) -> String {
+    let mut fields = telegram_form_pairs(chat_id, text).to_vec();
+    if let Some(markup) = reply_markup {
+        fields.push(("reply_markup", markup.to_owned()));
+    }
+    form_urlencode(&fields)
 }
 
 /// application/x-www-form-urlencoded encoding — legacy parity:
@@ -1140,35 +1314,27 @@ pub fn form_urlencode(pairs: &[(&str, String)]) -> String {
     out
 }
 
-/// POST to the Telegram bot API. Returns (status_code, body_text).
-/// Legacy parity: `_post_to_telegram`. UNPROVEN until deploy — the live
-/// HTTP leg runs only in a real Lambda; the payload construction it
-/// sends is what the unit tests cover. The token/chat-id are NEVER
-/// logged.
-pub async fn post_to_telegram(
+/// Deliver the encoded message, including any private-chat button.
+async fn post_telegram_body(
     client: &reqwest::Client,
-    token: &str,
-    chat_id: &str,
-    text: &str,
-) -> Result<(u16, String), reqwest::Error> {
-    let url = format!("{TELEGRAM_API_BASE}/bot{token}/sendMessage");
-    let body = form_urlencode(
-        &telegram_form_pairs(chat_id, text)
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect::<Vec<_>>(),
-    );
+    url: &str,
+    body: String,
+) -> Result<(u16, String), String> {
+    // The Bot API URL contains the token. Strip it from send and body errors
+    // before either can reach the batch result or Lambda logs.
+    let redact_url = |err: reqwest::Error| err.without_url().to_string();
     let resp = client
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
-        .await?;
+        .await
+        .map_err(redact_url)?;
     let status = resp.status().as_u16();
     // legacy: resp.read().decode("utf-8", errors="replace") — reqwest
     // text() is already lossy on invalid UTF-8; a transport error while
     // reading propagates like the legacy exception path.
-    let body_text = resp.text().await?;
+    let body_text = resp.text().await.map_err(redact_url)?;
     Ok((status, body_text))
 }
 
@@ -1177,9 +1343,9 @@ pub async fn post_to_telegram(
 /// parity: the `for text in texts:` loop of `lambda_handler`. `post` is
 /// the injected transport so tests exercise the full never-drop boundary
 /// without HTTP (the Rust analog of the legacy runtime's `mock.patch`).
-pub async fn send_texts<F, Fut>(texts: &[String], records_len: usize, mut post: F) -> Value
+pub async fn send_texts<T: Clone, F, Fut>(texts: &[T], records_len: usize, mut post: F) -> Value
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(T) -> Fut,
     Fut: Future<Output = Result<(u16, String), String>>,
 {
     let mut sent: u64 = 0;
@@ -1321,23 +1487,15 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
     let texts = {
         let mut guard = LAST_SENT.lock().unwrap_or_else(|e| e.into_inner());
         let cache = guard.get_or_insert_with(HashMap::new);
-        fold_records(&records, now, cache)
+        fold_for_delivery(&records, now, cache)
     };
     // (legacy backstopped a fold crash with one generic line per record;
     //  the Rust fold has no panicking path — ledger.)
 
-    let result = send_texts(&texts, records.len(), |text| {
-        let client = client.clone();
-        let token = token.clone();
-        let chat_id = chat_id.clone();
-        async move {
-            post_to_telegram(&client, &token, &chat_id, &text)
-                .await
-                // Token-redaction hardening: the reqwest error Display
-                // embeds the request URL, which contains the bot token —
-                // strip it before the string enters logs / the result.
-                .map_err(|e| e.without_url().to_string())
-        }
+    let configured_url = std::env::var("OPERATOR_PORTAL_URL").ok();
+    let send_url = format!("{TELEGRAM_API_BASE}/bot{token}/sendMessage");
+    let result = send_texts(&texts, records.len(), |delivery| {
+        delivery.post(&client, &send_url, &chat_id, configured_url.as_deref())
     })
     .await;
 
@@ -1356,6 +1514,9 @@ pub async fn handle(event: Value) -> Result<Value, Error> {
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod relay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2240,6 +2401,125 @@ mod tests {
     }
 
     // ---- PlainTextTransport (legacy: 5 tests) ----
+
+    #[test]
+    fn test_portal_web_app_url_preserves_stage_and_rejects_credential_fields() {
+        let stage = "https://portal.example.org/prod/";
+        assert_eq!(portal_web_app_url(Some(stage)).unwrap().as_str(), stage);
+        for invalid in [
+            None,
+            Some("http://portal.example.org/prod/"),
+            Some("https://operator:x@portal.example.org/"),
+            Some("https://portal.example.org/?key=x"),
+            Some("https://portal.example.org/#key=x"),
+        ] {
+            assert!(portal_web_app_url(invalid).is_none(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn portal_button_uses_only_its_configured_https_url_and_a_private_chat() {
+        let portal = "https://example.execute-api.ap-south-1.amazonaws.com/";
+        let button = operator_button("123456789", Some(portal)).expect("private user button");
+        assert_eq!(
+            serde_json::from_str::<Value>(&button).expect("valid reply markup"),
+            json!({"inline_keyboard":[[{"text":"Open Tickvault","web_app":{"url":portal}}]]})
+        );
+        for recipient in [
+            "",
+            "0",
+            "-7",
+            "-100123",
+            "@channel",
+            "+123",
+            "123abc",
+            "9223372036854775808",
+        ] {
+            assert!(
+                operator_button(recipient, Some(portal)).is_none(),
+                "{recipient}"
+            );
+        }
+        for configured in [
+            None,
+            Some(""),
+            Some("http://example.org"),
+            Some("not a URL"),
+            Some("https://name@example.org/"),
+            Some("https://name:x@example.org/"),
+            Some("https://example.org/?key=x"),
+            Some("https://example.org/#key=x"),
+        ] {
+            assert!(
+                operator_button("123", configured).is_none(),
+                "{configured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_sns_batch_only_decorates_tagged_portal_announcements() {
+        let subject = "Operator portal ready";
+        let marked = |subject: &str| {
+            json!({"Sns":{"Subject":subject,
+            "Message":"https://elsewhere.invalid/ URL in alert content",
+            "MessageAttributes":{"TickvaultEntry":{"Type":"String","Value":"operator-portal"}}}})
+        };
+        let mut markerless = marked(subject);
+        markerless["Sns"]["MessageAttributes"] = json!({});
+        let mut wrong_type = marked(subject);
+        wrong_type["Sns"]["MessageAttributes"]["TickvaultEntry"]["Type"] = json!("Binary");
+        let mut wrong_value = marked(subject);
+        wrong_value["Sns"]["MessageAttributes"]["TickvaultEntry"]["Value"] = json!("questdb");
+        let mut alarm = marked(subject);
+        alarm["Sns"]["Message"] =
+            json!(json!({"AlarmName":"alarm","NewStateValue":"ALARM"}).to_string());
+        let mixed = vec![
+            markerless,
+            marked(subject),
+            wrong_type,
+            alarm,
+            marked("Operator console key replaced"),
+            marked("QuestDB console ready"),
+            marked(START_NOTICE_SUBJECT),
+            wrong_value,
+        ];
+        let deliveries = fold_for_delivery(&mixed, 1.0, &mut HashMap::new());
+        // CloudWatch alarm is emitted first; plain publishes retain their own order.
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|d| d.button_requested)
+                .collect::<Vec<_>>(),
+            [false, false, true, false, true, false, true, false]
+        );
+        let canonical = "https://portal.example.org/";
+        for delivery in &deliveries {
+            let (form, _) = delivery.prepare("123", Some(canonical));
+            // Decode the exact form that the HTTP client sends to Telegram.
+            let decoded = reqwest::Url::parse(&format!("https://example.org/?{form}")).unwrap();
+            let fields: HashMap<_, _> = decoded.query_pairs().collect();
+            assert_eq!(fields["chat_id"], "123");
+            assert_eq!(fields["text"], delivery.text);
+            assert_eq!(fields["disable_web_page_preview"], "true");
+            match fields.get("reply_markup") {
+                Some(value) => {
+                    assert!(delivery.button_requested);
+                    assert_eq!(fields.len(), 4);
+                    let markup: Value = serde_json::from_str(value).unwrap();
+                    assert_eq!(markup["inline_keyboard"][0][0]["web_app"]["url"], canonical);
+                }
+                None => {
+                    assert!(!delivery.button_requested);
+                    assert_eq!(fields.len(), 3);
+                }
+            }
+            assert_eq!(
+                delivery.prepare("-123", Some(canonical)).0,
+                telegram_body("-123", &delivery.text, None)
+            );
+        }
+    }
 
     #[test]
     fn test_post_payload_has_no_parse_mode() {
